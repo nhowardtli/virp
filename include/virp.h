@@ -1,0 +1,321 @@
+/*
+ * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
+ * VIRP — Verified Intent Routing Protocol
+ * Core protocol definitions
+ */
+
+#ifndef VIRP_H
+#define VIRP_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+/* =========================================================================
+ * Protocol Constants
+ * ========================================================================= */
+
+#define VIRP_VERSION            1
+#define VIRP_PORT               1790        /* Proposed IANA assignment */
+#define VIRP_HEADER_SIZE        56          /* Fixed header: 24 bytes + 32 HMAC */
+#define VIRP_HMAC_SIZE          32          /* SHA-256 = 32 bytes */
+#define VIRP_HMAC_HEX_SIZE     65          /* 32 * 2 + NUL */
+#define VIRP_KEY_SIZE           32          /* 256-bit signing keys */
+#define VIRP_MAX_MESSAGE_SIZE   65536       /* 64KB max message */
+#define VIRP_MAX_PAYLOAD_SIZE   (VIRP_MAX_MESSAGE_SIZE - VIRP_HEADER_SIZE)
+#define VIRP_MAX_OBS_REFS       64          /* Max observation references per proposal */
+#define VIRP_MAX_INTENT_DATA    8192        /* Max intent payload */
+#define VIRP_MAGIC              0x56495250  /* "VIRP" in ASCII */
+
+/* =========================================================================
+ * Channel Identifiers
+ *
+ * The two channels can NEVER cross. O-Keys sign OC messages.
+ * R-Keys sign IC messages. This is structural, not policy.
+ * ========================================================================= */
+
+#define VIRP_CHANNEL_OC         0x01    /* Observation Channel — facts, signed by O-Node */
+#define VIRP_CHANNEL_IC         0x02    /* Intent Channel — proposals, signed by R-Node */
+
+/* =========================================================================
+ * Trust Tiers
+ *
+ * Mapped from TLI Ops Center command tiers:
+ *   GREEN  → Tier 1 (passive, no approval)
+ *   YELLOW → Tier 2 (active, single approval)
+ *   RED    → Tier 3 (critical, multi-human approval)
+ *   BLACK  → Tier 0 (impossible — not in message format)
+ * ========================================================================= */
+
+#define VIRP_TIER_BLACK         0x00    /* Forbidden — never transmitted */
+#define VIRP_TIER_GREEN         0x01    /* Passive — no approval required */
+#define VIRP_TIER_YELLOW        0x02    /* Active — single approval required */
+#define VIRP_TIER_RED           0x03    /* Critical — multi-human approval */
+
+/* =========================================================================
+ * Message Types
+ * ========================================================================= */
+
+/* Observation Channel messages (0x01 - 0x0F) */
+#define VIRP_MSG_OBSERVATION    0x01    /* Signed measurement of network state */
+#define VIRP_MSG_HELLO          0x02    /* Peer initialization and key exchange */
+
+/* Intent Channel messages (0x10 - 0x2F) */
+#define VIRP_MSG_PROPOSAL       0x10    /* Proposed change with evidence */
+#define VIRP_MSG_APPROVAL       0x11    /* Approval/rejection of proposal */
+#define VIRP_MSG_INTENT_ADV     0x20    /* Advertisement of network intent */
+#define VIRP_MSG_INTENT_WD      0x21    /* Withdrawal of intent */
+
+/* Shared messages (0x30+) */
+#define VIRP_MSG_HEARTBEAT      0x30    /* Signed liveness proof — OC only */
+#define VIRP_MSG_TEARDOWN       0xF0    /* Graceful session termination — both */
+
+/* =========================================================================
+ * Observation Types
+ * ========================================================================= */
+
+#define VIRP_OBS_PREFIX_REACHABLE   0x01    /* Prefix exists on this node */
+#define VIRP_OBS_LINK_STATE         0x02    /* Measured link metrics */
+#define VIRP_OBS_PEER_STATE         0x03    /* Adjacency state with neighbor */
+#define VIRP_OBS_FORWARDING_STATE   0x04    /* Verified forwarding table entry */
+#define VIRP_OBS_RESOURCE_STATE     0x05    /* CPU, memory, interface utilization */
+#define VIRP_OBS_SECURITY_STATE     0x06    /* Access policy, zone, encryption */
+#define VIRP_OBS_DEVICE_OUTPUT      0x07    /* Raw CLI/API output (TLI model) */
+
+/* =========================================================================
+ * Observation Scope
+ * ========================================================================= */
+
+#define VIRP_SCOPE_LOCAL        0x01    /* About this node */
+#define VIRP_SCOPE_ADJACENT     0x02    /* About a directly connected neighbor */
+#define VIRP_SCOPE_MEASURED     0x03    /* Derived from active probing */
+
+/* =========================================================================
+ * Proposal Types
+ * ========================================================================= */
+
+#define VIRP_PROP_ROUTE_INJECT      0x01    /* Add a route */
+#define VIRP_PROP_ROUTE_WITHDRAW    0x02    /* Remove a route */
+#define VIRP_PROP_METRIC_CHANGE     0x03    /* Change path metric */
+#define VIRP_PROP_POLICY_CHANGE     0x04    /* Change forwarding/security policy */
+#define VIRP_PROP_TOPOLOGY_CHANGE   0x05    /* Change peer relationships */
+#define VIRP_PROP_CONFIG_APPLY      0x06    /* Apply config block to device */
+
+/* =========================================================================
+ * Proposal States
+ * ========================================================================= */
+
+#define VIRP_PSTATE_PROPOSED        0x01
+#define VIRP_PSTATE_APPROVED        0x02
+#define VIRP_PSTATE_ACTIVE          0x03
+#define VIRP_PSTATE_REJECTED        0x04
+#define VIRP_PSTATE_ROLLED_BACK     0x05
+#define VIRP_PSTATE_EXPIRED         0x06
+
+/* =========================================================================
+ * Approval Types
+ * ========================================================================= */
+
+#define VIRP_APPROVAL_APPROVE       0x01
+#define VIRP_APPROVAL_REJECT        0x02
+#define VIRP_APPROVAL_ESCALATE      0x03    /* Needs higher-tier approval */
+
+/* =========================================================================
+ * Approver Class
+ * ========================================================================= */
+
+#define VIRP_APPROVER_AUTOMATED     0x01    /* R-Node within policy bounds */
+#define VIRP_APPROVER_HUMAN         0x02    /* Human operator */
+#define VIRP_APPROVER_MULTI_HUMAN   0x03    /* Multiple human operators */
+
+/* =========================================================================
+ * Intent Types
+ * ========================================================================= */
+
+#define VIRP_INTENT_REACHABILITY    0x01    /* Prefix reachable with guarantees */
+#define VIRP_INTENT_SERVICE         0x02    /* Service available (fw, lb, etc) */
+#define VIRP_INTENT_CAPACITY        0x03    /* Available capacity on path */
+#define VIRP_INTENT_CONSTRAINT      0x04    /* MUST/MUST NOT traverse nodes */
+#define VIRP_INTENT_SLA             0x05    /* Performance guarantee */
+
+/* =========================================================================
+ * Node Types
+ * ========================================================================= */
+
+#define VIRP_NODE_OBSERVER      0x01    /* O-Node: measures and signs */
+#define VIRP_NODE_REASONING     0x02    /* R-Node: reasons and proposes */
+#define VIRP_NODE_HYBRID        0x03    /* H-Node: both, internally separated */
+
+/* =========================================================================
+ * Peer States (FSM)
+ * ========================================================================= */
+
+#define VIRP_PEER_IDLE              0x00
+#define VIRP_PEER_INIT              0x01
+#define VIRP_PEER_OBS_EXCHANGE      0x02
+#define VIRP_PEER_TRUST_VERIFY      0x03
+#define VIRP_PEER_ESTABLISHED       0x04
+#define VIRP_PEER_ACTIVE            0x05
+#define VIRP_PEER_TEARDOWN          0x06
+
+/* =========================================================================
+ * Structures
+ * ========================================================================= */
+
+/*
+ * VIRP Common Header — 56 bytes fixed
+ *
+ * Every VIRP message starts with this header. The HMAC covers
+ * the entire message (header fields + payload) excluding the
+ * HMAC field itself.
+ *
+ * Wire format is network byte order (big-endian).
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t     version;                    /* Protocol version (1) */
+    uint8_t     type;                       /* Message type */
+    uint16_t    length;                     /* Total message length incl header */
+    uint32_t    node_id;                    /* Originating node identifier */
+    uint8_t     channel;                    /* OC (0x01) or IC (0x02) */
+    uint8_t     tier;                       /* GREEN/YELLOW/RED */
+    uint16_t    reserved;                   /* Must be zero */
+    uint32_t    seq_num;                    /* Monotonic sequence number */
+    uint64_t    timestamp_ns;               /* Nanosecond Unix timestamp */
+    uint8_t     hmac[VIRP_HMAC_SIZE];       /* HMAC-SHA256 signature */
+} virp_header_t;
+
+_Static_assert(sizeof(virp_header_t) == VIRP_HEADER_SIZE,
+               "VIRP header must be exactly 56 bytes");
+
+/*
+ * Observation payload
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t     obs_type;                   /* VIRP_OBS_* */
+    uint8_t     obs_scope;                  /* VIRP_SCOPE_* */
+    uint16_t    obs_length;                 /* Length of observation data */
+    /* Variable-length observation data follows */
+} virp_observation_t;
+
+/*
+ * Observation reference — used in proposals to cite evidence
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t    node_id;                    /* Node that made the observation */
+    uint32_t    seq_num;                    /* Sequence number of observation */
+} virp_obs_ref_t;
+
+/*
+ * Proposal payload
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t    proposal_id;                /* Unique proposal identifier */
+    uint8_t     prop_type;                  /* VIRP_PROP_* */
+    uint8_t     prop_state;                 /* VIRP_PSTATE_* */
+    uint16_t    blast_radius;               /* Estimated affected nodes/prefixes */
+    uint32_t    obs_ref_count;              /* Number of supporting observations */
+    /* Array of virp_obs_ref_t follows (obs_ref_count entries) */
+    /* Variable-length proposal data follows after refs */
+} virp_proposal_t;
+
+/*
+ * Approval payload
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t    proposal_id;                /* Which proposal */
+    uint32_t    approver_node_id;           /* Who approved */
+    uint8_t     approval_type;              /* APPROVE/REJECT/ESCALATE */
+    uint8_t     approver_class;             /* AUTOMATED/HUMAN/MULTI_HUMAN */
+    uint16_t    reserved;                   /* Must be zero */
+} virp_approval_t;
+
+/*
+ * Intent advertisement payload
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t    intent_id;                  /* Unique intent identifier */
+    uint8_t     intent_type;                /* VIRP_INTENT_* */
+    uint8_t     priority;                   /* 0-255, higher = more preferred */
+    uint16_t    ttl_seconds;                /* Time to live */
+    uint32_t    proof_count;                /* Number of proof-of-capability refs */
+    /* Array of virp_obs_ref_t follows (proof_count entries) */
+    /* Variable-length intent data follows after proofs */
+} virp_intent_adv_t;
+
+/*
+ * Intent withdrawal payload
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t    intent_id;                  /* Which intent to withdraw */
+} virp_intent_wd_t;
+
+/*
+ * Heartbeat payload — OC only
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t    uptime_seconds;             /* Node uptime */
+    uint8_t     onode_ok;                   /* O-Node operational (0/1) */
+    uint8_t     rnode_ok;                   /* R-Node operational (0/1) */
+    uint16_t    active_observations;        /* Current observation count */
+    uint32_t    active_proposals;           /* Current proposal count */
+} virp_heartbeat_t;
+
+/*
+ * Hello payload — exchanged during INIT
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t    magic;                      /* VIRP_MAGIC */
+    uint8_t     version;                    /* Protocol version */
+    uint8_t     node_type;                  /* OBSERVER/REASONING/HYBRID */
+    uint8_t     max_tier;                   /* Highest tier this node supports */
+    uint8_t     reserved;
+    uint32_t    node_id;                    /* This node's ID */
+    uint8_t     okey_fingerprint[VIRP_HMAC_SIZE]; /* SHA-256 of O-Node public key */
+    uint8_t     rkey_fingerprint[VIRP_HMAC_SIZE]; /* SHA-256 of R-Node public key */
+} virp_hello_t;
+
+/*
+ * VIRP signing key pair — one per key type (O-Key or R-Key)
+ */
+typedef struct {
+    uint8_t     key[VIRP_KEY_SIZE];         /* 256-bit HMAC key */
+    bool        loaded;                     /* Key is initialized */
+} virp_key_t;
+
+/* =========================================================================
+ * Return codes
+ * ========================================================================= */
+
+typedef enum {
+    VIRP_OK                     =  0,
+    VIRP_ERR_NULL_PTR           = -1,
+    VIRP_ERR_BUFFER_TOO_SMALL   = -2,
+    VIRP_ERR_INVALID_VERSION    = -3,
+    VIRP_ERR_INVALID_TYPE       = -4,
+    VIRP_ERR_INVALID_CHANNEL    = -5,
+    VIRP_ERR_INVALID_TIER       = -6,
+    VIRP_ERR_INVALID_LENGTH     = -7,
+    VIRP_ERR_HMAC_FAILED        = -8,
+    VIRP_ERR_CHANNEL_VIOLATION  = -9,   /* R-Key on OC or O-Key on IC */
+    VIRP_ERR_TIER_VIOLATION     = -10,  /* BLACK tier transmitted */
+    VIRP_ERR_REPLAY_DETECTED    = -11,  /* Sequence number not monotonic */
+    VIRP_ERR_NO_EVIDENCE        = -12,  /* Proposal with zero obs refs */
+    VIRP_ERR_STALE_OBSERVATION  = -13,  /* Referenced observation expired */
+    VIRP_ERR_KEY_NOT_LOADED     = -14,
+    VIRP_ERR_MESSAGE_TOO_LARGE  = -15,
+    VIRP_ERR_RESERVED_NONZERO   = -16,
+} virp_error_t;
+
+/* =========================================================================
+ * Human-readable helpers
+ * ========================================================================= */
+
+const char *virp_error_str(virp_error_t err);
+const char *virp_msg_type_str(uint8_t type);
+const char *virp_channel_str(uint8_t channel);
+const char *virp_tier_str(uint8_t tier);
+const char *virp_obs_type_str(uint8_t obs_type);
+const char *virp_peer_state_str(uint8_t state);
+const char *virp_prop_state_str(uint8_t state);
+
+#endif /* VIRP_H */

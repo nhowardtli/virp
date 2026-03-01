@@ -1,0 +1,75 @@
+# Copyright (c) 2026 Third Level IT LLC. All rights reserved.
+# VIRP — Verified Intent Routing Protocol
+
+CC      = gcc
+CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g
+CFLAGS += -I./include
+LDFLAGS = -lcrypto -lpthread
+
+BUILD_DIR = build
+
+# Core library objects
+LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
+             $(BUILD_DIR)/virp_message.o \
+             $(BUILD_DIR)/virp_driver.o \
+             $(BUILD_DIR)/driver_mock.o \
+             $(BUILD_DIR)/virp_onode.o
+
+LIB          = $(BUILD_DIR)/libvirp.a
+TEST_BIN     = $(BUILD_DIR)/test_virp
+FUZZ_BIN     = $(BUILD_DIR)/fuzz_virp
+TOOL_BIN     = $(BUILD_DIR)/virp-tool
+ONODE_BIN    = $(BUILD_DIR)/virp-onode
+TEST_ONODE   = $(BUILD_DIR)/test_onode
+
+.PHONY: all clean test fuzz test-onode
+
+all: $(LIB) $(TEST_BIN) $(FUZZ_BIN) $(TOOL_BIN) $(ONODE_BIN) $(TEST_ONODE)
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/virp_crypto.o: src/virp_crypto.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_message.o: src/virp_message.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_driver.o: src/virp_driver.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_mock.o: src/drivers/driver_mock.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(LIB): $(LIB_OBJS)
+	ar rcs $@ $^
+
+$(TEST_BIN): tests/test_virp.c $(LIB)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+
+$(FUZZ_BIN): tests/fuzz_virp.c $(LIB)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+
+$(TOOL_BIN): src/virp_tool.c $(LIB)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+
+$(ONODE_BIN): src/virp_onode_main.c $(LIB)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+
+$(TEST_ONODE): tests/test_onode.c $(LIB)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+
+test: $(TEST_BIN)
+	./$(TEST_BIN)
+
+fuzz: $(FUZZ_BIN)
+	./$(FUZZ_BIN)
+
+test-onode: $(TEST_ONODE)
+	./$(TEST_ONODE)
+
+clean:
+	rm -rf $(BUILD_DIR)
