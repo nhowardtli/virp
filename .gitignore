@@ -1,0 +1,9 @@
+build/
+keys/
+*.key
+devices.json
+*.tar.gz
+*.bak
+__pycache__/
+venv/
+.env

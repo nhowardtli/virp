@@ -1,5 +1,8 @@
 # Copyright (c) 2026 Third Level IT LLC. All rights reserved.
 # VIRP — Verified Intent Routing Protocol
+#
+# Build with Cisco driver:  make CISCO=1
+# Build without (default):  make
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g
@@ -14,6 +17,13 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_driver.o \
              $(BUILD_DIR)/driver_mock.o \
              $(BUILD_DIR)/virp_onode.o
+
+# Optional Cisco driver (requires libssh2)
+ifdef CISCO
+  CFLAGS  += -DVIRP_DRIVER_CISCO
+  LDFLAGS += -lssh2
+  LIB_OBJS += $(BUILD_DIR)/driver_cisco.o
+endif
 
 LIB          = $(BUILD_DIR)/libvirp.a
 TEST_BIN     = $(BUILD_DIR)/test_virp
@@ -41,6 +51,9 @@ $(BUILD_DIR)/virp_driver.o: src/virp_driver.c | $(BUILD_DIR)
 $(BUILD_DIR)/driver_mock.o: src/drivers/driver_mock.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/driver_cisco.o: src/drivers/driver_cisco.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -56,8 +69,8 @@ $(FUZZ_BIN): tests/fuzz_virp.c $(LIB)
 $(TOOL_BIN): src/virp_tool.c $(LIB)
 	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
 
-$(ONODE_BIN): src/virp_onode_main.c $(LIB)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+$(ONODE_BIN): src/virp_onode_main.c src/virp_onode_json.c $(LIB)
+	$(CC) $(CFLAGS) src/virp_onode_main.c src/virp_onode_json.c -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
 
 $(TEST_ONODE): tests/test_onode.c $(LIB)
 	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
@@ -73,3 +86,11 @@ test-onode: $(TEST_ONODE)
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+LIVE_TEST = $(BUILD_DIR)/virp-live-test
+
+$(LIVE_TEST): tests/test_live.c $(LIB)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+
+test-live: $(LIVE_TEST)
+	./$(LIVE_TEST)

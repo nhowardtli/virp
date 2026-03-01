@@ -23,12 +23,21 @@
 
 static onode_state_t g_state;
 
+/* Forward declare drivers */
+extern void virp_driver_mock_init(void);
+#ifdef VIRP_DRIVER_CISCO
+extern void virp_driver_cisco_init(void);
+#endif
+
 static void signal_handler(int sig)
 {
     (void)sig;
     fprintf(stderr, "\n[O-Node] Signal received, shutting down...\n");
     onode_shutdown(&g_state);
 }
+
+/* JSON device loader (virp_onode_json.c) */
+extern int onode_load_devices_json(onode_state_t *state, const char *path);
 
 static void add_mock_devices(onode_state_t *state)
 {
@@ -69,6 +78,7 @@ static void usage(const char *prog)
     printf("Copyright (c) 2026 Third Level IT LLC\n\n");
     printf("Usage: %s [options]\n\n", prog);
     printf("Options:\n");
+    printf("  -d <path>   Device JSON file path\n");
     printf("  -k <path>   O-Key file path (generates new key if file doesn't exist)\n");
     printf("  -s <path>   Unix socket path (default: %s)\n", ONODE_SOCKET_PATH);
     printf("  -n <hex>    Node ID in hex (default: 0x00000001)\n");
@@ -80,13 +90,17 @@ static void usage(const char *prog)
 int main(int argc, char **argv)
 {
     const char *okey_path = NULL;
+    const char *devices_path = NULL;
     const char *socket_path = NULL;
     uint32_t node_id = 0x00000001;
     bool use_mock = false;
 
     int opt;
-    while ((opt = getopt(argc, argv, "k:s:n:mh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:k:s:n:mh")) != -1) {
         switch (opt) {
+        case 'd':
+            devices_path = optarg;
+            break;
         case 'k':
             okey_path = optarg;
             break;
@@ -114,6 +128,9 @@ int main(int argc, char **argv)
 
     /* Register drivers */
     virp_driver_mock_init();
+#ifdef VIRP_DRIVER_CISCO
+    virp_driver_cisco_init();
+#endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 
     /* Initialize O-Node */
@@ -125,7 +142,9 @@ int main(int argc, char **argv)
     }
 
     /* Load devices */
-    if (use_mock) {
+    if (devices_path) {
+        onode_load_devices_json(&g_state, devices_path);
+    } else if (use_mock) {
         add_mock_devices(&g_state);
     }
 
