@@ -21,13 +21,15 @@ During development of our AI Operations Center at [Third Level IT](https://third
 
 We had HMAC signing on the executor. The AI bypassed it by writing fabricated output directly in its chat response text — never touching the verification layer. The signature was a vault door on the front entrance with an open window around back.
 
+
+
 This isn't a bug in one model. It's a structural problem with every AI system that manages infrastructure. Every vendor's answer today is "trust us."
 
 Our answer is "trust math."
 
 ## The Solution
 
-VIRP is a protocol and reference implementation that provides **cryptographic proof of device state** for AI-managed networks.
+VIRP is a protocol and reference implementation that provides **cryptographic proof of device state** for AI-managed networks.  VIRP complements Zero Trust by enforcing epistemic trust — trust in facts, not actors.
 
 The core idea: the AI never talks to the network directly. A standalone observation node (O-Node) connects to devices, collects output, and signs every observation with HMAC-SHA256 at the point of collection. The AI receives signed observations read-only. It can analyze them, reason about them, and propose changes — but it cannot forge signatures for data it never collected.
 
