@@ -544,7 +544,7 @@ See [SECURITY.md](SECURITY.md) for vulnerability disclosure policy.
 - Built from real production failures, not academic theory
 
 GitHub: [github.com/nhowardtli/virp](https://github.com/nhowardtli/virp)
-
+https://zenodo.org/records/18830236
 ---
 
 > *"Every observation is cryptographically signed. The AI cannot fabricate what the protocol won't sign."*
