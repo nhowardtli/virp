@@ -4,6 +4,8 @@ keys/
 devices.json
 *.tar.gz
 *.bak
+*.o
+*.a
 __pycache__/
 venv/
 .env

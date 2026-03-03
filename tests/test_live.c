@@ -42,9 +42,9 @@ int main(int argc, char **argv) {
     };
     snprintf(device.hostname, sizeof(device.hostname), "R-live");
     snprintf(device.host, sizeof(device.host), "%s", host);
-    snprintf(device.username, sizeof(device.username), "virp-svc");
-    snprintf(device.password, sizeof(device.password), "changeme");
-    snprintf(device.enable_password, sizeof(device.enable_password), "changeme");
+    snprintf(device.username, sizeof(device.username), "aiops-svc");
+    snprintf(device.password, sizeof(device.password), "A!0ps-Svc#2026Lab");
+    snprintf(device.enable_password, sizeof(device.enable_password), "A!0ps-Svc#2026Lab");
     printf("[*] Target: %s (%s)\n", device.hostname, device.host);
     printf("[*] Command: %s\n\n", command);
     printf("[*] Connecting via SSH...\n");

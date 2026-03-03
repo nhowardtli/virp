@@ -31,6 +31,9 @@ extern void virp_driver_mock_init(void);
 #ifdef VIRP_DRIVER_CISCO
 extern void virp_driver_cisco_init(void);
 #endif
+#ifdef VIRP_DRIVER_FORTINET
+extern void virp_driver_fortinet_init(void);
+#endif
 
 static void signal_handler(int sig)
 {
@@ -50,7 +53,7 @@ static void signal_handler(int sig)
  *       "host": "10.0.0.50",
  *       "port": 22,
  *       "vendor": "cisco_ios",
- *       "username": "virp-svc",
+ *       "username": "aiops-svc",
  *       "password": "secret",
  *       "enable": "secret",
  *       "node_id": "01010101"
@@ -133,6 +136,21 @@ static int load_devices(onode_state_t *state, const char *path)
         if (json_object_object_get_ex(dev_obj, "node_id", &val))
             device.node_id = (uint32_t)strtoul(
                 json_object_get_string(val), NULL, 16);
+
+        /* FortiGate-specific fields (ignored for other vendors) */
+        if (json_object_object_get_ex(dev_obj, "api_token", &val))
+            snprintf(device.api_token, sizeof(device.api_token), "%s",
+                     json_object_get_string(val));
+
+        if (json_object_object_get_ex(dev_obj, "api_port", &val))
+            device.api_port = (uint16_t)json_object_get_int(val);
+
+        if (json_object_object_get_ex(dev_obj, "vdom", &val))
+            snprintf(device.vdom, sizeof(device.vdom), "%s",
+                     json_object_get_string(val));
+
+        if (json_object_object_get_ex(dev_obj, "verify_tls", &val))
+            device.verify_tls = json_object_get_boolean(val);
 
         if (device.hostname[0] == '\0' || device.host[0] == '\0') {
             fprintf(stderr, "[O-Node] Skipping device %d: missing hostname/host\n", i);
@@ -222,6 +240,9 @@ int main(int argc, char **argv)
     virp_driver_mock_init();
 #ifdef VIRP_DRIVER_CISCO
     virp_driver_cisco_init();
+#endif
+#ifdef VIRP_DRIVER_FORTINET
+    virp_driver_fortinet_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 

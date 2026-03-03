@@ -47,10 +47,10 @@
  *   BLACK  → Tier 0 (impossible — not in message format)
  * ========================================================================= */
 
-#define VIRP_TIER_BLACK         0x00    /* Forbidden — never transmitted */
 #define VIRP_TIER_GREEN         0x01    /* Passive — no approval required */
 #define VIRP_TIER_YELLOW        0x02    /* Active — single approval required */
 #define VIRP_TIER_RED           0x03    /* Critical — multi-human approval */
+#define VIRP_TIER_BLACK         0xFF    /* Forbidden — never transmitted */
 
 /* =========================================================================
  * Message Types

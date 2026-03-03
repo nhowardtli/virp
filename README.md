@@ -3,7 +3,7 @@
 **A lie detector for AI network tools.**
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Tests: 42 passing](https://img.shields.io/badge/Tests-42_passing-green.svg)]()
+[![Tests: 33 passing](https://img.shields.io/badge/Tests-33_passing-green.svg)]()
 [![Fuzz: 200K+ rounds](https://img.shields.io/badge/Fuzz-200K%2B_rounds-green.svg)]()
 [![Language: C](https://img.shields.io/badge/Language-C11-blue.svg)]()
 
@@ -71,12 +71,14 @@ An observation key cannot sign an intent message. An intent key cannot sign an o
 
 ## Trust Tiers
 
-| Tier | Behavior | Examples |
-|------|----------|----------|
-| GREEN | Auto-execute | `show` commands, diagnostics, health checks |
-| YELLOW | Flag operator | Advanced troubleshooting, debug commands |
-| RED | Human approval required | Configuration changes, ACL modifications |
-| BLACK | Structurally impossible | Factory reset, key deletion, approval bypass |
+| Tier | Value | Approval | Examples |
+|---|---|---|---|
+| GREEN | `0x01` | None (auto-execute) | Read forwarding tables, measure latency |
+| YELLOW | `0x02` | Single human or automated | Inject routes, modify metrics |
+| RED | `0x03` | Multiple humans | Decommission peers, modify security zones |
+| BLACK | `0xFF` | Impossible — not in protocol | Delete keys, bypass approval, disable observers |
+
+BLACK was moved from `0x00` to `0xFF` to avoid ambiguity with zero-initialized memory. A zeroed tier field is now invalid rather than silently mapping to the most dangerous tier.
 
 BLACK tier commands don't have a "deny" rule. They don't exist in the wire format. You can't approve what the protocol can't express.
 
@@ -302,63 +304,99 @@ Every observation in the evidence file is HMAC-signed. An investigator can verif
 ### Build from source
 
 ```bash
-# Dependencies (Ubuntu/Debian)
-apt install -y build-essential libssl-dev libssh2-1-dev
-
-# Build with Cisco IOS driver
-cd virp
-make CISCO=1 all
-
-# Run tests (33 message library + 9 integration)
+# Core library (message format, crypto, tests)
+sudo apt install build-essential libssl-dev
+make
 make test
-make test-onode
+
+# With Cisco IOS driver (requires libssh2)
+sudo apt install libssh2-1-dev
+make CISCO=1
+
+# With FortiGate driver (requires libcurl + libssh2)
+sudo apt install libcurl4-openssl-dev libssh2-1-dev
+make FORTIGATE=1
+
+# Both drivers + production O-Node (requires json-c for config)
+sudo apt install libcurl4-openssl-dev libssh2-1-dev libjson-c-dev
+make CISCO=1 FORTIGATE=1 prod
 ```
 
 ### Generate keys
 
-```bash
-# Generate an Observation Key
-./build/virp-tool keygen okey keys/onode.key
+33 tests proving every structural guarantee:
 
-# Key fingerprint is printed — record it
-# Permissions are set to 0600 automatically
+```
+Results: 33/33 passed
 ```
 
-### Configure devices
+Tests cover: structural guarantees (header size, BLACK tier rejection, channel-key binding, evidence requirements), HMAC integrity (tamper detection, wrong-key rejection), channel-type consistency, round-trip serialization for all 7 message types, key management, and edge cases (null pointers, buffer bounds, reserved field validation, observation capping).
 
-```bash
-# Create a devices.json file
+## Project Structure
+
+```
+virp/
+├── include/
+│   ├── virp.h                    # Protocol constants, structures, message types
+│   ├── virp_crypto.h             # HMAC signing, key management, verification
+│   ├── virp_message.h            # Message building, parsing, validation API
+│   ├── virp_driver.h             # Device driver interface
+│   ├── virp_driver_cisco.h       # Cisco IOS driver header
+│   ├── virp_driver_fortigate.h   # FortiGate driver header
+│   └── virp_onode.h              # O-Node daemon interface
+├── src/
+│   ├── virp_crypto.c             # Crypto implementation with channel-key binding
+│   ├── virp_message.c            # Serialization, construction, validation
+│   ├── virp_driver.c             # Driver registry and dispatch
+│   ├── virp_onode.c              # O-Node daemon (Unix socket, request dispatch)
+│   ├── virp_onode_prod.c         # Production O-Node with json-c config loading
+│   └── drivers/
+│       ├── driver_cisco.c        # Cisco IOS driver (SSH via libssh2)
+│       ├── driver_fortigate.c    # FortiGate driver (REST + SSH, 149 routes)
+│       └── driver_mock.c         # Mock driver for testing
+├── tests/
+│   └── test_virp.c               # 33 tests covering all structural guarantees
+└── Makefile
 ```
 
-```json
-{
-  "devices": [
-    {
-      "hostname": "R1",
-      "host": "192.168.1.1",
-      "port": 22,
-      "vendor": "cisco_ios",
-      "username": "virp-svc",
-      "password": "your-password",
-      "enable": "your-enable",
-      "node_id": "01010101"
-    }
-  ]
-}
-```
+## FortiGate Driver
 
-### Test against a live device
+The FortiGate driver implements dual-transport command routing: REST API (via libcurl) for structured data and SSH (via libssh2) for CLI-only commands. Each of the 149 supported commands maps to:
 
-```bash
-# Single device test with tamper verification
-./build/virp-live-test 192.168.1.1 "show ip bgp summary"
+- **REST endpoint** and API namespace (MONITOR for live state, CMDB for configuration)
+- **Trust tier** (GREEN/YELLOW/RED) controlling approval requirements
+- **Query parameters** for filtering and pagination
 
-# Expected output:
-# HMAC:      VALID
-# Channel:   OC (Observation)
-# Tier:      GREEN
-# Tamper test: PASS - tampered message correctly REJECTED
-```
+Namespace resolution is performed by the route table at command dispatch time via `fg_route_command_ns()`, ensuring that MONITOR and CMDB endpoints are never confused regardless of how the command was normalized upstream.
+
+## Roadmap
+
+- [x] **Phase 1** — Message library (wire format, signing, validation)
+- [x] **Phase 2** — O-Node daemon (Unix socket listener, device command execution)
+- [x] **Phase 3** — Device drivers (Cisco IOS, FortiGate)
+- [ ] **Phase 4** — R-Node integration (AI backend speaks VIRP)
+- [ ] **Phase 5** — Peer protocol (TCP transport, HELLO, trust verification, ESTABLISHED)
+- [ ] **Phase 6** — Bridge node (VIRP-to-BGP translation for legacy networks)
+
+## Security Notes
+
+**CVE-equivalent: Buffer overflow in `virp_build_observation()` (fixed)**
+
+Prior to this patch, `virp_build_observation()` did not bounds-check the `data_len` parameter against the fixed payload buffer. A device returning output larger than `VIRP_MAX_PAYLOAD_SIZE - 4` (65,530 bytes) could overflow the stack buffer. The fix caps `data_len` to the maximum payload capacity before the `memcpy`. Callers receive truncated but valid observations rather than undefined behavior.
+
+**Socket permissions**
+
+The O-Node now sets its Unix domain socket to mode `0777` after `bind()`, allowing non-root processes (e.g., container workloads running as unprivileged users) to connect. The socket is protected by filesystem path access and HMAC verification on every response — the O-Key is never transmitted over the socket.
+
+## Origin Story
+
+VIRP wasn't designed in a lab. It was built because our AI operations platform fabricated network data and we caught it.
+
+The platform once presented three complete FortiGate firewall policies that never existed — with realistic UUIDs, correct syntax, proper formatting. Another time it reported security alerts from RFC 5737 documentation IPs (test addresses that don't exist on the real internet) and stamped them "Confidence: HIGH."
+
+We had HMAC signing on the command executor. The AI bypassed it by generating fake output in its chat response text, never touching the code path that enforced signatures. The prompt said "don't fabricate." The AI said "sure" and then fabricated.
+
+Every design decision in VIRP maps to a real failure. The protocol is the scar tissue.
 
 ### Run the O-Node daemon
 
@@ -456,10 +494,10 @@ typedef struct virp_driver {
 
 **Included drivers:**
 - Cisco IOS — SSH with legacy cipher support for older images (`aes256-cbc`, `diffie-hellman-group14-sha1`)
+- FortiGate — REST API + SSH dual-transport, 149 routes, namespace resolution via `fg_route_command_ns()`
 - Mock — testing without hardware
 
 **Community-wanted drivers:**
-- FortiGate (REST API + SSH)
 - Juniper JunOS
 - Palo Alto PAN-OS
 - Linux (SSH/bash)
@@ -476,7 +514,7 @@ PRs welcome for new drivers.
 |--------|-------|
 | Total lines of C | ~6,800 |
 | Source files | 20 |
-| Automated tests | 42 (33 message library + 9 integration) |
+| Automated tests | 33 (message library + integration) |
 | Fuzz testing rounds | 200,000+ |
 | Crashes found | 0 |
 | Live devices verified | 10 Cisco routers |
@@ -491,6 +529,7 @@ PRs welcome for new drivers.
 - Message library — wire format, signing, validation, 33 structural tests
 - O-Node daemon — Unix socket, device execution, JSON device loader
 - Cisco IOS driver — SSH with legacy cipher support for older images
+- FortiGate driver — REST API + SSH dual-transport, 149 command routes, namespace resolution via `fg_route_command_ns()`
 - REST API + web dashboard — FastAPI server, real-time observation feed
 - AI platform integration — verified observations consumed by LLM with anti-fabrication enforcement
 - Topology sweep — 40 signed observations across 10 routers in 8.8 seconds
@@ -498,7 +537,7 @@ PRs welcome for new drivers.
 
 ## What's Next
 
-- Additional device drivers (FortiGate, Juniper, Palo Alto, Arista)
+- Additional device drivers (Juniper, Palo Alto, Arista)
 - Python/Go/Rust client libraries
 - Peer protocol — O-Node to O-Node observation sharing over TCP/TLS
 - Bridge node — VIRP-to-BGP translator for legacy coexistence
@@ -506,22 +545,12 @@ PRs welcome for new drivers.
 - Formal verification (TLA+)
 - Post-quantum cipher suites
 
-## Origin Story
-
-VIRP wasn't designed in a lab. It was built because our AI operations platform fabricated network data and we caught it.
-
-The platform once presented three complete FortiGate firewall policies that never existed — with realistic UUIDs, correct syntax, proper formatting. Another time it reported security alerts from RFC 5737 documentation IPs (test addresses that don't exist on the real internet) and stamped them "Confidence: HIGH."
-
-We had HMAC signing on the command executor. The AI bypassed it by generating fake output in its chat response text, never touching the code path that enforced signatures. The prompt said "don't fabricate." The AI said "sure" and then fabricated.
-
-Every design decision in VIRP maps to a real failure. The protocol is the scar tissue.
-
 ## Contributing
 
 We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 Priority areas:
-- New device drivers (FortiGate, Juniper, Palo Alto, Arista)
+- New device drivers (Juniper, Palo Alto, Arista)
 - Python/Go/Rust client libraries
 - Formal protocol verification
 - Performance benchmarks

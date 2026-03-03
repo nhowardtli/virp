@@ -311,8 +311,10 @@ virp_error_t virp_build_observation(uint8_t *buf, size_t buf_len,
     if (!buf || !out_len || !sk)
         return VIRP_ERR_NULL_PTR;
 
-    /* Build observation payload */
+    /* Build observation payload — cap data to max payload capacity */
     uint8_t payload[4 + VIRP_MAX_PAYLOAD_SIZE];
+    if (data_len > VIRP_MAX_PAYLOAD_SIZE - 4)
+        data_len = (uint16_t)(VIRP_MAX_PAYLOAD_SIZE - 4);
     payload[0] = obs_type;
     payload[1] = obs_scope;
     uint16_t dl_n = htons(data_len);

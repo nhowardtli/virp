@@ -27,6 +27,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 
 /* =========================================================================
@@ -453,6 +454,9 @@ virp_error_t onode_start(onode_state_t *state)
         close(state->listen_fd);
         return VIRP_ERR_KEY_NOT_LOADED;
     }
+
+    /* Allow non-root users (e.g. Docker tliadmin) to connect */
+    chmod(state->socket_path, 0777);
 
     if (listen(state->listen_fd, ONODE_MAX_CLIENTS) < 0) {
         perror("[O-Node] listen");

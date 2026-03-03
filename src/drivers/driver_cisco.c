@@ -29,7 +29,6 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
-#include <pthread.h>
 #include <libssh2.h>
 
 /* =========================================================================
@@ -41,10 +40,6 @@
 #define SSH_PROMPT_WAIT_MS      500     /* Wait after command for output */
 #define SSH_READ_BUF_SIZE       32768
 #define SSH_MAX_PROMPT_LEN      128
-
-#define POOL_MAX_CONNS          16      /* Max pooled connections */
-#define POOL_IDLE_TIMEOUT_SEC   30      /* Close after 30s inactivity */
-#define POOL_REAPER_INTERVAL_SEC 5      /* Reaper thread wake interval */
 
 /* =========================================================================
  * Connection State
@@ -59,128 +54,7 @@ struct virp_conn {
     size_t              prompt_len;
     bool                connected;
     bool                in_enable;
-    /* Connection pool fields */
-    time_t              last_activity;  /* CLOCK_MONOTONIC seconds */
-    bool                pooled;         /* Currently sitting in the pool */
 };
-
-/* =========================================================================
- * Connection Pool
- *
- * Caches idle SSH sessions keyed by host+port+username. A background
- * reaper thread closes any session idle longer than POOL_IDLE_TIMEOUT_SEC.
- * ========================================================================= */
-
-static virp_conn_t     *conn_pool[POOL_MAX_CONNS];
-static int              pool_count;
-static pthread_mutex_t  pool_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_t        pool_reaper_tid;
-static bool             pool_reaper_started;
-
-/* Forward declarations */
-static void conn_destroy(virp_conn_t *conn);
-static void pool_evict_idle_locked(void);
-
-static time_t mono_now(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec;
-}
-
-/* Check if an SSH session is still alive */
-static bool conn_alive(virp_conn_t *conn)
-{
-    if (!conn || !conn->connected || !conn->channel)
-        return false;
-    if (libssh2_channel_eof(conn->channel))
-        return false;
-    return true;
-}
-
-/* Match a device descriptor to a pooled connection */
-static bool device_match(const virp_conn_t *conn, const virp_device_t *dev)
-{
-    return strcmp(conn->device.host, dev->host) == 0 &&
-           conn->device.port == dev->port &&
-           strcmp(conn->device.username, dev->username) == 0;
-}
-
-/* Evict connections idle > POOL_IDLE_TIMEOUT_SEC. Caller holds pool_lock. */
-static void pool_evict_idle_locked(void)
-{
-    time_t now = mono_now();
-
-    for (int i = 0; i < pool_count; ) {
-        if (now - conn_pool[i]->last_activity > POOL_IDLE_TIMEOUT_SEC) {
-            virp_conn_t *stale = conn_pool[i];
-            conn_pool[i] = conn_pool[--pool_count];
-            conn_destroy(stale);
-        } else {
-            i++;
-        }
-    }
-}
-
-/* Background reaper thread — enforces the idle timeout */
-static void *pool_reaper(void *arg)
-{
-    (void)arg;
-    for (;;) {
-        sleep(POOL_REAPER_INTERVAL_SEC);
-        pthread_mutex_lock(&pool_lock);
-        pool_evict_idle_locked();
-        pthread_mutex_unlock(&pool_lock);
-    }
-    return NULL;
-}
-
-static void pool_ensure_reaper(void)
-{
-    if (!pool_reaper_started) {
-        pool_reaper_started = true;
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, pool_reaper, NULL) == 0) {
-            pthread_detach(tid);
-            pool_reaper_tid = tid;
-        }
-    }
-}
-
-/* Find and remove a matching idle connection from the pool.
- * Caller holds pool_lock. Returns NULL if none found. */
-static virp_conn_t *pool_checkout(const virp_device_t *dev)
-{
-    for (int i = 0; i < pool_count; i++) {
-        if (device_match(conn_pool[i], dev)) {
-            virp_conn_t *conn = conn_pool[i];
-            conn_pool[i] = conn_pool[--pool_count];
-            conn->pooled = false;
-            return conn;
-        }
-    }
-    return NULL;
-}
-
-/* Return a connection to the pool, or destroy it if pool is full / dead. */
-static void pool_return(virp_conn_t *conn)
-{
-    pthread_mutex_lock(&pool_lock);
-    pool_evict_idle_locked();
-    pool_ensure_reaper();
-
-    if (pool_count < POOL_MAX_CONNS && conn_alive(conn)) {
-        conn->last_activity = mono_now();
-        conn->pooled = true;
-        conn_pool[pool_count++] = conn;
-        pthread_mutex_unlock(&pool_lock);
-        fprintf(stderr, "[Cisco] Connection pooled: %s (%d in pool)\n",
-                conn->device.hostname, pool_count);
-    } else {
-        pthread_mutex_unlock(&pool_lock);
-        conn_destroy(conn);
-    }
-}
 
 /* =========================================================================
  * TCP Connection
@@ -310,26 +184,6 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
 {
     if (!device) return NULL;
 
-    /* Check the pool for a reusable connection */
-    pthread_mutex_lock(&pool_lock);
-    pool_evict_idle_locked();
-    pool_ensure_reaper();
-    virp_conn_t *cached = pool_checkout(device);
-    pthread_mutex_unlock(&pool_lock);
-
-    if (cached) {
-        if (conn_alive(cached)) {
-            cached->last_activity = mono_now();
-            fprintf(stderr, "[Cisco] Reusing pooled connection: %s@%s\n",
-                    device->username, device->host);
-            return cached;
-        }
-        /* Pooled connection is dead, destroy and create fresh */
-        fprintf(stderr, "[Cisco] Pooled connection dead, reconnecting: %s\n",
-                device->host);
-        conn_destroy(cached);
-    }
-
     virp_conn_t *conn = calloc(1, sizeof(*conn));
     if (!conn) return NULL;
 
@@ -338,7 +192,6 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
     conn->connected = false;
     conn->in_enable = false;
     conn->prompt_len = 0;
-    conn->pooled = false;
 
     /* TCP connect */
     uint16_t port = device->port ? device->port : 22;
@@ -466,7 +319,6 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
     conn->connected = true;
     conn->in_enable = (conn->prompt_len > 0 &&
                        conn->prompt[conn->prompt_len - 1] == '#');
-    conn->last_activity = mono_now();
 
     fprintf(stderr, "[Cisco] Connected: %s@%s:%u prompt='%s' enable=%d\n",
             device->username, device->host, port,
@@ -494,8 +346,6 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
                  "Not connected to %s", conn->device.hostname);
         return VIRP_OK;
     }
-
-    conn->last_activity = mono_now();
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -584,10 +434,10 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
 }
 
 /* =========================================================================
- * Connection teardown (actual SSH close + free)
+ * Driver: disconnect
  * ========================================================================= */
 
-static void conn_destroy(virp_conn_t *conn)
+static void cisco_disconnect(virp_conn_t *conn)
 {
     if (!conn) return;
 
@@ -609,19 +459,9 @@ static void conn_destroy(virp_conn_t *conn)
     if (conn->sock_fd >= 0)
         close(conn->sock_fd);
 
-    fprintf(stderr, "[Cisco] Destroyed: %s\n", conn->device.hostname);
+    fprintf(stderr, "[Cisco] Disconnected: %s\n", conn->device.hostname);
 
     free(conn);
-}
-
-/* =========================================================================
- * Driver: disconnect — returns connection to pool for reuse
- * ========================================================================= */
-
-static void cisco_disconnect(virp_conn_t *conn)
-{
-    if (!conn) return;
-    pool_return(conn);
 }
 
 /* =========================================================================

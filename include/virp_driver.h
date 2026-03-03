@@ -37,6 +37,12 @@ typedef enum {
     VIRP_VENDOR_MOCK        = 99,   /* Testing only */
 } virp_vendor_t;
 
+/*
+ * Trust tier type — used by vendor-specific drivers (FortiGate, Cisco)
+ * for command routing tables. Maps to VIRP_TIER_* constants in virp.h.
+ */
+typedef uint8_t virp_trust_tier_t;
+
 /* =========================================================================
  * Connection Handle
  *
@@ -64,6 +70,11 @@ typedef struct {
     virp_vendor_t   vendor;
     uint32_t        node_id;            /* VIRP node ID for this device */
     bool            enabled;
+    /* Vendor-optional (FortiGate) — zero-initialized for other vendors */
+    char            api_token[256];     /* REST API Bearer token */
+    uint16_t        api_port;           /* REST API port (default 443) */
+    char            vdom[64];           /* VDOM name (default "root") */
+    bool            verify_tls;         /* Verify TLS cert on REST calls */
 } virp_device_t;
 
 /* =========================================================================

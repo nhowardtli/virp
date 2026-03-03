@@ -1,8 +1,10 @@
 # Copyright (c) 2026 Third Level IT LLC. All rights reserved.
 # VIRP — Verified Intent Routing Protocol
 #
-# Build with Cisco driver:  make CISCO=1
-# Build without (default):  make
+# Build with Cisco driver:     make CISCO=1
+# Build with FortiGate driver: make FORTIGATE=1
+# Build both:                  make CISCO=1 FORTIGATE=1
+# Build without (default):     make
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g
@@ -23,6 +25,17 @@ ifdef CISCO
   CFLAGS  += -DVIRP_DRIVER_CISCO
   LDFLAGS += -lssh2
   LIB_OBJS += $(BUILD_DIR)/driver_cisco.o
+endif
+
+# Optional FortiGate driver (requires libcurl + libssh2)
+ifdef FORTIGATE
+  CFLAGS  += -DVIRP_DRIVER_FORTINET
+  LDFLAGS += -lcurl
+  # libssh2 may already be linked via CISCO; add only if not already present
+  ifndef CISCO
+    LDFLAGS += -lssh2
+  endif
+  LIB_OBJS += $(BUILD_DIR)/driver_fortigate.o
 endif
 
 LIB          = $(BUILD_DIR)/libvirp.a
@@ -52,6 +65,9 @@ $(BUILD_DIR)/driver_mock.o: src/drivers/driver_mock.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_cisco.o: src/drivers/driver_cisco.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_fortigate.o: src/drivers/driver_fortigate.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)
@@ -94,3 +110,11 @@ $(LIVE_TEST): tests/test_live.c $(LIB)
 
 test-live: $(LIVE_TEST)
 	./$(LIVE_TEST)
+
+# Production O-Node (with device config loading via json-c)
+ONODE_PROD = $(BUILD_DIR)/virp-onode-prod
+
+$(ONODE_PROD): src/virp_onode_prod.c $(LIB)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -ljson-c -o $@
+
+prod: $(ONODE_PROD)
