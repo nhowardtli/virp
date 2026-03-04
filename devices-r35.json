@@ -1,0 +1,354 @@
+{
+  "devices": [
+    {
+      "hostname": "R1",
+      "host": "10.0.0.50",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "01010101"
+    },
+    {
+      "hostname": "R2",
+      "host": "10.0.0.51",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "02020202"
+    },
+    {
+      "hostname": "R3",
+      "host": "10.0.0.52",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "03030303"
+    },
+    {
+      "hostname": "R4",
+      "host": "10.0.0.53",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "04040404"
+    },
+    {
+      "hostname": "R5",
+      "host": "10.0.0.54",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "05050505"
+    },
+    {
+      "hostname": "R6",
+      "host": "10.0.0.55",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "06060606"
+    },
+    {
+      "hostname": "R7",
+      "host": "10.0.0.56",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "07070707"
+    },
+    {
+      "hostname": "R8",
+      "host": "10.0.0.57",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "08080808"
+    },
+    {
+      "hostname": "R9",
+      "host": "10.0.0.58",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "09090909"
+    },
+    {
+      "hostname": "R10",
+      "host": "10.0.0.59",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "0A0A0A0A"
+    },
+    {
+      "hostname": "R11",
+      "host": "10.0.0.60",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "0B0B0B0B"
+    },
+    {
+      "hostname": "R12",
+      "host": "10.0.0.61",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "0C0C0C0C"
+    },
+    {
+      "hostname": "R13",
+      "host": "10.0.0.62",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "0D0D0D0D"
+    },
+    {
+      "hostname": "R14",
+      "host": "10.0.0.63",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "0E0E0E0E"
+    },
+    {
+      "hostname": "R15",
+      "host": "10.0.0.64",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "0F0F0F0F"
+    },
+    {
+      "hostname": "R16",
+      "host": "10.0.0.65",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "10101010"
+    },
+    {
+      "hostname": "R17",
+      "host": "10.0.0.66",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "11111111"
+    },
+    {
+      "hostname": "R18",
+      "host": "10.0.0.67",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "12121212"
+    },
+    {
+      "hostname": "R19",
+      "host": "10.0.0.68",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "13131313"
+    },
+    {
+      "hostname": "R20",
+      "host": "10.0.0.69",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "14141414"
+    },
+    {
+      "hostname": "R21",
+      "host": "10.0.0.70",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "15151515"
+    },
+    {
+      "hostname": "R22",
+      "host": "10.0.0.71",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "16161616"
+    },
+    {
+      "hostname": "R23",
+      "host": "10.0.0.72",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "17171717"
+    },
+    {
+      "hostname": "R24",
+      "host": "10.0.0.73",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "18181818"
+    },
+    {
+      "hostname": "R25",
+      "host": "10.0.0.74",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "19191919"
+    },
+    {
+      "hostname": "R26",
+      "host": "10.0.0.75",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "1A1A1A1A"
+    },
+    {
+      "hostname": "R27",
+      "host": "10.0.0.76",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "1B1B1B1B"
+    },
+    {
+      "hostname": "R28",
+      "host": "10.0.0.77",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "1C1C1C1C"
+    },
+    {
+      "hostname": "R29",
+      "host": "10.0.0.78",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "1D1D1D1D"
+    },
+    {
+      "hostname": "R30",
+      "host": "10.0.0.79",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "1E1E1E1E"
+    },
+    {
+      "hostname": "R31",
+      "host": "10.0.0.80",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "1F1F1F1F"
+    },
+    {
+      "hostname": "R32",
+      "host": "10.0.0.81",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "20202020"
+    },
+    {
+      "hostname": "R33",
+      "host": "10.0.0.82",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "21212121"
+    },
+    {
+      "hostname": "R34",
+      "host": "10.0.0.83",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "22222222"
+    },
+    {
+      "hostname": "R35",
+      "host": "10.0.0.84",
+      "port": 22,
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "A!0ps-Svc#2026Lab",
+      "enable": "A!0ps-Svc#2026Lab",
+      "node_id": "23232323"
+    }
+  ]
+}
