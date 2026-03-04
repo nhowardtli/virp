@@ -57,6 +57,7 @@ typedef enum {
     ONODE_ACTION_HEALTH     = 2,    /* Health check, return OBSERVATION */
     ONODE_ACTION_HEARTBEAT  = 3,    /* Return HEARTBEAT message */
     ONODE_ACTION_LIST       = 4,    /* List devices, return OBSERVATION */
+    ONODE_ACTION_SIGN_INTENT = 5,   /* Sign intent hash, return OBSERVATION */
     ONODE_ACTION_SHUTDOWN   = 99,   /* Graceful shutdown */
 } onode_action_t;
 

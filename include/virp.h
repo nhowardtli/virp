@@ -81,6 +81,7 @@
 #define VIRP_OBS_RESOURCE_STATE     0x05    /* CPU, memory, interface utilization */
 #define VIRP_OBS_SECURITY_STATE     0x06    /* Access policy, zone, encryption */
 #define VIRP_OBS_DEVICE_OUTPUT      0x07    /* Raw CLI/API output (TLI model) */
+#define VIRP_OBS_INTENT_SIGNED      0x08    /* O-Node witnessed AI intent declaration */
 
 /* =========================================================================
  * Observation Scope

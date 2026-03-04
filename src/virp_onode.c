@@ -91,6 +91,8 @@ static bool parse_request(const char *json, onode_request_t *req)
         req->action = ONODE_ACTION_HEARTBEAT;
     else if (strcmp(action_str, "list_devices") == 0)
         req->action = ONODE_ACTION_LIST;
+    else if (strcmp(action_str, "sign_intent") == 0)
+        req->action = ONODE_ACTION_SIGN_INTENT;
     else if (strcmp(action_str, "shutdown") == 0)
         req->action = ONODE_ACTION_SHUTDOWN;
     else
@@ -379,6 +381,28 @@ static void handle_client(onode_state_t *state, int client_fd)
         err = onode_list_devices(state, resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send(client_fd, resp_buf, resp_len, 0);
+        break;
+
+    case ONODE_ACTION_SIGN_INTENT:
+        if (req.command[0] == '\0') {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        /* req.command contains SHA256 hex of intent JSON (64 chars) */
+        err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
+                                      state->node_id, onode_next_seq(state),
+                                      VIRP_OBS_INTENT_SIGNED, VIRP_SCOPE_LOCAL,
+                                      (const uint8_t *)req.command,
+                                      (uint16_t)strlen(req.command),
+                                      &state->okey);
+        if (err == VIRP_OK && resp_len > 0) {
+            send(client_fd, resp_buf, resp_len, 0);
+            state->observations_sent++;
+        } else {
+            uint32_t err_code = htonl((uint32_t)err);
+            send(client_fd, &err_code, 4, 0);
+        }
         break;
 
     case ONODE_ACTION_SHUTDOWN:

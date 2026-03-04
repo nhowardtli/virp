@@ -871,6 +871,7 @@ const char *virp_obs_type_str(uint8_t obs_type)
     case VIRP_OBS_RESOURCE_STATE:   return "RESOURCE_STATE";
     case VIRP_OBS_SECURITY_STATE:   return "SECURITY_STATE";
     case VIRP_OBS_DEVICE_OUTPUT:    return "DEVICE_OUTPUT";
+    case VIRP_OBS_INTENT_SIGNED:    return "INTENT_SIGNED";
     default:                        return "UNKNOWN";
     }
 }
