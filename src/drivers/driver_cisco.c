@@ -355,6 +355,7 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
     snprintf(cmd_buf, sizeof(cmd_buf), "%s\n", command);
 
     if (ssh_write(conn, cmd_buf) != 0) {
+        conn->connected = false;  /* Mark stale for reconnect */
         result->success = false;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Failed to send command to %s", conn->device.hostname);
@@ -371,6 +372,7 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
                                        (end.tv_nsec - start.tv_nsec) / 1000000);
 
     if (n <= 0) {
+        conn->connected = false;  /* Mark stale for reconnect */
         result->success = false;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Read timeout on %s", conn->device.hostname);

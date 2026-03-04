@@ -125,6 +125,16 @@ static int find_device(onode_state_t *state, const char *hostname)
     return -1;
 }
 
+static void drop_connection(onode_state_t *state, int dev_idx)
+{
+    virp_conn_t *conn = state->connections[dev_idx];
+    if (!conn) return;
+    const virp_driver_t *drv = virp_driver_lookup(state->devices[dev_idx].vendor);
+    if (drv && drv->disconnect)
+        drv->disconnect(conn);
+    state->connections[dev_idx] = NULL;
+}
+
 static virp_conn_t *get_connection(onode_state_t *state, int dev_idx)
 {
     if (state->connections[dev_idx])
@@ -189,16 +199,36 @@ virp_error_t onode_execute(onode_state_t *state,
     if (err != VIRP_OK)
         return err;
 
-    /* Wrap output in signed OBSERVATION */
-    uint16_t data_len = (result.output_len > 65530) ?
-                        65530 : (uint16_t)result.output_len;
+    /* On failure: drop stale connection, retry once with fresh connection */
+    if (!result.success && result.output_len == 0) {
+        drop_connection(state, dev_idx);
+        conn = get_connection(state, dev_idx);
+        if (conn) {
+            memset(&result, 0, sizeof(result));
+            err = drv->execute(conn, command, &result);
+            if (err != VIRP_OK)
+                return err;
+        }
+    }
+
+    /* If still failed after retry, return error_msg as observation data */
+    const uint8_t *obs_data;
+    uint16_t data_len;
+    if (!result.success && result.output_len == 0 && result.error_msg[0]) {
+        obs_data = (const uint8_t *)result.error_msg;
+        data_len = (uint16_t)strlen(result.error_msg);
+    } else {
+        obs_data = (const uint8_t *)result.output;
+        data_len = (result.output_len > 65530) ?
+                    65530 : (uint16_t)result.output_len;
+    }
 
     err = virp_build_observation(out_buf, out_buf_len, out_len,
                                  state->devices[dev_idx].node_id,
                                  onode_next_seq(state),
                                  VIRP_OBS_DEVICE_OUTPUT,
                                  VIRP_SCOPE_LOCAL,
-                                 (const uint8_t *)result.output, data_len,
+                                 obs_data, data_len,
                                  &state->okey);
 
     if (err == VIRP_OK)
