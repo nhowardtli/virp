@@ -54,7 +54,24 @@ static const char *SCHEMA_SQL =
     "  UNIQUE(session_id, sequence)"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_chain_session_seq "
-    "  ON chain_entries(session_id, sequence);";
+    "  ON chain_entries(session_id, sequence);"
+    "CREATE TABLE IF NOT EXISTS intents ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  intent_id TEXT NOT NULL UNIQUE,"
+    "  intent_hash TEXT NOT NULL,"
+    "  intent_json TEXT NOT NULL,"
+    "  confidence TEXT NOT NULL,"
+    "  expires_at_ns INTEGER NOT NULL,"
+    "  max_commands INTEGER NOT NULL,"
+    "  commands_executed INTEGER NOT NULL DEFAULT 0,"
+    "  proposed_actions TEXT NOT NULL,"
+    "  constraints TEXT NOT NULL,"
+    "  signature_hmac TEXT NOT NULL,"
+    "  signature_seq INTEGER NOT NULL,"
+    "  signature_timestamp_ns INTEGER NOT NULL,"
+    "  created_at_ns INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_intents_id ON intents(intent_id);";
 
 /* =========================================================================
  * Prepared Statement SQL
@@ -90,6 +107,24 @@ static const char *SQL_INSERT_MILESTONE =
     "(session_id, sequence, entries_covered, cumulative_hash, "
     " chain_hmac, created_at_ns) "
     "VALUES (?,?,?,?,?,?)";
+
+/* Intent store SQL */
+static const char *SQL_INTENT_INSERT =
+    "INSERT OR REPLACE INTO intents "
+    "(intent_id, intent_hash, intent_json, confidence, expires_at_ns, "
+    " max_commands, commands_executed, proposed_actions, constraints, "
+    " signature_hmac, signature_seq, signature_timestamp_ns, created_at_ns) "
+    "VALUES (?,?,?,?,?,?,0,?,?,?,?,?,?)";
+
+static const char *SQL_INTENT_GET =
+    "SELECT intent_id, intent_hash, intent_json, confidence, expires_at_ns, "
+    "  max_commands, commands_executed, proposed_actions, constraints, "
+    "  signature_hmac, signature_seq, signature_timestamp_ns, created_at_ns "
+    "FROM intents WHERE intent_id = ?";
+
+static const char *SQL_INTENT_EXECUTE =
+    "UPDATE intents SET commands_executed = commands_executed + 1 "
+    "WHERE intent_id = ? AND commands_executed < max_commands";
 
 /* =========================================================================
  * Helpers
@@ -301,6 +336,19 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
         sqlite3_prepare_v2(state->db, SQL_INSERT_MILESTONE, -1,
                            &state->stmt_insert_milestone, NULL) != SQLITE_OK) {
         fprintf(stderr, "[Chain] Failed to prepare statements: %s\n",
+                sqlite3_errmsg(state->db));
+        sqlite3_close(state->db);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* Prepare intent store statements */
+    if (sqlite3_prepare_v2(state->db, SQL_INTENT_INSERT, -1,
+                           &state->stmt_intent_insert, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(state->db, SQL_INTENT_GET, -1,
+                           &state->stmt_intent_get, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(state->db, SQL_INTENT_EXECUTE, -1,
+                           &state->stmt_intent_execute, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[Chain] Failed to prepare intent statements: %s\n",
                 sqlite3_errmsg(state->db));
         sqlite3_close(state->db);
         return VIRP_ERR_CHAIN_DB;
@@ -590,6 +638,12 @@ void virp_chain_destroy(virp_chain_state_t *state)
         sqlite3_finalize(state->stmt_get_range);
     if (state->stmt_insert_milestone)
         sqlite3_finalize(state->stmt_insert_milestone);
+    if (state->stmt_intent_insert)
+        sqlite3_finalize(state->stmt_intent_insert);
+    if (state->stmt_intent_get)
+        sqlite3_finalize(state->stmt_intent_get);
+    if (state->stmt_intent_execute)
+        sqlite3_finalize(state->stmt_intent_execute);
     if (state->db)
         sqlite3_close(state->db);
 
@@ -597,4 +651,126 @@ void virp_chain_destroy(virp_chain_state_t *state)
 
     memset(state, 0, sizeof(*state));
     fprintf(stderr, "[Chain] Destroyed\n");
+}
+
+/* =========================================================================
+ * Durable Intent Store
+ * ========================================================================= */
+
+static void populate_intent_from_row(sqlite3_stmt *stmt,
+                                      virp_intent_entry_t *entry)
+{
+    snprintf(entry->intent_id, sizeof(entry->intent_id), "%s",
+             (const char *)sqlite3_column_text(stmt, 0));
+    snprintf(entry->intent_hash, sizeof(entry->intent_hash), "%s",
+             (const char *)sqlite3_column_text(stmt, 1));
+    snprintf(entry->intent_json, sizeof(entry->intent_json), "%s",
+             (const char *)sqlite3_column_text(stmt, 2));
+    snprintf(entry->confidence, sizeof(entry->confidence), "%s",
+             (const char *)sqlite3_column_text(stmt, 3));
+    entry->expires_at_ns = sqlite3_column_int64(stmt, 4);
+    entry->max_commands = (int32_t)sqlite3_column_int(stmt, 5);
+    entry->commands_executed = (int32_t)sqlite3_column_int(stmt, 6);
+    snprintf(entry->proposed_actions, sizeof(entry->proposed_actions), "%s",
+             (const char *)sqlite3_column_text(stmt, 7));
+    snprintf(entry->constraints, sizeof(entry->constraints), "%s",
+             (const char *)sqlite3_column_text(stmt, 8));
+    snprintf(entry->signature_hmac, sizeof(entry->signature_hmac), "%s",
+             (const char *)sqlite3_column_text(stmt, 9));
+    entry->signature_seq = sqlite3_column_int64(stmt, 10);
+    entry->signature_timestamp_ns = sqlite3_column_int64(stmt, 11);
+    entry->created_at_ns = sqlite3_column_int64(stmt, 12);
+}
+
+virp_error_t virp_chain_intent_store(virp_chain_state_t *state,
+                                      virp_intent_entry_t *entry)
+{
+    if (!state || !state->db || !entry)
+        return VIRP_ERR_NULL_PTR;
+
+    /* Compute HMAC of intent_hash using K_chain */
+    hmac_sha256_hex(state->chain_key.key.key,
+                    entry->intent_hash, strlen(entry->intent_hash),
+                    entry->signature_hmac);
+
+    /* Timestamps */
+    entry->created_at_ns = (int64_t)get_wall_ns();
+    entry->signature_timestamp_ns = entry->created_at_ns;
+
+    sqlite3_stmt *stmt = state->stmt_intent_insert;
+    sqlite3_reset(stmt);
+
+    sqlite3_bind_text(stmt, 1, entry->intent_id, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, entry->intent_hash, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, entry->intent_json, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, entry->confidence, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 5, entry->expires_at_ns);
+    sqlite3_bind_int(stmt, 6, entry->max_commands);
+    sqlite3_bind_text(stmt, 7, entry->proposed_actions, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 8, entry->constraints, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 9, entry->signature_hmac, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 10, entry->signature_seq);
+    sqlite3_bind_int64(stmt, 11, entry->signature_timestamp_ns);
+    sqlite3_bind_int64(stmt, 12, entry->created_at_ns);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "[Chain] Intent store failed: %s\n",
+                sqlite3_errmsg(state->db));
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    entry->commands_executed = 0;  /* Fresh intent */
+    return VIRP_OK;
+}
+
+virp_error_t virp_chain_intent_get(virp_chain_state_t *state,
+                                    const char *intent_id,
+                                    virp_intent_entry_t *entry)
+{
+    if (!state || !state->db || !intent_id || !entry)
+        return VIRP_ERR_NULL_PTR;
+
+    sqlite3_stmt *stmt = state->stmt_intent_get;
+    sqlite3_reset(stmt);
+    sqlite3_bind_text(stmt, 1, intent_id, -1, SQLITE_STATIC);
+
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        populate_intent_from_row(stmt, entry);
+        return VIRP_OK;
+    }
+
+    return VIRP_ERR_INTENT_NOT_FOUND;
+}
+
+virp_error_t virp_chain_intent_execute(virp_chain_state_t *state,
+                                        const char *intent_id,
+                                        virp_intent_entry_t *entry)
+{
+    if (!state || !state->db || !intent_id || !entry)
+        return VIRP_ERR_NULL_PTR;
+
+    /* Atomically increment commands_executed (only if < max_commands) */
+    sqlite3_stmt *stmt = state->stmt_intent_execute;
+    sqlite3_reset(stmt);
+    sqlite3_bind_text(stmt, 1, intent_id, -1, SQLITE_STATIC);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "[Chain] Intent execute update failed: %s\n",
+                sqlite3_errmsg(state->db));
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    if (sqlite3_changes(state->db) == 0) {
+        /* Either intent not found, or already at max_commands */
+        virp_error_t err = virp_chain_intent_get(state, intent_id, entry);
+        if (err != VIRP_OK)
+            return VIRP_ERR_INTENT_NOT_FOUND;
+        return VIRP_ERR_INTENT_EXHAUSTED;
+    }
+
+    /* Return updated entry */
+    return virp_chain_intent_get(state, intent_id, entry);
 }

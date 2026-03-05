@@ -85,6 +85,9 @@
 #define VIRP_OBS_OUTCOME_SIGNED     0x09    /* O-Node witnessed outcome verification */
 #define VIRP_OBS_CHAIN_ENTRY        0x0A    /* Trust chain entry appended */
 #define VIRP_OBS_CHAIN_VERIFY       0x0B    /* Trust chain verification result */
+#define VIRP_OBS_INTENT_STORED      0x0C    /* Intent stored in durable DB */
+#define VIRP_OBS_INTENT_FETCHED     0x0D    /* Intent retrieved from DB */
+#define VIRP_OBS_INTENT_EXECUTED    0x0E    /* Intent execution counter updated */
 
 /* =========================================================================
  * Observation Scope
@@ -315,6 +318,9 @@ typedef enum {
     VIRP_ERR_FED_REVOKED        = -21,  /* Federation key revoked */
     VIRP_ERR_FED_UNVERIFIED     = -22,  /* Unverified foreign peer */
     VIRP_ERR_TENANT_VIOLATION   = -23,  /* Tenant isolation violation */
+    VIRP_ERR_INTENT_NOT_FOUND   = -24,  /* Intent ID not in durable store */
+    VIRP_ERR_INTENT_EXPIRED     = -25,  /* Intent TTL exceeded */
+    VIRP_ERR_INTENT_EXHAUSTED   = -26,  /* Intent max_commands reached */
 } virp_error_t;
 
 /* =========================================================================

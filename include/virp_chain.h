@@ -72,6 +72,10 @@ typedef struct {
     sqlite3_stmt       *stmt_get_last;
     sqlite3_stmt       *stmt_get_range;
     sqlite3_stmt       *stmt_insert_milestone;
+    /* Intent store prepared statements */
+    sqlite3_stmt       *stmt_intent_insert;
+    sqlite3_stmt       *stmt_intent_get;
+    sqlite3_stmt       *stmt_intent_execute;
 } virp_chain_state_t;
 
 /* =========================================================================
@@ -126,5 +130,51 @@ virp_error_t virp_chain_get_last(virp_chain_state_t *state,
  * Clean up all resources.
  */
 void virp_chain_destroy(virp_chain_state_t *state);
+
+/* =========================================================================
+ * Durable Intent Store — intents survive process restarts
+ *
+ * Stored in the same chain.db. The O-Node owns the DB; the MCP server
+ * (which may be a short-lived process) calls through the Unix socket.
+ * ========================================================================= */
+
+typedef struct {
+    char     intent_id[128];
+    char     intent_hash[65];
+    char     confidence[16];
+    int64_t  expires_at_ns;
+    int32_t  max_commands;
+    int32_t  commands_executed;
+    char     signature_hmac[65];
+    int64_t  signature_seq;
+    int64_t  signature_timestamp_ns;
+    int64_t  created_at_ns;
+    /* Large text fields — caller provides buffers */
+    char     intent_json[4096];
+    char     proposed_actions[2048];
+    char     constraints[512];
+} virp_intent_entry_t;
+
+/*
+ * Store an intent in the durable DB. Returns the stored entry
+ * with signature fields populated.
+ */
+virp_error_t virp_chain_intent_store(virp_chain_state_t *state,
+                                      virp_intent_entry_t *entry);
+
+/*
+ * Retrieve an intent by ID. Returns VIRP_ERR_INTENT_NOT_FOUND if missing.
+ */
+virp_error_t virp_chain_intent_get(virp_chain_state_t *state,
+                                    const char *intent_id,
+                                    virp_intent_entry_t *entry);
+
+/*
+ * Atomically increment commands_executed. Returns updated entry.
+ * Returns VIRP_ERR_INTENT_EXHAUSTED if max_commands already reached.
+ */
+virp_error_t virp_chain_intent_execute(virp_chain_state_t *state,
+                                        const char *intent_id,
+                                        virp_intent_entry_t *entry);
 
 #endif /* VIRP_CHAIN_H */

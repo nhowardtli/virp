@@ -829,6 +829,9 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_FED_REVOKED:       return "Federation key revoked";
     case VIRP_ERR_FED_UNVERIFIED:    return "Unverified foreign peer";
     case VIRP_ERR_TENANT_VIOLATION:  return "Tenant isolation violation";
+    case VIRP_ERR_INTENT_NOT_FOUND:  return "Intent not found in durable store";
+    case VIRP_ERR_INTENT_EXPIRED:    return "Intent TTL exceeded";
+    case VIRP_ERR_INTENT_EXHAUSTED:  return "Intent max_commands reached";
     default:                         return "Unknown error";
     }
 }
@@ -882,6 +885,9 @@ const char *virp_obs_type_str(uint8_t obs_type)
     case VIRP_OBS_OUTCOME_SIGNED:   return "OUTCOME_SIGNED";
     case VIRP_OBS_CHAIN_ENTRY:      return "CHAIN_ENTRY";
     case VIRP_OBS_CHAIN_VERIFY:     return "CHAIN_VERIFY";
+    case VIRP_OBS_INTENT_STORED:    return "INTENT_STORED";
+    case VIRP_OBS_INTENT_FETCHED:   return "INTENT_FETCHED";
+    case VIRP_OBS_INTENT_EXECUTED:  return "INTENT_EXECUTED";
     default:                        return "UNKNOWN";
     }
 }

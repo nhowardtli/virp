@@ -48,6 +48,15 @@ typedef struct {
     char            artifact_hash[65];
     int64_t         from_sequence;
     int64_t         to_sequence;
+    /* Intent fields (durable intent store) */
+    char            intent_id[128];
+    char            intent_hash[65];
+    char            confidence[16];
+    int64_t         expires_at_ns;
+    int32_t         max_commands;
+    char            intent_json[4096];      /* Canonical JSON */
+    char            proposed_actions[2048];  /* JSON array */
+    char            constraints[512];       /* JSON object */
 } onode_request_t;
 
 static bool json_extract_string(const char *json, const char *key,
@@ -71,10 +80,16 @@ static bool json_extract_string(const char *json, const char *key,
     if (*pos != '"') return false;
     pos++;
 
-    /* Copy until closing quote */
+    /* Copy until unescaped closing quote, unescaping as we go */
     size_t i = 0;
-    while (*pos && *pos != '"' && i < out_len - 1) {
-        out[i++] = *pos++;
+    while (*pos && i < out_len - 1) {
+        if (*pos == '"') break;          /* unescaped quote = end of string */
+        if (*pos == '\\' && *(pos + 1)) {
+            pos++;                        /* skip backslash */
+            out[i++] = *pos++;            /* copy the escaped character */
+        } else {
+            out[i++] = *pos++;
+        }
     }
     out[i] = '\0';
     return true;
@@ -126,6 +141,12 @@ static bool parse_request(const char *json, onode_request_t *req)
         req->action = ONODE_ACTION_CHAIN_APPEND;
     else if (strcmp(action_str, "chain_verify") == 0)
         req->action = ONODE_ACTION_CHAIN_VERIFY;
+    else if (strcmp(action_str, "intent_store") == 0)
+        req->action = ONODE_ACTION_INTENT_STORE;
+    else if (strcmp(action_str, "intent_get") == 0)
+        req->action = ONODE_ACTION_INTENT_GET;
+    else if (strcmp(action_str, "intent_execute") == 0)
+        req->action = ONODE_ACTION_INTENT_EXECUTE;
     else if (strcmp(action_str, "shutdown") == 0)
         req->action = ONODE_ACTION_SHUTDOWN;
     else
@@ -146,6 +167,26 @@ static bool parse_request(const char *json, onode_request_t *req)
                         sizeof(req->artifact_hash));
     json_extract_int64(json, "from_sequence", &req->from_sequence);
     json_extract_int64(json, "to_sequence", &req->to_sequence);
+
+    /* Intent fields */
+    json_extract_string(json, "intent_id", req->intent_id,
+                        sizeof(req->intent_id));
+    json_extract_string(json, "intent_hash", req->intent_hash,
+                        sizeof(req->intent_hash));
+    json_extract_string(json, "confidence", req->confidence,
+                        sizeof(req->confidence));
+    json_extract_int64(json, "expires_at_ns", &req->expires_at_ns);
+    {
+        int64_t mc = 0;
+        json_extract_int64(json, "max_commands", &mc);
+        req->max_commands = (int32_t)mc;
+    }
+    json_extract_string(json, "intent_json", req->intent_json,
+                        sizeof(req->intent_json));
+    json_extract_string(json, "proposed_actions", req->proposed_actions,
+                        sizeof(req->proposed_actions));
+    json_extract_string(json, "constraints", req->constraints,
+                        sizeof(req->constraints));
 
     return true;
 }
@@ -560,6 +601,182 @@ static void handle_client(onode_state_t *state, int client_fd)
             err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
                                           state->node_id, onode_next_seq(state),
                                           VIRP_OBS_CHAIN_VERIFY, VIRP_SCOPE_LOCAL,
+                                          (const uint8_t *)json_buf, (uint16_t)jlen,
+                                          &state->okey);
+            if (err == VIRP_OK && resp_len > 0) {
+                send(client_fd, resp_buf, resp_len, 0);
+                state->observations_sent++;
+            } else {
+                uint32_t err_code = htonl((uint32_t)err);
+                send(client_fd, &err_code, 4, 0);
+            }
+        }
+        break;
+
+    case ONODE_ACTION_INTENT_STORE:
+        if (!state->chain_enabled) {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_CHAIN_DB);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        if (req.intent_id[0] == '\0' || req.intent_hash[0] == '\0' ||
+            req.intent_json[0] == '\0') {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        {
+            virp_intent_entry_t ie;
+            memset(&ie, 0, sizeof(ie));
+            snprintf(ie.intent_id, sizeof(ie.intent_id), "%s", req.intent_id);
+            snprintf(ie.intent_hash, sizeof(ie.intent_hash), "%s", req.intent_hash);
+            snprintf(ie.intent_json, sizeof(ie.intent_json), "%s", req.intent_json);
+            snprintf(ie.confidence, sizeof(ie.confidence), "%s", req.confidence);
+            ie.expires_at_ns = req.expires_at_ns;
+            ie.max_commands = req.max_commands;
+            snprintf(ie.proposed_actions, sizeof(ie.proposed_actions), "%s",
+                     req.proposed_actions);
+            snprintf(ie.constraints, sizeof(ie.constraints), "%s",
+                     req.constraints);
+
+            /* Sequence for the observation response */
+            uint32_t seq = onode_next_seq(state);
+            ie.signature_seq = seq;
+
+            /* HMAC + timestamps computed inside virp_chain_intent_store */
+            err = virp_chain_intent_store(&state->chain, &ie);
+            if (err != VIRP_OK) {
+                uint32_t err_code = htonl((uint32_t)err);
+                send(client_fd, &err_code, 4, 0);
+                break;
+            }
+
+            char json_buf[512];
+            int jlen = snprintf(json_buf, sizeof(json_buf),
+                "{\"commands_executed\":%d,"
+                "\"intent_id\":\"%s\","
+                "\"max_commands\":%d,"
+                "\"signature_hmac\":\"%s\","
+                "\"signature_seq\":%lld,"
+                "\"signature_timestamp_ns\":%lld}",
+                ie.commands_executed,
+                ie.intent_id,
+                ie.max_commands,
+                ie.signature_hmac,
+                (long long)ie.signature_seq,
+                (long long)ie.signature_timestamp_ns);
+            err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
+                                          state->node_id, seq,
+                                          VIRP_OBS_INTENT_STORED, VIRP_SCOPE_LOCAL,
+                                          (const uint8_t *)json_buf, (uint16_t)jlen,
+                                          &state->okey);
+            if (err == VIRP_OK && resp_len > 0) {
+                send(client_fd, resp_buf, resp_len, 0);
+                state->observations_sent++;
+            } else {
+                uint32_t err_code = htonl((uint32_t)err);
+                send(client_fd, &err_code, 4, 0);
+            }
+        }
+        break;
+
+    case ONODE_ACTION_INTENT_GET:
+        if (!state->chain_enabled) {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_CHAIN_DB);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        if (req.intent_id[0] == '\0') {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        {
+            virp_intent_entry_t ie;
+            err = virp_chain_intent_get(&state->chain, req.intent_id, &ie);
+            if (err != VIRP_OK) {
+                uint32_t err_code = htonl((uint32_t)err);
+                send(client_fd, &err_code, 4, 0);
+                break;
+            }
+
+            /* Return full intent data as JSON */
+            char json_buf[6144];
+            int jlen = snprintf(json_buf, sizeof(json_buf),
+                "{\"commands_executed\":%d,"
+                "\"confidence\":\"%s\","
+                "\"constraints\":%s,"
+                "\"created_at_ns\":%lld,"
+                "\"expires_at_ns\":%lld,"
+                "\"intent_hash\":\"%s\","
+                "\"intent_id\":\"%s\","
+                "\"intent_json\":%s,"
+                "\"max_commands\":%d,"
+                "\"proposed_actions\":%s,"
+                "\"signature_hmac\":\"%s\","
+                "\"signature_seq\":%lld,"
+                "\"signature_timestamp_ns\":%lld}",
+                ie.commands_executed,
+                ie.confidence,
+                ie.constraints,
+                (long long)ie.created_at_ns,
+                (long long)ie.expires_at_ns,
+                ie.intent_hash,
+                ie.intent_id,
+                ie.intent_json,
+                ie.max_commands,
+                ie.proposed_actions,
+                ie.signature_hmac,
+                (long long)ie.signature_seq,
+                (long long)ie.signature_timestamp_ns);
+            /* Clamp payload to uint16 max */
+            if (jlen > 65535) jlen = 65535;
+            err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
+                                          state->node_id, onode_next_seq(state),
+                                          VIRP_OBS_INTENT_FETCHED, VIRP_SCOPE_LOCAL,
+                                          (const uint8_t *)json_buf, (uint16_t)jlen,
+                                          &state->okey);
+            if (err == VIRP_OK && resp_len > 0) {
+                send(client_fd, resp_buf, resp_len, 0);
+                state->observations_sent++;
+            } else {
+                uint32_t err_code = htonl((uint32_t)err);
+                send(client_fd, &err_code, 4, 0);
+            }
+        }
+        break;
+
+    case ONODE_ACTION_INTENT_EXECUTE:
+        if (!state->chain_enabled) {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_CHAIN_DB);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        if (req.intent_id[0] == '\0') {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        {
+            virp_intent_entry_t ie;
+            err = virp_chain_intent_execute(&state->chain, req.intent_id, &ie);
+            if (err != VIRP_OK) {
+                uint32_t err_code = htonl((uint32_t)err);
+                send(client_fd, &err_code, 4, 0);
+                break;
+            }
+
+            char json_buf[512];
+            int jlen = snprintf(json_buf, sizeof(json_buf),
+                "{\"commands_executed\":%d,"
+                "\"intent_id\":\"%s\","
+                "\"max_commands\":%d}",
+                ie.commands_executed,
+                ie.intent_id,
+                ie.max_commands);
+            err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
+                                          state->node_id, onode_next_seq(state),
+                                          VIRP_OBS_INTENT_EXECUTED, VIRP_SCOPE_LOCAL,
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {

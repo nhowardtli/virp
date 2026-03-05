@@ -33,7 +33,7 @@
 #define ONODE_HEARTBEAT_SEC     30
 #define ONODE_MAX_CLIENTS       8
 #define ONODE_RECV_TIMEOUT_SEC  5
-#define ONODE_MAX_REQUEST_SIZE  4096
+#define ONODE_MAX_REQUEST_SIZE  8192
 
 /* =========================================================================
  * Request/Response Protocol (over Unix socket)
@@ -62,6 +62,9 @@ typedef enum {
     ONODE_ACTION_SIGN_OUTCOME = 6,  /* Sign outcome hash, return OBSERVATION */
     ONODE_ACTION_CHAIN_APPEND = 7,  /* Append artifact to trust chain */
     ONODE_ACTION_CHAIN_VERIFY = 8,  /* Verify trust chain integrity */
+    ONODE_ACTION_INTENT_STORE = 9,  /* Store intent in durable DB */
+    ONODE_ACTION_INTENT_GET   = 10, /* Retrieve intent by ID */
+    ONODE_ACTION_INTENT_EXECUTE = 11, /* Record execution against intent */
     ONODE_ACTION_SHUTDOWN   = 99,   /* Graceful shutdown */
 } onode_action_t;
 
