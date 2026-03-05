@@ -1,4 +1,4 @@
-# VIRP — Verified Intent Routing Protocol
+# VIRP — Verified Infrastructure Reality Protocol
 
 **Cryptographic trust primitives for agentic infrastructure operations.**
 
