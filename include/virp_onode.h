@@ -22,6 +22,7 @@
 #include "virp.h"
 #include "virp_crypto.h"
 #include "virp_driver.h"
+#include "virp_chain.h"
 
 /* =========================================================================
  * O-Node Configuration
@@ -58,6 +59,9 @@ typedef enum {
     ONODE_ACTION_HEARTBEAT  = 3,    /* Return HEARTBEAT message */
     ONODE_ACTION_LIST       = 4,    /* List devices, return OBSERVATION */
     ONODE_ACTION_SIGN_INTENT = 5,   /* Sign intent hash, return OBSERVATION */
+    ONODE_ACTION_SIGN_OUTCOME = 6,  /* Sign outcome hash, return OBSERVATION */
+    ONODE_ACTION_CHAIN_APPEND = 7,  /* Append artifact to trust chain */
+    ONODE_ACTION_CHAIN_VERIFY = 8,  /* Verify trust chain integrity */
     ONODE_ACTION_SHUTDOWN   = 99,   /* Graceful shutdown */
 } onode_action_t;
 
@@ -81,6 +85,10 @@ typedef struct {
     /* Socket */
     int                 listen_fd;
     char                socket_path[108];  /* Must fit in sun_path */
+
+    /* Trust chain (Primitive 6) */
+    virp_chain_state_t  chain;
+    bool                chain_enabled;
 
     /* Runtime */
     bool                running;

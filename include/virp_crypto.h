@@ -26,6 +26,7 @@
 typedef enum {
     VIRP_KEY_TYPE_OKEY = 1,     /* Observation key — signs OC messages */
     VIRP_KEY_TYPE_RKEY = 2,     /* Reasoning key — signs IC messages */
+    VIRP_KEY_TYPE_CHAIN = 3,    /* Chain key — signs trust chain entries */
 } virp_key_type_t;
 
 typedef struct {

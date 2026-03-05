@@ -191,6 +191,8 @@ static void usage(const char *prog)
     printf("  -s <path>   Unix socket path (default: %s)\n", ONODE_SOCKET_PATH);
     printf("  -d <path>   Device config JSON file (required)\n");
     printf("  -n <hex>    Node ID in hex (default: 0x00000001)\n");
+    printf("  -c <path>   Chain database path (enables Primitive 6 trust chain)\n");
+    printf("  -C <path>   Chain key path (32-byte key file, required with -c)\n");
     printf("  -h          Show this help\n");
     printf("\n");
 }
@@ -200,10 +202,12 @@ int main(int argc, char **argv)
     const char *okey_path = NULL;
     const char *socket_path = NULL;
     const char *devices_path = NULL;
+    const char *chain_db_path = NULL;
+    const char *chain_key_path = NULL;
     uint32_t node_id = 0x00000001;
 
     int opt;
-    while ((opt = getopt(argc, argv, "k:s:d:n:h")) != -1) {
+    while ((opt = getopt(argc, argv, "k:s:d:n:c:C:h")) != -1) {
         switch (opt) {
         case 'k':
             okey_path = optarg;
@@ -216,6 +220,12 @@ int main(int argc, char **argv)
             break;
         case 'n':
             node_id = (uint32_t)strtoul(optarg, NULL, 16);
+            break;
+        case 'c':
+            chain_db_path = optarg;
+            break;
+        case 'C':
+            chain_key_path = optarg;
             break;
         case 'h':
         default:
@@ -260,6 +270,23 @@ int main(int argc, char **argv)
         fprintf(stderr, "[O-Node] No devices loaded. Exiting.\n");
         onode_destroy(&g_state);
         return 1;
+    }
+
+    /* Initialize trust chain (Primitive 6) if configured */
+    if (chain_db_path && chain_key_path) {
+        virp_error_t chain_err = virp_chain_init(&g_state.chain,
+                                                  chain_db_path,
+                                                  chain_key_path,
+                                                  node_id, "local");
+        if (chain_err == VIRP_OK) {
+            g_state.chain_enabled = true;
+            fprintf(stderr, "[O-Node] Trust chain enabled: db=%s\n",
+                    chain_db_path);
+        } else {
+            fprintf(stderr, "[O-Node] Trust chain init failed: %s "
+                    "(continuing without chain)\n",
+                    virp_error_str(chain_err));
+        }
     }
 
     /* Install signal handlers */

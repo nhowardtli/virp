@@ -41,6 +41,13 @@ typedef struct {
     onode_action_t  action;
     char            device[64];
     char            command[1024];
+    /* Chain fields (Primitive 6) */
+    char            session_id[64];
+    char            artifact_type[16];
+    char            artifact_id[128];
+    char            artifact_hash[65];
+    int64_t         from_sequence;
+    int64_t         to_sequence;
 } onode_request_t;
 
 static bool json_extract_string(const char *json, const char *key,
@@ -73,6 +80,26 @@ static bool json_extract_string(const char *json, const char *key,
     return true;
 }
 
+static bool json_extract_int64(const char *json, const char *key, int64_t *out)
+{
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+
+    const char *pos = strstr(json, search);
+    if (!pos) return false;
+
+    pos = strchr(pos + strlen(search), ':');
+    if (!pos) return false;
+    pos++;
+
+    while (*pos == ' ' || *pos == '\t') pos++;
+    if (*pos == '\0') return false;
+
+    char *end;
+    *out = strtoll(pos, &end, 10);
+    return (end != pos);
+}
+
 static bool parse_request(const char *json, onode_request_t *req)
 {
     if (!json || !req) return false;
@@ -93,6 +120,12 @@ static bool parse_request(const char *json, onode_request_t *req)
         req->action = ONODE_ACTION_LIST;
     else if (strcmp(action_str, "sign_intent") == 0)
         req->action = ONODE_ACTION_SIGN_INTENT;
+    else if (strcmp(action_str, "sign_outcome") == 0)
+        req->action = ONODE_ACTION_SIGN_OUTCOME;
+    else if (strcmp(action_str, "chain_append") == 0)
+        req->action = ONODE_ACTION_CHAIN_APPEND;
+    else if (strcmp(action_str, "chain_verify") == 0)
+        req->action = ONODE_ACTION_CHAIN_VERIFY;
     else if (strcmp(action_str, "shutdown") == 0)
         req->action = ONODE_ACTION_SHUTDOWN;
     else
@@ -101,6 +134,18 @@ static bool parse_request(const char *json, onode_request_t *req)
     /* Extract optional fields */
     json_extract_string(json, "device", req->device, sizeof(req->device));
     json_extract_string(json, "command", req->command, sizeof(req->command));
+
+    /* Chain fields */
+    json_extract_string(json, "session_id", req->session_id,
+                        sizeof(req->session_id));
+    json_extract_string(json, "artifact_type", req->artifact_type,
+                        sizeof(req->artifact_type));
+    json_extract_string(json, "artifact_id", req->artifact_id,
+                        sizeof(req->artifact_id));
+    json_extract_string(json, "artifact_hash", req->artifact_hash,
+                        sizeof(req->artifact_hash));
+    json_extract_int64(json, "from_sequence", &req->from_sequence);
+    json_extract_int64(json, "to_sequence", &req->to_sequence);
 
     return true;
 }
@@ -405,6 +450,128 @@ static void handle_client(onode_state_t *state, int client_fd)
         }
         break;
 
+    case ONODE_ACTION_SIGN_OUTCOME:
+        if (req.command[0] == '\0') {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        /* req.command contains SHA256 hex of outcome JSON (64 chars) */
+        err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
+                                      state->node_id, onode_next_seq(state),
+                                      VIRP_OBS_OUTCOME_SIGNED, VIRP_SCOPE_LOCAL,
+                                      (const uint8_t *)req.command,
+                                      (uint16_t)strlen(req.command),
+                                      &state->okey);
+        if (err == VIRP_OK && resp_len > 0) {
+            send(client_fd, resp_buf, resp_len, 0);
+            state->observations_sent++;
+        } else {
+            uint32_t err_code = htonl((uint32_t)err);
+            send(client_fd, &err_code, 4, 0);
+        }
+        break;
+
+    case ONODE_ACTION_CHAIN_APPEND:
+        if (!state->chain_enabled) {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_CHAIN_DB);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        if (req.session_id[0] == '\0' || req.artifact_type[0] == '\0' ||
+            req.artifact_id[0] == '\0' || req.artifact_hash[0] == '\0') {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        {
+            virp_chain_entry_t chain_entry;
+            err = virp_chain_append(&state->chain, req.session_id,
+                                     req.artifact_type, req.artifact_id,
+                                     req.artifact_hash, &chain_entry);
+            if (err != VIRP_OK) {
+                uint32_t err_code = htonl((uint32_t)err);
+                send(client_fd, &err_code, 4, 0);
+                break;
+            }
+            /* JSON-encode the chain entry as observation payload */
+            char json_buf[2048];
+            int jlen = snprintf(json_buf, sizeof(json_buf),
+                "{\"chain_entry_hash\":\"%s\","
+                "\"previous_entry_hash\":\"%s\","
+                "\"sequence\":%lld,"
+                "\"session_id\":\"%s\","
+                "\"signer_node_id\":%u,"
+                "\"signer_org_id\":\"%s\"}",
+                chain_entry.chain_entry_hash,
+                chain_entry.previous_entry_hash,
+                (long long)chain_entry.sequence,
+                chain_entry.session_id,
+                chain_entry.signer_node_id,
+                chain_entry.signer_org_id);
+            err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
+                                          state->node_id, onode_next_seq(state),
+                                          VIRP_OBS_CHAIN_ENTRY, VIRP_SCOPE_LOCAL,
+                                          (const uint8_t *)json_buf, (uint16_t)jlen,
+                                          &state->okey);
+            if (err == VIRP_OK && resp_len > 0) {
+                send(client_fd, resp_buf, resp_len, 0);
+                state->observations_sent++;
+            } else {
+                uint32_t err_code = htonl((uint32_t)err);
+                send(client_fd, &err_code, 4, 0);
+            }
+        }
+        break;
+
+    case ONODE_ACTION_CHAIN_VERIFY:
+        if (!state->chain_enabled) {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_CHAIN_DB);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        if (req.session_id[0] == '\0') {
+            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
+            send(client_fd, &err_code, 4, 0);
+            break;
+        }
+        {
+            virp_chain_verify_result_t vresult;
+            err = virp_chain_verify(&state->chain, req.session_id,
+                                     req.from_sequence, req.to_sequence,
+                                     &vresult);
+            if (err != VIRP_OK) {
+                uint32_t err_code = htonl((uint32_t)err);
+                send(client_fd, &err_code, 4, 0);
+                break;
+            }
+            char json_buf[1024];
+            int jlen = snprintf(json_buf, sizeof(json_buf),
+                "{\"entries_checked\":%lld,"
+                "\"first_broken\":%lld,"
+                "\"from_sequence\":%lld,"
+                "\"to_sequence\":%lld,"
+                "\"valid\":%s}",
+                (long long)vresult.entries_checked,
+                (long long)vresult.first_broken,
+                (long long)vresult.from_sequence,
+                (long long)vresult.to_sequence,
+                vresult.valid ? "true" : "false");
+            err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
+                                          state->node_id, onode_next_seq(state),
+                                          VIRP_OBS_CHAIN_VERIFY, VIRP_SCOPE_LOCAL,
+                                          (const uint8_t *)json_buf, (uint16_t)jlen,
+                                          &state->okey);
+            if (err == VIRP_OK && resp_len > 0) {
+                send(client_fd, resp_buf, resp_len, 0);
+                state->observations_sent++;
+            } else {
+                uint32_t err_code = htonl((uint32_t)err);
+                send(client_fd, &err_code, 4, 0);
+            }
+        }
+        break;
+
     case ONODE_ACTION_SHUTDOWN:
         fprintf(stderr, "[O-Node] Shutdown requested\n");
         onode_shutdown(state);
@@ -593,6 +760,10 @@ void onode_destroy(onode_state_t *state)
         close(state->listen_fd);
         unlink(state->socket_path);
     }
+
+    /* Destroy trust chain */
+    if (state->chain_enabled)
+        virp_chain_destroy(&state->chain);
 
     /* Destroy the O-Key — zero it out */
     virp_key_destroy(&state->okey);

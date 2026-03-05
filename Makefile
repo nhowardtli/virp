@@ -9,7 +9,7 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g
 CFLAGS += -I./include
-LDFLAGS = -lcrypto -lpthread
+LDFLAGS = -lcrypto -lpthread -lsqlite3 -lsodium
 
 BUILD_DIR = build
 
@@ -18,7 +18,9 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_message.o \
              $(BUILD_DIR)/virp_driver.o \
              $(BUILD_DIR)/driver_mock.o \
-             $(BUILD_DIR)/virp_onode.o
+             $(BUILD_DIR)/virp_onode.o \
+             $(BUILD_DIR)/virp_chain.o \
+             $(BUILD_DIR)/virp_federation.o
 
 # Optional Cisco driver (requires libssh2)
 ifdef CISCO
@@ -45,7 +47,7 @@ TOOL_BIN     = $(BUILD_DIR)/virp-tool
 ONODE_BIN    = $(BUILD_DIR)/virp-onode
 TEST_ONODE   = $(BUILD_DIR)/test_onode
 
-.PHONY: all clean test fuzz test-onode
+.PHONY: all clean test fuzz test-onode test-chain test-federation
 
 all: $(LIB) $(TEST_BIN) $(FUZZ_BIN) $(TOOL_BIN) $(ONODE_BIN) $(TEST_ONODE)
 
@@ -71,6 +73,12 @@ $(BUILD_DIR)/driver_fortigate.o: src/drivers/driver_fortigate.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_chain.o: src/virp_chain.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_federation.o: src/virp_federation.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(LIB): $(LIB_OBJS)
@@ -100,6 +108,22 @@ fuzz: $(FUZZ_BIN)
 test-onode: $(TEST_ONODE)
 	./$(TEST_ONODE)
 
+# Chain and Federation tests
+TEST_CHAIN = $(BUILD_DIR)/test_chain
+TEST_FED   = $(BUILD_DIR)/test_federation
+
+$(TEST_CHAIN): tests/test_chain.c $(LIB)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+
+$(TEST_FED): tests/test_federation.c $(LIB)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+
+test-chain: $(TEST_CHAIN)
+	./$(TEST_CHAIN)
+
+test-federation: $(TEST_FED)
+	./$(TEST_FED)
+
 clean:
 	rm -rf $(BUILD_DIR)
 
@@ -118,3 +142,5 @@ $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
 	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -ljson-c -o $@
 
 prod: $(ONODE_PROD)
+
+all-tests: test test-onode test-chain test-federation

@@ -822,6 +822,13 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_KEY_NOT_LOADED:    return "Signing key not loaded";
     case VIRP_ERR_MESSAGE_TOO_LARGE: return "Message exceeds maximum size";
     case VIRP_ERR_RESERVED_NONZERO:  return "Reserved field is non-zero";
+    case VIRP_ERR_CHAIN_DB:          return "Chain database error";
+    case VIRP_ERR_CHAIN_BROKEN:      return "Chain integrity violated";
+    case VIRP_ERR_CHAIN_SEQUENCE:    return "Chain sequence error";
+    case VIRP_ERR_FED_KEY_VERSION:   return "Federation key version too low";
+    case VIRP_ERR_FED_REVOKED:       return "Federation key revoked";
+    case VIRP_ERR_FED_UNVERIFIED:    return "Unverified foreign peer";
+    case VIRP_ERR_TENANT_VIOLATION:  return "Tenant isolation violation";
     default:                         return "Unknown error";
     }
 }
@@ -872,6 +879,9 @@ const char *virp_obs_type_str(uint8_t obs_type)
     case VIRP_OBS_SECURITY_STATE:   return "SECURITY_STATE";
     case VIRP_OBS_DEVICE_OUTPUT:    return "DEVICE_OUTPUT";
     case VIRP_OBS_INTENT_SIGNED:    return "INTENT_SIGNED";
+    case VIRP_OBS_OUTCOME_SIGNED:   return "OUTCOME_SIGNED";
+    case VIRP_OBS_CHAIN_ENTRY:      return "CHAIN_ENTRY";
+    case VIRP_OBS_CHAIN_VERIFY:     return "CHAIN_VERIFY";
     default:                        return "UNKNOWN";
     }
 }

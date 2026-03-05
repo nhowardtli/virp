@@ -82,6 +82,9 @@
 #define VIRP_OBS_SECURITY_STATE     0x06    /* Access policy, zone, encryption */
 #define VIRP_OBS_DEVICE_OUTPUT      0x07    /* Raw CLI/API output (TLI model) */
 #define VIRP_OBS_INTENT_SIGNED      0x08    /* O-Node witnessed AI intent declaration */
+#define VIRP_OBS_OUTCOME_SIGNED     0x09    /* O-Node witnessed outcome verification */
+#define VIRP_OBS_CHAIN_ENTRY        0x0A    /* Trust chain entry appended */
+#define VIRP_OBS_CHAIN_VERIFY       0x0B    /* Trust chain verification result */
 
 /* =========================================================================
  * Observation Scope
@@ -305,6 +308,13 @@ typedef enum {
     VIRP_ERR_KEY_NOT_LOADED     = -14,
     VIRP_ERR_MESSAGE_TOO_LARGE  = -15,
     VIRP_ERR_RESERVED_NONZERO   = -16,
+    VIRP_ERR_CHAIN_DB           = -17,  /* Chain database error */
+    VIRP_ERR_CHAIN_BROKEN       = -18,  /* Chain integrity violated */
+    VIRP_ERR_CHAIN_SEQUENCE     = -19,  /* Chain sequence error */
+    VIRP_ERR_FED_KEY_VERSION    = -20,  /* Federation key version too low */
+    VIRP_ERR_FED_REVOKED        = -21,  /* Federation key revoked */
+    VIRP_ERR_FED_UNVERIFIED     = -22,  /* Unverified foreign peer */
+    VIRP_ERR_TENANT_VIOLATION   = -23,  /* Tenant isolation violation */
 } virp_error_t;
 
 /* =========================================================================
