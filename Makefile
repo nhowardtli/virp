@@ -58,7 +58,7 @@ TOOL_BIN     = $(BUILD_DIR)/virp-tool
 ONODE_BIN    = $(BUILD_DIR)/virp-onode
 TEST_ONODE   = $(BUILD_DIR)/test_onode
 
-.PHONY: all clean test fuzz test-onode test-chain test-federation
+.PHONY: all clean test fuzz test-onode test-chain test-federation test-interop
 
 all: $(LIB) $(TEST_BIN) $(FUZZ_BIN) $(TOOL_BIN) $(ONODE_BIN) $(TEST_ONODE)
 
@@ -157,4 +157,14 @@ $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
 
 prod: $(ONODE_PROD)
 
-all-tests: test test-onode test-chain test-federation
+# C/Go interop test
+TEST_INTEROP = $(BUILD_DIR)/test_interop_c
+GO_DIR       = implementations/go
+
+$(TEST_INTEROP): tests/test_interop_c.c $(LIB)
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+
+test-interop: $(TEST_INTEROP)
+	cd $(GO_DIR) && go test ./virp/ -run TestInterop -v -count=1
+
+all-tests: test test-onode test-chain test-federation test-interop
