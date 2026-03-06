@@ -28,6 +28,9 @@ extern void virp_driver_mock_init(void);
 #ifdef VIRP_DRIVER_CISCO
 extern void virp_driver_cisco_init(void);
 #endif
+#ifdef VIRP_DRIVER_LINUX
+extern void virp_driver_linux_init(void);
+#endif
 
 static void signal_handler(int sig)
 {
@@ -130,6 +133,9 @@ int main(int argc, char **argv)
     virp_driver_mock_init();
 #ifdef VIRP_DRIVER_CISCO
     virp_driver_cisco_init();
+#endif
+#ifdef VIRP_DRIVER_LINUX
+    virp_driver_linux_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 

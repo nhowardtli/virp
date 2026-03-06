@@ -211,8 +211,11 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
         return NULL;
     }
 
-    /* Set preferred algorithms — support legacy IOS */
+    /* Set preferred algorithms — modern IOS first, legacy fallback */
     libssh2_session_method_pref(conn->session, LIBSSH2_METHOD_KEX,
+        "ecdh-sha2-nistp256,"
+        "ecdh-sha2-nistp384,"
+        "ecdh-sha2-nistp521,"
         "diffie-hellman-group14-sha256,"
         "diffie-hellman-group14-sha1,"
         "diffie-hellman-group-exchange-sha256,"
@@ -224,7 +227,7 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
         "aes256-ctr,aes128-ctr,aes256-cbc,aes128-cbc,3des-cbc");
 
     libssh2_session_method_pref(conn->session, LIBSSH2_METHOD_HOSTKEY,
-        "ssh-rsa,rsa-sha2-256,rsa-sha2-512");
+        "rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-ed25519");
 
     /* SSH handshake */
     if (libssh2_session_handshake(conn->session, conn->sock_fd) != 0) {

@@ -621,8 +621,24 @@ static virp_error_t fg_ssh_execute(struct virp_conn *conn,
         return FG_ERR_TRANSPORT;
     }
 
-    /* Wait for initial prompt */
-    usleep(500000);
+    /* Drain initial prompt/banner before sending command */
+    libssh2_session_set_blocking(session, 0);
+    {
+        char drain[4096];
+        int drain_idle = 0;
+        while (drain_idle < 15) {
+            ssize_t n = libssh2_channel_read(channel, drain, sizeof(drain) - 1);
+            if (n > 0) {
+                drain_idle = 0;
+            } else if (n == LIBSSH2_ERROR_EAGAIN) {
+                drain_idle++;
+                usleep(100000);
+            } else {
+                break;
+            }
+        }
+    }
+    libssh2_session_set_blocking(session, 1);
 
     /* Send command */
     char cmd_buf[4096];

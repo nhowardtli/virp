@@ -40,6 +40,17 @@ ifdef FORTIGATE
   LIB_OBJS += $(BUILD_DIR)/driver_fortigate.o
 endif
 
+# Optional Linux driver (requires libssh2)
+ifdef LINUX
+  CFLAGS  += -DVIRP_DRIVER_LINUX
+  ifndef CISCO
+    ifndef FORTIGATE
+      LDFLAGS += -lssh2
+    endif
+  endif
+  LIB_OBJS += $(BUILD_DIR)/driver_linux.o
+endif
+
 LIB          = $(BUILD_DIR)/libvirp.a
 TEST_BIN     = $(BUILD_DIR)/test_virp
 FUZZ_BIN     = $(BUILD_DIR)/fuzz_virp
@@ -70,6 +81,9 @@ $(BUILD_DIR)/driver_cisco.o: src/drivers/driver_cisco.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_fortigate.o: src/drivers/driver_fortigate.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_linux.o: src/drivers/driver_linux.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)
