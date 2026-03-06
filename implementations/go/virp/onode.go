@@ -402,15 +402,33 @@ func SendRequest(socketPath string, req *ONodeRequest) ([]byte, error) {
 		return nil, err
 	}
 
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
 	if _, err := conn.Write(data); err != nil {
 		return nil, err
 	}
 
+	// Read response — may arrive in multiple chunks for large messages.
+	// First read gets the header; if we have a valid length, keep reading.
 	resp := make([]byte, MaxMessageSize)
-	n, err := conn.Read(resp)
-	if err != nil {
-		return nil, err
+	total := 0
+	for {
+		n, err := conn.Read(resp[total:])
+		if n > 0 {
+			total += n
+		}
+		if err != nil {
+			break
+		}
+		// If we have at least a header, check if we have the full message
+		if total >= HeaderSize {
+			msgLen := int(binary.BigEndian.Uint16(resp[2:4]))
+			if msgLen >= HeaderSize && total >= msgLen {
+				break
+			}
+		}
 	}
-	return resp[:n], nil
+	if total == 0 {
+		return nil, fmt.Errorf("empty response from O-Node")
+	}
+	return resp[:total], nil
 }
