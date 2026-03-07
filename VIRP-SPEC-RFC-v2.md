@@ -5,7 +5,7 @@ Category: Experimental                                    March 3, 2026
 Expires: September 3, 2026
 
 
-        Verified Intent Routing Protocol (VIRP) Specification
+        Verified Infrastructure Response Protocol (VIRP) Specification
                         draft-howard-virp-01
 
 Abstract
