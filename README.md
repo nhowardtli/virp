@@ -1,3 +1,5 @@
+VIRP (Verified Infrastructure Response Protocol) is an experimental protocol that provides cryptographic verification for AI systems interacting with real infrastructure, ensuring that observations, actions, and outcomes can be independently verified.
+
 
 # VIRP — Verified Infrastructure Response Protocol
 
