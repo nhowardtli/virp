@@ -3,6 +3,40 @@
 
 Cryptographic trust primitives for agentic infrastructure operations.
 
+Protocol Status
+
+VIRP — Verified Infrastructure Response Protocol
+VIRP is an experimental protocol designed to provide cryptographic verification for AI systems interacting with infrastructure.
+The protocol addresses a new failure mode in AI-driven operations: fabricated infrastructure state, where AI systems produce technically plausible but false device output or telemetry.
+VIRP introduces a structural trust model built around verified observations, authorized intent, and verified outcomes.
+
+Current status
+
+Component	Status
+Protocol specification	Draft Internet-Draft
+Reference implementation	Implemented (C O-Node + Python integration)
+Trust primitives	Implemented
+Test coverage	150+ tests
+Independent implementations	Not yet
+Security review	Pending
+Production deployments	Experimental
+
+VIRP is currently intended for research, experimentation, and early adoption.
+
+The protocol will be considered mature once:
+
+an independent implementation exists (Go/Rust/etc.)
+
+cross-implementation interoperability is demonstrated
+
+the protocol undergoes external security review
+
+real-world deployments validate the trust model
+
+Contributions and feedback from infrastructure engineers, security researchers, and protocol designers are welcome.
+
+
+
 ## The Problem
 
 AI systems managing infrastructure fabricate data. Not occasionally — routinely. During  
