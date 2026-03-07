@@ -40,6 +40,17 @@ ifdef FORTIGATE
   LIB_OBJS += $(BUILD_DIR)/driver_fortigate.o
 endif
 
+# Optional PAN-OS driver (requires libssh2)
+ifdef PANOS
+  CFLAGS  += -DVIRP_DRIVER_PALOALTO
+  ifndef CISCO
+    ifndef FORTIGATE
+      LDFLAGS += -lssh2
+    endif
+  endif
+  LIB_OBJS += $(BUILD_DIR)/driver_panos.o
+endif
+
 # Optional Linux driver (requires libssh2)
 ifdef LINUX
   CFLAGS  += -DVIRP_DRIVER_LINUX
@@ -81,6 +92,9 @@ $(BUILD_DIR)/driver_cisco.o: src/drivers/driver_cisco.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_fortigate.o: src/drivers/driver_fortigate.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_panos.o: src/driver_panos.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_linux.o: src/drivers/driver_linux.c | $(BUILD_DIR)

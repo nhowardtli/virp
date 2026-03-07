@@ -31,6 +31,9 @@ extern void virp_driver_cisco_init(void);
 #ifdef VIRP_DRIVER_LINUX
 extern void virp_driver_linux_init(void);
 #endif
+#ifdef VIRP_DRIVER_PALOALTO
+extern void virp_driver_paloalto_init(void);
+#endif
 
 static void signal_handler(int sig)
 {
@@ -136,6 +139,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_LINUX
     virp_driver_linux_init();
+#endif
+#ifdef VIRP_DRIVER_PALOALTO
+    virp_driver_paloalto_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 

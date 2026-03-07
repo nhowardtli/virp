@@ -104,6 +104,8 @@ int onode_load_devices_json(onode_state_t *state, const char *path)
             device.vendor = VIRP_VENDOR_CISCO_IOS;
         else if (strstr(vendor_str, "forti"))
             device.vendor = VIRP_VENDOR_FORTINET;
+        else if (strstr(vendor_str, "panos") || strstr(vendor_str, "paloalto"))
+            device.vendor = VIRP_VENDOR_PALOALTO;
         else if (strstr(vendor_str, "linux"))
             device.vendor = VIRP_VENDOR_LINUX;
         else if (strstr(vendor_str, "mock"))

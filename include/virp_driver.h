@@ -192,4 +192,8 @@ void virp_driver_fortinet_init(void);
 void virp_driver_linux_init(void);
 #endif
 
+#ifdef VIRP_DRIVER_PALOALTO
+void virp_driver_paloalto_init(void);
+#endif
+
 #endif /* VIRP_DRIVER_H */
