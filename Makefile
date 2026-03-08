@@ -7,7 +7,7 @@
 # Build without (default):     make
 
 CC      = gcc
-CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g
+CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC
 CFLAGS += -I./include
 LDFLAGS = -lcrypto -lpthread -lsqlite3 -lsodium
 
@@ -63,15 +63,18 @@ ifdef LINUX
 endif
 
 LIB          = $(BUILD_DIR)/libvirp.a
+SHLIB        = $(BUILD_DIR)/libvirp.so
 TEST_BIN     = $(BUILD_DIR)/test_virp
 FUZZ_BIN     = $(BUILD_DIR)/fuzz_virp
 TOOL_BIN     = $(BUILD_DIR)/virp-tool
 ONODE_BIN    = $(BUILD_DIR)/virp-onode
 TEST_ONODE   = $(BUILD_DIR)/test_onode
 
-.PHONY: all clean test fuzz test-onode test-chain test-federation test-interop
+.PHONY: all clean test fuzz test-onode test-chain test-federation test-interop shared
 
-all: $(LIB) $(TEST_BIN) $(FUZZ_BIN) $(TOOL_BIN) $(ONODE_BIN) $(TEST_ONODE)
+all: $(LIB) $(SHLIB) $(TEST_BIN) $(FUZZ_BIN) $(TOOL_BIN) $(ONODE_BIN) $(TEST_ONODE)
+
+shared: $(SHLIB)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -112,20 +115,23 @@ $(BUILD_DIR)/virp_federation.o: src/virp_federation.c | $(BUILD_DIR)
 $(LIB): $(LIB_OBJS)
 	ar rcs $@ $^
 
+$(SHLIB): $(LIB_OBJS)
+	$(CC) -shared -o $@ $^ $(LDFLAGS)
+
 $(TEST_BIN): tests/test_virp.c $(LIB)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 $(FUZZ_BIN): tests/fuzz_virp.c $(LIB)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 $(TOOL_BIN): src/virp_tool.c $(LIB)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 $(ONODE_BIN): src/virp_onode_main.c src/virp_onode_json.c $(LIB)
-	$(CC) $(CFLAGS) src/virp_onode_main.c src/virp_onode_json.c -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) src/virp_onode_main.c src/virp_onode_json.c $(LIB) $(LDFLAGS) -o $@
 
 $(TEST_ONODE): tests/test_onode.c $(LIB)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)
@@ -141,10 +147,10 @@ TEST_CHAIN = $(BUILD_DIR)/test_chain
 TEST_FED   = $(BUILD_DIR)/test_federation
 
 $(TEST_CHAIN): tests/test_chain.c $(LIB)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 $(TEST_FED): tests/test_federation.c $(LIB)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-chain: $(TEST_CHAIN)
 	./$(TEST_CHAIN)
@@ -158,7 +164,7 @@ clean:
 LIVE_TEST = $(BUILD_DIR)/virp-live-test
 
 $(LIVE_TEST): tests/test_live.c $(LIB)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-live: $(LIVE_TEST)
 	./$(LIVE_TEST)
@@ -167,7 +173,7 @@ test-live: $(LIVE_TEST)
 ONODE_PROD = $(BUILD_DIR)/virp-onode-prod
 
 $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -ljson-c -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -ljson-c -o $@
 
 prod: $(ONODE_PROD)
 
@@ -176,7 +182,7 @@ TEST_INTEROP = $(BUILD_DIR)/test_interop_c
 GO_DIR       = implementations/go
 
 $(TEST_INTEROP): tests/test_interop_c.c $(LIB)
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lvirp $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-interop: $(TEST_INTEROP)
 	cd $(GO_DIR) && go test ./virp/ -run TestInterop -v -count=1
