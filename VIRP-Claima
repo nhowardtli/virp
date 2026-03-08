@@ -1,0 +1,358 @@
+# VIRP-CLAIMS: Claim Verification Layer
+
+### Companion Specification to draft-howard-virp-01
+
+**Status:** Informational Draft  
+**Author:** Nate Howard, Third Level IT LLC  
+**Date:** 2026-03-08  
+**Repository:** github.com/nhowardtli/virp
+
+-----
+
+## Abstract
+
+VIRP (Verified Infrastructure Response Protocol) establishes cryptographic authenticity for infrastructure observations. This companion specification defines a Claim Verification Layer (CVL) that binds AI-generated operational assertions to specific signed observations, enabling auditability and contradiction detection.
+
+VIRP-CLAIMS does not guarantee that AI reasoning is correct. It guarantees that AI reasoning is **traceable, bounded, and auditable**. These are distinct and achievable properties. Correctness of interpretation remains outside protocol scope and is explicitly acknowledged as such.
+
+-----
+
+## 1. Motivation
+
+A signed observation proves that telemetry was collected from a specific device at a specific time and has not been modified. It does not constrain what an AI agent may subsequently assert about that telemetry.
+
+Without a binding layer, the following failure mode exists:
+
+```
+O-Node collects: show ip bgp summary
+Signature: VALID
+AI asserts:      "All BGP peers are healthy"
+Reality:         One peer is in Idle state
+Protocol result: No violation detected
+```
+
+The observation is authentic. The conclusion is wrong. VIRP v1 cannot detect this because the conclusion is never checked against the evidence.
+
+VIRP-CLAIMS addresses this by requiring that operational assertions reference specific observations, declare the evidence chain used to derive them, and expose that chain to deterministic verification.
+
+-----
+
+## 2. Scope and Non-Goals
+
+**In scope:**
+
+- Defining the Claim object and its required fields
+- Defining the Verdict enumeration and semantics
+- Specifying how a verifier checks a Claim against its referenced Observations
+- Defining collection metadata that exposes observation quality
+
+**Explicitly out of scope:**
+
+- Whether the AI reasoned correctly about valid evidence
+- Natural language interpretation of CLI output
+- Parser correctness guarantees
+- Model behavior constraints
+
+The protocol can verify that a claim is **grounded**. It cannot verify that a grounded claim is **true**. Operators must understand this distinction. The CVL makes the distinction visible and auditable rather than hidden inside model confidence.
+
+-----
+
+## 3. Data Model
+
+### 3.1 Observation (VIRP v1, reproduced for reference)
+
+```
+Observation {
+    obs_id:        uint64          // monotonic, unique per O-Node
+    node_id:       string          // device identifier
+    command:       string          // exact command executed
+    timestamp:     uint64          // Unix epoch, seconds
+    sequence:      uint64          // per-node monotonic counter
+    raw_output:    bytes           // verbatim device response
+    signature:     bytes[32]       // HMAC-SHA256 over canonical fields
+    trust_tier:    enum            // GREEN | YELLOW | RED | BLACK
+}
+```
+
+### 3.2 CollectionMetadata (new in CVL)
+
+Attached to every Observation at collection time. Exposes completeness signals that affect whether an Observation is safe to reason from.
+
+```
+CollectionMetadata {
+    collection_status:  enum        // COMPLETE | TRUNCATED | TIMEOUT | PARTIAL | ERROR
+    payload_bytes:      uint32      // byte count of raw_output
+    payload_hash:       bytes[32]   // SHA-256 of raw_output, independent of HMAC
+    truncation_flag:    bool        // explicit truncation detected in output
+    timeout_flag:       bool        // collection terminated by timeout
+    parser_name:        string      // identifier of parser applied, if any
+    parser_version:     string      // semver of parser
+    parser_confidence:  float       // [0.0, 1.0] parser extraction confidence, 0 if not parsed
+    collection_latency_ms: uint32   // time from command send to response complete
+}
+```
+
+A verifier MUST treat any Observation with `collection_status != COMPLETE` as insufficient for strong Claims. Verdicts derived from incomplete Observations MUST be downgraded to `INCOMPLETE`.
+
+### 3.3 Claim
+
+A Claim is a structured, machine-verifiable assertion derived from one or more Observations. Free-form natural language summaries are permitted as supplemental fields but are not verifiable and MUST NOT be used as the basis for Verdict determination.
+
+```
+Claim {
+    claim_id:       string          // UUID v4
+    claim_type:     string          // namespaced type, e.g. "bgp.neighbor.state"
+    agent_id:       string          // identifier of AI agent producing the claim
+    timestamp:      uint64          // Unix epoch, claim production time
+    
+    assertion:      Assertion       // the structured claim (see 3.3.1)
+    evidence:       []EvidenceRef   // one or more observation bindings
+    
+    natural_language: string        // optional, non-verifiable summary
+    confidence:     float           // agent self-reported confidence [0.0, 1.0]
+}
+```
+
+#### 3.3.1 Assertion
+
+```
+Assertion {
+    subject:    string      // e.g. "bgp.neighbor[10.0.0.2]"
+    predicate:  string      // e.g. "state"
+    operator:   enum        // EQ | NEQ | GT | LT | GTE | LTE | EXISTS | NOT_EXISTS
+    value:      string      // expected value as string, e.g. "Established"
+}
+```
+
+#### 3.3.2 EvidenceRef
+
+```
+EvidenceRef {
+    obs_id:         uint64      // references Observation.obs_id
+    node_id:        string      // must match Observation.node_id
+    extracted_path: string      // JSONPath or field descriptor into parsed output
+    extracted_value: string     // value actually extracted from that path
+}
+```
+
+The `extracted_path` and `extracted_value` fields expose exactly how the Claim was derived from the raw observation. A skeptic can take `obs_id`, retrieve the raw output, apply the same extraction path, and confirm or contradict the extracted value independently.
+
+-----
+
+## 4. Verdict Enumeration
+
+```
+enum Verdict {
+    VERIFIED        // claim assertion matches extracted evidence from valid, complete observations
+    CONTRADICTED    // claim assertion directly contradicts extracted evidence
+    UNVERIFIABLE    // no signed observation exists that covers the claim subject
+    INCOMPLETE      // supporting observations exist but are marked TRUNCATED, TIMEOUT, or PARTIAL
+    STALE           // observations exist but fall outside the configured freshness window
+    SCHEMA_ERROR    // claim is malformed or references nonexistent observation IDs
+}
+```
+
+### 4.1 Verdict Precedence
+
+When multiple evidence references are present, the most conservative Verdict applies:
+
+```
+CONTRADICTED > INCOMPLETE > STALE > UNVERIFIABLE > VERIFIED
+```
+
+A single CONTRADICTED evidence reference makes the Claim CONTRADICTED regardless of other evidence.
+
+-----
+
+## 5. Verifier Behavior
+
+A conforming verifier MUST implement the following checks in order:
+
+**Step 1 — Schema validation**  
+Confirm Claim is well-formed. All required fields present. `claim_type` is a recognized namespace. If malformed: return `SCHEMA_ERROR`.
+
+**Step 2 — Observation retrieval**  
+For each `EvidenceRef`, retrieve the referenced Observation by `obs_id`. If any referenced Observation cannot be found in the signed corpus: return `UNVERIFIABLE`.
+
+**Step 3 — Signature verification**  
+Verify HMAC-SHA256 signature on each referenced Observation. If any signature fails: treat that Observation as invalid and return `UNVERIFIABLE` for claims depending on it.
+
+**Step 4 — Freshness check**  
+Confirm each Observation timestamp falls within the configured freshness window (default: 300 seconds). If any observation is outside the window: flag for `STALE`. Apply precedence rules.
+
+**Step 5 — Completeness check**  
+Inspect `CollectionMetadata.collection_status` for each Observation. If any is not `COMPLETE`: return `INCOMPLETE`. Apply precedence rules.
+
+**Step 6 — Extraction verification**  
+For each `EvidenceRef`, apply `extracted_path` to the Observation’s `raw_output` and confirm the result matches `extracted_value`. If extraction produces a different value than claimed: return `CONTRADICTED`.
+
+**Step 7 — Assertion check**  
+Evaluate `Assertion.operator` against the extracted values. If the assertion evaluates false: return `CONTRADICTED`. If it evaluates true: return `VERIFIED`.
+
+-----
+
+## 6. Trust Tier Inheritance
+
+Claims inherit the trust tier of their lowest-tier referenced Observation.
+
+```
+Claim references obs GREEN + obs YELLOW → Claim tier: YELLOW
+Claim references obs RED               → Claim tier: RED (regardless of others)
+```
+
+A VERIFIED claim at tier RED means: the evidence supports the claim, but the evidence itself comes from a node with degraded trust posture. Operators MUST be presented with tier alongside Verdict.
+
+-----
+
+## 7. Example: BGP State Claim
+
+### 7.1 Observation
+
+```json
+{
+  "obs_id": 37807,
+  "node_id": "R1",
+  "command": "show ip bgp summary",
+  "timestamp": 1741478201,
+  "sequence": 412,
+  "raw_output": "...<verbatim output>...",
+  "signature": "a3f92e...",
+  "trust_tier": "GREEN",
+  "collection_metadata": {
+    "collection_status": "COMPLETE",
+    "payload_bytes": 1842,
+    "payload_hash": "9d4c1a...",
+    "truncation_flag": false,
+    "timeout_flag": false,
+    "parser_name": "cisco-bgp-summary",
+    "parser_version": "1.2.0",
+    "parser_confidence": 0.97,
+    "collection_latency_ms": 312
+  }
+}
+```
+
+### 7.2 Claim (VERIFIED case)
+
+```json
+{
+  "claim_id": "f81d4fa-e29a-4f9b-8c3e-1234abcd5678",
+  "claim_type": "bgp.neighbor.state",
+  "agent_id": "tli-opsagent-v1",
+  "timestamp": 1741478209,
+  "assertion": {
+    "subject": "bgp.neighbor[10.0.0.2]",
+    "predicate": "state",
+    "operator": "EQ",
+    "value": "Established"
+  },
+  "evidence": [
+    {
+      "obs_id": 37807,
+      "node_id": "R1",
+      "extracted_path": "$.neighbors[?(@.address=='10.0.0.2')].state",
+      "extracted_value": "Established"
+    }
+  ],
+  "natural_language": "BGP neighbor 10.0.0.2 on R1 is in Established state.",
+  "confidence": 0.97
+}
+```
+
+**Verifier output:**
+
+```
+Claim:     bgp.neighbor[10.0.0.2].state == Established
+Evidence:  obs_id 37807 (R1, 2026-03-08T14:16:41Z)
+Signature: VALID
+Freshness: WITHIN WINDOW (8s)
+Complete:  YES
+Extracted: Established
+Verdict:   VERIFIED  [GREEN]
+```
+
+### 7.3 Claim (UNVERIFIABLE case — fabricated)
+
+```json
+{
+  "claim_id": "a99c3fd1-...",
+  "claim_type": "firewall.policy.exists",
+  "assertion": {
+    "subject": "firewall.policy[873a]",
+    "predicate": "exists",
+    "operator": "EQ",
+    "value": "true"
+  },
+  "evidence": []
+}
+```
+
+**Verifier output:**
+
+```
+Claim:     firewall.policy[873a].exists == true
+Evidence:  NONE
+Verdict:   UNVERIFIABLE
+Reason:    No signed observation covers this subject.
+           Claim cannot be evaluated against the VIRP corpus.
+```
+
+-----
+
+## 8. What This Does Not Solve
+
+This section is included deliberately to prevent scope creep and misrepresentation.
+
+**Parser correctness:** If `cisco-bgp-summary` v1.2.0 misparses a neighbor state, the Claim will be VERIFIED and incorrect. CVL exposes the parser name and version so this is detectable and attributable, but does not prevent it.
+
+**Model hallucination on valid evidence:** A model may see `state: Established` and conclude “the network is healthy” when other peers are down. CVL bounds Claims to specific assertions about specific subjects. Broad health summaries should be decomposed into individual Claims or flagged as non-verifiable natural language.
+
+**Adversarial observation injection:** If the O-Node itself is compromised, signed observations may be fabricated at source. CVL inherits VIRP’s trust tier model for this. A compromised node produces RED-tier observations.
+
+**Completeness of coverage:** A signed observation corpus covers only what was collected. Absence of a signed observation does not prove absence of a network condition.
+
+-----
+
+## 9. Relationship to VIRP Core
+
+```
+VIRP Core (draft-howard-virp-01)
+└── Observation authenticity
+└── O-Node signing
+└── Trust tiers
+└── Freshness / TTL
+└── Two-channel separation (Observation vs Intent)
+
+VIRP-CLAIMS (this document)
+└── Claim binding to Observations
+└── Structured assertion schema
+└── Verifier algorithm
+└── Verdict enumeration
+└── Collection metadata / completeness signals
+└── Trust tier inheritance for Claims
+```
+
+VIRP-CLAIMS depends on VIRP Core. VIRP Core is complete and useful without VIRP-CLAIMS. CVL is a companion layer, not a revision.
+
+-----
+
+## 10. Implementation Notes
+
+A minimal CVL verifier requires:
+
+- Read access to a signed Observation corpus (flat file, SQLite, or API)
+- HMAC-SHA256 verification (reuses VIRP Core logic)
+- A JSONPath or equivalent extraction library
+- Configurable freshness window (default: 300s)
+
+A reference implementation will be published at `github.com/nhowardtli/virp` alongside the core library. The verifier will expose a `virp verify <claim_file>` CLI interface suitable for demonstration and integration testing.
+
+-----
+
+## 11. The One Sentence
+
+> VIRP does not claim a model cannot reason incorrectly. It ensures that incorrect reasoning is detectable, attributable, and bounded — because every Claim is traceable to the exact signed evidence it was derived from.
+
+-----
+
+*This document is an informational draft. Feedback and critique welcome at nhoward@thirdlevelit.com.*
