@@ -34,6 +34,7 @@ typedef enum {
     VIRP_VENDOR_PALOALTO    = 5,
     VIRP_VENDOR_WINDOWS     = 6,
     VIRP_VENDOR_PROXMOX     = 7,
+    VIRP_VENDOR_CISCO_ASA   = 8,
     VIRP_VENDOR_MOCK        = 99,   /* Testing only */
 } virp_vendor_t;
 
@@ -194,6 +195,10 @@ void virp_driver_linux_init(void);
 
 #ifdef VIRP_DRIVER_PALOALTO
 void virp_driver_paloalto_init(void);
+#endif
+
+#ifdef VIRP_DRIVER_CISCO_ASA
+void virp_driver_asa_init(void);
 #endif
 
 #endif /* VIRP_DRIVER_H */

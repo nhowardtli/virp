@@ -267,8 +267,9 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
         return NULL;
     }
 
-    /* Request PTY — IOS needs this for interactive shell */
-    if (libssh2_channel_request_pty(conn->channel, "vt100") != 0) {
+    /* Request PTY — IOS needs this for interactive shell; 200 cols */
+    if (libssh2_channel_request_pty_ex(conn->channel, "vt100", 5,
+                                        NULL, 0, 200, 24, 0, 0) != 0) {
         fprintf(stderr, "[Cisco] PTY request failed\n");
     }
 

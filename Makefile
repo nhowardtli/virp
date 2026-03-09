@@ -51,6 +51,19 @@ ifdef PANOS
   LIB_OBJS += $(BUILD_DIR)/driver_panos.o
 endif
 
+# Optional Cisco ASA driver (requires libssh2)
+ifdef ASA
+  CFLAGS  += -DVIRP_DRIVER_CISCO_ASA
+  ifndef CISCO
+    ifndef FORTIGATE
+      ifndef PANOS
+        LDFLAGS += -lssh2
+      endif
+    endif
+  endif
+  LIB_OBJS += $(BUILD_DIR)/driver_asa.o $(BUILD_DIR)/parser_asa.o
+endif
+
 # Optional Linux driver (requires libssh2)
 ifdef LINUX
   CFLAGS  += -DVIRP_DRIVER_LINUX
@@ -98,6 +111,12 @@ $(BUILD_DIR)/driver_fortigate.o: src/drivers/driver_fortigate.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_panos.o: src/driver_panos.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_asa.o: src/drivers/driver_asa.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/parser_asa.o: src/drivers/parser_asa.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_linux.o: src/drivers/driver_linux.c | $(BUILD_DIR)
@@ -186,5 +205,14 @@ $(TEST_INTEROP): tests/test_interop_c.c $(LIB)
 
 test-interop: $(TEST_INTEROP)
 	cd $(GO_DIR) && go test ./virp/ -run TestInterop -v -count=1
+
+# ASA driver tests
+TEST_ASA = $(BUILD_DIR)/test_driver_asa
+
+$(TEST_ASA): tests/test_driver_asa.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-asa: $(TEST_ASA)
+	./$(TEST_ASA)
 
 all-tests: test test-onode test-chain test-federation test-interop

@@ -40,6 +40,9 @@ extern void virp_driver_linux_init(void);
 #ifdef VIRP_DRIVER_PALOALTO
 extern void virp_driver_paloalto_init(void);
 #endif
+#ifdef VIRP_DRIVER_CISCO_ASA
+extern void virp_driver_asa_init(void);
+#endif
 
 static void signal_handler(int sig)
 {
@@ -79,6 +82,7 @@ static virp_vendor_t vendor_from_string(const char *s)
     if (strcmp(s, "panos") == 0)     return VIRP_VENDOR_PALOALTO;
     if (strcmp(s, "windows") == 0)   return VIRP_VENDOR_WINDOWS;
     if (strcmp(s, "proxmox") == 0)   return VIRP_VENDOR_PROXMOX;
+    if (strcmp(s, "cisco_asa") == 0) return VIRP_VENDOR_CISCO_ASA;
     if (strcmp(s, "mock") == 0)      return VIRP_VENDOR_MOCK;
     return VIRP_VENDOR_UNKNOWN;
 }
@@ -266,6 +270,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_PALOALTO
     virp_driver_paloalto_init();
+#endif
+#ifdef VIRP_DRIVER_CISCO_ASA
+    virp_driver_asa_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 
