@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
- * VIRP — Verified Intent Routing Protocol
+ * VIRP — Verified Infrastructure Response Protocol
  * Primitive 7: Trust Federation — Ed25519 signatures for multi-org trust
  *
  * Dual mode: HMAC always present for internal. Ed25519 added alongside

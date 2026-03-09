@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
- * VIRP — Verified Intent Routing Protocol
+ * VIRP — Verified Infrastructure Response Protocol
  * Linux Device Driver — SSH exec channel via libssh2
  *
  * Handles:

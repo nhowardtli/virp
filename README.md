@@ -1,4 +1,3 @@
-
 # VIRP — Verified Infrastructure Response Protocol
 
 **Cryptographic trust primitives for AI agents operating on real infrastructure.**

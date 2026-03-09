@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
- * VIRP — Verified Intent Routing Protocol
+ * VIRP — Verified Infrastructure Response Protocol
  * Test suite — every structural guarantee must be proven here
  *
  * If a test doesn't exist for a security property, that property
@@ -743,7 +743,7 @@ int main(void)
 {
     printf("\n");
     printf("================================================================\n");
-    printf("  VIRP — Verified Intent Routing Protocol\n");
+    printf("  VIRP — Verified Infrastructure Response Protocol\n");
     printf("  Test Suite v1.0\n");
     printf("  Copyright (c) 2026 Third Level IT LLC\n");
     printf("================================================================\n\n");

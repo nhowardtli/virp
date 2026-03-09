@@ -310,7 +310,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="VIRP Appliance",
-    description="Verified Intent Routing Protocol — Network Trust Anchor",
+    description="Verified Infrastructure Response Protocol — Network Trust Anchor",
     version="0.1.0-poc",
     lifespan=lifespan,
 )

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
- * VIRP — Verified Intent Routing Protocol
+ * VIRP — Verified Infrastructure Response Protocol
  * Primitive 7: Trust Federation Implementation
  *
  * Ed25519 signatures via libsodium for multi-org trust.

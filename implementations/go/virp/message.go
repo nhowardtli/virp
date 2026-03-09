@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Third Level IT LLC. All rights reserved.
-// VIRP -- Verified Intent Routing Protocol
+// VIRP -- Verified Infrastructure Response Protocol
 // Message construction, parsing, and validation -- Go implementation
 //
 // Wire-compatible with the C implementation. All fields are big-endian.

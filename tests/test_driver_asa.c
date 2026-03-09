@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
- * VIRP — Verified Intent Routing Protocol
+ * VIRP — Verified Infrastructure Response Protocol
  * Cisco ASA Driver Unit Tests
  *
  * Tests parsers and command routing locally (no SSH).

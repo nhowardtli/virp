@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
- * VIRP — Verified Intent Routing Protocol
+ * VIRP — Verified Infrastructure Response Protocol
  * Cisco ASA Device Driver — SSH-only, ASA-OS 9.8.x through 9.20.x
  *
  * Handles:

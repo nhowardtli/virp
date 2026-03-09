@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
- * VIRP — Verified Intent Routing Protocol
+ * VIRP — Verified Infrastructure Response Protocol
  * Cryptographic operations — HMAC-SHA256 signing and verification
  *
  * Key separation is STRUCTURAL:

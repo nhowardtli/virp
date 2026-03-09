@@ -6,11 +6,11 @@ Expires: September 3, 2026
 
 
         Verified Infrastructure Response Protocol (VIRP) Specification
-                        draft-howard-virp-01
+                        draft-howard-virp-02
 
 Abstract
 
-   This document specifies the Verified Intent Routing Protocol (VIRP),
+   This document specifies the Verified Infrastructure Response Protocol (VIRP),
    a cryptographic trust framework for AI-managed network infrastructure.
    VIRP provides structural guarantees that observations of network
    state are authentic and that proposed changes are authorized, through

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
- * VIRP — Verified Intent Routing Protocol
+ * VIRP — Verified Infrastructure Response Protocol
  * Topology Sweep — crawl a network, sign everything, build a map
  *
  * This tool connects to every router in the lab, runs multiple

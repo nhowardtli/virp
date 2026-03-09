@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
- * VIRP — Verified Intent Routing Protocol
+ * VIRP — Verified Infrastructure Response Protocol
  * CLI Tool — key generation, message inspection, test message building
  *
  * Usage:
@@ -478,7 +478,7 @@ static int cmd_build(int argc, char **argv)
 static void usage(void)
 {
     printf("\n");
-    printf("VIRP Tool — Verified Intent Routing Protocol\n");
+    printf("VIRP Tool — Verified Infrastructure Response Protocol\n");
     printf("Copyright (c) 2026 Third Level IT LLC\n\n");
     printf("Commands:\n");
     printf("  keygen   <okey|rkey> <output_file>       Generate signing key\n");

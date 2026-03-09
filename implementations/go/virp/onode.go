@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Third Level IT LLC. All rights reserved.
-// VIRP -- Verified Intent Routing Protocol
+// VIRP -- Verified Infrastructure Response Protocol
 // O-Node Daemon -- the hardened observer process (Go implementation)
 //
 // The O-Node is the ONLY process that holds the O-Key.
