@@ -362,6 +362,8 @@ static virp_conn_t *pa_connect(const virp_device_t *device)
 
     /* Set preferred algorithms — PAN-OS supports modern ciphers */
     libssh2_session_method_pref(conn->session, LIBSSH2_METHOD_KEX,
+        "curve25519-sha256,"
+        "curve25519-sha256@libssh.org,"
         "ecdh-sha2-nistp256,"
         "ecdh-sha2-nistp384,"
         "ecdh-sha2-nistp521,"
@@ -378,16 +380,26 @@ static virp_conn_t *pa_connect(const virp_device_t *device)
         "rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-ed25519");
 
     /* SSH handshake */
-    if (libssh2_session_handshake(conn->session, conn->sock_fd) != 0) {
+    int rc = libssh2_session_handshake(conn->session, conn->sock_fd);
+    if (rc != 0) {
         char *errmsg;
-        libssh2_session_last_error(conn->session, &errmsg, NULL, 0);
-        fprintf(stderr, "[PAN-OS] SSH handshake failed: %s (%s:%u)\n",
-                errmsg, device->host, port);
+        int errcode = libssh2_session_last_error(conn->session, &errmsg, NULL, 0);
+        fprintf(stderr, "[PAN-OS] SSH handshake failed: rc=%d errcode=%d msg='%s' (%s:%u)\n",
+                rc, errcode, errmsg, device->host, port);
         libssh2_session_free(conn->session);
         close(conn->sock_fd);
         free(conn);
         return NULL;
     }
+
+    /* Log negotiated KEX for debugging */
+    const char *kex_used = libssh2_session_methods(conn->session, LIBSSH2_METHOD_KEX);
+    fprintf(stderr, "[PAN-OS] KEX negotiated: %s (%s:%u)\n",
+            kex_used ? kex_used : "(null)", device->host, port);
+
+    const char *hk_used = libssh2_session_methods(conn->session, LIBSSH2_METHOD_HOSTKEY);
+    fprintf(stderr, "[PAN-OS] Host key type: %s (%s:%u)\n",
+            hk_used ? hk_used : "(null)", device->host, port);
 
     /* Password authentication */
     if (libssh2_userauth_password(conn->session,
