@@ -43,6 +43,10 @@ extern void virp_driver_paloalto_init(void);
 #ifdef VIRP_DRIVER_CISCO_ASA
 extern void virp_driver_asa_init(void);
 #endif
+#ifdef VIRP_DRIVER_WAZUH
+extern void virp_driver_wazuh_init(void);
+#include <curl/curl.h>
+#endif
 
 static void signal_handler(int sig)
 {
@@ -84,6 +88,7 @@ static virp_vendor_t vendor_from_string(const char *s)
     if (strcmp(s, "windows") == 0)   return VIRP_VENDOR_WINDOWS;
     if (strcmp(s, "proxmox") == 0)   return VIRP_VENDOR_PROXMOX;
     if (strcmp(s, "cisco_asa") == 0) return VIRP_VENDOR_CISCO_ASA;
+    if (strcmp(s, "wazuh") == 0)     return VIRP_VENDOR_WAZUH;
     if (strcmp(s, "mock") == 0)      return VIRP_VENDOR_MOCK;
     return VIRP_VENDOR_UNKNOWN;
 }
@@ -261,6 +266,10 @@ int main(int argc, char **argv)
     printf("  Copyright (c) 2026 Third Level IT LLC\n");
     printf("================================================================\n\n");
 
+#ifdef VIRP_DRIVER_WAZUH
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+#endif
+
     /* Register drivers */
     virp_driver_mock_init();
 #ifdef VIRP_DRIVER_CISCO
@@ -277,6 +286,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_CISCO_ASA
     virp_driver_asa_init();
+#endif
+#ifdef VIRP_DRIVER_WAZUH
+    virp_driver_wazuh_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 

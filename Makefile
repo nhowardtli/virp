@@ -66,6 +66,13 @@ ifdef ASA
   LIB_OBJS += $(BUILD_DIR)/driver_asa.o $(BUILD_DIR)/parser_asa.o
 endif
 
+# Optional Wazuh driver (requires libcurl — REST API, not SSH)
+ifdef WAZUH
+  CFLAGS  += -DVIRP_DRIVER_WAZUH $(shell pkg-config --cflags libcurl 2>/dev/null)
+  LDFLAGS += $(shell pkg-config --libs libcurl 2>/dev/null || echo "-lcurl")
+  LIB_OBJS += $(BUILD_DIR)/driver_wazuh.o
+endif
+
 # Optional Linux driver (requires libssh2)
 ifdef LINUX
   CFLAGS  += -DVIRP_DRIVER_LINUX
@@ -122,6 +129,9 @@ $(BUILD_DIR)/parser_asa.o: src/drivers/parser_asa.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_linux.o: src/drivers/driver_linux.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_wazuh.o: src/drivers/driver_wazuh.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)
@@ -214,7 +224,7 @@ prod: $(ONODE_PROD)
 # Full production build — recursive make ensures all ifdef guards evaluate correctly
 .PHONY: prod-full
 prod-full:
-	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 $(ONODE_PROD)
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 $(ONODE_PROD)
 
 # C/Go interop test
 TEST_INTEROP = $(BUILD_DIR)/test_interop_c
@@ -243,6 +253,15 @@ $(TEST_JSON): tests/test_json_extract.c $(LIB)
 
 test-json: $(TEST_JSON)
 	./$(TEST_JSON)
+
+# Wazuh driver tests (requires WAZUH=1 and live Wazuh Manager)
+TEST_WAZUH = $(BUILD_DIR)/test_driver_wazuh
+
+$(TEST_WAZUH): tests/test_driver_wazuh.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-wazuh: $(TEST_WAZUH)
+	./$(TEST_WAZUH)
 
 # Session negative-path tests
 TEST_SESSION_NEG = $(BUILD_DIR)/test_session_negative
