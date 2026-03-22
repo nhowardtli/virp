@@ -367,12 +367,39 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
         return WZ_ERR_NOT_CONNECTED;
     }
 
+    /*
+     * Strip HTTP method prefix if present.
+     *
+     * IronClaw (R-Node AI) may send commands like "GET /agents?status=active&limit=20".
+     * The Wazuh driver only needs the endpoint path — the HTTP method is always GET
+     * (all endpoints are read-only). The method prefix would corrupt the URL if
+     * concatenated directly (e.g. "https://host:55000GET /agents?...").
+     *
+     * The endpoint path (with query string) goes straight to libcurl's CURLOPT_URL
+     * as a C string — no shell interpretation, no fork/exec. Characters like & in
+     * the query string are URL parameter separators, not shell operators.
+     */
+    const char *endpoint = command;
+    if (strncmp(command, "GET ",     4) == 0) endpoint = command + 4;
+    else if (strncmp(command, "POST ",    5) == 0) endpoint = command + 5;
+    else if (strncmp(command, "PUT ",     4) == 0) endpoint = command + 4;
+    else if (strncmp(command, "DELETE ",  7) == 0) endpoint = command + 7;
+    else if (strncmp(command, "PATCH ",   6) == 0) endpoint = command + 6;
+
+    /* Ensure endpoint starts with '/' */
+    if (endpoint[0] != '/') {
+        result->success = false;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Invalid endpoint (must start with /): %.64s", command);
+        return VIRP_OK;
+    }
+
     /* Check trust tier — refuse BLACK-tier endpoints */
-    virp_trust_tier_t tier = wz_route_endpoint(command);
+    virp_trust_tier_t tier = wz_route_endpoint(endpoint);
     if (tier == VIRP_TIER_BLACK) {
         result->success = false;
         snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Endpoint blocked (BLACK tier): %s", command);
+                 "Endpoint blocked (BLACK tier): %s", endpoint);
         return VIRP_OK;
     }
 
@@ -390,9 +417,9 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    /* Step 2: Build URL */
+    /* Step 2: Build URL — base_url + endpoint path, passed directly to libcurl */
     char url[2048];
-    snprintf(url, sizeof(url), "%s%s", conn->base_url, command);
+    snprintf(url, sizeof(url), "%s%s", conn->base_url, endpoint);
 
     /* Step 3: Build Authorization header */
     char auth_hdr[WZ_TOKEN_MAX + 32];
@@ -450,7 +477,7 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
     /* Step 4: Format output like other drivers: hostname>endpoint\nresponse */
     int written = snprintf(result->output, sizeof(result->output),
                            "%s>%s [HTTP %ld]\n%s",
-                           conn->device.hostname, command,
+                           conn->device.hostname, endpoint,
                            http_code, api_response);
     result->output_len = (written > 0) ? (size_t)written : 0;
 
@@ -468,7 +495,7 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
         result->exit_code = (int)http_code;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "HTTP %ld from %s%s", http_code,
-                 conn->device.hostname, command);
+                 conn->device.hostname, endpoint);
     } else {
         result->success = true;
         result->exit_code = 0;
