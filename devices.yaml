@@ -1,21 +1,3 @@
-colo-switch:
-  hostname: colo-switch
-  host: 10.0.10.2
-  port: 22
-  vendor: cisco_ios
-  platform: Catalyst 3850
-  type: switch
-  site: colo-123net
-  customer: third-level-it
-  node_id: C0100201
-  trust_tier: YELLOW
-  collector: ssh
-  credential_ref: colo-switch
-  enabled: true
-  tags:
-  - physical
-  - colo
-  - production
 fortigate-200g:
   hostname: fortigate-200g
   host: 10.0.10.1
@@ -74,63 +56,6 @@ fortiwifi-60f:
   - physical
   - home
   - lab
-asa-5525:
-  hostname: asa-5525
-  host: 10.0.0.253
-  port: 22
-  vendor: cisco_asa
-  platform: ASA 5525-X
-  type: firewall
-  site: home-lab
-  customer: third-level-it
-  node_id: A0100201
-  trust_tier: YELLOW
-  collector: ssh
-  credential_ref: asa-5525
-  enabled: true
-  tags:
-  - physical
-  - home
-  - lab
-  - firewall
-wazuh:
-  hostname: wazuh
-  host: 10.0.20.10
-  port: 22
-  vendor: linux
-  platform: Wazuh SIEM
-  type: siem
-  site: home-lab
-  customer: third-level-it
-  node_id: S0100101
-  trust_tier: GREEN
-  collector: none
-  credential_ref: wazuh
-  enabled: true
-  tags:
-  - infrastructure
-  - monitoring
-  - siem
-  notes: "All FortiGate syslogs forward here. Query Wazuh for firewall logs \u2014\
-    \ FortiGate has no local log storage."
-proxmox:
-  hostname: proxmox
-  host: 10.0.10.10
-  port: 22
-  vendor: linux
-  platform: Dell R740 / Proxmox VE
-  type: hypervisor
-  site: colo-123net
-  customer: third-level-it
-  node_id: S0100201
-  trust_tier: GREEN
-  collector: none
-  credential_ref: proxmox
-  enabled: true
-  tags:
-  - infrastructure
-  - hypervisor
-  - colo
 R1:
   hostname: R1
   host: 10.0.0.50
@@ -761,3 +686,78 @@ R35:
   - gns3
   - lab
   - bgp
+SW-3850:
+  hostname: SW-3850
+  host: 10.0.10.2
+  port: 22
+  vendor: cisco_ios
+  platform: Catalyst 3850
+  type: switch
+  site: colo-123net
+  customer: third-level-it
+  node_id: C0100201
+  trust_tier: YELLOW
+  collector: ssh
+  credential_ref: colo-switch
+  enabled: true
+  tags:
+  - physical
+  - colo
+  - production
+Proxmox-Colo:
+  hostname: Proxmox-Colo
+  host: 10.0.10.10
+  port: 22
+  vendor: linux
+  platform: Dell R740 / Proxmox VE
+  type: hypervisor
+  site: colo-123net
+  customer: third-level-it
+  node_id: S0100201
+  trust_tier: GREEN
+  collector: none
+  credential_ref: proxmox
+  enabled: true
+  tags:
+  - infrastructure
+  - hypervisor
+  - colo
+Wazuh:
+  hostname: Wazuh
+  host: 10.0.20.10
+  port: 22
+  vendor: linux
+  platform: Wazuh SIEM
+  type: siem
+  site: home-lab
+  customer: third-level-it
+  node_id: S0100101
+  trust_tier: GREEN
+  collector: none
+  credential_ref: wazuh
+  enabled: true
+  tags:
+  - infrastructure
+  - monitoring
+  - siem
+  notes: "All FortiGate syslogs forward here. Query Wazuh for firewall logs \u2014\
+    \ FortiGate has no local log storage."
+ASA-5525:
+  hostname: ASA-5525
+  host: 10.0.0.253
+  port: 22
+  vendor: cisco_asa
+  platform: ASA 5525-X
+  type: firewall
+  site: home-lab
+  customer: third-level-it
+  node_id: A0100201
+  trust_tier: YELLOW
+  collector: ssh
+  credential_ref: asa-5525
+  enabled: true
+  tags:
+  - physical
+  - home
+  - lab
+  - firewall
