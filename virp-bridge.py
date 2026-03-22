@@ -43,6 +43,14 @@ import sys
 import time
 from datetime import datetime, timezone
 
+# Single source of truth — device registry
+from device_registry import (
+    all_device_metadata,
+    device_metadata,
+    get_device_list_for_prompt,
+    load_devices,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [virp-bridge] %(levelname)s %(message)s",
@@ -323,6 +331,29 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                 self._send_json(200, chain_verify()); return
             if command == "chain_export":
                 self._send_json(200, chain_export()); return
+
+            # ── Device registry queries (single source of truth) ──
+            if command == "device_list":
+                metadata = all_device_metadata()
+                self._send_json(200, {
+                    "devices": metadata,
+                    "total": len(metadata),
+                }); return
+            if command == "device_info":
+                target = req.get("hostname") or req.get("device")
+                if not target:
+                    self._send_error(400, "device_info requires 'hostname'")
+                    return
+                meta = device_metadata(target)
+                if not meta:
+                    self._send_error(404, f"device '{target}' not in registry")
+                    return
+                self._send_json(200, meta); return
+            if command == "device_prompt":
+                self._send_json(200, {
+                    "prompt_fragment": get_device_list_for_prompt(),
+                }); return
+
             hostname = req.get("hostname") or req.get("device")
             if not command or not hostname:
                 self._send_error(400, "missing 'command' and/or 'hostname'")

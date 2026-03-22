@@ -146,41 +146,51 @@ exporter_info.info({"version": "1.0.0", "chain_db": CHAIN_DB_PATH})
 
 # ---------------------------------------------------------------------------
 # Device mapping: node_id (hex) → hostname
+# Uses device_registry (single source of truth) with legacy JSON fallback.
 # ---------------------------------------------------------------------------
 def _node_id_hex_to_int(hex_id: str) -> int:
     """Convert 8-char hex node_id from devices.json to the integer used in artifact_id."""
     return int(hex_id, 16)
 
 
-def _parse_devices_file(path: str) -> list[dict]:
-    """Parse devices.json in either format (proper JSON or 'devices [...]' wrapper)."""
-    with open(path) as f:
-        raw = f.read().strip()
-    # Format 1: proper JSON — {"devices": [...]}
-    # Format 2: bare wrapper — devices [...]
-    if raw.startswith("{"):
-        obj = json.loads(raw)
-        if isinstance(obj, dict) and "devices" in obj:
-            return obj["devices"]
-        return []
-    if raw.startswith("devices"):
-        raw = raw[raw.index("["):]
-    return json.loads(raw)
-
-
 def load_device_map() -> dict[int, str]:
-    """Build node_id_int → hostname map from devices.json."""
+    """Build node_id_int → hostname map.
+
+    Tries device_registry.node_id_to_hostname() first (reads devices.yaml),
+    falls back to parsing legacy JSON files.
+    """
+    # Try canonical device registry first
+    try:
+        import sys
+        sys.path.insert(0, "/root/virp")
+        from device_registry import node_id_to_hostname
+        mapping = node_id_to_hostname()
+        if mapping:
+            log.info("Loaded %d device mappings from device_registry (devices.yaml)", len(mapping))
+            return mapping
+    except Exception as e:
+        log.warning("device_registry unavailable, falling back to JSON: %s", e)
+
+    # Legacy fallback — parse devices.json directly
     mapping: dict[int, str] = {}
     paths = [DEVICES_JSON_PATH, "/opt/virp/devices.json"]
     for path in paths:
         try:
-            devices = _parse_devices_file(path)
+            with open(path) as f:
+                raw = f.read().strip()
+            if raw.startswith("{"):
+                obj = json.loads(raw)
+                devices = obj.get("devices", []) if isinstance(obj, dict) else []
+            elif raw.startswith("devices"):
+                devices = json.loads(raw[raw.index("["):])
+            else:
+                devices = []
             for dev in devices:
                 nid = dev.get("node_id", "")
                 hostname = dev.get("hostname", "")
                 if nid and hostname:
                     mapping[_node_id_hex_to_int(nid)] = hostname
-            log.info("Loaded devices from %s", path)
+            log.info("Loaded devices from %s (legacy fallback)", path)
             break
         except FileNotFoundError:
             continue

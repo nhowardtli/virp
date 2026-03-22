@@ -30,9 +30,16 @@ from pydantic import BaseModel
 
 VIRP_SOCKET = os.environ.get("VIRP_SOCKET", "/tmp/virp-onode.sock")
 VIRP_KEY_PATH = os.environ.get("VIRP_KEY_PATH", "/etc/virp/keys/onode.key")
-DEVICES_PATH = os.environ.get("VIRP_DEVICES", "/etc/virp/devices.json")
+DEVICES_PATH = os.environ.get("VIRP_DEVICES", "/etc/virp/devices.json")  # legacy fallback
 WEB_DIR = os.environ.get("VIRP_WEB_DIR", "/opt/virp-appliance/web")
 API_TOKEN = os.environ.get("VIRP_API_TOKEN", "")  # Optional bearer token
+
+# Single source of truth — device registry
+try:
+    import device_registry as _dr
+    _HAVE_REGISTRY = True
+except ImportError:
+    _HAVE_REGISTRY = False
 
 # VIRP protocol constants
 VIRP_HEADER_SIZE = 56
@@ -303,12 +310,46 @@ def onode_batch_execute(commands_list: list[dict], timeout: float = 30.0) -> lis
 # Device Registry
 # ---------------------------------------------------------------------------
 
+_VENDOR_TO_DRIVER = {
+    "cisco_ios": "cisco",
+    "cisco_asa": "cisco_asa",
+    "fortinet": "fortigate",
+    "panos": "panos",
+    "linux": "linux",
+    "juniper": "juniper",
+    "windows": "windows",
+    "proxmox": "proxmox",
+    "wazuh": "wazuh",
+}
+
+
 def load_devices() -> dict:
-    """Load device registry from config file."""
+    """Load device registry.
+
+    Uses the canonical devices.yaml via device_registry if available,
+    falling back to the legacy devices.json for backward compat.
+    Returns dict keyed by hostname with host/driver fields.
+    """
+    if _HAVE_REGISTRY:
+        result = {}
+        for name, d in _dr.get_enabled_devices().items():
+            vendor = d.get("vendor", "")
+            result[name] = {
+                "host": d.get("host", ""),
+                "driver": _VENDOR_TO_DRIVER.get(vendor, vendor),
+                "vendor": vendor,
+                "platform": d.get("platform", ""),
+                "type": d.get("type", ""),
+                "trust_tier": d.get("trust_tier", "YELLOW"),
+                "collector": d.get("collector", "none"),
+                "tags": d.get("tags", []),
+            }
+        return result
+
+    # Legacy fallback — read from devices.json
     try:
         with open(DEVICES_PATH) as f:
             raw = json.load(f)
-        # Handle VIRP source format: {"devices": [{"hostname": "R1", ...}]}
         if isinstance(raw, dict) and "devices" in raw and isinstance(raw["devices"], list):
             result = {}
             for d in raw["devices"]:
@@ -316,9 +357,6 @@ def load_devices() -> dict:
                 result[name] = {
                     "host": d.get("host", ""),
                     "driver": "cisco" if d.get("vendor", "").startswith("cisco") else d.get("driver", "unknown"),
-                    "username": d.get("username", ""),
-                    "password": d.get("password", ""),
-                    "enable": d.get("enable", ""),
                 }
             return result
         return raw
@@ -428,13 +466,20 @@ async def list_devices():
     devices = load_devices()
     result = []
     for name, config in devices.items():
-        result.append({
+        entry = {
             "name": name,
             "host": config.get("host", ""),
             "driver": config.get("driver", "unknown"),
-            "virp_supported": config.get("driver") == "cisco",  # POC: only Cisco for now
-        })
-    return {"devices": result, "total": len(result)}
+            "virp_supported": config.get("driver") in ("cisco", "fortigate", "panos", "cisco_asa"),
+        }
+        # Include richer metadata from device_registry when available
+        if _HAVE_REGISTRY:
+            entry["platform"] = config.get("platform", "")
+            entry["type"] = config.get("type", "")
+            entry["trust_tier"] = config.get("trust_tier", "YELLOW")
+            entry["tags"] = config.get("tags", [])
+        result.append(entry)
+    return {"devices": result, "total": len(result), "source": "devices.yaml" if _HAVE_REGISTRY else "devices.json"}
 
 
 @app.post("/api/observe")
@@ -447,10 +492,16 @@ async def observe(req: ObserveRequest):
         raise HTTPException(status_code=404, detail=f"Device '{req.device}' not registered")
 
     device_info = devices[req.device]
-    if device_info.get("driver") != "cisco":
+    _SUPPORTED_DRIVERS = {"cisco", "fortigate", "panos", "cisco_asa", "linux", "wazuh"}
+    if device_info.get("collector", "ssh") == "none":
         raise HTTPException(
             status_code=400,
-            detail=f"Device '{req.device}' uses driver '{device_info.get('driver')}' — only 'cisco' is VIRP-supported in POC"
+            detail=f"Device '{req.device}' has collector=none — not observable via SSH"
+        )
+    if device_info.get("driver") not in _SUPPORTED_DRIVERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Device '{req.device}' uses driver '{device_info.get('driver')}' — not VIRP-supported"
         )
 
     try:
@@ -493,8 +544,10 @@ async def sweep(req: SweepRequest):
     Each command is batched across all target devices simultaneously.
     """
     devices = load_devices()
+    _SWEEP_DRIVERS = {"cisco", "fortigate", "panos", "cisco_asa", "linux", "wazuh"}
     target_devices = req.devices or [
-        name for name, cfg in devices.items() if cfg.get("driver") == "cisco"
+        name for name, cfg in devices.items()
+        if cfg.get("driver") in _SWEEP_DRIVERS and cfg.get("collector", "ssh") != "none"
     ]
     commands = req.commands or [
         "show ip bgp summary",
@@ -508,8 +561,8 @@ async def sweep(req: SweepRequest):
     for device in target_devices:
         if device not in devices:
             errors.append({"device": device, "error": "Not registered"})
-        elif devices[device].get("driver") != "cisco":
-            errors.append({"device": device, "error": "Not VIRP-supported (POC: Cisco only)"})
+        elif devices[device].get("driver") not in _SWEEP_DRIVERS:
+            errors.append({"device": device, "error": f"Driver '{devices[device].get('driver')}' not supported"})
         else:
             valid_devices.append(device)
 
@@ -618,29 +671,57 @@ async def key_info():
 
 @app.post("/api/devices/add")
 async def add_device(req: DeviceAddRequest):
-    """Add a device to the registry."""
-    devices = load_devices()
-    devices[req.name] = {
+    """Add a device to the registry.
+
+    NOTE: During migration, this writes to the legacy devices.json.
+    The canonical source is /root/virp/devices.yaml — edit that file
+    for permanent additions.
+    """
+    if _HAVE_REGISTRY and _dr.get_device(req.name):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Device '{req.name}' already exists in devices.yaml. "
+                   f"Edit /root/virp/devices.yaml to modify it."
+        )
+    # Legacy fallback: write to devices.json
+    try:
+        with open(DEVICES_PATH) as f:
+            raw = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        raw = {}
+    raw[req.name] = {
         "host": req.host,
         "driver": req.driver,
-        "username": req.username,
-        "password": req.password,
-        "enable": req.enable,
     }
     with open(DEVICES_PATH, "w") as f:
-        json.dump(devices, f, indent=2)
-    return {"status": "added", "device": req.name}
+        json.dump(raw, f, indent=2)
+    return {
+        "status": "added",
+        "device": req.name,
+        "warning": "Added to legacy devices.json. For permanent changes, edit /root/virp/devices.yaml",
+    }
 
 
 @app.delete("/api/devices/{name}")
 async def remove_device(name: str):
     """Remove a device from the registry."""
-    devices = load_devices()
-    if name not in devices:
+    if _HAVE_REGISTRY and _dr.get_device(name):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Device '{name}' is defined in devices.yaml. "
+                   f"Edit /root/virp/devices.yaml to remove it."
+        )
+    # Legacy fallback
+    try:
+        with open(DEVICES_PATH) as f:
+            raw = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
         raise HTTPException(status_code=404, detail=f"Device '{name}' not found")
-    del devices[name]
+    if name not in raw:
+        raise HTTPException(status_code=404, detail=f"Device '{name}' not found")
+    del raw[name]
     with open(DEVICES_PATH, "w") as f:
-        json.dump(devices, f, indent=2)
+        json.dump(raw, f, indent=2)
     return {"status": "removed", "device": name}
 
 
