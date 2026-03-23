@@ -1,0 +1,25 @@
+# VIRP MCP Server Configuration
+# Copy to virp-mcp.yaml or ~/.virp/mcp.yaml
+
+onode:
+  # TCP connection (for remote O-Node via socat bridge)
+  host: "10.0.0.211"
+  port: 9999
+
+  # Unix socket (uncomment to use local socket instead of TCP)
+  # socket: "/tmp/virp-onode.sock"
+
+  # Command execution timeout (seconds)
+  timeout: 30
+
+server:
+  name: "virp-mcp-server"
+  log_level: "INFO"
+
+  # Transport: "stdio" for Claude Desktop / CLI agents
+  #            "sse" for web-based agents
+  transport: "stdio"
+
+  # SSE settings (only used when transport = "sse")
+  sse_host: "127.0.0.1"
+  sse_port: 8399

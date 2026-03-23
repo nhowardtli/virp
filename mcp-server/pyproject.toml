@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "virp-mcp-server"
+version = "0.1.0"
+description = "VIRP MCP Server — Cryptographic trust primitives for AI agents operating on live network infrastructure."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Nate Howard", email = "nhoward@thirdlevelit.com" },
+]
+keywords = [
+    "virp",
+    "mcp",
+    "network",
+    "infrastructure",
+    "cryptography",
+    "ai",
+    "trust",
+    "hmac",
+    "verification",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "mcp>=1.2.0",
+]
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://thirdlevel.ai"
+Repository = "https://github.com/nhowardtli/virp"
+Documentation = "https://github.com/nhowardtli/virp/tree/main/mcp-server"
+"Bug Tracker" = "https://github.com/nhowardtli/virp/issues"
+
+[project.scripts]
+virp-mcp = "virp_mcp.server:main"
+virp-mock-onode = "virp_mcp.mock_onode:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["virp_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
