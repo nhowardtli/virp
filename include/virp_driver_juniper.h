@@ -54,6 +54,15 @@ virp_trust_tier_t junos_route_command(const char *command);
  */
 junos_mode_t junos_parse_mode(const char *prompt);
 
+/*
+ * Detect if a command string is a batch (contains ';' or '\n' separators).
+ * Batch commands are executed sequentially in a single PTY session,
+ * preserving JunOS candidate configuration between commands.
+ *
+ * Example: "configure; set interfaces ge-0/0/0 ...; commit check; commit"
+ */
+bool junos_is_batch_command(const char *command);
+
 extern const size_t JUNOS_ROUTE_TABLE_SIZE;
 extern const junos_command_route_t JUNOS_ROUTE_TABLE[];
 

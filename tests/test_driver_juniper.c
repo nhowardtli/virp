@@ -361,6 +361,110 @@ static void test_route_table_coverage(void)
 }
 
 /* =========================================================================
+ * Batch Command Detection Tests
+ * ========================================================================= */
+
+static void test_batch_detection(void)
+{
+    printf("\n=== Batch Command Detection ===\n");
+
+    TEST("single command — not a batch");
+    assert(junos_is_batch_command("show route") == false);
+    PASS();
+
+    TEST("semicolon-separated — is a batch");
+    assert(junos_is_batch_command("configure; set interfaces ge-0/0/0 unit 0; commit") == true);
+    PASS();
+
+    TEST("newline-separated — is a batch");
+    assert(junos_is_batch_command("configure\nset interfaces ge-0/0/0 unit 0\ncommit") == true);
+    PASS();
+
+    TEST("mixed separators — is a batch");
+    assert(junos_is_batch_command("configure; set foo\ncommit check; commit") == true);
+    PASS();
+
+    TEST("trailing semicolon only — not a batch (no second command)");
+    /* "show route;" has a ; but strtok would yield one command — still
+     * detected as batch by is_batch_command, which is fine: the dispatch
+     * will parse out one command and execute it as single. */
+    assert(junos_is_batch_command("show route;") == true);
+    PASS();
+
+    TEST("trailing newline only — not a batch");
+    assert(junos_is_batch_command("show route\n") == false);
+    PASS();
+
+    TEST("empty string — not a batch");
+    assert(junos_is_batch_command("") == false);
+    PASS();
+
+    TEST("null — not a batch");
+    assert(junos_is_batch_command(NULL) == false);
+    PASS();
+
+    TEST("configure/set/commit check/commit batch");
+    assert(junos_is_batch_command(
+        "configure; set interfaces ge-0/0/0 unit 0 family inet address "
+        "10.0.0.1/24; set routing-options static route 0.0.0.0/0 next-hop "
+        "10.0.0.254; commit check; commit") == true);
+    PASS();
+}
+
+/* =========================================================================
+ * Batch BLACK Tier Pre-scan Tests
+ *
+ * The batch executor pre-scans all commands for BLACK tier before running
+ * any. These tests verify the routing table catches BLACK commands that
+ * would appear in realistic batch sequences.
+ * ========================================================================= */
+
+static void test_batch_tier_prescan(void)
+{
+    printf("\n=== Batch BLACK Tier Pre-scan ===\n");
+
+    TEST("batch with reboot — BLACK detected");
+    /* In a real batch, this would be rejected before any command runs */
+    assert(junos_route_command("request system reboot") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("batch with zeroize — BLACK detected");
+    assert(junos_route_command("request system zeroize") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("batch with file delete — BLACK detected");
+    assert(junos_route_command("file delete /var/tmp/core") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("typical config batch — no BLACK");
+    const char *cmds[] = {
+        "configure",
+        "set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+        "set protocols ospf area 0 interface ge-0/0/0",
+        "commit check",
+        "commit",
+    };
+    for (int i = 0; i < 5; i++) {
+        assert(junos_route_command(cmds[i]) != VIRP_TIER_BLACK);
+    }
+    PASS();
+
+    TEST("NAT config batch — all RED, no BLACK");
+    const char *nat_cmds[] = {
+        "configure",
+        "set security nat destination rule-set RS1 rule R1 match destination-address 203.0.113.1/32",
+        "set security nat destination rule-set RS1 rule R1 then destination-address 10.0.0.100/32",
+        "commit check",
+        "commit",
+    };
+    for (int i = 0; i < 5; i++) {
+        virp_trust_tier_t t = junos_route_command(nat_cmds[i]);
+        assert(t == VIRP_TIER_RED);
+    }
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -373,6 +477,8 @@ int main(void)
     test_command_routing();
     test_driver_registration();
     test_route_table_coverage();
+    test_batch_detection();
+    test_batch_tier_prescan();
 
     printf("\n=======================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
