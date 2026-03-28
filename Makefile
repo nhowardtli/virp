@@ -66,6 +66,28 @@ ifdef ASA
   LIB_OBJS += $(BUILD_DIR)/driver_asa.o $(BUILD_DIR)/parser_asa.o
 endif
 
+# Optional Wazuh driver (requires libcurl — REST API, not SSH)
+ifdef WAZUH
+  CFLAGS  += -DVIRP_DRIVER_WAZUH $(shell pkg-config --cflags libcurl 2>/dev/null)
+  LDFLAGS += $(shell pkg-config --libs libcurl 2>/dev/null || echo "-lcurl")
+  LIB_OBJS += $(BUILD_DIR)/driver_wazuh.o
+endif
+
+# Optional Juniper JunOS driver (requires libssh2)
+ifdef JUNIPER
+  CFLAGS  += -DVIRP_DRIVER_JUNIPER
+  ifndef CISCO
+    ifndef FORTIGATE
+      ifndef PANOS
+        ifndef ASA
+          LDFLAGS += -lssh2
+        endif
+      endif
+    endif
+  endif
+  LIB_OBJS += $(BUILD_DIR)/driver_juniper.o
+endif
+
 # Optional Linux driver (requires libssh2)
 ifdef LINUX
   CFLAGS  += -DVIRP_DRIVER_LINUX
@@ -121,7 +143,13 @@ $(BUILD_DIR)/driver_asa.o: src/drivers/driver_asa.c | $(BUILD_DIR)
 $(BUILD_DIR)/parser_asa.o: src/drivers/parser_asa.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/driver_juniper.o: src/drivers/driver_juniper.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/driver_linux.o: src/drivers/driver_linux.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_wazuh.o: src/drivers/driver_wazuh.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)
@@ -205,7 +233,16 @@ ONODE_PROD = $(BUILD_DIR)/virp-onode-prod
 $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -ljson-c -o $@
 
+prod: CISCO := 1
+prod: FORTIGATE := 1
+prod: PALOALTO := 1
+prod: ASA := 1
 prod: $(ONODE_PROD)
+
+# Full production build — recursive make ensures all ifdef guards evaluate correctly
+.PHONY: prod-full
+prod-full:
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 $(ONODE_PROD)
 
 # C/Go interop test
 TEST_INTEROP = $(BUILD_DIR)/test_interop_c
@@ -235,6 +272,15 @@ $(TEST_JSON): tests/test_json_extract.c $(LIB)
 test-json: $(TEST_JSON)
 	./$(TEST_JSON)
 
+# Wazuh driver tests (requires WAZUH=1 and live Wazuh Manager)
+TEST_WAZUH = $(BUILD_DIR)/test_driver_wazuh
+
+$(TEST_WAZUH): tests/test_driver_wazuh.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-wazuh: $(TEST_WAZUH)
+	./$(TEST_WAZUH)
+
 # Session negative-path tests
 TEST_SESSION_NEG = $(BUILD_DIR)/test_session_negative
 
@@ -252,5 +298,14 @@ $(TEST_SESSION_KEY): tests/test_session_key.c $(LIB)
 
 test-session-key: $(TEST_SESSION_KEY)
 	./$(TEST_SESSION_KEY)
+
+# Juniper JunOS driver tests
+TEST_JUNIPER = $(BUILD_DIR)/test_driver_juniper
+
+$(TEST_JUNIPER): tests/test_driver_juniper.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-juniper: $(TEST_JUNIPER)
+	./$(TEST_JUNIPER)
 
 all-tests: test test-onode test-chain test-federation test-interop test-json test-session test-session-key

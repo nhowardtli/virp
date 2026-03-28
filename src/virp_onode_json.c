@@ -108,6 +108,10 @@ int onode_load_devices_json(onode_state_t *state, const char *path)
             device.vendor = VIRP_VENDOR_PALOALTO;
         else if (strstr(vendor_str, "linux"))
             device.vendor = VIRP_VENDOR_LINUX;
+        else if (strstr(vendor_str, "wazuh"))
+            device.vendor = VIRP_VENDOR_WAZUH;
+        else if (strstr(vendor_str, "juniper") || strstr(vendor_str, "junos"))
+            device.vendor = VIRP_VENDOR_JUNIPER;
         else if (strstr(vendor_str, "mock"))
             device.vendor = VIRP_VENDOR_MOCK;
         else

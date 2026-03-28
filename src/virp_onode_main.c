@@ -37,6 +37,13 @@ extern void virp_driver_fortinet_init(void);
 #ifdef VIRP_DRIVER_PALOALTO
 extern void virp_driver_paloalto_init(void);
 #endif
+#ifdef VIRP_DRIVER_WAZUH
+extern void virp_driver_wazuh_init(void);
+#include <curl/curl.h>
+#endif
+#ifdef VIRP_DRIVER_JUNIPER
+extern void virp_driver_juniper_init(void);
+#endif
 
 static void signal_handler(int sig)
 {
@@ -135,6 +142,12 @@ int main(int argc, char **argv)
     printf("  Copyright (c) 2026 Third Level IT LLC\n");
     printf("================================================================\n\n");
 
+#ifdef VIRP_DRIVER_WAZUH
+    /* curl_global_init must be called before any CURL easy handles.
+     * Must happen before driver init since connect() creates handles. */
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+#endif
+
     /* Register drivers */
     virp_driver_mock_init();
 #ifdef VIRP_DRIVER_CISCO
@@ -148,6 +161,12 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_PALOALTO
     virp_driver_paloalto_init();
+#endif
+#ifdef VIRP_DRIVER_WAZUH
+    virp_driver_wazuh_init();
+#endif
+#ifdef VIRP_DRIVER_JUNIPER
+    virp_driver_juniper_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 
