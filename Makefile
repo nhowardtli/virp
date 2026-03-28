@@ -73,6 +73,21 @@ ifdef WAZUH
   LIB_OBJS += $(BUILD_DIR)/driver_wazuh.o
 endif
 
+# Optional Juniper JunOS driver (requires libssh2)
+ifdef JUNIPER
+  CFLAGS  += -DVIRP_DRIVER_JUNIPER
+  ifndef CISCO
+    ifndef FORTIGATE
+      ifndef PANOS
+        ifndef ASA
+          LDFLAGS += -lssh2
+        endif
+      endif
+    endif
+  endif
+  LIB_OBJS += $(BUILD_DIR)/driver_juniper.o
+endif
+
 # Optional Linux driver (requires libssh2)
 ifdef LINUX
   CFLAGS  += -DVIRP_DRIVER_LINUX
@@ -126,6 +141,9 @@ $(BUILD_DIR)/driver_asa.o: src/drivers/driver_asa.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/parser_asa.o: src/drivers/parser_asa.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_juniper.o: src/drivers/driver_juniper.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_linux.o: src/drivers/driver_linux.c | $(BUILD_DIR)
@@ -224,7 +242,7 @@ prod: $(ONODE_PROD)
 # Full production build — recursive make ensures all ifdef guards evaluate correctly
 .PHONY: prod-full
 prod-full:
-	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 $(ONODE_PROD)
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 $(ONODE_PROD)
 
 # C/Go interop test
 TEST_INTEROP = $(BUILD_DIR)/test_interop_c
@@ -280,5 +298,14 @@ $(TEST_SESSION_KEY): tests/test_session_key.c $(LIB)
 
 test-session-key: $(TEST_SESSION_KEY)
 	./$(TEST_SESSION_KEY)
+
+# Juniper JunOS driver tests
+TEST_JUNIPER = $(BUILD_DIR)/test_driver_juniper
+
+$(TEST_JUNIPER): tests/test_driver_juniper.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-juniper: $(TEST_JUNIPER)
+	./$(TEST_JUNIPER)
 
 all-tests: test test-onode test-chain test-federation test-interop test-json test-session test-session-key

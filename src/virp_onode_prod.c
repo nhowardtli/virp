@@ -47,6 +47,9 @@ extern void virp_driver_asa_init(void);
 extern void virp_driver_wazuh_init(void);
 #include <curl/curl.h>
 #endif
+#ifdef VIRP_DRIVER_JUNIPER
+extern void virp_driver_juniper_init(void);
+#endif
 
 static void signal_handler(int sig)
 {
@@ -289,6 +292,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_WAZUH
     virp_driver_wazuh_init();
+#endif
+#ifdef VIRP_DRIVER_JUNIPER
+    virp_driver_juniper_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 

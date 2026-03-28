@@ -141,26 +141,14 @@ def get_ssh_targets() -> dict:
 # AI / Prompt generation
 # ---------------------------------------------------------------------------
 
-def get_device_list_for_prompt() -> str:
-    """Generate device summary for AI system prompt injection.
-
-    Returns a human-readable multi-line string listing all enabled devices
-    with their platform, vendor, IP, type, tier, and site.
-    """
+def get_device_list_for_prompt():
+    """Generate device summary for AI system prompt injection."""
     devices = get_enabled_devices()
-    lines = []
-    for name, d in sorted(devices.items()):
-        notes = ""
-        if d.get("notes"):
-            notes = f" -- {d['notes']}"
-        lines.append(
-            f"- {name}: {d.get('platform', '?')} ({d['vendor']}) "
-            f"at {d['host']} [{d.get('type', '?')}] "
-            f"[{d.get('trust_tier', '?')}] site={d.get('site', '?')}"
-            f"{notes}"
-        )
+    lines = ["IMPORTANT: Always use the EXACT hostname shown below (before the colon) in all tool calls. Never abbreviate or rename devices."]
+    for name, d in devices.items():
+        lines.append(f"- {name}: {d['platform']} ({d['vendor']}) at {d['host']} "
+                     f"[{d['type']}] [{d['trust_tier']}] site={d['site']}")
     return "\n".join(lines)
-
 
 # ---------------------------------------------------------------------------
 # Metadata export (no credentials)

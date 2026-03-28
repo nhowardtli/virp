@@ -207,4 +207,8 @@ void virp_driver_asa_init(void);
 void virp_driver_wazuh_init(void);
 #endif
 
+#ifdef VIRP_DRIVER_JUNIPER
+void virp_driver_juniper_init(void);
+#endif
+
 #endif /* VIRP_DRIVER_H */
