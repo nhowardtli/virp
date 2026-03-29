@@ -625,6 +625,22 @@ static virp_error_t asa_execute(virp_conn_t *conn,
         return VIRP_OK;
     }
 
+    /* ── BLACK tier safety: never execute destructive commands ── */
+    virp_trust_tier_t tier = asa_route_command(command);
+    if (tier == VIRP_TIER_BLACK) {
+        result->success = false;
+        result->exit_code = 1;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "BLACK tier: command blocked on %s", conn->device.hostname);
+        fprintf(stderr, "[ASA] BLACK tier blocked: '%s' on %s\n",
+                command, conn->device.hostname);
+        int written = snprintf(result->output, sizeof(result->output),
+                               "%s# %s\nBLACK tier: command forbidden",
+                               conn->device.hostname, command);
+        result->output_len = (written > 0) ? (size_t)written : 0;
+        return VIRP_OK;
+    }
+
     /* Step 1: Flush stale output */
     asa_flush_buffer(conn);
 

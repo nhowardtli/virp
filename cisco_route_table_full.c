@@ -17,7 +17,7 @@
  *   GREEN  — show commands (read-only state), auto-execute
  *   YELLOW — config reads, debug setup, flag operator
  *   RED    — credential exposure, human approval required
- *   BLACK  — not in table (reload, erase startup-config)
+ *   BLACK  — destructive (reload, erase startup-config, delete flash)
  *
  * Copyright 2026 Third Level IT LLC — Apache 2.0
  */
@@ -908,6 +908,53 @@ const cisco_command_route_t CISCO_ROUTE_TABLE[] = {
     { "show running-config crypto",
       NULL, NULL,
       CISCO_DS_RUNNING, VIRP_TIER_RED },
+
+    /* ═══════════════════════════════════════════════════════════════
+     * BLACK TIER — Destructive operations, never transmitted
+     *
+     * No RESTCONF path, no YANG model — these are rejected at the
+     * driver level before any bytes hit the wire.
+     * ═══════════════════════════════════════════════════════════════ */
+
+    { "reload",
+      NULL, NULL,
+      CISCO_DS_OPERATIONAL, VIRP_TIER_BLACK },
+
+    { "write erase",
+      NULL, NULL,
+      CISCO_DS_OPERATIONAL, VIRP_TIER_BLACK },
+
+    { "erase startup-config",
+      NULL, NULL,
+      CISCO_DS_OPERATIONAL, VIRP_TIER_BLACK },
+
+    { "erase startup",
+      NULL, NULL,
+      CISCO_DS_OPERATIONAL, VIRP_TIER_BLACK },
+
+    { "delete flash:",
+      NULL, NULL,
+      CISCO_DS_OPERATIONAL, VIRP_TIER_BLACK },
+
+    { "delete bootflash:",
+      NULL, NULL,
+      CISCO_DS_OPERATIONAL, VIRP_TIER_BLACK },
+
+    { "delete nvram:",
+      NULL, NULL,
+      CISCO_DS_OPERATIONAL, VIRP_TIER_BLACK },
+
+    { "squeeze flash:",
+      NULL, NULL,
+      CISCO_DS_OPERATIONAL, VIRP_TIER_BLACK },
+
+    { "format flash:",
+      NULL, NULL,
+      CISCO_DS_OPERATIONAL, VIRP_TIER_BLACK },
+
+    { "format bootflash:",
+      NULL, NULL,
+      CISCO_DS_OPERATIONAL, VIRP_TIER_BLACK },
 };
 
 const size_t CISCO_ROUTE_TABLE_SIZE =
@@ -933,17 +980,16 @@ const size_t CISCO_ROUTE_TABLE_SIZE =
  *   telnet                         — Telnet test
  *   ssh                            — SSH test from device
  *
- * NEVER auto-execute (handled by approval queue):
+ * NEVER auto-execute (BLACK tier — blocked at driver level):
  *   reload                         — Reboot
  *   write erase                    — Erase startup-config
  *   erase startup-config           — Same
  *   delete flash:                  — Delete files
  *   squeeze flash:                 — Reclaim space
- *   copy running-config startup    — Save config
- *   configure terminal             — Enter config mode
+ *   format flash:                  — Format flash filesystem
  *
- * These are not in the routing table because they don't exist
- * as read operations. The VIRP approval queue handles them
- * at a higher level.
+ * These are now explicitly BLACK tier in the routing table AND
+ * enforced by cisco_is_black_tier() in the driver execute path.
+ * No code path — the O-Node returns an error, not a pending approval.
  * ═══════════════════════════════════════════════════════════════════
  */

@@ -27,6 +27,12 @@ extern "C" {
 /* Driver init — call once at startup to register with driver registry */
 void virp_driver_fortinet_init(void);
 
+/*
+ * BLACK tier check — returns true if the command is destructive
+ * and must never be transmitted to the device.
+ */
+bool fg_is_black_tier(const char *command);
+
 #ifdef __cplusplus
 }
 #endif

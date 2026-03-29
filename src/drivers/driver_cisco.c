@@ -405,6 +405,40 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
  * Driver: execute
  * ========================================================================= */
 
+/* =========================================================================
+ * BLACK Tier — Destructive commands that must never reach the wire.
+ *
+ * These are prefix-matched (case-insensitive).  Any command that starts
+ * with one of these strings is rejected outright — no SSH, no approval
+ * queue, no code path.
+ * ========================================================================= */
+
+static const char *CISCO_BLACK_COMMANDS[] = {
+    "reload",
+    "write erase",
+    "erase startup-config",
+    "erase startup",
+    "delete flash:",
+    "delete bootflash:",
+    "delete nvram:",
+    "squeeze flash:",
+    "format flash:",
+    "format bootflash:",
+};
+static const size_t CISCO_BLACK_COUNT =
+    sizeof(CISCO_BLACK_COMMANDS) / sizeof(CISCO_BLACK_COMMANDS[0]);
+
+bool cisco_is_black_tier(const char *command)
+{
+    if (!command) return false;
+    for (size_t i = 0; i < CISCO_BLACK_COUNT; i++) {
+        size_t plen = strlen(CISCO_BLACK_COMMANDS[i]);
+        if (strncasecmp(command, CISCO_BLACK_COMMANDS[i], plen) == 0)
+            return true;
+    }
+    return false;
+}
+
 static virp_error_t cisco_execute(virp_conn_t *conn,
                                   const char *command,
                                   virp_exec_result_t *result)
@@ -413,6 +447,21 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
         return VIRP_ERR_NULL_PTR;
 
     memset(result, 0, sizeof(*result));
+
+    /* ── BLACK tier safety: never execute destructive commands ── */
+    if (cisco_is_black_tier(command)) {
+        result->success = false;
+        result->exit_code = 1;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "BLACK tier: command blocked on %s", conn->device.hostname);
+        fprintf(stderr, "[Cisco] BLACK tier blocked: '%s' on %s\n",
+                command, conn->device.hostname);
+        int written = snprintf(result->output, sizeof(result->output),
+                               "%s#%s\nBLACK tier: command forbidden",
+                               conn->device.hostname, command);
+        result->output_len = (written > 0) ? (size_t)written : 0;
+        return VIRP_OK;
+    }
 
     if (!conn->connected) {
         result->success = false;

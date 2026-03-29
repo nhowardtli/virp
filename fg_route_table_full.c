@@ -8,9 +8,11 @@
  *   GREEN  — Read-only runtime monitoring, auto-execute
  *   YELLOW — Config reads, advanced diagnostics, flag operator
  *   RED    — Security-sensitive reads, human approval required
- *   BLACK  — Not in table (structurally impossible)
+ *   BLACK  — Destructive (factoryreset, formatdisk, reboot, shutdown)
  *
  * Commands not in this table → SSH transport, YELLOW tier.
+ * BLACK tier commands are also enforced by fg_is_black_tier()
+ * in the driver execute path — no code path to the wire.
  *
  * Copyright 2026 Third Level IT LLC — Apache 2.0
  */
@@ -708,6 +710,33 @@ const fg_command_route_t FG_ROUTE_TABLE[] = {
     { "get system config backup",
       "system/config/backup", "scope=global",
       FG_API_MONITOR, VIRP_TIER_RED },
+
+    /* ═══════════════════════════════════════════════════════════════
+     * BLACK TIER — Destructive operations, never transmitted
+     *
+     * No REST API path — these are rejected at the driver level
+     * before any bytes hit the wire.
+     * ═══════════════════════════════════════════════════════════════ */
+
+    { "execute factoryreset",
+      NULL, NULL,
+      FG_API_MONITOR, VIRP_TIER_BLACK },
+
+    { "execute formatdisk",
+      NULL, NULL,
+      FG_API_MONITOR, VIRP_TIER_BLACK },
+
+    { "execute reboot",
+      NULL, NULL,
+      FG_API_MONITOR, VIRP_TIER_BLACK },
+
+    { "execute shutdown",
+      NULL, NULL,
+      FG_API_MONITOR, VIRP_TIER_BLACK },
+
+    { "fnsysctl",
+      NULL, NULL,
+      FG_API_MONITOR, VIRP_TIER_BLACK },
 };
 
 const size_t FG_ROUTE_TABLE_SIZE =
@@ -744,8 +773,8 @@ const size_t FG_ROUTE_TABLE_SIZE =
  *   fnsysctl cat                 — Hidden Linux shell
  *   fnsysctl ifconfig            — Hidden Linux shell
  *
- * The SSH fallback at YELLOW tier is intentional.
+ * The SSH fallback at YELLOW tier is intentional for diagnostics.
  * Dangerous execute commands (reboot, shutdown, factoryreset)
- * should be handled by the VIRP approval queue at a higher
- * level, not by the routing table.
+ * are now BLACK tier in the routing table AND enforced by
+ * fg_is_black_tier() in the driver — no code path to the wire.
  * ═══════════════════════════════════════════════════════════════════ */

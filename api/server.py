@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import socket
 import struct
 import time
@@ -66,6 +67,32 @@ MAX_LOG_SIZE = 1000
 appliance_start_time = time.time()
 key_material = None
 key_fingerprint = None
+
+# Observation payload cache — stores raw signed output for content fidelity checks.
+# Key: (device, sequence) → {"payload": str, "verified": bool, "timestamp": float}
+_obs_payload_cache: dict[tuple[str, int], dict] = {}
+_OBS_CACHE_MAX = 500
+
+
+def _cache_observation(device: str, sequence: int, payload: str,
+                       verified: bool, timestamp: float = 0.0):
+    """Store a raw observation payload for content fidelity gate lookups."""
+    _obs_payload_cache[(device, sequence)] = {
+        "payload": payload,
+        "verified": verified,
+        "timestamp": timestamp or time.time(),
+    }
+    while len(_obs_payload_cache) > _OBS_CACHE_MAX:
+        _obs_payload_cache.pop(next(iter(_obs_payload_cache)))
+
+
+def _get_latest_cached(device: str) -> Optional[dict]:
+    """Get the most recent cached observation for a device."""
+    latest = None
+    for (d, seq), entry in _obs_payload_cache.items():
+        if d == device and (latest is None or seq > latest[0]):
+            latest = (seq, entry)
+    return latest[1] if latest else None
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +197,263 @@ def parse_virp_message(msg: bytes) -> dict:
         "hmac_hex": received_hmac.hex(),
         "verified": verified,
         "raw_size": len(msg),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Observation Gate: Content Fidelity Verification
+# ---------------------------------------------------------------------------
+#
+# Pass 1 (existing): HMAC verification — did signed data come back?
+# Pass 2 (new):      Content fidelity — does the AI's response accurately
+#                     reflect what the signed data actually says?
+#
+# Claim types cross-referenced:
+#   - Numeric counts:    "N running VMs" vs actual count in signed output
+#   - Universal claims:  "all interfaces up" vs exceptions in signed output
+#   - IP addresses:      IPs in AI text must appear in signed observation
+# ---------------------------------------------------------------------------
+
+# ── Claim extraction patterns ──
+
+_COUNT_PATTERN = re.compile(
+    r'\b(\d+)\s+'
+    r'(running|active|up|down|idle|established|stopped|failed|configured|'
+    r'enabled|disabled|healthy|unhealthy|online|offline|connected|'
+    r'disconnected|listening|blocked|open|closed|reachable|unreachable)\s+'
+    r'(VMs?|virtual\s+machines?|interfaces?|neighbors?|sessions?|routes?|'
+    r'policies|rules?|users?|processes|services?|containers?|nodes?|'
+    r'peers?|connections?|ports?|instances?|members?|devices?|tunnels?|'
+    r'zones?|vlans?|prefixes|adjacencies|circuits?)',
+    re.IGNORECASE
+)
+
+_ALL_NONE_PATTERN = re.compile(
+    r'\b(all|every|each|no|none|zero)\s+\S+(?:\s+\S+){0,4}?\s+'
+    r'(?:are|is|have|has|were|was|show|report)\s+'
+    r'(up|down|running|active|established|healthy|online|offline|'
+    r'stopped|failed|inactive|idle|connected|disconnected|'
+    r'unreachable|reachable|operational|degraded)',
+    re.IGNORECASE
+)
+
+_IP_PATTERN = re.compile(
+    r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:/\d{1,2})?)\b'
+)
+
+_STATUS_ANTONYMS = {
+    "up": ["down", "administratively down", "err-disabled", "not connect"],
+    "down": ["up"],
+    "running": ["stopped", "halted", "failed", "exited", "dead", "inactive"],
+    "stopped": ["running", "active"],
+    "active": ["inactive", "standby", "failed"],
+    "established": ["idle", "active", "connect", "opensent", "openconfirm"],
+    "healthy": ["unhealthy", "degraded", "failed", "critical"],
+    "online": ["offline", "unreachable"],
+    "connected": ["disconnected", "unreachable"],
+    "reachable": ["unreachable"],
+    "operational": ["degraded", "failed", "down"],
+}
+
+
+def _count_in_raw(raw_output: str, qualifier: str) -> int:
+    """Count data lines containing a qualifier word in device output.
+
+    Skips empty lines and separator lines (----, ====, etc.).
+    Returns 0 if qualifier not found anywhere.
+    """
+    pattern = re.compile(r'\b' + re.escape(qualifier) + r'\b', re.IGNORECASE)
+    count = 0
+    for line in raw_output.strip().splitlines():
+        stripped = line.strip()
+        if not stripped or re.match(r'^[-=~+#*]+$', stripped):
+            continue
+        if pattern.search(stripped):
+            count += 1
+    return count
+
+
+def _check_universal_claim(raw_output: str, quantifier: str,
+                           status: str) -> Optional[dict]:
+    """Check an all/none claim against raw output.
+
+    Returns mismatch details if contradicted, None if supported.
+    """
+    status_lower = status.lower()
+    is_universal = quantifier.lower() in ("all", "every", "each")
+    is_negation = quantifier.lower() in ("no", "none", "zero")
+
+    anti = _STATUS_ANTONYMS.get(status_lower, [])
+    lines = raw_output.strip().splitlines()
+
+    if is_universal and anti:
+        for line in lines:
+            ll = line.lower()
+            for a in anti:
+                if a in ll and re.search(r'\d', line):
+                    return {
+                        "quantifier": quantifier,
+                        "claimed_status": status,
+                        "contradiction": line.strip()[:150],
+                        "detail": f"'{quantifier}...{status}' contradicted — "
+                                  f"found '{a}' in signed data",
+                    }
+    elif is_negation:
+        pattern = re.compile(r'\b' + re.escape(status_lower) + r'\b',
+                             re.IGNORECASE)
+        for line in lines:
+            if pattern.search(line) and re.search(r'\d', line):
+                return {
+                    "quantifier": quantifier,
+                    "claimed_status": status,
+                    "contradiction": line.strip()[:150],
+                    "detail": f"'{quantifier}...{status}' contradicted — "
+                              f"found '{status}' in signed data",
+                }
+    return None
+
+
+def _find_device_scope(text: str, match_pos: int,
+                       device_names: list[str],
+                       window: int = 300) -> Optional[str]:
+    """Find which device a claim is about based on proximity in the AI text."""
+    start = max(0, match_pos - window)
+    end = min(len(text), match_pos + window)
+    context = text[start:end].lower()
+    claim_offset = match_pos - start
+
+    closest = None
+    closest_dist = float("inf")
+    for name in device_names:
+        idx = context.find(name.lower())
+        if idx >= 0:
+            dist = abs(idx - claim_offset)
+            if dist < closest_dist:
+                closest_dist = dist
+                closest = name
+    return closest
+
+
+def check_content_fidelity(ai_response: str,
+                           observations: list[dict]) -> dict:
+    """Cross-reference AI claims against raw signed observation payloads.
+
+    Args:
+        ai_response:  The AI-generated text to verify.
+        observations: List of dicts with at least "device" and "payload" keys.
+
+    Returns:
+        {"passed": bool, "mismatches": [...], "verified": int, "unchecked": int}
+    """
+    mismatches = []
+    verified = 0
+    unchecked = 0
+
+    if not observations:
+        return {"passed": True, "mismatches": [], "verified": 0, "unchecked": 0}
+
+    device_payloads = {}
+    for obs in observations:
+        dev = obs.get("device", "")
+        pay = obs.get("payload", "")
+        if dev and pay:
+            # Concatenate if multiple observations per device (e.g., multi-command)
+            device_payloads[dev] = device_payloads.get(dev, "") + "\n" + pay
+
+    all_payload = "\n".join(device_payloads.values()).strip()
+    if not all_payload:
+        return {"passed": True, "mismatches": [], "verified": 0, "unchecked": 0}
+
+    device_names = list(device_payloads.keys())
+
+    # ── Check 1: Numeric count claims ──
+    for m in _COUNT_PATTERN.finditer(ai_response):
+        claimed = int(m.group(1))
+        qualifier = m.group(2)
+        noun = m.group(3)
+
+        # Scope to the relevant device if possible
+        scoped_dev = _find_device_scope(ai_response, m.start(), device_names)
+        target_payload = (device_payloads.get(scoped_dev, all_payload)
+                          if scoped_dev else all_payload)
+
+        raw_count = _count_in_raw(target_payload, qualifier)
+        if raw_count == 0:
+            unchecked += 1
+            continue
+
+        # Allow ±1 tolerance for header-line ambiguity
+        min_actual = max(0, raw_count - 1)
+        max_actual = raw_count
+        if claimed < min_actual or claimed > max_actual:
+            mismatches.append({
+                "type": "count",
+                "claim": m.group(0),
+                "claimed": claimed,
+                "signed_range": [min_actual, max_actual],
+                "raw_lines": raw_count,
+                "qualifier": qualifier,
+                "noun": noun,
+                "device": scoped_dev,
+                "detail": (f"AI claimed {claimed} {qualifier} {noun} — "
+                           f"signed data shows {min_actual}-{max_actual}"),
+            })
+        else:
+            verified += 1
+
+    # ── Check 2: Universal / negation claims ──
+    for m in _ALL_NONE_PATTERN.finditer(ai_response):
+        quantifier = m.group(1)
+        status = m.group(2)
+
+        scoped_dev = _find_device_scope(ai_response, m.start(), device_names)
+        target_payload = (device_payloads.get(scoped_dev, all_payload)
+                          if scoped_dev else all_payload)
+
+        contradiction = _check_universal_claim(target_payload, quantifier, status)
+        if contradiction:
+            mismatches.append({
+                "type": "universal",
+                "claim": m.group(0),
+                "device": scoped_dev,
+                **contradiction,
+            })
+        else:
+            verified += 1
+
+    # ── Check 3: IP addresses ──
+    ai_ips = set(_IP_PATTERN.findall(ai_response))
+    payload_text = all_payload  # IPs checked against all signed data
+
+    for ip in ai_ips:
+        base_ip = ip.split("/")[0]
+        octets = base_ip.split(".")
+        if len(octets) != 4:
+            continue
+        try:
+            if not all(0 <= int(o) <= 255 for o in octets):
+                continue
+        except ValueError:
+            continue
+        # Skip non-routable / broadcast / link-local noise
+        if base_ip in ("0.0.0.0", "255.255.255.255", "127.0.0.1"):
+            continue
+
+        if base_ip in payload_text or ip in payload_text:
+            verified += 1
+        else:
+            mismatches.append({
+                "type": "ip_address",
+                "claim": ip,
+                "detail": (f"IP {ip} in AI response not found "
+                           f"in any signed observation payload"),
+            })
+
+    return {
+        "passed": len(mismatches) == 0,
+        "mismatches": mismatches,
+        "verified": verified,
+        "unchecked": unchecked,
     }
 
 
@@ -392,6 +676,13 @@ class DeviceAddRequest(BaseModel):
     enable: str = ""
 
 
+class GateRequest(BaseModel):
+    """Observation Gate request — verify AI response against signed data."""
+    response: str                               # AI-generated text
+    observations: Optional[list[dict]] = None   # Full obs dicts (device + payload)
+    device_refs: Optional[list[str]] = None     # Alternative: look up cached payloads
+
+
 # ---------------------------------------------------------------------------
 # Auth Middleware
 # ---------------------------------------------------------------------------
@@ -513,6 +804,15 @@ async def observe(req: ObserveRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Observation failed: {e}")
 
+    # Cache payload for content fidelity gate
+    _cache_observation(
+        device=req.device,
+        sequence=obs.get("sequence", 0),
+        payload=obs.get("payload", ""),
+        verified=obs.get("verified", False),
+        timestamp=obs.get("timestamp", 0.0),
+    )
+
     # Log it
     log_entry = {
         "id": str(uuid.uuid4()),
@@ -583,6 +883,13 @@ async def sweep(req: SweepRequest):
                         "verified": False,
                     })
                 else:
+                    _cache_observation(
+                        device=dev,
+                        sequence=obs.get("sequence", 0),
+                        payload=obs.get("payload", ""),
+                        verified=obs.get("verified", False),
+                        timestamp=obs.get("timestamp", 0.0),
+                    )
                     device_results.get(dev, []).append({
                         "command": cmd,
                         "verified": obs.get("verified", False),
@@ -654,6 +961,133 @@ async def get_observations(limit: int = 50, device: Optional[str] = None):
     return {
         "observations": list(reversed(logs[-limit:])),
         "total": len(logs),
+    }
+
+
+@app.post("/api/gate")
+async def observation_gate(req: GateRequest):
+    """Observation Gate — verify AI response fidelity against signed data.
+
+    Two-pass verification:
+      Pass 1: Device reference — did signed observations come back for
+              every device the AI mentions?  (existing HMAC check)
+      Pass 2: Content fidelity — does the AI's text accurately reflect
+              what the signed data actually says?  (new)
+
+    Tags returned:
+      [OBSERVATION GATE: VERIFIED]          — both passes clear
+      [OBSERVATION GATE: UNVERIFIED]        — no signed data for a referenced device
+      [OBSERVATION GATE: CONTENT MISMATCH]  — signed data contradicts AI claims
+    """
+    checks = []
+    tags = []
+
+    # ── Resolve observations ──
+    # Caller can pass full observation dicts OR device names (we look up cached).
+    observations = list(req.observations or [])
+
+    if req.device_refs:
+        obs_devices_seen = {o.get("device") for o in observations}
+        for dev in req.device_refs:
+            if dev in obs_devices_seen:
+                continue
+            cached = _get_latest_cached(dev)
+            if cached:
+                observations.append({
+                    "device": dev,
+                    "payload": cached["payload"],
+                    "verified": cached["verified"],
+                })
+
+    # ── Pass 1: Device reference check ──
+    devices = load_devices()
+    referenced_devices: set[str] = set()
+    response_lower = req.response.lower()
+
+    for name in devices:
+        if name.lower() in response_lower:
+            referenced_devices.add(name)
+    if req.device_refs:
+        referenced_devices.update(req.device_refs)
+
+    obs_by_device = {}
+    for o in observations:
+        d = o.get("device", "")
+        if d:
+            obs_by_device[d] = o
+
+    for device in sorted(referenced_devices):
+        obs = obs_by_device.get(device)
+        if obs and obs.get("verified", False):
+            checks.append({
+                "pass": 1,
+                "type": "device_reference",
+                "device": device,
+                "status": "VERIFIED",
+                "detail": "Signed observation present and HMAC-verified",
+            })
+        elif obs:
+            checks.append({
+                "pass": 1,
+                "type": "device_reference",
+                "device": device,
+                "status": "UNVERIFIED",
+                "detail": "Observation present but HMAC verification failed",
+            })
+            tags.append(f"[OBSERVATION GATE: UNVERIFIED — {device}]")
+        else:
+            checks.append({
+                "pass": 1,
+                "type": "device_reference",
+                "device": device,
+                "status": "UNVERIFIED",
+                "detail": "No signed observation for this device",
+            })
+            tags.append(f"[OBSERVATION GATE: UNVERIFIED — {device}]")
+
+    # ── Pass 2: Content fidelity (only verified observations) ──
+    verified_obs = [o for o in observations if o.get("verified", False)]
+
+    if verified_obs:
+        fidelity = check_content_fidelity(req.response, verified_obs)
+
+        if not fidelity["passed"]:
+            for mm in fidelity["mismatches"]:
+                checks.append({
+                    "pass": 2,
+                    "type": "content_fidelity",
+                    "status": "CONTENT_MISMATCH",
+                    **mm,
+                })
+            tags.append("[OBSERVATION GATE: CONTENT MISMATCH]")
+        else:
+            checks.append({
+                "pass": 2,
+                "type": "content_fidelity",
+                "status": "VERIFIED",
+                "claims_verified": fidelity["verified"],
+                "claims_unchecked": fidelity["unchecked"],
+            })
+
+    # ── Determine overall gate result ──
+    has_unverified = any(c.get("status") == "UNVERIFIED" for c in checks)
+    has_mismatch = any(c.get("status") == "CONTENT_MISMATCH" for c in checks)
+
+    if not has_unverified and not has_mismatch and checks:
+        tags.append("[OBSERVATION GATE: VERIFIED]")
+
+    return {
+        "gate_pass": not has_unverified and not has_mismatch,
+        "tags": tags,
+        "checks": checks,
+        "summary": {
+            "devices_referenced": len(referenced_devices),
+            "observations_available": len(observations),
+            "verified_observations": len(verified_obs),
+            "content_mismatches": sum(
+                1 for c in checks if c.get("status") == "CONTENT_MISMATCH"
+            ),
+        },
     }
 
 
