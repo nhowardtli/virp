@@ -2,7 +2,7 @@
  * driver_fortigate.c — FortiGate device driver implementation
  *
  * Ported to VIRP appliance type system (fixed buffers, virp_driver.h).
- * Original from tli-ops-center/virp/src/driver_fortigate.c.
+ * Original from ironclaw/virp/src/driver_fortigate.c.
  *
  * Implements the five virp_driver_t functions:
  *   connect     — Establish SSH connection
@@ -348,6 +348,34 @@ static virp_conn_t *fg_connect(const virp_device_t *device)
 }
 
 
+/* ══════════════════════════════════════════════════════════════════
+ * BLACK Tier — Destructive commands that must never reach the wire.
+ *
+ * Prefix-matched (case-insensitive).  Any command that starts with
+ * one of these strings is rejected outright at the driver level.
+ * ══════════════════════════════════════════════════════════════════ */
+
+static const char *FG_BLACK_COMMANDS[] = {
+    "execute factoryreset",
+    "execute formatdisk",
+    "execute reboot",
+    "execute shutdown",
+    "fnsysctl",
+};
+static const size_t FG_BLACK_COUNT =
+    sizeof(FG_BLACK_COMMANDS) / sizeof(FG_BLACK_COMMANDS[0]);
+
+bool fg_is_black_tier(const char *command)
+{
+    if (!command) return false;
+    for (size_t i = 0; i < FG_BLACK_COUNT; i++) {
+        size_t plen = strlen(FG_BLACK_COMMANDS[i]);
+        if (strncasecmp(command, FG_BLACK_COMMANDS[i], plen) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* ── execute ────────────────────────────────────────────────────── */
 static virp_error_t fg_execute(virp_conn_t *base_conn,
                                const char *command,
@@ -358,6 +386,22 @@ static virp_error_t fg_execute(virp_conn_t *base_conn,
 
     struct virp_conn *conn = (struct virp_conn *)base_conn;
     memset(result, 0, sizeof(*result));
+
+    /* ── BLACK tier safety: never execute destructive commands ── */
+    if (fg_is_black_tier(command)) {
+        result->success = false;
+        result->exit_code = 1;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "BLACK tier: command blocked on %s",
+                 conn->device.hostname);
+        fprintf(stderr, "[FortiGate] BLACK tier blocked: '%s' on %s\n",
+                command, conn->device.hostname);
+        int written = snprintf(result->output, sizeof(result->output),
+                               "%s $ %s\nBLACK tier: command forbidden",
+                               conn->device.hostname, command);
+        result->output_len = (written > 0) ? (size_t)written : 0;
+        return VIRP_OK;
+    }
 
     if (!conn->ssh_connected) {
         snprintf(result->error_msg, sizeof(result->error_msg),

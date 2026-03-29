@@ -386,6 +386,10 @@ static bool asa_enter_enable(virp_conn_t *conn)
         char discard[4096];
         ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
 
+        /* Set terminal width to prevent 80-char line wrapping */
+        ssh_write(conn, "terminal width 512\n");
+        ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
+
         return true;
     }
 
@@ -576,9 +580,12 @@ static virp_conn_t *asa_connect(const virp_device_t *device)
     } else if (conn->current_mode == ASA_MODE_ENABLE ||
                conn->current_mode == ASA_MODE_CONFIG) {
         conn->in_enable = true;
-        /* Already in enable — just disable pager */
+        /* Already in enable — just disable pager and set width */
         ssh_write(conn, "terminal pager 0\n");
         char discard[4096];
+        ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
+
+        ssh_write(conn, "terminal width 512\n");
         ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
     }
 
@@ -615,6 +622,22 @@ static virp_error_t asa_execute(virp_conn_t *conn,
         result->success = false;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Not connected to %s", conn->device.hostname);
+        return VIRP_OK;
+    }
+
+    /* ── BLACK tier safety: never execute destructive commands ── */
+    virp_trust_tier_t tier = asa_route_command(command);
+    if (tier == VIRP_TIER_BLACK) {
+        result->success = false;
+        result->exit_code = 1;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "BLACK tier: command blocked on %s", conn->device.hostname);
+        fprintf(stderr, "[ASA] BLACK tier blocked: '%s' on %s\n",
+                command, conn->device.hostname);
+        int written = snprintf(result->output, sizeof(result->output),
+                               "%s# %s\nBLACK tier: command forbidden",
+                               conn->device.hostname, command);
+        result->output_len = (written > 0) ? (size_t)written : 0;
         return VIRP_OK;
     }
 

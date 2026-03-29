@@ -99,6 +99,12 @@ virp_error_t cisco_route_command(const char *command,
                                  const char **restconf_path,
                                  const char **yang_module);
 
+/*
+ * BLACK tier check — returns true if the command is destructive
+ * and must never be transmitted to the device.
+ */
+bool cisco_is_black_tier(const char *command);
+
 extern const size_t CISCO_ROUTE_TABLE_SIZE;
 extern const cisco_command_route_t CISCO_ROUTE_TABLE[];
 
