@@ -1,0 +1,19 @@
+[Unit]
+Description=VIRP Chain Verification Service
+After=network.target virp-onode.service
+
+[Service]
+Type=simple
+User=virp-verify
+Group=virp-onode
+ExecStart=/usr/bin/python3 /opt/virp/virp-verify.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Read-only access to chain.db via group membership
+SupplementaryGroups=virp-onode
+
+[Install]
+WantedBy=multi-user.target
