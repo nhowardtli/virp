@@ -201,6 +201,9 @@ int main(int argc, char **argv)
         add_mock_devices(&g_state);
     }
 
+    /* Wipe session material on exit */
+    atexit(virp_session_destroy);
+
     /* Install signal handlers */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
