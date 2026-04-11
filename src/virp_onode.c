@@ -633,10 +633,10 @@ static int hex_decode(const char *hex, uint8_t *out, size_t out_len)
 }
 
 /* Encode bytes to lowercase hex. buf must hold 2*len+1 bytes. */
-static void hex_encode(char *buf, const uint8_t *data, size_t len)
+static void hex_encode(char *buf, size_t buf_size, const uint8_t *data, size_t len)
 {
     for (size_t i = 0; i < len; i++)
-        sprintf(buf + i * 2, "%02x", data[i]);
+        snprintf(buf + i * 2, buf_size - i * 2, "%02x", data[i]);
     buf[len * 2] = '\0';
 }
 
@@ -1192,9 +1192,9 @@ static void handle_client(onode_state_t *state, int client_fd)
 
         /* Return HELLO_ACK as JSON */
         char sid_hex[33], cn_hex[17], sn_hex[17];
-        hex_encode(sid_hex, ack.session_id, 16);
-        hex_encode(cn_hex, ack.client_nonce, 8);
-        hex_encode(sn_hex, ack.server_nonce, 8);
+        hex_encode(sid_hex, sizeof(sid_hex), ack.session_id, 16);
+        hex_encode(cn_hex, sizeof(cn_hex), ack.client_nonce, 8);
+        hex_encode(sn_hex, sizeof(sn_hex), ack.server_nonce, 8);
 
         char json_resp[1024];
         int jlen = snprintf(json_resp, sizeof(json_resp),

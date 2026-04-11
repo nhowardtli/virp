@@ -308,6 +308,13 @@ $(TEST_JUNIPER): tests/test_driver_juniper.c $(LIB)
 test-juniper: $(TEST_JUNIPER)
 	./$(TEST_JUNIPER)
 
+# Lint: fail build if sprintf( appears in src/ (use snprintf instead)
+.PHONY: lint-sprintf
+lint-sprintf:
+	@echo "=== checking for banned sprintf in src/ ==="
+	@if grep -rn 'sprintf(' src/; then echo "FAIL: sprintf found — use snprintf"; exit 1; fi
+	@echo "  PASS: no sprintf found"
+
 # Lint: report any memcmp usage in src/ for human review (advisory, not fatal)
 .PHONY: lint-memcmp
 lint-memcmp:

@@ -23,10 +23,10 @@
 #include <openssl/rand.h>
 
 /* Format len bytes as lowercase hex into buf (must hold 2*len+1). */
-static void hs_hex(char *buf, const uint8_t *data, size_t len)
+static void hs_hex(char *buf, size_t buf_size, const uint8_t *data, size_t len)
 {
     for (size_t i = 0; i < len; i++)
-        sprintf(buf + i * 2, "%02x", data[i]);
+        snprintf(buf + i * 2, buf_size - i * 2, "%02x", data[i]);
     buf[len * 2] = '\0';
 }
 
@@ -76,7 +76,7 @@ virp_error_t virp_handle_hello(const virp_session_hello_t *hello_in,
     /* Log received HELLO */
     {
         char nonce_hex[17];
-        hs_hex(nonce_hex, hello_in->client_nonce, 8);
+        hs_hex(nonce_hex, sizeof(nonce_hex), hello_in->client_nonce, 8);
 
         char ver_buf[64];
         int vpos = 0;
@@ -159,8 +159,8 @@ virp_error_t virp_handle_hello(const virp_session_hello_t *hello_in,
     /* Log HELLO_ACK sent */
     {
         char sid_hex[33], snonce_hex[17];
-        hs_hex(sid_hex, hello_ack_out->session_id, 16);
-        hs_hex(snonce_hex, hello_ack_out->server_nonce, 8);
+        hs_hex(sid_hex, sizeof(sid_hex), hello_ack_out->session_id, 16);
+        hs_hex(snonce_hex, sizeof(snonce_hex), hello_ack_out->server_nonce, 8);
         fprintf(stderr,
                 "[VIRP-HS] SESSION_HELLO_ACK sent, "
                 "session_id=%s, server_nonce=%s\n",
