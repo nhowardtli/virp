@@ -1,0 +1,39 @@
+(* virp_p1_step10.pv - soundness *)
+free c: channel.
+free state_cell: channel [private].
+type key.
+free k: key [private].
+
+fun hmac(bitstring, key): bitstring.
+reduc forall m: bitstring, kk: key; verify(hmac(m,kk), m, kk) = true.
+fun nat_to_bs(nat): bitstring [data].
+
+event Sent(nat, bitstring).
+event Accepted(nat, bitstring).
+
+(* 1. Key secrecy *)
+query attacker(k).
+(* 2. Injective authentication - no replay, no forgery *)
+query n: nat, m: bitstring;
+  inj-event(Accepted(n,m)) ==> inj-event(Sent(n,m)).
+(* 3. No two Accepted with same counter (monotonicity) *)
+query n: nat, m1: bitstring, m2: bitstring;
+  event(Accepted(n,m1)) && event(Accepted(n,m2)) ==> m1 = m2.
+
+let Signer(ctr: nat) =
+  new obs: bitstring;
+  event Sent(ctr, obs);
+  out(c, (ctr, obs, hmac((nat_to_bs(ctr), obs), k))).
+
+let Verifier =
+  in(c, (n: nat, m: bitstring, t: bitstring));
+  if verify(t, (nat_to_bs(n), m), k) = true then
+    in(state_cell, stored: nat) [precise];
+    if n > stored then
+      event Accepted(n, m);
+      out(state_cell, n)
+    else
+      out(state_cell, stored).
+
+process
+  out(state_cell, 0) | !Signer(1) | !Signer(2) | !Signer(3) | !Verifier

@@ -1,0 +1,45 @@
+theory VIRP_P1
+begin
+
+builtins: natural-numbers
+functions: mac/2
+
+rule SignerInit:
+  [ Fr(~k) ]
+  --[ KeyGen(~k), OnlyOnce() ]->
+  [ !Key(~k), SState(%1), VState(%1) ]
+
+rule Sign:
+  [ !Key(~k), SState(%n), Fr(~obs) ]
+  --[ Sent(%n, ~obs) ]->
+  [ SState(%n %+ %1), Out(<%n, ~obs, mac(<%n, ~obs>, ~k)>) ]
+
+rule Verify:
+  [ !Key(~k), In(<%n, m, mac(<%n, m>, ~k)>), VState(%stored) ]
+  --[ 
+      Smaller(%stored, %n),
+      Accepted(%n, m)
+  ]->
+  [ VState(%n) ]
+
+restriction only_once:
+  "All #i #j. OnlyOnce() @ i & OnlyOnce() @ j ==> #i = #j"
+
+restriction smaller:
+  "All x y #i. Smaller(x, y) @ i ==> x << y"
+
+lemma key_secrecy:
+  "All k #i. KeyGen(k) @ i ==> not (Ex #j. K(k) @ j)"
+
+lemma noninjective_agreement:
+  "All n m #i. Accepted(n,m) @ i ==> Ex #j. Sent(n,m) @ j & #j < #i"
+
+lemma counter_unique:
+  "All n m1 m2 #i #j.
+    Accepted(n,m1) @ i & Accepted(n,m2) @ j ==> m1 = m2"
+
+lemma injective_agreement:
+  "All n m #i #j. 
+    Accepted(n,m) @ i & Accepted(n,m) @ j ==> #i = #j"
+
+end
