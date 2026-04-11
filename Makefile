@@ -315,6 +315,14 @@ lint-sprintf:
 	@if grep -rn 'sprintf(' src/; then echo "FAIL: sprintf found — use snprintf"; exit 1; fi
 	@echo "  PASS: no sprintf found"
 
+# Lint: fail build if rand( or srand( appears in src/ outside driver_mock.c
+.PHONY: lint-rand
+lint-rand:
+	@echo "=== checking for banned rand()/srand() in src/ ==="
+	@if grep -rn 'rand(' src/ --include='*.c' | grep -v 'driver_mock.c' | grep -v 'RAND_bytes' | grep -v 'srand' | grep -v '/\*' | grep -v '^\s*//' ; then echo "FAIL: rand() found — use RAND_bytes"; exit 1; fi
+	@if grep -rn 'srand(' src/ --include='*.c' | grep -v 'driver_mock.c' ; then echo "FAIL: srand() found — use RAND_bytes"; exit 1; fi
+	@echo "  PASS: no banned rand/srand found"
+
 # Lint: report any memcmp usage in src/ for human review (advisory, not fatal)
 .PHONY: lint-memcmp
 lint-memcmp:
