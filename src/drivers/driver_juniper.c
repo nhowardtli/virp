@@ -398,6 +398,8 @@ static void junos_flush_buffer(virp_conn_t *conn)
  * only advertise keyboard-interactive.
  * ========================================================================= */
 
+#define KBD_MAX_PROMPTS 4
+
 static void kbd_interactive_callback(const char *name, int name_len,
                                       const char *instruction, int instruction_len,
                                       int num_prompts,
@@ -408,6 +410,16 @@ static void kbd_interactive_callback(const char *name, int name_len,
     (void)name; (void)name_len;
     (void)instruction; (void)instruction_len;
     (void)prompts;
+
+    if (num_prompts > KBD_MAX_PROMPTS) {
+        fprintf(stderr, "[JunOS] keyboard-interactive: server sent %d prompts "
+                "(max %d) — rejecting\n", num_prompts, KBD_MAX_PROMPTS);
+        for (int i = 0; i < num_prompts; i++) {
+            responses[i].text   = NULL;
+            responses[i].length = 0;
+        }
+        return;
+    }
 
     const char *password = (const char *)*abstract;
 

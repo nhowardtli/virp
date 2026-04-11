@@ -64,7 +64,20 @@ struct virp_conn {
  * IOS 7200 (and many other IOS versions) only advertise
  * keyboard-interactive — not password. This callback supplies
  * the password for every prompt the server sends.
+ *
+ * Prompt cap: A legitimate IOS device sends 1–2 prompts (password,
+ * sometimes OTP). A hostile or broken server could request thousands.
+ * We cap at 4 to bound memory allocation.
+ *
+ * Ownership: libssh2 takes ownership of each responses[i].text and
+ * calls free() on it after the callback returns. We strdup() the
+ * password into each response. Because libssh2 frees the buffer
+ * internally (not us), we cannot OPENSSL_cleanse the copy — the
+ * password material persists in freed heap until overwritten. The
+ * authoritative copy on conn->device.password is wiped at disconnect.
  * ========================================================================= */
+
+#define KBD_MAX_PROMPTS 4
 
 static void kbd_interactive_callback(const char *name, int name_len,
                                       const char *instruction, int instruction_len,
@@ -76,6 +89,17 @@ static void kbd_interactive_callback(const char *name, int name_len,
     (void)name; (void)name_len;
     (void)instruction; (void)instruction_len;
     (void)prompts;
+
+    if (num_prompts > KBD_MAX_PROMPTS) {
+        fprintf(stderr, "[Cisco] keyboard-interactive: server sent %d prompts "
+                "(max %d) — rejecting\n", num_prompts, KBD_MAX_PROMPTS);
+        /* Zero all responses so libssh2 sees empty answers */
+        for (int i = 0; i < num_prompts; i++) {
+            responses[i].text   = NULL;
+            responses[i].length = 0;
+        }
+        return;
+    }
 
     const char *password = (const char *)*abstract;
 
