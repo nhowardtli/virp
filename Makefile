@@ -308,4 +308,10 @@ $(TEST_JUNIPER): tests/test_driver_juniper.c $(LIB)
 test-juniper: $(TEST_JUNIPER)
 	./$(TEST_JUNIPER)
 
+# Lint: report any memcmp usage in src/ for human review (advisory, not fatal)
+.PHONY: lint-memcmp
+lint-memcmp:
+	@echo "=== memcmp usage in src/ (advisory) ==="
+	@grep -rn 'memcmp' src/ || echo "  (none found)"
+
 all-tests: test test-onode test-chain test-federation test-interop test-json test-session test-session-key

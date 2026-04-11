@@ -122,6 +122,16 @@ void virp_key_destroy(virp_signing_key_t *sk)
         p[i] = 0;
 }
 
+int virp_consttime_eq(const void *a, const void *b, size_t n)
+{
+    const volatile uint8_t *pa = (const volatile uint8_t *)a;
+    const volatile uint8_t *pb = (const volatile uint8_t *)b;
+    volatile uint8_t diff = 0;
+    for (size_t i = 0; i < n; i++)
+        diff |= pa[i] ^ pb[i];
+    return (diff == 0) ? 1 : 0;
+}
+
 /* =========================================================================
  * HMAC-SHA256
  * ========================================================================= */
@@ -252,12 +262,8 @@ virp_error_t virp_verify(const uint8_t *msg, size_t msg_len,
     virp_hmac_sha256(sk->key.key, sign_buf, sign_len, expected);
 
     /* Constant-time comparison to prevent timing attacks */
-    const uint8_t *actual = msg + hmac_offset;
-    uint8_t diff = 0;
-    for (size_t i = 0; i < VIRP_HMAC_SIZE; i++)
-        diff |= actual[i] ^ expected[i];
-
-    return (diff == 0) ? VIRP_OK : VIRP_ERR_HMAC_FAILED;
+    return virp_consttime_eq(msg + hmac_offset, expected, VIRP_HMAC_SIZE)
+               ? VIRP_OK : VIRP_ERR_HMAC_FAILED;
 }
 
 /* =========================================================================

@@ -14,6 +14,7 @@
 
 #include "virp_session.h"
 #include "virp_handshake.h"
+#include "virp_crypto.h"
 #include "virp_transcript.h"
 #include "virp.h"
 #include <stdio.h>
@@ -191,14 +192,11 @@ virp_error_t virp_handle_session_bind(const virp_session_bind_t *bind_in)
     if (g_virp_session.state != VIRP_SESSION_NEGOTIATED)
         return VIRP_ERR_SESSION_INVALID;
 
-    /* verify session_id matches */
-    if (memcmp(bind_in->session_id, g_virp_session.session_id, 16) != 0)
-        return VIRP_ERR_CONTEXT_MISMATCH;
-
-    /* verify nonces match */
-    if (memcmp(bind_in->client_nonce, g_virp_session.client_nonce, 8) != 0)
-        return VIRP_ERR_CONTEXT_MISMATCH;
-    if (memcmp(bind_in->server_nonce, g_virp_session.server_nonce, 8) != 0)
+    /* verify session_id and nonces match (constant-time) */
+    int id_ok    = virp_consttime_eq(bind_in->session_id,   g_virp_session.session_id,   16);
+    int cn_ok    = virp_consttime_eq(bind_in->client_nonce, g_virp_session.client_nonce,  8);
+    int sn_ok    = virp_consttime_eq(bind_in->server_nonce, g_virp_session.server_nonce,  8);
+    if (!(id_ok & cn_ok & sn_ok))
         return VIRP_ERR_CONTEXT_MISMATCH;
 
     /* Accumulate transcript: serialize SESSION_BIND */

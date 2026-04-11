@@ -70,6 +70,13 @@ virp_error_t virp_key_save_file(const virp_signing_key_t *sk,
  */
 void virp_key_destroy(virp_signing_key_t *sk);
 
+/*
+ * Constant-time comparison of two buffers.
+ * Returns 1 if equal, 0 otherwise. Evaluates all bytes regardless
+ * of mismatch position to prevent timing side-channels.
+ */
+int virp_consttime_eq(const void *a, const void *b, size_t n);
+
 /* =========================================================================
  * Signing and Verification
  *
