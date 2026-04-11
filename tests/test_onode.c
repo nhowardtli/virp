@@ -571,6 +571,76 @@ TEST(test_batch_sequence_numbers_unique)
 }
 
 /* =========================================================================
+ * hex_decode unit tests
+ * ========================================================================= */
+
+TEST(test_hex_decode_empty_string)
+{
+    uint8_t out[16];
+    ASSERT_EQ(virp_hex_decode("", out, sizeof(out)), 0);
+}
+
+TEST(test_hex_decode_odd_length)
+{
+    uint8_t out[16];
+    ASSERT_EQ(virp_hex_decode("abc", out, sizeof(out)), -1);
+}
+
+TEST(test_hex_decode_valid_lowercase)
+{
+    uint8_t out[4];
+    ASSERT_EQ(virp_hex_decode("deadbeef", out, sizeof(out)), 4);
+    ASSERT_EQ(out[0], 0xde);
+    ASSERT_EQ(out[1], 0xad);
+    ASSERT_EQ(out[2], 0xbe);
+    ASSERT_EQ(out[3], 0xef);
+}
+
+TEST(test_hex_decode_valid_uppercase)
+{
+    uint8_t out[4];
+    ASSERT_EQ(virp_hex_decode("DEADBEEF", out, sizeof(out)), 4);
+    ASSERT_EQ(out[0], 0xde);
+    ASSERT_EQ(out[1], 0xad);
+    ASSERT_EQ(out[2], 0xbe);
+    ASSERT_EQ(out[3], 0xef);
+}
+
+TEST(test_hex_decode_mixed_case)
+{
+    uint8_t out[3];
+    ASSERT_EQ(virp_hex_decode("aAbBcC", out, sizeof(out)), 3);
+    ASSERT_EQ(out[0], 0xaa);
+    ASSERT_EQ(out[1], 0xbb);
+    ASSERT_EQ(out[2], 0xcc);
+}
+
+TEST(test_hex_decode_embedded_space)
+{
+    uint8_t out[16];
+    ASSERT_EQ(virp_hex_decode("de ad", out, sizeof(out)), -1);
+}
+
+TEST(test_hex_decode_embedded_plus)
+{
+    uint8_t out[16];
+    ASSERT_EQ(virp_hex_decode("de+d", out, sizeof(out)), -1);
+}
+
+TEST(test_hex_decode_embedded_0x)
+{
+    uint8_t out[16];
+    ASSERT_EQ(virp_hex_decode("0xab", out, sizeof(out)), -1);
+}
+
+TEST(test_hex_decode_oversized_input)
+{
+    uint8_t out[2];
+    /* 6 hex chars = 3 bytes, but out only holds 2 */
+    ASSERT_EQ(virp_hex_decode("aabbcc", out, sizeof(out)), -1);
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -611,7 +681,18 @@ int main(void)
     pthread_create(&server_thread, NULL, onode_thread, NULL);
     usleep(200000);  /* Wait for socket to be ready */
 
-    printf("[O-Node Pipeline Tests]\n");
+    printf("[hex_decode Unit Tests]\n");
+    RUN_TEST(test_hex_decode_empty_string);
+    RUN_TEST(test_hex_decode_odd_length);
+    RUN_TEST(test_hex_decode_valid_lowercase);
+    RUN_TEST(test_hex_decode_valid_uppercase);
+    RUN_TEST(test_hex_decode_mixed_case);
+    RUN_TEST(test_hex_decode_embedded_space);
+    RUN_TEST(test_hex_decode_embedded_plus);
+    RUN_TEST(test_hex_decode_embedded_0x);
+    RUN_TEST(test_hex_decode_oversized_input);
+
+    printf("\n[O-Node Pipeline Tests]\n");
     RUN_TEST(test_execute_show_ip_route);
     RUN_TEST(test_execute_show_bgp_summary);
     RUN_TEST(test_execute_different_devices);

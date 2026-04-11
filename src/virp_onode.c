@@ -617,17 +617,28 @@ static int parse_batch_commands(const char *json,
  * Client Request Handler
  * ========================================================================= */
 
-/* Decode hex string to bytes. Returns number of bytes written, or -1 on error. */
-static int hex_decode(const char *hex, uint8_t *out, size_t out_len)
+/* Map a single hex character to its 4-bit value, or -1 if invalid. */
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Decode hex string to bytes. Returns number of bytes written, or -1 on error.
+ * Rejects any non-[0-9a-fA-F] character (no whitespace, signs, or 0x prefixes). */
+int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len)
 {
     size_t hex_len = strlen(hex);
     if (hex_len % 2 != 0 || hex_len / 2 > out_len)
         return -1;
-    for (size_t i = 0; i < hex_len / 2; i++) {
-        unsigned int byte;
-        if (sscanf(hex + i * 2, "%2x", &byte) != 1)
+    for (size_t i = 0; i < hex_len; i += 2) {
+        int hi = hex_nibble(hex[i]);
+        int lo = hex_nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0)
             return -1;
-        out[i] = (uint8_t)byte;
+        out[i / 2] = (uint8_t)((hi << 4) | lo);
     }
     return (int)(hex_len / 2);
 }
@@ -1171,7 +1182,7 @@ static void handle_client(onode_state_t *state, int client_fd)
 
         /* Parse client_nonce from hex (8 bytes = 16 hex chars) */
         if (req.client_nonce[0]) {
-            hex_decode(req.client_nonce, hello.client_nonce, 8);
+            virp_hex_decode(req.client_nonce, hello.client_nonce, 8);
         }
 
         {
@@ -1226,13 +1237,13 @@ static void handle_client(onode_state_t *state, int client_fd)
 
         /* session_id from hex (reuse req.session_id, 16 bytes = 32 hex) */
         if (req.session_id[0]) {
-            hex_decode(req.session_id, bind_msg.session_id, 16);
+            virp_hex_decode(req.session_id, bind_msg.session_id, 16);
         }
 
         if (req.client_nonce[0])
-            hex_decode(req.client_nonce, bind_msg.client_nonce, 8);
+            virp_hex_decode(req.client_nonce, bind_msg.client_nonce, 8);
         if (req.server_nonce[0])
-            hex_decode(req.server_nonce, bind_msg.server_nonce, 8);
+            virp_hex_decode(req.server_nonce, bind_msg.server_nonce, 8);
 
         {
             struct timespec ts;

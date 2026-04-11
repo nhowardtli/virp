@@ -215,4 +215,11 @@ bool json_extract_string(const char *json, const char *key,
 
 bool json_extract_int64(const char *json, const char *key, int64_t *out);
 
+/*
+ * Decode a hex string to bytes. Only accepts [0-9a-fA-F].
+ * Returns number of bytes written, or -1 on error
+ * (odd length, non-hex character, output buffer too small).
+ */
+int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len);
+
 #endif /* VIRP_ONODE_H */
