@@ -248,7 +248,7 @@ CHAIN_DB = "/var/lib/virp/chain.db"
 
 def chain_session():
     try:
-        conn = sqlite3.connect(f"file://{CHAIN_DB}?mode=ro&immutable=1", uri=True)
+        conn = sqlite3.connect(f"file://{CHAIN_DB}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("SELECT session_id, MIN(timestamp_ns) AS first_ts, MAX(timestamp_ns) AS last_ts, COUNT(*) AS entry_count FROM chain_entries GROUP BY session_id ORDER BY first_ts DESC LIMIT 1")
@@ -262,7 +262,7 @@ def chain_session():
 
 def chain_entries(limit=200):
     try:
-        conn = sqlite3.connect(f"file://{CHAIN_DB}?mode=ro&immutable=1", uri=True)
+        conn = sqlite3.connect(f"file://{CHAIN_DB}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("SELECT id, session_id, sequence, artifact_type, artifact_id, substr(chain_hmac,1,12) as hmac_short, chain_hmac, timestamp_ns, artifact_hash, previous_entry_hash, chain_entry_hash FROM chain_entries ORDER BY timestamp_ns DESC LIMIT ?", (limit,))
@@ -276,7 +276,7 @@ def chain_entries(limit=200):
 
 def chain_verify():
     try:
-        conn = sqlite3.connect(f"file://{CHAIN_DB}?mode=ro&immutable=1", uri=True)
+        conn = sqlite3.connect(f"file://{CHAIN_DB}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("SELECT id, chain_entry_hash, previous_entry_hash FROM chain_entries ORDER BY id ASC")
@@ -295,7 +295,7 @@ def chain_verify():
 
 def chain_export():
     try:
-        conn = sqlite3.connect(f"file://{CHAIN_DB}?mode=ro&immutable=1", uri=True)
+        conn = sqlite3.connect(f"file://{CHAIN_DB}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("SELECT * FROM chain_entries ORDER BY id ASC")
@@ -304,6 +304,73 @@ def chain_export():
         return {"entries": entries, "total": len(entries)}
     except Exception as e:
         return {"error": str(e), "entries": [], "total": 0}
+
+
+def chain_register(hmac_hex, device, command_text, tier="GREEN", node_id=0):
+    """Register an observation HMAC in chain.db for later verification.
+
+    Called by the dashboard after onode_execute() returns a valid HMAC.
+    This bridges the gap between the O-Node's in-memory HMAC generation
+    and the chain.db audit trail.
+    """
+    import time as _time
+    try:
+        conn = sqlite3.connect(CHAIN_DB)
+        cur = conn.cursor()
+
+        session_id = _session_id or "dashboard-obs"
+        now_ns = int(_time.time() * 1e9)
+
+        # Get previous entry hash and next sequence for chain linking
+        cur.execute(
+            "SELECT chain_entry_hash, sequence FROM chain_entries "
+            "WHERE session_id = ? ORDER BY sequence DESC LIMIT 1",
+            (session_id,),
+        )
+        prev = cur.fetchone()
+        prev_hash = prev[0] if prev else "0" * 64
+        next_seq = (prev[1] + 1) if prev else 0
+
+        # Compute chain entry hash (SHA-256 of key fields)
+        entry_data = f"{session_id}:{hmac_hex}:{device}:{now_ns}"
+        entry_hash = hashlib.sha256(entry_data.encode()).hexdigest()
+
+        # Artifact hash from command content
+        artifact_hash = hashlib.sha256(
+            (command_text or "").encode()
+        ).hexdigest()
+
+        artifact_id = f"obs:{device}:{int(_time.time())}"
+
+        cur.execute(
+            "INSERT INTO chain_entries "
+            "(session_id, sequence, chain_entry_hash, previous_entry_hash, "
+            " timestamp_ns, monotonic_ns, artifact_type, artifact_id, "
+            " artifact_hash, signer_node_id, chain_hmac) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, next_seq, entry_hash, prev_hash,
+             now_ns, now_ns, "observation", artifact_id,
+             artifact_hash, node_id, hmac_hex),
+        )
+
+        # Also store artifact content for the verify service
+        cur.execute(
+            "INSERT OR IGNORE INTO artifacts "
+            "(artifact_id, artifact_type, artifact_content, artifact_hash, "
+            " session_id, created_at_ns) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (artifact_id, "observation",
+             f"{device}#{command_text}", artifact_hash,
+             session_id, now_ns),
+        )
+
+        conn.commit()
+        conn.close()
+        log.info("chain_register: %s device=%s cmd=%s", hmac_hex[:12], device, command_text[:40])
+        return {"registered": True, "chain_hmac": hmac_hex[:12]}
+    except Exception as e:
+        log.error("chain_register failed: %s", e)
+        return {"registered": False, "error": str(e)}
 
 class BridgeHandler(socketserver.StreamRequestHandler):
     """Handle one JSON request per TCP connection."""
@@ -331,6 +398,17 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                 self._send_json(200, chain_verify()); return
             if command == "chain_export":
                 self._send_json(200, chain_export()); return
+            if command == "chain_register":
+                hmac_val = req.get("hmac", "")
+                device = req.get("device", "")
+                cmd = req.get("cmd", "")
+                tier = req.get("tier", "GREEN")
+                node_id = req.get("node_id", 0)
+                if not hmac_val or not device:
+                    self._send_error(400, "chain_register requires 'hmac' and 'device'")
+                    return
+                self._send_json(200, chain_register(hmac_val, device, cmd, tier, node_id))
+                return
 
             # ── Device registry queries (single source of truth) ──
             if command == "device_list":
