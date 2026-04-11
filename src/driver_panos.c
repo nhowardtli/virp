@@ -47,6 +47,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <libssh2.h>
+#include <openssl/crypto.h>
 
 /* =========================================================================
  * Constants
@@ -805,6 +806,7 @@ static void pa_disconnect(virp_conn_t *conn)
 
     fprintf(stderr, "[PAN-OS] Disconnected: %s\n", conn->device.hostname);
 
+    OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
     free(conn);
 }
 

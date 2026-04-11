@@ -88,6 +88,12 @@ virp_error_t virp_session_check_timeouts(void);
  */
 void virp_session_on_disconnect(void);
 
+/*
+ * Wipe all session material (keys, nonces, transcript).
+ * Call at process exit or from an atexit handler.
+ */
+void virp_session_destroy(void);
+
 #ifdef __cplusplus
 }
 #endif

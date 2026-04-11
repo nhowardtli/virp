@@ -91,3 +91,8 @@ void virp_session_on_disconnect(void)
     virp_session_reset();
     /* state is now DISCONNECTED, generation is incremented */
 }
+
+void virp_session_destroy(void)
+{
+    OPENSSL_cleanse(&g_virp_session, sizeof(g_virp_session));
+}

@@ -15,6 +15,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_onode.h"
+#include "virp_session.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -184,6 +185,9 @@ int main(int argc, char **argv)
     } else if (use_mock) {
         add_mock_devices(&g_state);
     }
+
+    /* Wipe session material on exit */
+    atexit(virp_session_destroy);
 
     /* Install signal handlers */
     signal(SIGINT, signal_handler);

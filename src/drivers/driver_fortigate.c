@@ -42,6 +42,7 @@
 #include <netdb.h>
 
 #include <libssh2.h>
+#include <openssl/crypto.h>
 
 #include "virp_driver.h"
 #include "virp_driver_fortigate.h"
@@ -431,6 +432,7 @@ static void fg_disconnect(virp_conn_t *base_conn)
     }
     conn->ssh_connected = false;
 
+    OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
     free(conn);
 }
 

@@ -39,6 +39,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include <curl/curl.h>
+#include <openssl/crypto.h>
 
 /* =========================================================================
  * Command Routing Table — Wazuh API endpoints → trust tiers
@@ -539,6 +540,7 @@ static void wazuh_disconnect(virp_conn_t *base_conn)
 
     fprintf(stderr, "[Wazuh] Disconnected: %s\n", conn->device.hostname);
 
+    OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
     free(conn);
 }
 

@@ -32,6 +32,7 @@
 #include <netdb.h>
 #include <errno.h>
 #include <libssh2.h>
+#include <openssl/crypto.h>
 
 /* =========================================================================
  * Constants
@@ -764,6 +765,8 @@ static void asa_disconnect(virp_conn_t *conn)
 
     fprintf(stderr, "[ASA] Disconnected: %s\n", conn->device.hostname);
 
+    OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
+    OPENSSL_cleanse(conn->device.enable_password, sizeof(conn->device.enable_password));
     free(conn);
 }
 

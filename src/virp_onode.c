@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <openssl/crypto.h>
 
 /* =========================================================================
  * JSON Request Parsing (minimal, no dependencies)
@@ -1695,6 +1696,16 @@ void onode_destroy(onode_state_t *state)
     /* Destroy trust chain */
     if (state->chain_enabled)
         virp_chain_destroy(&state->chain);
+
+    /* Wipe device passwords from inventory */
+    for (int i = 0; i < state->device_count; i++) {
+        OPENSSL_cleanse(state->devices[i].password,
+                        sizeof(state->devices[i].password));
+        OPENSSL_cleanse(state->devices[i].enable_password,
+                        sizeof(state->devices[i].enable_password));
+        OPENSSL_cleanse(state->devices[i].api_token,
+                        sizeof(state->devices[i].api_token));
+    }
 
     /* Destroy mutexes */
     pthread_mutex_destroy(&state->state_mutex);
