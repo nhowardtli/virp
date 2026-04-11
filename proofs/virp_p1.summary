@@ -1,0 +1,21 @@
+[Theory VIRP_P1] Theory loaded
+[Theory VIRP_P1] Theory translated
+[Theory VIRP_P1] Derivation checks started
+[Theory VIRP_P1] Derivation checks ended
+[Theory VIRP_P1] Theory closed
+[Saturating Sources] Step 1 (Max 5)
+[Saturating Sources] Done
+Simplifier iteration 11:
+
+The reduction-rules for
+were applied to the following constraint system.
+
+  nodes:
+    #i: instance (modulo AC) Verify:
+           [
+           !Key( ~k ),
+           In( <(%n%+%1%+%1%+%1), ~obs, mac(<(%n%+%1%+%1%+%1), ~obs>, ~k)> ),
+
+[... proof search output elided ...]
+
+
