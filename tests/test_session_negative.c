@@ -226,6 +226,24 @@ static void test_oversized_server_id_truncated(void)
     printf("PASS\n");
 }
 
+static void test_oversized_server_id_truncated(void)
+{
+    printf("  test_oversized_server_id_truncated... ");
+
+    /* 80-char string > 64-byte server_id buffer */
+    char long_id[80];
+    memset(long_id, 'A', sizeof(long_id) - 1);
+    long_id[sizeof(long_id) - 1] = '\0';
+
+    virp_error_t err = virp_session_init(long_id);
+    assert(err == VIRP_ERR_INVALID_LENGTH);
+
+    /* session should still be usable — server_id was truncated, not rejected */
+    assert(virp_session_state() == VIRP_SESSION_DISCONNECTED);
+    assert(strlen(g_virp_session.server_id) == 63);
+    printf("PASS\n");
+}
+
 int main(void)
 {
     printf("=== VIRP Session Negative-Path Tests ===\n");
