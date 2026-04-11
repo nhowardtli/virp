@@ -67,7 +67,7 @@ typedef struct {
 extern virp_session_t g_virp_session;
 
 /* Session API */
-void virp_session_init(const char *server_id);
+virp_error_t virp_session_init(const char *server_id);
 void virp_session_reset(void);
 virp_session_state_t virp_session_state(void);
 

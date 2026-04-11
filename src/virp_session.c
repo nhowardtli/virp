@@ -16,16 +16,21 @@
 /* Global single session */
 virp_session_t g_virp_session = {0};
 
-void virp_session_init(const char *server_id)
+virp_error_t virp_session_init(const char *server_id)
 {
     memset(&g_virp_session, 0, sizeof(g_virp_session));
     g_virp_session.state = VIRP_SESSION_DISCONNECTED;
     if (server_id) {
         size_t len = strlen(server_id);
-        if (len >= sizeof(g_virp_session.server_id))
+        if (len >= sizeof(g_virp_session.server_id)) {
             len = sizeof(g_virp_session.server_id) - 1;
+            memcpy(g_virp_session.server_id, server_id, len);
+            g_virp_session.server_id[len] = '\0';
+            return VIRP_ERR_INVALID_LENGTH;
+        }
         memcpy(g_virp_session.server_id, server_id, len);
     }
+    return VIRP_OK;
 }
 
 void virp_session_reset(void)
