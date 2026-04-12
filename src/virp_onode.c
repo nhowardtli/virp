@@ -1196,7 +1196,7 @@ static void handle_client(onode_state_t *state, int client_fd)
 
         /* Process handshake */
         virp_session_hello_ack_t ack;
-        err = virp_handle_hello(&g_virp_ctx, &hello, &ack);
+        err = virp_handle_hello(state->ctx, &hello, &ack);
         if (err != VIRP_OK) {
             uint32_t err_code = htonl((uint32_t)err);
             send(client_fd, &err_code, 4, 0);
@@ -1254,7 +1254,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                 (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
         }
 
-        err = virp_handle_session_bind(&g_virp_ctx, &bind_msg);
+        err = virp_handle_session_bind(state->ctx, &bind_msg);
         if (err != VIRP_OK) {
             uint32_t err_code = htonl((uint32_t)err);
             send(client_fd, &err_code, 4, 0);
@@ -1262,7 +1262,7 @@ static void handle_client(onode_state_t *state, int client_fd)
         }
 
         /* BIND succeeded → derive session key to reach ACTIVE */
-        err = virp_session_derive_key(&g_virp_ctx, state->okey.key.key);
+        err = virp_session_derive_key(state->ctx, state->okey.key.key);
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] session key derivation failed: %d\n",
                     (int)err);
@@ -1277,7 +1277,7 @@ static void handle_client(onode_state_t *state, int client_fd)
     }
 
     case ONODE_ACTION_SESSION_CLOSE:
-        virp_handle_session_close(&g_virp_ctx);
+        virp_handle_session_close(state->ctx);
         fprintf(stderr, "[O-Node] Session closed by client\n");
         {
             const char *close_resp = "{\"status\":\"closed\"}";

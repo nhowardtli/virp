@@ -286,12 +286,11 @@ virp_error_t virp_sign_observation_v2(
     virp_obs_header_v2_t *hdr_out,
     uint8_t        sig_out[32])
 {
-    (void)ctx;
-    if (!command || !payload || !hdr_out || !sig_out)
+    if (!ctx || !command || !payload || !hdr_out || !sig_out)
         return VIRP_ERR_NULL_PTR;
 
     /* v2 observations require an active session with derived key */
-    virp_error_t serr = virp_session_require_active(&g_virp_ctx);
+    virp_error_t serr = virp_session_require_active(ctx);
     if (serr != VIRP_OK) return serr;
 
     if (!ctx->session.session_key_valid)

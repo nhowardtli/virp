@@ -663,6 +663,13 @@ int main(void)
         return 1;
     }
 
+    /* Allocate the protocol context owned by this test process. */
+    g_state.ctx = virp_context_new();
+    if (!g_state.ctx) {
+        fprintf(stderr, "Failed to allocate virp_context_t\n");
+        return 1;
+    }
+
     /* Add mock devices */
     virp_device_t devices[] = {
         { .hostname = "R5", .host = "10.0.0.5", .port = 22,
@@ -714,6 +721,8 @@ int main(void)
     onode_shutdown(&g_state);
     pthread_join(server_thread, NULL);
     onode_destroy(&g_state);
+    virp_context_destroy(g_state.ctx);
+    g_state.ctx = NULL;
 
     printf("\n================================================================\n");
     printf("  Results: %d/%d passed", tests_passed, tests_run);

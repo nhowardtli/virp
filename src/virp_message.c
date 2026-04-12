@@ -244,8 +244,16 @@ virp_error_t virp_validate_message(const uint8_t *msg, size_t msg_len,
     if (hdr_out->length > msg_len)
         return VIRP_ERR_INVALID_LENGTH;
 
-    /* Step 5: Verify HMAC signature */
-    err = virp_verify(&g_virp_ctx, msg, hdr_out->length, sk);
+    /*
+     * Step 5: Verify HMAC signature.
+     *
+     * v1 virp_verify() does not touch any session state — it HMACs the
+     * message against the supplied key. It takes a virp_context_t
+     * parameter for signature symmetry with v2 signing, but ignores
+     * it. Passing NULL here keeps the message-builder API free of a
+     * ctx parameter it would only forward and never use.
+     */
+    err = virp_verify(NULL, msg, hdr_out->length, sk);
     if (err != VIRP_OK) return err;
 
     return VIRP_OK;
@@ -289,8 +297,13 @@ static virp_error_t build_and_sign(uint8_t *buf, size_t buf_len,
     if (payload_len > 0 && payload)
         memcpy(buf + VIRP_HEADER_SIZE, payload, payload_len);
 
-    /* Sign the complete message */
-    err = virp_sign(&g_virp_ctx, buf, total, sk);
+    /*
+     * Sign the complete message. v1 virp_sign() is pure HMAC over the
+     * supplied key and does not read session state; ctx is unused,
+     * so pass NULL rather than threading a context through every
+     * build_observation / build_proposal / build_approval caller.
+     */
+    err = virp_sign(NULL, buf, total, sk);
     if (err != VIRP_OK) return err;
 
     *out_len = total;

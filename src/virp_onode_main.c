@@ -54,12 +54,6 @@ static void signal_handler(int sig)
     onode_shutdown(&g_state);
 }
 
-/* atexit adapter for virp_session_destroy(ctx) */
-static void virp_session_destroy_atexit(void)
-{
-    virp_session_destroy(&g_virp_ctx);
-}
-
 /* JSON device loader (virp_onode_json.c) */
 extern int onode_load_devices_json(onode_state_t *state, const char *path);
 
@@ -186,15 +180,26 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * Allocate the protocol context. main owns the lifetime: it is
+     * destroyed after onode_destroy() below, and the OPENSSL_cleanse
+     * inside virp_context_destroy() wipes session_key, transcript
+     * state, and nonces before the allocation is released.
+     */
+    virp_context_t *ctx = virp_context_new();
+    if (!ctx) {
+        fprintf(stderr, "[O-Node] Failed to allocate protocol context\n");
+        onode_destroy(&g_state);
+        return 1;
+    }
+    g_state.ctx = ctx;
+
     /* Load devices */
     if (devices_path) {
         onode_load_devices_json(&g_state, devices_path);
     } else if (use_mock) {
         add_mock_devices(&g_state);
     }
-
-    /* Wipe session material on exit */
-    atexit(virp_session_destroy_atexit);
 
     /* Install signal handlers */
     signal(SIGINT, signal_handler);
@@ -203,8 +208,10 @@ int main(int argc, char **argv)
     /* Start event loop (blocks) */
     err = onode_start(&g_state);
 
-    /* Cleanup */
+    /* Cleanup — destroy onode state, then wipe+free the context */
     onode_destroy(&g_state);
+    virp_context_destroy(ctx);
+    g_state.ctx = NULL;
 
     return (err == VIRP_OK) ? 0 : 1;
 }

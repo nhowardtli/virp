@@ -35,11 +35,11 @@ static virp_session_hello_t make_hello(void)
 }
 
 /* Helper: complete a valid handshake, return the ack */
-static virp_session_hello_ack_t do_hello(void)
+static virp_session_hello_ack_t do_hello(virp_context_t *ctx)
 {
     virp_session_hello_t hello = make_hello();
     virp_session_hello_ack_t ack;
-    virp_error_t err = virp_handle_hello(&g_virp_ctx, &hello, &ack);
+    virp_error_t err = virp_handle_hello(ctx, &hello, &ack);
     assert(err == VIRP_OK);
     return ack;
 }
@@ -47,49 +47,57 @@ static virp_session_hello_ack_t do_hello(void)
 static void test_bind_before_hello(void)
 {
     printf("  test_bind_before_hello... ");
-    virp_session_init(&g_virp_ctx, "onode-test");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
 
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
     bind.msg_type = VIRP_MSG_SESSION_BIND;
 
-    virp_error_t err = virp_handle_session_bind(&g_virp_ctx, &bind);
+    virp_error_t err = virp_handle_session_bind(ctx, &bind);
     assert(err == VIRP_ERR_SESSION_INVALID);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_double_hello_while_active(void)
 {
     printf("  test_double_hello_while_active... ");
-    virp_session_init(&g_virp_ctx, "onode-test");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
 
     /* complete full handshake */
-    virp_session_hello_ack_t ack = do_hello();
+    virp_session_hello_ack_t ack = do_hello(ctx);
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
     bind.msg_type = VIRP_MSG_SESSION_BIND;
     memcpy(bind.session_id,   ack.session_id,   16);
     memcpy(bind.client_nonce, ack.client_nonce,  8);
     memcpy(bind.server_nonce, ack.server_nonce,  8);
-    assert(virp_handle_session_bind(&g_virp_ctx, &bind) == VIRP_OK);
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_BOUND);
-    assert(virp_session_derive_key(&g_virp_ctx, test_master_key) == VIRP_OK);
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_ACTIVE);
+    assert(virp_handle_session_bind(ctx, &bind) == VIRP_OK);
+    assert(virp_session_state(ctx) == VIRP_SESSION_BOUND);
+    assert(virp_session_derive_key(ctx, test_master_key) == VIRP_OK);
+    assert(virp_session_state(ctx) == VIRP_SESSION_ACTIVE);
 
     /* try a second HELLO while active */
     virp_session_hello_t hello2 = make_hello();
     virp_session_hello_ack_t ack2;
-    virp_error_t err = virp_handle_hello(&g_virp_ctx, &hello2, &ack2);
+    virp_error_t err = virp_handle_hello(ctx, &hello2, &ack2);
     assert(err == VIRP_ERR_SESSION_INVALID);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_wrong_nonce_rejected(void)
 {
     printf("  test_wrong_nonce_rejected... ");
-    virp_session_init(&g_virp_ctx, "onode-test");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
 
-    virp_session_hello_ack_t ack = do_hello();
+    virp_session_hello_ack_t ack = do_hello(ctx);
 
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
@@ -99,17 +107,20 @@ static void test_wrong_nonce_rejected(void)
     /* deliberately wrong server nonce */
     memset(bind.server_nonce, 0xFF, 8);
 
-    virp_error_t err = virp_handle_session_bind(&g_virp_ctx, &bind);
+    virp_error_t err = virp_handle_session_bind(ctx, &bind);
     assert(err == VIRP_ERR_CONTEXT_MISMATCH);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_wrong_session_id_rejected(void)
 {
     printf("  test_wrong_session_id_rejected... ");
-    virp_session_init(&g_virp_ctx, "onode-test");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
 
-    virp_session_hello_ack_t ack = do_hello();
+    virp_session_hello_ack_t ack = do_hello(ctx);
 
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
@@ -119,86 +130,99 @@ static void test_wrong_session_id_rejected(void)
     memcpy(bind.client_nonce, ack.client_nonce, 8);
     memcpy(bind.server_nonce, ack.server_nonce, 8);
 
-    virp_error_t err = virp_handle_session_bind(&g_virp_ctx, &bind);
+    virp_error_t err = virp_handle_session_bind(ctx, &bind);
     assert(err == VIRP_ERR_CONTEXT_MISMATCH);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_sign_before_active_rejected(void)
 {
     printf("  test_sign_before_active_rejected... ");
-    virp_session_init(&g_virp_ctx, "onode-test");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
 
     /* session is DISCONNECTED — require_active must fail */
-    virp_error_t err = virp_session_require_active(&g_virp_ctx);
+    virp_error_t err = virp_session_require_active(ctx);
     assert(err == VIRP_ERR_SESSION_INVALID);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_close_from_non_active(void)
 {
     printf("  test_close_from_non_active... ");
-    virp_session_init(&g_virp_ctx, "onode-test");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
 
     /* close from DISCONNECTED — should not crash, should leave DISCONNECTED */
-    virp_handle_session_close(&g_virp_ctx);
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_DISCONNECTED);
+    virp_handle_session_close(ctx);
+    assert(virp_session_state(ctx) == VIRP_SESSION_DISCONNECTED);
 
     /* close from NEGOTIATED */
-    virp_session_hello_ack_t ack = do_hello();
+    virp_session_hello_ack_t ack = do_hello(ctx);
     (void)ack;
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_NEGOTIATED);
-    virp_handle_session_close(&g_virp_ctx);
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_DISCONNECTED);
+    assert(virp_session_state(ctx) == VIRP_SESSION_NEGOTIATED);
+    virp_handle_session_close(ctx);
+    assert(virp_session_state(ctx) == VIRP_SESSION_DISCONNECTED);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_reconnect_after_close(void)
 {
     printf("  test_reconnect_after_close... ");
-    virp_session_init(&g_virp_ctx, "onode-test");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
 
     /* complete handshake */
-    virp_session_hello_ack_t ack = do_hello();
+    virp_session_hello_ack_t ack = do_hello(ctx);
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
     bind.msg_type = VIRP_MSG_SESSION_BIND;
     memcpy(bind.session_id,   ack.session_id,   16);
     memcpy(bind.client_nonce, ack.client_nonce,  8);
     memcpy(bind.server_nonce, ack.server_nonce,  8);
-    assert(virp_handle_session_bind(&g_virp_ctx, &bind) == VIRP_OK);
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_BOUND);
-    assert(virp_session_derive_key(&g_virp_ctx, test_master_key) == VIRP_OK);
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_ACTIVE);
+    assert(virp_handle_session_bind(ctx, &bind) == VIRP_OK);
+    assert(virp_session_state(ctx) == VIRP_SESSION_BOUND);
+    assert(virp_session_derive_key(ctx, test_master_key) == VIRP_OK);
+    assert(virp_session_state(ctx) == VIRP_SESSION_ACTIVE);
 
     /* close */
-    virp_handle_session_close(&g_virp_ctx);
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_DISCONNECTED);
+    virp_handle_session_close(ctx);
+    assert(virp_session_state(ctx) == VIRP_SESSION_DISCONNECTED);
 
     /* reconnect — new HELLO must succeed */
     virp_session_hello_t hello2 = make_hello();
     virp_session_hello_ack_t ack2;
-    virp_error_t err = virp_handle_hello(&g_virp_ctx, &hello2, &ack2);
+    virp_error_t err = virp_handle_hello(ctx, &hello2, &ack2);
     assert(err == VIRP_OK);
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_NEGOTIATED);
+    assert(virp_session_state(ctx) == VIRP_SESSION_NEGOTIATED);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_oversized_server_id_truncated(void)
 {
     printf("  test_oversized_server_id_truncated... ");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
 
     /* 80-char string > 64-byte server_id buffer */
     char long_id[80];
     memset(long_id, 'A', sizeof(long_id) - 1);
     long_id[sizeof(long_id) - 1] = '\0';
 
-    virp_error_t err = virp_session_init(&g_virp_ctx, long_id);
+    virp_error_t err = virp_session_init(ctx, long_id);
     assert(err == VIRP_ERR_INVALID_LENGTH);
 
     /* session should still be usable — server_id was truncated, not rejected */
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_DISCONNECTED);
-    assert(strlen(g_virp_session.server_id) == 63);
+    assert(virp_session_state(ctx) == VIRP_SESSION_DISCONNECTED);
+    assert(strlen(ctx->session.server_id) == 63);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 

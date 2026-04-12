@@ -155,7 +155,7 @@ int virp_canonicalize_command(const char *cmd, char *out, size_t out_len);
 
 /*
  * Build and sign a v2 observation header + payload.
- * Uses the HKDF-derived session key from g_virp_session.
+ * Uses the HKDF-derived session key stored in ctx->session.
  * Session must be ACTIVE with a valid session key.
  *
  * Returns VIRP_OK on success, error code otherwise.

@@ -551,8 +551,8 @@ TEST(test_null_pointers)
     ASSERT_EQ(virp_header_serialize(NULL, NULL, 0), VIRP_ERR_NULL_PTR);
     ASSERT_EQ(virp_header_deserialize(NULL, NULL, 0), VIRP_ERR_NULL_PTR);
     ASSERT_EQ(virp_header_validate(NULL), VIRP_ERR_NULL_PTR);
-    ASSERT_EQ(virp_sign(&g_virp_ctx, NULL, 0, NULL), VIRP_ERR_NULL_PTR);
-    ASSERT_EQ(virp_verify(&g_virp_ctx, NULL, 0, NULL), VIRP_ERR_NULL_PTR);
+    ASSERT_EQ(virp_sign(NULL, NULL, 0, NULL), VIRP_ERR_NULL_PTR);
+    ASSERT_EQ(virp_verify(NULL, NULL, 0, NULL), VIRP_ERR_NULL_PTR);
 }
 
 TEST(test_buffer_too_small)

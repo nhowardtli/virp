@@ -61,7 +61,7 @@ virp_error_t virp_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
 
 /*
  * Derive session key from master key + transcript hash + generation.
- * Sets g_virp_session.session_key and session_key_valid = 1.
+ * Sets ctx->session.session_key and session_key_valid = 1.
  * Transitions state from BOUND → ACTIVE.
  *
  * master_key: 32-byte master observation key

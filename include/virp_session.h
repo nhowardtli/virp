@@ -75,11 +75,9 @@ typedef struct {
  * Session API
  *
  * Every function takes a virp_context_t *ctx as its first parameter.
- * Commit 1 wires the parameter through but does not yet reference it
- * inside function bodies — they still read/write the process-wide
- * g_virp_ctx.session via the g_virp_session macro alias in
- * virp_context.h. Commits 2 and 3 will migrate the bodies and delete
- * the global respectively.
+ * Callers allocate contexts with virp_context_new() (see
+ * virp_context.h) and release them with virp_context_destroy();
+ * session material is wiped as part of context destruction.
  */
 virp_error_t virp_session_init(virp_context_t *ctx, const char *server_id);
 void virp_session_reset(virp_context_t *ctx);
@@ -101,12 +99,6 @@ virp_error_t virp_session_check_timeouts(virp_context_t *ctx);
  * Forces unambiguous transition to DISCONNECTED regardless of state.
  */
 void virp_session_on_disconnect(virp_context_t *ctx);
-
-/*
- * Wipe all session material (keys, nonces, transcript).
- * Call at process exit or from an atexit handler.
- */
-void virp_session_destroy(virp_context_t *ctx);
 
 #ifdef __cplusplus
 }

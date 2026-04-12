@@ -44,8 +44,7 @@ virp_error_t virp_handle_hello(virp_context_t *ctx,
                                const virp_session_hello_t *hello_in,
                                virp_session_hello_ack_t  *hello_ack_out)
 {
-    (void)ctx;
-    if (!hello_in || !hello_ack_out)
+    if (!ctx || !hello_in || !hello_ack_out)
         return VIRP_ERR_NULL_PTR;
 
     /* reject if session already active */
@@ -55,7 +54,7 @@ virp_error_t virp_handle_hello(virp_context_t *ctx,
     }
 
     /* reset any stale session */
-    virp_session_reset(&g_virp_ctx);
+    virp_session_reset(ctx);
 
     /* check version compatibility — we support v2 and v1 */
     uint8_t selected_version = 0;
@@ -153,10 +152,10 @@ virp_error_t virp_handle_hello(virp_context_t *ctx,
         int n;
 
         n = virp_serialize_hello(hello_in, ser, sizeof(ser));
-        if (n > 0) virp_transcript_append(&g_virp_ctx, ser, (size_t)n);
+        if (n > 0) virp_transcript_append(ctx, ser, (size_t)n);
 
         n = virp_serialize_hello_ack(hello_ack_out, ser, sizeof(ser));
-        if (n > 0) virp_transcript_append(&g_virp_ctx, ser, (size_t)n);
+        if (n > 0) virp_transcript_append(ctx, ser, (size_t)n);
     }
 
     /* Log HELLO_ACK sent */
@@ -183,8 +182,7 @@ virp_error_t virp_handle_hello(virp_context_t *ctx,
 virp_error_t virp_handle_session_bind(virp_context_t *ctx,
                                       const virp_session_bind_t *bind_in)
 {
-    (void)ctx;
-    if (!bind_in)
+    if (!ctx || !bind_in)
         return VIRP_ERR_NULL_PTR;
 
     /*
@@ -208,11 +206,11 @@ virp_error_t virp_handle_session_bind(virp_context_t *ctx,
     {
         uint8_t ser[256];
         int n = virp_serialize_session_bind(bind_in, ser, sizeof(ser));
-        if (n > 0) virp_transcript_append(&g_virp_ctx, ser, (size_t)n);
+        if (n > 0) virp_transcript_append(ctx, ser, (size_t)n);
     }
 
     /* Finalize transcript hash */
-    virp_transcript_finalize(&g_virp_ctx);
+    virp_transcript_finalize(ctx);
 
     /* advance to BOUND (caller must derive session key to reach ACTIVE) */
     ctx->session.state = VIRP_SESSION_BOUND;
@@ -230,6 +228,5 @@ virp_error_t virp_handle_session_bind(virp_context_t *ctx,
  */
 void virp_handle_session_close(virp_context_t *ctx)
 {
-    (void)ctx;
-    virp_session_reset(&g_virp_ctx);
+    virp_session_reset(ctx);
 }

@@ -23,6 +23,7 @@
 #include "virp_crypto.h"
 #include "virp_driver.h"
 #include "virp_chain.h"
+#include "virp_context.h"
 #include <pthread.h>
 
 /* =========================================================================
@@ -131,6 +132,16 @@ typedef struct {
     uint32_t            observations_sent;
     uint32_t            errors;
     uint32_t            reconnects;     /* Total successful reconnections */
+
+    /*
+     * Protocol context (borrowed, not owned). The main() that owns
+     * this onode_state_t also owns the virp_context_t and must
+     * assign it here before calling onode_start(). handle_client
+     * reads ctx through this pointer to drive the session handshake.
+     * Lifetime: allocated with virp_context_new() in main, destroyed
+     * with virp_context_destroy() after onode_destroy().
+     */
+    virp_context_t      *ctx;
 } onode_state_t;
 
 /* =========================================================================

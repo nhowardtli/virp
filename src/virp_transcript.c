@@ -144,7 +144,6 @@ int virp_serialize_session_bind(const virp_session_bind_t *b,
 virp_error_t virp_transcript_append(virp_context_t *ctx,
                                     const uint8_t *data, size_t len)
 {
-    (void)ctx;
     if (ctx->session.transcript_len + len >
             sizeof(ctx->session.transcript_buf))
         return VIRP_ERR_BUFFER_TOO_SMALL;
@@ -157,7 +156,6 @@ virp_error_t virp_transcript_append(virp_context_t *ctx,
 
 void virp_transcript_finalize(virp_context_t *ctx)
 {
-    (void)ctx;
     SHA256(ctx->session.transcript_buf,
            ctx->session.transcript_len,
            ctx->session.transcript_hash);
@@ -222,8 +220,7 @@ virp_error_t virp_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
 virp_error_t virp_session_derive_key(virp_context_t *ctx,
                                      const uint8_t master_key[32])
 {
-    (void)ctx;
-    if (!master_key)
+    if (!ctx || !master_key)
         return VIRP_ERR_NULL_PTR;
 
     if (ctx->session.state != VIRP_SESSION_BOUND)

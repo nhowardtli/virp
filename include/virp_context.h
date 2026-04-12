@@ -11,8 +11,11 @@
  * in the narrow sense, while the context is the library handle that
  * holds it (compare OpenSSL's SSL_CTX vs. SSL).
  *
- * Today the struct contains exactly one field (session). The
- * parameter name used throughout the codebase is `ctx`.
+ * Ownership: contexts are allocated by callers via virp_context_new()
+ * and released with virp_context_destroy(). There is no process-wide
+ * default. Each caller — the o-node main, each test, any library
+ * consumer — is responsible for the lifetime of its own context.
+ * The parameter name used throughout the codebase is `ctx`.
  */
 
 #ifndef VIRP_CONTEXT_H
@@ -29,20 +32,17 @@ struct virp_context_s {
 };
 
 /*
- * Process-wide single context. Commit 1 keeps the global backing
- * store in place; commit 3 will delete it and require callers to
- * allocate their own. Until then, callers pass &g_virp_ctx into
- * the threaded prototypes.
+ * Allocate a zero-initialized virp_context_t. Session state starts
+ * in VIRP_SESSION_DISCONNECTED. Returns NULL only on calloc failure.
  */
-extern virp_context_t g_virp_ctx;
+virp_context_t *virp_context_new(void);
 
 /*
- * Macro alias so existing code that refers to g_virp_session.foo
- * keeps compiling. Expands to the same lvalue as the new backing
- * store. Commit 2 will migrate function bodies to ctx->session
- * and commit 3 will retire this alias.
+ * Wipe (OPENSSL_cleanse) and free a context. Safe to call with NULL.
+ * The cleanse ensures session_key, transcript buffer, and nonces
+ * are not left in the heap page after release.
  */
-#define g_virp_session (g_virp_ctx.session)
+void virp_context_destroy(virp_context_t *ctx);
 
 #ifdef __cplusplus
 }
