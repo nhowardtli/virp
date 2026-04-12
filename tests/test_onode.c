@@ -570,6 +570,70 @@ TEST(test_batch_sequence_numbers_unique)
     ASSERT_TRUE(seqs[1] != seqs[2]);
 }
 
+TEST(test_batch_same_device_concurrent)
+{
+    /*
+     * Send 8 parallel commands to the SAME device (R6) with a mock delay.
+     * The per-device exec_mutex serializes access so that libssh2 is
+     * never driven concurrently. All 8 results must be valid signed
+     * observations with the correct node_id and non-empty payload.
+     */
+    virp_driver_mock_set_delay(20);  /* 20ms per command */
+
+    uint8_t resp[8][VIRP_MAX_MESSAGE_SIZE];
+    size_t resp_len[8];
+
+    int count = client_batch_request(
+        "{\"action\":\"batch_execute\",\"commands\":["
+        "{\"device\":\"R6\",\"command\":\"show version\"},"
+        "{\"device\":\"R6\",\"command\":\"show ip route\"},"
+        "{\"device\":\"R6\",\"command\":\"show ip bgp summary\"},"
+        "{\"device\":\"R6\",\"command\":\"show version\"},"
+        "{\"device\":\"R6\",\"command\":\"show ip route\"},"
+        "{\"device\":\"R6\",\"command\":\"show version\"},"
+        "{\"device\":\"R6\",\"command\":\"show ip route\"},"
+        "{\"device\":\"R6\",\"command\":\"show version\"}"
+        "]}",
+        resp, resp_len, 8);
+
+    virp_driver_mock_set_delay(0);
+
+    ASSERT_EQ(count, 8);
+
+    /* Every response must be a valid signed observation for R6 */
+    for (int i = 0; i < 8; i++) {
+        virp_header_t hdr;
+        virp_error_t err = virp_validate_message(resp[i], resp_len[i],
+                                                  &g_state.okey, &hdr);
+        ASSERT_OK(err);
+        ASSERT_EQ(hdr.type, VIRP_MSG_OBSERVATION);
+        ASSERT_EQ(hdr.node_id, 0x06060606);  /* R6 */
+
+        /* Parse payload — must be non-empty */
+        virp_observation_t obs;
+        const uint8_t *data;
+        uint16_t data_len;
+        err = virp_parse_observation(resp[i] + VIRP_HEADER_SIZE,
+                                      resp_len[i] - VIRP_HEADER_SIZE,
+                                      &obs, &data, &data_len);
+        ASSERT_OK(err);
+        ASSERT_TRUE(data_len > 0);
+    }
+
+    /* All sequence numbers must be unique (no races on seq_num) */
+    uint32_t seqs[8];
+    for (int i = 0; i < 8; i++) {
+        virp_header_t hdr;
+        virp_validate_message(resp[i], resp_len[i], &g_state.okey, &hdr);
+        seqs[i] = hdr.seq_num;
+    }
+    for (int i = 0; i < 8; i++) {
+        for (int j = i + 1; j < 8; j++) {
+            ASSERT_TRUE(seqs[i] != seqs[j]);
+        }
+    }
+}
+
 /* =========================================================================
  * hex_decode unit tests
  * ========================================================================= */
@@ -716,6 +780,7 @@ int main(void)
     RUN_TEST(test_batch_execute_not_found_device);
     RUN_TEST(test_batch_execute_parallel_timing);
     RUN_TEST(test_batch_sequence_numbers_unique);
+    RUN_TEST(test_batch_same_device_concurrent);
 
     /* Shutdown */
     onode_shutdown(&g_state);

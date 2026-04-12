@@ -396,9 +396,17 @@ virp_error_t onode_execute(onode_state_t *state,
                                       &state->okey);
     }
 
+    /*
+     * Per-device execution lock — serializes all command execution on
+     * this connection so that batch_execute threads targeting the same
+     * device do not race on the libssh2 session.
+     */
+    pthread_mutex_lock(&state->exec_mutex[dev_idx]);
+
     /* Get or create connection */
     virp_conn_t *conn = get_connection(state, dev_idx);
     if (!conn) {
+        pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
         char err_msg[256];
         snprintf(err_msg, sizeof(err_msg),
                  "ERROR: cannot connect to '%s'", device_name);
@@ -412,13 +420,17 @@ virp_error_t onode_execute(onode_state_t *state,
 
     /* Execute command through driver */
     const virp_driver_t *drv = virp_driver_lookup(state->devices[dev_idx].vendor);
-    if (!drv)
+    if (!drv) {
+        pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
         return VIRP_ERR_INVALID_TYPE;
+    }
 
     virp_exec_result_t result;
     virp_error_t err = drv->execute(conn, command, &result);
-    if (err != VIRP_OK)
+    if (err != VIRP_OK) {
+        pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
         return err;
+    }
 
     /* On failure: drop stale connection, retry once with fresh connection */
     if (!result.success && result.output_len == 0) {
@@ -427,10 +439,14 @@ virp_error_t onode_execute(onode_state_t *state,
         if (conn) {
             memset(&result, 0, sizeof(result));
             err = drv->execute(conn, command, &result);
-            if (err != VIRP_OK)
+            if (err != VIRP_OK) {
+                pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
                 return err;
+            }
         }
     }
+
+    pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
 
     /* If still failed after retry, return error_msg as observation data */
     const uint8_t *obs_data;
@@ -1075,16 +1091,12 @@ static void handle_client(onode_state_t *state, int client_fd)
             break;
         }
 
-        /* Reject duplicate devices — threads must not share connections */
-        for (int i = 0; i < cmd_count; i++) {
-            for (int j = i + 1; j < cmd_count; j++) {
-                if (strcmp(args[i].device, args[j].device) == 0) {
-                    uint32_t err_code = htonl((uint32_t)VIRP_ERR_INVALID_TYPE);
-                    send(client_fd, &err_code, 4, 0);
-                    goto batch_done;
-                }
-            }
-        }
+        /*
+         * Multiple batch items may target the same device. The per-device
+         * exec_mutex in onode_execute serializes access to the shared
+         * connection, so this is safe. Commands to different devices run
+         * in parallel; commands to the same device run sequentially.
+         */
 
         /* Allocate per-thread response buffers */
         bool alloc_ok = true;
@@ -1132,7 +1144,6 @@ static void handle_client(onode_state_t *state, int client_fd)
         for (int i = 0; i < cmd_count; i++)
             free(args[i].resp_buf);
 
-        batch_done:
         break;
     }
 
@@ -1511,6 +1522,8 @@ virp_error_t onode_init(onode_state_t *state,
     state->watchdog_running = false;
     pthread_mutex_init(&state->state_mutex, NULL);
     pthread_mutex_init(&state->conn_mutex, NULL);
+    for (int i = 0; i < ONODE_MAX_DEVICES; i++)
+        pthread_mutex_init(&state->exec_mutex[i], NULL);
 
     /* Socket path */
     if (socket_path)
@@ -1711,6 +1724,8 @@ void onode_destroy(onode_state_t *state)
     /* Destroy mutexes */
     pthread_mutex_destroy(&state->state_mutex);
     pthread_mutex_destroy(&state->conn_mutex);
+    for (int i = 0; i < state->device_count; i++)
+        pthread_mutex_destroy(&state->exec_mutex[i]);
 
     /* Destroy the O-Key — zero it out */
     virp_key_destroy(&state->okey);

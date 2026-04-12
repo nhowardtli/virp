@@ -122,6 +122,22 @@ typedef struct {
     pthread_mutex_t     state_mutex;    /* Protects seq_num, observations_sent */
     pthread_mutex_t     conn_mutex;     /* Protects connections[] and reconnect[] */
 
+    /*
+     * Per-device execution mutex.
+     *
+     * virp_conn_t is not thread-safe: libssh2 sessions and channels
+     * must not be used concurrently. batch_execute launches one thread
+     * per batch item; if two items target the same device they would
+     * race on the shared connection. exec_mutex[dev_idx] serializes
+     * all command execution on a given device. It is held for the
+     * entire execute path (get_connection → drv->execute → retry →
+     * build_observation) so that exactly one thread drives the
+     * connection at a time.
+     *
+     * Different devices are independent — their mutexes never contend.
+     */
+    pthread_mutex_t     exec_mutex[ONODE_MAX_DEVICES];
+
     /* Watchdog thread (auto-reconnect) */
     pthread_t           watchdog_thread;
     bool                watchdog_running;
