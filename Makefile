@@ -233,10 +233,8 @@ ONODE_PROD = $(BUILD_DIR)/virp-onode-prod
 $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -ljson-c -o $@
 
-prod: CISCO := 1
-prod: FORTIGATE := 1
-prod: PALOALTO := 1
-prod: ASA := 1
+# Note: 'make prod' builds only the prod binary against the current library.
+# Use 'make prod-full' to rebuild everything with all drivers enabled.
 prod: $(ONODE_PROD)
 
 # Full production build — recursive make ensures all ifdef guards evaluate correctly
