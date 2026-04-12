@@ -82,6 +82,7 @@ virp_error_t virp_session_require_active(virp_context_t *ctx)
 
 virp_error_t virp_session_check_timeouts(virp_context_t *ctx)
 {
+    (void)ctx;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
@@ -112,7 +113,8 @@ void virp_session_on_disconnect(virp_context_t *ctx)
     /* state is now DISCONNECTED, generation is incremented */
 }
 
-void virp_session_destroy(void)
+void virp_session_destroy(virp_context_t *ctx)
 {
+    (void)ctx;
     OPENSSL_cleanse(&g_virp_session, sizeof(g_virp_session));
 }

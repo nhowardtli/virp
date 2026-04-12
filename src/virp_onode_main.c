@@ -54,6 +54,12 @@ static void signal_handler(int sig)
     onode_shutdown(&g_state);
 }
 
+/* atexit adapter for virp_session_destroy(ctx) */
+static void virp_session_destroy_atexit(void)
+{
+    virp_session_destroy(&g_virp_ctx);
+}
+
 /* JSON device loader (virp_onode_json.c) */
 extern int onode_load_devices_json(onode_state_t *state, const char *path);
 
@@ -202,7 +208,7 @@ int main(int argc, char **argv)
     }
 
     /* Wipe session material on exit */
-    atexit(virp_session_destroy);
+    atexit(virp_session_destroy_atexit);
 
     /* Install signal handlers */
     signal(SIGINT, signal_handler);

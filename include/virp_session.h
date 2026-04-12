@@ -104,7 +104,7 @@ void virp_session_on_disconnect(virp_context_t *ctx);
  * Wipe all session material (keys, nonces, transcript).
  * Call at process exit or from an atexit handler.
  */
-void virp_session_destroy(void);
+void virp_session_destroy(virp_context_t *ctx);
 
 #ifdef __cplusplus
 }
