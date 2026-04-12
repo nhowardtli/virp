@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "virp.h"
+#include "virp_session.h"  /* virp_context_t forward decl */
 #include "virp_handshake.h"
 
 #ifdef __cplusplus
@@ -37,12 +38,13 @@ int virp_serialize_session_bind(const virp_session_bind_t *b,
  * Append serialized bytes to the session transcript buffer.
  * Returns VIRP_OK or VIRP_ERR_BUFFER_TOO_SMALL if transcript_buf overflows.
  */
-virp_error_t virp_transcript_append(const uint8_t *data, size_t len);
+virp_error_t virp_transcript_append(virp_context_t *ctx,
+                                    const uint8_t *data, size_t len);
 
 /*
  * Finalize the transcript: SHA-256(transcript_buf) → session.transcript_hash.
  */
-void virp_transcript_finalize(void);
+void virp_transcript_finalize(virp_context_t *ctx);
 
 /*
  * HKDF-SHA256 (RFC 5869). Single-block expand (output ≤ 32 bytes).
@@ -66,7 +68,8 @@ virp_error_t virp_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
  *
  * Returns VIRP_OK on success, VIRP_ERR_SESSION_INVALID if not in BOUND state.
  */
-virp_error_t virp_session_derive_key(const uint8_t master_key[32]);
+virp_error_t virp_session_derive_key(virp_context_t *ctx,
+                                     const uint8_t master_key[32]);
 
 #ifdef __cplusplus
 }

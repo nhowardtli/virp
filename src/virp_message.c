@@ -9,6 +9,7 @@
 #define _POSIX_C_SOURCE 199309L  /* clock_gettime */
 
 #include "virp_message.h"
+#include "virp_context.h"
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
@@ -244,7 +245,7 @@ virp_error_t virp_validate_message(const uint8_t *msg, size_t msg_len,
         return VIRP_ERR_INVALID_LENGTH;
 
     /* Step 5: Verify HMAC signature */
-    err = virp_verify(msg, hdr_out->length, sk);
+    err = virp_verify(&g_virp_ctx, msg, hdr_out->length, sk);
     if (err != VIRP_OK) return err;
 
     return VIRP_OK;
@@ -289,7 +290,7 @@ static virp_error_t build_and_sign(uint8_t *buf, size_t buf_len,
         memcpy(buf + VIRP_HEADER_SIZE, payload, payload_len);
 
     /* Sign the complete message */
-    err = virp_sign(buf, total, sk);
+    err = virp_sign(&g_virp_ctx, buf, total, sk);
     if (err != VIRP_OK) return err;
 
     *out_len = total;

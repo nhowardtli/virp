@@ -16,6 +16,7 @@
 
 #include "virp_onode.h"
 #include "virp_session.h"
+#include "virp_context.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,12 @@ static void signal_handler(int sig)
     (void)sig;
     fprintf(stderr, "\n[O-Node] Signal received, shutting down...\n");
     onode_shutdown(&g_state);
+}
+
+/* atexit adapter for virp_session_destroy(ctx) */
+static void virp_session_destroy_atexit(void)
+{
+    virp_session_destroy(&g_virp_ctx);
 }
 
 /* JSON device loader (virp_onode_json.c) */
@@ -187,7 +194,7 @@ int main(int argc, char **argv)
     }
 
     /* Wipe session material on exit */
-    atexit(virp_session_destroy);
+    atexit(virp_session_destroy_atexit);
 
     /* Install signal handlers */
     signal(SIGINT, signal_handler);

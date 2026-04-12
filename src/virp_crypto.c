@@ -12,6 +12,7 @@
 #include "virp_crypto.h"
 #include "virp_message.h"
 #include "virp_session.h"
+#include "virp_context.h"
 #include <string.h>
 #include <stdio.h>
 #include <fcntl.h>
@@ -167,9 +168,11 @@ static virp_error_t check_channel_key_binding(uint8_t channel,
  * Signing and Verification
  * ========================================================================= */
 
-virp_error_t virp_sign(uint8_t *msg, size_t msg_len,
+virp_error_t virp_sign(virp_context_t *ctx,
+                       uint8_t *msg, size_t msg_len,
                        const virp_signing_key_t *sk)
 {
+    (void)ctx;
     if (!msg || !sk)
         return VIRP_ERR_NULL_PTR;
     if (!sk->key.loaded)
@@ -223,9 +226,11 @@ virp_error_t virp_sign(uint8_t *msg, size_t msg_len,
     return VIRP_OK;
 }
 
-virp_error_t virp_verify(const uint8_t *msg, size_t msg_len,
+virp_error_t virp_verify(virp_context_t *ctx,
+                         const uint8_t *msg, size_t msg_len,
                          const virp_signing_key_t *sk)
 {
+    (void)ctx;
     if (!msg || !sk)
         return VIRP_ERR_NULL_PTR;
     if (!sk->key.loaded)
@@ -271,6 +276,7 @@ virp_error_t virp_verify(const uint8_t *msg, size_t msg_len,
  * ========================================================================= */
 
 virp_error_t virp_sign_observation_v2(
+    virp_context_t *ctx,
     uint64_t       node_id,
     uint64_t       device_id,
     uint8_t        tier,
@@ -280,11 +286,12 @@ virp_error_t virp_sign_observation_v2(
     virp_obs_header_v2_t *hdr_out,
     uint8_t        sig_out[32])
 {
+    (void)ctx;
     if (!command || !payload || !hdr_out || !sig_out)
         return VIRP_ERR_NULL_PTR;
 
     /* v2 observations require an active session with derived key */
-    virp_error_t serr = virp_session_require_active();
+    virp_error_t serr = virp_session_require_active(&g_virp_ctx);
     if (serr != VIRP_OK) return serr;
 
     if (!g_virp_session.session_key_valid)

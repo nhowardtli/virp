@@ -13,6 +13,7 @@
 #define _POSIX_C_SOURCE 199309L  /* clock_gettime */
 
 #include "virp_session.h"
+#include "virp_context.h"
 #include "virp_handshake.h"
 #include "virp_crypto.h"
 #include "virp_transcript.h"
@@ -39,9 +40,11 @@ static void hs_hex(char *buf, size_t buf_size, const uint8_t *data, size_t len)
  *
  * Enforces single-session: rejects if a session is already ACTIVE.
  */
-virp_error_t virp_handle_hello(const virp_session_hello_t *hello_in,
-                                virp_session_hello_ack_t  *hello_ack_out)
+virp_error_t virp_handle_hello(virp_context_t *ctx,
+                               const virp_session_hello_t *hello_in,
+                               virp_session_hello_ack_t  *hello_ack_out)
 {
+    (void)ctx;
     if (!hello_in || !hello_ack_out)
         return VIRP_ERR_NULL_PTR;
 
@@ -52,7 +55,7 @@ virp_error_t virp_handle_hello(const virp_session_hello_t *hello_in,
     }
 
     /* reset any stale session */
-    virp_session_reset();
+    virp_session_reset(&g_virp_ctx);
 
     /* check version compatibility — we support v2 and v1 */
     uint8_t selected_version = 0;
@@ -150,10 +153,10 @@ virp_error_t virp_handle_hello(const virp_session_hello_t *hello_in,
         int n;
 
         n = virp_serialize_hello(hello_in, ser, sizeof(ser));
-        if (n > 0) virp_transcript_append(ser, (size_t)n);
+        if (n > 0) virp_transcript_append(&g_virp_ctx, ser, (size_t)n);
 
         n = virp_serialize_hello_ack(hello_ack_out, ser, sizeof(ser));
-        if (n > 0) virp_transcript_append(ser, (size_t)n);
+        if (n > 0) virp_transcript_append(&g_virp_ctx, ser, (size_t)n);
     }
 
     /* Log HELLO_ACK sent */
@@ -177,8 +180,10 @@ virp_error_t virp_handle_hello(const virp_session_hello_t *hello_in,
  * Verifies session_id, client_nonce, server_nonce match.
  * Advances state to ACTIVE on success.
  */
-virp_error_t virp_handle_session_bind(const virp_session_bind_t *bind_in)
+virp_error_t virp_handle_session_bind(virp_context_t *ctx,
+                                      const virp_session_bind_t *bind_in)
 {
+    (void)ctx;
     if (!bind_in)
         return VIRP_ERR_NULL_PTR;
 
@@ -203,11 +208,11 @@ virp_error_t virp_handle_session_bind(const virp_session_bind_t *bind_in)
     {
         uint8_t ser[256];
         int n = virp_serialize_session_bind(bind_in, ser, sizeof(ser));
-        if (n > 0) virp_transcript_append(ser, (size_t)n);
+        if (n > 0) virp_transcript_append(&g_virp_ctx, ser, (size_t)n);
     }
 
     /* Finalize transcript hash */
-    virp_transcript_finalize();
+    virp_transcript_finalize(&g_virp_ctx);
 
     /* advance to BOUND (caller must derive session key to reach ACTIVE) */
     g_virp_session.state = VIRP_SESSION_BOUND;
@@ -223,7 +228,8 @@ virp_error_t virp_handle_session_bind(const virp_session_bind_t *bind_in)
  *
  * Either peer may close. Reset session state.
  */
-void virp_handle_session_close(void)
+void virp_handle_session_close(virp_context_t *ctx)
 {
-    virp_session_reset();
+    (void)ctx;
+    virp_session_reset(&g_virp_ctx);
 }

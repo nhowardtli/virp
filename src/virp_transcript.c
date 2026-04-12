@@ -8,6 +8,7 @@
 
 #include "virp_transcript.h"
 #include "virp_session.h"
+#include "virp_context.h"
 #include <stdio.h>
 #include <string.h>
 #include <openssl/hmac.h>
@@ -140,8 +141,10 @@ int virp_serialize_session_bind(const virp_session_bind_t *b,
  * Transcript accumulation
  * ========================================================================= */
 
-virp_error_t virp_transcript_append(const uint8_t *data, size_t len)
+virp_error_t virp_transcript_append(virp_context_t *ctx,
+                                    const uint8_t *data, size_t len)
 {
+    (void)ctx;
     if (g_virp_session.transcript_len + len >
             sizeof(g_virp_session.transcript_buf))
         return VIRP_ERR_BUFFER_TOO_SMALL;
@@ -152,8 +155,9 @@ virp_error_t virp_transcript_append(const uint8_t *data, size_t len)
     return VIRP_OK;
 }
 
-void virp_transcript_finalize(void)
+void virp_transcript_finalize(virp_context_t *ctx)
 {
+    (void)ctx;
     SHA256(g_virp_session.transcript_buf,
            g_virp_session.transcript_len,
            g_virp_session.transcript_hash);
@@ -215,8 +219,10 @@ virp_error_t virp_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
  * Session Key Derivation
  * ========================================================================= */
 
-virp_error_t virp_session_derive_key(const uint8_t master_key[32])
+virp_error_t virp_session_derive_key(virp_context_t *ctx,
+                                     const uint8_t master_key[32])
 {
+    (void)ctx;
     if (!master_key)
         return VIRP_ERR_NULL_PTR;
 

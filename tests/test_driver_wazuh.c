@@ -20,6 +20,7 @@
 #include "virp_driver.h"
 #include "virp_driver_wazuh.h"
 #include "virp_crypto.h"
+#include "virp_context.h"
 #include "virp_message.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -303,7 +304,7 @@ static void test_virp_signing(void)
             obs_len, data_len);
 
     /* Verify the signature */
-    err = virp_verify(obs_buf, obs_len, &okey);
+    err = virp_verify(&g_virp_ctx, obs_buf, obs_len, &okey);
     if (err != VIRP_OK) {
         char msg[128];
         snprintf(msg, sizeof(msg), "virp_verify failed: %d", err);
