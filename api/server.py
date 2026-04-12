@@ -181,7 +181,7 @@ def parse_virp_message(msg: bytes) -> dict:
         computed = hmac.new(key_material, sign_buf, hashlib.sha256).digest()
         verified = hmac.compare_digest(computed, received_hmac)
 
-    tier_names = {0x01: "GREEN", 0x02: "YELLOW", 0x03: "RED", 0x04: "BLACK"}
+    tier_names = {0x01: "GREEN", 0x02: "YELLOW", 0x03: "RED", 0xFF: "BLACK"}
     type_names = {
         0x01: "OBSERVATION", 0x02: "HELLO", 0x10: "PROPOSAL",
         0x11: "APPROVAL", 0x20: "INTENT_ADVERTISE", 0x21: "INTENT_WITHDRAW",
