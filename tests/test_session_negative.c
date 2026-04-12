@@ -229,18 +229,21 @@ static void test_oversized_server_id_truncated(void)
 static void test_oversized_server_id_truncated(void)
 {
     printf("  test_oversized_server_id_truncated... ");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
 
     /* 80-char string > 64-byte server_id buffer */
     char long_id[80];
     memset(long_id, 'A', sizeof(long_id) - 1);
     long_id[sizeof(long_id) - 1] = '\0';
 
-    virp_error_t err = virp_session_init(&g_virp_ctx, long_id);
+    virp_error_t err = virp_session_init(ctx, long_id);
     assert(err == VIRP_ERR_INVALID_LENGTH);
 
     /* session should still be usable — server_id was truncated, not rejected */
-    assert(virp_session_state(&g_virp_ctx) == VIRP_SESSION_DISCONNECTED);
-    assert(strlen(g_virp_session.server_id) == 63);
+    assert(virp_session_state(ctx) == VIRP_SESSION_DISCONNECTED);
+    assert(strlen(ctx->session.server_id) == 63);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
