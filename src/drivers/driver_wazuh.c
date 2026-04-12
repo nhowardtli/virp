@@ -9,7 +9,7 @@
  *   - JWT authentication (POST /security/user/authenticate with basic auth)
  *   - Token lifecycle (auto-refresh before 15-minute expiry)
  *   - HTTPS GET to collector endpoints (agents, alerts, vuln, syscheck)
- *   - Self-signed TLS (verify off — lab environment)
+ *   - TLS verification on by default; VIRP_WAZUH_INSECURE=1 to disable
  *   - Output scrubbing (HTTP envelope stripped, raw JSON payload kept)
  *   - Command routing table for trust tier classification
  *
@@ -131,6 +131,30 @@ struct virp_conn {
 };
 
 /* =========================================================================
+ * TLS Verification Configuration
+ *
+ * Default: verification ON. Override with VIRP_WAZUH_INSECURE=1.
+ * Custom CA bundle: set VIRP_CA_BUNDLE to path.
+ * ========================================================================= */
+
+static void wz_configure_tls(CURL *curl)
+{
+    const char *insecure = getenv("VIRP_WAZUH_INSECURE");
+    if (insecure && strcmp(insecure, "1") == 0) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        return;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    const char *ca_bundle = getenv("VIRP_CA_BUNDLE");
+    if (ca_bundle && ca_bundle[0] != '\0')
+        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle);
+}
+
+/* =========================================================================
  * CURL Write Callback — accumulate response into a fixed buffer
  *
  * userdata points to a wz_response_t which tracks the write position.
@@ -204,8 +228,7 @@ static virp_error_t wz_authenticate(struct virp_conn *conn)
     curl_easy_setopt(conn->curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(conn->curl, CURLOPT_CONNECTTIMEOUT, (long)WZ_CONNECT_TIMEOUT_SEC);
     curl_easy_setopt(conn->curl, CURLOPT_TIMEOUT, (long)WZ_API_TIMEOUT_SEC);
-    curl_easy_setopt(conn->curl, CURLOPT_SSL_VERIFYPEER, 0L);  /* Self-signed */
-    curl_easy_setopt(conn->curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    wz_configure_tls(conn->curl);
 
     CURLcode rc = curl_easy_perform(conn->curl);
     if (rc != CURLE_OK) {
@@ -314,6 +337,15 @@ static virp_conn_t *wazuh_connect(const virp_device_t *device)
         fprintf(stderr, "[Wazuh] curl_easy_init() failed\n");
         free(conn);
         return NULL;
+    }
+
+    /* Log TLS posture at connect time */
+    {
+        const char *insecure = getenv("VIRP_WAZUH_INSECURE");
+        if (insecure && strcmp(insecure, "1") == 0) {
+            fprintf(stderr, "[WARN] Wazuh TLS verification DISABLED "
+                    "(VIRP_WAZUH_INSECURE=1) — MITM risk\n");
+        }
     }
 
     fprintf(stderr, "[Wazuh] Connecting to %s as %s\n",
@@ -448,8 +480,7 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
     curl_easy_setopt(conn->curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(conn->curl, CURLOPT_CONNECTTIMEOUT, (long)WZ_CONNECT_TIMEOUT_SEC);
     curl_easy_setopt(conn->curl, CURLOPT_TIMEOUT, (long)WZ_API_TIMEOUT_SEC);
-    curl_easy_setopt(conn->curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(conn->curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    wz_configure_tls(conn->curl);
 
     CURLcode rc = curl_easy_perform(conn->curl);
 
