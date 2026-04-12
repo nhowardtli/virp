@@ -116,5 +116,5 @@ void virp_session_on_disconnect(virp_context_t *ctx)
 void virp_session_destroy(virp_context_t *ctx)
 {
     (void)ctx;
-    OPENSSL_cleanse(&g_virp_session, sizeof(g_virp_session));
+    OPENSSL_cleanse(&ctx->session, sizeof(ctx->session));
 }
