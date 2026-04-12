@@ -13,6 +13,7 @@
 
 #include "virp.h"
 #include "virp_crypto.h"
+#include "virp_context.h"
 #include "virp_message.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -212,8 +213,8 @@ static int fuzz_boundary(void)
     virp_validate_message(buf, VIRP_HEADER_SIZE, &okey, &hdr);
 
     /* Signing with NULL key */
-    virp_sign(buf, VIRP_HEADER_SIZE, NULL);
-    virp_verify(buf, VIRP_HEADER_SIZE, NULL);
+    virp_sign(NULL, buf, VIRP_HEADER_SIZE, NULL);
+    virp_verify(NULL, buf, VIRP_HEADER_SIZE, NULL);
 
     /* Build with zero-length data */
     size_t out_len;

@@ -238,7 +238,7 @@ A VERIFIED claim at tier RED means: the evidence supports the claim, but the evi
 {
   "claim_id": "f81d4fa-e29a-4f9b-8c3e-1234abcd5678",
   "claim_type": "bgp.neighbor.state",
-  "agent_id": "tli-opsagent-v1",
+  "agent_id": "ironclaw-agent-v1",
   "timestamp": 1741478209,
   "assertion": {
     "subject": "bgp.neighbor[10.0.0.2]",

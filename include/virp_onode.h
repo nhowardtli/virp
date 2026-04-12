@@ -23,6 +23,7 @@
 #include "virp_crypto.h"
 #include "virp_driver.h"
 #include "virp_chain.h"
+#include "virp_context.h"
 #include <pthread.h>
 
 /* =========================================================================
@@ -35,7 +36,7 @@
 #define ONODE_HEARTBEAT_SEC     30
 #define ONODE_MAX_CLIENTS       8
 #define ONODE_RECV_TIMEOUT_SEC  5
-#define ONODE_MAX_REQUEST_SIZE  8192
+#define ONODE_MAX_REQUEST_SIZE  24576
 
 /* Auto-reconnect configuration */
 #define ONODE_WATCHDOG_INTERVAL_SEC  5   /* How often the watchdog checks */
@@ -131,6 +132,16 @@ typedef struct {
     uint32_t            observations_sent;
     uint32_t            errors;
     uint32_t            reconnects;     /* Total successful reconnections */
+
+    /*
+     * Protocol context (borrowed, not owned). The main() that owns
+     * this onode_state_t also owns the virp_context_t and must
+     * assign it here before calling onode_start(). handle_client
+     * reads ctx through this pointer to drive the session handshake.
+     * Lifetime: allocated with virp_context_new() in main, destroyed
+     * with virp_context_destroy() after onode_destroy().
+     */
+    virp_context_t      *ctx;
 } onode_state_t;
 
 /* =========================================================================
@@ -214,5 +225,12 @@ bool json_extract_string(const char *json, const char *key,
                          char *out, size_t out_len);
 
 bool json_extract_int64(const char *json, const char *key, int64_t *out);
+
+/*
+ * Decode a hex string to bytes. Only accepts [0-9a-fA-F].
+ * Returns number of bytes written, or -1 on error
+ * (odd length, non-hex character, output buffer too small).
+ */
+int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len);
 
 #endif /* VIRP_ONODE_H */

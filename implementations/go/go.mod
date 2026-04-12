@@ -1,3 +1,3 @@
-module github.com/nhowardtli/virp/implementations/go
+module github.com/nhowardtli/ironclaw/implementations/go
 
 go 1.22.1

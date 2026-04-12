@@ -15,6 +15,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_onode.h"
+#include "virp_session.h"
+#include "virp_context.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -178,6 +180,20 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * Allocate the protocol context. main owns the lifetime: it is
+     * destroyed after onode_destroy() below, and the OPENSSL_cleanse
+     * inside virp_context_destroy() wipes session_key, transcript
+     * state, and nonces before the allocation is released.
+     */
+    virp_context_t *ctx = virp_context_new();
+    if (!ctx) {
+        fprintf(stderr, "[O-Node] Failed to allocate protocol context\n");
+        onode_destroy(&g_state);
+        return 1;
+    }
+    g_state.ctx = ctx;
+
     /* Load devices */
     if (devices_path) {
         onode_load_devices_json(&g_state, devices_path);
@@ -192,8 +208,10 @@ int main(int argc, char **argv)
     /* Start event loop (blocks) */
     err = onode_start(&g_state);
 
-    /* Cleanup */
+    /* Cleanup — destroy onode state, then wipe+free the context */
     onode_destroy(&g_state);
+    virp_context_destroy(ctx);
+    g_state.ctx = NULL;
 
     return (err == VIRP_OK) ? 0 : 1;
 }

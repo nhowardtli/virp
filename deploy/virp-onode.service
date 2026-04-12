@@ -1,0 +1,13 @@
+[Unit]
+Description=VIRP Observation Node Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/virp/build/virp-onode-prod -k /etc/virp/keys/onode.key -s /tmp/virp-onode.sock -d /etc/virp/devices.json
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

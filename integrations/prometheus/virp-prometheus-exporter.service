@@ -1,0 +1,30 @@
+[Unit]
+Description=VIRP Prometheus Exporter — chain.db metrics on :9100
+After=network.target virp-onode.service
+Wants=virp-onode.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/virp/prometheus/virp_prometheus_exporter.py
+Restart=always
+RestartSec=10
+User=virp-onode
+Group=virp-onode
+
+# Environment — override via drop-in or /etc/default/virp-prometheus-exporter
+Environment=VIRP_CHAIN_DB=/var/lib/virp/chain.db
+Environment=VIRP_DEVICES_JSON=/run/virp/devices.json
+Environment=VIRP_EXPORTER_PORT=9100
+Environment=VIRP_EXPORTER_ADDR=0.0.0.0
+Environment=VIRP_POLL_INTERVAL=15
+
+# Hardening
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/virp
+ReadOnlyPaths=/run/virp
+ReadOnlyPaths=/opt/virp/prometheus
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

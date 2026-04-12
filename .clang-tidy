@@ -1,0 +1,15 @@
+---
+Checks: >
+  cert-*,
+  bugprone-*,
+  clang-analyzer-security-*,
+  clang-analyzer-core.*,
+  -readability-*,
+  -modernize-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp
+WarningsAsErrors: ''
+HeaderFilterRegex: 'include/.*'
+FormatStyle: none

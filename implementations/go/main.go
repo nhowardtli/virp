@@ -21,7 +21,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/nhowardtli/virp/implementations/go/virp"
+	"github.com/nhowardtli/ironclaw/implementations/go/virp"
 )
 
 func main() {

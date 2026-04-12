@@ -31,7 +31,7 @@ from virp_verify import (
     evaluate_assertion, load_corpus,
 )
 
-KEY_PATH = "/root/virp/keys/onode.key"
+KEY_PATH = "/opt/virp/keys/onode.key"
 
 
 def make_corpus_entry(bridge, obs_id, node_id, raw_output,
