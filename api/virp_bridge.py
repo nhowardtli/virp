@@ -4,7 +4,6 @@ virp_bridge.py — Python ctypes bridge to libvirp.so
 All VIRP operations go through the C library. No Python reimplementation.
 
 Provides:
-  - Command routing via fg_route_command() (FortiGate CLI → REST endpoint + tier)
   - Observation building and signing via virp_build_observation()
   - Signature verification via virp_verify()
   - Key management via virp_key_load_file() / virp_key_init()
@@ -145,18 +144,10 @@ class VIRPBridge:
         """Define C function signatures for ctypes."""
         lib = self._lib
 
-        # ── FortiGate command routing ──
-        # virp_error_t fg_route_command(const char *command,
-        #     fg_transport_t *transport, virp_trust_tier_t *tier,
-        #     const char **endpoint, const char **params)
-        lib.fg_route_command.argtypes = [
-            ctypes.c_char_p,                    # command
-            ctypes.POINTER(ctypes.c_int),       # transport (out, enum int)
-            ctypes.POINTER(ctypes.c_uint8),     # tier (out, uint8_t)
-            ctypes.POINTER(ctypes.c_char_p),    # endpoint (out)
-            ctypes.POINTER(ctypes.c_char_p),    # params (out)
-        ]
-        lib.fg_route_command.restype = ctypes.c_int
+        # TODO(2026-04-12): fg_route_command and FG_ROUTE_TABLE_SIZE are not
+        # yet implemented in libvirp.so. fg_route_table_full.c exists but has
+        # no function, no header, and is not in LIB_OBJS. Re-add bindings
+        # once the C side is integrated.
 
         # ── Key management ──
         # virp_error_t virp_key_init(virp_signing_key_t *sk,
@@ -224,8 +215,7 @@ class VIRPBridge:
         ]
         lib.virp_hmac_sha256.restype = None
 
-        # ── FG_ROUTE_TABLE_SIZE (const size_t, read-only data) ──
-        self._route_table_size = ctypes.c_size_t.in_dll(lib, "FG_ROUTE_TABLE_SIZE")
+        # FG_ROUTE_TABLE_SIZE removed — see TODO above
 
     # ── Key management ─────────────────────────────────────────────
 
@@ -255,58 +245,6 @@ class VIRPBridge:
         if err != 0:
             raise RuntimeError(f"virp_key_init failed: error {err}")
         self._signing_key = sk
-
-    # ── Command routing (FortiGate) ────────────────────────────────
-
-    @property
-    def route_table_size(self) -> int:
-        """Number of entries in the C FG_ROUTE_TABLE."""
-        return self._route_table_size.value
-
-    def route_command(self, command: str) -> dict:
-        """
-        Route a CLI-style command through the C library's FortiGate routing table.
-
-        Returns:
-            {
-                "transport": "rest" | "ssh",
-                "tier": "green" | "yellow" | "red",
-                "endpoint": str | None,
-                "params": str | None,
-                "source": "native"
-            }
-        """
-        transport = ctypes.c_int(0)
-        tier = ctypes.c_uint8(0)
-        endpoint = ctypes.c_char_p(None)
-        params = ctypes.c_char_p(None)
-
-        err = self._lib.fg_route_command(
-            command.encode("utf-8"),
-            ctypes.byref(transport),
-            ctypes.byref(tier),
-            ctypes.byref(endpoint),
-            ctypes.byref(params),
-        )
-
-        if err != 0:
-            logger.error(f"fg_route_command failed: error {err}")
-            return {
-                "transport": "ssh",
-                "tier": "yellow",
-                "endpoint": None,
-                "params": None,
-                "source": "native",
-                "error": int(err),
-            }
-
-        return {
-            "transport": TRANSPORT_LABELS.get(transport.value, "ssh"),
-            "tier": TIER_LABELS.get(tier.value, "yellow"),
-            "endpoint": endpoint.value.decode("utf-8") if endpoint.value else None,
-            "params": params.value.decode("utf-8") if params.value else None,
-            "source": "native",
-        }
 
     # ── Observation signing ────────────────────────────────────────
 
@@ -371,23 +309,6 @@ class VIRPBridge:
             ctypes.byref(self._signing_key),
         )
         return err == 0
-
-    # ── Convenience methods ────────────────────────────────────────
-
-    def get_tier_for_command(self, command: str) -> str:
-        """Get the trust tier string for a command."""
-        return self.route_command(command)["tier"]
-
-    def requires_approval(self, command: str) -> bool:
-        """RED tier = requires human approval."""
-        return self.get_tier_for_command(command) == "red"
-
-    def get_api_endpoint(self, command: str) -> Optional[str]:
-        """Get the REST API endpoint for a command, or None if SSH-only."""
-        result = self.route_command(command)
-        if result["transport"] == "rest":
-            return result["endpoint"]
-        return None
 
     def __del__(self):
         if hasattr(self, '_signing_key') and self._signing_key is not None:
