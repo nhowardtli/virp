@@ -669,6 +669,71 @@ static void hex_encode(char *buf, size_t buf_size, const uint8_t *data, size_t l
     buf[len * 2] = '\0';
 }
 
+/* =========================================================================
+ * Socket Framing (v2)
+ *
+ * Wire format:
+ *   [4 bytes: big-endian payload length (covers payload only, NOT the prefix)]
+ *   [1 byte:  VIRP_FRAME_VERSION (0x02)]
+ *   [N bytes: request payload (JSON)]
+ *
+ * The length prefix is payload-only. A 100-byte JSON request has
+ * length = 101 (1 version byte + 100 payload bytes), and 105 bytes
+ * on the wire (4 prefix + 101 frame).
+ *
+ * v1 detection: if the first byte is non-zero (e.g. '{' = 0x7B from
+ * raw JSON), this is a v1 unframed client. The server responds with
+ * a raw 4-byte VIRP_ERR_PROTOCOL_VERSION and closes.
+ * ========================================================================= */
+
+/*
+ * Read exactly `len` bytes from fd into buf.
+ * Handles partial reads, distinguishes EAGAIN/EINTR from EOF.
+ * Returns 0 on success, -1 on EOF or fatal error.
+ */
+static int recv_exact(int fd, void *buf, size_t len)
+{
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = recv(fd, (uint8_t *)buf + got, len - got, 0);
+        if (n > 0) {
+            got += (size_t)n;
+        } else if (n == 0) {
+            /* EOF — peer closed */
+            return -1;
+        } else {
+            /* n < 0: check errno */
+            if (errno == EINTR)
+                continue;   /* signal interrupted — retry */
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return -1;  /* timeout or non-blocking — treat as failure */
+            return -1;      /* other error */
+        }
+    }
+    return 0;
+}
+
+/*
+ * Send a framed response: [4-byte big-endian length][payload].
+ * Length covers the payload only, not the 4-byte prefix itself.
+ */
+static void send_framed(int fd, const void *buf, size_t len)
+{
+    uint32_t net_len = htonl((uint32_t)len);
+    send(fd, &net_len, 4, 0);
+    if (len > 0)
+        send(fd, buf, len, 0);
+}
+
+/*
+ * Send a framed 4-byte error code.
+ */
+static void send_framed_error(int fd, virp_error_t err)
+{
+    uint32_t err_code = htonl((uint32_t)err);
+    send_framed(fd, &err_code, 4);
+}
+
 static void handle_client(onode_state_t *state, int client_fd)
 {
     char recv_buf[ONODE_MAX_REQUEST_SIZE];
@@ -679,20 +744,60 @@ static void handle_client(onode_state_t *state, int client_fd)
     struct timeval tv = { .tv_sec = ONODE_RECV_TIMEOUT_SEC, .tv_usec = 0 };
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    /* Read request */
-    ssize_t n = recv(client_fd, recv_buf, sizeof(recv_buf) - 1, 0);
-    if (n <= 0) {
+    /* ── v2 framed receive ───────────────────────────────────────────
+     * Read 4-byte big-endian length prefix. If the first byte is
+     * non-zero, the client is sending raw JSON (v1) — reject cleanly. */
+    uint8_t len_buf[4];
+    if (recv_exact(client_fd, len_buf, 4) < 0) {
         close(client_fd);
         return;
     }
-    recv_buf[n] = '\0';
+
+    if (len_buf[0] != 0x00) {
+        /* v1 client: first byte is part of JSON (e.g. '{' = 0x7B).
+         * Send unframed error so the v1 client can read it. */
+        uint32_t err_code = htonl((uint32_t)VIRP_ERR_PROTOCOL_VERSION);
+        send(client_fd, &err_code, 4, 0);
+        close(client_fd);
+        return;
+    }
+
+    uint32_t frame_len = ((uint32_t)len_buf[0] << 24) |
+                         ((uint32_t)len_buf[1] << 16) |
+                         ((uint32_t)len_buf[2] <<  8) |
+                         ((uint32_t)len_buf[3]);
+
+    if (frame_len < 2 || frame_len > sizeof(recv_buf) - 1) {
+        /* Too small (need version + at least 1 byte) or too large */
+        send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+        close(client_fd);
+        return;
+    }
+
+    /* Read exactly frame_len bytes */
+    char frame_buf[ONODE_MAX_REQUEST_SIZE];
+    if (recv_exact(client_fd, frame_buf, frame_len) < 0) {
+        close(client_fd);
+        return;
+    }
+
+    /* Check frame version byte */
+    if ((uint8_t)frame_buf[0] != VIRP_FRAME_VERSION) {
+        send_framed_error(client_fd, VIRP_ERR_PROTOCOL_VERSION);
+        close(client_fd);
+        return;
+    }
+
+    /* Extract JSON payload (skip version byte) */
+    size_t json_len = frame_len - 1;
+    memcpy(recv_buf, frame_buf + 1, json_len);
+    recv_buf[json_len] = '\0';
 
     /* Parse request */
     onode_request_t req;
     if (!parse_request(recv_buf, &req)) {
         /* Bad request — send error code */
-        uint32_t err_code = htonl((uint32_t)VIRP_ERR_INVALID_TYPE);
-        send(client_fd, &err_code, 4, 0);
+        send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
         close(client_fd);
         return;
     }
@@ -702,53 +807,48 @@ static void handle_client(onode_state_t *state, int client_fd)
     switch (req.action) {
     case ONODE_ACTION_EXECUTE:
         if (req.device[0] == '\0' || req.command[0] == '\0') {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
         err = onode_execute(state, req.device, req.command,
                             resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
-            send(client_fd, resp_buf, resp_len, 0);
+            send_framed(client_fd, resp_buf, resp_len);
         else {
-            uint32_t err_code = htonl((uint32_t)err);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, err);
         }
         break;
 
     case ONODE_ACTION_HEALTH:
         if (req.device[0] == '\0') {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
         /* Health check — execute a simple command */
         err = onode_execute(state, req.device, "show version",
                             resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
-            send(client_fd, resp_buf, resp_len, 0);
+            send_framed(client_fd, resp_buf, resp_len);
         else {
-            uint32_t err_code = htonl((uint32_t)err);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, err);
         }
         break;
 
     case ONODE_ACTION_HEARTBEAT:
         err = onode_heartbeat(state, resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
-            send(client_fd, resp_buf, resp_len, 0);
+            send_framed(client_fd, resp_buf, resp_len);
         break;
 
     case ONODE_ACTION_LIST:
         err = onode_list_devices(state, resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
-            send(client_fd, resp_buf, resp_len, 0);
+            send_framed(client_fd, resp_buf, resp_len);
         break;
 
     case ONODE_ACTION_SIGN_INTENT:
         if (req.command[0] == '\0') {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
         /* req.command contains SHA256 hex of intent JSON (64 chars) */
@@ -759,18 +859,16 @@ static void handle_client(onode_state_t *state, int client_fd)
                                       (uint16_t)strlen(req.command),
                                       &state->okey);
         if (err == VIRP_OK && resp_len > 0) {
-            send(client_fd, resp_buf, resp_len, 0);
+            send_framed(client_fd, resp_buf, resp_len);
             state->observations_sent++;
         } else {
-            uint32_t err_code = htonl((uint32_t)err);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, err);
         }
         break;
 
     case ONODE_ACTION_SIGN_OUTCOME:
         if (req.command[0] == '\0') {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
         /* req.command contains SHA256 hex of outcome JSON (64 chars) */
@@ -781,24 +879,21 @@ static void handle_client(onode_state_t *state, int client_fd)
                                       (uint16_t)strlen(req.command),
                                       &state->okey);
         if (err == VIRP_OK && resp_len > 0) {
-            send(client_fd, resp_buf, resp_len, 0);
+            send_framed(client_fd, resp_buf, resp_len);
             state->observations_sent++;
         } else {
-            uint32_t err_code = htonl((uint32_t)err);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, err);
         }
         break;
 
     case ONODE_ACTION_CHAIN_APPEND:
         if (!state->chain_enabled) {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_CHAIN_DB);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
             break;
         }
         if (req.session_id[0] == '\0' || req.artifact_type[0] == '\0' ||
             req.artifact_id[0] == '\0' || req.artifact_hash[0] == '\0') {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
         {
@@ -807,8 +902,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                                      req.artifact_type, req.artifact_id,
                                      req.artifact_hash, &chain_entry);
             if (err != VIRP_OK) {
-                uint32_t err_code = htonl((uint32_t)err);
-                send(client_fd, &err_code, 4, 0);
+                send_framed_error(client_fd, err);
                 break;
             }
             /* Store raw artifact content if provided */
@@ -839,24 +933,21 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send(client_fd, resp_buf, resp_len, 0);
+                send_framed(client_fd, resp_buf, resp_len);
                 state->observations_sent++;
             } else {
-                uint32_t err_code = htonl((uint32_t)err);
-                send(client_fd, &err_code, 4, 0);
+                send_framed_error(client_fd, err);
             }
         }
         break;
 
     case ONODE_ACTION_CHAIN_VERIFY:
         if (!state->chain_enabled) {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_CHAIN_DB);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
             break;
         }
         if (req.session_id[0] == '\0') {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
         {
@@ -865,8 +956,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                                      req.from_sequence, req.to_sequence,
                                      &vresult);
             if (err != VIRP_OK) {
-                uint32_t err_code = htonl((uint32_t)err);
-                send(client_fd, &err_code, 4, 0);
+                send_framed_error(client_fd, err);
                 break;
             }
             char json_buf[1024];
@@ -887,25 +977,22 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send(client_fd, resp_buf, resp_len, 0);
+                send_framed(client_fd, resp_buf, resp_len);
                 state->observations_sent++;
             } else {
-                uint32_t err_code = htonl((uint32_t)err);
-                send(client_fd, &err_code, 4, 0);
+                send_framed_error(client_fd, err);
             }
         }
         break;
 
     case ONODE_ACTION_INTENT_STORE:
         if (!state->chain_enabled) {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_CHAIN_DB);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
             break;
         }
         if (req.intent_id[0] == '\0' || req.intent_hash[0] == '\0' ||
             req.intent_json[0] == '\0') {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
         {
@@ -929,8 +1016,7 @@ static void handle_client(onode_state_t *state, int client_fd)
             /* HMAC + timestamps computed inside virp_chain_intent_store */
             err = virp_chain_intent_store(&state->chain, &ie);
             if (err != VIRP_OK) {
-                uint32_t err_code = htonl((uint32_t)err);
-                send(client_fd, &err_code, 4, 0);
+                send_framed_error(client_fd, err);
                 break;
             }
             /* Store intent content as artifact */
@@ -961,32 +1047,28 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send(client_fd, resp_buf, resp_len, 0);
+                send_framed(client_fd, resp_buf, resp_len);
                 state->observations_sent++;
             } else {
-                uint32_t err_code = htonl((uint32_t)err);
-                send(client_fd, &err_code, 4, 0);
+                send_framed_error(client_fd, err);
             }
         }
         break;
 
     case ONODE_ACTION_INTENT_GET:
         if (!state->chain_enabled) {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_CHAIN_DB);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
             break;
         }
         if (req.intent_id[0] == '\0') {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
         {
             virp_intent_entry_t ie;
             err = virp_chain_intent_get(&state->chain, req.intent_id, &ie);
             if (err != VIRP_OK) {
-                uint32_t err_code = htonl((uint32_t)err);
-                send(client_fd, &err_code, 4, 0);
+                send_framed_error(client_fd, err);
                 break;
             }
 
@@ -1027,32 +1109,28 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send(client_fd, resp_buf, resp_len, 0);
+                send_framed(client_fd, resp_buf, resp_len);
                 state->observations_sent++;
             } else {
-                uint32_t err_code = htonl((uint32_t)err);
-                send(client_fd, &err_code, 4, 0);
+                send_framed_error(client_fd, err);
             }
         }
         break;
 
     case ONODE_ACTION_INTENT_EXECUTE:
         if (!state->chain_enabled) {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_CHAIN_DB);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
             break;
         }
         if (req.intent_id[0] == '\0') {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
         {
             virp_intent_entry_t ie;
             err = virp_chain_intent_execute(&state->chain, req.intent_id, &ie);
             if (err != VIRP_OK) {
-                uint32_t err_code = htonl((uint32_t)err);
-                send(client_fd, &err_code, 4, 0);
+                send_framed_error(client_fd, err);
                 break;
             }
 
@@ -1070,11 +1148,10 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send(client_fd, resp_buf, resp_len, 0);
+                send_framed(client_fd, resp_buf, resp_len);
                 state->observations_sent++;
             } else {
-                uint32_t err_code = htonl((uint32_t)err);
-                send(client_fd, &err_code, 4, 0);
+                send_framed_error(client_fd, err);
             }
         }
         break;
@@ -1086,8 +1163,7 @@ static void handle_client(onode_state_t *state, int client_fd)
 
         int cmd_count = parse_batch_commands(recv_buf, args, ONODE_MAX_BATCH);
         if (cmd_count <= 0) {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
 
@@ -1108,8 +1184,7 @@ static void handle_client(onode_state_t *state, int client_fd)
         if (!alloc_ok) {
             for (int i = 0; i < cmd_count; i++)
                 free(args[i].resp_buf);
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
 
@@ -1122,22 +1197,37 @@ static void handle_client(onode_state_t *state, int client_fd)
         for (int i = 0; i < cmd_count; i++)
             pthread_join(threads[i], NULL);
 
-        /* Send response: 4-byte count, then per-result length-prefixed messages */
-        uint32_t net_count = htonl((uint32_t)cmd_count);
-        send(client_fd, &net_count, 4, 0);
-
-        for (int i = 0; i < cmd_count; i++) {
-            if (args[i].err == VIRP_OK && args[i].resp_len > 0) {
-                uint32_t net_len = htonl((uint32_t)args[i].resp_len);
-                send(client_fd, &net_len, 4, 0);
-                send(client_fd, args[i].resp_buf, args[i].resp_len, 0);
-            } else {
-                /* Length 4 signals an error code follows */
-                uint32_t net_len = htonl(4);
-                send(client_fd, &net_len, 4, 0);
-                uint32_t err_code = htonl((uint32_t)args[i].err);
-                send(client_fd, &err_code, 4, 0);
+        /* Accumulate batch response into a buffer, then send as one frame.
+         * Format: 4-byte count, then per-result (4-byte len + data). */
+        {
+            size_t batch_cap = 4; /* count */
+            for (int i = 0; i < cmd_count; i++)
+                batch_cap += 4 + (args[i].err == VIRP_OK ? args[i].resp_len : 4);
+            uint8_t *batch_buf = malloc(batch_cap);
+            if (!batch_buf) {
+                send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
+                for (int i = 0; i < cmd_count; i++)
+                    free(args[i].resp_buf);
+                break;
             }
+            size_t off = 0;
+            uint32_t net_count = htonl((uint32_t)cmd_count);
+            memcpy(batch_buf + off, &net_count, 4); off += 4;
+            for (int i = 0; i < cmd_count; i++) {
+                if (args[i].err == VIRP_OK && args[i].resp_len > 0) {
+                    uint32_t net_len = htonl((uint32_t)args[i].resp_len);
+                    memcpy(batch_buf + off, &net_len, 4); off += 4;
+                    memcpy(batch_buf + off, args[i].resp_buf, args[i].resp_len);
+                    off += args[i].resp_len;
+                } else {
+                    uint32_t net_len = htonl(4);
+                    memcpy(batch_buf + off, &net_len, 4); off += 4;
+                    uint32_t err_code = htonl((uint32_t)args[i].err);
+                    memcpy(batch_buf + off, &err_code, 4); off += 4;
+                }
+            }
+            send_framed(client_fd, batch_buf, off);
+            free(batch_buf);
         }
 
         /* Cleanup */
@@ -1149,8 +1239,7 @@ static void handle_client(onode_state_t *state, int client_fd)
 
     case ONODE_ACTION_SESSION_HELLO: {
         if (req.client_id[0] == '\0') {
-            uint32_t err_code = htonl((uint32_t)VIRP_ERR_NULL_PTR);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
 
@@ -1209,8 +1298,7 @@ static void handle_client(onode_state_t *state, int client_fd)
         virp_session_hello_ack_t ack;
         err = virp_handle_hello(state->ctx, &hello, &ack);
         if (err != VIRP_OK) {
-            uint32_t err_code = htonl((uint32_t)err);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, err);
             break;
         }
 
@@ -1235,7 +1323,7 @@ static void handle_client(onode_state_t *state, int client_fd)
             ack.accepted_channels,
             sid_hex, cn_hex, sn_hex);
 
-        send(client_fd, json_resp, (size_t)jlen, 0);
+        send_framed(client_fd, json_resp, (size_t)jlen);
         break;
     }
 
@@ -1267,8 +1355,7 @@ static void handle_client(onode_state_t *state, int client_fd)
 
         err = virp_handle_session_bind(state->ctx, &bind_msg);
         if (err != VIRP_OK) {
-            uint32_t err_code = htonl((uint32_t)err);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, err);
             break;
         }
 
@@ -1277,13 +1364,12 @@ static void handle_client(onode_state_t *state, int client_fd)
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] session key derivation failed: %d\n",
                     (int)err);
-            uint32_t err_code = htonl((uint32_t)err);
-            send(client_fd, &err_code, 4, 0);
+            send_framed_error(client_fd, err);
             break;
         }
 
         const char *ok_resp = "{\"status\":\"bound\",\"active\":true}";
-        send(client_fd, ok_resp, strlen(ok_resp), 0);
+        send_framed(client_fd, ok_resp, strlen(ok_resp));
         break;
     }
 
@@ -1292,7 +1378,7 @@ static void handle_client(onode_state_t *state, int client_fd)
         fprintf(stderr, "[O-Node] Session closed by client\n");
         {
             const char *close_resp = "{\"status\":\"closed\"}";
-            send(client_fd, close_resp, strlen(close_resp), 0);
+            send_framed(client_fd, close_resp, strlen(close_resp));
         }
         break;
 

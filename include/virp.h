@@ -24,6 +24,10 @@
 #define VIRP_KEY_SIZE           32          /* 256-bit signing keys */
 #define VIRP_MAX_MESSAGE_SIZE   65536       /* 64KB max message */
 #define VIRP_MAX_PAYLOAD_SIZE   (VIRP_MAX_MESSAGE_SIZE - VIRP_HEADER_SIZE)
+/* Socket framing version — inside the length-prefixed frame, NOT before it.
+ * Enables version negotiation on a bad length without losing recovery. */
+#define VIRP_FRAME_VERSION      0x02        /* v2 framed protocol */
+
 #define VIRP_MAX_OBS_REFS       64          /* Max observation references per proposal */
 #define VIRP_MAX_INTENT_DATA    8192        /* Max intent payload */
 #define VIRP_MAGIC              0x56495250  /* "VIRP" in ASCII */
@@ -373,6 +377,7 @@ typedef enum {
     VIRP_ERR_CRYPTO              = -32,  /* Cryptographic operation failed */
     VIRP_ERR_HOST_KEY_MISMATCH   = -33,  /* SSH host key changed (possible MITM) */
     VIRP_ERR_HOST_KEY_UNKNOWN    = -34,  /* SSH host key not in known_hosts */
+    VIRP_ERR_PROTOCOL_VERSION    = -35,  /* Client sent unframed v1 request */
 } virp_error_t;
 
 /* =========================================================================

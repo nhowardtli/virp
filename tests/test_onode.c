@@ -105,20 +105,44 @@ static int client_connect(void)
     return fd;
 }
 
+/*
+ * Send a v2 framed request: [4-byte len][0x02 version][JSON]
+ * Receive a v2 framed response: [4-byte len][payload]
+ */
 static ssize_t client_request(const char *json,
                               uint8_t *resp, size_t resp_len)
 {
     int fd = client_connect();
     if (fd < 0) return -1;
 
-    send(fd, json, strlen(json), 0);
+    /* Send v2 framed request */
+    size_t json_len = strlen(json);
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));  /* version byte + JSON */
+    send(fd, &frame_len, 4, 0);
+    uint8_t version = VIRP_FRAME_VERSION;
+    send(fd, &version, 1, 0);
+    send(fd, json, json_len, 0);
 
     /* Brief pause to let O-Node process */
     usleep(50000);
 
-    ssize_t n = recv(fd, resp, resp_len, 0);
+    /* Read framed response: 4-byte length prefix + payload */
+    uint32_t net_rlen;
+    ssize_t nr = recv(fd, &net_rlen, 4, 0);
+    if (nr != 4) { close(fd); return -1; }
+    uint32_t rlen = ntohl(net_rlen);
+    if (rlen > resp_len) { close(fd); return -1; }
+
+    /* Read exact payload */
+    size_t got = 0;
+    while (got < rlen) {
+        ssize_t n = recv(fd, resp + got, rlen - got, 0);
+        if (n <= 0) { close(fd); return (ssize_t)got; }
+        got += (size_t)n;
+    }
+
     close(fd);
-    return n;
+    return (ssize_t)rlen;
 }
 
 /* =========================================================================
@@ -372,27 +396,46 @@ static int client_batch_request(const char *json,
     int fd = client_connect();
     if (fd < 0) return -1;
 
-    send(fd, json, strlen(json), 0);
+    /* Send v2 framed request */
+    size_t json_len = strlen(json);
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+    send(fd, &frame_len, 4, 0);
+    uint8_t version = VIRP_FRAME_VERSION;
+    send(fd, &version, 1, 0);
+    send(fd, json, json_len, 0);
     usleep(200000); /* Let threads complete */
 
-    /* Read 4-byte count */
+    /* Read framed response: [4-byte outer len][batch payload] */
+    uint32_t net_outer;
+    if (recv_all(fd, &net_outer, 4) < 0) { close(fd); return -1; }
+    uint32_t outer_len = ntohl(net_outer);
+
+    /* Read entire batch payload */
+    uint8_t *batch = malloc(outer_len);
+    if (!batch) { close(fd); return -1; }
+    if (recv_all(fd, batch, outer_len) < 0) { free(batch); close(fd); return -1; }
+
+    /* Parse batch: 4-byte count, then per-result (4-byte len + data) */
+    if (outer_len < 4) { free(batch); close(fd); return -1; }
     uint32_t net_count;
-    if (recv_all(fd, &net_count, 4) < 0) { close(fd); return -1; }
+    memcpy(&net_count, batch, 4);
     int count = (int)ntohl(net_count);
     if (count > max_results) count = max_results;
 
+    size_t off = 4;
     for (int i = 0; i < count; i++) {
-        /* Read 4-byte length prefix */
+        if (off + 4 > outer_len) { free(batch); close(fd); return i; }
         uint32_t net_len;
-        if (recv_all(fd, &net_len, 4) < 0) { close(fd); return i; }
+        memcpy(&net_len, batch + off, 4); off += 4;
         uint32_t msg_len = ntohl(net_len);
-        if (msg_len > VIRP_MAX_MESSAGE_SIZE) { close(fd); return i; }
-
-        /* Read message payload */
-        if (recv_all(fd, resp[i], msg_len) < 0) { close(fd); return i; }
+        if (msg_len > VIRP_MAX_MESSAGE_SIZE || off + msg_len > outer_len) {
+            free(batch); close(fd); return i;
+        }
+        memcpy(resp[i], batch + off, msg_len); off += msg_len;
         resp_len[i] = msg_len;
     }
 
+    free(batch);
     close(fd);
     return count;
 }
@@ -634,6 +677,37 @@ TEST(test_batch_same_device_concurrent)
     }
 }
 
+TEST(test_v1_unframed_client_rejected)
+{
+    /*
+     * A v1 client sends raw JSON (starts with '{' = 0x7B).
+     * The server should respond with unframed VIRP_ERR_PROTOCOL_VERSION
+     * and close the connection.
+     */
+    int fd = client_connect();
+    ASSERT_TRUE(fd >= 0);
+
+    /* Send raw JSON (v1 style — no frame prefix) */
+    const char *v1_json = "{\"action\":\"heartbeat\"}";
+    send(fd, v1_json, strlen(v1_json), 0);
+    usleep(50000);
+
+    /* Should receive a raw 4-byte error code (not framed) */
+    uint32_t net_err;
+    ssize_t n = recv(fd, &net_err, 4, 0);
+    ASSERT_EQ((int)n, 4);
+
+    int32_t err = (int32_t)ntohl(net_err);
+    ASSERT_EQ(err, VIRP_ERR_PROTOCOL_VERSION);
+
+    /* Connection should be closed by server */
+    char extra;
+    ssize_t more = recv(fd, &extra, 1, 0);
+    ASSERT_TRUE(more <= 0);  /* EOF */
+
+    close(fd);
+}
+
 /* =========================================================================
  * hex_decode unit tests
  * ========================================================================= */
@@ -781,6 +855,9 @@ int main(void)
     RUN_TEST(test_batch_execute_parallel_timing);
     RUN_TEST(test_batch_sequence_numbers_unique);
     RUN_TEST(test_batch_same_device_concurrent);
+
+    printf("\n[v2 Framing Tests]\n");
+    RUN_TEST(test_v1_unframed_client_rejected);
 
     /* Shutdown */
     onode_shutdown(&g_state);
