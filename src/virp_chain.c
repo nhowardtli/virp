@@ -71,7 +71,18 @@ static const char *SCHEMA_SQL =
     "  signature_timestamp_ns INTEGER NOT NULL,"
     "  created_at_ns INTEGER NOT NULL"
     ");"
-    "CREATE INDEX IF NOT EXISTS idx_intents_id ON intents(intent_id);";
+    "CREATE INDEX IF NOT EXISTS idx_intents_id ON intents(intent_id);"
+    "CREATE TABLE IF NOT EXISTS artifacts ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  artifact_id TEXT NOT NULL,"
+    "  artifact_type TEXT NOT NULL,"
+    "  artifact_content TEXT NOT NULL,"
+    "  artifact_hash TEXT NOT NULL,"
+    "  session_id TEXT NOT NULL,"
+    "  created_at_ns INTEGER NOT NULL,"
+    "  UNIQUE(artifact_id)"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_artifacts_id ON artifacts(artifact_id);";
 
 /* =========================================================================
  * Prepared Statement SQL
@@ -125,6 +136,12 @@ static const char *SQL_INTENT_GET =
 static const char *SQL_INTENT_EXECUTE =
     "UPDATE intents SET commands_executed = commands_executed + 1 "
     "WHERE intent_id = ? AND commands_executed < max_commands";
+
+static const char *SQL_ARTIFACT_INSERT =
+    "INSERT OR REPLACE INTO artifacts "
+    "(artifact_id, artifact_type, artifact_content, artifact_hash, "
+    " session_id, created_at_ns) "
+    "VALUES (?,?,?,?,?,?)";
 
 /* =========================================================================
  * Helpers
@@ -349,6 +366,15 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
         sqlite3_prepare_v2(state->db, SQL_INTENT_EXECUTE, -1,
                            &state->stmt_intent_execute, NULL) != SQLITE_OK) {
         fprintf(stderr, "[Chain] Failed to prepare intent statements: %s\n",
+                sqlite3_errmsg(state->db));
+        sqlite3_close(state->db);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* Prepare artifact store statement */
+    if (sqlite3_prepare_v2(state->db, SQL_ARTIFACT_INSERT, -1,
+                           &state->stmt_artifact_insert, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[Chain] Failed to prepare artifact statement: %s\n",
                 sqlite3_errmsg(state->db));
         sqlite3_close(state->db);
         return VIRP_ERR_CHAIN_DB;
@@ -644,6 +670,8 @@ void virp_chain_destroy(virp_chain_state_t *state)
         sqlite3_finalize(state->stmt_intent_get);
     if (state->stmt_intent_execute)
         sqlite3_finalize(state->stmt_intent_execute);
+    if (state->stmt_artifact_insert)
+        sqlite3_finalize(state->stmt_artifact_insert);
     if (state->db)
         sqlite3_close(state->db);
 
@@ -773,4 +801,44 @@ virp_error_t virp_chain_intent_execute(virp_chain_state_t *state,
 
     /* Return updated entry */
     return virp_chain_intent_get(state, intent_id, entry);
+}
+
+/* =========================================================================
+ * Artifact Store
+ * ========================================================================= */
+
+virp_error_t virp_chain_artifact_store(virp_chain_state_t *state,
+                                        const char *artifact_id,
+                                        const char *artifact_type,
+                                        const char *artifact_content,
+                                        const char *artifact_hash,
+                                        const char *session_id)
+{
+    if (!state || !state->db || !artifact_id || !artifact_type ||
+        !artifact_content || !artifact_hash || !session_id)
+        return VIRP_ERR_NULL_PTR;
+
+    if (artifact_content[0] == '\0')
+        return VIRP_ERR_NULL_PTR;
+
+    sqlite3_stmt *stmt = state->stmt_artifact_insert;
+    sqlite3_reset(stmt);
+
+    sqlite3_bind_text(stmt, 1, artifact_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, artifact_type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, artifact_content, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, artifact_hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, session_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 6, (int64_t)get_wall_ns());
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_reset(stmt);
+
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "[Chain] Artifact store failed: %s\n",
+                sqlite3_errmsg(state->db));
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    return VIRP_OK;
 }

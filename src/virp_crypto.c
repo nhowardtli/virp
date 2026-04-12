@@ -12,6 +12,7 @@
 #include "virp_crypto.h"
 #include "virp_message.h"
 #include "virp_session.h"
+#include "virp_context.h"
 #include <string.h>
 #include <stdio.h>
 #include <fcntl.h>
@@ -122,6 +123,16 @@ void virp_key_destroy(virp_signing_key_t *sk)
         p[i] = 0;
 }
 
+int virp_consttime_eq(const void *a, const void *b, size_t n)
+{
+    const volatile uint8_t *pa = (const volatile uint8_t *)a;
+    const volatile uint8_t *pb = (const volatile uint8_t *)b;
+    volatile uint8_t diff = 0;
+    for (size_t i = 0; i < n; i++)
+        diff |= pa[i] ^ pb[i];
+    return (diff == 0) ? 1 : 0;
+}
+
 /* =========================================================================
  * HMAC-SHA256
  * ========================================================================= */
@@ -157,9 +168,11 @@ static virp_error_t check_channel_key_binding(uint8_t channel,
  * Signing and Verification
  * ========================================================================= */
 
-virp_error_t virp_sign(uint8_t *msg, size_t msg_len,
+virp_error_t virp_sign(virp_context_t *ctx,
+                       uint8_t *msg, size_t msg_len,
                        const virp_signing_key_t *sk)
 {
+    (void)ctx;
     if (!msg || !sk)
         return VIRP_ERR_NULL_PTR;
     if (!sk->key.loaded)
@@ -213,9 +226,11 @@ virp_error_t virp_sign(uint8_t *msg, size_t msg_len,
     return VIRP_OK;
 }
 
-virp_error_t virp_verify(const uint8_t *msg, size_t msg_len,
+virp_error_t virp_verify(virp_context_t *ctx,
+                         const uint8_t *msg, size_t msg_len,
                          const virp_signing_key_t *sk)
 {
+    (void)ctx;
     if (!msg || !sk)
         return VIRP_ERR_NULL_PTR;
     if (!sk->key.loaded)
@@ -252,12 +267,8 @@ virp_error_t virp_verify(const uint8_t *msg, size_t msg_len,
     virp_hmac_sha256(sk->key.key, sign_buf, sign_len, expected);
 
     /* Constant-time comparison to prevent timing attacks */
-    const uint8_t *actual = msg + hmac_offset;
-    uint8_t diff = 0;
-    for (size_t i = 0; i < VIRP_HMAC_SIZE; i++)
-        diff |= actual[i] ^ expected[i];
-
-    return (diff == 0) ? VIRP_OK : VIRP_ERR_HMAC_FAILED;
+    return virp_consttime_eq(msg + hmac_offset, expected, VIRP_HMAC_SIZE)
+               ? VIRP_OK : VIRP_ERR_HMAC_FAILED;
 }
 
 /* =========================================================================
@@ -265,6 +276,7 @@ virp_error_t virp_verify(const uint8_t *msg, size_t msg_len,
  * ========================================================================= */
 
 virp_error_t virp_sign_observation_v2(
+    virp_context_t *ctx,
     uint64_t       node_id,
     uint64_t       device_id,
     uint8_t        tier,
@@ -274,21 +286,21 @@ virp_error_t virp_sign_observation_v2(
     virp_obs_header_v2_t *hdr_out,
     uint8_t        sig_out[32])
 {
-    if (!command || !payload || !hdr_out || !sig_out)
+    if (!ctx || !command || !payload || !hdr_out || !sig_out)
         return VIRP_ERR_NULL_PTR;
 
     /* v2 observations require an active session with derived key */
-    virp_error_t serr = virp_session_require_active();
+    virp_error_t serr = virp_session_require_active(ctx);
     if (serr != VIRP_OK) return serr;
 
-    if (!g_virp_session.session_key_valid)
+    if (!ctx->session.session_key_valid)
         return VIRP_ERR_KEY_NOT_LOADED;
 
     /* update session activity timestamp */
     {
         struct timespec ts_act;
         clock_gettime(CLOCK_REALTIME, &ts_act);
-        g_virp_session.last_activity_ns =
+        ctx->session.last_activity_ns =
             (uint64_t)ts_act.tv_sec * 1000000000ULL + ts_act.tv_nsec;
     }
 
@@ -309,7 +321,7 @@ virp_error_t virp_sign_observation_v2(
     hdr.timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 
     /* session id — always from the active session */
-    memcpy(hdr.session_id, g_virp_session.session_id, 16);
+    memcpy(hdr.session_id, ctx->session.session_id, 16);
 
     /* canonicalize command and hash it */
     char canon[512];
@@ -328,7 +340,7 @@ virp_error_t virp_sign_observation_v2(
 
     unsigned int sig_len = 32;
     if (!HMAC(EVP_sha256(),
-              g_virp_session.session_key, 32,
+              ctx->session.session_key, 32,
               sign_buf, sign_len, sig_out, &sig_len))
         return VIRP_ERR_CRYPTO;
 

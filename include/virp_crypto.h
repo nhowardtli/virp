@@ -14,6 +14,7 @@
 #define VIRP_CRYPTO_H
 
 #include "virp.h"
+#include "virp_session.h"  /* virp_context_t forward decl */
 
 /* =========================================================================
  * Key Management
@@ -70,6 +71,13 @@ virp_error_t virp_key_save_file(const virp_signing_key_t *sk,
  */
 void virp_key_destroy(virp_signing_key_t *sk);
 
+/*
+ * Constant-time comparison of two buffers.
+ * Returns 1 if equal, 0 otherwise. Evaluates all bytes regardless
+ * of mismatch position to prevent timing side-channels.
+ */
+int virp_consttime_eq(const void *a, const void *b, size_t n);
+
 /* =========================================================================
  * Signing and Verification
  *
@@ -98,7 +106,8 @@ void virp_key_destroy(virp_signing_key_t *sk);
  * Returns VIRP_OK on success, VIRP_ERR_CHANNEL_VIOLATION if
  * key type doesn't match channel.
  */
-virp_error_t virp_sign(uint8_t *msg, size_t msg_len,
+virp_error_t virp_sign(virp_context_t *ctx,
+                       uint8_t *msg, size_t msg_len,
                        const virp_signing_key_t *sk);
 
 /*
@@ -112,7 +121,8 @@ virp_error_t virp_sign(uint8_t *msg, size_t msg_len,
  * Returns VIRP_ERR_HMAC_FAILED if signature doesn't match.
  * Returns VIRP_ERR_CHANNEL_VIOLATION if key type doesn't match channel.
  */
-virp_error_t virp_verify(const uint8_t *msg, size_t msg_len,
+virp_error_t virp_verify(virp_context_t *ctx,
+                         const uint8_t *msg, size_t msg_len,
                          const virp_signing_key_t *sk);
 
 /*
@@ -145,12 +155,13 @@ int virp_canonicalize_command(const char *cmd, char *out, size_t out_len);
 
 /*
  * Build and sign a v2 observation header + payload.
- * Uses the HKDF-derived session key from g_virp_session.
+ * Uses the HKDF-derived session key stored in ctx->session.
  * Session must be ACTIVE with a valid session key.
  *
  * Returns VIRP_OK on success, error code otherwise.
  */
 virp_error_t virp_sign_observation_v2(
+    virp_context_t *ctx,
     uint64_t node_id, uint64_t device_id,
     uint8_t tier, uint64_t seq_num,
     const char *command,

@@ -308,4 +308,46 @@ $(TEST_JUNIPER): tests/test_driver_juniper.c $(LIB)
 test-juniper: $(TEST_JUNIPER)
 	./$(TEST_JUNIPER)
 
+# Lint: fail build if sprintf( appears in src/ (use snprintf instead)
+.PHONY: lint-sprintf
+lint-sprintf:
+	@echo "=== checking for banned sprintf in src/ ==="
+	@if grep -rn 'sprintf(' src/; then echo "FAIL: sprintf found — use snprintf"; exit 1; fi
+	@echo "  PASS: no sprintf found"
+
+# Lint: fail build if rand( or srand( appears in src/ outside driver_mock.c
+.PHONY: lint-rand
+lint-rand:
+	@echo "=== checking for banned rand()/srand() in src/ ==="
+	@if grep -rn 'rand(' src/ --include='*.c' | grep -v 'driver_mock.c' | grep -v 'RAND_bytes' | grep -v 'srand' | grep -v '/\*' | grep -v '^\s*//' ; then echo "FAIL: rand() found — use RAND_bytes"; exit 1; fi
+	@if grep -rn 'srand(' src/ --include='*.c' | grep -v 'driver_mock.c' ; then echo "FAIL: srand() found — use RAND_bytes"; exit 1; fi
+	@echo "  PASS: no banned rand/srand found"
+
+# Lint: report any memcmp usage in src/ for human review (advisory, not fatal)
+.PHONY: lint-memcmp
+lint-memcmp:
+	@echo "=== memcmp usage in src/ (advisory) ==="
+	@grep -rn 'memcmp' src/ || echo "  (none found)"
+
+# ASan+UBSan test rebuild — runs full test suite under sanitizers
+.PHONY: asan-test
+asan-test:
+	$(MAKE) clean
+	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
+	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined"
+	@echo "=== Running tests under ASan+UBSan ==="
+	./$(TEST_BIN) 2>&1
+	./$(TEST_ONODE) 2>&1
+	@echo "=== ASan+UBSan test run complete ==="
+
+# libFuzzer harness (requires clang)
+FUZZ_LIBFUZZER = $(BUILD_DIR)/fuzz_libfuzzer
+
+.PHONY: fuzz-libfuzzer
+fuzz-libfuzzer: $(LIB)
+	clang -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -g \
+	      -I./include tests/fuzz_libfuzzer.c $(LIB) $(LDFLAGS) \
+	      -lstdc++ -o $(FUZZ_LIBFUZZER)
+	@echo "Built $(FUZZ_LIBFUZZER) — run with: ./$(FUZZ_LIBFUZZER) [corpus_dir]"
+
 all-tests: test test-onode test-chain test-federation test-interop test-json test-session test-session-key

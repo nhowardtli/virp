@@ -5,7 +5,7 @@
 // and messages built by Go can be validated by the C implementation.
 // Also tests live round-trip with the running C O-Node daemon.
 //
-// Requires the C interop tool at /root/virp/build/test_interop_c
+// Requires the C interop tool at /opt/virp/build/test_interop_c
 // and (optionally) a running C O-Node at /tmp/virp-onode.sock.
 
 package virp
@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const cInteropBin = "/root/virp/build/test_interop_c"
+const cInteropBin = "/opt/virp/build/test_interop_c"
 
 // writeMsgFile writes messages in the interop format: [4-byte BE length][message]
 func writeMsgFile(path string, messages [][]byte) error {

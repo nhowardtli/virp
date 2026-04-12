@@ -25,6 +25,14 @@
 extern "C" {
 #endif
 
+/*
+ * Forward declaration of virp_context_t. Full definition lives in
+ * virp_context.h, which callers of the threaded API must include.
+ * Using a forward decl here keeps virp_session.h / virp_context.h
+ * free of a circular include.
+ */
+typedef struct virp_context_s virp_context_t;
+
 typedef enum {
     VIRP_SESSION_DISCONNECTED = 0,
     VIRP_SESSION_HELLO_SENT   = 1,  /* client sent HELLO, awaiting ACK */
@@ -63,16 +71,20 @@ typedef struct {
     size_t   transcript_len;
 } virp_session_t;
 
-/* Global single-session state — one active session at a time */
-extern virp_session_t g_virp_session;
-
-/* Session API */
-void virp_session_init(const char *server_id);
-void virp_session_reset(void);
-virp_session_state_t virp_session_state(void);
+/*
+ * Session API
+ *
+ * Every function takes a virp_context_t *ctx as its first parameter.
+ * Callers allocate contexts with virp_context_new() (see
+ * virp_context.h) and release them with virp_context_destroy();
+ * session material is wiped as part of context destruction.
+ */
+virp_error_t virp_session_init(virp_context_t *ctx, const char *server_id);
+void virp_session_reset(virp_context_t *ctx);
+virp_session_state_t virp_session_state(virp_context_t *ctx);
 
 /* Returns VIRP_OK if session is ACTIVE and ready for observations */
-virp_error_t virp_session_require_active(void);
+virp_error_t virp_session_require_active(virp_context_t *ctx);
 
 /*
  * Check for session timeouts. Call from O-Node main loop or before
@@ -80,13 +92,13 @@ virp_error_t virp_session_require_active(void);
  * for SESSION_BIND, or ACTIVE session has been idle too long.
  * Returns VIRP_ERR_SESSION_INVALID if a timeout was enforced.
  */
-virp_error_t virp_session_check_timeouts(void);
+virp_error_t virp_session_check_timeouts(virp_context_t *ctx);
 
 /*
  * Call immediately when the transport socket closes or errors.
  * Forces unambiguous transition to DISCONNECTED regardless of state.
  */
-void virp_session_on_disconnect(void);
+void virp_session_on_disconnect(virp_context_t *ctx);
 
 #ifdef __cplusplus
 }

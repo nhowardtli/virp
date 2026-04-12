@@ -3,7 +3,7 @@
  * VIRP Live Device Test
  *
  * Usage: virp-live-test [router_ip] [command]
- * Defaults: R1 (10.0.0.50) "show ip bgp summary"
+ * Defaults: R1 (198.51.100.1) "show ip bgp summary"
  */
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -20,7 +20,7 @@ extern void virp_driver_mock_init(void);
 extern void virp_driver_cisco_init(void);
 #endif
 int main(int argc, char **argv) {
-    const char *host = (argc > 1) ? argv[1] : "10.0.0.50";
+    const char *host = (argc > 1) ? argv[1] : "198.51.100.1";
     const char *command = (argc > 2) ? argv[2] : "show ip bgp summary";
     printf("\n================================================================\n");
     printf("  VIRP Live Device Test\n");
@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
     };
     snprintf(device.hostname, sizeof(device.hostname), "R-live");
     snprintf(device.host, sizeof(device.host), "%s", host);
-    snprintf(device.username, sizeof(device.username), "admin");
+    snprintf(device.username, sizeof(device.username), "virp-agent");
     snprintf(device.password, sizeof(device.password), "changeme");
     snprintf(device.enable_password, sizeof(device.enable_password), "changeme");
     printf("[*] Target: %s (%s)\n", device.hostname, device.host);

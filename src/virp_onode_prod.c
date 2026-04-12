@@ -306,11 +306,25 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * Allocate the protocol context. main() owns it for the lifetime
+     * of the process. virp_context_destroy() below will OPENSSL_cleanse
+     * session_key / transcript state before freeing.
+     */
+    virp_context_t *ctx = virp_context_new();
+    if (!ctx) {
+        fprintf(stderr, "[O-Node] Failed to allocate protocol context\n");
+        onode_destroy(&g_state);
+        return 1;
+    }
+    g_state.ctx = ctx;
+
     /* Load devices from JSON config */
     int loaded = load_devices(&g_state, devices_path);
     if (loaded <= 0) {
         fprintf(stderr, "[O-Node] No devices loaded. Exiting.\n");
         onode_destroy(&g_state);
+        virp_context_destroy(ctx);
         return 1;
     }
 
@@ -340,6 +354,8 @@ int main(int argc, char **argv)
 
     /* Cleanup */
     onode_destroy(&g_state);
+    virp_context_destroy(ctx);
+    g_state.ctx = NULL;
 
     return (err == VIRP_OK) ? 0 : 1;
 }

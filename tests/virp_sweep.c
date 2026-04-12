@@ -16,7 +16,7 @@
  *
  * Usage:
  *   virp-sweep                      # All 10 routers, default commands
- *   virp-sweep 10.0.0.50 10.0.0.51  # Specific routers only
+ *   virp-sweep 198.51.100.1 198.51.100.2  # Specific routers only
  */
 
 #define _DEFAULT_SOURCE

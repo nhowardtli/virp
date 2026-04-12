@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "virp_session.h"
+#include "virp_context.h"
 #include "virp_handshake.h"
 #include "virp_transcript.h"
 #include "virp_crypto.h"
@@ -33,11 +34,11 @@ static virp_session_hello_t make_hello(void)
 }
 
 /* Helper: complete full handshake through BOUND + derive → ACTIVE */
-static void do_full_handshake(void)
+static void do_full_handshake(virp_context_t *ctx)
 {
     virp_session_hello_t hello = make_hello();
     virp_session_hello_ack_t ack;
-    assert(virp_handle_hello(&hello, &ack) == VIRP_OK);
+    assert(virp_handle_hello(ctx, &hello, &ack) == VIRP_OK);
 
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
@@ -45,83 +46,94 @@ static void do_full_handshake(void)
     memcpy(bind.session_id,   ack.session_id,   16);
     memcpy(bind.client_nonce, ack.client_nonce,  8);
     memcpy(bind.server_nonce, ack.server_nonce,  8);
-    assert(virp_handle_session_bind(&bind) == VIRP_OK);
-    assert(virp_session_state() == VIRP_SESSION_BOUND);
+    assert(virp_handle_session_bind(ctx, &bind) == VIRP_OK);
+    assert(virp_session_state(ctx) == VIRP_SESSION_BOUND);
 
-    assert(virp_session_derive_key(test_master_key) == VIRP_OK);
-    assert(virp_session_state() == VIRP_SESSION_ACTIVE);
+    assert(virp_session_derive_key(ctx, test_master_key) == VIRP_OK);
+    assert(virp_session_state(ctx) == VIRP_SESSION_ACTIVE);
 }
 
 static void test_key_derived_and_valid(void)
 {
     printf("  test_key_derived_and_valid... ");
-    virp_session_init("onode-test");
-    do_full_handshake();
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
+    do_full_handshake(ctx);
 
     /* session key must be non-zero and marked valid */
-    assert(g_virp_session.session_key_valid == 1);
+    assert(ctx->session.session_key_valid == 1);
 
     uint8_t zeros[32];
     memset(zeros, 0, 32);
-    assert(memcmp(g_virp_session.session_key, zeros, 32) != 0);
+    assert(memcmp(ctx->session.session_key, zeros, 32) != 0);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_key_zeroed_on_reset(void)
 {
     printf("  test_key_zeroed_on_reset... ");
-    virp_session_init("onode-test");
-    do_full_handshake();
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
+    do_full_handshake(ctx);
 
     /* save key for comparison */
     uint8_t saved_key[32];
-    memcpy(saved_key, g_virp_session.session_key, 32);
+    memcpy(saved_key, ctx->session.session_key, 32);
 
     /* reset clears key */
-    virp_session_reset();
-    assert(g_virp_session.session_key_valid == 0);
+    virp_session_reset(ctx);
+    assert(ctx->session.session_key_valid == 0);
 
     uint8_t zeros[32];
     memset(zeros, 0, 32);
-    assert(memcmp(g_virp_session.session_key, zeros, 32) == 0);
+    assert(memcmp(ctx->session.session_key, zeros, 32) == 0);
 
     /* and it was non-zero before */
     assert(memcmp(saved_key, zeros, 32) != 0);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_keys_unique_per_session(void)
 {
     printf("  test_keys_unique_per_session... ");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
 
     /* Session 1 */
-    virp_session_init("onode-test");
-    do_full_handshake();
+    virp_session_init(ctx, "onode-test");
+    do_full_handshake(ctx);
     uint8_t key1[32];
-    memcpy(key1, g_virp_session.session_key, 32);
+    memcpy(key1, ctx->session.session_key, 32);
 
     /* Close and restart */
-    virp_handle_session_close();
-    assert(virp_session_state() == VIRP_SESSION_DISCONNECTED);
+    virp_handle_session_close(ctx);
+    assert(virp_session_state(ctx) == VIRP_SESSION_DISCONNECTED);
 
     /* Session 2 — different nonces → different transcript → different key */
-    do_full_handshake();
+    do_full_handshake(ctx);
     uint8_t key2[32];
-    memcpy(key2, g_virp_session.session_key, 32);
+    memcpy(key2, ctx->session.session_key, 32);
 
     assert(memcmp(key1, key2, 32) != 0);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_sign_without_derivation_fails(void)
 {
     printf("  test_sign_without_derivation_fails... ");
-    virp_session_init("onode-test");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
 
     /* complete handshake but do NOT derive key — state is BOUND, not ACTIVE */
     virp_session_hello_t hello = make_hello();
     virp_session_hello_ack_t ack;
-    assert(virp_handle_hello(&hello, &ack) == VIRP_OK);
+    assert(virp_handle_hello(ctx, &hello, &ack) == VIRP_OK);
 
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
@@ -129,38 +141,43 @@ static void test_sign_without_derivation_fails(void)
     memcpy(bind.session_id,   ack.session_id,   16);
     memcpy(bind.client_nonce, ack.client_nonce,  8);
     memcpy(bind.server_nonce, ack.server_nonce,  8);
-    assert(virp_handle_session_bind(&bind) == VIRP_OK);
-    assert(virp_session_state() == VIRP_SESSION_BOUND);
+    assert(virp_handle_session_bind(ctx, &bind) == VIRP_OK);
+    assert(virp_session_state(ctx) == VIRP_SESSION_BOUND);
 
     /* attempt to sign — should fail because not ACTIVE */
     uint8_t payload[] = "test-payload";
     virp_obs_header_v2_t hdr;
     uint8_t sig[32];
     virp_error_t err = virp_sign_observation_v2(
+        ctx,
         0x01, 0x02, VIRP_TIER_GREEN, 1,
         "show ip route",
         payload, sizeof(payload) - 1,
         &hdr, sig);
     assert(err == VIRP_ERR_SESSION_INVALID);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 
 static void test_derive_requires_bound_state(void)
 {
     printf("  test_derive_requires_bound_state... ");
-    virp_session_init("onode-test");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
 
     /* DISCONNECTED — derive must fail */
-    virp_error_t err = virp_session_derive_key(test_master_key);
+    virp_error_t err = virp_session_derive_key(ctx, test_master_key);
     assert(err == VIRP_ERR_SESSION_INVALID);
 
     /* NEGOTIATED — derive must fail */
     virp_session_hello_t hello = make_hello();
     virp_session_hello_ack_t ack;
-    assert(virp_handle_hello(&hello, &ack) == VIRP_OK);
-    assert(virp_session_state() == VIRP_SESSION_NEGOTIATED);
-    err = virp_session_derive_key(test_master_key);
+    assert(virp_handle_hello(ctx, &hello, &ack) == VIRP_OK);
+    assert(virp_session_state(ctx) == VIRP_SESSION_NEGOTIATED);
+    err = virp_session_derive_key(ctx, test_master_key);
     assert(err == VIRP_ERR_SESSION_INVALID);
+    virp_context_destroy(ctx);
     printf("PASS\n");
 }
 

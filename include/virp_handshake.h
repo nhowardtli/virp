@@ -13,6 +13,7 @@
 
 #include <stdint.h>
 #include "virp.h"
+#include "virp_session.h"  /* virp_context_t forward decl */
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,12 +64,14 @@ typedef struct {
 } virp_session_close_t;
 
 /* Handshake API */
-virp_error_t virp_handle_hello(const virp_session_hello_t *hello_in,
-                                virp_session_hello_ack_t  *hello_ack_out);
+virp_error_t virp_handle_hello(virp_context_t *ctx,
+                               const virp_session_hello_t *hello_in,
+                               virp_session_hello_ack_t  *hello_ack_out);
 
-virp_error_t virp_handle_session_bind(const virp_session_bind_t *bind_in);
+virp_error_t virp_handle_session_bind(virp_context_t *ctx,
+                                      const virp_session_bind_t *bind_in);
 
-void virp_handle_session_close(void);
+void virp_handle_session_close(virp_context_t *ctx);
 
 #ifdef __cplusplus
 }

@@ -76,6 +76,8 @@ typedef struct {
     sqlite3_stmt       *stmt_intent_insert;
     sqlite3_stmt       *stmt_intent_get;
     sqlite3_stmt       *stmt_intent_execute;
+    /* Artifact store */
+    sqlite3_stmt       *stmt_artifact_insert;
 } virp_chain_state_t;
 
 /* =========================================================================
@@ -176,5 +178,21 @@ virp_error_t virp_chain_intent_get(virp_chain_state_t *state,
 virp_error_t virp_chain_intent_execute(virp_chain_state_t *state,
                                         const char *intent_id,
                                         virp_intent_entry_t *entry);
+
+/* =========================================================================
+ * Artifact Store — persists raw payloads alongside chain hashes
+ * ========================================================================= */
+
+/*
+ * Store an artifact's raw content in the artifacts table.
+ * artifact_id must match the chain_entries.artifact_id for cross-reference.
+ * Returns VIRP_ERR_NULL_PTR if any parameter is NULL or content is empty.
+ */
+virp_error_t virp_chain_artifact_store(virp_chain_state_t *state,
+                                        const char *artifact_id,
+                                        const char *artifact_type,
+                                        const char *artifact_content,
+                                        const char *artifact_hash,
+                                        const char *session_id);
 
 #endif /* VIRP_CHAIN_H */

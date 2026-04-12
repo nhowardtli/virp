@@ -19,6 +19,7 @@
 #include "virp_message.h"
 #include "virp_handshake.h"
 #include "virp_transcript.h"
+#include "virp_context.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,7 @@
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <openssl/crypto.h>
 
 /* =========================================================================
  * JSON Request Parsing (minimal, no dependencies)
@@ -49,6 +51,7 @@ typedef struct {
     char            artifact_type[16];
     char            artifact_id[128];
     char            artifact_hash[65];
+    char            artifact_content[8192]; /* Raw payload for artifact store */
     int64_t         from_sequence;
     int64_t         to_sequence;
     /* Intent fields (durable intent store) */
@@ -225,6 +228,8 @@ static bool parse_request(const char *json, onode_request_t *req)
                         sizeof(req->artifact_id));
     json_extract_string(json, "artifact_hash", req->artifact_hash,
                         sizeof(req->artifact_hash));
+    json_extract_string(json, "artifact_content", req->artifact_content,
+                        sizeof(req->artifact_content));
     json_extract_int64(json, "from_sequence", &req->from_sequence);
     json_extract_int64(json, "to_sequence", &req->to_sequence);
 
@@ -614,26 +619,37 @@ static int parse_batch_commands(const char *json,
  * Client Request Handler
  * ========================================================================= */
 
-/* Decode hex string to bytes. Returns number of bytes written, or -1 on error. */
-static int hex_decode(const char *hex, uint8_t *out, size_t out_len)
+/* Map a single hex character to its 4-bit value, or -1 if invalid. */
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Decode hex string to bytes. Returns number of bytes written, or -1 on error.
+ * Rejects any non-[0-9a-fA-F] character (no whitespace, signs, or 0x prefixes). */
+int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len)
 {
     size_t hex_len = strlen(hex);
     if (hex_len % 2 != 0 || hex_len / 2 > out_len)
         return -1;
-    for (size_t i = 0; i < hex_len / 2; i++) {
-        unsigned int byte;
-        if (sscanf(hex + i * 2, "%2x", &byte) != 1)
+    for (size_t i = 0; i < hex_len; i += 2) {
+        int hi = hex_nibble(hex[i]);
+        int lo = hex_nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0)
             return -1;
-        out[i] = (uint8_t)byte;
+        out[i / 2] = (uint8_t)((hi << 4) | lo);
     }
     return (int)(hex_len / 2);
 }
 
 /* Encode bytes to lowercase hex. buf must hold 2*len+1 bytes. */
-static void hex_encode(char *buf, const uint8_t *data, size_t len)
+static void hex_encode(char *buf, size_t buf_size, const uint8_t *data, size_t len)
 {
     for (size_t i = 0; i < len; i++)
-        sprintf(buf + i * 2, "%02x", data[i]);
+        snprintf(buf + i * 2, buf_size - i * 2, "%02x", data[i]);
     buf[len * 2] = '\0';
 }
 
@@ -779,6 +795,13 @@ static void handle_client(onode_state_t *state, int client_fd)
                 send(client_fd, &err_code, 4, 0);
                 break;
             }
+            /* Store raw artifact content if provided */
+            if (req.artifact_content[0] != '\0') {
+                virp_chain_artifact_store(&state->chain,
+                    req.artifact_id, req.artifact_type,
+                    req.artifact_content, req.artifact_hash,
+                    req.session_id);
+            }
             /* JSON-encode the chain entry as observation payload */
             char json_buf[2048];
             int jlen = snprintf(json_buf, sizeof(json_buf),
@@ -893,6 +916,13 @@ static void handle_client(onode_state_t *state, int client_fd)
                 uint32_t err_code = htonl((uint32_t)err);
                 send(client_fd, &err_code, 4, 0);
                 break;
+            }
+            /* Store intent content as artifact */
+            if (ie.intent_json[0] != '\0') {
+                virp_chain_artifact_store(&state->chain,
+                    ie.intent_id, "intent",
+                    ie.intent_json, ie.intent_hash,
+                    req.session_id[0] != '\0' ? req.session_id : "intent");
             }
 
             char json_buf[512];
@@ -1154,7 +1184,7 @@ static void handle_client(onode_state_t *state, int client_fd)
 
         /* Parse client_nonce from hex (8 bytes = 16 hex chars) */
         if (req.client_nonce[0]) {
-            hex_decode(req.client_nonce, hello.client_nonce, 8);
+            virp_hex_decode(req.client_nonce, hello.client_nonce, 8);
         }
 
         {
@@ -1166,7 +1196,7 @@ static void handle_client(onode_state_t *state, int client_fd)
 
         /* Process handshake */
         virp_session_hello_ack_t ack;
-        err = virp_handle_hello(&hello, &ack);
+        err = virp_handle_hello(state->ctx, &hello, &ack);
         if (err != VIRP_OK) {
             uint32_t err_code = htonl((uint32_t)err);
             send(client_fd, &err_code, 4, 0);
@@ -1175,9 +1205,9 @@ static void handle_client(onode_state_t *state, int client_fd)
 
         /* Return HELLO_ACK as JSON */
         char sid_hex[33], cn_hex[17], sn_hex[17];
-        hex_encode(sid_hex, ack.session_id, 16);
-        hex_encode(cn_hex, ack.client_nonce, 8);
-        hex_encode(sn_hex, ack.server_nonce, 8);
+        hex_encode(sid_hex, sizeof(sid_hex), ack.session_id, 16);
+        hex_encode(cn_hex, sizeof(cn_hex), ack.client_nonce, 8);
+        hex_encode(sn_hex, sizeof(sn_hex), ack.server_nonce, 8);
 
         char json_resp[1024];
         int jlen = snprintf(json_resp, sizeof(json_resp),
@@ -1209,13 +1239,13 @@ static void handle_client(onode_state_t *state, int client_fd)
 
         /* session_id from hex (reuse req.session_id, 16 bytes = 32 hex) */
         if (req.session_id[0]) {
-            hex_decode(req.session_id, bind_msg.session_id, 16);
+            virp_hex_decode(req.session_id, bind_msg.session_id, 16);
         }
 
         if (req.client_nonce[0])
-            hex_decode(req.client_nonce, bind_msg.client_nonce, 8);
+            virp_hex_decode(req.client_nonce, bind_msg.client_nonce, 8);
         if (req.server_nonce[0])
-            hex_decode(req.server_nonce, bind_msg.server_nonce, 8);
+            virp_hex_decode(req.server_nonce, bind_msg.server_nonce, 8);
 
         {
             struct timespec ts;
@@ -1224,7 +1254,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                 (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
         }
 
-        err = virp_handle_session_bind(&bind_msg);
+        err = virp_handle_session_bind(state->ctx, &bind_msg);
         if (err != VIRP_OK) {
             uint32_t err_code = htonl((uint32_t)err);
             send(client_fd, &err_code, 4, 0);
@@ -1232,7 +1262,7 @@ static void handle_client(onode_state_t *state, int client_fd)
         }
 
         /* BIND succeeded → derive session key to reach ACTIVE */
-        err = virp_session_derive_key(state->okey.key.key);
+        err = virp_session_derive_key(state->ctx, state->okey.key.key);
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] session key derivation failed: %d\n",
                     (int)err);
@@ -1247,7 +1277,7 @@ static void handle_client(onode_state_t *state, int client_fd)
     }
 
     case ONODE_ACTION_SESSION_CLOSE:
-        virp_handle_session_close();
+        virp_handle_session_close(state->ctx);
         fprintf(stderr, "[O-Node] Session closed by client\n");
         {
             const char *close_resp = "{\"status\":\"closed\"}";
@@ -1559,7 +1589,7 @@ virp_error_t onode_start(onode_state_t *state)
     }
 
     /* Allow non-root users (e.g. Docker tliadmin) to connect */
-    chmod(state->socket_path, 0777);
+    chmod(state->socket_path, 0660);
 
     if (listen(state->listen_fd, ONODE_MAX_CLIENTS) < 0) {
         perror("[O-Node] listen");
@@ -1667,6 +1697,16 @@ void onode_destroy(onode_state_t *state)
     /* Destroy trust chain */
     if (state->chain_enabled)
         virp_chain_destroy(&state->chain);
+
+    /* Wipe device passwords from inventory */
+    for (int i = 0; i < state->device_count; i++) {
+        OPENSSL_cleanse(state->devices[i].password,
+                        sizeof(state->devices[i].password));
+        OPENSSL_cleanse(state->devices[i].enable_password,
+                        sizeof(state->devices[i].enable_password));
+        OPENSSL_cleanse(state->devices[i].api_token,
+                        sizeof(state->devices[i].api_token));
+    }
 
     /* Destroy mutexes */
     pthread_mutex_destroy(&state->state_mutex);
