@@ -371,6 +371,8 @@ typedef enum {
     VIRP_ERR_SESSION_INVALID     = -30,  /* Invalid session ID */
     VIRP_ERR_CONTEXT_MISMATCH    = -31,  /* Context mismatch in verification */
     VIRP_ERR_CRYPTO              = -32,  /* Cryptographic operation failed */
+    VIRP_ERR_HOST_KEY_MISMATCH   = -33,  /* SSH host key changed (possible MITM) */
+    VIRP_ERR_HOST_KEY_UNKNOWN    = -34,  /* SSH host key not in known_hosts */
 } virp_error_t;
 
 /* =========================================================================

@@ -46,6 +46,7 @@
 
 #include "virp_driver.h"
 #include "virp_driver_fortigate.h"
+#include "virp_ssh_hostkey.h"
 
 
 /* ══════════════════════════════════════════════════════════════════
@@ -134,7 +135,17 @@ static int fg_ssh_connect(struct virp_conn *conn)
         return -1;
     }
 
-    fprintf(stderr, "[virp-fg] handshake OK, authenticating\n");
+    fprintf(stderr, "[virp-fg] handshake OK, verifying host key\n");
+
+    virp_error_t hk_err = virp_ssh_verify_hostkey(session, conn->device.host,
+                                                   conn->ssh_port);
+    if (hk_err != VIRP_OK) {
+        fprintf(stderr, "[virp-fg] Host key verification failed: %s\n",
+                virp_error_str(hk_err));
+        libssh2_session_free(session);
+        close(sock);
+        return -1;
+    }
 
     rc = libssh2_userauth_password(session,
                                    conn->device.username,

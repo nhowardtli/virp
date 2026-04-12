@@ -899,6 +899,8 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_SESSION_INVALID:     return "Invalid session ID";
     case VIRP_ERR_CONTEXT_MISMATCH:    return "Context mismatch in verification";
     case VIRP_ERR_CRYPTO:              return "Cryptographic operation failed";
+    case VIRP_ERR_HOST_KEY_MISMATCH:   return "SSH host key mismatch (possible MITM)";
+    case VIRP_ERR_HOST_KEY_UNKNOWN:    return "SSH host key not in known_hosts";
     default:                         return "Unknown error";
     }
 }

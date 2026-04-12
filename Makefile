@@ -8,7 +8,7 @@
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC
-CFLAGS += -I./include
+CFLAGS += -I./include $(CFLAGS_EXTRA)
 LDFLAGS = -lcrypto -lpthread -lsqlite3 -lsodium
 
 BUILD_DIR = build
@@ -99,6 +99,11 @@ ifdef LINUX
   LIB_OBJS += $(BUILD_DIR)/driver_linux.o
 endif
 
+# SSH host key verification — included when any SSH driver is enabled
+ifneq (,$(or $(CISCO),$(FORTIGATE),$(PANOS),$(ASA),$(JUNIPER),$(LINUX)))
+  LIB_OBJS += $(BUILD_DIR)/virp_ssh_hostkey.o
+endif
+
 LIB          = $(BUILD_DIR)/libvirp.a
 SHLIB        = $(BUILD_DIR)/libvirp.so
 TEST_BIN     = $(BUILD_DIR)/test_virp
@@ -150,6 +155,9 @@ $(BUILD_DIR)/driver_linux.o: src/drivers/driver_linux.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_wazuh.o: src/drivers/driver_wazuh.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_ssh_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)
@@ -238,9 +246,17 @@ $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
 prod: $(ONODE_PROD)
 
 # Full production build — recursive make ensures all ifdef guards evaluate correctly
+# SSH host key verification is strict: unknown keys are rejected.
 .PHONY: prod-full
 prod-full:
 	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 $(ONODE_PROD)
+
+# Dev build — all drivers, TOFU enabled by default so lab devices work
+# without pre-populating known_hosts. Do not run dev binaries in production.
+.PHONY: dev-full
+dev-full:
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 \
+		CFLAGS_EXTRA="-DVIRP_SSH_TOFU_DEFAULT" all
 
 # C/Go interop test
 TEST_INTEROP = $(BUILD_DIR)/test_interop_c

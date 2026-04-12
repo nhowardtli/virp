@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <libssh2.h>
 #include <openssl/crypto.h>
+#include "virp_ssh_hostkey.h"
 
 /* =========================================================================
  * Constants
@@ -510,6 +511,18 @@ static virp_conn_t *asa_connect(const virp_device_t *device)
         libssh2_session_last_error(conn->session, &errmsg, NULL, 0);
         fprintf(stderr, "[ASA] SSH handshake failed: %s (%s:%u)\n",
                 errmsg, device->host, port);
+        libssh2_session_free(conn->session);
+        close(conn->sock_fd);
+        free(conn);
+        return NULL;
+    }
+
+    /* Verify host key before authentication */
+    virp_error_t hk_err = virp_ssh_verify_hostkey(conn->session,
+                                                   device->host, port);
+    if (hk_err != VIRP_OK) {
+        fprintf(stderr, "[ASA] Host key verification failed: %s\n",
+                virp_error_str(hk_err));
         libssh2_session_free(conn->session);
         close(conn->sock_fd);
         free(conn);
