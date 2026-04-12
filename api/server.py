@@ -34,6 +34,7 @@ VIRP_KEY_PATH = os.environ.get("VIRP_KEY_PATH", "/etc/virp/keys/onode.key")
 DEVICES_PATH = os.environ.get("VIRP_DEVICES", "/etc/virp/devices.json")  # legacy fallback
 WEB_DIR = os.environ.get("VIRP_WEB_DIR", "/opt/virp-appliance/web")
 API_TOKEN = os.environ.get("VIRP_API_TOKEN", "")  # Optional bearer token
+VIRP_ALLOW_PY_FALLBACK = os.environ.get("VIRP_ALLOW_PY_FALLBACK", "") == "1"
 
 # Single source of truth — device registry
 try:
@@ -67,6 +68,7 @@ MAX_LOG_SIZE = 1000
 appliance_start_time = time.time()
 key_material = None
 key_fingerprint = None
+_virp_bridge = None  # VIRPBridge instance for C-based HMAC verification
 
 # Observation payload cache — stores raw signed output for content fidelity checks.
 # Key: (device, sequence) → {"payload": str, "verified": bool, "timestamp": float}
@@ -100,23 +102,38 @@ def _get_latest_cached(device: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def load_okey():
-    """Load the O-Key for HMAC verification."""
-    global key_material, key_fingerprint
+    """Load the O-Key for HMAC verification.
+
+    Primary path: load via VIRPBridge (C library).
+    Fallback: raw Python hmac — only if VIRP_ALLOW_PY_FALLBACK=1.
+    """
+    global key_material, key_fingerprint, _virp_bridge
     try:
         with open(VIRP_KEY_PATH, "rb") as f:
             data = f.read()
-        # Key file is exactly 32 bytes of raw key material (no prefix)
         if len(data) != VIRP_KEY_SIZE:
             raise ValueError(f"Expected {VIRP_KEY_SIZE}-byte key, got {len(data)} bytes")
         key_material = data
         key_fingerprint = hashlib.sha256(key_material).hexdigest()[:16]
-        return True
     except FileNotFoundError:
         print(f"[WARN] O-Key not found at {VIRP_KEY_PATH} — running in demo mode")
         return False
     except Exception as e:
         print(f"[ERROR] Failed to load O-Key: {e}")
         return False
+
+    # Try to initialize the C bridge for HMAC verification
+    try:
+        from virp_bridge import VIRPBridge
+        _virp_bridge = VIRPBridge(key_path=VIRP_KEY_PATH)
+        print(f"[VIRP] C bridge loaded for HMAC verification")
+    except Exception as e:
+        _virp_bridge = None
+        if VIRP_ALLOW_PY_FALLBACK:
+            print(f"[WARN] C bridge unavailable ({e}), using Python HMAC fallback")
+        else:
+            print(f"[ERROR] C bridge unavailable ({e}) and VIRP_ALLOW_PY_FALLBACK!=1")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -154,11 +171,12 @@ def parse_virp_message(msg: bytes) -> dict:
         raise ValueError(f"Invalid length field: {length} < header size {VIRP_HEADER_SIZE}")
     payload = msg[VIRP_HEADER_SIZE:VIRP_HEADER_SIZE + payload_len]
 
-    # Verify HMAC if key is loaded
-    # HMAC covers bytes [0:24] (header before HMAC) + bytes [56:] (payload)
-    # The 32-byte HMAC field at [24:56] is excluded from the hash input
+    # Verify HMAC — prefer C library, fall back to Python only if allowed
     verified = False
-    if key_material:
+    if _virp_bridge is not None:
+        verified = _virp_bridge.verify_observation(msg)
+    elif key_material and VIRP_ALLOW_PY_FALLBACK:
+        print("[WARN] Using Python HMAC fallback — set up C bridge to eliminate drift risk")
         sign_buf = msg[0:24] + msg[56:56 + payload_len]
         computed = hmac.new(key_material, sign_buf, hashlib.sha256).digest()
         verified = hmac.compare_digest(computed, received_hmac)
