@@ -202,9 +202,11 @@ class VIRPBridge:
         lib.virp_build_observation.restype = ctypes.c_int
 
         # ── Signature verification ──
-        # virp_error_t virp_verify(const uint8_t *msg, size_t msg_len,
+        # virp_error_t virp_verify(virp_context_t *ctx,
+        #     const uint8_t *msg, size_t msg_len,
         #     const virp_signing_key_t *sk)
         lib.virp_verify.argtypes = [
+            ctypes.c_void_p,                    # ctx (unused, pass NULL)
             ctypes.POINTER(ctypes.c_uint8),
             ctypes.c_size_t,
             ctypes.POINTER(VIRPSigningKey),
@@ -363,6 +365,7 @@ class VIRPBridge:
 
         msg_buf = (ctypes.c_uint8 * len(msg))(*msg)
         err = self._lib.virp_verify(
+            None,                               # ctx — unused by virp_verify
             msg_buf,
             ctypes.c_size_t(len(msg)),
             ctypes.byref(self._signing_key),
