@@ -165,10 +165,12 @@ def parse_virp_message(msg: bytes) -> dict:
      seq_num, timestamp_ns) = struct.unpack_from("!BBHI BBHI Q", msg, 0)
     received_hmac = msg[24:56]
 
-    # Extract payload (everything after the 56-byte header)
+    # Extract payload — validate length against both header size and actual buffer
+    if length < VIRP_HEADER_SIZE:
+        raise ValueError(f"Declared length {length} < header size {VIRP_HEADER_SIZE}")
+    if length > len(msg):
+        raise ValueError(f"Declared length {length} > actual message size {len(msg)}")
     payload_len = length - VIRP_HEADER_SIZE
-    if payload_len < 0:
-        raise ValueError(f"Invalid length field: {length} < header size {VIRP_HEADER_SIZE}")
     payload = msg[VIRP_HEADER_SIZE:VIRP_HEADER_SIZE + payload_len]
 
     # Verify HMAC — prefer C library, fall back to Python only if allowed
