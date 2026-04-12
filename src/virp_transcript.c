@@ -145,22 +145,22 @@ virp_error_t virp_transcript_append(virp_context_t *ctx,
                                     const uint8_t *data, size_t len)
 {
     (void)ctx;
-    if (g_virp_session.transcript_len + len >
-            sizeof(g_virp_session.transcript_buf))
+    if (ctx->session.transcript_len + len >
+            sizeof(ctx->session.transcript_buf))
         return VIRP_ERR_BUFFER_TOO_SMALL;
 
-    memcpy(g_virp_session.transcript_buf + g_virp_session.transcript_len,
+    memcpy(ctx->session.transcript_buf + ctx->session.transcript_len,
            data, len);
-    g_virp_session.transcript_len += len;
+    ctx->session.transcript_len += len;
     return VIRP_OK;
 }
 
 void virp_transcript_finalize(virp_context_t *ctx)
 {
     (void)ctx;
-    SHA256(g_virp_session.transcript_buf,
-           g_virp_session.transcript_len,
-           g_virp_session.transcript_hash);
+    SHA256(ctx->session.transcript_buf,
+           ctx->session.transcript_len,
+           ctx->session.transcript_hash);
 }
 
 /* =========================================================================
@@ -226,31 +226,31 @@ virp_error_t virp_session_derive_key(virp_context_t *ctx,
     if (!master_key)
         return VIRP_ERR_NULL_PTR;
 
-    if (g_virp_session.state != VIRP_SESSION_BOUND)
+    if (ctx->session.state != VIRP_SESSION_BOUND)
         return VIRP_ERR_SESSION_INVALID;
 
     /* info = big-endian generation counter (8 bytes) */
     uint8_t info[8];
-    put_be64(info, g_virp_session.generation);
+    put_be64(info, ctx->session.generation);
 
     virp_error_t err = virp_hkdf_sha256(
         master_key, 32,
-        g_virp_session.transcript_hash, 32,
+        ctx->session.transcript_hash, 32,
         info, sizeof(info),
-        g_virp_session.session_key);
+        ctx->session.session_key);
 
     if (err != VIRP_OK)
         return err;
 
-    g_virp_session.session_key_valid = 1;
+    ctx->session.session_key_valid = 1;
 
     /* Transition BOUND → ACTIVE */
-    g_virp_session.state = VIRP_SESSION_ACTIVE;
+    ctx->session.state = VIRP_SESSION_ACTIVE;
 
     {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        g_virp_session.established_at_ns =
+        ctx->session.established_at_ns =
             (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
     }
 

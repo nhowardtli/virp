@@ -294,14 +294,14 @@ virp_error_t virp_sign_observation_v2(
     virp_error_t serr = virp_session_require_active(&g_virp_ctx);
     if (serr != VIRP_OK) return serr;
 
-    if (!g_virp_session.session_key_valid)
+    if (!ctx->session.session_key_valid)
         return VIRP_ERR_KEY_NOT_LOADED;
 
     /* update session activity timestamp */
     {
         struct timespec ts_act;
         clock_gettime(CLOCK_REALTIME, &ts_act);
-        g_virp_session.last_activity_ns =
+        ctx->session.last_activity_ns =
             (uint64_t)ts_act.tv_sec * 1000000000ULL + ts_act.tv_nsec;
     }
 
@@ -322,7 +322,7 @@ virp_error_t virp_sign_observation_v2(
     hdr.timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 
     /* session id — always from the active session */
-    memcpy(hdr.session_id, g_virp_session.session_id, 16);
+    memcpy(hdr.session_id, ctx->session.session_id, 16);
 
     /* canonicalize command and hash it */
     char canon[512];
@@ -341,7 +341,7 @@ virp_error_t virp_sign_observation_v2(
 
     unsigned int sig_len = 32;
     if (!HMAC(EVP_sha256(),
-              g_virp_session.session_key, 32,
+              ctx->session.session_key, 32,
               sign_buf, sign_len, sig_out, &sig_len))
         return VIRP_ERR_CRYPTO;
 

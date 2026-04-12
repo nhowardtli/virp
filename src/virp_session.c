@@ -15,27 +15,29 @@
 #include <openssl/crypto.h>  /* OPENSSL_cleanse */
 
 /*
- * Process-wide context — single backing store for the global
- * session. Commit 1 intentionally keeps function bodies referring
- * to the old name via the g_virp_session macro alias declared in
- * virp_context.h.
+ * Process-wide context — single backing store. Function bodies in
+ * this file now reference ctx->session directly (commit 2). The
+ * ctx->session macro alias in virp_context.h still resolves to
+ * g_virp_ctx.session and exists only for the small number of
+ * call sites in other files that have not been ported yet; commit
+ * 3 deletes the global and the alias together.
  */
 virp_context_t g_virp_ctx = {0};
 
 virp_error_t virp_session_init(virp_context_t *ctx, const char *server_id)
 {
     (void)ctx;
-    memset(&g_virp_session, 0, sizeof(g_virp_session));
-    g_virp_session.state = VIRP_SESSION_DISCONNECTED;
+    memset(&ctx->session, 0, sizeof(ctx->session));
+    ctx->session.state = VIRP_SESSION_DISCONNECTED;
     if (server_id) {
         size_t len = strlen(server_id);
-        if (len >= sizeof(g_virp_session.server_id)) {
-            len = sizeof(g_virp_session.server_id) - 1;
-            memcpy(g_virp_session.server_id, server_id, len);
-            g_virp_session.server_id[len] = '\0';
+        if (len >= sizeof(ctx->session.server_id)) {
+            len = sizeof(ctx->session.server_id) - 1;
+            memcpy(ctx->session.server_id, server_id, len);
+            ctx->session.server_id[len] = '\0';
             return VIRP_ERR_INVALID_LENGTH;
         }
-        memcpy(g_virp_session.server_id, server_id, len);
+        memcpy(ctx->session.server_id, server_id, len);
     }
     return VIRP_OK;
 }
@@ -44,28 +46,28 @@ void virp_session_reset(virp_context_t *ctx)
 {
     (void)ctx;
     char server_id[64];
-    memcpy(server_id, g_virp_session.server_id, sizeof(server_id));
-    uint64_t gen = g_virp_session.generation + 1;
+    memcpy(server_id, ctx->session.server_id, sizeof(server_id));
+    uint64_t gen = ctx->session.generation + 1;
     /* Wipe session key before clearing struct */
-    OPENSSL_cleanse(g_virp_session.session_key,
-                    sizeof(g_virp_session.session_key));
-    g_virp_session.session_key_valid = 0;
-    memset(&g_virp_session, 0, sizeof(g_virp_session));
-    g_virp_session.generation = gen;
-    g_virp_session.state = VIRP_SESSION_DISCONNECTED;
-    memcpy(g_virp_session.server_id, server_id, sizeof(server_id));
+    OPENSSL_cleanse(ctx->session.session_key,
+                    sizeof(ctx->session.session_key));
+    ctx->session.session_key_valid = 0;
+    memset(&ctx->session, 0, sizeof(ctx->session));
+    ctx->session.generation = gen;
+    ctx->session.state = VIRP_SESSION_DISCONNECTED;
+    memcpy(ctx->session.server_id, server_id, sizeof(server_id));
 }
 
 virp_session_state_t virp_session_state(virp_context_t *ctx)
 {
     (void)ctx;
-    return g_virp_session.state;
+    return ctx->session.state;
 }
 
 virp_error_t virp_session_require_active(virp_context_t *ctx)
 {
     (void)ctx;
-    if (g_virp_session.state != VIRP_SESSION_ACTIVE)
+    if (ctx->session.state != VIRP_SESSION_ACTIVE)
         return VIRP_ERR_SESSION_INVALID;
     return VIRP_OK;
 }
@@ -77,17 +79,17 @@ virp_error_t virp_session_check_timeouts(virp_context_t *ctx)
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 
-    if (g_virp_session.state == VIRP_SESSION_NEGOTIATED) {
-        if (now - g_virp_session.hello_ack_sent_at_ns >
+    if (ctx->session.state == VIRP_SESSION_NEGOTIATED) {
+        if (now - ctx->session.hello_ack_sent_at_ns >
                 VIRP_SESSION_BIND_TIMEOUT_NS) {
             virp_session_reset(&g_virp_ctx);
             return VIRP_ERR_SESSION_INVALID;
         }
     }
 
-    if (g_virp_session.state == VIRP_SESSION_ACTIVE) {
-        if (g_virp_session.last_activity_ns > 0 &&
-            now - g_virp_session.last_activity_ns >
+    if (ctx->session.state == VIRP_SESSION_ACTIVE) {
+        if (ctx->session.last_activity_ns > 0 &&
+            now - ctx->session.last_activity_ns >
                 VIRP_SESSION_IDLE_TIMEOUT_NS) {
             virp_session_reset(&g_virp_ctx);
             return VIRP_ERR_SESSION_INVALID;
@@ -107,5 +109,5 @@ void virp_session_on_disconnect(virp_context_t *ctx)
 void virp_session_destroy(virp_context_t *ctx)
 {
     (void)ctx;
-    OPENSSL_cleanse(&g_virp_session, sizeof(g_virp_session));
+    OPENSSL_cleanse(&ctx->session, sizeof(ctx->session));
 }

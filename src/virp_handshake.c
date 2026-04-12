@@ -49,8 +49,8 @@ virp_error_t virp_handle_hello(virp_context_t *ctx,
         return VIRP_ERR_NULL_PTR;
 
     /* reject if session already active */
-    if (g_virp_session.state == VIRP_SESSION_ACTIVE ||
-        g_virp_session.state == VIRP_SESSION_BOUND) {
+    if (ctx->session.state == VIRP_SESSION_ACTIVE ||
+        ctx->session.state == VIRP_SESSION_BOUND) {
         return VIRP_ERR_SESSION_INVALID;
     }
 
@@ -99,29 +99,29 @@ virp_error_t virp_handle_hello(virp_context_t *ctx,
     }
 
     /* generate session_id (16 random bytes) */
-    if (RAND_bytes(g_virp_session.session_id, 16) != 1)
+    if (RAND_bytes(ctx->session.session_id, 16) != 1)
         return VIRP_ERR_CRYPTO;
 
     /* generate server_nonce (8 random bytes) */
-    if (RAND_bytes(g_virp_session.server_nonce, 8) != 1)
+    if (RAND_bytes(ctx->session.server_nonce, 8) != 1)
         return VIRP_ERR_CRYPTO;
 
     /* store client nonce */
-    memcpy(g_virp_session.client_nonce, hello_in->client_nonce, 8);
+    memcpy(ctx->session.client_nonce, hello_in->client_nonce, 8);
 
     /* store negotiated params */
-    g_virp_session.selected_version   = selected_version;
-    g_virp_session.selected_algorithm = VIRP_ALG_HMAC_SHA256;
-    memcpy(g_virp_session.client_id, hello_in->client_id,
-           sizeof(g_virp_session.client_id) - 1);
-    g_virp_session.client_id[sizeof(g_virp_session.client_id) - 1] = '\0';
+    ctx->session.selected_version   = selected_version;
+    ctx->session.selected_algorithm = VIRP_ALG_HMAC_SHA256;
+    memcpy(ctx->session.client_id, hello_in->client_id,
+           sizeof(ctx->session.client_id) - 1);
+    ctx->session.client_id[sizeof(ctx->session.client_id) - 1] = '\0';
 
     /* advance state and record timestamp for bind timeout */
-    g_virp_session.state = VIRP_SESSION_NEGOTIATED;
+    ctx->session.state = VIRP_SESSION_NEGOTIATED;
     {
         struct timespec ts_neg;
         clock_gettime(CLOCK_REALTIME, &ts_neg);
-        g_virp_session.hello_ack_sent_at_ns =
+        ctx->session.hello_ack_sent_at_ns =
             (uint64_t)ts_neg.tv_sec * 1000000000ULL + ts_neg.tv_nsec;
     }
 
@@ -130,16 +130,16 @@ virp_error_t virp_handle_hello(virp_context_t *ctx,
     hello_ack_out->msg_type           = VIRP_MSG_SESSION_HELLO_ACK;
     hello_ack_out->selected_version   = selected_version;
     hello_ack_out->selected_algorithm = VIRP_ALG_HMAC_SHA256;
-    memcpy(hello_ack_out->session_id,   g_virp_session.session_id,   16);
-    memcpy(hello_ack_out->client_nonce, g_virp_session.client_nonce,  8);
-    memcpy(hello_ack_out->server_nonce, g_virp_session.server_nonce,  8);
+    memcpy(hello_ack_out->session_id,   ctx->session.session_id,   16);
+    memcpy(hello_ack_out->client_nonce, ctx->session.client_nonce,  8);
+    memcpy(hello_ack_out->server_nonce, ctx->session.server_nonce,  8);
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     hello_ack_out->timestamp_ns =
         (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 
-    memcpy(hello_ack_out->server_id, g_virp_session.server_id,
+    memcpy(hello_ack_out->server_id, ctx->session.server_id,
            sizeof(hello_ack_out->server_id));
 
     /* accepted channels: OBSERVATION always; INTENT if version >= 2 */
@@ -194,13 +194,13 @@ virp_error_t virp_handle_session_bind(virp_context_t *ctx,
      * generation will fail either the state check or the memcmp checks
      * below, since reset clears all nonces and session_id.
      */
-    if (g_virp_session.state != VIRP_SESSION_NEGOTIATED)
+    if (ctx->session.state != VIRP_SESSION_NEGOTIATED)
         return VIRP_ERR_SESSION_INVALID;
 
     /* verify session_id and nonces match (constant-time) */
-    int id_ok    = virp_consttime_eq(bind_in->session_id,   g_virp_session.session_id,   16);
-    int cn_ok    = virp_consttime_eq(bind_in->client_nonce, g_virp_session.client_nonce,  8);
-    int sn_ok    = virp_consttime_eq(bind_in->server_nonce, g_virp_session.server_nonce,  8);
+    int id_ok    = virp_consttime_eq(bind_in->session_id,   ctx->session.session_id,   16);
+    int cn_ok    = virp_consttime_eq(bind_in->client_nonce, ctx->session.client_nonce,  8);
+    int sn_ok    = virp_consttime_eq(bind_in->server_nonce, ctx->session.server_nonce,  8);
     if (!(id_ok & cn_ok & sn_ok))
         return VIRP_ERR_CONTEXT_MISMATCH;
 
@@ -215,7 +215,7 @@ virp_error_t virp_handle_session_bind(virp_context_t *ctx,
     virp_transcript_finalize(&g_virp_ctx);
 
     /* advance to BOUND (caller must derive session key to reach ACTIVE) */
-    g_virp_session.state = VIRP_SESSION_BOUND;
+    ctx->session.state = VIRP_SESSION_BOUND;
 
     fprintf(stderr, "[VIRP-HS] SESSION_BIND verified — "
             "session BOUND, transcript finalized\n");
