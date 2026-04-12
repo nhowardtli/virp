@@ -34,12 +34,15 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <openssl/crypto.h>
+#include "cJSON.h"
 
 /* =========================================================================
- * JSON Request Parsing (minimal, no dependencies)
+ * JSON Request Parsing
  *
- * We parse just enough JSON to extract action, device, and command.
- * No dynamic allocation. No external library. Fixed buffers.
+ * cJSON (vendored v1.7.18) is the primary parser.
+ * The old string-search parser is retained under VIRP_JSON_DUAL_PARSE
+ * for side-by-side comparison, then will be deleted once the corpus
+ * shows zero disagreements over 48 hours.
  * ========================================================================= */
 
 typedef struct {
@@ -170,15 +173,111 @@ bool json_extract_int64(const char *json, const char *key, int64_t *out)
     return (end != pos);
 }
 
+/* =========================================================================
+ * cJSON-based JSON extraction (primary path)
+ *
+ * These replace the string-search versions above. Under
+ * VIRP_JSON_DUAL_PARSE, both run and disagreements are logged.
+ * ========================================================================= */
+
+static bool json_extract_string_cjson(cJSON *root, const char *key,
+                                       char *out, size_t out_len)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsString(item) || item->valuestring == NULL) {
+        out[0] = '\0';
+        return false;
+    }
+    snprintf(out, out_len, "%s", item->valuestring);
+    return true;
+}
+
+static bool json_extract_int64_cjson(cJSON *root, const char *key,
+                                      int64_t *out)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsNumber(item)) {
+        *out = (int64_t)item->valuedouble;
+        return true;
+    }
+    return false;
+}
+
+#ifdef VIRP_JSON_DUAL_PARSE
+/*
+ * Compare string-search vs cJSON results. Log disagreements with
+ * enough context to diagnose: key, both results, first 200 chars
+ * of the input JSON.
+ */
+static void dual_check_string(const char *json, cJSON *root,
+                               const char *key, char *out, size_t out_len)
+{
+    char old_result[2048];
+    bool old_ok = json_extract_string(json, key, old_result, sizeof(old_result));
+
+    char new_result[2048];
+    bool new_ok = json_extract_string_cjson(root, key, new_result, sizeof(new_result));
+
+    if (old_ok != new_ok || (old_ok && strcmp(old_result, new_result) != 0)) {
+        fprintf(stderr, "[DUAL-PARSE] DISAGREE key=\"%s\" "
+                "old_ok=%d old=\"%.200s\" new_ok=%d new=\"%.200s\" "
+                "json=\"%.200s\"\n",
+                key,
+                old_ok, old_ok ? old_result : "(none)",
+                new_ok, new_ok ? new_result : "(none)",
+                json);
+    }
+
+    /* Use cJSON result as the primary */
+    if (new_ok)
+        snprintf(out, out_len, "%s", new_result);
+    else
+        out[0] = '\0';
+}
+
+static void dual_check_int64(const char *json, cJSON *root,
+                              const char *key, int64_t *out)
+{
+    int64_t old_val = 0, new_val = 0;
+    bool old_ok = json_extract_int64(json, key, &old_val);
+    bool new_ok = json_extract_int64_cjson(root, key, &new_val);
+
+    if (old_ok != new_ok || (old_ok && old_val != new_val)) {
+        fprintf(stderr, "[DUAL-PARSE] DISAGREE key=\"%s\" "
+                "old_ok=%d old=%lld new_ok=%d new=%lld "
+                "json=\"%.200s\"\n",
+                key,
+                old_ok, (long long)old_val,
+                new_ok, (long long)new_val,
+                json);
+    }
+
+    if (new_ok) *out = new_val;
+}
+#endif /* VIRP_JSON_DUAL_PARSE */
+
 static bool parse_request(const char *json, onode_request_t *req)
 {
     if (!json || !req) return false;
 
     memset(req, 0, sizeof(*req));
 
+    cJSON *root = cJSON_Parse(json);
+    if (!root) return false;
+
+    /* Action (required) */
     char action_str[32];
-    if (!json_extract_string(json, "action", action_str, sizeof(action_str)))
+
+#ifdef VIRP_JSON_DUAL_PARSE
+    dual_check_string(json, root, "action", action_str, sizeof(action_str));
+#else
+    if (!json_extract_string_cjson(root, "action", action_str, sizeof(action_str))) {
+        cJSON_Delete(root);
         return false;
+    }
+#endif
+
+    if (action_str[0] == '\0') { cJSON_Delete(root); return false; }
 
     if (strcmp(action_str, "execute") == 0)
         req->action = ONODE_ACTION_EXECUTE;
@@ -212,60 +311,61 @@ static bool parse_request(const char *json, onode_request_t *req)
         req->action = ONODE_ACTION_SESSION_CLOSE;
     else if (strcmp(action_str, "shutdown") == 0)
         req->action = ONODE_ACTION_SHUTDOWN;
-    else
+    else {
+        cJSON_Delete(root);
         return false;
+    }
+
+    /* Helper macros for dual-parse vs cJSON-only extraction */
+#ifdef VIRP_JSON_DUAL_PARSE
+  #define EXTRACT_STR(key, dst, sz)  dual_check_string(json, root, key, dst, sz)
+  #define EXTRACT_I64(key, dst)      dual_check_int64(json, root, key, dst)
+#else
+  #define EXTRACT_STR(key, dst, sz)  json_extract_string_cjson(root, key, dst, sz)
+  #define EXTRACT_I64(key, dst)      json_extract_int64_cjson(root, key, dst)
+#endif
 
     /* Extract optional fields */
-    json_extract_string(json, "device", req->device, sizeof(req->device));
-    json_extract_string(json, "command", req->command, sizeof(req->command));
+    EXTRACT_STR("device", req->device, sizeof(req->device));
+    EXTRACT_STR("command", req->command, sizeof(req->command));
 
     /* Chain fields */
-    json_extract_string(json, "session_id", req->session_id,
-                        sizeof(req->session_id));
-    json_extract_string(json, "artifact_type", req->artifact_type,
-                        sizeof(req->artifact_type));
-    json_extract_string(json, "artifact_id", req->artifact_id,
-                        sizeof(req->artifact_id));
-    json_extract_string(json, "artifact_hash", req->artifact_hash,
-                        sizeof(req->artifact_hash));
-    json_extract_string(json, "artifact_content", req->artifact_content,
-                        sizeof(req->artifact_content));
-    json_extract_int64(json, "from_sequence", &req->from_sequence);
-    json_extract_int64(json, "to_sequence", &req->to_sequence);
+    EXTRACT_STR("session_id", req->session_id, sizeof(req->session_id));
+    EXTRACT_STR("artifact_type", req->artifact_type, sizeof(req->artifact_type));
+    EXTRACT_STR("artifact_id", req->artifact_id, sizeof(req->artifact_id));
+    EXTRACT_STR("artifact_hash", req->artifact_hash, sizeof(req->artifact_hash));
+    EXTRACT_STR("artifact_content", req->artifact_content,
+                sizeof(req->artifact_content));
+    EXTRACT_I64("from_sequence", &req->from_sequence);
+    EXTRACT_I64("to_sequence", &req->to_sequence);
 
     /* Intent fields */
-    json_extract_string(json, "intent_id", req->intent_id,
-                        sizeof(req->intent_id));
-    json_extract_string(json, "intent_hash", req->intent_hash,
-                        sizeof(req->intent_hash));
-    json_extract_string(json, "confidence", req->confidence,
-                        sizeof(req->confidence));
-    json_extract_int64(json, "expires_at_ns", &req->expires_at_ns);
+    EXTRACT_STR("intent_id", req->intent_id, sizeof(req->intent_id));
+    EXTRACT_STR("intent_hash", req->intent_hash, sizeof(req->intent_hash));
+    EXTRACT_STR("confidence", req->confidence, sizeof(req->confidence));
+    EXTRACT_I64("expires_at_ns", &req->expires_at_ns);
     {
         int64_t mc = 0;
-        json_extract_int64(json, "max_commands", &mc);
+        EXTRACT_I64("max_commands", &mc);
         req->max_commands = (int32_t)mc;
     }
-    json_extract_string(json, "intent_json", req->intent_json,
-                        sizeof(req->intent_json));
-    json_extract_string(json, "proposed_actions", req->proposed_actions,
-                        sizeof(req->proposed_actions));
-    json_extract_string(json, "constraints", req->constraints,
-                        sizeof(req->constraints));
+    EXTRACT_STR("intent_json", req->intent_json, sizeof(req->intent_json));
+    EXTRACT_STR("proposed_actions", req->proposed_actions,
+                sizeof(req->proposed_actions));
+    EXTRACT_STR("constraints", req->constraints, sizeof(req->constraints));
 
     /* Handshake fields */
-    json_extract_string(json, "client_id", req->client_id,
-                        sizeof(req->client_id));
-    json_extract_string(json, "client_nonce", req->client_nonce,
-                        sizeof(req->client_nonce));
-    json_extract_string(json, "server_nonce", req->server_nonce,
-                        sizeof(req->server_nonce));
-    json_extract_string(json, "versions", req->versions,
-                        sizeof(req->versions));
-    json_extract_string(json, "algorithms", req->algorithms,
-                        sizeof(req->algorithms));
-    json_extract_int64(json, "supported_channels", &req->supported_channels);
+    EXTRACT_STR("client_id", req->client_id, sizeof(req->client_id));
+    EXTRACT_STR("client_nonce", req->client_nonce, sizeof(req->client_nonce));
+    EXTRACT_STR("server_nonce", req->server_nonce, sizeof(req->server_nonce));
+    EXTRACT_STR("versions", req->versions, sizeof(req->versions));
+    EXTRACT_STR("algorithms", req->algorithms, sizeof(req->algorithms));
+    EXTRACT_I64("supported_channels", &req->supported_channels);
 
+#undef EXTRACT_STR
+#undef EXTRACT_I64
+
+    cJSON_Delete(root);
     return true;
 }
 
@@ -577,57 +677,35 @@ static int parse_batch_commands(const char *json,
                                  batch_thread_arg_t *args,
                                  int max_cmds)
 {
-    const char *pos = strstr(json, "\"commands\"");
-    if (!pos) return 0;
+    cJSON *root = cJSON_Parse(json);
+    if (!root) return 0;
 
-    pos = strchr(pos + 10, '[');
-    if (!pos) return 0;
-    pos++;
-
-    int count = 0;
-    while (count < max_cmds) {
-        /* Skip whitespace and commas */
-        while (*pos == ' ' || *pos == '\t' || *pos == '\n' ||
-               *pos == '\r' || *pos == ',')
-            pos++;
-
-        if (*pos == ']' || *pos == '\0') break;
-        if (*pos != '{') break;
-
-        /* Find matching '}' with depth tracking */
-        int depth = 0;
-        bool in_string = false;
-        const char *obj_start = pos;
-        const char *p = pos;
-        while (*p) {
-            if (*p == '\\' && in_string) { p++; if (*p) p++; continue; }
-            if (*p == '"') in_string = !in_string;
-            if (!in_string) {
-                if (*p == '{') depth++;
-                if (*p == '}') { depth--; if (depth == 0) break; }
-            }
-            p++;
-        }
-        if (*p != '}') break;
-
-        /* Extract object into temp buffer */
-        size_t obj_len = (size_t)(p - obj_start + 1);
-        char obj_buf[2048];
-        if (obj_len >= sizeof(obj_buf)) { pos = p + 1; continue; }
-        memcpy(obj_buf, obj_start, obj_len);
-        obj_buf[obj_len] = '\0';
-
-        if (json_extract_string(obj_buf, "device",
-                                args[count].device,
-                                sizeof(args[count].device)) &&
-            json_extract_string(obj_buf, "command",
-                                args[count].command,
-                                sizeof(args[count].command))) {
-            count++;
-        }
-        pos = p + 1;
+    cJSON *commands = cJSON_GetObjectItemCaseSensitive(root, "commands");
+    if (!cJSON_IsArray(commands)) {
+        cJSON_Delete(root);
+        return 0;
     }
 
+    int count = 0;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, commands) {
+        if (count >= max_cmds) break;
+        if (!cJSON_IsObject(item)) continue;
+
+        cJSON *dev = cJSON_GetObjectItemCaseSensitive(item, "device");
+        cJSON *cmd = cJSON_GetObjectItemCaseSensitive(item, "command");
+
+        if (cJSON_IsString(dev) && dev->valuestring &&
+            cJSON_IsString(cmd) && cmd->valuestring) {
+            snprintf(args[count].device, sizeof(args[count].device),
+                     "%s", dev->valuestring);
+            snprintf(args[count].command, sizeof(args[count].command),
+                     "%s", cmd->valuestring);
+            count++;
+        }
+    }
+
+    cJSON_Delete(root);
     return count;
 }
 

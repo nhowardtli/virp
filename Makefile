@@ -8,7 +8,7 @@
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC
-CFLAGS += -I./include $(CFLAGS_EXTRA)
+CFLAGS += -I./include -I./src/third_party $(CFLAGS_EXTRA)
 LDFLAGS = -lcrypto -lpthread -lsqlite3 -lsodium
 
 BUILD_DIR = build
@@ -23,7 +23,8 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_federation.o \
              $(BUILD_DIR)/virp_session.o \
              $(BUILD_DIR)/virp_handshake.o \
-             $(BUILD_DIR)/virp_transcript.o
+             $(BUILD_DIR)/virp_transcript.o \
+             $(BUILD_DIR)/cJSON.o
 
 # Optional Cisco driver (requires libssh2)
 ifdef CISCO
@@ -158,6 +159,9 @@ $(BUILD_DIR)/driver_wazuh.o: src/drivers/driver_wazuh.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_ssh_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cJSON.o: src/third_party/cJSON.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)

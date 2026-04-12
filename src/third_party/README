@@ -1,0 +1,14 @@
+Third-party vendored libraries
+===============================
+
+cJSON — Ultralightweight JSON parser in ANSI C
+  Version: 1.7.18
+  Tag:     v1.7.18
+  Commit:  acc76239bee01d8e9c858ae2cab296704e52d916
+  Source:  https://github.com/DaveGamble/cJSON
+  License: MIT
+  Vendored: 2026-04-12
+
+  Files: cJSON.c, cJSON.h
+  Unmodified from upstream. Do not edit — update by re-downloading
+  from a newer tagged release.
