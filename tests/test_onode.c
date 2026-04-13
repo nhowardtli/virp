@@ -370,8 +370,9 @@ TEST(test_wrong_key_fails_verify)
  * Batch execution helpers
  * ========================================================================= */
 
-/* Mock driver delay hook (defined in driver_mock.c) */
+/* Mock driver hooks (defined in driver_mock.c) */
 extern void virp_driver_mock_set_delay(int ms);
+extern void virp_driver_mock_set_forced_error(virp_error_t err);
 
 static int recv_all(int fd, void *buf, size_t len)
 {
@@ -709,6 +710,53 @@ TEST(test_v1_unframed_client_rejected)
 }
 
 /* =========================================================================
+ * Signed error observation tests
+ * ========================================================================= */
+
+TEST(test_driver_error_returns_signed_observation)
+{
+    /*
+     * When drv->execute() returns a non-VIRP_OK error (not just
+     * result.success=false), the O-Node MUST still emit a signed
+     * VIRP_OBS_ERROR observation — never an unsigned 4-byte error code.
+     * This ensures the R-Node receives a verifiable failure receipt.
+     */
+
+    /* Arm mock driver to return VIRP_ERR_CRYPTO on next execute */
+    virp_driver_mock_set_forced_error(VIRP_ERR_CRYPTO);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request(
+        "{\"action\": \"execute\", \"device\": \"R6\", \"command\": \"show version\"}",
+        resp, sizeof(resp));
+
+    /* Disarm so subsequent tests aren't affected */
+    virp_driver_mock_set_forced_error(VIRP_OK);
+
+    /* Response must be a full VIRP message, not a 4-byte error code */
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+
+    /* Must be a valid, signed observation */
+    virp_header_t hdr;
+    virp_error_t err = virp_validate_message(resp, (size_t)n, &g_state.okey, &hdr);
+    ASSERT_OK(err);
+    ASSERT_EQ(hdr.type, VIRP_MSG_OBSERVATION);
+    ASSERT_EQ(hdr.channel, VIRP_CHANNEL_OC);
+
+    /* Parse observation — must be VIRP_OBS_ERROR with descriptive text */
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    err = virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                                 (size_t)n - VIRP_HEADER_SIZE,
+                                 &obs, &data, &data_len);
+    ASSERT_OK(err);
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(data_len > 0);
+    ASSERT_TRUE(strstr((const char *)data, "driver execute failed") != NULL);
+}
+
+/* =========================================================================
  * hex_decode unit tests
  * ========================================================================= */
 
@@ -858,6 +906,9 @@ int main(void)
 
     printf("\n[v2 Framing Tests]\n");
     RUN_TEST(test_v1_unframed_client_rejected);
+
+    printf("\n[Signed Error Observation Tests]\n");
+    RUN_TEST(test_driver_error_returns_signed_observation);
 
     /* Shutdown */
     onode_shutdown(&g_state);

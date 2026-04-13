@@ -522,14 +522,34 @@ virp_error_t onode_execute(onode_state_t *state,
     const virp_driver_t *drv = virp_driver_lookup(state->devices[dev_idx].vendor);
     if (!drv) {
         pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
-        return VIRP_ERR_INVALID_TYPE;
+        char err_msg[256];
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: no driver for '%s'", device_name);
+        return virp_build_observation(out_buf, out_buf_len, out_len,
+                                      state->devices[dev_idx].node_id,
+                                      onode_next_seq(state),
+                                      VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                      (const uint8_t *)err_msg,
+                                      (uint16_t)strlen(err_msg),
+                                      &state->okey);
     }
 
     virp_exec_result_t result;
     virp_error_t err = drv->execute(conn, command, &result);
     if (err != VIRP_OK) {
+        drop_connection(state, dev_idx);
         pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
-        return err;
+        char err_msg[256];
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: driver execute failed on '%s': %s",
+                 device_name, virp_error_str(err));
+        return virp_build_observation(out_buf, out_buf_len, out_len,
+                                      state->devices[dev_idx].node_id,
+                                      onode_next_seq(state),
+                                      VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                      (const uint8_t *)err_msg,
+                                      (uint16_t)strlen(err_msg),
+                                      &state->okey);
     }
 
     /* On failure: drop stale connection, retry once with fresh connection */
@@ -540,8 +560,20 @@ virp_error_t onode_execute(onode_state_t *state,
             memset(&result, 0, sizeof(result));
             err = drv->execute(conn, command, &result);
             if (err != VIRP_OK) {
+                drop_connection(state, dev_idx);
                 pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
-                return err;
+                char err_msg[256];
+                snprintf(err_msg, sizeof(err_msg),
+                         "ERROR: driver execute failed on '%s' (retry): %s",
+                         device_name, virp_error_str(err));
+                return virp_build_observation(
+                    out_buf, out_buf_len, out_len,
+                    state->devices[dev_idx].node_id,
+                    onode_next_seq(state),
+                    VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                    (const uint8_t *)err_msg,
+                    (uint16_t)strlen(err_msg),
+                    &state->okey);
             }
         }
     }

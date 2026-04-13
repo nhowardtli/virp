@@ -111,6 +111,7 @@
 #define VIRP_OBS_INTENT_STORED      0x0C    /* Intent stored in durable DB */
 #define VIRP_OBS_INTENT_FETCHED     0x0D    /* Intent retrieved from DB */
 #define VIRP_OBS_INTENT_EXECUTED    0x0E    /* Intent execution counter updated */
+#define VIRP_OBS_ERROR              0x0F    /* Signed error: driver/transport failure */
 
 /* =========================================================================
  * Observation Scope

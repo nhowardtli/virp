@@ -19,6 +19,10 @@
 static int mock_delay_ms = 0;
 void virp_driver_mock_set_delay(int ms) { mock_delay_ms = ms; }
 
+/* Test hook: force drv->execute() to return this error code (0 = disabled) */
+static virp_error_t mock_forced_error = VIRP_OK;
+void virp_driver_mock_set_forced_error(virp_error_t err) { mock_forced_error = err; }
+
 /* =========================================================================
  * Mock connection — just stores the device info
  * ========================================================================= */
@@ -122,6 +126,10 @@ static virp_error_t mock_execute(virp_conn_t *conn,
         return VIRP_ERR_NULL_PTR;
 
     memset(result, 0, sizeof(*result));
+
+    /* Test hook: simulate driver-level error (not just result.success=false) */
+    if (mock_forced_error != VIRP_OK)
+        return mock_forced_error;
 
     if (!conn->connected) {
         result->success = false;

@@ -958,6 +958,7 @@ const char *virp_obs_type_str(uint8_t obs_type)
     case VIRP_OBS_INTENT_STORED:    return "INTENT_STORED";
     case VIRP_OBS_INTENT_FETCHED:   return "INTENT_FETCHED";
     case VIRP_OBS_INTENT_EXECUTED:  return "INTENT_EXECUTED";
+    case VIRP_OBS_ERROR:            return "ERROR";
     default:                        return "UNKNOWN";
     }
 }
