@@ -245,9 +245,15 @@ ONODE_PROD = $(BUILD_DIR)/virp-onode-prod
 $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -ljson-c -o $@
 
-# Note: 'make prod' builds only the prod binary against the current library.
-# Use 'make prod-full' to rebuild everything with all drivers enabled.
-prod: $(ONODE_PROD)
+# 'make prod' builds the prod O-Node with all production drivers enabled,
+# including PAN-OS. Uses recursive $(MAKE) because the driver guards are
+# `ifdef PANOS` / `ifdef CISCO` / etc., which are evaluated at Makefile
+# parse time — target-specific variable assignments (`prod: PANOS := 1`)
+# would not reach those guards. Kept distinct from `prod-full` so either
+# name works and callers have a single driver-enabled build entry point.
+.PHONY: prod
+prod:
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 $(ONODE_PROD)
 
 # Full production build — recursive make ensures all ifdef guards evaluate correctly
 # SSH host key verification is strict: unknown keys are rejected.
