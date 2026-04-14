@@ -1685,17 +1685,28 @@ static void *watchdog_thread_fn(void *arg)
                 if (hc != VIRP_OK) {
                     fprintf(stderr, "[Watchdog] Health check failed: %s — dropping\n",
                             state->devices[i].hostname);
-                    ri->reconnecting = true;
-                    pthread_mutex_unlock(&state->conn_mutex);
-
-                    /* Drop outside the lock (disconnect may block) */
-                    drv->disconnect(conn);
-
-                    pthread_mutex_lock(&state->conn_mutex);
+                    /*
+                     * Null the slot and mark reconnecting under conn_mutex,
+                     * stash the pointer locally, then release conn_mutex
+                     * before taking exec_mutex. This preserves the
+                     * conn_mutex-never-held-with-exec_mutex invariant while
+                     * still serializing disconnect against any in-flight
+                     * onode_execute on the same device.
+                     */
+                    virp_conn_t *stale = conn;
                     state->connections[i] = NULL;
+                    ri->reconnecting = true;
                     ri->last_attempt = now;
                     if (ri->backoff_sec == 0)
                         ri->backoff_sec = ONODE_RECONNECT_BACKOFF_INIT;
+                    pthread_mutex_unlock(&state->conn_mutex);
+
+                    /* Wait out any in-flight execute, then tear down. */
+                    pthread_mutex_lock(&state->exec_mutex[i]);
+                    drv->disconnect(stale);
+                    pthread_mutex_unlock(&state->exec_mutex[i]);
+
+                    pthread_mutex_lock(&state->conn_mutex);
                     ri->reconnecting = false;
                     pthread_mutex_unlock(&state->conn_mutex);
                 } else {
@@ -1982,14 +1993,22 @@ void onode_destroy(onode_state_t *state)
     if (state->watchdog_thread)
         pthread_join(state->watchdog_thread, NULL);
 
-    /* Close all device connections */
+    /*
+     * Close all device connections. The listen socket has already been
+     * closed by onode_shutdown()'s `running=false`, so no new client
+     * requests will arrive; any in-flight onode_execute runs to
+     * completion under exec_mutex[i]. Take exec_mutex[i] here too so
+     * we can't race the final call to drv->execute.
+     */
     for (int i = 0; i < state->device_count; i++) {
+        pthread_mutex_lock(&state->exec_mutex[i]);
         if (state->connections[i]) {
             const virp_driver_t *drv = virp_driver_lookup(state->devices[i].vendor);
             if (drv)
                 drv->disconnect(state->connections[i]);
             state->connections[i] = NULL;
         }
+        pthread_mutex_unlock(&state->exec_mutex[i]);
     }
 
     /* Close listen socket */

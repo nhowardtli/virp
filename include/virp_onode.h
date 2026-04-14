@@ -146,6 +146,19 @@ typedef struct {
      * build_observation) so that exactly one thread drives the
      * connection at a time.
      *
+     * The watchdog thread must also acquire exec_mutex[dev_idx] before
+     * calling drv->disconnect() on an established connection; without
+     * that, an in-flight onode_execute could still be inside
+     * drv->execute() on a pointer the watchdog is freeing. Likewise
+     * onode_destroy() takes each exec_mutex before final teardown.
+     *
+     * Lock ordering invariant: conn_mutex and exec_mutex[*] must never
+     * be held at the same time. Each is acquired, used briefly, and
+     * released before any code path attempts to acquire the other.
+     * conn_mutex protects slot lookup only (connections[], reconnect[]);
+     * exec_mutex protects the lifetime of the referenced virp_conn_t*
+     * against concurrent execute / disconnect.
+     *
      * Different devices are independent — their mutexes never contend.
      */
     pthread_mutex_t     exec_mutex[ONODE_MAX_DEVICES];

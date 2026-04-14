@@ -305,6 +305,15 @@ $(TEST_JX_UINT32): tests/test_jx_uint32.c src/virp_onode_json.c $(LIB)
 test-jx-uint32: $(TEST_JX_UINT32)
 	./$(TEST_JX_UINT32)
 
+# Concurrent onode_execute smoke test (connection lifetime race)
+TEST_ONODE_CONC = $(BUILD_DIR)/test_onode_concurrency
+
+$(TEST_ONODE_CONC): tests/test_onode_concurrency.c $(LIB)
+	$(CC) $(CFLAGS) tests/test_onode_concurrency.c $(LIB) $(LDFLAGS) -o $@
+
+test-onode-concurrency: $(TEST_ONODE_CONC)
+	./$(TEST_ONODE_CONC)
+
 # Wazuh driver tests (requires WAZUH=1 and live Wazuh Manager)
 TEST_WAZUH = $(BUILD_DIR)/test_driver_wazuh
 
