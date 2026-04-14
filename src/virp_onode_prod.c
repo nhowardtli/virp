@@ -96,12 +96,85 @@ static virp_vendor_t vendor_from_string(const char *s)
     return VIRP_VENDOR_UNKNOWN;
 }
 
+/*
+ * Parse the top-level `socket_allowed_uids` array from the config and
+ * install it on the O-Node state. Absent array → state is left untouched
+ * and onode_start() will self-seed with geteuid().
+ */
+static void load_socket_allowed_uids(onode_state_t *state,
+                                     struct json_object *root)
+{
+    struct json_object *arr;
+    if (!json_object_object_get_ex(root, "socket_allowed_uids", &arr) ||
+        !json_object_is_type(arr, json_type_array)) {
+        return;  /* optional */
+    }
+
+    int n = (int)json_object_array_length(arr);
+    if (n <= 0) return;
+    if (n > ONODE_MAX_ALLOWED_UIDS) {
+        fprintf(stderr, "[O-Node] socket_allowed_uids has %d entries, "
+                        "truncating to %d\n", n, ONODE_MAX_ALLOWED_UIDS);
+        n = ONODE_MAX_ALLOWED_UIDS;
+    }
+
+    uid_t uids[ONODE_MAX_ALLOWED_UIDS];
+    int parsed = 0;
+    for (int i = 0; i < n; i++) {
+        struct json_object *el = json_object_array_get_idx(arr, i);
+        if (!el) continue;
+        if (json_object_is_type(el, json_type_int)) {
+            uids[parsed++] = (uid_t)json_object_get_int(el);
+        } else if (json_object_is_type(el, json_type_string)) {
+            uids[parsed++] = (uid_t)strtoul(json_object_get_string(el),
+                                            NULL, 10);
+        }
+    }
+    if (parsed > 0)
+        onode_set_allowed_uids(state, uids, (size_t)parsed);
+}
+
+/*
+ * Parse the optional top-level `socket_path` override. If present, it
+ * takes precedence over the -s CLI argument. This lets operators move
+ * the socket (e.g. when redirecting the socat bridge) by editing the
+ * config file only.
+ *
+ * Returns a malloc'd copy the caller must free, or NULL.
+ */
+static char *load_socket_path_override(struct json_object *root)
+{
+    struct json_object *val;
+    if (!json_object_object_get_ex(root, "socket_path", &val) ||
+        !json_object_is_type(val, json_type_string))
+        return NULL;
+    const char *s = json_object_get_string(val);
+    return (s && *s) ? strdup(s) : NULL;
+}
+
 static int load_devices(onode_state_t *state, const char *path)
 {
     struct json_object *root = json_object_from_file(path);
     if (!root) {
         fprintf(stderr, "[O-Node] Failed to parse device config: %s\n", path);
         return -1;
+    }
+
+    /* Socket access gate: install allowlist before onode_start(). */
+    load_socket_allowed_uids(state, root);
+
+    /*
+     * Optional socket_path override from config. Takes precedence over
+     * the -s CLI flag so operators can move the socket (for the socat
+     * bridge in particular) by editing the JSON alone.
+     */
+    char *sock_override = load_socket_path_override(root);
+    if (sock_override) {
+        snprintf(state->socket_path, sizeof(state->socket_path), "%s",
+                 sock_override);
+        fprintf(stderr, "[O-Node] socket_path from config: %s\n",
+                state->socket_path);
+        free(sock_override);
     }
 
     struct json_object *devices_arr;

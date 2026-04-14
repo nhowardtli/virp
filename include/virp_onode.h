@@ -25,6 +25,7 @@
 #include "virp_chain.h"
 #include "virp_context.h"
 #include <pthread.h>
+#include <sys/types.h>   /* uid_t for socket_allowed_uids */
 
 /* =========================================================================
  * O-Node Configuration
@@ -32,11 +33,12 @@
 
 #define ONODE_MAX_DEVICES       64
 #define ONODE_MAX_BATCH         16
-#define ONODE_SOCKET_PATH       "/tmp/virp-onode.sock"
+#define ONODE_SOCKET_PATH       "/run/virp/onode.sock"
 #define ONODE_HEARTBEAT_SEC     30
 #define ONODE_MAX_CLIENTS       8
 #define ONODE_RECV_TIMEOUT_SEC  5
 #define ONODE_MAX_REQUEST_SIZE  24576
+#define ONODE_MAX_ALLOWED_UIDS  16
 
 /* Auto-reconnect configuration */
 #define ONODE_WATCHDOG_INTERVAL_SEC  5   /* How often the watchdog checks */
@@ -113,6 +115,16 @@ typedef struct {
     /* Socket */
     int                 listen_fd;
     char                socket_path[108];  /* Must fit in sun_path */
+
+    /*
+     * SO_PEERCRED accept-path allowlist. Populated by the daemon's
+     * main() (prod: parsed from the JSON config's socket_allowed_uids
+     * array via json-c). If empty, onode_start() seeds it with the
+     * daemon's own effective UID so a missing config still yields a
+     * working — and self-only — default.
+     */
+    uid_t               socket_allowed_uids[ONODE_MAX_ALLOWED_UIDS];
+    size_t              socket_allowed_uids_count;
 
     /* Trust chain (Primitive 6) */
     virp_chain_state_t  chain;
@@ -241,6 +253,14 @@ bool json_extract_string(const char *json, const char *key,
                          char *out, size_t out_len);
 
 bool json_extract_int64(const char *json, const char *key, int64_t *out);
+
+/*
+ * Set the SO_PEERCRED allowlist. Replaces any existing entries.
+ * Returns VIRP_OK, or VIRP_ERR_MESSAGE_TOO_LARGE if `count` exceeds
+ * ONODE_MAX_ALLOWED_UIDS.
+ */
+virp_error_t onode_set_allowed_uids(onode_state_t *state,
+                                    const uid_t *uids, size_t count);
 
 /*
  * Decode a hex string to bytes. Only accepts [0-9a-fA-F].

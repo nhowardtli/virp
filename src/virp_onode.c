@@ -14,6 +14,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE   /* struct ucred (SO_PEERCRED) */
 
 #include "virp_onode.h"
 #include "virp_message.h"
@@ -842,6 +843,36 @@ static void send_framed_error(int fd, virp_error_t err)
 {
     uint32_t err_code = htonl((uint32_t)err);
     send_framed(fd, &err_code, 4);
+}
+
+/*
+ * SO_PEERCRED accept-path gate.
+ *
+ * Checks the connected peer's UID against state->socket_allowed_uids.
+ * On success returns true and writes cred info to *out_uid / *out_pid
+ * for logging. On failure returns false; the caller must close the fd.
+ */
+static bool peer_uid_allowed(onode_state_t *state, int client_fd,
+                             uid_t *out_uid, pid_t *out_pid)
+{
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    memset(&cred, 0, sizeof(cred));
+    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) {
+        /* If we cannot read creds, fail closed — do not leak capability. */
+        perror("[O-Node] getsockopt SO_PEERCRED");
+        if (out_uid) *out_uid = (uid_t)-1;
+        if (out_pid) *out_pid = 0;
+        return false;
+    }
+    if (out_uid) *out_uid = cred.uid;
+    if (out_pid) *out_pid = cred.pid;
+
+    for (size_t i = 0; i < state->socket_allowed_uids_count; i++) {
+        if (state->socket_allowed_uids[i] == cred.uid)
+            return true;
+    }
+    return false;
 }
 
 static void handle_client(onode_state_t *state, int client_fd)
@@ -1771,10 +1802,64 @@ virp_error_t onode_add_device(onode_state_t *state,
     return VIRP_OK;
 }
 
+virp_error_t onode_set_allowed_uids(onode_state_t *state,
+                                    const uid_t *uids, size_t count)
+{
+    if (!state || (!uids && count > 0))
+        return VIRP_ERR_NULL_PTR;
+    if (count > ONODE_MAX_ALLOWED_UIDS)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+    for (size_t i = 0; i < count; i++)
+        state->socket_allowed_uids[i] = uids[i];
+    state->socket_allowed_uids_count = count;
+    return VIRP_OK;
+}
+
 virp_error_t onode_start(onode_state_t *state)
 {
     if (!state)
         return VIRP_ERR_NULL_PTR;
+
+    /*
+     * Ensure parent directory exists with 0700 owned by the current
+     * effective UID. /run/virp is the canonical location; /tmp/-style
+     * paths are still accepted (parent is '/' — skipped). Failure is
+     * logged but non-fatal so bind() gets a chance to produce the
+     * clearer error if the path really is unwritable.
+     */
+    const char *last_slash = strrchr(state->socket_path, '/');
+    if (last_slash && last_slash != state->socket_path) {
+        char dir[128];
+        size_t n = (size_t)(last_slash - state->socket_path);
+        if (n >= sizeof(dir)) n = sizeof(dir) - 1;
+        memcpy(dir, state->socket_path, n);
+        dir[n] = '\0';
+        if (mkdir(dir, 0700) < 0 && errno != EEXIST) {
+            fprintf(stderr, "[O-Node] mkdir %s: %s (continuing)\n",
+                    dir, strerror(errno));
+        } else if (errno != EEXIST) {
+            /* Newly created — tighten owner/mode in case umask relaxed it. */
+            chmod(dir, 0700);
+        }
+    }
+
+    /*
+     * If no allowlist was configured, default to the daemon's own
+     * effective UID only. This keeps the socket closed to every other
+     * local user unless an operator opts a UID in via the config.
+     */
+    if (state->socket_allowed_uids_count == 0) {
+        state->socket_allowed_uids[0] = geteuid();
+        state->socket_allowed_uids_count = 1;
+        fprintf(stderr,
+                "[O-Node] socket_allowed_uids: <default> = [%u] (daemon UID)\n",
+                (unsigned)geteuid());
+    } else {
+        fprintf(stderr, "[O-Node] socket_allowed_uids:");
+        for (size_t i = 0; i < state->socket_allowed_uids_count; i++)
+            fprintf(stderr, " %u", (unsigned)state->socket_allowed_uids[i]);
+        fprintf(stderr, "\n");
+    }
 
     /* Remove stale socket */
     unlink(state->socket_path);
@@ -1861,6 +1946,16 @@ virp_error_t onode_start(onode_state_t *state)
             int client_fd = accept(state->listen_fd, NULL, NULL);
             if (client_fd < 0) {
                 perror("[O-Node] accept");
+                continue;
+            }
+            uid_t peer_uid = (uid_t)-1;
+            pid_t peer_pid = 0;
+            if (!peer_uid_allowed(state, client_fd, &peer_uid, &peer_pid)) {
+                fprintf(stderr,
+                        "[O-Node] REJECTED connection: peer uid=%u pid=%d "
+                        "not in socket_allowed_uids\n",
+                        (unsigned)peer_uid, (int)peer_pid);
+                close(client_fd);
                 continue;
             }
             handle_client(state, client_fd);
