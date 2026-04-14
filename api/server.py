@@ -55,6 +55,13 @@ except ImportError:
 VIRP_HEADER_SIZE = 56
 VIRP_HMAC_SIZE = 32
 VIRP_KEY_SIZE = 32
+
+# Upper bound on a single framed VIRP message accepted by the API. The
+# wire length field is uint16 so the protocol ceiling is 65535; the
+# onode's own request buffer is 24KB. 32KB gives headroom for legitimate
+# long `show` outputs while refusing anything suspiciously oversized
+# before we start dereferencing the length field.
+VIRP_MAX_FRAME = 32768
 VIRP_VERSION = 0x01
 VIRP_TYPE_OBSERVATION = 0x01
 VIRP_TYPE_HELLO = 0x02
@@ -148,6 +155,31 @@ def load_okey():
 # VIRP Message Parsing
 # ---------------------------------------------------------------------------
 
+def _parse_error(reason: str) -> dict:
+    """Return a dict shaped like parse_virp_message's success return but with
+    the observation marked unparseable. Callers treat `parse_error` truthiness
+    and `verified: False` as a hard reject — such frames never enter the
+    observation log or reach the Observation Gate as verified. Keys used by
+    the /api/observe handler are present with safe defaults so a reject path
+    doesn't KeyError downstream."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "parse_error": reason,
+        "verified": False,
+        "type": "PARSE_ERROR",
+        "observation": "",
+        "payload": "",
+        "payload_length": 0,
+        "sequence": 0,
+        "trust_tier": "UNKNOWN",
+        "timestamp": 0.0,
+        "timestamp_ns": 0,
+        "timestamp_iso": now_iso,
+        "node_id": 0,
+        "channel": "UNKNOWN",
+    }
+
+
 def parse_virp_message(msg: bytes) -> dict:
     """Parse a binary VIRP message into structured data.
 
@@ -163,9 +195,18 @@ def parse_virp_message(msg: bytes) -> dict:
       [16-23] uint64  timestamp_ns
       [24-55] uint8[32] HMAC-SHA256
     Payload follows at offset 56.
+
+    Size validation is defensive: the 16-bit length field is attacker-
+    controlled before HMAC verification, so we refuse any frame larger
+    than VIRP_MAX_FRAME or that lies about its own length before we
+    dereference the payload slice. Parse errors are returned as dicts
+    with `parse_error` set rather than raised, so callers handle them
+    uniformly with HMAC failures.
     """
     if len(msg) < VIRP_HEADER_SIZE:
-        raise ValueError(f"Message too short: {len(msg)} bytes (min {VIRP_HEADER_SIZE})")
+        return _parse_error(
+            f"Message too short: {len(msg)} bytes (min {VIRP_HEADER_SIZE})"
+        )
 
     # Parse 56-byte header
     (version, msg_type, length, node_id,
@@ -173,11 +214,21 @@ def parse_virp_message(msg: bytes) -> dict:
      seq_num, timestamp_ns) = struct.unpack_from("!BBHI BBHI Q", msg, 0)
     received_hmac = msg[24:56]
 
-    # Extract payload — validate length against both header size and actual buffer
+    # Hard cap: reject pathological length fields before any slicing.
+    if length > VIRP_MAX_FRAME:
+        return _parse_error(
+            f"Declared length {length} exceeds VIRP_MAX_FRAME {VIRP_MAX_FRAME}"
+        )
+    # Lower bound: length must at least cover the header.
     if length < VIRP_HEADER_SIZE:
-        raise ValueError(f"Declared length {length} < header size {VIRP_HEADER_SIZE}")
-    if length > len(msg):
-        raise ValueError(f"Declared length {length} > actual message size {len(msg)}")
+        return _parse_error(
+            f"Declared length {length} < header size {VIRP_HEADER_SIZE}"
+        )
+    # Consistency: the buffer we actually received must hold the claim.
+    if len(msg) < length:
+        return _parse_error(
+            f"Buffer {len(msg)} bytes < declared length {length}"
+        )
     payload_len = length - VIRP_HEADER_SIZE
     payload = msg[VIRP_HEADER_SIZE:VIRP_HEADER_SIZE + payload_len]
 
