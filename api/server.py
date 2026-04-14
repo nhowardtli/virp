@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,6 +35,14 @@ DEVICES_PATH = os.environ.get("VIRP_DEVICES", "/etc/virp/devices.json")  # legac
 WEB_DIR = os.environ.get("VIRP_WEB_DIR", "/opt/virp-appliance/web")
 API_TOKEN = os.environ.get("VIRP_API_TOKEN", "")  # Optional bearer token
 VIRP_ALLOW_PY_FALLBACK = os.environ.get("VIRP_ALLOW_PY_FALLBACK", "") == "1"
+
+# CORS: pinned origin allowlist (comma-separated). CT 210 is the canonical
+# tli-ops-center frontend; CT 211 is this appliance's own UI mount.
+_DEFAULT_ORIGINS = "http://10.0.0.210,http://10.0.0.211"
+VIRP_ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("VIRP_ALLOWED_ORIGINS", _DEFAULT_ORIGINS).split(",")
+    if o.strip()
+]
 
 # Single source of truth — device registry
 try:
@@ -708,7 +716,11 @@ class GateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 async def check_auth(request: Request):
-    """Simple bearer token auth (if configured)."""
+    """FastAPI dependency: bearer token auth (if configured).
+
+    Use via `dependencies=[Depends(check_auth)]` on route decorators.
+    When VIRP_API_TOKEN is unset, auth is a no-op (POC/dev mode).
+    """
     if not API_TOKEN:
         return  # No auth configured
     auth = request.headers.get("Authorization", "")
@@ -740,10 +752,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=VIRP_ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["authorization", "content-type"],
 )
 
 
@@ -753,7 +765,7 @@ app.add_middleware(
 
 @app.get("/api/health")
 async def health():
-    """Appliance health check."""
+    """Appliance health check. Intentionally public — used by monitors/load balancers."""
     onode_alive = os.path.exists(VIRP_SOCKET)
     devices = load_devices()
     uptime = time.time() - appliance_start_time
@@ -771,7 +783,7 @@ async def health():
     }
 
 
-@app.get("/api/devices")
+@app.get("/api/devices", dependencies=[Depends(check_auth)])
 async def list_devices():
     """List all registered devices."""
     devices = load_devices()
@@ -793,11 +805,9 @@ async def list_devices():
     return {"devices": result, "total": len(result), "source": "devices.yaml" if _HAVE_REGISTRY else "devices.json"}
 
 
-@app.post("/api/observe")
+@app.post("/api/observe", dependencies=[Depends(check_auth)])
 async def observe(req: ObserveRequest):
     """Execute a command on a device and return a signed VIRP observation."""
-    await check_auth(Request)
-
     devices = load_devices()
     if req.device not in devices:
         raise HTTPException(status_code=404, detail=f"Device '{req.device}' not registered")
@@ -856,7 +866,7 @@ async def observe(req: ObserveRequest):
     }
 
 
-@app.post("/api/sweep")
+@app.post("/api/sweep", dependencies=[Depends(check_auth)])
 async def sweep(req: SweepRequest):
     """Run a topology sweep across all (or selected) devices.
 
@@ -972,7 +982,7 @@ async def sweep(req: SweepRequest):
     }
 
 
-@app.get("/api/observations")
+@app.get("/api/observations", dependencies=[Depends(check_auth)])
 async def get_observations(limit: int = 50, device: Optional[str] = None):
     """Get recent observation log."""
     logs = observation_log
@@ -984,7 +994,7 @@ async def get_observations(limit: int = 50, device: Optional[str] = None):
     }
 
 
-@app.post("/api/gate")
+@app.post("/api/gate", dependencies=[Depends(check_auth)])
 async def observation_gate(req: GateRequest):
     """Observation Gate — verify AI response fidelity against signed data.
 
@@ -1113,7 +1123,7 @@ async def observation_gate(req: GateRequest):
 
 @app.get("/api/key")
 async def key_info():
-    """Public key information (fingerprint only — never expose key material)."""
+    """Intentionally public — fingerprint-only info, never exposes key material."""
     return {
         "key_loaded": key_material is not None,
         "fingerprint": key_fingerprint,
@@ -1123,7 +1133,7 @@ async def key_info():
     }
 
 
-@app.post("/api/devices/add")
+@app.post("/api/devices/add", dependencies=[Depends(check_auth)])
 async def add_device(req: DeviceAddRequest):
     """Add a device to the registry.
 
@@ -1156,7 +1166,7 @@ async def add_device(req: DeviceAddRequest):
     }
 
 
-@app.delete("/api/devices/{name}")
+@app.delete("/api/devices/{name}", dependencies=[Depends(check_auth)])
 async def remove_device(name: str):
     """Remove a device from the registry."""
     if _HAVE_REGISTRY and _dr.get_device(name):
