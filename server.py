@@ -58,8 +58,21 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8080
 
 ONODE_HOST = "10.0.0.211"
-ONODE_PORT = 9999
+ONODE_PORT = 9999          # C O-Node VIRP protocol service on 211
+ONODE_BRIDGE_PORT = 9998   # virp-bridge.py chain query service on 211 (separate process)
 ONODE_TIMEOUT = 15
+
+# ── CORS ───────────────────────────────────────────────────────────────────
+# Read allowed origins from env var (comma-separated), matching convention
+# on CT 211's hardening/audit-2026-04 branch.
+_default_origins = "http://10.0.0.210,http://10.0.0.211"
+CORS_ALLOWED_ORIGINS = [
+    o.strip() for o in
+    os.environ.get("VIRP_ALLOWED_ORIGINS", _default_origins).split(",")
+    if o.strip()
+]
+CORS_ALLOWED_METHODS = "GET, POST, OPTIONS"
+CORS_ALLOWED_HEADERS = "authorization, content-type"
 
 # ── VIRP Protocol Constants ─────────────────────────────────────────────────
 
@@ -1595,6 +1608,14 @@ class VIRPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _cors_headers(self):
+        """Emit CORS headers pinned to VIRP_ALLOWED_ORIGINS (env-configurable)."""
+        origin = self.headers.get("Origin", "")
+        if origin in CORS_ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", CORS_ALLOWED_METHODS)
+        self.send_header("Access-Control-Allow-Headers", CORS_ALLOWED_HEADERS)
+
     def handle_index(self):
         self.send_html(DASHBOARD_HTML)
 
@@ -1603,17 +1624,13 @@ class VIRPHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self._cors_headers()
         self.end_headers()
 
     def do_GET(self):
@@ -1697,7 +1714,9 @@ class VIRPHandler(BaseHTTPRequestHandler):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(10)
-            s.connect((ONODE_HOST, 9998))
+            # 9998 = virp-bridge.py chain query service on 211;
+            # 9999 = C O-Node VIRP protocol on 211. Separate services.
+            s.connect((ONODE_HOST, ONODE_BRIDGE_PORT))
             s.sendall(json.dumps(payload).encode())
             s.shutdown(socket.SHUT_WR)
             chunks = []
@@ -1736,7 +1755,7 @@ class VIRPHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Disposition", "attachment; filename=virp-chain-export.json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(json.dumps(result, indent=2).encode())
 
@@ -1861,7 +1880,7 @@ class VIRPHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._cors_headers()
         self.end_headers()
 
         def sse(event_dict):
