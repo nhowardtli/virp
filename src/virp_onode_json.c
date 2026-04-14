@@ -26,11 +26,39 @@ static bool jx_string(const char *json, const char *key, char *out, size_t out_s
     return i > 0;
 }
 
+/*
+ * jx_uint32 — extract a uint32 value for "key" from a flat JSON blob.
+ *
+ * Accepts two forms:
+ *   "key": "C0100101"   — quoted; parsed as hex (legacy node_id format)
+ *   "key": 5            — unquoted; parsed via strtoul base=0 so it handles
+ *                         decimal, 0x-prefixed hex, and 0-prefixed octal
+ *
+ * Returns `def` if the key is missing or the value does not parse. Previously
+ * only the quoted form was handled; unquoted numbers silently returned `def`,
+ * which for node_id meant `0` — a silent trust-chain failure.
+ */
 static uint32_t jx_uint32(const char *json, const char *key, uint32_t def)
 {
-    char val[32];
-    if (!jx_string(json, key, val, sizeof(val))) return def;
-    return (uint32_t)strtoul(val, NULL, 16);
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return def;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p == '"') {
+        char val[32];
+        if (!jx_string(json, key, val, sizeof(val))) return def;
+        char *end = NULL;
+        unsigned long v = strtoul(val, &end, 16);
+        if (end == val) return def;
+        return (uint32_t)v;
+    }
+    /* Unquoted number: accept decimal, 0x hex, 0 octal via base 0. */
+    char *end = NULL;
+    unsigned long v = strtoul(p, &end, 0);
+    if (end == p) return def;
+    return (uint32_t)v;
 }
 
 static int jx_int(const char *json, const char *key, int def)

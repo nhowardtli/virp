@@ -296,6 +296,15 @@ $(TEST_JSON): tests/test_json_extract.c $(LIB)
 test-json: $(TEST_JSON)
 	./$(TEST_JSON)
 
+# jx_uint32 regression test (unquoted-number parsing in virp_onode_json.c)
+TEST_JX_UINT32 = $(BUILD_DIR)/test_jx_uint32
+
+$(TEST_JX_UINT32): tests/test_jx_uint32.c src/virp_onode_json.c $(LIB)
+	$(CC) $(CFLAGS) tests/test_jx_uint32.c $(LIB) $(LDFLAGS) -o $@
+
+test-jx-uint32: $(TEST_JX_UINT32)
+	./$(TEST_JX_UINT32)
+
 # Wazuh driver tests (requires WAZUH=1 and live Wazuh Manager)
 TEST_WAZUH = $(BUILD_DIR)/test_driver_wazuh
 
