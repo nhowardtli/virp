@@ -32,8 +32,10 @@ echo "[3/6] Testing O-Node connectivity on 10.0.0.211:9999..."
 if timeout 3 bash -c 'echo > /dev/tcp/10.0.0.211/9999' 2>/dev/null; then
     echo "  ✓ O-Node reachable"
 else
+    VIRP_ONODE_SOCKET="${VIRP_ONODE_SOCKET:-/tmp/virp-onode.sock}"
     echo "  ⚠ O-Node not reachable — check socat bridge on CT 211"
-    echo "  Expected: socat TCP-LISTEN:9999,fork,reuseaddr UNIX-CONNECT:/tmp/virp-onode.sock"
+    echo "  Expected: socat TCP-LISTEN:9999,fork,reuseaddr UNIX-CONNECT:${VIRP_ONODE_SOCKET}"
+    echo "  (set VIRP_ONODE_SOCKET to override socket path; default: /tmp/virp-onode.sock)"
     echo "  Continuing deployment anyway..."
 fi
 

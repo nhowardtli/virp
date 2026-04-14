@@ -44,9 +44,11 @@ bash deploy.sh
 ```
 
 ### Prerequisites on CT 211:
-Socat bridge must be running:
+Socat bridge must be running (socket path configurable via `VIRP_ONODE_SOCKET`,
+default `/tmp/virp-onode.sock`):
 ```bash
-socat TCP-LISTEN:9999,fork,reuseaddr UNIX-CONNECT:/tmp/virp-onode.sock
+VIRP_ONODE_SOCKET="${VIRP_ONODE_SOCKET:-/tmp/virp-onode.sock}"
+socat TCP-LISTEN:9999,fork,reuseaddr UNIX-CONNECT:${VIRP_ONODE_SOCKET}
 ```
 
 ### Test:
