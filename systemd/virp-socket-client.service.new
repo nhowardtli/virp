@@ -1,0 +1,16 @@
+[Unit]
+Description=VIRP O-Node Socket Client (post-cutover: /run/virp/onode.sock)
+After=network.target
+
+[Service]
+User=virp-onode
+Group=virp-onode
+UMask=0117
+ExecStartPre=/bin/mkdir -p /run/virp
+ExecStartPre=/bin/rm -f /run/virp/onode.sock
+ExecStart=/usr/bin/socat UNIX-LISTEN:/run/virp/onode.sock,fork,reuseaddr TCP:10.0.0.211:9999
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
