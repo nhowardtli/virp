@@ -678,6 +678,110 @@ TEST(test_batch_same_device_concurrent)
     }
 }
 
+TEST(test_framed_request_split_across_three_sends)
+{
+    /*
+     * Exercise the recv_exact loop in handle_client by splitting a
+     * single framed request across three send() calls with jittered
+     * delays. A correct implementation must accumulate partial reads
+     * and parse the full request; a buggy one that treats each recv()
+     * as a complete frame will error or hang.
+     *
+     * Wire layout sent:
+     *   [4-byte BE length][0x02 version][JSON]
+     *
+     * Split points:
+     *   send 1: 2 of 4 prefix bytes
+     *   send 2: remaining 2 prefix bytes + version byte
+     *   send 3: JSON payload
+     */
+    int fd = client_connect();
+    ASSERT_TRUE(fd >= 0);
+
+    const char *json = "{\"action\":\"heartbeat\"}";
+    size_t json_len = strlen(json);
+    uint32_t frame_len = (uint32_t)(1 + json_len);  /* version + JSON */
+    uint8_t prefix[4] = {
+        (uint8_t)(frame_len >> 24),
+        (uint8_t)(frame_len >> 16),
+        (uint8_t)(frame_len >>  8),
+        (uint8_t)(frame_len),
+    };
+    uint8_t version = VIRP_FRAME_VERSION;
+
+    /* Jittered delays between 10–40ms to force the server through the
+     * partial-read branch of recv_exact(). Deterministic seed keeps
+     * the test reproducible. */
+    srand(0xA77);
+    useconds_t d1 = 10000 + (useconds_t)(rand() % 30000);
+    useconds_t d2 = 10000 + (useconds_t)(rand() % 30000);
+
+    ASSERT_EQ((int)send(fd, prefix, 2, 0), 2);
+    usleep(d1);
+    uint8_t mid[3] = { prefix[2], prefix[3], version };
+    ASSERT_EQ((int)send(fd, mid, 3, 0), 3);
+    usleep(d2);
+    ASSERT_EQ((int)send(fd, json, json_len, 0), (ssize_t)json_len);
+
+    /* Read framed response and verify it is a valid signed HEARTBEAT */
+    uint32_t net_rlen;
+    ASSERT_EQ((int)recv(fd, &net_rlen, 4, MSG_WAITALL), 4);
+    uint32_t rlen = ntohl(net_rlen);
+    ASSERT_TRUE(rlen >= VIRP_HEADER_SIZE);
+    ASSERT_TRUE(rlen <= VIRP_MAX_MESSAGE_SIZE);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    size_t got = 0;
+    while (got < rlen) {
+        ssize_t n = recv(fd, resp + got, rlen - got, 0);
+        ASSERT_TRUE(n > 0);
+        got += (size_t)n;
+    }
+    close(fd);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(resp, rlen, &g_state.okey, &hdr));
+    ASSERT_EQ(hdr.type, VIRP_MSG_HEARTBEAT);
+}
+
+TEST(test_framed_oversize_length_rejected)
+{
+    /*
+     * An attacker-controlled length prefix that exceeds
+     * ONODE_MAX_REQUEST_SIZE must be rejected before any payload
+     * bytes are read. Expect a framed VIRP_ERR_MESSAGE_TOO_LARGE and
+     * an immediate server-side close.
+     */
+    int fd = client_connect();
+    ASSERT_TRUE(fd >= 0);
+
+    uint32_t huge = (uint32_t)ONODE_MAX_REQUEST_SIZE + 1024;
+    uint8_t prefix[4] = {
+        (uint8_t)(huge >> 24),
+        (uint8_t)(huge >> 16),
+        (uint8_t)(huge >>  8),
+        (uint8_t)(huge),
+    };
+    ASSERT_EQ((int)send(fd, prefix, 4, 0), 4);
+
+    /* Expect framed error: 4-byte length prefix = 4, then int32 error */
+    uint32_t net_rlen;
+    ASSERT_EQ((int)recv(fd, &net_rlen, 4, MSG_WAITALL), 4);
+    ASSERT_EQ((int)ntohl(net_rlen), 4);
+
+    uint32_t net_err;
+    ASSERT_EQ((int)recv(fd, &net_err, 4, MSG_WAITALL), 4);
+    int32_t err = (int32_t)ntohl(net_err);
+    ASSERT_EQ(err, VIRP_ERR_MESSAGE_TOO_LARGE);
+
+    /* Server should close — no payload bytes were ever read. */
+    uint8_t extra;
+    ssize_t more = recv(fd, &extra, 1, 0);
+    ASSERT_TRUE(more <= 0);
+
+    close(fd);
+}
+
 TEST(test_v1_unframed_client_rejected)
 {
     /*
@@ -707,6 +811,128 @@ TEST(test_v1_unframed_client_rejected)
     ASSERT_TRUE(more <= 0);  /* EOF */
 
     close(fd);
+}
+
+/* =========================================================================
+ * Worker pool / head-of-line-blocking test
+ *
+ * Confirms that a slow command on one connection does NOT block other
+ * connections. With the old synchronous accept loop, 9 heartbeats
+ * queued behind a 400ms-slow execute would complete over ~3.6s (serial).
+ * With the worker pool, they overlap and finish in ~500ms total.
+ * ========================================================================= */
+
+typedef struct {
+    int          slot;
+    double       start_ms;
+    double       end_ms;
+    int          ok;
+    uint8_t      msg_type;
+} hol_result_t;
+
+typedef struct {
+    hol_result_t *result;
+    const char   *json;
+} hol_client_arg_t;
+
+static void *hol_client_thread(void *raw)
+{
+    hol_client_arg_t *ca = (hol_client_arg_t *)raw;
+    hol_result_t *r = ca->result;
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    r->start_ms = time_ms();
+    ssize_t n = client_request(ca->json, resp, sizeof(resp));
+    r->end_ms = time_ms();
+
+    if (n <= (ssize_t)VIRP_HEADER_SIZE) {
+        r->ok = 0;
+        return NULL;
+    }
+
+    virp_header_t hdr;
+    if (virp_validate_message(resp, (size_t)n, &g_state.okey, &hdr) != VIRP_OK) {
+        r->ok = 0;
+        return NULL;
+    }
+    r->msg_type = (uint8_t)hdr.type;
+    r->ok = 1;
+    return NULL;
+}
+
+TEST(test_concurrent_clients_no_head_of_line)
+{
+    /*
+     * Ten parallel clients:
+     *   - slot 0 sends an execute on R6 that sleeps 400ms inside the
+     *     mock driver.
+     *   - slots 1-9 send heartbeats (no driver, fast path).
+     *
+     * Expected: all succeed, and the slow execute runs concurrently
+     * with the heartbeats — the median heartbeat latency must be far
+     * below the slow-command latency.
+     */
+    const int N = 10;
+    const int SLOW_MS = 400;
+
+    virp_driver_mock_set_delay(SLOW_MS);
+
+    pthread_t     threads[N];
+    hol_result_t  results[N];
+    hol_client_arg_t args[N];
+    memset(results, 0, sizeof(results));
+
+    for (int i = 0; i < N; i++) {
+        results[i].slot = i;
+        args[i].result = &results[i];
+        args[i].json = (i == 0)
+            ? "{\"action\":\"execute\",\"device\":\"R6\",\"command\":\"show version\"}"
+            : "{\"action\":\"heartbeat\"}";
+    }
+
+    double batch_start = time_ms();
+    for (int i = 0; i < N; i++)
+        pthread_create(&threads[i], NULL, hol_client_thread, &args[i]);
+    for (int i = 0; i < N; i++)
+        pthread_join(threads[i], NULL);
+    double batch_end = time_ms();
+
+    virp_driver_mock_set_delay(0);
+
+    /* All 10 must have succeeded. */
+    for (int i = 0; i < N; i++) {
+        if (!results[i].ok) {
+            printf(" [FAIL]\n    slot %d request failed\n", i);
+            tests_run++; tests_failed++; return;
+        }
+    }
+
+    /* slot 0 was the slow execute; expect duration ≥ SLOW_MS. */
+    double slow_dur = results[0].end_ms - results[0].start_ms;
+    ASSERT_TRUE(slow_dur >= (double)SLOW_MS * 0.9);
+
+    /*
+     * The 9 heartbeats must finish WAY before the slow execute does.
+     * Under serialization each would wait for the slow one (~400ms+);
+     * with the worker pool they should complete in well under 200ms.
+     * Use 250ms as a generous ceiling that still proves concurrency.
+     */
+    for (int i = 1; i < N; i++) {
+        double hb_dur = results[i].end_ms - results[i].start_ms;
+        if (hb_dur >= 250.0) {
+            printf(" [FAIL]\n    heartbeat slot %d took %.1fms "
+                   "(slow execute took %.1fms) — accept loop likely "
+                   "serialized\n", i, hb_dur, slow_dur);
+            tests_run++; tests_failed++; return;
+        }
+    }
+
+    /*
+     * Total elapsed must be dominated by the slow command, not the sum
+     * of all requests. Cap at 2× SLOW_MS to allow scheduler jitter.
+     */
+    double total = batch_end - batch_start;
+    ASSERT_TRUE(total < (double)SLOW_MS * 2.0);
 }
 
 /* =========================================================================
@@ -754,6 +980,58 @@ TEST(test_driver_error_returns_signed_observation)
     ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
     ASSERT_TRUE(data_len > 0);
     ASSERT_TRUE(strstr((const char *)data, "driver execute failed") != NULL);
+}
+
+/* =========================================================================
+ * SO_PEERCRED allowlist tests
+ *
+ * The daemon's default allowlist (set in onode_start()) is the daemon's
+ * own effective UID — which is the test process's UID in this harness.
+ * The "allowed" test confirms that baseline; the "rejected" test flips
+ * the allowlist to a different UID, proves the daemon drops the
+ * connection without reading, then restores the original allowlist so
+ * later tests keep working.
+ * ========================================================================= */
+
+TEST(test_peer_uid_allowed)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request("{\"action\": \"heartbeat\"}",
+                               resp, sizeof(resp));
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(resp, (size_t)n, &g_state.okey, &hdr));
+    ASSERT_EQ(hdr.type, VIRP_MSG_HEARTBEAT);
+}
+
+TEST(test_peer_uid_rejected)
+{
+    uid_t saved[ONODE_MAX_ALLOWED_UIDS];
+    size_t saved_count = g_state.socket_allowed_uids_count;
+    for (size_t i = 0; i < saved_count; i++)
+        saved[i] = g_state.socket_allowed_uids[i];
+
+    /*
+     * Pick any UID that is not the caller's. 0 works as long as the
+     * test is not run as root; if it is, fall back to nobody (65534).
+     * All we need is a value that differs from geteuid().
+     */
+    uid_t wrong = (geteuid() == 0) ? 65534 : 0;
+    ASSERT_OK(onode_set_allowed_uids(&g_state, &wrong, 1));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request("{\"action\": \"heartbeat\"}",
+                               resp, sizeof(resp));
+
+    /* Restore before any further assertions so a failure still leaves
+     * the daemon in a usable state for subsequent tests. */
+    onode_set_allowed_uids(&g_state, saved, saved_count);
+
+    /* client_request returns -1 when the length prefix cannot be read,
+     * which is exactly what we expect when the daemon closes without
+     * sending anything. */
+    ASSERT_EQ((int)(n < 0), 1);
 }
 
 /* =========================================================================
@@ -906,9 +1184,18 @@ int main(void)
 
     printf("\n[v2 Framing Tests]\n");
     RUN_TEST(test_v1_unframed_client_rejected);
+    RUN_TEST(test_framed_request_split_across_three_sends);
+    RUN_TEST(test_framed_oversize_length_rejected);
+
+    printf("\n[Worker Pool / Concurrency Tests]\n");
+    RUN_TEST(test_concurrent_clients_no_head_of_line);
 
     printf("\n[Signed Error Observation Tests]\n");
     RUN_TEST(test_driver_error_returns_signed_observation);
+
+    printf("\n[SO_PEERCRED Allowlist Tests]\n");
+    RUN_TEST(test_peer_uid_allowed);
+    RUN_TEST(test_peer_uid_rejected);
 
     /* Shutdown */
     onode_shutdown(&g_state);

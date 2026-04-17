@@ -7,6 +7,9 @@
  * is not guaranteed. Write the test first.
  */
 
+#define _POSIX_C_SOURCE 200809L   /* symlink, fileno */
+#define _DEFAULT_SOURCE           /* fileno on glibc */
+
 #include "virp.h"
 #include "virp_crypto.h"
 #include "virp_context.h"
@@ -16,6 +19,8 @@
 #include <string.h>
 #include <assert.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 /* =========================================================================
  * Test framework — minimal, no dependencies
@@ -541,6 +546,89 @@ TEST(test_key_save_and_load)
     unlink(path);
 }
 
+/*
+ * Hardening: a key file with group/other bits set must be refused by
+ * virp_key_load_file. virp_key_save_file writes 0600, so we chmod
+ * post-save to force the insecure mode. The daemon's onode_init calls
+ * virp_key_load_file directly, so rejection here means the daemon
+ * would refuse to start.
+ */
+TEST(test_key_load_rejects_insecure_mode)
+{
+    virp_signing_key_t original, loaded;
+    const char *path = "/tmp/virp_test_key_perms.bin";
+
+    virp_key_generate(&original, VIRP_KEY_TYPE_RKEY);
+    ASSERT_OK(virp_key_save_file(&original, path));
+
+    /* Force the mode the user's prompt calls out — 0644. */
+    ASSERT_TRUE(chmod(path, 0644) == 0);
+    virp_error_t err = virp_key_load_file(&loaded, VIRP_KEY_TYPE_RKEY, path);
+    ASSERT_EQ(err, VIRP_ERR_KEY_NOT_LOADED);
+
+    /* 0604 (other-readable) also rejected */
+    ASSERT_TRUE(chmod(path, 0604) == 0);
+    err = virp_key_load_file(&loaded, VIRP_KEY_TYPE_RKEY, path);
+    ASSERT_EQ(err, VIRP_ERR_KEY_NOT_LOADED);
+
+    /* 0640 (group-readable) also rejected */
+    ASSERT_TRUE(chmod(path, 0640) == 0);
+    err = virp_key_load_file(&loaded, VIRP_KEY_TYPE_RKEY, path);
+    ASSERT_EQ(err, VIRP_ERR_KEY_NOT_LOADED);
+
+    /* Sanity: 0600 is accepted. */
+    ASSERT_TRUE(chmod(path, 0600) == 0);
+    err = virp_key_load_file(&loaded, VIRP_KEY_TYPE_RKEY, path);
+    ASSERT_OK(err);
+
+    unlink(path);
+}
+
+/*
+ * A symlinked key file must be refused — O_NOFOLLOW guards against
+ * a swap-at-open attack where the target is replaced by a world-
+ * writable file between stat and open.
+ */
+TEST(test_key_load_rejects_symlink)
+{
+    virp_signing_key_t original, loaded;
+    const char *target = "/tmp/virp_test_key_target.bin";
+    const char *link   = "/tmp/virp_test_key_link.bin";
+
+    virp_key_generate(&original, VIRP_KEY_TYPE_RKEY);
+    ASSERT_OK(virp_key_save_file(&original, target));
+    unlink(link);
+    ASSERT_TRUE(symlink(target, link) == 0);
+
+    virp_error_t err = virp_key_load_file(&loaded, VIRP_KEY_TYPE_RKEY, link);
+    ASSERT_EQ(err, VIRP_ERR_KEY_NOT_LOADED);
+
+    unlink(link);
+    unlink(target);
+}
+
+/*
+ * Truncated key files (shorter than VIRP_KEY_SIZE) must be refused
+ * rather than silently returning uninitialized bytes.
+ */
+TEST(test_key_load_rejects_truncated)
+{
+    virp_signing_key_t loaded;
+    const char *path = "/tmp/virp_test_key_short.bin";
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT_TRUE(fd >= 0);
+    uint8_t short_buf[VIRP_KEY_SIZE - 4] = {0};
+    ssize_t wn = write(fd, short_buf, sizeof(short_buf));
+    ASSERT_TRUE(wn == (ssize_t)sizeof(short_buf));
+    close(fd);
+
+    virp_error_t err = virp_key_load_file(&loaded, VIRP_KEY_TYPE_RKEY, path);
+    ASSERT_EQ(err, VIRP_ERR_KEY_NOT_LOADED);
+
+    unlink(path);
+}
+
 /* =========================================================================
  * 11. Edge cases and NULL safety
  * ========================================================================= */
@@ -784,6 +872,9 @@ int main(void)
     printf("\n[Key Management]\n");
     RUN_TEST(test_key_generate_and_destroy);
     RUN_TEST(test_key_save_and_load);
+    RUN_TEST(test_key_load_rejects_insecure_mode);
+    RUN_TEST(test_key_load_rejects_symlink);
+    RUN_TEST(test_key_load_rejects_truncated);
 
     printf("\n[Edge Cases]\n");
     RUN_TEST(test_null_pointers);

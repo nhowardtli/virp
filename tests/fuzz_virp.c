@@ -15,6 +15,7 @@
 #include "virp_crypto.h"
 #include "virp_context.h"
 #include "virp_message.h"
+#include "virp_onode.h"  /* onode_parse_request_fuzz */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -240,6 +241,76 @@ static int fuzz_boundary(void)
 }
 
 /* =========================================================================
+ * parse_request fuzzing — JSON-shaped inputs, pure random bytes, and
+ * structural mutations of a valid request. The parser must never
+ * crash; returning false for garbage is the expected happy path.
+ * ========================================================================= */
+
+static const char *const SEED_REQUESTS[] = {
+    "{\"action\":\"heartbeat\"}",
+    "{\"action\":\"execute\",\"device\":\"R1\",\"command\":\"show ver\"}",
+    "{\"action\":\"chain_verify\",\"session_id\":\"abcd\","
+        "\"from_sequence\":0,\"to_sequence\":1000}",
+    "{\"action\":\"intent_store\",\"intent_id\":\"x\","
+        "\"intent_hash\":\"deadbeef\",\"expires_at_ns\":123,"
+        "\"max_commands\":5}",
+    "{\"action\":\"session_hello\",\"client_id\":\"c\","
+        "\"client_nonce\":\"0011223344556677\","
+        "\"versions\":\"2,1\",\"algorithms\":\"1\","
+        "\"supported_channels\":3}",
+    "[\"not\",\"an\",\"object\"]",
+    "\"bare string\"",
+    "42",
+    "",
+    "{",
+};
+
+static int fuzz_parse_request(int rounds)
+{
+    uint8_t buf[4096];
+    int crashes = 0;
+
+    printf("  parse_request fuzzing: %d rounds... ", rounds);
+    fflush(stdout);
+
+    /* Pass 1: feed seed inputs verbatim so the parser always sees
+     * well-formed + a few deliberately malformed examples. */
+    const size_t nseeds = sizeof(SEED_REQUESTS) / sizeof(SEED_REQUESTS[0]);
+    for (size_t i = 0; i < nseeds; i++) {
+        const char *s = SEED_REQUESTS[i];
+        onode_parse_request_fuzz((const uint8_t *)s, strlen(s));
+    }
+
+    /* Pass 2: random bytes of random length. */
+    for (int i = 0; i < rounds; i++) {
+        size_t len = (size_t)(rand() % (int)sizeof(buf));
+        for (size_t j = 0; j < len; j++)
+            buf[j] = rand8();
+        onode_parse_request_fuzz(buf, len);
+    }
+
+    /* Pass 3: seed + bit-flip mutations. A valid JSON object with
+     * random byte corruptions stresses the error paths more than
+     * uniform random bytes, which mostly fail at cJSON_Parse. */
+    for (int i = 0; i < rounds; i++) {
+        const char *seed = SEED_REQUESTS[rand() % (int)nseeds];
+        size_t len = strlen(seed);
+        if (len >= sizeof(buf)) continue;
+        memcpy(buf, seed, len);
+
+        int n_flips = 1 + (rand() % 5);
+        for (int f = 0; f < n_flips && len > 0; f++) {
+            size_t pos = (size_t)(rand()) % len;
+            buf[pos] ^= (uint8_t)(1 << (rand() % 8));
+        }
+        onode_parse_request_fuzz(buf, len);
+    }
+
+    printf("OK (no crashes)\n");
+    return crashes;
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -265,6 +336,7 @@ int main(int argc, char **argv)
     failures += fuzz_random(rounds);
     failures += fuzz_mutation(rounds);
     failures += fuzz_boundary();
+    failures += fuzz_parse_request(rounds);
 
     printf("\n================================================================\n");
     if (failures == 0)

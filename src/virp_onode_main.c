@@ -17,11 +17,64 @@
 #include "virp_onode.h"
 #include "virp_session.h"
 #include "virp_context.h"
+#include "virp_crypto.h"   /* virp_crypto_harden_process */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <getopt.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+/*
+ * Parse VIRP_ALLOWED_UIDS ("uid1,uid2,...") into the daemon's socket
+ * allowlist. Invalid entries are logged and skipped; an empty or unset
+ * variable leaves the allowlist at count=0 so onode_start() can fall
+ * back to the daemon's own effective UID.
+ */
+static void load_allowed_uids_from_env(onode_state_t *state)
+{
+    const char *env = getenv("VIRP_ALLOWED_UIDS");
+    if (!env || env[0] == '\0')
+        return;
+
+    uid_t uids[ONODE_MAX_ALLOWED_UIDS];
+    size_t count = 0;
+
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", env);
+
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save);
+         tok != NULL;
+         tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (*tok == '\0') continue;
+
+        if (count >= ONODE_MAX_ALLOWED_UIDS) {
+            fprintf(stderr,
+                    "[O-Node] VIRP_ALLOWED_UIDS: too many entries "
+                    "(max %d) — extras ignored\n",
+                    ONODE_MAX_ALLOWED_UIDS);
+            break;
+        }
+
+        errno = 0;
+        char *end = NULL;
+        unsigned long v = strtoul(tok, &end, 10);
+        if (errno != 0 || end == tok || (*end != '\0' && *end != ' ' && *end != '\t')) {
+            fprintf(stderr,
+                    "[O-Node] VIRP_ALLOWED_UIDS: skipping invalid entry '%s'\n",
+                    tok);
+            continue;
+        }
+        uids[count++] = (uid_t)v;
+    }
+
+    if (count > 0)
+        onode_set_allowed_uids(state, uids, count);
+}
 
 static onode_state_t g_state;
 
@@ -172,6 +225,15 @@ int main(int argc, char **argv)
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 
+    /*
+     * Harden the process BEFORE the key is loaded:
+     *  - PR_SET_DUMPABLE=0 → no core dumps, no ptrace from the same UID.
+     *  - Warn if /proc/self/coredump_filter would include anon pages.
+     * Doing this pre-load means there is no window in which the key
+     * sits in RAM of a dumpable process.
+     */
+    virp_crypto_harden_process();
+
     /* Initialize O-Node */
     virp_error_t err = onode_init(&g_state, node_id, okey_path, socket_path);
     if (err != VIRP_OK) {
@@ -200,6 +262,15 @@ int main(int argc, char **argv)
     } else if (use_mock) {
         add_mock_devices(&g_state);
     }
+
+    /*
+     * Populate the socket peer-credential allowlist from the environment.
+     * If VIRP_ALLOWED_UIDS is unset, onode_start() defaults the list to
+     * the daemon's own effective UID. JSON-config prod builds set the
+     * list earlier via load_socket_allowed_uids(); the env var is a
+     * lightweight escape hatch for mock/dev and container overrides.
+     */
+    load_allowed_uids_from_env(&g_state);
 
     /* Install signal handlers */
     signal(SIGINT, signal_handler);

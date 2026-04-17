@@ -66,6 +66,10 @@ ONODE_SOCKET = "/tmp/virp-onode.sock"
 OKEY_PATH = "/root/virp/keys/onode.key"
 ONODE_TIMEOUT = 30.0
 
+# v2 socket framing — must match daemon handle_client()
+VIRP_FRAME_VERSION = 0x02
+ONODE_MAX_REQUEST_SIZE = 24576
+
 # VIRP binary protocol constants
 HEADER_SIZE = 56
 HEADER_FMT = ">BBHIBBHIQ32s"
@@ -83,21 +87,41 @@ assert len(OKEY) == 32, f"O-Key must be 32 bytes, got {len(OKEY)}"
 log.info("O-Key loaded from %s", OKEY_PATH)
 
 
+def _recv_exact(s, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("O-Node closed socket prematurely")
+        buf += chunk
+    return buf
+
+
 def onode_send(request: dict) -> bytes:
-    """Send a JSON request to the O-Node, return raw response."""
+    """Send a JSON request to the O-Node over v2 framing, return raw response payload.
+
+    Wire send:     [4-byte BE len][0x02 version][JSON]
+    Wire receive:  [4-byte BE len][payload]  — returned value is payload only.
+    """
     s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
     s.settimeout(ONODE_TIMEOUT)
     try:
         s.connect(ONODE_SOCKET)
-        s.sendall(json.dumps(request).encode())
-        s.shutdown(sock_mod.SHUT_WR)
-        chunks = []
-        while True:
-            c = s.recv(65536)
-            if not c:
-                break
-            chunks.append(c)
-        return b"".join(chunks)
+
+        payload = json.dumps(request).encode()
+        frame_len = 1 + len(payload)
+        if frame_len > ONODE_MAX_REQUEST_SIZE:
+            raise ValueError(
+                f"request frame {frame_len} bytes exceeds "
+                f"ONODE_MAX_REQUEST_SIZE ({ONODE_MAX_REQUEST_SIZE})"
+            )
+        s.sendall(struct.pack("!I", frame_len) + bytes([VIRP_FRAME_VERSION]) + payload)
+
+        raw_len = _recv_exact(s, 4)
+        (resp_len,) = struct.unpack("!I", raw_len)
+        if resp_len == 0:
+            return b""
+        return _recv_exact(s, resp_len)
     finally:
         s.close()
 

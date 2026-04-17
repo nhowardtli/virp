@@ -17,6 +17,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_onode.h"
+#include "virp_crypto.h"   /* virp_crypto_harden_process */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -370,6 +371,12 @@ int main(int argc, char **argv)
     virp_driver_juniper_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
+
+    /*
+     * Harden the process before loading the key (see virp_onode_main.c
+     * for rationale).
+     */
+    virp_crypto_harden_process();
 
     /* Initialize O-Node */
     virp_error_t err = onode_init(&g_state, node_id, okey_path, socket_path);

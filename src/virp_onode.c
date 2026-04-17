@@ -40,10 +40,18 @@
 /* =========================================================================
  * JSON Request Parsing
  *
- * cJSON (vendored v1.7.18) is the primary parser.
- * The old string-search parser is retained under VIRP_JSON_DUAL_PARSE
- * for side-by-side comparison, then will be deleted once the corpus
- * shows zero disagreements over 48 hours.
+ * cJSON (vendored at src/third_party/cJSON.{c,h}, v1.7.18, MIT) is the
+ * sole parser. The hand-rolled strstr-based extractor that used to
+ * live here had multiple soundness bugs (key matching inside string
+ * values, lossy \u handling, silent surrogate replacement) and was
+ * deleted once DUAL_PARSE logged zero disagreements for 48h.
+ *
+ * All request fields go through cJSON_GetObjectItemCaseSensitive on
+ * the root object — never a substring search — so a notes field like
+ * "notes":"\"action\":\"shutdown\"" cannot trigger an action. Integer
+ * fields that feed into unsigned receiver types (supported_channels,
+ * sequence numbers, expires_at_ns) are range-checked: negatives and
+ * values above the receiver's max are rejected outright.
  * ========================================================================= */
 
 typedef struct {
@@ -76,111 +84,12 @@ typedef struct {
     int64_t         supported_channels;
 } onode_request_t;
 
-bool json_extract_string(const char *json, const char *key,
-                         char *out, size_t out_len)
-{
-    char search[128];
-    snprintf(search, sizeof(search), "\"%s\"", key);
-
-    const char *pos = strstr(json, search);
-    if (!pos) return false;
-
-    /* Find the colon after the key */
-    pos = strchr(pos + strlen(search), ':');
-    if (!pos) return false;
-    pos++;
-
-    /* Skip whitespace */
-    while (*pos == ' ' || *pos == '\t') pos++;
-
-    /* Find opening quote */
-    if (*pos != '"') return false;
-    pos++;
-
-    /* Copy until unescaped closing quote, decoding JSON escapes */
-    size_t i = 0;
-    while (*pos && i < out_len - 1) {
-        if (*pos == '"') break;          /* unescaped quote = end of string */
-        if (*pos == '\\' && *(pos + 1)) {
-            pos++;  /* skip backslash */
-            switch (*pos) {
-            case 'n':  out[i++] = '\n'; pos++; break;
-            case 't':  out[i++] = '\t'; pos++; break;
-            case 'r':  out[i++] = '\r'; pos++; break;
-            case '\\': out[i++] = '\\'; pos++; break;
-            case '"':  out[i++] = '"';  pos++; break;
-            case '/':  out[i++] = '/';  pos++; break;
-            case 'b':  out[i++] = '\b'; pos++; break;
-            case 'f':  out[i++] = '\f'; pos++; break;
-            case 'u': {
-                /* \uXXXX — BMP only, surrogates replaced with '?' */
-                pos++;  /* skip 'u' */
-                if (pos[0] && pos[1] && pos[2] && pos[3]) {
-                    char hex[5] = { pos[0], pos[1], pos[2], pos[3], '\0' };
-                    unsigned long cp = strtoul(hex, NULL, 16);
-                    pos += 4;
-                    if (cp >= 0xD800 && cp <= 0xDFFF) {
-                        /* Surrogate pair — replace with '?' */
-                        if (i < out_len - 1) out[i++] = '?';
-                    } else if (cp <= 0x7F) {
-                        if (i < out_len - 1) out[i++] = (char)cp;
-                    } else if (cp <= 0x7FF) {
-                        if (i + 1 < out_len - 1) {
-                            out[i++] = (char)(0xC0 | (cp >> 6));
-                            out[i++] = (char)(0x80 | (cp & 0x3F));
-                        }
-                    } else {
-                        if (i + 2 < out_len - 1) {
-                            out[i++] = (char)(0xE0 | (cp >> 12));
-                            out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                            out[i++] = (char)(0x80 | (cp & 0x3F));
-                        }
-                    }
-                } else {
-                    /* Incomplete \u sequence — copy '?' */
-                    if (i < out_len - 1) out[i++] = '?';
-                }
-                break;
-            }
-            default:
-                out[i++] = *pos++;        /* unknown escape: copy as-is */
-                break;
-            }
-        } else {
-            out[i++] = *pos++;
-        }
-    }
-    out[i] = '\0';
-    return true;
-}
-
-bool json_extract_int64(const char *json, const char *key, int64_t *out)
-{
-    char search[128];
-    snprintf(search, sizeof(search), "\"%s\"", key);
-
-    const char *pos = strstr(json, search);
-    if (!pos) return false;
-
-    pos = strchr(pos + strlen(search), ':');
-    if (!pos) return false;
-    pos++;
-
-    while (*pos == ' ' || *pos == '\t') pos++;
-    if (*pos == '\0') return false;
-
-    char *end;
-    *out = strtoll(pos, &end, 10);
-    return (end != pos);
-}
-
-/* =========================================================================
- * cJSON-based JSON extraction (primary path)
- *
- * These replace the string-search versions above. Under
- * VIRP_JSON_DUAL_PARSE, both run and disagreements are logged.
- * ========================================================================= */
-
+/*
+ * Extract a string-valued key from a JSON object. Writes at most
+ * out_len-1 bytes plus a NUL. Returns false if the key is absent,
+ * null, or not a string; out[0] is set to NUL in that case so the
+ * caller's zero-initialized req struct is unchanged.
+ */
 static bool json_extract_string_cjson(cJSON *root, const char *key,
                                        char *out, size_t out_len)
 {
@@ -193,6 +102,10 @@ static bool json_extract_string_cjson(cJSON *root, const char *key,
     return true;
 }
 
+/*
+ * Extract a signed-integer-valued key. Accepts cJSON numbers only.
+ * Returns false (leaving *out untouched) if absent or non-numeric.
+ */
 static bool json_extract_int64_cjson(cJSON *root, const char *key,
                                       int64_t *out)
 {
@@ -204,58 +117,23 @@ static bool json_extract_int64_cjson(cJSON *root, const char *key,
     return false;
 }
 
-#ifdef VIRP_JSON_DUAL_PARSE
 /*
- * Compare string-search vs cJSON results. Log disagreements with
- * enough context to diagnose: key, both results, first 200 chars
- * of the input JSON.
+ * Extract a non-negative integer bounded by [0, max]. Returns false
+ * (without touching *out) if absent OR if the value is negative or
+ * exceeds max. Use this for any field whose receiver is unsigned
+ * (supported_channels, etc.) or a sequence number, so attacker-
+ * controlled negatives never silently become huge uints.
  */
-static void dual_check_string(const char *json, cJSON *root,
-                               const char *key, char *out, size_t out_len)
+static bool json_extract_u64_bounded(cJSON *root, const char *key,
+                                      uint64_t max, uint64_t *out)
 {
-    char old_result[2048];
-    bool old_ok = json_extract_string(json, key, old_result, sizeof(old_result));
-
-    char new_result[2048];
-    bool new_ok = json_extract_string_cjson(root, key, new_result, sizeof(new_result));
-
-    if (old_ok != new_ok || (old_ok && strcmp(old_result, new_result) != 0)) {
-        fprintf(stderr, "[DUAL-PARSE] DISAGREE key=\"%s\" "
-                "old_ok=%d old=\"%.200s\" new_ok=%d new=\"%.200s\" "
-                "json=\"%.200s\"\n",
-                key,
-                old_ok, old_ok ? old_result : "(none)",
-                new_ok, new_ok ? new_result : "(none)",
-                json);
-    }
-
-    /* Use cJSON result as the primary */
-    if (new_ok)
-        snprintf(out, out_len, "%s", new_result);
-    else
-        out[0] = '\0';
+    int64_t v = 0;
+    if (!json_extract_int64_cjson(root, key, &v)) return false;
+    if (v < 0) return false;
+    if ((uint64_t)v > max) return false;
+    *out = (uint64_t)v;
+    return true;
 }
-
-static void dual_check_int64(const char *json, cJSON *root,
-                              const char *key, int64_t *out)
-{
-    int64_t old_val = 0, new_val = 0;
-    bool old_ok = json_extract_int64(json, key, &old_val);
-    bool new_ok = json_extract_int64_cjson(root, key, &new_val);
-
-    if (old_ok != new_ok || (old_ok && old_val != new_val)) {
-        fprintf(stderr, "[DUAL-PARSE] DISAGREE key=\"%s\" "
-                "old_ok=%d old=%lld new_ok=%d new=%lld "
-                "json=\"%.200s\"\n",
-                key,
-                old_ok, (long long)old_val,
-                new_ok, (long long)new_val,
-                json);
-    }
-
-    if (new_ok) *out = new_val;
-}
-#endif /* VIRP_JSON_DUAL_PARSE */
 
 static bool parse_request(const char *json, onode_request_t *req)
 {
@@ -263,21 +141,25 @@ static bool parse_request(const char *json, onode_request_t *req)
 
     memset(req, 0, sizeof(*req));
 
+    /*
+     * Structural validation: cJSON_Parse rejects malformed JSON. We
+     * additionally require the root be an object — a bare array or
+     * string parses successfully but has no keys to look up, which
+     * would silently bypass the action gate.
+     */
     cJSON *root = cJSON_Parse(json);
     if (!root) return false;
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return false;
+    }
 
     /* Action (required) */
     char action_str[32];
-
-#ifdef VIRP_JSON_DUAL_PARSE
-    dual_check_string(json, root, "action", action_str, sizeof(action_str));
-#else
     if (!json_extract_string_cjson(root, "action", action_str, sizeof(action_str))) {
         cJSON_Delete(root);
         return false;
     }
-#endif
-
     if (action_str[0] == '\0') { cJSON_Delete(root); return false; }
 
     if (strcmp(action_str, "execute") == 0)
@@ -317,16 +199,9 @@ static bool parse_request(const char *json, onode_request_t *req)
         return false;
     }
 
-    /* Helper macros for dual-parse vs cJSON-only extraction */
-#ifdef VIRP_JSON_DUAL_PARSE
-  #define EXTRACT_STR(key, dst, sz)  dual_check_string(json, root, key, dst, sz)
-  #define EXTRACT_I64(key, dst)      dual_check_int64(json, root, key, dst)
-#else
-  #define EXTRACT_STR(key, dst, sz)  json_extract_string_cjson(root, key, dst, sz)
-  #define EXTRACT_I64(key, dst)      json_extract_int64_cjson(root, key, dst)
-#endif
+#define EXTRACT_STR(key, dst, sz)  json_extract_string_cjson(root, key, dst, sz)
 
-    /* Extract optional fields */
+    /* Extract optional string fields */
     EXTRACT_STR("device", req->device, sizeof(req->device));
     EXTRACT_STR("command", req->command, sizeof(req->command));
 
@@ -337,18 +212,59 @@ static bool parse_request(const char *json, onode_request_t *req)
     EXTRACT_STR("artifact_hash", req->artifact_hash, sizeof(req->artifact_hash));
     EXTRACT_STR("artifact_content", req->artifact_content,
                 sizeof(req->artifact_content));
-    EXTRACT_I64("from_sequence", &req->from_sequence);
-    EXTRACT_I64("to_sequence", &req->to_sequence);
+
+    /*
+     * Chain sequence numbers: negative values are meaningless and would
+     * have wrapped to huge positives in any int64→uint context. Cap at
+     * INT64_MAX so the stored int64_t can't round-trip to an invalid
+     * state, and reject negatives outright.
+     */
+    {
+        uint64_t v = 0;
+        if (json_extract_u64_bounded(root, "from_sequence",
+                                     (uint64_t)INT64_MAX, &v))
+            req->from_sequence = (int64_t)v;
+        else if (cJSON_GetObjectItemCaseSensitive(root, "from_sequence")) {
+            /* Present but invalid (negative or non-number) — reject the
+             * whole request rather than silently proceed with 0. */
+            cJSON_Delete(root);
+            return false;
+        }
+        if (json_extract_u64_bounded(root, "to_sequence",
+                                     (uint64_t)INT64_MAX, &v))
+            req->to_sequence = (int64_t)v;
+        else if (cJSON_GetObjectItemCaseSensitive(root, "to_sequence")) {
+            cJSON_Delete(root);
+            return false;
+        }
+    }
 
     /* Intent fields */
     EXTRACT_STR("intent_id", req->intent_id, sizeof(req->intent_id));
     EXTRACT_STR("intent_hash", req->intent_hash, sizeof(req->intent_hash));
     EXTRACT_STR("confidence", req->confidence, sizeof(req->confidence));
-    EXTRACT_I64("expires_at_ns", &req->expires_at_ns);
     {
-        int64_t mc = 0;
-        EXTRACT_I64("max_commands", &mc);
-        req->max_commands = (int32_t)mc;
+        uint64_t v = 0;
+        if (json_extract_u64_bounded(root, "expires_at_ns",
+                                     (uint64_t)INT64_MAX, &v))
+            req->expires_at_ns = (int64_t)v;
+        else if (cJSON_GetObjectItemCaseSensitive(root, "expires_at_ns")) {
+            cJSON_Delete(root);
+            return false;
+        }
+    }
+    {
+        /* max_commands is a signed int32 so it tolerates the JSON
+         * source being signed, but negative is nonsensical and the
+         * value must fit an int32. Bound at INT32_MAX. */
+        uint64_t v = 0;
+        if (json_extract_u64_bounded(root, "max_commands",
+                                     (uint64_t)INT32_MAX, &v))
+            req->max_commands = (int32_t)v;
+        else if (cJSON_GetObjectItemCaseSensitive(root, "max_commands")) {
+            cJSON_Delete(root);
+            return false;
+        }
     }
     EXTRACT_STR("intent_json", req->intent_json, sizeof(req->intent_json));
     EXTRACT_STR("proposed_actions", req->proposed_actions,
@@ -361,10 +277,24 @@ static bool parse_request(const char *json, onode_request_t *req)
     EXTRACT_STR("server_nonce", req->server_nonce, sizeof(req->server_nonce));
     EXTRACT_STR("versions", req->versions, sizeof(req->versions));
     EXTRACT_STR("algorithms", req->algorithms, sizeof(req->algorithms));
-    EXTRACT_I64("supported_channels", &req->supported_channels);
+
+    /*
+     * supported_channels is a bitmask that gets cast to uint32_t later
+     * when building the SESSION_HELLO. Guarantee the cast is lossless
+     * by bounding at UINT32_MAX and rejecting negatives here.
+     */
+    {
+        uint64_t v = 0;
+        if (json_extract_u64_bounded(root, "supported_channels",
+                                     (uint64_t)UINT32_MAX, &v))
+            req->supported_channels = (int64_t)v;
+        else if (cJSON_GetObjectItemCaseSensitive(root, "supported_channels")) {
+            cJSON_Delete(root);
+            return false;
+        }
+    }
 
 #undef EXTRACT_STR
-#undef EXTRACT_I64
 
     cJSON_Delete(root);
     return true;
@@ -380,6 +310,19 @@ uint32_t onode_next_seq(onode_state_t *state)
     uint32_t seq = ++state->seq_num;
     pthread_mutex_unlock(&state->state_mutex);
     return seq;
+}
+
+/*
+ * Atomically increment observations_sent. Worker threads call this
+ * from handle_client after every successful framed send. Must not be
+ * inlined into caller code without state_mutex, otherwise concurrent
+ * workers will lose increments.
+ */
+static inline void onode_inc_observations(onode_state_t *state)
+{
+    pthread_mutex_lock(&state->state_mutex);
+    state->observations_sent++;
+    pthread_mutex_unlock(&state->state_mutex);
 }
 
 /* =========================================================================
@@ -712,6 +655,10 @@ static int parse_batch_commands(const char *json,
 {
     cJSON *root = cJSON_Parse(json);
     if (!root) return 0;
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return 0;
+    }
 
     cJSON *commands = cJSON_GetObjectItemCaseSensitive(root, "commands");
     if (!cJSON_IsArray(commands)) {
@@ -908,9 +855,19 @@ static void handle_client(onode_state_t *state, int client_fd)
                          ((uint32_t)len_buf[2] <<  8) |
                          ((uint32_t)len_buf[3]);
 
-    if (frame_len < 2 || frame_len > sizeof(recv_buf) - 1) {
-        /* Too small (need version + at least 1 byte) or too large */
+    if (frame_len < 2) {
+        /* Too small — need at least the version byte + 1 payload byte. */
         send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+        close(client_fd);
+        return;
+    }
+    if (frame_len > sizeof(recv_buf) - 1) {
+        /*
+         * Reject oversize frames with MESSAGE_TOO_LARGE so clients can
+         * distinguish "you sent junk" from "your payload won't fit".
+         * Bound check happens before we read a single payload byte.
+         */
+        send_framed_error(client_fd, VIRP_ERR_MESSAGE_TOO_LARGE);
         close(client_fd);
         return;
     }
@@ -1001,7 +958,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                                       &state->okey);
         if (err == VIRP_OK && resp_len > 0) {
             send_framed(client_fd, resp_buf, resp_len);
-            state->observations_sent++;
+            onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -1021,7 +978,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                                       &state->okey);
         if (err == VIRP_OK && resp_len > 0) {
             send_framed(client_fd, resp_buf, resp_len);
-            state->observations_sent++;
+            onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -1075,7 +1032,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
                 send_framed(client_fd, resp_buf, resp_len);
-                state->observations_sent++;
+                onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -1119,7 +1076,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
                 send_framed(client_fd, resp_buf, resp_len);
-                state->observations_sent++;
+                onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -1189,7 +1146,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
                 send_framed(client_fd, resp_buf, resp_len);
-                state->observations_sent++;
+                onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -1251,7 +1208,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
                 send_framed(client_fd, resp_buf, resp_len);
-                state->observations_sent++;
+                onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -1290,7 +1247,7 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
                 send_framed(client_fd, resp_buf, resp_len);
-                state->observations_sent++;
+                onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -1435,9 +1392,12 @@ static void handle_client(onode_state_t *state, int client_fd)
                 (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
         }
 
-        /* Process handshake */
+        /* Process handshake — serialized: only one handshake may drive
+         * the shared ctx at a time. */
         virp_session_hello_ack_t ack;
+        pthread_mutex_lock(&state->session_mutex);
         err = virp_handle_hello(state->ctx, &hello, &ack);
+        pthread_mutex_unlock(&state->session_mutex);
         if (err != VIRP_OK) {
             send_framed_error(client_fd, err);
             break;
@@ -1494,16 +1454,17 @@ static void handle_client(onode_state_t *state, int client_fd)
                 (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
         }
 
+        /* BIND + derive_key must happen atomically against ctx so a
+         * concurrent HELLO on another worker can't observe a half-
+         * bound session. */
+        pthread_mutex_lock(&state->session_mutex);
         err = virp_handle_session_bind(state->ctx, &bind_msg);
-        if (err != VIRP_OK) {
-            send_framed_error(client_fd, err);
-            break;
+        if (err == VIRP_OK) {
+            err = virp_session_derive_key(state->ctx, state->okey.key.key);
         }
-
-        /* BIND succeeded → derive session key to reach ACTIVE */
-        err = virp_session_derive_key(state->ctx, state->okey.key.key);
+        pthread_mutex_unlock(&state->session_mutex);
         if (err != VIRP_OK) {
-            fprintf(stderr, "[O-Node] session key derivation failed: %d\n",
+            fprintf(stderr, "[O-Node] session bind/derive failed: %d\n",
                     (int)err);
             send_framed_error(client_fd, err);
             break;
@@ -1515,7 +1476,9 @@ static void handle_client(onode_state_t *state, int client_fd)
     }
 
     case ONODE_ACTION_SESSION_CLOSE:
+        pthread_mutex_lock(&state->session_mutex);
         virp_handle_session_close(state->ctx);
+        pthread_mutex_unlock(&state->session_mutex);
         fprintf(stderr, "[O-Node] Session closed by client\n");
         {
             const char *close_resp = "{\"status\":\"closed\"}";
@@ -1740,6 +1703,42 @@ done:
 }
 
 /* =========================================================================
+ * Connection Worker Pool
+ *
+ * Each accepted fd is dispatched to its own detached pthread running
+ * connection_worker(). A counting semaphore (state->worker_sem) caps
+ * live workers at ONODE_MAX_WORKERS; the accept loop reserves a slot
+ * with sem_trywait() before spawning and the worker releases it on
+ * completion. This keeps the accept loop lock-free and non-blocking
+ * even when individual connections spend seconds in SSH I/O.
+ * ========================================================================= */
+
+typedef struct {
+    onode_state_t *state;
+    int            client_fd;
+} worker_arg_t;
+
+static void *connection_worker(void *raw_arg)
+{
+    worker_arg_t *arg = (worker_arg_t *)raw_arg;
+    onode_state_t *state = arg->state;
+    int fd = arg->client_fd;
+    free(arg);
+
+    /* handle_client() closes the fd on every return path. */
+    handle_client(state, fd);
+
+    /* Release the worker slot and update the live counter. */
+    pthread_mutex_lock(&state->state_mutex);
+    if (state->workers_live > 0)
+        state->workers_live--;
+    pthread_mutex_unlock(&state->state_mutex);
+    sem_post(&state->worker_sem);
+
+    return NULL;
+}
+
+/* =========================================================================
  * Lifecycle
  * ========================================================================= */
 
@@ -1760,8 +1759,21 @@ virp_error_t onode_init(onode_state_t *state,
     state->watchdog_running = false;
     pthread_mutex_init(&state->state_mutex, NULL);
     pthread_mutex_init(&state->conn_mutex, NULL);
+    pthread_mutex_init(&state->session_mutex, NULL);
     for (int i = 0; i < ONODE_MAX_DEVICES; i++)
         pthread_mutex_init(&state->exec_mutex[i], NULL);
+
+    /* Worker pool semaphore. Initialized to ONODE_MAX_WORKERS; each
+     * accepted connection takes one unit and the worker thread
+     * returns it on completion. */
+    if (sem_init(&state->worker_sem, 0, ONODE_MAX_WORKERS) == 0) {
+        state->worker_sem_inited = true;
+    } else {
+        perror("[O-Node] sem_init");
+        state->worker_sem_inited = false;
+    }
+    state->workers_live = 0;
+    state->workers_rejected = 0;
 
     /* Socket path */
     if (socket_path)
@@ -1907,7 +1919,7 @@ virp_error_t onode_start(onode_state_t *state)
     /* Belt-and-suspenders: force 0660 in case umask didn't apply. */
     chmod(state->socket_path, 0660);
 
-    if (listen(state->listen_fd, ONODE_MAX_CLIENTS) < 0) {
+    if (listen(state->listen_fd, ONODE_LISTEN_BACKLOG) < 0) {
         perror("[O-Node] listen");
         close(state->listen_fd);
         return VIRP_ERR_KEY_NOT_LOADED;
@@ -1980,11 +1992,85 @@ virp_error_t onode_start(onode_state_t *state)
                 close(client_fd);
                 continue;
             }
-            handle_client(state, client_fd);
+
+            /*
+             * Reserve a worker slot. sem_trywait never blocks — if the
+             * pool is full we reject immediately rather than letting
+             * slow SSH sessions pile up behind the accept loop.
+             */
+            if (sem_trywait(&state->worker_sem) != 0) {
+                pthread_mutex_lock(&state->state_mutex);
+                state->workers_rejected++;
+                uint32_t rej = state->workers_rejected;
+                pthread_mutex_unlock(&state->state_mutex);
+                fprintf(stderr,
+                        "[O-Node] worker pool saturated (max=%d) — "
+                        "closing peer uid=%u pid=%d (total rejected=%u)\n",
+                        ONODE_MAX_WORKERS,
+                        (unsigned)peer_uid, (int)peer_pid, rej);
+                close(client_fd);
+                continue;
+            }
+
+            worker_arg_t *arg = (worker_arg_t *)malloc(sizeof(*arg));
+            if (!arg) {
+                /* malloc failure: return the slot and drop the client. */
+                sem_post(&state->worker_sem);
+                fprintf(stderr, "[O-Node] worker_arg alloc failed — dropping\n");
+                close(client_fd);
+                continue;
+            }
+            arg->state = state;
+            arg->client_fd = client_fd;
+
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+            pthread_t tid;
+            int rc = pthread_create(&tid, &attr, connection_worker, arg);
+            pthread_attr_destroy(&attr);
+            if (rc != 0) {
+                /* Thread creation failed: undo semaphore + free arg. */
+                sem_post(&state->worker_sem);
+                free(arg);
+                fprintf(stderr, "[O-Node] pthread_create failed: %s\n",
+                        strerror(rc));
+                close(client_fd);
+                continue;
+            }
+
+            pthread_mutex_lock(&state->state_mutex);
+            state->workers_live++;
+            pthread_mutex_unlock(&state->state_mutex);
         }
     }
 
     fprintf(stderr, "[O-Node] Shutting down...\n");
+
+    /*
+     * Drain the worker pool. Workers are detached (no pthread_join),
+     * so we wait on the counter they maintain under state_mutex.
+     * Bounded wait: up to ~5 seconds, after which we warn and return
+     * — preferable to blocking teardown forever on a wedged SSH call.
+     */
+    for (int waited = 0; waited < 50; waited++) {
+        pthread_mutex_lock(&state->state_mutex);
+        uint32_t live = state->workers_live;
+        pthread_mutex_unlock(&state->state_mutex);
+        if (live == 0) break;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000L };  /* 100ms */
+        nanosleep(&ts, NULL);
+    }
+    pthread_mutex_lock(&state->state_mutex);
+    uint32_t live_final = state->workers_live;
+    pthread_mutex_unlock(&state->state_mutex);
+    if (live_final > 0) {
+        fprintf(stderr,
+                "[O-Node] drain timeout — %u worker(s) still live\n",
+                live_final);
+    }
+
     return VIRP_OK;
 }
 
@@ -2042,15 +2128,47 @@ void onode_destroy(onode_state_t *state)
                         sizeof(state->devices[i].api_token));
     }
 
-    /* Destroy mutexes */
+    /* Destroy mutexes and worker semaphore */
     pthread_mutex_destroy(&state->state_mutex);
     pthread_mutex_destroy(&state->conn_mutex);
+    pthread_mutex_destroy(&state->session_mutex);
     for (int i = 0; i < state->device_count; i++)
         pthread_mutex_destroy(&state->exec_mutex[i]);
+    if (state->worker_sem_inited) {
+        sem_destroy(&state->worker_sem);
+        state->worker_sem_inited = false;
+    }
 
     /* Destroy the O-Key — zero it out */
     virp_key_destroy(&state->okey);
 
     fprintf(stderr, "[O-Node] Destroyed. %u observations signed, %u reconnects.\n",
             state->observations_sent, state->reconnects);
+}
+
+/* =========================================================================
+ * Fuzz entry point
+ *
+ * Thin wrapper around parse_request() for fuzz harnesses. Accepts
+ * arbitrary bytes of length n, copies them into a NUL-terminated
+ * buffer, and invokes the parser. Contract: MUST NOT crash regardless
+ * of input. Return value semantics mirror parse_request (true = parsed
+ * into req, false = rejected). Defined alongside the parser so callers
+ * don't need access to onode_request_t internals.
+ * ========================================================================= */
+bool onode_parse_request_fuzz(const uint8_t *data, size_t n)
+{
+    /* Refuse absurdly large inputs — parse_request itself would cap,
+     * but this keeps the fuzzer from spending time on the same path. */
+    if (n > ONODE_MAX_REQUEST_SIZE) return false;
+
+    char *buf = (char *)malloc(n + 1);
+    if (!buf) return false;
+    if (n > 0) memcpy(buf, data, n);
+    buf[n] = '\0';
+
+    onode_request_t req;
+    bool ok = parse_request(buf, &req);
+    free(buf);
+    return ok;
 }

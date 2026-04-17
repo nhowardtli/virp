@@ -25,6 +25,8 @@
 #include "virp_chain.h"
 #include "virp_context.h"
 #include <pthread.h>
+#include <semaphore.h>   /* sem_t for worker pool cap */
+#include <stdint.h>
 #include <sys/types.h>   /* uid_t for socket_allowed_uids */
 
 /* =========================================================================
@@ -39,6 +41,27 @@
 #define ONODE_RECV_TIMEOUT_SEC  5
 #define ONODE_MAX_REQUEST_SIZE  24576
 #define ONODE_MAX_ALLOWED_UIDS  16
+
+/*
+ * Worker pool bound. Each accepted connection is handled by its own
+ * detached pthread; a counting semaphore caps how many may be live at
+ * once. New connections arriving while the pool is saturated are
+ * rejected (fd closed) rather than queued, so a stuck SSH session
+ * cannot build an unbounded backlog. Override at build time with
+ * -DONODE_MAX_WORKERS=N.
+ */
+#ifndef ONODE_MAX_WORKERS
+#define ONODE_MAX_WORKERS       32
+#endif
+
+/*
+ * Kernel accept queue. Must comfortably exceed ONODE_MAX_WORKERS so
+ * that short bursts of connections don't get RST'd before the accept
+ * loop can dispatch them.
+ */
+#ifndef ONODE_LISTEN_BACKLOG
+#define ONODE_LISTEN_BACKLOG    128
+#endif
 
 /* Auto-reconnect configuration */
 #define ONODE_WATCHDOG_INTERVAL_SEC  5   /* How often the watchdog checks */
@@ -133,6 +156,16 @@ typedef struct {
     /* Thread safety */
     pthread_mutex_t     state_mutex;    /* Protects seq_num, observations_sent */
     pthread_mutex_t     conn_mutex;     /* Protects connections[] and reconnect[] */
+    /*
+     * Serializes access to `ctx` during session handshake messages
+     * (HELLO / BIND / CLOSE / DERIVE_KEY). There is exactly one
+     * handshake context per daemon; concurrent worker threads that try
+     * to drive a handshake would corrupt its state machine otherwise.
+     * Command execution after session_derive_key is covered by the
+     * per-device exec_mutex, so this lock is only held for the short
+     * handshake calls — never around SSH I/O.
+     */
+    pthread_mutex_t     session_mutex;
 
     /*
      * Per-device execution mutex.
@@ -166,6 +199,18 @@ typedef struct {
     /* Watchdog thread (auto-reconnect) */
     pthread_t           watchdog_thread;
     bool                watchdog_running;
+
+    /*
+     * Worker pool. Each accepted connection is handled on a detached
+     * pthread; `worker_sem` is a counting semaphore initialized to
+     * ONODE_MAX_WORKERS that caps concurrency. `workers_live` is an
+     * advisory counter (under state_mutex) used only for heartbeat
+     * logging and for the shutdown drain loop.
+     */
+    sem_t               worker_sem;
+    bool                worker_sem_inited;
+    uint32_t            workers_live;
+    uint32_t            workers_rejected;   /* saturated-pool rejections */
 
     /* Runtime */
     bool                running;
@@ -258,16 +303,6 @@ uint32_t onode_next_seq(onode_state_t *state);
  * ========================================================================= */
 
 /*
- * Extract a string value from a JSON object by key.
- * Decodes all JSON escape sequences: \n \t \r \\ \" \/ \b \f \uXXXX.
- * Returns false if key not found or value is not a string.
- */
-bool json_extract_string(const char *json, const char *key,
-                         char *out, size_t out_len);
-
-bool json_extract_int64(const char *json, const char *key, int64_t *out);
-
-/*
  * Set the SO_PEERCRED allowlist. Replaces any existing entries.
  * Returns VIRP_OK, or VIRP_ERR_MESSAGE_TOO_LARGE if `count` exceeds
  * ONODE_MAX_ALLOWED_UIDS.
@@ -281,5 +316,13 @@ virp_error_t onode_set_allowed_uids(onode_state_t *state,
  * (odd length, non-hex character, output buffer too small).
  */
 int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len);
+
+/*
+ * Fuzz entry point for the internal JSON request parser. Intended for
+ * test harnesses — production callers should not use this. Never
+ * crashes regardless of input; returns true iff the input parsed into
+ * a valid request.
+ */
+bool onode_parse_request_fuzz(const uint8_t *data, size_t n);
 
 #endif /* VIRP_ONODE_H */

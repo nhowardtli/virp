@@ -5,13 +5,19 @@ REST API wrapping virp-onode for consumption by any automation platform.
 """
 
 import asyncio
+import collections
+import fcntl
 import hashlib
 import hmac
+import ipaddress
 import json
+import logging
 import os
 import re
 import socket
 import struct
+import tempfile
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -23,7 +29,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, field_validator
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -31,16 +37,61 @@ from pydantic import BaseModel
 
 VIRP_SOCKET = os.environ.get("VIRP_SOCKET", "/tmp/virp-onode.sock")
 VIRP_KEY_PATH = os.environ.get("VIRP_KEY_PATH", "/etc/virp/keys/onode.key")
-DEVICES_PATH = os.environ.get("VIRP_DEVICES", "/etc/virp/devices.json")  # legacy fallback
+# devices.json lives under /var/lib/virp (service-user writable) rather
+# than /etc/virp (root-owned, immutable config). Operators can point
+# VIRP_DEVICES elsewhere; see deploy/virp-onode.service for the
+# systemd StateDirectory convention.
+DEVICES_PATH = os.environ.get("VIRP_DEVICES", "/var/lib/virp/devices.json")
 WEB_DIR = os.environ.get("VIRP_WEB_DIR", "/opt/virp-appliance/web")
 API_TOKEN = os.environ.get("VIRP_API_TOKEN", "")  # Optional bearer token
 VIRP_ALLOW_PY_FALLBACK = os.environ.get("VIRP_ALLOW_PY_FALLBACK", "") == "1"
 
-# CORS: pinned origin allowlist (comma-separated). CT 210 is the canonical
-# tli-ops-center frontend; CT 211 is this appliance's own UI mount.
-_DEFAULT_ORIGINS = "http://10.0.0.210,http://10.0.0.211"
+# Drivers that the VIRP daemon actually knows how to talk to. This
+# list is authoritative for /api/devices/add; anything else is
+# rejected with 400. Keep in sync with _VENDOR_TO_DRIVER above and
+# the C-side virp_vendor enum.
+VIRP_ALLOWED_DRIVERS = frozenset({
+    "cisco", "cisco_asa", "fortigate", "panos",
+    "linux", "juniper", "windows", "proxmox", "wazuh",
+})
+
+# RFC 1123-ish strict hostname: labels of 1-63 chars, letters/digits/
+# hyphens, no leading/trailing hyphen, total length capped at 253.
+# Rejects shell metacharacters, spaces, and anything json.dump would
+# have to escape weirdly later.
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)"
+    r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+    r"(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$"
+)
+
+# Serializes every devices.json read-modify-write. threading.Lock (not
+# asyncio.Lock) because an asyncio.Lock binds to a specific event loop,
+# and uvicorn + TestClient both spin up independent loops per-worker /
+# per-test which would deadlock a shared asyncio.Lock. threading.Lock
+# handles the async-worker-thread case cleanly since FastAPI runs
+# sync-looking code on a threadpool. For multi-process uvicorn
+# deployments, fcntl.flock on the tempfile-then-rename path below
+# provides cross-process safety as well.
+_devices_lock = threading.Lock()
+
+_audit_log = logging.getLogger("virp.audit")
+if not _audit_log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s [virp.audit] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S"
+    ))
+    _audit_log.addHandler(_handler)
+    _audit_log.setLevel(logging.INFO)
+
+# CORS: pinned origin allowlist (comma-separated). Defaults to empty —
+# no CORS middleware is installed unless VIRP_ALLOWED_ORIGINS is set. The
+# canonical frontends (CT 210 tli-ops-center, CT 211 this appliance UI)
+# are configured via systemd/docker env, not baked in, so dev environments
+# don't accidentally inherit a production allowlist.
 VIRP_ALLOWED_ORIGINS = [
-    o.strip() for o in os.environ.get("VIRP_ALLOWED_ORIGINS", _DEFAULT_ORIGINS).split(",")
+    o.strip() for o in os.environ.get("VIRP_ALLOWED_ORIGINS", "").split(",")
     if o.strip()
 ]
 
@@ -63,6 +114,12 @@ VIRP_KEY_SIZE = 32
 # before we start dereferencing the length field.
 VIRP_MAX_FRAME = 32768
 VIRP_VERSION = 0x01
+# Wire-level socket framing (distinct from VIRP_VERSION, which is the
+# version field in the VIRP message header). v2 framing is:
+#   [4-byte BE length][1-byte frame version = 0x02][JSON payload]
+# The daemon rejects unframed (v1) requests with VIRP_ERR_PROTOCOL_VERSION.
+VIRP_FRAME_VERSION = 0x02
+ONODE_MAX_REQUEST_SIZE = 24576
 VIRP_TYPE_OBSERVATION = 0x01
 VIRP_TYPE_HELLO = 0x02
 VIRP_TYPE_PROPOSAL = 0x10
@@ -78,51 +135,145 @@ VIRP_CHANNEL_IC = 0x02
 # State
 # ---------------------------------------------------------------------------
 
-observation_log = []  # In-memory log (POC — production would use SQLite/Postgres)
 MAX_LOG_SIZE = 1000
+#
+# IN-MEMORY ONLY — not a durable audit trail
+# ------------------------------------------
+# observation_log is a best-effort rolling window of the last
+# MAX_LOG_SIZE entries. It exists so /api/observations and the
+# heartbeat counter can surface recent activity without reaching into
+# the signed chain. It is NOT the source of truth, is NOT durable
+# across process restarts, and provides NO guarantees under concurrent
+# writers beyond what deque.append offers (which is thread-safe for
+# single appends and bounded by maxlen).
+#
+# Production auditing goes through the signed trust chain at
+# src/virp_chain.c (SQLite-backed, HMAC-chained, survives restart).
+# Query /api/observations only for operator visibility / dashboards,
+# never as a compliance artifact.
+#
+observation_log = collections.deque(maxlen=MAX_LOG_SIZE)
+
 appliance_start_time = time.time()
 key_material = None
 key_fingerprint = None
 _virp_bridge = None  # VIRPBridge instance for C-based HMAC verification
 
-# Observation payload cache — stores raw signed output for content fidelity checks.
-# Key: (device, sequence) → {"payload": str, "verified": bool, "timestamp": float}
-_obs_payload_cache: dict[tuple[str, int], dict] = {}
+# Observation payload cache — stores raw signed output for content fidelity
+# checks. Key: (device, sequence) → {"payload": str, "verified": bool,
+# "timestamp": float}. OrderedDict gives us LRU eviction via
+# popitem(last=False); move_to_end() bumps an entry to MRU on access.
+# Guarded by _obs_cache_lock because both the writer path (observe,
+# sweep) and the reader path (observation_gate) run on async workers
+# that may be dispatched to different threads by uvicorn.
+_obs_payload_cache: "collections.OrderedDict[tuple[str, int], dict]" = collections.OrderedDict()
 _OBS_CACHE_MAX = 500
+_obs_cache_lock = asyncio.Lock()
 
 
-def _cache_observation(device: str, sequence: int, payload: str,
-                       verified: bool, timestamp: float = 0.0):
-    """Store a raw observation payload for content fidelity gate lookups."""
-    _obs_payload_cache[(device, sequence)] = {
-        "payload": payload,
-        "verified": verified,
-        "timestamp": timestamp or time.time(),
-    }
-    while len(_obs_payload_cache) > _OBS_CACHE_MAX:
-        _obs_payload_cache.pop(next(iter(_obs_payload_cache)))
+async def _cache_observation(device: str, sequence: int, payload: str,
+                             verified: bool, timestamp: float = 0.0) -> None:
+    """
+    Store a raw observation payload under the lock, evicting the LRU
+    entry when _OBS_CACHE_MAX is reached. If (device, sequence) is
+    already present, its entry is updated and moved to MRU rather than
+    duplicated.
+    """
+    key = (device, sequence)
+    async with _obs_cache_lock:
+        _obs_payload_cache[key] = {
+            "payload": payload,
+            "verified": verified,
+            "timestamp": timestamp or time.time(),
+        }
+        _obs_payload_cache.move_to_end(key)
+        while len(_obs_payload_cache) > _OBS_CACHE_MAX:
+            _obs_payload_cache.popitem(last=False)
 
 
-def _get_latest_cached(device: str) -> Optional[dict]:
-    """Get the most recent cached observation for a device."""
-    latest = None
-    for (d, seq), entry in _obs_payload_cache.items():
-        if d == device and (latest is None or seq > latest[0]):
-            latest = (seq, entry)
-    return latest[1] if latest else None
+async def _get_latest_cached(device: str) -> Optional[dict]:
+    """
+    Return the most recent cached observation for `device`, marking it
+    MRU. O(n) scan over the cache — n is bounded by _OBS_CACHE_MAX, so
+    this is fine at 500 but should move to a per-device index if the
+    cap ever rises into the 10k+ range.
+    """
+    async with _obs_cache_lock:
+        latest_key = None
+        latest_seq = -1
+        for (d, seq) in _obs_payload_cache:
+            if d == device and seq > latest_seq:
+                latest_seq = seq
+                latest_key = (d, seq)
+        if latest_key is None:
+            return None
+        _obs_payload_cache.move_to_end(latest_key)
+        return _obs_payload_cache[latest_key]
 
 
 # ---------------------------------------------------------------------------
 # Key Management
 # ---------------------------------------------------------------------------
 
+def _check_key_file_permissions(path: str) -> Optional[str]:
+    """
+    Mirror the C-side virp_key_load_file gate. Returns None if the
+    file is safe to open, or a human-readable refusal reason. Uses
+    os.lstat so a symlink is caught before any read, and os.stat on
+    the resolved path so the real target's mode is also validated.
+    Runs BEFORE opening the file — there is still a theoretical TOCTOU
+    between stat and open, but the daemon's /etc/virp tree is
+    root-owned and the service-user only has write access to the
+    directories it manages, so the racer would already have the
+    capability to plant the key itself.
+    """
+    try:
+        lst = os.lstat(path)
+    except FileNotFoundError:
+        return None  # Caller handles "not found" separately
+    if os.path.islink(path):
+        return (f"key file {path} is a symlink — refusing to follow "
+                f"(mirror of C O_NOFOLLOW gate)")
+
+    st = os.stat(path)   # After lstat says it's not a symlink, stat==lstat
+    mode = st.st_mode & 0o777
+    if mode & 0o077:
+        return (f"key file {path} has insecure mode 0o{mode:o} — "
+                f"refusing to load. Run: chmod 0600 {path}")
+    if st.st_uid != os.geteuid():
+        return (f"key file {path} is owned by uid={st.st_uid}, "
+                f"expected {os.geteuid()} — refusing to load")
+    if not stat_is_regular(st.st_mode):
+        return f"key file {path} is not a regular file"
+    return None
+
+
+def stat_is_regular(mode: int) -> bool:
+    # os.path.S_ISREG exists only via the `stat` module — inline to
+    # avoid an extra import at module scope.
+    import stat as _stat
+    return _stat.S_ISREG(mode)
+
+
 def load_okey():
     """Load the O-Key for HMAC verification.
 
     Primary path: load via VIRPBridge (C library).
     Fallback: raw Python hmac — only if VIRP_ALLOW_PY_FALLBACK=1.
+
+    Before reading, the file must be mode 0400/0600 and owned by the
+    current euid, matching the C daemon's enforcement so the API
+    server cannot accidentally load a key file that the daemon would
+    refuse (or, worse, that someone else on the box has already been
+    able to read).
     """
     global key_material, key_fingerprint, _virp_bridge
+
+    refusal = _check_key_file_permissions(VIRP_KEY_PATH)
+    if refusal:
+        print(f"[ERROR] {refusal}")
+        return False
+
     try:
         with open(VIRP_KEY_PATH, "rb") as f:
             data = f.read()
@@ -540,36 +691,61 @@ def check_content_fidelity(ai_response: str,
 # virp-onode Client
 # ---------------------------------------------------------------------------
 
+def _recv_exact(sock, n: int) -> bytes:
+    """Receive exactly n bytes, looping over partial reads."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Socket closed prematurely")
+        buf += chunk
+    return buf
+
+
+def _send_framed_request(sock: socket.socket, request_obj: dict) -> None:
+    """Serialize request_obj as JSON and send it as a v2 framed message.
+
+    Wire format:  [4-byte BE length][1-byte VIRP_FRAME_VERSION][JSON]
+    Length covers (version byte + JSON), not the prefix itself.
+    """
+    payload = json.dumps(request_obj).encode("utf-8")
+    frame_len = 1 + len(payload)
+    if frame_len > ONODE_MAX_REQUEST_SIZE:
+        raise ValueError(
+            f"request frame {frame_len} bytes exceeds "
+            f"ONODE_MAX_REQUEST_SIZE ({ONODE_MAX_REQUEST_SIZE})"
+        )
+    header = struct.pack("!I", frame_len) + bytes([VIRP_FRAME_VERSION])
+    sock.sendall(header + payload)
+
+
+def _recv_framed_response(sock: socket.socket) -> bytes:
+    """Read a v2 framed response: [4-byte BE length][payload]. Returns payload."""
+    raw_len = _recv_exact(sock, 4)
+    length = struct.unpack("!I", raw_len)[0]
+    if length == 0:
+        return b""
+    return _recv_exact(sock, length)
+
+
 def onode_execute(device: str, command: str, timeout: float = 30.0) -> dict:
     """Send a command to virp-onode and return parsed observation."""
-    request = json.dumps({
-        "action": "execute",
-        "device": device,
-        "command": command,
-    }).encode("utf-8")
-
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
 
     try:
         sock.connect(VIRP_SOCKET)
-
-        # Send raw JSON (no length prefix - onode expects raw recv)
-        sock.sendall(request)
-
-        # Receive raw response - onode sends either:
-        #   - A full VIRP message (56+ bytes) on success
-        #   - A 4-byte error code on failure
-        chunks = []
-        while True:
-            chunk = sock.recv(8192)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        msg = b"".join(chunks)
+        _send_framed_request(sock, {
+            "action": "execute",
+            "device": device,
+            "command": command,
+        })
+        msg = _recv_framed_response(sock)
 
         if len(msg) == 0:
             raise ConnectionError("Empty response from onode")
+        # A 4-byte payload inside the outer frame is an error code, not
+        # a VIRP header — distinguish it from a truncated observation.
         if len(msg) == 4:
             err_code = struct.unpack("!I", msg)[0]
             raise ConnectionError(f"onode error code: {err_code}")
@@ -584,44 +760,47 @@ def onode_execute(device: str, command: str, timeout: float = 30.0) -> dict:
         sock.close()
 
 
-def _recv_exact(sock, n: int) -> bytes:
-    """Receive exactly n bytes."""
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Socket closed prematurely")
-        buf += chunk
-    return buf
-
-
 ONODE_MAX_BATCH = 16  # Must match ONODE_MAX_BATCH in virp_onode.h
 
 
 def _batch_execute_chunk(chunk: list[dict], timeout: float) -> list[dict]:
-    """Send a single batch_execute request (up to ONODE_MAX_BATCH commands)."""
-    request = json.dumps({
-        "action": "batch_execute",
-        "commands": chunk,
-    }).encode("utf-8")
+    """Send a single batch_execute request (up to ONODE_MAX_BATCH commands).
 
+    Response format (inside the outer framed payload):
+      [4-byte BE count]
+      [4-byte BE msg_len_1][msg_1]
+      [4-byte BE msg_len_2][msg_2]
+      ...
+    """
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
 
     try:
         sock.connect(VIRP_SOCKET)
-        sock.sendall(request)
-        sock.shutdown(socket.SHUT_WR)
+        _send_framed_request(sock, {
+            "action": "batch_execute",
+            "commands": chunk,
+        })
 
-        # Read 4-byte result count
-        raw_count = _recv_exact(sock, 4)
-        count = struct.unpack("!I", raw_count)[0]
+        batch_payload = _recv_framed_response(sock)
+        if len(batch_payload) < 4:
+            raise ConnectionError(
+                f"batch response too short: {len(batch_payload)} bytes"
+            )
+
+        count = struct.unpack_from("!I", batch_payload, 0)[0]
+        off = 4
 
         results = []
         for i in range(count):
-            raw_len = _recv_exact(sock, 4)
-            msg_len = struct.unpack("!I", raw_len)[0]
-            msg = _recv_exact(sock, msg_len)
+            if off + 4 > len(batch_payload):
+                raise ConnectionError("batch response truncated at len prefix")
+            msg_len = struct.unpack_from("!I", batch_payload, off)[0]
+            off += 4
+            if off + msg_len > len(batch_payload):
+                raise ConnectionError("batch response truncated at payload")
+            msg = batch_payload[off:off + msg_len]
+            off += msg_len
 
             device = chunk[i]["device"] if i < len(chunk) else f"device_{i}"
             command = chunk[i]["command"] if i < len(chunk) else "unknown"
@@ -747,12 +926,50 @@ class SweepRequest(BaseModel):
 
 
 class DeviceAddRequest(BaseModel):
+    """
+    Minimal device identity. Credentials MUST go through the separate
+    credential store (see deploy/README → credential layout) — never
+    through this API, which would persist them in a plaintext JSON
+    file readable by anything in the virp group. `extra='forbid'`
+    causes pydantic to reject requests that carry `password` /
+    `enable` / `username` / any other unexpected key with a 422.
+    """
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     host: str
     driver: str = "cisco"
-    username: str = ""
-    password: str = ""
-    enable: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        if not v or not _HOSTNAME_RE.match(v):
+            raise ValueError("name must be a valid hostname label")
+        return v
+
+    @field_validator("host")
+    @classmethod
+    def _validate_host(cls, v: str) -> str:
+        if not v:
+            raise ValueError("host is required")
+        # Accept a literal IPv4 / IPv6 address...
+        try:
+            ipaddress.ip_address(v)
+            return v
+        except ValueError:
+            pass
+        # ...or a strict DNS hostname.
+        if _HOSTNAME_RE.match(v):
+            return v
+        raise ValueError("host must be a valid IP address or hostname")
+
+    @field_validator("driver")
+    @classmethod
+    def _validate_driver(cls, v: str) -> str:
+        if v not in VIRP_ALLOWED_DRIVERS:
+            allowed = ", ".join(sorted(VIRP_ALLOWED_DRIVERS))
+            raise ValueError(f"driver must be one of: {allowed}")
+        return v
 
 
 class GateRequest(BaseModel):
@@ -766,16 +983,112 @@ class GateRequest(BaseModel):
 # Auth Middleware
 # ---------------------------------------------------------------------------
 
+def _request_identity(request: Request) -> str:
+    """
+    Best-effort identity string for audit log lines. With bearer-token
+    auth there is no per-user identity, so we log:
+      - the sha256-prefixed fingerprint of the presented token (never
+        the token itself), and
+      - the client IP from the socket + X-Forwarded-For when present.
+    Future: swap in a real token→principal lookup once the token
+    store lands.
+    """
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[len("Bearer "):]
+        fp = hashlib.sha256(token.encode("utf-8", "ignore")).hexdigest()[:12]
+        token_id = f"token:{fp}"
+    else:
+        token_id = "token:none"
+
+    client = request.client.host if request.client else "?"
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        client = f"{client} via {xff.split(',')[0].strip()}"
+
+    return f"{token_id} from {client}"
+
+
+def _read_then_write_devices(path: str, mutate) -> dict:
+    """
+    Read the devices.json at `path`, call mutate(raw_dict) to update it,
+    then atomically replace the file. Steps:
+
+      1. Acquire a process-level threading.Lock  (prevents intra-proc race).
+      2. Take an fcntl.LOCK_EX on a sidecar `.lock` file (cross-proc).
+      3. Read current devices.json, invoke mutate().
+      4. Write into a tempfile in the same directory, fsync it.
+      5. os.replace() the tempfile onto the target (atomic rename).
+      6. fsync the enclosing directory so the rename is durable.
+
+    Returns the mutated dict. Propagates whatever mutate() raises.
+    """
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(parent, exist_ok=True)
+    lock_path = os.path.join(parent, ".devices.lock")
+
+    with _devices_lock:
+        # Open + hold an exclusive flock on the sidecar across the entire
+        # read-modify-write. The separate file means concurrent readers
+        # of devices.json itself are never blocked.
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o640)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+            try:
+                with open(path) as f:
+                    raw = json.load(f)
+                if not isinstance(raw, dict):
+                    raw = {}
+            except (FileNotFoundError, json.JSONDecodeError):
+                raw = {}
+
+            mutate(raw)
+
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".devices-", suffix=".json.tmp", dir=parent
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(raw, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(tmp_path, 0o640)
+                os.replace(tmp_path, path)
+
+                dfd = os.open(parent, os.O_DIRECTORY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+                raise
+
+            return raw
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+
+
 async def check_auth(request: Request):
     """FastAPI dependency: bearer token auth (if configured).
 
     Use via `dependencies=[Depends(check_auth)]` on route decorators.
     When VIRP_API_TOKEN is unset, auth is a no-op (POC/dev mode).
+    Comparison is constant-time so a valid-length wrong token cannot be
+    learned byte-by-byte from response-time differences.
     """
     if not API_TOKEN:
         return  # No auth configured
     auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_TOKEN}":
+    expected = f"Bearer {API_TOKEN}"
+    if not hmac.compare_digest(auth, expected):
         raise HTTPException(status_code=401, detail="Invalid or missing API token")
 
 
@@ -783,8 +1096,34 @@ async def check_auth(request: Request):
 # Application
 # ---------------------------------------------------------------------------
 
+def _probe_coredump_filter() -> None:
+    """
+    On Linux, /proc/self/coredump_filter decides which VM areas land
+    in a core dump. Bit 0 (anonymous private) and bit 2 (anonymous
+    shared) cover the pages that hold a loaded key. Warn the operator
+    if either is set — the C daemon calls prctl(PR_SET_DUMPABLE, 0),
+    but the Python API server has no equivalent and falls back to
+    relying on the filter + rlimit/coredumpctl config.
+    """
+    try:
+        with open("/proc/self/coredump_filter") as f:
+            filt = int(f.read().strip(), 16)
+    except (FileNotFoundError, ValueError):
+        return  # Not Linux, or /proc unavailable
+
+    if filt & 0b0101:   # bit 0 (anon private) or bit 2 (anon shared)
+        print(
+            f"[WARN] /proc/self/coredump_filter=0x{filt:x} includes "
+            f"anonymous pages — a core dump of this process could "
+            f"expose loaded key material. Consider setting "
+            f"coredump_filter to 0 or running under a systemd unit "
+            f"with LimitCORE=0."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _probe_coredump_filter()
     load_okey()
     print(f"[VIRP] Appliance API starting")
     print(f"[VIRP] Socket: {VIRP_SOCKET}")
@@ -801,13 +1140,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=VIRP_ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["authorization", "content-type"],
-)
+if VIRP_ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=VIRP_ALLOWED_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["authorization", "content-type"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +1226,7 @@ async def observe(req: ObserveRequest):
         raise HTTPException(status_code=500, detail=f"Observation failed: {e}")
 
     # Cache payload for content fidelity gate
-    _cache_observation(
+    await _cache_observation(
         device=req.device,
         sequence=obs.get("sequence", 0),
         payload=obs.get("payload", ""),
@@ -894,8 +1234,10 @@ async def observe(req: ObserveRequest):
         timestamp=obs.get("timestamp", 0.0),
     )
 
-    # Log it
-    log_entry = {
+    # Log it. deque(maxlen=...) drops the oldest automatically; no
+    # manual trim, no O(n) pop(0) — and the bound is enforced by the
+    # container, not by a racy length check.
+    observation_log.append({
         "id": str(uuid.uuid4()),
         "device": req.device,
         "command": req.command,
@@ -905,10 +1247,7 @@ async def observe(req: ObserveRequest):
         "payload_length": obs["payload_length"],
         "sequence": obs["sequence"],
         "logged_at": datetime.now(timezone.utc).isoformat(),
-    }
-    observation_log.append(log_entry)
-    if len(observation_log) > MAX_LOG_SIZE:
-        observation_log.pop(0)
+    })
 
     return {
         "observation": obs,
@@ -964,7 +1303,7 @@ async def sweep(req: SweepRequest):
                         "verified": False,
                     })
                 else:
-                    _cache_observation(
+                    await _cache_observation(
                         device=dev,
                         sequence=obs.get("sequence", 0),
                         payload=obs.get("payload", ""),
@@ -1000,9 +1339,7 @@ async def sweep(req: SweepRequest):
                     "verified": False,
                 })
 
-    # Trim log
-    while len(observation_log) > MAX_LOG_SIZE:
-        observation_log.pop(0)
+    # (No manual trim — deque(maxlen=MAX_LOG_SIZE) bounds itself.)
 
     results = []
     for d in valid_devices:
@@ -1035,13 +1372,18 @@ async def sweep(req: SweepRequest):
 
 @app.get("/api/observations", dependencies=[Depends(check_auth)])
 async def get_observations(limit: int = 50, device: Optional[str] = None):
-    """Get recent observation log."""
-    logs = observation_log
+    """
+    Return recent in-memory observations (see note on observation_log).
+    Snapshot the deque to a list BEFORE slicing/iterating so a
+    concurrent append does not raise RuntimeError mid-iteration and
+    the snapshot is consistent with the `total` we report back.
+    """
+    snapshot = list(observation_log)
     if device:
-        logs = [l for l in logs if l.get("device") == device]
+        snapshot = [l for l in snapshot if l.get("device") == device]
     return {
-        "observations": list(reversed(logs[-limit:])),
-        "total": len(logs),
+        "observations": list(reversed(snapshot[-limit:])),
+        "total": len(snapshot),
     }
 
 
@@ -1072,7 +1414,7 @@ async def observation_gate(req: GateRequest):
         for dev in req.device_refs:
             if dev in obs_devices_seen:
                 continue
-            cached = _get_latest_cached(dev)
+            cached = await _get_latest_cached(dev)
             if cached:
                 observations.append({
                     "device": dev,
@@ -1185,8 +1527,14 @@ async def key_info():
 
 
 @app.post("/api/devices/add", dependencies=[Depends(check_auth)])
-async def add_device(req: DeviceAddRequest):
+async def add_device(req: DeviceAddRequest, request: Request):
     """Add a device to the registry.
+
+    Inputs are validated on the pydantic model (hostname-shape name,
+    IP-or-hostname host, allowlisted driver, no credential fields).
+    The read-modify-write is serialized under _devices_lock and
+    committed via tmpfile+fsync+os.replace, so concurrent callers and
+    mid-write crashes cannot leave a torn file.
 
     NOTE: During migration, this writes to the legacy devices.json.
     The canonical source is /root/virp/devices.yaml — edit that file
@@ -1198,18 +1546,20 @@ async def add_device(req: DeviceAddRequest):
             detail=f"Device '{req.name}' already exists in devices.yaml. "
                    f"Edit /root/virp/devices.yaml to modify it."
         )
-    # Legacy fallback: write to devices.json
-    try:
-        with open(DEVICES_PATH) as f:
-            raw = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        raw = {}
-    raw[req.name] = {
-        "host": req.host,
-        "driver": req.driver,
-    }
-    with open(DEVICES_PATH, "w") as f:
-        json.dump(raw, f, indent=2)
+
+    identity = _request_identity(request)
+
+    def _apply(raw: dict) -> None:
+        raw[req.name] = {"host": req.host, "driver": req.driver}
+
+    # Offload the blocking file I/O to a thread so we don't stall the
+    # event loop. The thread still serializes via _devices_lock + flock.
+    await asyncio.to_thread(_read_then_write_devices, DEVICES_PATH, _apply)
+
+    _audit_log.info(
+        "device.add name=%s host=%s driver=%s by=%s",
+        req.name, req.host, req.driver, identity,
+    )
     return {
         "status": "added",
         "device": req.name,
@@ -1218,25 +1568,32 @@ async def add_device(req: DeviceAddRequest):
 
 
 @app.delete("/api/devices/{name}", dependencies=[Depends(check_auth)])
-async def remove_device(name: str):
-    """Remove a device from the registry."""
+async def remove_device(name: str, request: Request):
+    """Remove a device from the registry. Same locking + atomic-write
+    guarantees as add_device."""
     if _HAVE_REGISTRY and _dr.get_device(name):
         raise HTTPException(
             status_code=409,
             detail=f"Device '{name}' is defined in devices.yaml. "
                    f"Edit /root/virp/devices.yaml to remove it."
         )
-    # Legacy fallback
+
+    identity = _request_identity(request)
+
+    class _NotFound(Exception):
+        pass
+
+    def _apply(raw: dict) -> None:
+        if name not in raw:
+            raise _NotFound()
+        del raw[name]
+
     try:
-        with open(DEVICES_PATH) as f:
-            raw = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        await asyncio.to_thread(_read_then_write_devices, DEVICES_PATH, _apply)
+    except _NotFound:
         raise HTTPException(status_code=404, detail=f"Device '{name}' not found")
-    if name not in raw:
-        raise HTTPException(status_code=404, detail=f"Device '{name}' not found")
-    del raw[name]
-    with open(DEVICES_PATH, "w") as f:
-        json.dump(raw, f, indent=2)
+
+    _audit_log.info("device.remove name=%s by=%s", name, identity)
     return {"status": "removed", "device": name}
 
 
@@ -1255,4 +1612,8 @@ if web_path.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8470, log_level="info")
+    # Default to loopback; operators must opt in to external exposure by
+    # setting VIRP_BIND_HOST (e.g. 0.0.0.0) — usually behind a reverse
+    # proxy that terminates TLS and adds the bearer token.
+    bind_host = os.environ.get("VIRP_BIND_HOST", "127.0.0.1")
+    uvicorn.run(app, host=bind_host, port=8470, log_level="info")

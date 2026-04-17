@@ -287,15 +287,6 @@ $(TEST_ASA): tests/test_driver_asa.c $(LIB)
 test-asa: $(TEST_ASA)
 	./$(TEST_ASA)
 
-# JSON extract tests (escape decoding)
-TEST_JSON = $(BUILD_DIR)/test_json_extract
-
-$(TEST_JSON): tests/test_json_extract.c $(LIB)
-	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
-
-test-json: $(TEST_JSON)
-	./$(TEST_JSON)
-
 # jx_uint32 regression test (unquoted-number parsing in virp_onode_json.c)
 TEST_JX_UINT32 = $(BUILD_DIR)/test_jx_uint32
 
@@ -392,4 +383,4 @@ fuzz-libfuzzer: $(LIB)
 	      -lstdc++ -o $(FUZZ_LIBFUZZER)
 	@echo "Built $(FUZZ_LIBFUZZER) — run with: ./$(FUZZ_LIBFUZZER) [corpus_dir]"
 
-all-tests: test test-onode test-chain test-federation test-interop test-json test-session test-session-key
+all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key
