@@ -1,13 +1,55 @@
 [Unit]
 Description=VIRP Observation Node Daemon
 After=network.target
+# The devices.json writer (api/server.py /api/devices/add) must share
+# group ownership of /var/lib/virp so the HTTP service can write what
+# this daemon reads. Provision both units under the same `virp` user.
 
 [Service]
 Type=simple
-ExecStart=/opt/virp/build/virp-onode-prod -k /etc/virp/keys/onode.key -s /tmp/virp-onode.sock -d /etc/virp/devices.json
+# Runs as a dedicated service user, NOT root. Create with:
+#   useradd --system --home-dir /var/lib/virp --shell /usr/sbin/nologin virp
+# and give it ownership of /etc/virp/keys/onode.key (0600) and
+# /var/lib/virp (0750). Never put credentials in devices.json —
+# credential store is /etc/virp/creds.d/ (0700, root-owned).
+User=virp
+Group=virp
+
+# Read-only key material plus mutable device list. Keep mutating
+# state under StateDirectory so systemd creates+chowns it for us.
+StateDirectory=virp
+StateDirectoryMode=0750
+ExecStart=/opt/virp/build/virp-onode-prod \
+    -k /etc/virp/keys/onode.key \
+    -s /run/virp/onode.sock \
+    -d /var/lib/virp/devices.json
+
+# Socket directory (RuntimeDirectory is auto-created 0755 virp:virp).
+RuntimeDirectory=virp
+RuntimeDirectoryMode=0750
+
 Restart=always
 RestartSec=5
-User=root
+
+# Sandbox
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# Only /etc/virp/keys (read) and /var/lib/virp (write) are needed for
+# device config; ProtectSystem=strict hides everything else.
+ReadOnlyPaths=/etc/virp
+ReadWritePaths=/var/lib/virp
 
 [Install]
 WantedBy=multi-user.target

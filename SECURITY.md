@@ -33,6 +33,24 @@ The following are in scope for security reports:
 - Issues requiring physical access to the host machine
 - Social engineering
 
+## Socket Peer Authentication
+
+The O-Node Unix domain socket is gated by SO_PEERCRED (Linux) / getpeereid
+(BSD). Every `accept()` reads the connecting process's UID and compares
+it against a startup-loaded allowlist:
+
+- `VIRP_ALLOWED_UIDS` — comma-separated UID list (e.g. `VIRP_ALLOWED_UIDS=0,1001`)
+- Prod builds also honor `socket_allowed_uids` in the JSON config
+- If neither is set, the allowlist defaults to the daemon's own
+  effective UID — closed to every other local user
+
+Rejected connections are closed immediately without reading any bytes
+and produce a single `REJECTED connection: peer uid=...` log line.
+
+The socket itself is created mode 0660 atomically via `umask(0117)` set
+around `bind()` (with a belt-and-suspenders `chmod(0660)` after), so
+there is no window in which a world-accessible node exists on disk.
+
 ## Supported Versions
 
 | Version | Supported |
