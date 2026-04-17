@@ -1887,13 +1887,24 @@ virp_error_t onode_start(onode_state_t *state)
     addr.sun_family = AF_UNIX;
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", state->socket_path);
 
-    if (bind(state->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    /*
+     * Tighten umask so bind() creates the socket 0660 atomically — no
+     * window where a world-accessible node exists on disk before chmod
+     * runs. The chmod below is retained as belt-and-suspenders in case
+     * the filesystem or a platform quirk ignores umask for AF_UNIX.
+     */
+    mode_t prev_umask = umask(0117);
+    int bind_rc = bind(state->listen_fd, (struct sockaddr *)&addr, sizeof(addr));
+    int bind_errno = errno;
+    umask(prev_umask);
+    if (bind_rc < 0) {
+        errno = bind_errno;
         perror("[O-Node] bind");
         close(state->listen_fd);
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
-    /* Allow non-root users (e.g. Docker tliadmin) to connect */
+    /* Belt-and-suspenders: force 0660 in case umask didn't apply. */
     chmod(state->socket_path, 0660);
 
     if (listen(state->listen_fd, ONODE_MAX_CLIENTS) < 0) {
