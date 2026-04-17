@@ -169,4 +169,18 @@ virp_error_t virp_sign_observation_v2(
     virp_obs_header_v2_t *hdr_out,
     uint8_t sig_out[32]);
 
+/* =========================================================================
+ * Process hardening
+ *
+ * Call once at daemon startup, after any fork() that's going to stay
+ * resident. Disables core dumps for this process (PR_SET_DUMPABLE=0
+ * on Linux, a no-op elsewhere), and logs a warning if
+ * /proc/self/coredump_filter is configured to dump anonymous or
+ * shared-memory pages, since those are where a loaded key lives.
+ *
+ * Non-fatal on failure — returns VIRP_OK if the process is already
+ * undumpable or if the filter looks safe.
+ * ========================================================================= */
+virp_error_t virp_crypto_harden_process(void);
+
 #endif /* VIRP_CRYPTO_H */

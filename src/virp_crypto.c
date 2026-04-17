@@ -8,17 +8,24 @@
  */
 
 #define _POSIX_C_SOURCE 199309L  /* clock_gettime */
+#define _GNU_SOURCE               /* O_NOFOLLOW, prctl */
 
 #include "virp_crypto.h"
 #include "virp_message.h"
 #include "virp_session.h"
 #include "virp_context.h"
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/mman.h>            /* mlock */
+#ifdef __linux__
+#include <sys/prctl.h>           /* PR_SET_DUMPABLE */
+#endif
+#include <sodium.h>              /* sodium_mlock */
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 
@@ -51,6 +58,27 @@ virp_error_t virp_key_init(virp_signing_key_t *sk,
     return VIRP_OK;
 }
 
+/*
+ * Read exactly want bytes from fd into buf. Loops on partial read(),
+ * retries on EINTR, and returns the number actually read. Caller
+ * must compare against want to detect EOF-before-want.
+ */
+static ssize_t read_exact(int fd, void *buf, size_t want)
+{
+    size_t got = 0;
+    uint8_t *p = (uint8_t *)buf;
+    while (got < want) {
+        ssize_t n = read(fd, p + got, want - got);
+        if (n == 0) break;                 /* EOF */
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        got += (size_t)n;
+    }
+    return (ssize_t)got;
+}
+
 virp_error_t virp_key_load_file(virp_signing_key_t *sk,
                                 virp_key_type_t type,
                                 const char *path)
@@ -58,18 +86,121 @@ virp_error_t virp_key_load_file(virp_signing_key_t *sk,
     if (!sk || !path)
         return VIRP_ERR_NULL_PTR;
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
+    /*
+     * O_NOFOLLOW: refuse to open through a symlink. Combined with the
+     * fstat-on-fd check below this prevents a symlink-race where a
+     * world-writable target is swapped in between lstat and open.
+     * O_CLOEXEC: we spawn worker threads that may exec(); never leak
+     * the key fd to a child.
+     */
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ELOOP) {
+            fprintf(stderr, "[VIRP] Key file %s is a symlink — refusing "
+                            "to follow (O_NOFOLLOW)\n", path);
+        } else {
+            fprintf(stderr, "[VIRP] open(%s): %s\n", path, strerror(errno));
+        }
         return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    /*
+     * Must be a regular file. fstat on an fd opened with O_NOFOLLOW
+     * never returns S_ISLNK on Linux, but reject non-regulars as a
+     * defense in depth — a FIFO or device would have undefined read
+     * semantics for key material.
+     */
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "[VIRP] Key file %s is not a regular file\n", path);
+        close(fd);
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    /*
+     * Permission gate: mode must be 0400 or 0600, owned by the
+     * effective UID of this process. Anything with group or other
+     * bits set means the key may have been read already by someone
+     * else and should not be trusted.
+     */
+    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+        fprintf(stderr,
+                "[VIRP] Key file %s has insecure mode 0%o — refusing "
+                "to load. Run: chmod 0600 %s\n",
+                path, (unsigned)(st.st_mode & 07777), path);
+        close(fd);
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    uid_t euid = geteuid();
+    if (st.st_uid != euid) {
+        fprintf(stderr,
+                "[VIRP] Key file %s is owned by uid=%u, expected %u — "
+                "refusing to load\n",
+                path, (unsigned)st.st_uid, (unsigned)euid);
+        close(fd);
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    /* File size sanity check: reject clearly-wrong sizes early. */
+    if (st.st_size != (off_t)VIRP_KEY_SIZE) {
+        fprintf(stderr,
+                "[VIRP] Key file %s is %lld bytes, expected %d\n",
+                path, (long long)st.st_size, VIRP_KEY_SIZE);
+        close(fd);
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
 
     uint8_t buf[VIRP_KEY_SIZE];
-    ssize_t n = read(fd, buf, VIRP_KEY_SIZE);
+    ssize_t n = read_exact(fd, buf, VIRP_KEY_SIZE);
     close(fd);
 
-    if (n != VIRP_KEY_SIZE)
+    if (n < 0) {
+        fprintf(stderr, "[VIRP] read(%s): %s\n", path, strerror(errno));
+        /* No partial material to wipe — read_exact returns -1 before
+         * writing usable data. */
         return VIRP_ERR_KEY_NOT_LOADED;
+    }
+    if (n != (ssize_t)VIRP_KEY_SIZE) {
+        fprintf(stderr,
+                "[VIRP] Key file %s truncated: got %zd bytes, expected %d\n",
+                path, n, VIRP_KEY_SIZE);
+        /* Wipe the partial read before returning. */
+        volatile uint8_t *p = (volatile uint8_t *)buf;
+        for (size_t i = 0; i < VIRP_KEY_SIZE; i++) p[i] = 0;
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
 
-    return virp_key_init(sk, type, buf);
+    virp_error_t err = virp_key_init(sk, type, buf);
+
+    /* Wipe the stack copy regardless of init outcome. */
+    volatile uint8_t *zp = (volatile uint8_t *)buf;
+    for (size_t i = 0; i < VIRP_KEY_SIZE; i++) zp[i] = 0;
+
+    if (err != VIRP_OK)
+        return err;
+
+    /*
+     * Pin the key page so it cannot be swapped to disk. Non-fatal:
+     * unprivileged processes often can't mlock beyond RLIMIT_MEMLOCK,
+     * and federation/session code takes the same stance. Operators
+     * who need hard guarantees should raise the rlimit or run under
+     * a systemd unit that grants CAP_IPC_LOCK.
+     */
+    if (sodium_mlock(sk->key.key, VIRP_KEY_SIZE) != 0) {
+        fprintf(stderr,
+                "[VIRP] Warning: sodium_mlock() failed on %s key — "
+                "key may be swappable (errno=%d: %s)\n",
+                (type == VIRP_KEY_TYPE_OKEY ? "O" : "R"),
+                errno, strerror(errno));
+    }
+
+    return VIRP_OK;
 }
 
 virp_error_t virp_key_generate(virp_signing_key_t *sk,
@@ -345,5 +476,67 @@ virp_error_t virp_sign_observation_v2(
         return VIRP_ERR_CRYPTO;
 
     *hdr_out = hdr;
+    return VIRP_OK;
+}
+
+/* =========================================================================
+ * Process hardening — PR_SET_DUMPABLE + coredump_filter probe
+ * ========================================================================= */
+
+/*
+ * Default coredump_filter on Linux is 0x33: anonymous private (bit 0),
+ * anonymous shared (bit 2), ELF headers (bit 4), HugeTLB private (bit 5).
+ * Keys loaded into process memory live in anonymous private pages (bit 0).
+ * Any filter with bit 0 set would include those pages in a core dump.
+ * We only warn — flipping bits on the user's behalf would be surprising
+ * and PR_SET_DUMPABLE=0 already prevents the core entirely.
+ */
+#define COREDUMP_BIT_ANON_PRIVATE  (1u << 0)
+#define COREDUMP_BIT_ANON_SHARED   (1u << 2)
+
+static void probe_coredump_filter(void)
+{
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/coredump_filter", "r");
+    if (!f) return;  /* Not Linux, or /proc not mounted — nothing to warn about */
+    unsigned int filter = 0;
+    int got = fscanf(f, "%x", &filter);
+    fclose(f);
+    if (got != 1) return;
+
+    if (filter & (COREDUMP_BIT_ANON_PRIVATE | COREDUMP_BIT_ANON_SHARED)) {
+        fprintf(stderr,
+                "[VIRP] Warning: coredump_filter=0x%x includes anonymous "
+                "pages — if PR_SET_DUMPABLE is ever re-enabled, a core "
+                "dump could contain the loaded key. PR_SET_DUMPABLE=0 "
+                "is being set now as a hard mitigation.\n",
+                filter);
+    }
+#endif
+}
+
+virp_error_t virp_crypto_harden_process(void)
+{
+    probe_coredump_filter();
+
+#ifdef __linux__
+    /*
+     * PR_SET_DUMPABLE=0 has three effects:
+     *   1. The process cannot be core-dumped.
+     *   2. /proc/<pid>/{mem,maps} become owned by root and unreadable
+     *      by the real UID (so another process running as the same
+     *      user can't ptrace-read the key).
+     *   3. ptrace attach is blocked for non-root.
+     * This is the single most effective local-defense against key
+     * exfiltration after load.
+     */
+    if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0) {
+        fprintf(stderr,
+                "[VIRP] Warning: prctl(PR_SET_DUMPABLE, 0) failed: %s\n",
+                strerror(errno));
+        /* Non-fatal: continue running. */
+    }
+#endif
+
     return VIRP_OK;
 }
