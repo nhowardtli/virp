@@ -35,9 +35,10 @@ The following are in scope for security reports:
 
 ## Socket Peer Authentication
 
-The O-Node Unix domain socket is gated by SO_PEERCRED (Linux) / getpeereid
-(BSD). Every `accept()` reads the connecting process's UID and compares
-it against a startup-loaded allowlist:
+The O-Node Unix domain socket is gated by `SO_PEERCRED` (Linux). VIRP
+currently supports Linux only; the BSD `getpeereid` equivalent is not
+implemented. Every `accept()` reads the connecting process's UID and
+compares it against a startup-loaded allowlist:
 
 - `VIRP_ALLOWED_UIDS` — comma-separated UID list (e.g. `VIRP_ALLOWED_UIDS=0,1001`)
 - Prod builds also honor `socket_allowed_uids` in the JSON config
