@@ -52,6 +52,56 @@ The socket itself is created mode 0660 atomically via `umask(0117)` set
 around `bind()` (with a belt-and-suspenders `chmod(0660)` after), so
 there is no window in which a world-accessible node exists on disk.
 
+## Trust Boundaries and Transport Paths
+
+VIRP defines two distinct paths that reach the O-Node. Their protections
+are not the same, and a protection that applies to one does not
+automatically apply to the other.
+
+**Local Unix domain socket** — `/run/virp/onode.sock` (prod) or
+`/tmp/virp-onode.sock` (dev). Protected by:
+
+- `SO_PEERCRED` peer-UID allowlist (see previous section) — the kernel
+  reports the caller's real UID, which is checked against the
+  startup-loaded allowlist before any bytes are read.
+- Filesystem mode `0660` with ownership restricted to the daemon's
+  service user/group.
+- VIRP message-layer session handshake (`SESSION_HELLO` /
+  `SESSION_HELLO_ACK` with nonces, followed by HKDF session-key
+  derivation) on every fresh connection.
+- HMAC-SHA256 signing of every observation returned to the caller,
+  using an O-Key the caller does not possess.
+
+**TCP path (CT 210 dashboard ↔ CT 211 O-Node, ports 9998/9999)** — the
+dashboard's `virp-bridge.py` listens on TCP 9998 locally on CT 210 and
+opens a TCP connection to CT 211:9999, where a socat forwarder proxies
+to the Unix socket. On this path:
+
+- `SO_PEERCRED` sees the local socat process's UID, **not** the remote
+  dashboard's identity. It cannot distinguish authorized dashboard
+  traffic from any other process on CT 211 that can reach the socat
+  forwarder.
+- The VIRP message-layer session handshake and HMAC signing of
+  observations still apply — observations returned across the TCP
+  bridge are signed at collection time with the O-Key and are as
+  verifiable as on the local path. An attacker who intercepts or
+  injects on the TCP path cannot forge observations without the O-Key.
+- The TCP path itself is **not** currently TLS-protected, and the
+  session handshake authenticates session establishment via nonce
+  exchange but does not cryptographically bind to a TCP endpoint
+  identity. Confidentiality, integrity of requests in flight, and
+  mutual authentication of the two containers currently rely on:
+  - W1 egress isolation (CT 210 can reach only allowlisted ports on
+    CT 211),
+  - network segmentation between the two containers,
+  - the O-Key's secrecy on CT 211 (observations remain unforgeable
+    even if the request channel is compromised).
+
+**Open work.** TCP-path mutual authentication — either mTLS between
+the dashboard bridge and the socat endpoint, or request-side signing
+at the VIRP message layer — is not yet implemented and is tracked as
+follow-up hardening.
+
 ## Supported Versions
 
 | Version | Supported |
