@@ -395,7 +395,7 @@ The AI's fabrication in test 6 was not malicious---it was a natural consequence 
 
 \section{Limitations}
 
-\textbf{O-Node trust.} VIRP assumes the O-Node is trusted. A compromised O-Node can produce signed fabrications. Hardware trust anchors (TPM) and formal verification of the O-Node binary are planned mitigations.
+\textbf{O-Node trust.} VIRP assumes the O-Node is trusted. A compromised O-Node can produce signed fabrications. Hardware trust anchors (TPM) and formal verification of the O-Node binary are planned mitigations. Phase~1 of the formal verification effort (protocol-level, not binary-level) is already complete: HMAC key secrecy and non-injective agreement are machine-verified in ProVerif and Tamarin under a Dolev--Yao attacker \cite{draft-howard-virp-05}. Injective agreement and counter uniqueness remain open.
 
 \textbf{Correlation fabrication.} VIRP prevents the AI from fabricating observations (T1--T3) but does not fully prevent fabricated correlations between real observations (T4). An AI could claim that a real BGP state change was caused by a real (but unrelated) interface error.
 
@@ -415,7 +415,7 @@ The AI's fabrication in test 6 was not malicious---it was a natural consequence 
 
 \textbf{SIEM integration.} Wazuh and Splunk as signed event sources, enabling AI correlation of security alerts with verified network state.
 
-\textbf{Formal verification.} Applying model checking or theorem proving to the channel-key binding and tier enforcement logic.
+\textbf{Formal verification (Phase 2).} Phase~1 machine-verified HMAC key secrecy and non-injective agreement in ProVerif and Tamarin under Dolev--Yao \cite{draft-howard-virp-05}. Phase~2 targets the two properties that remain open---injective agreement and counter uniqueness---and extends the model to channel-key binding and tier enforcement logic.
 
 \textbf{Post-quantum cryptography.} Transition path from HMAC-SHA256 to post-quantum signature schemes as standards mature.
 
@@ -480,6 +480,11 @@ RFC 6480, February 2012.
 M. Lepinski and K. Sriram,
 ``BGPsec Protocol Specification,''
 RFC 8205, September 2017.
+
+\bibitem{draft-howard-virp-05}
+N. Howard,
+``VIRP: Verified Infrastructure Response Protocol,''
+Internet-Draft draft-howard-virp-05, IETF, work in progress, 2026.
 
 \end{thebibliography}
 
