@@ -197,8 +197,8 @@ $(FUZZ_BIN): tests/fuzz_virp.c $(LIB)
 $(TOOL_BIN): src/virp_tool.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
-$(ONODE_BIN): src/virp_onode_main.c src/virp_onode_json.c $(LIB)
-	$(CC) $(CFLAGS) src/virp_onode_main.c src/virp_onode_json.c $(LIB) $(LDFLAGS) -o $@
+$(ONODE_BIN): src/virp_onode_main.c $(LIB)
+	$(CC) $(CFLAGS) src/virp_onode_main.c $(LIB) $(LDFLAGS) -ljson-c -o $@
 
 $(TEST_ONODE): tests/test_onode.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
@@ -286,15 +286,6 @@ $(TEST_ASA): tests/test_driver_asa.c $(LIB)
 
 test-asa: $(TEST_ASA)
 	./$(TEST_ASA)
-
-# jx_uint32 regression test (unquoted-number parsing in virp_onode_json.c)
-TEST_JX_UINT32 = $(BUILD_DIR)/test_jx_uint32
-
-$(TEST_JX_UINT32): tests/test_jx_uint32.c src/virp_onode_json.c $(LIB)
-	$(CC) $(CFLAGS) tests/test_jx_uint32.c $(LIB) $(LDFLAGS) -o $@
-
-test-jx-uint32: $(TEST_JX_UINT32)
-	./$(TEST_JX_UINT32)
 
 # Concurrent onode_execute smoke test (connection lifetime race)
 TEST_ONODE_CONC = $(BUILD_DIR)/test_onode_concurrency

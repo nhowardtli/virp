@@ -15,6 +15,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_onode.h"
+#include "virp_driver.h"
 #include "virp_session.h"
 #include "virp_context.h"
 #include "virp_crypto.h"   /* virp_crypto_harden_process */
@@ -26,6 +27,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <json-c/json.h>
 
 /*
  * Parse VIRP_ALLOWED_UIDS ("uid1,uid2,...") into the daemon's socket
@@ -107,8 +109,132 @@ static void signal_handler(int sig)
     onode_shutdown(&g_state);
 }
 
-/* JSON device loader (virp_onode_json.c) */
-extern int onode_load_devices_json(onode_state_t *state, const char *path);
+/* =========================================================================
+ * Dev/mock device loader
+ *
+ * Parses a devices.json file via json-c and adds each entry to the O-Node
+ * state. Shares vendor-string semantics with src/virp_onode_prod.c's
+ * load_devices; the dev binary supports only the SSH device fields (no
+ * socket_allowed_uids / socket_path override / FortiGate REST fields),
+ * since those are prod-deployment concerns. Returns the number of
+ * successfully-loaded devices, or -1 on parse failure.
+ * ========================================================================= */
+
+static virp_vendor_t vendor_from_string(const char *s)
+{
+    if (!s) return VIRP_VENDOR_UNKNOWN;
+    if (strcmp(s, "cisco_ios") == 0) return VIRP_VENDOR_CISCO_IOS;
+    if (strcmp(s, "cisco") == 0)     return VIRP_VENDOR_CISCO_IOS;
+    if (strcmp(s, "fortinet") == 0)  return VIRP_VENDOR_FORTINET;
+    if (strcmp(s, "linux") == 0)     return VIRP_VENDOR_LINUX;
+    if (strcmp(s, "juniper") == 0)   return VIRP_VENDOR_JUNIPER;
+    if (strcmp(s, "paloalto") == 0)  return VIRP_VENDOR_PALOALTO;
+    if (strcmp(s, "panos") == 0)     return VIRP_VENDOR_PALOALTO;
+    if (strcmp(s, "windows") == 0)   return VIRP_VENDOR_WINDOWS;
+    if (strcmp(s, "proxmox") == 0)   return VIRP_VENDOR_PROXMOX;
+    if (strcmp(s, "cisco_asa") == 0) return VIRP_VENDOR_CISCO_ASA;
+    if (strcmp(s, "wazuh") == 0)     return VIRP_VENDOR_WAZUH;
+    if (strcmp(s, "mock") == 0)      return VIRP_VENDOR_MOCK;
+    return VIRP_VENDOR_UNKNOWN;
+}
+
+static bool json_get_string(struct json_object *obj, const char *key,
+                            char *out, size_t out_sz)
+{
+    struct json_object *val;
+    if (!json_object_object_get_ex(obj, key, &val)) return false;
+    if (!json_object_is_type(val, json_type_string)) return false;
+    const char *s = json_object_get_string(val);
+    if (!s) return false;
+    snprintf(out, out_sz, "%s", s);
+    return true;
+}
+
+static int load_devices_json(onode_state_t *state, const char *path)
+{
+    struct json_object *root = json_object_from_file(path);
+    if (!root) {
+        fprintf(stderr, "[O-Node] Failed to parse device config: %s\n", path);
+        return -1;
+    }
+
+    struct json_object *devices_arr;
+    if (!json_object_object_get_ex(root, "devices", &devices_arr) ||
+        !json_object_is_type(devices_arr, json_type_array)) {
+        fprintf(stderr, "[O-Node] Config missing 'devices' array\n");
+        json_object_put(root);
+        return -1;
+    }
+
+    int count = (int)json_object_array_length(devices_arr);
+    int loaded = 0;
+
+    for (int i = 0; i < count; i++) {
+        struct json_object *dev_obj = json_object_array_get_idx(devices_arr, i);
+        if (!dev_obj || !json_object_is_type(dev_obj, json_type_object))
+            continue;
+
+        virp_device_t device;
+        memset(&device, 0, sizeof(device));
+        device.enabled = true;
+        device.port = 22;
+
+        json_get_string(dev_obj, "hostname", device.hostname, sizeof(device.hostname));
+        json_get_string(dev_obj, "host",     device.host,     sizeof(device.host));
+        json_get_string(dev_obj, "username", device.username, sizeof(device.username));
+        json_get_string(dev_obj, "password", device.password, sizeof(device.password));
+        json_get_string(dev_obj, "enable",   device.enable_password,
+                        sizeof(device.enable_password));
+
+        struct json_object *val;
+        if (json_object_object_get_ex(dev_obj, "port", &val) &&
+            json_object_is_type(val, json_type_int))
+            device.port = (uint16_t)json_object_get_int(val);
+
+        char vendor_str[32] = {0};
+        if (json_get_string(dev_obj, "vendor", vendor_str, sizeof(vendor_str)))
+            device.vendor = vendor_from_string(vendor_str);
+        else
+            device.vendor = VIRP_VENDOR_UNKNOWN;
+
+        /*
+         * node_id accepts either a quoted hex string ("0A0000FD") or an
+         * unquoted JSON number. Legacy dev configs used hex strings; newer
+         * configs may use plain integers.
+         */
+        if (json_object_object_get_ex(dev_obj, "node_id", &val)) {
+            if (json_object_is_type(val, json_type_string)) {
+                const char *s = json_object_get_string(val);
+                if (s) device.node_id = (uint32_t)strtoul(s, NULL, 16);
+            } else if (json_object_is_type(val, json_type_int)) {
+                device.node_id = (uint32_t)json_object_get_int64(val);
+            }
+        }
+
+        if (device.hostname[0] == '\0' || device.host[0] == '\0') {
+            fprintf(stderr, "[O-Node] Skipping device %d: missing hostname/host\n", i);
+            continue;
+        }
+
+        if (device.vendor == VIRP_VENDOR_UNKNOWN) {
+            fprintf(stderr, "[O-Node] Skipping %s: unknown vendor '%s'\n",
+                    device.hostname, vendor_str);
+            continue;
+        }
+
+        virp_error_t err = onode_add_device(state, &device);
+        if (err != VIRP_OK) {
+            fprintf(stderr, "[O-Node] Failed to add %s: %s\n",
+                    device.hostname, virp_error_str(err));
+            continue;
+        }
+        loaded++;
+    }
+
+    json_object_put(root);
+    fprintf(stderr, "[O-Node] Loaded %d/%d devices from %s\n", loaded, count, path);
+    return loaded;
+}
 
 static void add_mock_devices(onode_state_t *state)
 {
@@ -258,7 +384,7 @@ int main(int argc, char **argv)
 
     /* Load devices */
     if (devices_path) {
-        onode_load_devices_json(&g_state, devices_path);
+        load_devices_json(&g_state, devices_path);
     } else if (use_mock) {
         add_mock_devices(&g_state);
     }
