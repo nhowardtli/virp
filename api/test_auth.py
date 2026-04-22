@@ -95,7 +95,6 @@ def client(server):
 MUTATING_ROUTES = [
     ("POST", "/api/observe", lambda: {"device": "R1", "command": "show ver"}),
     ("POST", "/api/sweep",   lambda: {"devices": ["R1"], "commands": ["show ver"]}),
-    ("POST", "/api/gate",    lambda: {"response": "R1 is up", "observations": []}),
     ("POST", "/api/devices/add",
         lambda: {"name": "R99", "host": "10.0.0.99", "driver": "cisco"}),
     ("DELETE", "/api/devices/R1", lambda: None),
