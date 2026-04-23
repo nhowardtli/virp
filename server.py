@@ -81,22 +81,22 @@ VIRP_TYPE_OBSERVATION = 0x01
 VIRP_TIER_NAMES = {0x00: "BLACK", 0x01: "GREEN", 0x02: "YELLOW", 0x03: "RED"}
 VIRP_FRAME_VERSION = 0x02
 
-# ── Validator Violation Codes ────────────────────────────────────────────────
-# Mirror of validator_violation_code_t from virp_validator.c on CT 211.
-# The C validator serialises these as integer codes in the JSON response;
-# this dict maps them to human-readable labels for banner rendering.
+# Violation codes. Must stay in sync with
+# /root/virp/include/virp_validator.h on CT 211, lines 79-88.
+# When the C header changes, this dict must change. A mismatch
+# produces banner text that misleads operators about what the
+# validator actually decided (observed 2026-04-23).
 VALIDATOR_VIOLATION_CODES = {
-    0:  "none",
-    1:  "evidence_ref references a tool_use_id not present in this turn",
-    2:  "evidence_ref is null but a matching tool call exists for the claimed device",
-    3:  "assertion device does not match the device targeted by the referenced tool call",
-    4:  "claim_text is not substantiated by the tool output",
-    5:  "prose_hash does not match the prose content received",
-    6:  "tool call was made but no assertion references it",
-    7:  "manifest schema is invalid",
-    8:  "duplicate assertion id in manifest",
-    9:  "assertion references an artifact_hash that is not in tool_call_refs",
-    10: "turn contained no tool calls but assertions claim tool-backed evidence",
+    0: "none",
+    1: "no_evidence_state_read",
+    2: "no_evidence_state_change",
+    3: "evidence_ref not present in this turn's tool results",
+    4: "evidence_ref not found in chain.db",
+    5: "unknown claim_type",
+    6: "prose_hash mismatch",
+    7: "manifest malformed",
+    8: "manifest too large",
+    9: "manifest missing",
 }
 
 
