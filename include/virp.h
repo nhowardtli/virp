@@ -112,6 +112,7 @@
 #define VIRP_OBS_INTENT_FETCHED     0x0D    /* Intent retrieved from DB */
 #define VIRP_OBS_INTENT_EXECUTED    0x0E    /* Intent execution counter updated */
 #define VIRP_OBS_ERROR              0x0F    /* Signed error: driver/transport failure */
+#define VIRP_OBS_VALIDATION_DECISION 0x10   /* Response-validator decision, signed by O-Node */
 
 /* =========================================================================
  * Observation Scope

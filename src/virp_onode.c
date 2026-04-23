@@ -21,6 +21,7 @@
 #include "virp_handshake.h"
 #include "virp_transcript.h"
 #include "virp_context.h"
+#include "virp_validator.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,6 +187,8 @@ static bool parse_request(const char *json, onode_request_t *req)
         req->action = ONODE_ACTION_INTENT_EXECUTE;
     else if (strcmp(action_str, "batch_execute") == 0)
         req->action = ONODE_ACTION_BATCH_EXECUTE;
+    else if (strcmp(action_str, "validate_turn") == 0)
+        req->action = ONODE_ACTION_VALIDATE_TURN;
     else if (strcmp(action_str, "session_hello") == 0)
         req->action = ONODE_ACTION_SESSION_HELLO;
     else if (strcmp(action_str, "session_bind") == 0)
@@ -1332,6 +1335,115 @@ static void handle_client(onode_state_t *state, int client_fd)
         for (int i = 0; i < cmd_count; i++)
             free(args[i].resp_buf);
 
+        break;
+    }
+
+    case ONODE_ACTION_VALIDATE_TURN: {
+        /*
+         * Response validator (CT 211 side).
+         *
+         * Request JSON shape:
+         *   {
+         *     "action": "validate_turn",
+         *     "session_id": "...",          // fallback if manifest unparseable
+         *     "prose": "...",
+         *     "manifest": { ...sidecar... }
+         *   }
+         *
+         * The manifest is a nested JSON object, not a string. We
+         * re-parse recv_buf here because it doesn't fit the flat
+         * onode_request_t schema — same approach as batch_execute.
+         *
+         * Response is a signed VIRP OBSERVATION with VIRP_OBS_VALIDATION_DECISION
+         * and a JSON payload describing the decision. The O-Key signature on
+         * the observation is the trust boundary: CT 210 cannot forge a PASS.
+         */
+        if (!state->chain_enabled) {
+            send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
+            break;
+        }
+
+        cJSON *root = cJSON_Parse(recv_buf);
+        if (!root || !cJSON_IsObject(root)) {
+            if (root) cJSON_Delete(root);
+            send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
+            break;
+        }
+
+        cJSON *mani  = cJSON_GetObjectItemCaseSensitive(root, "manifest");
+        cJSON *prose = cJSON_GetObjectItemCaseSensitive(root, "prose");
+
+        char *mani_json = NULL;
+        size_t mani_len = 0;
+        if (cJSON_IsObject(mani)) {
+            mani_json = cJSON_PrintUnformatted(mani);
+            if (mani_json) mani_len = strlen(mani_json);
+        }
+
+        const char *prose_str = cJSON_IsString(prose) ? prose->valuestring : "";
+        size_t prose_len = strlen(prose_str);
+
+        const char *fallback_sid = (req.session_id[0] != '\0')
+                                   ? req.session_id : "unknown";
+
+        validator_result_t vr;
+        virp_error_t verr = validator_run_turn(&state->chain,
+                                                mani_json, mani_len,
+                                                prose_str, prose_len,
+                                                fallback_sid, &vr);
+        if (mani_json) free(mani_json);
+        cJSON_Delete(root);
+
+        if (verr != VIRP_OK) {
+            send_framed_error(client_fd, verr);
+            break;
+        }
+
+        /*
+         * Build JSON payload. Up to VALIDATOR_MAX_ASSERTIONS per-
+         * assertion objects plus the envelope — fits in 8KB.
+         */
+        char json_buf[8192];
+        int joff = snprintf(json_buf, sizeof(json_buf),
+            "{\"decision\":\"%s\","
+            "\"turn_violation\":%d,"
+            "\"chain_sequence\":%lld,"
+            "\"chain_entry_hash\":\"%s\","
+            "\"artifact_hash\":\"%s\","
+            "\"assertions\":[",
+            validator_decision_str(vr.decision),
+            (int)vr.turn_violation,
+            (long long)vr.chain_sequence,
+            vr.chain_entry_hash,
+            vr.artifact_hash);
+
+        for (size_t i = 0; i < vr.per_assertion_count; i++) {
+            int jw = snprintf(json_buf + joff, sizeof(json_buf) - (size_t)joff,
+                "%s{\"decision\":\"%s\",\"violation\":%d}",
+                (i == 0) ? "" : ",",
+                validator_decision_str(vr.per_assertion[i].decision),
+                (int)vr.per_assertion[i].violation);
+            if (jw < 0 || (size_t)jw >= sizeof(json_buf) - (size_t)joff) {
+                send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+                goto validate_turn_done;
+            }
+            joff += jw;
+        }
+        joff += snprintf(json_buf + joff, sizeof(json_buf) - (size_t)joff, "]}");
+
+        err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
+                                      state->node_id, onode_next_seq(state),
+                                      VIRP_OBS_VALIDATION_DECISION, VIRP_SCOPE_LOCAL,
+                                      (const uint8_t *)json_buf, (uint16_t)joff,
+                                      &state->okey);
+        if (err == VIRP_OK && resp_len > 0) {
+            send_framed(client_fd, resp_buf, resp_len);
+            onode_inc_observations(state);
+        } else {
+            send_framed_error(client_fd, err);
+        }
+
+    validate_turn_done:
         break;
     }
 

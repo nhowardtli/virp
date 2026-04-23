@@ -24,6 +24,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_session.o \
              $(BUILD_DIR)/virp_handshake.o \
              $(BUILD_DIR)/virp_transcript.o \
+             $(BUILD_DIR)/virp_validator.o \
              $(BUILD_DIR)/cJSON.o
 
 # Optional Cisco driver (requires libssh2)
@@ -180,6 +181,9 @@ $(BUILD_DIR)/virp_handshake.o: src/virp_handshake.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_transcript.o: src/virp_transcript.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_validator.o: src/virp_validator.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(LIB): $(LIB_OBJS)
@@ -374,4 +378,13 @@ fuzz-libfuzzer: $(LIB)
 	      -lstdc++ -o $(FUZZ_LIBFUZZER)
 	@echo "Built $(FUZZ_LIBFUZZER) — run with: ./$(FUZZ_LIBFUZZER) [corpus_dir]"
 
-all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key
+# Response validator tests
+TEST_VALIDATOR = $(BUILD_DIR)/test_validator
+
+$(TEST_VALIDATOR): tests/test_validator.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-validator: $(TEST_VALIDATOR)
+	./$(TEST_VALIDATOR)
+
+all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-validator
