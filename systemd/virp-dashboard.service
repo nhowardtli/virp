@@ -1,0 +1,14 @@
+[Unit]
+Description=VIRP Dashboard with Landlock (Wall 4)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/virp-dashboard/landlock_cage.py
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
