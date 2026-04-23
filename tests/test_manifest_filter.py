@@ -123,6 +123,24 @@ class TestManifestFilter(unittest.TestCase):
         flushed = _flush_manifest_buffer(bs)
         self.assertEqual(flushed, "<<<")
 
+    def test_text_resumes_after_manifest_in_new_chunk(self):
+        """Closing delimiter in one chunk, resumed text in next chunk.
+
+        Guards against a stale manifest_buffer after the in_manifest
+        state transitions back to False. The existing split-delimiter
+        tests don't cover this because they include the resumed text
+        in the same chunk as the closing delimiter.
+        """
+        chunks = [
+            'before<<<VALIDATOR_MANIFEST>>>{"assertions":[]}<<<END_VALIDATOR_MANIFEST>>>',
+            "after",
+        ]
+        result = _simulate_stream(chunks)
+        self.assertIn("before", result)
+        self.assertIn("after", result)
+        self.assertNotIn("<<<", result)
+        self.assertNotIn("assertions", result)
+
     def test_flush_inside_manifest_discards(self):
         """Flush inside a manifest discards the buffer."""
         bs = _new_block_state()
