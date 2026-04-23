@@ -110,6 +110,93 @@ def _virp_recv_framed(sock):
     resp_len = struct.unpack("!I", len_data)[0]
     return _virp_recv_exact(sock, resp_len)
 
+
+# ── Manifest Streaming Filter ─────────────────────────────────────────────
+
+_MANIFEST_START = "<<<VALIDATOR_MANIFEST>>>"
+_MANIFEST_END = "<<<END_VALIDATOR_MANIFEST>>>"
+
+
+def _filter_manifest_for_stream(block_state, incoming):
+    """Buffer and emit only the text the user should see.
+
+    Manifest delimiters can arrive split across deltas. The state machine
+    holds a small buffer and only emits text once we're certain it is
+    outside the manifest block.
+
+    block_state must have keys: "in_manifest" (bool), "manifest_buffer" (str).
+    Returns the string to emit (may be empty).
+    """
+    buf = block_state["manifest_buffer"] + incoming
+    out = []
+
+    while buf:
+        if block_state["in_manifest"]:
+            # Look for closing delimiter
+            end_idx = buf.find(_MANIFEST_END)
+            if end_idx != -1:
+                # Skip everything up to and including the end delimiter
+                buf = buf[end_idx + len(_MANIFEST_END):]
+                block_state["in_manifest"] = False
+                block_state["manifest_buffer"] = ""
+                continue
+            # Could the end delimiter be starting at the tail?
+            # Check if the tail of buf is a prefix of _MANIFEST_END
+            held = 0
+            for k in range(1, min(len(_MANIFEST_END), len(buf)) + 1):
+                if _MANIFEST_END[:k] == buf[-k:]:
+                    held = k
+            if held:
+                # Hold back the potential partial delimiter
+                block_state["manifest_buffer"] = buf[-held:]
+            else:
+                block_state["manifest_buffer"] = ""
+            # Either way, nothing visible while inside manifest
+            return "".join(out)
+
+        # Not inside manifest — look for opening delimiter
+        start_idx = buf.find(_MANIFEST_START)
+        if start_idx != -1:
+            # Emit everything before the start delimiter
+            if start_idx > 0:
+                out.append(buf[:start_idx])
+            buf = buf[start_idx + len(_MANIFEST_START):]
+            block_state["in_manifest"] = True
+            block_state["manifest_buffer"] = ""
+            continue
+
+        # No full start delimiter found. Check for partial at the tail.
+        held = 0
+        for k in range(1, min(len(_MANIFEST_START), len(buf)) + 1):
+            if _MANIFEST_START[:k] == buf[-k:]:
+                held = k
+        if held:
+            # Emit everything except the potential partial delimiter
+            if len(buf) - held > 0:
+                out.append(buf[:len(buf) - held])
+            block_state["manifest_buffer"] = buf[-held:]
+        else:
+            out.append(buf)
+            block_state["manifest_buffer"] = ""
+        break
+
+    return "".join(out)
+
+
+def _flush_manifest_buffer(block_state):
+    """Flush remaining buffer on content_block_stop.
+
+    If we're not inside a manifest, emit whatever was held back.
+    If we ARE inside a manifest (LLM truncated), discard it.
+    """
+    if block_state["in_manifest"]:
+        block_state["manifest_buffer"] = ""
+        return ""
+    remaining = block_state["manifest_buffer"]
+    block_state["manifest_buffer"] = ""
+    return remaining
+
+
 # ── Vendor Display Mapping ─────────────────────────────────────────────────
 # Maps O-Node vendor codes to UI display names and default BGP commands.
 
@@ -364,6 +451,143 @@ def verify_chain_hash(hmac_hex, chain_index):
         return ("VERIFIED", f"chain_id={entry.get('id')} seq={entry.get('sequence')}")
 
     return ("FABRICATED", "NO_MATCH")
+
+
+def extract_validator_manifest(text):
+    """Pull the assertion manifest out of the assistant's response text.
+
+    Returns (stripped_text, manifest_dict_or_None, parse_error_or_None).
+    - stripped_text: the response text with the manifest block removed,
+      so the end user doesn't see raw JSON in the UI.
+    - manifest_dict: parsed manifest, or None if absent/malformed.
+    - parse_error: short string describing what went wrong, or None.
+
+    Missing manifest is NOT treated as a parse error here — surfaced as
+    manifest=None, error=None, and the caller decides policy.
+    """
+    START = "<<<VALIDATOR_MANIFEST>>>"
+    END = "<<<END_VALIDATOR_MANIFEST>>>"
+    start_idx = text.find(START)
+    if start_idx == -1:
+        return text, None, None
+    end_idx = text.find(END, start_idx + len(START))
+    if end_idx == -1:
+        return text, None, "manifest opening delimiter without close"
+    raw = text[start_idx + len(START):end_idx].strip()
+    stripped = (text[:start_idx] + text[end_idx + len(END):]).strip()
+    try:
+        manifest = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return stripped, None, f"manifest JSON parse failed: {e}"
+    if not isinstance(manifest, dict) or "assertions" not in manifest:
+        return stripped, None, "manifest missing 'assertions' key"
+    if not isinstance(manifest["assertions"], list):
+        return stripped, None, "manifest 'assertions' not a list"
+    return stripped, manifest, None
+
+
+def _parse_validation_observation(resp_bytes):
+    """Parse a VIRP OBSERVATION with obs_type 0x10 (validation decision).
+
+    The validator on CT 211 returns a signed VIRP observation. We skip
+    the 56-byte header, then the 4-byte observation sub-header
+    (obs_type, obs_scope, obs_length), and JSON-parse the payload.
+
+    Falls back to parsing the entire post-header blob as JSON if the
+    obs sub-header doesn't decode cleanly — defensive against future
+    format changes.
+    """
+    if len(resp_bytes) < VIRP_HEADER_SIZE:
+        # Try raw JSON parse for non-VIRP-framed responses
+        return json.loads(resp_bytes.decode("utf-8"))
+
+    payload_bytes = resp_bytes[VIRP_HEADER_SIZE:]
+
+    # Try observation sub-header parse first (matches onode_execute pattern)
+    if len(payload_bytes) >= 4:
+        obs_length = struct.unpack_from("!H", payload_bytes, 2)[0]
+        if 4 + obs_length <= len(payload_bytes):
+            obs_text = payload_bytes[4:4 + obs_length].decode("utf-8", errors="replace")
+            try:
+                return json.loads(obs_text)
+            except json.JSONDecodeError:
+                pass
+
+    # Fallback: entire payload as JSON
+    return json.loads(payload_bytes.decode("utf-8", errors="replace"))
+
+
+def validate_turn_with_211(manifest, prose, collected_hmacs, session_id):
+    """Call ONODE_ACTION_VALIDATE_TURN on CT 211.
+
+    Builds the wire payload matching what virp_validator.c expects and
+    sends it over the v2-framed ONODE_HOST:ONODE_PORT socket.
+
+    Returns: (decision, violations, chain_seq, chain_entry_hash, error)
+      decision: "pass" | "warn" | "block" | "error"
+      violations: list of strings suitable for display
+      chain_seq: int or None
+      chain_entry_hash: str or None
+      error: str or None (set when decision == "error")
+    """
+    # TODO: pinned O-Key fingerprint verification goes here when that
+    # lands. Today we trust the framed response from ONODE_HOST:ONODE_PORT
+    # based on network reachability. Tracked in api/validator/__init__.py
+    # TODO block on CT 211.
+    try:
+        prose_hash = hashlib.sha256(prose.encode("utf-8")).hexdigest()
+        turn_id = f"t_{int(time.time() * 1000)}"
+
+        # tool_use_id → artifact_hash translation. collected_hmacs is a
+        # list of (hmac_full, hostname). For the first integration pass,
+        # pass through the artifact_hashes and let the validator check
+        # membership. Claim-to-tool_use binding sharpens in a follow-up.
+        tool_call_refs = [h for h, _ in collected_hmacs]
+
+        wire_manifest = {
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "prose_hash": prose_hash,
+            "tool_call_refs": tool_call_refs,
+            "assertions": manifest.get("assertions", []),
+        }
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(ONODE_TIMEOUT)
+        sock.connect((ONODE_HOST, ONODE_PORT))
+        req = json.dumps({
+            "action": "validate_turn",
+            "session_id": session_id,
+            "prose": prose,
+            "manifest": wire_manifest,
+        })
+        # Use the same v2 framing as all other ONODE calls in this file
+        _virp_send_framed(sock, req.encode("utf-8"))
+        resp_bytes = _virp_recv_framed(sock)
+        sock.close()
+
+        if not resp_bytes:
+            return ("error", [], None, None, "empty response from validator")
+
+        payload = _parse_validation_observation(resp_bytes)
+
+        decision = payload.get("decision", "error")
+        violations = []
+        if payload.get("turn_violation") and payload["turn_violation"] != "none":
+            violations.append(f"manifest: {payload['turn_violation']}")
+        for a in payload.get("assertions", []):
+            v = a.get("violation", "none")
+            if v != "none":
+                violations.append(f"assertion {a.get('id', '?')}: {v}")
+
+        return (decision, violations,
+                payload.get("chain_sequence"),
+                payload.get("chain_entry_hash"),
+                None)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        return ("error", [], None, None, f"validator unreachable: {e}")
+    except Exception as e:
+        return ("error", [], None, None, f"validator call failed: {e}")
 
 
 def verify_all_hashes(hmac_list):
@@ -759,6 +983,49 @@ def build_ironclaw_system_prompt():
         "No markdown tables unless requested. No blast radius diagrams unless requested. "
         "If everything is fine, say so in one line. "
         "If one device needs attention, name it and state the issue in two sentences.",
+        "",
+        "## Assertion Manifest (required for every response)",
+        "",
+        "After your main response text, you MUST emit an assertion manifest "
+        "block. This is not optional. A response without a manifest will be "
+        "flagged UNVERIFIED at the gate.",
+        "",
+        "The manifest is a fenced JSON block with the exact delimiters shown:",
+        "",
+        "<<<VALIDATOR_MANIFEST>>>",
+        '{',
+        '  "assertions": [',
+        '    {',
+        '      "id": "a_01",',
+        '      "device": "R1",',
+        '      "claim_type": "state_read",',
+        '      "claim_text": "interface Gi0/1 is administratively up",',
+        '      "evidence_ref": "<tool_use_id from this turn>"',
+        '    }',
+        '  ]',
+        '}',
+        "<<<END_VALIDATOR_MANIFEST>>>",
+        "",
+        "Rules:",
+        "- One assertion per device-state claim you made in the main text. "
+        "Every factual claim about device state, config, or topology must "
+        "have a corresponding assertion. Narrative text, hedging, and "
+        "questions back to the user do NOT require assertions.",
+        "- claim_type is one of: state_read, state_change, config_read, "
+        "config_change. Pick the narrowest accurate type.",
+        "- evidence_ref MUST be the tool_use_id of a tool_use block you "
+        "issued in this same turn that returned the data backing the claim. "
+        "If the claim is not backed by a tool_use in this turn (e.g. you "
+        "are recalling prior context or speculating), set evidence_ref to "
+        "null explicitly.",
+        "- NEVER fabricate a tool_use_id. The gate will reject any "
+        "evidence_ref that does not match a tool_use_id the API framework "
+        "actually recorded this turn.",
+        "- If you made no device-state claims, emit an empty assertions array. "
+        "Do not omit the manifest.",
+        "",
+        "The manifest is parsed by a validator outside your control. It is "
+        "not a formatting convention — it is a machine-verified contract.",
         "",
     ]
 
@@ -1817,7 +2084,15 @@ class VIRPHandler(BaseHTTPRequestHandler):
                         "type": cb.get("type"), "id": cb.get("id"),
                         "name": cb.get("name"), "text": "",
                         "thinking": "", "signature": "", "input_json": "",
+                        "in_manifest": False, "manifest_buffer": "",
                     }
+                elif ev_type == "content_block_stop":
+                    idx = ev.get("index", -1)
+                    b = blocks.get(idx)
+                    if b and b["type"] == "text":
+                        flushed = _flush_manifest_buffer(b)
+                        if flushed:
+                            sse({"type": "text", "text": flushed})
                 elif ev_type == "content_block_delta":
                     idx = ev.get("index", -1)
                     delta = ev.get("delta", {})
@@ -1826,8 +2101,11 @@ class VIRPHandler(BaseHTTPRequestHandler):
                     if b is None:
                         continue
                     if dt == "text_delta":
-                        b["text"] += delta.get("text", "")
-                        sse({"type": "text", "text": delta.get("text", "")})
+                        chunk_text = delta.get("text", "")
+                        b["text"] += chunk_text  # full text kept for the gate
+                        visible = _filter_manifest_for_stream(b, chunk_text)
+                        if visible:
+                            sse({"type": "text", "text": visible})
                     elif dt == "thinking_delta":
                         b["thinking"] += delta.get("thinking", "")
                         sse({"type": "thinking", "text": delta.get("thinking", "")})
@@ -1977,6 +2255,15 @@ class VIRPHandler(BaseHTTPRequestHandler):
                     if block.get("type") == "text":
                         final_text += block.get("text", "")
 
+            # Layer 2 prep — pull manifest out of final_text so downstream
+            # gate layers see the prose without the machine-readable block.
+            display_text, manifest, manifest_parse_err = \
+                extract_validator_manifest(final_text)
+            # Overwrite final_text so Layer 1 checks against the display prose,
+            # not the manifest JSON. The original assistant_content blocks are
+            # left untouched — history retention is downstream of this.
+            final_text = display_text
+
             # --- Layer 0: Chain Verification (HMAC → chain.db) ---
             # Verify every HMAC from tool results against the chain
             # verification service on CT 211.  This runs BEFORE the
@@ -2046,6 +2333,84 @@ class VIRPHandler(BaseHTTPRequestHandler):
                          "chain_results": [(h[:12], s) for h, s, _ in chain_results]})
                     if collected_hmacs:
                         print(f"[OBSERVATION-GATE] VERIFIED: {len(collected_hmacs)} hash(es) confirmed in chain.db")
+
+            # --- Layer 2: Claim-level manifest validation ---
+            # Runs only if Layers 0/0b/1 did not already hard-flag as
+            # FABRICATED. A FABRICATED chain verification makes Layer 2
+            # moot — that is a stronger signal. If Layer 1 flagged,
+            # Layer 2 still runs because it adds claim-level detail.
+            if chain_status not in ("FABRICATED",):
+                if manifest_parse_err:
+                    warning = (
+                        f"\n\n**[OBSERVATION GATE: MANIFEST MALFORMED]** "
+                        f"{manifest_parse_err}. Response cannot be claim-verified."
+                    )
+                    sse({"type": "text", "text": warning})
+                    sse({"type": "gate_warning", "warning": warning,
+                         "verification": "MANIFEST_MALFORMED", "flagged": True})
+                    print(f"[OBSERVATION-GATE] MANIFEST_MALFORMED: {manifest_parse_err}")
+                elif manifest is None:
+                    warning = (
+                        "\n\n**[OBSERVATION GATE: MANIFEST MISSING]** "
+                        "Response contained no assertion manifest. Per system "
+                        "prompt contract, this is UNVERIFIED at claim level."
+                    )
+                    sse({"type": "text", "text": warning})
+                    sse({"type": "gate_warning", "warning": warning,
+                         "verification": "MANIFEST_MISSING", "flagged": True})
+                    print("[OBSERVATION-GATE] MANIFEST_MISSING")
+                else:
+                    session_id = body.get("session_id") or f"dash_{int(time.time())}"
+                    decision, violations, chain_seq, chain_hash, err = \
+                        validate_turn_with_211(
+                            manifest, final_text, collected_hmacs, session_id,
+                        )
+                    if err:
+                        warning = (
+                            f"\n\n**[OBSERVATION GATE: VALIDATOR UNREACHABLE]** "
+                            f"{err}"
+                        )
+                        sse({"type": "text", "text": warning})
+                        sse({"type": "gate_warning", "warning": warning,
+                             "verification": "VALIDATOR_UNREACHABLE",
+                             "flagged": True})
+                        print(f"[OBSERVATION-GATE] VALIDATOR_UNREACHABLE: {err}")
+                    elif decision == "block":
+                        warning = (
+                            f"\n\n**[OBSERVATION GATE: CLAIM-LEVEL BLOCK]** "
+                            f"Validator rejected this response. "
+                            f"Violations: {'; '.join(violations) or 'unspecified'}. "
+                            f"Chain entry #{chain_seq}."
+                        )
+                        sse({"type": "text", "text": warning})
+                        sse({"type": "gate_warning", "warning": warning,
+                             "verification": "CLAIM_BLOCK",
+                             "violations": violations,
+                             "chain_sequence": chain_seq,
+                             "chain_entry_hash": chain_hash,
+                             "flagged": True})
+                        print(f"[OBSERVATION-GATE] CLAIM_BLOCK: {'; '.join(violations)}")
+                    elif decision == "warn":
+                        warning = (
+                            f"\n\n**[OBSERVATION GATE: CLAIM-LEVEL WARN]** "
+                            f"{'; '.join(violations)}. Chain entry #{chain_seq}."
+                        )
+                        sse({"type": "text", "text": warning})
+                        sse({"type": "gate_warning", "warning": warning,
+                             "verification": "CLAIM_WARN",
+                             "violations": violations,
+                             "chain_sequence": chain_seq,
+                             "chain_entry_hash": chain_hash,
+                             "flagged": True})
+                        print(f"[OBSERVATION-GATE] CLAIM_WARN: {'; '.join(violations)}")
+                    else:
+                        # pass — surface the audit pointer without a banner
+                        sse({"type": "gate_warning",
+                             "verification": "CLAIM_VERIFIED",
+                             "chain_sequence": chain_seq,
+                             "chain_entry_hash": chain_hash,
+                             "flagged": False})
+                        print(f"[OBSERVATION-GATE] CLAIM_VERIFIED: chain_seq={chain_seq}")
 
             sse({"type": "done"})
 
