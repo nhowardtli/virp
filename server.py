@@ -81,6 +81,39 @@ VIRP_TYPE_OBSERVATION = 0x01
 VIRP_TIER_NAMES = {0x00: "BLACK", 0x01: "GREEN", 0x02: "YELLOW", 0x03: "RED"}
 VIRP_FRAME_VERSION = 0x02
 
+# ── Validator Violation Codes ────────────────────────────────────────────────
+# Mirror of validator_violation_code_t from virp_validator.c on CT 211.
+# The C validator serialises these as integer codes in the JSON response;
+# this dict maps them to human-readable labels for banner rendering.
+VALIDATOR_VIOLATION_CODES = {
+    0:  "none",
+    1:  "evidence_ref references a tool_use_id not present in this turn",
+    2:  "evidence_ref is null but a matching tool call exists for the claimed device",
+    3:  "assertion device does not match the device targeted by the referenced tool call",
+    4:  "claim_text is not substantiated by the tool output",
+    5:  "prose_hash does not match the prose content received",
+    6:  "tool call was made but no assertion references it",
+    7:  "manifest schema is invalid",
+    8:  "duplicate assertion id in manifest",
+    9:  "assertion references an artifact_hash that is not in tool_call_refs",
+    10: "turn contained no tool calls but assertions claim tool-backed evidence",
+}
+
+
+def _stringify_violation(code):
+    """Translate a validator violation code to a display string.
+
+    Accepts int codes (from the C enum) or pre-stringified values.
+    Unknown codes pass through as-is so the banner always shows *something*.
+    """
+    if isinstance(code, int):
+        return VALIDATOR_VIOLATION_CODES.get(code, f"unknown violation code {code}")
+    # Already a string — look up by name in case the C side sent the enum
+    # name instead of the int (defensive), otherwise return as-is.
+    if code == "none":
+        return "none"
+    return str(code)
+
 
 # ── V2 Socket Framing Helpers ──────────────────────────────────────────────
 
@@ -517,11 +550,19 @@ def _parse_validation_observation(resp_bytes):
     return json.loads(payload_bytes.decode("utf-8", errors="replace"))
 
 
-def validate_turn_with_211(manifest, prose, collected_hmacs, session_id):
+def validate_turn_with_211(manifest, prose, collected_hmacs, session_id,
+                           evidence_map=None):
     """Call ONODE_ACTION_VALIDATE_TURN on CT 211.
 
     Builds the wire payload matching what virp_validator.c expects and
     sends it over the v2-framed ONODE_HOST:ONODE_PORT socket.
+
+    Args:
+      evidence_map: dict mapping "tool_result[N]" → artifact_hash, where
+        N is the zero-based index of successful tool calls in the current
+        turn, in emission order.  When provided, each assertion's
+        evidence_ref is translated to the corresponding artifact_hash
+        before the manifest is sent to the validator.
 
     Returns: (decision, violations, chain_seq, chain_entry_hash, error)
       decision: "pass" | "warn" | "block" | "error"
@@ -534,24 +575,43 @@ def validate_turn_with_211(manifest, prose, collected_hmacs, session_id):
     # lands. Today we trust the framed response from ONODE_HOST:ONODE_PORT
     # based on network reachability. Tracked in api/validator/__init__.py
     # TODO block on CT 211.
+    if evidence_map is None:
+        evidence_map = {}
     try:
         prose_hash = hashlib.sha256(prose.encode("utf-8")).hexdigest()
         turn_id = f"t_{int(time.time() * 1000)}"
 
-        # tool_use_id → artifact_hash translation. collected_hmacs is a
-        # list of (hmac_full, hostname). For the first integration pass,
-        # pass through the artifact_hashes and let the validator check
-        # membership. Claim-to-tool_use binding sharpens in a follow-up.
-        tool_call_refs = [h for h, _ in collected_hmacs]
+        # Build tool_call_refs from the evidence_map values (deduplicated,
+        # stable order). Falls back to collected_hmacs pass-through when
+        # the map is empty (no tool calls this turn).
+        if evidence_map:
+            seen = {}
+            tool_call_refs = []
+            for h in evidence_map.values():
+                if h not in seen:
+                    seen[h] = True
+                    tool_call_refs.append(h)
+        else:
+            tool_call_refs = [h for h, _ in collected_hmacs]
+
+        # Translate evidence_ref (tool_use_id) → artifact_hash in each
+        # assertion so the validator receives artifact hashes it can
+        # check against tool_call_refs directly.
+        wire_assertions = []
+        for a in manifest.get("assertions", []):
+            wa = dict(a)
+            ref = wa.get("evidence_ref")
+            if ref and ref in evidence_map:
+                wa["evidence_ref"] = evidence_map[ref]
+            wire_assertions.append(wa)
 
         wire_manifest = {
             "turn_id": turn_id,
             "session_id": session_id,
             "prose_hash": prose_hash,
             "tool_call_refs": tool_call_refs,
-            "assertions": manifest.get("assertions", []),
+            "assertions": wire_assertions,
         }
-
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(ONODE_TIMEOUT)
         sock.connect((ONODE_HOST, ONODE_PORT))
@@ -573,12 +633,15 @@ def validate_turn_with_211(manifest, prose, collected_hmacs, session_id):
 
         decision = payload.get("decision", "error")
         violations = []
-        if payload.get("turn_violation") and payload["turn_violation"] != "none":
-            violations.append(f"manifest: {payload['turn_violation']}")
+        tv = payload.get("turn_violation")
+        tv_str = _stringify_violation(tv) if tv is not None else "none"
+        if tv_str != "none":
+            violations.append(f"manifest: {tv_str}")
         for a in payload.get("assertions", []):
             v = a.get("violation", "none")
-            if v != "none":
-                violations.append(f"assertion {a.get('id', '?')}: {v}")
+            v_str = _stringify_violation(v)
+            if v_str != "none":
+                violations.append(f"assertion {a.get('id', '?')}: {v_str}")
 
         return (decision, violations,
                 payload.get("chain_sequence"),
@@ -1013,14 +1076,26 @@ def build_ironclaw_system_prompt():
         "questions back to the user do NOT require assertions.",
         "- claim_type is one of: state_read, state_change, config_read, "
         "config_change. Pick the narrowest accurate type.",
-        "- evidence_ref MUST be the tool_use_id of a tool_use block you "
-        "issued in this same turn that returned the data backing the claim. "
-        "If the claim is not backed by a tool_use in this turn (e.g. you "
+        "- evidence_ref MUST be a sequential index referring to a tool_use "
+        "block you issued in this turn. Format: \"tool_result[N]\" where N "
+        "is the zero-based index of the tool_use block in the order you "
+        "emitted them. The FIRST successful tool call is tool_result[0], "
+        "the SECOND is tool_result[1], and so on. Count only successful "
+        "tool calls — tool calls that were blocked (e.g. RED-tier) or "
+        "returned errors do NOT get an index and cannot be cited as "
+        "evidence.",
+        "- Do NOT invent descriptive IDs like \"result_R1_show_interfaces\" or "
+        "\"tool_R1_brief\". The ONLY valid format is \"tool_result[N]\".",
+        "- Do NOT cite the tool_use_id string (e.g. \"toolu_01...\") — you "
+        "cannot reliably know that value while generating your response. "
+        "Use the sequential index instead.",
+        "- If the claim is not backed by a tool_use in this turn (e.g. you "
         "are recalling prior context or speculating), set evidence_ref to "
         "null explicitly.",
-        "- NEVER fabricate a tool_use_id. The gate will reject any "
-        "evidence_ref that does not match a tool_use_id the API framework "
-        "actually recorded this turn.",
+        "- NEVER fabricate an evidence_ref. The gate will reject any "
+        "evidence_ref that does not match a successful tool call made in "
+        "this turn. If you are recalling prior context or speculating, "
+        "set evidence_ref to null (not a made-up index).",
         "- If you made no device-state claims, emit an empty assertions array. "
         "Do not omit the manifest.",
         "",
@@ -2167,6 +2242,8 @@ class VIRPHandler(BaseHTTPRequestHandler):
 
         try:
             collected_hmacs = []  # (hmac_hex, hostname) from tool results
+            evidence_map = {}    # "tool_result[N]" → artifact_hash (hmac_full)
+            tool_call_index = 0  # counts tool_use blocks emitted this turn
 
             for _iteration in range(10):
                 api_payload = {
@@ -2233,6 +2310,9 @@ class VIRPHandler(BaseHTTPRequestHandler):
                             hmac_full = result.get("hmac_full") or result.get("hmac")
                             if hmac_full and not result.get("error"):
                                 collected_hmacs.append((hmac_full, hostname))
+                                key = f"tool_result[{tool_call_index}]"
+                                evidence_map[key] = hmac_full
+                                tool_call_index += 1
                                 _bridge_chain_register(hmac_full, hostname, command)
                     else:
                         result_text = f"Unknown tool: {tool_name}"
@@ -2364,6 +2444,7 @@ class VIRPHandler(BaseHTTPRequestHandler):
                     decision, violations, chain_seq, chain_hash, err = \
                         validate_turn_with_211(
                             manifest, final_text, collected_hmacs, session_id,
+                            evidence_map=evidence_map,
                         )
                     if err:
                         warning = (
