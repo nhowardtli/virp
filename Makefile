@@ -387,4 +387,12 @@ $(TEST_VALIDATOR): tests/test_validator.c $(LIB)
 test-validator: $(TEST_VALIDATOR)
 	./$(TEST_VALIDATOR)
 
+# Opt-in end-to-end wire harness. Spins up virp-onode-prod and round-
+# trips three cases through api/validator to prove the C dispatcher and
+# the Python client agree on byte layout. Kept out of `make test` so the
+# default suite stays fast and driver-free.
+.PHONY: test-validator-e2e
+test-validator-e2e: prod-full
+	python3 tests/test_validator_e2e.py
+
 all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-validator

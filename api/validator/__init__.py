@@ -38,6 +38,25 @@ path by design.
 Copyright 2026 Third Level IT LLC.
 """
 
+# ---------------------------------------------------------------------------
+# TODO — mandatory O-Key signature verification
+#
+# validate_turn() currently accepts bridge= as an optional parameter for
+# HMAC verification of the signed observation response. This means a
+# caller that forgets to pass bridge= will trust whatever CT 211 claims,
+# unverified.
+#
+# Target state: the O-Key's public fingerprint is pinned on CT 210 (see
+# server.py:key_info()), validate_turn rejects any response whose
+# signature does not verify against the pinned fingerprint, and the
+# bridge= parameter becomes non-optional.
+#
+# Not done now because it requires deciding where O-Key fingerprint
+# material lives on CT 210 and how it's rotated. Revisit before the
+# validator moves to production-enforcing mode (i.e. before CT 210's AI
+# layer is required to emit manifests).
+# ---------------------------------------------------------------------------
+
 import hashlib
 import json
 import os
@@ -283,17 +302,25 @@ def validate_turn(session_id: str,
     )
 
 
-def attach_banner(prose: str, result: ValidationResult) -> str:
-    """Prepend a banner to prose for non-PASS decisions; passthrough otherwise.
+def attach_banner(prose: str,
+                  result: ValidationResult,
+                  allow_blocked_prose: bool = False) -> str:
+    """Apply the validator's decision to the outbound prose.
 
-    This helper does not suppress BLOCK prose — the AI layer's output is
-    returned intact with a banner. Callers that need harder handling
-    (hide output, redact, refuse to send) should check result.decision
-    directly.
+    - PASS: prose returned unchanged, no banner.
+    - WARN: banner prepended, prose retained.
+    - BLOCK: banner only. Prose is suppressed at the library level so
+      that a caller who forgets to check result.decision still fails
+      closed rather than leaking a fabrication.
+    - BLOCK with allow_blocked_prose=True: banner + prose. Use only for
+      audit or debugging contexts where seeing what was blocked is the
+      point.
     """
     banner = result.banner()
     if banner is None:
         return prose
+    if result.decision == Decision.BLOCK and not allow_blocked_prose:
+        return banner
     return f"{banner}\n\n{prose}"
 
 

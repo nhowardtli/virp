@@ -204,6 +204,11 @@ VIRP_OBS_VALIDATION_DECISION = 0x10`) whose payload is UTF-8 JSON:
   a bridge, CT 210 still has chain.db as the durable tamper-evident
   record.
 
+- On BLOCK, `attach_banner` returns banner-only. Prose is suppressed by
+  the library. Callers that need to surface blocked prose for audit or
+  debugging must explicitly opt in with `allow_blocked_prose=True`.
+  Fail-closed is the default.
+
 - `chain_sequence` and `chain_entry_hash` point at the row the
   validator just wrote under `artifact_type = "validation"`. An
   auditor can replay the chain and reproduce the decision from
