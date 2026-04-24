@@ -159,58 +159,6 @@ key_material = None
 key_fingerprint = None
 _virp_bridge = None  # VIRPBridge instance for C-based HMAC verification
 
-# Observation payload cache — stores raw signed output for content fidelity
-# checks. Key: (device, sequence) → {"payload": str, "verified": bool,
-# "timestamp": float}. OrderedDict gives us LRU eviction via
-# popitem(last=False); move_to_end() bumps an entry to MRU on access.
-# Guarded by _obs_cache_lock because both the writer path (observe,
-# sweep) and the reader path run on async workers
-# that may be dispatched to different threads by uvicorn.
-_obs_payload_cache: "collections.OrderedDict[tuple[str, int], dict]" = collections.OrderedDict()
-_OBS_CACHE_MAX = 500
-_obs_cache_lock = asyncio.Lock()
-
-
-async def _cache_observation(device: str, sequence: int, payload: str,
-                             verified: bool, timestamp: float = 0.0) -> None:
-    """
-    Store a raw observation payload under the lock, evicting the LRU
-    entry when _OBS_CACHE_MAX is reached. If (device, sequence) is
-    already present, its entry is updated and moved to MRU rather than
-    duplicated.
-    """
-    key = (device, sequence)
-    async with _obs_cache_lock:
-        _obs_payload_cache[key] = {
-            "payload": payload,
-            "verified": verified,
-            "timestamp": timestamp or time.time(),
-        }
-        _obs_payload_cache.move_to_end(key)
-        while len(_obs_payload_cache) > _OBS_CACHE_MAX:
-            _obs_payload_cache.popitem(last=False)
-
-
-async def _get_latest_cached(device: str) -> Optional[dict]:
-    """
-    Return the most recent cached observation for `device`, marking it
-    MRU. O(n) scan over the cache — n is bounded by _OBS_CACHE_MAX, so
-    this is fine at 500 but should move to a per-device index if the
-    cap ever rises into the 10k+ range.
-    """
-    async with _obs_cache_lock:
-        latest_key = None
-        latest_seq = -1
-        for (d, seq) in _obs_payload_cache:
-            if d == device and seq > latest_seq:
-                latest_seq = seq
-                latest_key = (d, seq)
-        if latest_key is None:
-            return None
-        _obs_payload_cache.move_to_end(latest_key)
-        return _obs_payload_cache[latest_key]
-
-
 # ---------------------------------------------------------------------------
 # Key Management
 # ---------------------------------------------------------------------------
@@ -963,15 +911,6 @@ async def observe(req: ObserveRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Observation failed: {e}")
 
-    # Cache payload for content fidelity gate
-    await _cache_observation(
-        device=req.device,
-        sequence=obs.get("sequence", 0),
-        payload=obs.get("payload", ""),
-        verified=obs.get("verified", False),
-        timestamp=obs.get("timestamp", 0.0),
-    )
-
     # Log it. deque(maxlen=...) drops the oldest automatically; no
     # manual trim, no O(n) pop(0) — and the bound is enforced by the
     # container, not by a racy length check.
@@ -1041,13 +980,6 @@ async def sweep(req: SweepRequest):
                         "verified": False,
                     })
                 else:
-                    await _cache_observation(
-                        device=dev,
-                        sequence=obs.get("sequence", 0),
-                        payload=obs.get("payload", ""),
-                        verified=obs.get("verified", False),
-                        timestamp=obs.get("timestamp", 0.0),
-                    )
                     device_results.get(dev, []).append({
                         "command": cmd,
                         "verified": obs.get("verified", False),
