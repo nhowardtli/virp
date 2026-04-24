@@ -95,8 +95,16 @@ def _load_libvirp() -> ctypes.CDLL:
     Load libvirp.so. Raises RuntimeError if not found.
     No fallback — the C library is mandatory.
     """
+    # Module-relative: api/virp_bridge.py → ../build/libvirp.so. Resolves
+    # to wherever the repo is checked out so callers don't need to install
+    # into /opt or /usr. Kept in the list alongside the legacy /opt path
+    # so existing deployments still work.
+    _repo_build = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "libvirp.so")
+    )
     search_paths = [
         os.environ.get("VIRP_LIB_PATH", ""),
+        _repo_build,
         "/opt/virp/build/libvirp.so",
         "/usr/local/lib/libvirp.so",
         "/usr/lib/libvirp.so",
