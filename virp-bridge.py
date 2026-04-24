@@ -86,6 +86,29 @@ with open(OKEY_PATH, "rb") as _f:
 assert len(OKEY) == 32, f"O-Key must be 32 bytes, got {len(OKEY)}"
 log.info("O-Key loaded from %s", OKEY_PATH)
 
+# HMAC verification path — mirrors api/server.py.
+# Primary: route through VIRPBridge (libvirp.so, chain-backed).
+# Fallback: pure-Python hmac — only if VIRP_ALLOW_PY_FALLBACK=1.
+VIRP_ALLOW_PY_FALLBACK = os.environ.get("VIRP_ALLOW_PY_FALLBACK", "") == "1"
+_virp_bridge = None
+
+try:
+    _api_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api")
+    if _api_dir not in sys.path:
+        sys.path.insert(0, _api_dir)
+    from virp_bridge import VIRPBridge
+    _virp_bridge = VIRPBridge(key_path=OKEY_PATH)
+    log.info("C bridge loaded for HMAC verification")
+except Exception as _e:
+    _virp_bridge = None
+    if VIRP_ALLOW_PY_FALLBACK:
+        log.warning("C bridge unavailable (%s), using Python HMAC fallback", _e)
+    else:
+        log.error(
+            "C bridge unavailable (%s) and VIRP_ALLOW_PY_FALLBACK!=1 — "
+            "HMAC verification will fail closed", _e,
+        )
+
 
 def _recv_exact(s, n: int) -> bytes:
     buf = b""
@@ -208,8 +231,18 @@ def onode_request(device: str, command: str) -> bytes:
 
 
 def verify_hmac(msg: bytes) -> bool:
-    """Verify HMAC-SHA256: covers [0:24] + [56:] — skips hmac field [24:56]."""
+    """Verify HMAC-SHA256 via libvirp (C) with optional Python fallback.
+
+    C path: VIRPBridge.verify_observation — the same chain-backed path
+    api/server.py uses. Python path: only engaged when the C bridge is
+    unavailable AND VIRP_ALLOW_PY_FALLBACK=1; otherwise fail closed so a
+    broken bridge cannot silently downgrade to a weaker code path.
+    """
     if len(msg) < HEADER_SIZE:
+        return False
+    if _virp_bridge is not None:
+        return _virp_bridge.verify_observation(msg)
+    if not VIRP_ALLOW_PY_FALLBACK:
         return False
     received = msg[HMAC_OFFSET:HMAC_OFFSET + HMAC_SIZE]
     sign_data = msg[:HMAC_OFFSET] + msg[HMAC_OFFSET + HMAC_SIZE:]
