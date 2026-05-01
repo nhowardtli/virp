@@ -363,68 +363,107 @@ def chain_export():
         return {"error": str(e), "entries": [], "total": 0}
 
 
-def chain_register(hmac_hex, device, command_text, tier="GREEN", node_id=0):
-    """Register an observation HMAC in chain.db for later verification.
+def chain_register(observation_b64, device, command_text, tier="GREEN", node_id=0):
+    """Register an observation in chain.db via O-Node CHAIN_APPEND.
 
-    Called by the dashboard after onode_execute() returns a valid HMAC.
-    This bridges the gap between the O-Node's in-memory HMAC generation
-    and the chain.db audit trail.
+    Caller supplies the raw observation bytes (base64-encoded). This
+    function:
+      1. Computes artifact_hash = sha256(raw_observation_bytes)
+      2. Sends 'chain_append' to the O-Node, which computes chain_hmac
+         and chain_entry_hash over the canonical entry JSON.
+
+    The bridge makes ZERO direct DB connections. All chain mutation
+    goes through the O-Node so the C-side primitives compute the
+    integrity hashes correctly per virp_chain_append().
+
+    NOTE: 'tier' and 'node_id' are accepted for wire compatibility with
+    the prior signature but are not used here -- signer_node_id is set
+    server-side from the O-Node's own state, and tier classification
+    happens at the dashboard, not in chain registration.
     """
+    import base64
     import time as _time
     try:
-        conn = sqlite3.connect(CHAIN_DB)
-        cur = conn.cursor()
-
+        raw_observation = base64.b64decode(observation_b64)
+        artifact_hash = hashlib.sha256(raw_observation).hexdigest()
+        artifact_id = f"obs:{device}:{int(_time.time_ns())}"
         session_id = _session_id or "dashboard-obs"
-        now_ns = int(_time.time() * 1e9)
 
-        # Get previous entry hash and next sequence for chain linking
-        cur.execute(
-            "SELECT chain_entry_hash, sequence FROM chain_entries "
-            "WHERE session_id = ? ORDER BY sequence DESC LIMIT 1",
-            (session_id,),
+        # artifact_content is stored verbatim by virp_chain_artifact_store.
+        # Decode as UTF-8 if possible; otherwise mark as base64 so the
+        # verifier can recover bytes.
+        try:
+            artifact_content = raw_observation.decode("utf-8")
+        except UnicodeDecodeError:
+            artifact_content = f"base64:{observation_b64}"
+
+        resp_bytes = onode_send({
+            "action": "chain_append",
+            "session_id": session_id,
+            "artifact_type": "observation",
+            "artifact_id": artifact_id,
+            "artifact_hash": artifact_hash,
+            "artifact_content": artifact_content,
+        })
+
+        if not resp_bytes:
+            log.error("chain_register: empty response from O-Node")
+            return {"registered": False, "error": "empty response from O-Node"}
+
+        # Framed 4-byte error: send_framed_error() in virp_onode.c
+        if len(resp_bytes) == 4:
+            code = struct.unpack(">I", resp_bytes)[0]
+            signed = code - 0x100000000 if code >= 0x80000000 else code
+            log.error("chain_register: O-Node error code %d (0x%08X)", signed, code)
+            return {"registered": False,
+                    "error": f"O-Node error code {signed}"}
+
+        # Success: framed VIRP observation. Layout:
+        #   [HEADER_SIZE bytes VIRP header (incl. HMAC at offset 24)]
+        #   [OBS_HDR_SIZE bytes obs sub-header: type, scope, length]
+        #   [obs_length bytes JSON payload (chain_entry fields)]
+        if len(resp_bytes) < HEADER_SIZE + OBS_HDR_SIZE:
+            log.error("chain_register: short response (%d bytes)", len(resp_bytes))
+            return {"registered": False,
+                    "error": f"short response ({len(resp_bytes)} bytes)"}
+
+        if not verify_hmac(resp_bytes):
+            log.warning("chain_register: HMAC verification failed on response envelope")
+
+        obs_payload = resp_bytes[HEADER_SIZE:]
+        _obs_type, _obs_scope, obs_length = struct.unpack(
+            OBS_HDR_FMT, obs_payload[:OBS_HDR_SIZE]
         )
-        prev = cur.fetchone()
-        prev_hash = prev[0] if prev else "0" * 64
-        next_seq = (prev[1] + 1) if prev else 0
+        json_bytes = obs_payload[OBS_HDR_SIZE:OBS_HDR_SIZE + obs_length]
 
-        # Compute chain entry hash (SHA-256 of key fields)
-        entry_data = f"{session_id}:{hmac_hex}:{device}:{now_ns}"
-        entry_hash = hashlib.sha256(entry_data.encode()).hexdigest()
+        try:
+            resp = json.loads(json_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            log.error("chain_register: malformed JSON in observation payload: %s", e)
+            return {"registered": False,
+                    "error": "malformed observation payload"}
 
-        # Artifact hash from command content
-        artifact_hash = hashlib.sha256(
-            (command_text or "").encode()
-        ).hexdigest()
-
-        artifact_id = f"obs:{device}:{int(_time.time())}"
-
-        cur.execute(
-            "INSERT INTO chain_entries "
-            "(session_id, sequence, chain_entry_hash, previous_entry_hash, "
-            " timestamp_ns, monotonic_ns, artifact_type, artifact_id, "
-            " artifact_hash, signer_node_id, chain_hmac) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, next_seq, entry_hash, prev_hash,
-             now_ns, now_ns, "observation", artifact_id,
-             artifact_hash, node_id, hmac_hex),
+        sequence = resp.get("sequence") if isinstance(resp, dict) else None
+        chain_entry_hash = (
+            resp.get("chain_entry_hash", "") if isinstance(resp, dict) else ""
+        )
+        chain_session_id = (
+            resp.get("session_id") if isinstance(resp, dict) else None
         )
 
-        # Also store artifact content for the verify service
-        cur.execute(
-            "INSERT OR IGNORE INTO artifacts "
-            "(artifact_id, artifact_type, artifact_content, artifact_hash, "
-            " session_id, created_at_ns) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (artifact_id, "observation",
-             f"{device}#{command_text}", artifact_hash,
-             session_id, now_ns),
+        log.info(
+            "chain_register: artifact=%s device=%s cmd=%s seq=%s session=%s",
+            artifact_id, device, command_text[:40], sequence, chain_session_id,
         )
 
-        conn.commit()
-        conn.close()
-        log.info("chain_register: %s device=%s cmd=%s", hmac_hex[:12], device, command_text[:40])
-        return {"registered": True, "chain_hmac": hmac_hex[:12]}
+        return {
+            "registered": True,
+            "artifact_id": artifact_id,
+            "artifact_hash": artifact_hash,
+            "chain_entry_hash": chain_entry_hash,
+            "sequence": sequence,
+            "session_id": chain_session_id,
+        }
     except Exception as e:
         log.error("chain_register failed: %s", e)
         return {"registered": False, "error": str(e)}
@@ -456,15 +495,16 @@ class BridgeHandler(socketserver.StreamRequestHandler):
             if command == "chain_export":
                 self._send_json(200, chain_export()); return
             if command == "chain_register":
-                hmac_val = req.get("hmac", "")
+                obs_b64 = req.get("observation_b64", "")
                 device = req.get("device", "")
                 cmd = req.get("cmd", "")
                 tier = req.get("tier", "GREEN")
                 node_id = req.get("node_id", 0)
-                if not hmac_val or not device:
-                    self._send_error(400, "chain_register requires 'hmac' and 'device'")
+                if not obs_b64 or not device:
+                    self._send_error(400,
+                        "chain_register requires 'observation_b64' and 'device'")
                     return
-                self._send_json(200, chain_register(hmac_val, device, cmd, tier, node_id))
+                self._send_json(200, chain_register(obs_b64, device, cmd, tier, node_id))
                 return
 
             # ── Device registry queries (single source of truth) ──
