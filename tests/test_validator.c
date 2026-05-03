@@ -318,23 +318,32 @@ static void test_manifest_too_large(void)
     cleanup();
     create_test_key();
 
-    char json[16384];
+    /*
+     * Sized to hold MAX_ASSERTIONS+1 entries: ~80 bytes per entry plus
+     * a small envelope. Was a 16KB stack array, which fit at MAX=32 but
+     * silently truncated under MAX=1024 and made the test exercise
+     * malformed-JSON rather than the too-many-assertions code path.
+     */
+    size_t json_cap = 256 + ((size_t)VALIDATOR_MAX_ASSERTIONS + 1) * 80;
+    char *json = malloc(json_cap);
+    ASSERT(json != NULL, "OOM allocating fixture");
     const char *ph = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    int off = snprintf(json, sizeof(json),
+    int off = snprintf(json, json_cap,
         "{\"session_id\":\"s7\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[],\"assertions\":[", ph);
 
     for (int i = 0; i < VALIDATOR_MAX_ASSERTIONS + 1; i++) {
-        int w = snprintf(json + off, sizeof(json) - (size_t)off,
+        int w = snprintf(json + off, json_cap - (size_t)off,
             "%s{\"device\":\"r%d\",\"claim_type\":\"state_read\",\"evidence_ref\":null}",
             (i == 0) ? "" : ",", i);
         off += w;
     }
-    off += snprintf(json + off, sizeof(json) - (size_t)off, "]}");
+    off += snprintf(json + off, json_cap - (size_t)off, "]}");
 
     validator_manifest_t m;
     validator_violation_code_t reason;
     virp_error_t err = validator_parse_manifest(json, (size_t)off, &m, &reason);
+    free(json);
     ASSERT(err != VIRP_OK, "parser should reject");
     ASSERT(reason == VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE, "reason code");
     PASS();
