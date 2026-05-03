@@ -35,8 +35,8 @@
  * All sized for stack allocation. No dynamic allocation in the hot path.
  * ========================================================================= */
 
-#define VALIDATOR_MAX_ASSERTIONS        32
-#define VALIDATOR_MAX_TOOL_CALL_REFS    64
+#define VALIDATOR_MAX_ASSERTIONS        1024
+#define VALIDATOR_MAX_TOOL_CALL_REFS    512
 #define VALIDATOR_DEVICE_MAX            64
 #define VALIDATOR_HASH_HEX_LEN          64      /* SHA-256 hex, no NUL */
 #define VALIDATOR_CLAIM_TYPE_MAX        32
