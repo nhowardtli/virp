@@ -443,12 +443,23 @@ virp_error_t validator_commit_decision(virp_chain_state_t *chain,
 {
     if (chain == NULL || manifest == NULL || result == NULL) return VIRP_ERR_NULL_PTR;
 
-    /* Canonical JSON buffer: big enough for MAX_ASSERTIONS plus preamble. */
-    char canonical[8192];
-    int n = build_canonical_decision(manifest, result, canonical, sizeof(canonical));
-    if (n < 0) return VIRP_ERR_BUFFER_TOO_SMALL;
+    /*
+     * Canonical JSON buffer scales with VALIDATOR_MAX_ASSERTIONS.
+     * Per-assertion ~256B worst case (device + claim_type + decision +
+     * violation), envelope ~4KB.
+     */
+    size_t canonical_cap = 4096 + (size_t)VALIDATOR_MAX_ASSERTIONS * 256;
+    char *canonical = malloc(canonical_cap);
+    if (canonical == NULL) return VIRP_ERR_NULL_PTR;
+
+    int n = build_canonical_decision(manifest, result, canonical, canonical_cap);
+    if (n < 0) {
+        free(canonical);
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+    }
 
     sha256_hex((const unsigned char *)canonical, (size_t)n, result->artifact_hash);
+    free(canonical);
 
     char artifact_id[64];
     (void)snprintf(artifact_id, sizeof(artifact_id),
