@@ -1400,11 +1400,17 @@ static void handle_client(onode_state_t *state, int client_fd)
         }
 
         /*
-         * Build JSON payload. Up to VALIDATOR_MAX_ASSERTIONS per-
-         * assertion objects plus the envelope — fits in 8KB.
+         * Build JSON payload on heap — sized to scale with
+         * VALIDATOR_MAX_ASSERTIONS rather than a fixed 8KB. Each per-
+         * assertion object is ~256B worst case; envelope ~4KB.
          */
-        char json_buf[8192];
-        int joff = snprintf(json_buf, sizeof(json_buf),
+        size_t json_cap = 4096 + (size_t)VALIDATOR_MAX_ASSERTIONS * 256;
+        char *json_buf = malloc(json_cap);
+        if (!json_buf) {
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
+            goto validate_turn_done;
+        }
+        int joff = snprintf(json_buf, json_cap,
             "{\"decision\":\"%s\","
             "\"turn_violation\":%d,"
             "\"chain_sequence\":%lld,"
@@ -1418,18 +1424,25 @@ static void handle_client(onode_state_t *state, int client_fd)
             vr.artifact_hash);
 
         for (size_t i = 0; i < vr.per_assertion_count; i++) {
-            int jw = snprintf(json_buf + joff, sizeof(json_buf) - (size_t)joff,
+            int jw = snprintf(json_buf + joff, json_cap - (size_t)joff,
                 "%s{\"decision\":\"%s\",\"violation\":%d}",
                 (i == 0) ? "" : ",",
                 validator_decision_str(vr.per_assertion[i].decision),
                 (int)vr.per_assertion[i].violation);
-            if (jw < 0 || (size_t)jw >= sizeof(json_buf) - (size_t)joff) {
+            if (jw < 0 || (size_t)jw >= json_cap - (size_t)joff) {
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 goto validate_turn_done;
             }
             joff += jw;
         }
-        joff += snprintf(json_buf + joff, sizeof(json_buf) - (size_t)joff, "]}");
+        {
+            int jw = snprintf(json_buf + joff, json_cap - (size_t)joff, "]}");
+            if (jw < 0 || (size_t)jw >= json_cap - (size_t)joff) {
+                send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+                goto validate_turn_done;
+            }
+            joff += jw;
+        }
 
         err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
                                       state->node_id, onode_next_seq(state),
@@ -1444,6 +1457,7 @@ static void handle_client(onode_state_t *state, int client_fd)
         }
 
     validate_turn_done:
+        free(json_buf);
         break;
     }
 
