@@ -496,10 +496,19 @@ virp_error_t validator_run_turn(virp_chain_state_t *chain,
         return VIRP_ERR_NULL_PTR;
     }
 
-    validator_manifest_t manifest;
+    /*
+     * Heap-allocate the manifest. At VALIDATOR_MAX_ASSERTIONS=1024 and
+     * VALIDATOR_MAX_TOOL_CALL_REFS=512 the struct is ~180KB; stack-
+     * allocating it would put meaningful pressure on every caller
+     * thread's stack (default 8MB on Linux but shared with the rest of
+     * the validator/onode call chain).
+     */
+    validator_manifest_t *manifest = calloc(1, sizeof(*manifest));
+    if (manifest == NULL) return VIRP_ERR_NULL_PTR;
+
     validator_violation_code_t reason = VALIDATOR_VIOLATION_NONE;
     virp_error_t perr = validator_parse_manifest(manifest_json, manifest_json_len,
-                                                  &manifest, &reason);
+                                                  manifest, &reason);
     if (perr != VIRP_OK) {
         memset(result, 0, sizeof(*result));
         result->chain_sequence  = -1;
@@ -509,17 +518,24 @@ virp_error_t validator_run_turn(virp_chain_state_t *chain,
                                   : VALIDATOR_VIOLATION_MANIFEST_MALFORMED;
 
         /* Manifest may not have given us a session_id. Fall back. */
-        (void)snprintf(manifest.session_id, sizeof(manifest.session_id),
+        (void)snprintf(manifest->session_id, sizeof(manifest->session_id),
                        "%s", fallback_session_id);
-        (void)snprintf(manifest.prose_hash, sizeof(manifest.prose_hash),
+        (void)snprintf(manifest->prose_hash, sizeof(manifest->prose_hash),
                        "%064d", 0);
-        manifest.assertion_count     = 0;
-        manifest.tool_call_ref_count = 0;
-        return validator_commit_decision(chain, &manifest, result);
+        manifest->assertion_count     = 0;
+        manifest->tool_call_ref_count = 0;
+        virp_error_t cerr = validator_commit_decision(chain, manifest, result);
+        free(manifest);
+        return cerr;
     }
 
-    virp_error_t eerr = validator_evaluate(chain, &manifest, prose, prose_len, result);
-    if (eerr != VIRP_OK) return eerr;
+    virp_error_t eerr = validator_evaluate(chain, manifest, prose, prose_len, result);
+    if (eerr != VIRP_OK) {
+        free(manifest);
+        return eerr;
+    }
 
-    return validator_commit_decision(chain, &manifest, result);
+    virp_error_t cerr = validator_commit_decision(chain, manifest, result);
+    free(manifest);
+    return cerr;
 }
