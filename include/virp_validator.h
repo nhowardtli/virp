@@ -32,7 +32,12 @@
 /* =========================================================================
  * Limits
  *
- * All sized for stack allocation. No dynamic allocation in the hot path.
+ * Caps bound the worst-case manifest. At the values below the manifest
+ * struct is ~180KB, so validator_run_turn heap-allocates it; the
+ * validator_result_t (~8KB) and per-call canonical/response buffers
+ * follow the same pattern. Increase the caps freely — adjust the heap
+ * sizing in validator_commit_decision and the onode handler if the
+ * per-assertion canonical format grows.
  * ========================================================================= */
 
 #define VALIDATOR_MAX_ASSERTIONS        1024

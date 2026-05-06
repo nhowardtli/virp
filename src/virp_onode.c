@@ -1407,7 +1407,7 @@ static void handle_client(onode_state_t *state, int client_fd)
         size_t json_cap = 4096 + (size_t)VALIDATOR_MAX_ASSERTIONS * 256;
         char *json_buf = malloc(json_cap);
         if (!json_buf) {
-            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
+            send_framed_error(client_fd, VIRP_ERR_OOM);
             goto validate_turn_done;
         }
         int joff = snprintf(json_buf, json_cap,

@@ -902,6 +902,7 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_HOST_KEY_MISMATCH:   return "SSH host key mismatch (possible MITM)";
     case VIRP_ERR_HOST_KEY_UNKNOWN:    return "SSH host key not in known_hosts";
     case VIRP_ERR_PROTOCOL_VERSION:   return "Unframed v1 request (upgrade client)";
+    case VIRP_ERR_OOM:                return "Heap allocation failed";
     default:                         return "Unknown error";
     }
 }

@@ -450,7 +450,7 @@ virp_error_t validator_commit_decision(virp_chain_state_t *chain,
      */
     size_t canonical_cap = 4096 + (size_t)VALIDATOR_MAX_ASSERTIONS * 256;
     char *canonical = malloc(canonical_cap);
-    if (canonical == NULL) return VIRP_ERR_NULL_PTR;
+    if (canonical == NULL) return VIRP_ERR_OOM;
 
     int n = build_canonical_decision(manifest, result, canonical, canonical_cap);
     if (n < 0) {
@@ -504,7 +504,7 @@ virp_error_t validator_run_turn(virp_chain_state_t *chain,
      * the validator/onode call chain).
      */
     validator_manifest_t *manifest = calloc(1, sizeof(*manifest));
-    if (manifest == NULL) return VIRP_ERR_NULL_PTR;
+    if (manifest == NULL) return VIRP_ERR_OOM;
 
     validator_violation_code_t reason = VALIDATOR_VIOLATION_NONE;
     virp_error_t perr = validator_parse_manifest(manifest_json, manifest_json_len,

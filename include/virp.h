@@ -380,6 +380,7 @@ typedef enum {
     VIRP_ERR_HOST_KEY_MISMATCH   = -33,  /* SSH host key changed (possible MITM) */
     VIRP_ERR_HOST_KEY_UNKNOWN    = -34,  /* SSH host key not in known_hosts */
     VIRP_ERR_PROTOCOL_VERSION    = -35,  /* Client sent unframed v1 request */
+    VIRP_ERR_OOM                 = -36,  /* Heap allocation failed */
 } virp_error_t;
 
 /* =========================================================================
