@@ -1,4 +1,4 @@
-# Contributing to IronClaw
+# Contributing to VIRP
 
 ## Getting Started
 

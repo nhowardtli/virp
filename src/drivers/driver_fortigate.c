@@ -2,7 +2,6 @@
  * driver_fortigate.c — FortiGate device driver implementation
  *
  * Ported to VIRP appliance type system (fixed buffers, virp_driver.h).
- * Original from ironclaw/virp/src/driver_fortigate.c.
  *
  * Implements the five virp_driver_t functions:
  *   connect     — Establish SSH connection

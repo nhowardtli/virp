@@ -3,7 +3,6 @@
  *
  * SSH-only transport. No REST API, no fallback.
  *
- * Ported to appliance type system from ironclaw stub.
  *
  * Copyright 2026 Third Level IT LLC — Apache 2.0
  */
