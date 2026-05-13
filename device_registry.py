@@ -1,18 +1,17 @@
 """
-VIRP Device Registry — Single Source of Truth
-==============================================
-Every component imports from here. Nobody parses their own device list.
+VIRP Device Registry — Single Source of Truth Reference Implementation
+======================================================================
+Reference pattern for VIRP device registries. Every component imports
+from here. Nobody parses their own device list.
 
-Location: /root/virp/device_registry.py (CT 211 - ironclaw-onode)
-Source:   /root/virp/devices.yaml
+Source: devices.yaml (deployer-specific)
 
 RULES:
   1. devices.yaml is the ONLY place device definitions live.
   2. Credentials are NEVER exposed — only credential_ref keys.
   3. The to_legacy_json() function bridges the gap during migration.
-  4. CT 210 queries CT 211 for device metadata (no local device lists).
 
-Copyright (c) 2026 Third Level IT LLC. All rights reserved.
+Copyright (c) 2026 Third Level IT LLC. Licensed under Apache 2.0.
 """
 
 from __future__ import annotations
