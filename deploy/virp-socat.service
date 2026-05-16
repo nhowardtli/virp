@@ -1,0 +1,19 @@
+[Unit]
+Description=VIRP O-Node socat TCP Bridge
+After=virp-onode.service
+Requires=virp-onode.service
+
+[Service]
+Type=simple
+User=virp-onode
+Group=virp-clients
+AmbientCapabilities=
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ExecStart=/usr/bin/socat TCP-LISTEN:9999,fork,reuseaddr \
+    UNIX-CONNECT:/tmp/virp-onode.sock
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
