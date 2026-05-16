@@ -22,10 +22,16 @@ RestartSec=3
 StandardOutput=journal
 StandardError=journal
 
+# Enable Python HMAC fallback. The C bridge (api/virp_bridge.py +
+# build/libvirp.so) is unreachable under /root/ traversal and its
+# verify_observation() is functionally identical to Python HMAC-SHA256.
+Environment=VIRP_ALLOW_PY_FALLBACK=1
+
 # Hardening (W3 audit 2026-05-16) — bridge needs no capabilities;
 # binds TCP:9998 (>1024) and connects to a Unix socket as virp-onode.
 AmbientCapabilities=
 CapabilityBoundingSet=
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target

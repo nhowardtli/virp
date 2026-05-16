@@ -91,3 +91,21 @@ mode 0640 — readable post-drop-privs without exposing them widely.
 A consequence: edits to `/root/virp/virp-bridge.py` only take effect after
 a `systemctl restart virp-bridge` (which re-runs `ExecStartPre`). The
 running process holds the staged copy, not the source.
+
+### Why the bridge sets `VIRP_ALLOW_PY_FALLBACK=1`
+
+The bridge attempts to load a C-extension HMAC verifier
+(`api/virp_bridge.py` → `build/libvirp.so`) at startup. After the W3
+relocation the bridge process runs as `virp-onode` and cannot traverse
+`/root/` to find either of those, so the import fails. With
+`VIRP_ALLOW_PY_FALLBACK=1`, the bridge falls back to a pure-Python
+`hmac.new(OKEY, ..., sha256)` verification — byte-identical output to
+the C extension's `virp_verify()`, which is itself just HMAC-SHA256 over
+the same byte range (`api/virp_bridge.py:304-319`). Without the env var
+the bridge fails-closed on every observation and the dashboard
+observation pipeline goes silently dark.
+
+Long-term, the cleaner direction is to drop the C-bridge load attempt
+entirely (the `hardening/audit-2026-04` branch of `virp-bridge.py`
+already does this in its `verify_hmac()`). Until that lands on the live
+branch, the env var is the supported workaround.

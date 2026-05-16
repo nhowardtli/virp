@@ -63,7 +63,7 @@ LISTEN_PORT = 9998
 MAX_REQUEST_SIZE = 524288
 
 ONODE_SOCKET = "/tmp/virp-onode.sock"
-OKEY_PATH = "/root/virp/keys/onode.key"
+OKEY_PATH = "/etc/virp/keys/onode.key"
 ONODE_TIMEOUT = 30.0
 
 # v2 socket framing — must match daemon handle_client()

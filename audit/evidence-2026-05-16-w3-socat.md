@@ -492,3 +492,192 @@ next W-primitive tightening. Suggested wording:
 | 22:54:00 | Bridge restart → `Handshake complete — session ACTIVE, session_id=16aa9ee80287751461caafb422194b67`. |
 | 22:57:39 | Synthetic chain_register succeeds end-to-end. `chain_entries` id 1844, artifact_type=observation, session_id matches handshake. First observation entry since 2026-05-12 20:21:55. |
 
+---
+
+## Addendum 3 — closing the four caveats + a latent onode bug (23:27 UTC)
+
+Addendum 2 left four items deferred ("Caveats discovered during this fix —
+not closed tonight"). This addendum closes three of them, partially closes
+the fourth, and surfaces a new latent bug in onode session lifecycle that
+was discovered while closing them.
+
+### Items closed
+
+1. **HMAC fail-closed on execute path** — closed via
+   `Environment=VIRP_ALLOW_PY_FALLBACK=1` on the bridge unit. The bridge
+   now logs `WARNING C bridge unavailable ..., using Python HMAC fallback`
+   instead of the previous ERROR fail-closed. The Python fallback is
+   functionally identical to the C verifier: both compute
+   `hmac.new(OKEY, msg[:24] + msg[56:], sha256)` and constant-time
+   compare against `msg[24:56]`. The C extension's
+   `verify_observation()` at `api/virp_bridge.py:304-319` is a ctypes
+   wrapper over `virp_verify()` which does the same HMAC-SHA256 over the
+   same byte range — there is no "chain-backed" extra check despite the
+   docstring's wording.
+
+2. **`peercred.conf` drop-in** — removed.
+   `/etc/systemd/system/virp-bridge.service.d/peercred.conf` and its
+   parent directory are gone. The base unit carries all relevant
+   directives. `deploy/README.md` cleanup procedure used verbatim.
+
+3. **`NoNewPrivileges=yes`** — added to both the deployed unit and
+   `deploy/virp-bridge.service`. Pure-win sandbox tightening for a
+   Python TCP service that never needs setuid. Now matches the socat
+   unit shape.
+
+### Item partially closed
+
+4. **Branch divergence on `virp-bridge.py`** — partially reconciled.
+
+   - The `OKEY_PATH` source edit (`/root/virp/keys/onode.key` →
+     `/etc/virp/keys/onode.key`) was committed on
+     `raise-validator-manifest-caps` as commit `38591ab` and applied to
+     `hardening/audit-2026-04` in this commit. Both branches now agree
+     on the key path.
+   - The deeper divergence is **not** closed: `hardening/audit-2026-04`
+     has restructured the HMAC verification path entirely (removed the
+     C-bridge load attempt, `VIRP_ALLOW_PY_FALLBACK` check, and the
+     gated `verify_hmac()` in favor of a direct
+     `hmac_mod.new(OKEY, ..., sha256)` call at `verify_hmac()` line ~210
+     of the hardening-branch file). With that change, the
+     `Environment=VIRP_ALLOW_PY_FALLBACK=1` line added in this addendum
+     would be ignored — harmless but vestigial.
+   - **Decision deferred to the next session**: pick a canonical
+     `virp-bridge.py` shape (most likely backport hardening's simpler
+     `verify_hmac()` to the live branch and drop the C-bridge load
+     attempt + env-var dance entirely), then update
+     `deploy/virp-bridge.service` to remove
+     `Environment=VIRP_ALLOW_PY_FALLBACK=1` in the same commit.
+
+### New latent bug discovered: onode session cleanup never runs
+
+During item-1 fix, the bridge restart hit
+`SESSION_HELLO rejected: error 4294967266` (= `-30` =
+`VIRP_ERR_SESSION_INVALID`). Root cause traced to
+`src/virp_handshake.c:50-54` — the single-session check rejects any
+HELLO that arrives while `ctx->session.state` is `ACTIVE` or `BOUND`,
+and the timeout-and-disconnect cleanup functions that would clear stale
+state are **never called from anywhere in the codebase**:
+
+```sh
+$ grep -rn 'virp_session_check_timeouts\|virp_session_on_disconnect' src/
+src/virp_session.c:119:virp_error_t virp_session_check_timeouts(virp_context_t *ctx)
+src/virp_session.c:145:void virp_session_on_disconnect(virp_context_t *ctx)
+```
+
+Only the definitions exist — no callers. As a result:
+
+- `VIRP_SESSION_IDLE_TIMEOUT_NS` (5 min) and `VIRP_SESSION_BIND_TIMEOUT_NS`
+  (30 s) are dead constants. Idle sessions never expire.
+- When the bridge process dies, the onode does not clean up the
+  associated session. The session stays `ACTIVE` until onode itself
+  restarts.
+- Any subsequent bridge restart within the lifetime of the same onode
+  process gets rejected with `VIRP_ERR_SESSION_INVALID` on HELLO.
+
+This is the *real* reason the dashboard observation path can't be
+restored simply by restarting the bridge after an incident — it requires
+an onode restart to clear session state. Confirmed empirically: bridge
+restart at 23:13:27 against onode (running since 22:27:45 with session
+16aa9ee...) returned -30; only after `systemctl restart virp-onode` at
+23:26:57 did the bridge auto-restart's HELLO succeed (session 83372a23...).
+
+Fix shape (next session): either invoke `virp_session_check_timeouts()`
+eagerly at the top of the `SESSION_HELLO` handler (lazy cleanup), or
+invoke `virp_session_on_disconnect()` from the client-disconnect path in
+`virp_onode.c` (eager cleanup, preferred — cleans up resources too).
+Both are one-line edits with no ABI change; rebuild via
+`make prod-full`. The same source edit could also call
+`virp_session_check_timeouts()` from the per-request path so idle
+sessions self-expire on the next inbound request even without a HELLO.
+
+This finding belongs in the same `SECURITY.md` follow-up checklist as
+the addendum-2 deployment-rollout pattern: any change that *adds* a
+session-stateful primitive to onode needs an enumeration step for
+"when/how does the new session state get cleaned up on the
+disconnect/timeout path?"
+
+### Verification — full execute → chain_register E2E against real SW-3850
+
+Unlike addendum 2's synthetic test, this run uses the actual show-version
+output from SW-3850 routed through the bridge, executed by onode over
+SSH, and HMAC-verified by the bridge using the Python fallback path
+that item-1's env var enables.
+
+```
+$ python3 /tmp/bridge_test.py
+>>> STEP 1: execute show version on SW-3850
+verdict=VERIFIED, chain_seq=1, trust_tier=GREEN, latency_ms=152.2, hmac=ccd837531a043760...
+raw_output snippet: SW-3850#show version
+Cisco IOS XE Software, Version 16.12.13
+Cisco IOS Software [Gibraltar], Catalyst L3 Switch Software (CAT3K_CAA-UNIVERSALK9-M)...
+
+>>> STEP 2: chain_register the real observation
+{
+  "registered": true,
+  "artifact_id": "obs:SW-3850:1778974051058439743",
+  "artifact_hash": "f6015700e6e4407cdc825abe13c9088440c84ccec0c1ec0c5dc251af2083b426",
+  "chain_entry_hash": "1d11dd7d61d702067474e87bfd330b96c6a22c22173e821bd27ad4e3e939994d",
+  "sequence": 0,
+  "session_id": "83372a234da1ab383846920e5815eced"
+}
+
+$ sqlite3 /var/lib/virp/chain.db \
+    "SELECT id, artifact_type, artifact_id, datetime(timestamp_ns/1000000000,'unixepoch') \
+     FROM chain_entries ORDER BY id DESC LIMIT 3;"
+1845|observation|obs:SW-3850:1778974051058439743|2026-05-16 23:27:31
+1844|observation|obs:SW-3850:1778972259696166598|2026-05-16 22:57:39
+1843|validation|val-b8108c94ad7cefb8|2026-05-16 22:41:31
+```
+
+- `verdict=VERIFIED` on execute — the Python HMAC fallback successfully
+  verified onode's signed observation. **No more 403.**
+- `latency_ms=152.2` — real device round-trip (SSH to SW-3850 at 10.0.10.2,
+  show version, parse, sign).
+- `chain_register` returned `registered: true`; `chain_entries` id 1845
+  shows the entry with `session_id=83372a234da1ab383846920e5815eced`
+  matching the bridge handshake session.
+
+The dashboard observation pipeline (execute → chain_register) is now
+fully restored end-to-end through W3 enforcement.
+
+### Cumulative state at end of session
+
+| Component | State |
+|-----------|-------|
+| `socket_allowed_uids` | `[999]` (set by W3 in devices.json.age, addendum 1) |
+| `virp-socat.service` | `User=virp-onode`, single hardened base unit (addendum 1) |
+| `virp-bridge.service` | `User=virp-onode`, `NoNewPrivileges=yes`, `Environment=VIRP_ALLOW_PY_FALLBACK=1`, `ExecStartPre=+/bin/install` staging to `/opt/virp/`, no drop-in (addenda 2 + 3) |
+| `/etc/systemd/system/virp-bridge.service.d/` | removed |
+| `virp-bridge.py:66 OKEY_PATH` | `/etc/virp/keys/onode.key` (live: commit `38591ab` on `raise-validator-manifest-caps`; tracked: also applied in this commit on `hardening/audit-2026-04`) |
+| Bridge handshake | ACTIVE, session_id=`83372a234da1ab383846920e5815eced` (since 23:27:02) |
+| Last observation in chain.db | id=1845, SW-3850, 23:27:31 UTC |
+| Open: branch reconciliation | structural `virp-bridge.py` divergence between `raise-validator-manifest-caps` and `hardening/audit-2026-04` — see "Item partially closed" above |
+| Open: onode session cleanup | latent bug, never calls `virp_session_check_timeouts` or `virp_session_on_disconnect` — see "New latent bug" above |
+
+### Files changed in addendum 3
+
+- **Modified:** `deploy/virp-bridge.service` — `Environment=VIRP_ALLOW_PY_FALLBACK=1`
+  and `NoNewPrivileges=yes` added
+- **Modified:** `deploy/README.md` — added "Why the bridge sets
+  `VIRP_ALLOW_PY_FALLBACK=1`" rationale section
+- **Modified:** `virp-bridge.py` — `OKEY_PATH` set to
+  `/etc/virp/keys/onode.key` (mirrors live commit `38591ab` on
+  `raise-validator-manifest-caps`)
+- **Appended:** this addendum
+- **Live system:** `/etc/systemd/system/virp-bridge.service` updated (in
+  sync with `deploy/`); `peercred.conf` drop-in removed; bridge
+  restarted; onode restarted twice during diagnosis (clearing stale
+  session state — see "New latent bug")
+
+### Timeline (W3 cleanup pass)
+
+| Time | Event |
+|------|-------|
+| 23:13:27 | Bridge restart hits `SESSION_HELLO rejected: error -30` — single-session bug surfaces |
+| 23:18:56 | Onode restart #1 to clear stale session 16aa9ee... — bridge auto-restart grabs session 074f51b0 |
+| 23:19:00 | Redundant `systemctl restart virp-bridge` re-traps the same single-session bug |
+| 23:26:57 | Onode restart #2 — bridge auto-restart grabs session 83372a23 cleanly |
+| 23:27:31 | E2E test: execute SW-3850 → `verdict=VERIFIED`; chain_register → id=1845; full dashboard observation path restored |
+
+
