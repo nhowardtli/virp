@@ -258,3 +258,237 @@ the socat service.
 | 22:03:03 | `install` + `daemon-reload` + `systemctl restart virp-socat` |
 | 22:03:03 → | socat PID 1269064, uid 999, 0 REJECTED |
 
+---
+
+## Addendum 2 — virp-bridge.service: same root cause, different daemon (22:54 UTC)
+
+The socat fix at 22:03:03 hardened the only TCP→Unix proxy on `:9999` but
+did not enumerate the *other* daemon that connects to `/tmp/virp-onode.sock`.
+`virp-bridge.service` — the Python JSON bridge on `:9998` — was still
+running as `User=root, Group=root` because its base unit, like socat's,
+had been untracked and unhardened. As soon as `socket_allowed_uids = [999]`
+was active (see addendum 1), the bridge's session-handshake connection
+was rejected on the same `SO_PEERCRED` gate, with the same root cause.
+
+The bridge's failure mode differed superficially: rather than refusing all
+traffic, it logged `Session handshake failed: Connection reset by peer`
+and fell back to "operating without session." Validation entries went
+through a non-session code path and kept landing in `chain_entries`,
+masking the breakage in the audit log itself. The actual loss — silent —
+was the observation/`chain_register` path: three confirmed failures at
+22:35:27, 22:35:59, 22:40:49, each logged as "Connection reset by peer."
+
+### Why this addendum is separate from addendum 1, not a continuation
+
+The socat fix at 22:03:03 was scoped to "the unit running as root that
+connects to the O-Node socket." That scope was incomplete. It enumerated
+*one* such unit. The general truth is: any process binding to or
+connecting to `/tmp/virp-onode.sock` must run as uid 999. Tonight there
+were two; there may be more in future (Wazuh REST collector, federation
+nodes, etc.). This is a deployment-rollout concern, not a one-off bug,
+and the close-out should reflect that — see "Significance" below.
+
+### Layered assumptions hit during the bridge fix
+
+The bridge fix exposed three assumption layers, each of which had to be
+unwound in order. None were addressable by changing `User=` alone.
+
+1. **UID layer (`SO_PEERCRED`)** — the W3 gate. Resolved by
+   `User=virp-onode, Group=virp-clients` on the bridge unit, identical
+   in shape to the socat fix.
+
+2. **Path layer (`/root/` 0700 + hard-coded source paths)** — `/root/`
+   is mode 0700 and unreadable post-drop-privs. Three sub-issues:
+
+   - `ExecStart=/usr/bin/python3 /root/virp/virp-bridge.py` failed with
+     `[Errno 13] Permission denied` on the script itself. Resolved by
+     `ExecStartPre=+/bin/install` staging to `/opt/virp/virp-bridge.py`
+     owned `virp-onode:virp-clients` mode 0640. The `+` prefix runs the
+     install as root before drop-privs.
+
+   - `virp-bridge.py` imports `device_registry` as a sibling module.
+     Staging only the entrypoint produced `ModuleNotFoundError`. Resolved
+     by a second `ExecStartPre=+/bin/install` line for
+     `/root/virp/device_registry.py`. No other first-party siblings are
+     imported (verified by grep).
+
+   - `virp-bridge.py:66` had `OKEY_PATH = "/root/virp/keys/onode.key"`.
+     Even with `/root/` traversal, that file is `root:root 0600`, so
+     `virp-onode` could not read it. The canonical key already lives at
+     `/etc/virp/keys/onode.key` (owned `virp-onode:virp-onode 0400`,
+     identical sha256, used by the daemon itself). Resolved by a one-line
+     source edit pointing `OKEY_PATH` at the canonical location and
+     dropping the `/root/virp/keys/` duplicate from the live read path.
+
+3. **Schema layer (chain.db table name)** — minor. The chain.db ledger
+   table is `chain_entries`, not `chain`; the pre/post-test snapshot
+   queries hit `Error: no such table: chain (1)` until corrected. Worth
+   noting because the chain.db schema is the verification surface for
+   every W3 evidence run, and a stale assumption about its shape silently
+   produces empty snapshots that look like "no observations" rather than
+   "wrong query."
+
+### Files changed
+
+- **New:** `deploy/virp-bridge.service` — single hardened base unit,
+  mirrors the socat shape (User/Group/AmbientCapabilities/CapabilityBoundingSet)
+  and adds the two `ExecStartPre=+/bin/install` lines for source staging
+- **Modified:** `deploy/README.md` — added bridge row in service table,
+  bridge entry in install procedure, bridge drop-in cleanup note,
+  bridge verification command, and a `/opt/virp/` staging rationale section
+- **Modified:** `Makefile` — extended `install-systemd-units` target with
+  the bridge unit and the legacy `peercred.conf` cleanup hint
+- **Modified:** `/root/virp/virp-bridge.py` (working tree, branch
+  `raise-validator-manifest-caps`) — `OKEY_PATH` source edit. See the
+  divergence note in "Caveats" below
+- **Installed:** `/etc/systemd/system/virp-bridge.service` (replaced)
+- **Still present:** `/etc/systemd/system/virp-bridge.service.d/peercred.conf`
+  — redundant with the new base unit; not removed in this round to limit
+  blast radius. Cleanup procedure documented in `deploy/README.md`
+
+### Diff vs prior running unit (additions only)
+
+```diff
++After=virp-onode.service
++Requires=virp-onode.service
++User=virp-onode
++Group=virp-clients
++ExecStartPre=+/bin/install -d -o virp-onode -g virp-clients -m 0750 /opt/virp
++ExecStartPre=+/bin/install -o virp-onode -g virp-clients -m 0640 /root/virp/virp-bridge.py /opt/virp/virp-bridge.py
++ExecStartPre=+/bin/install -o virp-onode -g virp-clients -m 0640 /root/virp/device_registry.py /opt/virp/device_registry.py
++AmbientCapabilities=
++CapabilityBoundingSet=
+-ExecStart=/usr/bin/python3 /root/virp/virp-bridge.py
++ExecStart=/usr/bin/python3 /opt/virp/virp-bridge.py
+-User=root
+-Group=root
+```
+
+### Verification — chain_register E2E (22:57:39 UTC)
+
+Pre-fix state of `chain_entries` showed the silent break: most recent
+`artifact_type=observation` entry was at **2026-05-12 20:21:55** (id 1836,
+seq 1063). Four days of zero observations, with only `validation` entries
+trickling in via the alternate code path.
+
+Bridge logs after restart at 22:54:00:
+
+```
+[virp-bridge] INFO O-Key loaded from /etc/virp/keys/onode.key
+[virp-bridge] INFO Handshake: HELLO_ACK received, session_id=16aa9ee80287751461caafb422194b67, version=2
+[virp-bridge] INFO Handshake complete — session ACTIVE, session_id=16aa9ee80287751461caafb422194b67
+```
+
+Synthetic `chain_register` against SW-3850 at 22:57:39 (direct JSON to
+TCP:9998, isolating the bridge→onode→chain path that W3 had blocked):
+
+```
+$ python3 /tmp/bridge_test.py
+{
+  "registered": true,
+  "artifact_id": "obs:SW-3850:1778972259696166598",
+  "artifact_hash": "88b886a6a8a280aec3972bab960574b19f391d2ff9e65390a59948a0ec807501",
+  "chain_entry_hash": "b7490fbb49c6e52a7951676e3caaa3f5334429178447f1d90e71588301e5d208",
+  "sequence": 0,
+  "session_id": "16aa9ee80287751461caafb422194b67"
+}
+
+$ sqlite3 /var/lib/virp/chain.db \
+    "SELECT id, sequence, artifact_type, artifact_id, datetime(timestamp_ns/1000000000,'unixepoch') \
+     FROM chain_entries WHERE id > 1843 ORDER BY id DESC LIMIT 5;"
+1844|0|observation|obs:SW-3850:1778972259696166598|2026-05-16 22:57:39
+```
+
+`session_id` in the bridge response matches the session_id printed on the
+post-restart handshake — i.e., the chain entry was written under the same
+session that the SO_PEERCRED gate just accepted. End-to-end is intact.
+
+### Caveats discovered during this fix (not closed tonight)
+
+1. **HMAC fail-closed on the execute path.** The bridge logs
+   `C bridge unavailable (No module named 'virp_bridge') and
+   VIRP_ALLOW_PY_FALLBACK!=1 — HMAC verification will fail closed`. The
+   `virp_bridge` Python extension is not on the default `sys.path` for
+   either `root` or `virp-onode` (verified). No process in the chain
+   exports `VIRP_ALLOW_PY_FALLBACK=1`. The execute path
+   (`{"command":"show version","hostname":"SW-3850"}`) therefore returns
+   HTTP 403 `HMAC verification failed` regardless of what the device
+   returns. `chain_register` succeeds in isolation because that handler
+   only logs HMAC mismatch as a warning (line 431) — but the natural
+   dashboard flow is execute → chain_register, so the dashboard's
+   observation pipeline is still broken end-to-end at the execute leg.
+   This is **pre-existing** (predates tonight's W3 work — chain.db shows
+   four days with no observations) and **out of W3 scope**. Tracked here
+   so it isn't forgotten.
+
+2. **Branch divergence for `virp-bridge.py`.** The unit committed in this
+   addendum was verified against the bridge source on the
+   `raise-validator-manifest-caps` working tree, plus a one-line
+   `OKEY_PATH` edit. The version of `virp-bridge.py` on
+   `hardening/audit-2026-04` is structurally different — the
+   `VIRPBridge`/`VIRP_ALLOW_PY_FALLBACK` HMAC mechanism has been removed
+   on that branch. Anyone who checks out `hardening/audit-2026-04` and
+   then deploys this unit is running a different bridge than the one
+   verified here. Reconciling those branches is the next deployment-side
+   task; this commit is unit-only by design.
+
+3. **`peercred.conf` drop-in not removed.** Redundant with the new base
+   unit but functionally inert. Cleanup is a one-liner (see
+   `deploy/README.md`) and was deferred to avoid bundling further changes
+   into the verification window.
+
+4. **`NoNewPrivileges=yes` not added to the bridge unit.** The socat unit
+   sets it. Adding it to bridge is a pure-win sandbox tightening for a
+   Python TCP service that never needs setuid. Deferred for consistency
+   with the unit shape explicitly approved tonight; recommended as a
+   follow-up in the same change that reconciles branch divergence.
+
+### Trust-primitive impact
+
+| Primitive | Pre-fix (since 22:03:03) | Post-fix (since 22:54:00) |
+|-----------|--------------------------|---------------------------|
+| W3 (SO_PEERCRED gate) | enforced; socat passes; **bridge rejected** | enforced; both socat *and* bridge pass |
+| chain.db observation writes | broken for 4 days, masked by validation-path success | restored (id 1844, 22:57:39) |
+| W1 / W2 / W4 | unchanged | unchanged |
+
+### Significance — the deployment-rollout pattern
+
+Tonight's session hardened W3 twice for the same underlying reason: a
+process with privileged access to a guarded resource was running as the
+wrong uid because its systemd unit was untracked. Socat and the bridge
+were the two known cases; there is no audit guarantee they are the only
+two. The risk shape is:
+
+- **W-primitive tightening** (e.g., `socket_allowed_uids = [999]`) **changes
+  the contract** between the daemon and its peers.
+- **Untracked / unenumerated peers do not get reviewed against the new
+  contract** because the change-management process operates on `deploy/`,
+  not on `/etc/systemd/system/`.
+- **Failure modes are silent and partial** — validation entries kept
+  flowing, dashboard kept responding, only the specific observation path
+  went quiet. Four days passed before anyone noticed.
+
+This is worth a `SECURITY.md` checklist item, owned by whoever lands the
+next W-primitive tightening. Suggested wording:
+
+> Before merging a change that tightens a W-primitive (SO_PEERCRED uid
+> allowlist, Landlock policy, egress firewall, signing requirement,
+> etc.), enumerate every process that *currently* depends on the loosened
+> behavior. If any of them is not described by a unit in `deploy/`, add
+> it to `deploy/` and reconcile before the tightening lands. Grep
+> `/etc/systemd/system/` for units that reference the guarded resource
+> (`/tmp/virp-onode.sock`, the Landlocked directory, the formerly-open
+> egress port, etc.) as the minimum enumeration step.
+
+### Timeline (W3 bridge fix)
+
+| Time | Event |
+|------|-------|
+| 22:27:45 | Bridge handshake fails after socat consolidation activated `socket_allowed_uids = [999]` enforcement on its connection too. Bridge starts logging "operating without session." |
+| 22:35:27 / 22:35:59 / 22:40:49 | Three confirmed `chain_register` failures, "Connection reset by peer." |
+| ~22:47   | User attempts `User=virp-onode` drop-in (`peercred.conf`). Bridge crashes with `[Errno 13] Permission denied` on `/root/virp/virp-bridge.py` — the `/root/` traversal layer. |
+| 22:51:17 | New unit (this addendum's `deploy/virp-bridge.service`) written and restarted; second failure mode: `ModuleNotFoundError: No module named 'device_registry'` — the sibling-module layer. |
+| 22:53    | `OKEY_PATH` source edit applied; `device_registry.py` added to `ExecStartPre=+/bin/install`. |
+| 22:54:00 | Bridge restart → `Handshake complete — session ACTIVE, session_id=16aa9ee80287751461caafb422194b67`. |
+| 22:57:39 | Synthetic chain_register succeeds end-to-end. `chain_entries` id 1844, artifact_type=observation, session_id matches handshake. First observation entry since 2026-05-12 20:21:55. |
+

@@ -1,0 +1,31 @@
+[Unit]
+Description=VIRP Demo Bridge — TCP:9998 JSON API to O-Node
+After=virp-onode.service
+Requires=virp-onode.service
+
+[Service]
+Type=simple
+User=virp-onode
+Group=virp-clients
+
+# /root/ is 0700, so virp-onode cannot traverse it. Stage the bridge
+# script + its sibling module under /opt/virp/ during ExecStartPre
+# (escalated via '+') before drop-privs.
+ExecStartPre=+/bin/install -d -o virp-onode -g virp-clients -m 0750 /opt/virp
+ExecStartPre=+/bin/install -o virp-onode -g virp-clients -m 0640 /root/virp/virp-bridge.py /opt/virp/virp-bridge.py
+ExecStartPre=+/bin/install -o virp-onode -g virp-clients -m 0640 /root/virp/device_registry.py /opt/virp/device_registry.py
+
+ExecStart=/usr/bin/python3 /opt/virp/virp-bridge.py
+
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (W3 audit 2026-05-16) — bridge needs no capabilities;
+# binds TCP:9998 (>1024) and connects to a Unix socket as virp-onode.
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

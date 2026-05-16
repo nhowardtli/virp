@@ -387,12 +387,15 @@ all-tests: test test-onode test-chain test-federation test-interop test-session 
 
 .PHONY: install-systemd-units
 install-systemd-units:
-	install -m 0644 deploy/virp-onode.service /etc/systemd/system/virp-onode.service
-	install -m 0644 deploy/virp-socat.service /etc/systemd/system/virp-socat.service
+	install -m 0644 deploy/virp-onode.service  /etc/systemd/system/virp-onode.service
+	install -m 0644 deploy/virp-socat.service  /etc/systemd/system/virp-socat.service
+	install -m 0644 deploy/virp-bridge.service /etc/systemd/system/virp-bridge.service
 	systemctl daemon-reload
 	@echo "Units installed. To activate:"
-	@echo "  systemctl enable --now virp-onode.service virp-socat.service"
-	@echo "If migrating from the legacy override.conf:"
+	@echo "  systemctl enable --now virp-onode.service virp-socat.service virp-bridge.service"
+	@echo "If migrating from legacy drop-ins:"
 	@echo "  rm -f /etc/systemd/system/virp-socat.service.d/override.conf"
 	@echo "  rmdir /etc/systemd/system/virp-socat.service.d 2>/dev/null || true"
-	@echo "  systemctl daemon-reload && systemctl restart virp-socat"
+	@echo "  rm -f /etc/systemd/system/virp-bridge.service.d/peercred.conf"
+	@echo "  rmdir /etc/systemd/system/virp-bridge.service.d 2>/dev/null || true"
+	@echo "  systemctl daemon-reload && systemctl restart virp-socat virp-bridge"
