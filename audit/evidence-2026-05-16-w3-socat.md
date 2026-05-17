@@ -1904,3 +1904,229 @@ specific case from tonight's FortiGate turns that motivated Phase
 | Phases 1–4 outcome | False-confession finding closed at three angles: typed errors (Phase 2), correct claim-type vocabulary (Phase 3), entity canonicalization (Phase 4). All four phases additive and forward-compatible; CT 210 sees the typed banner string + new wire fields, the live system continues to operate, and the binary swap + CT 210 client update are sequenced for next session. |
 
 
+## Addendum 8 — Phase 4 live deployment (2026-05-17 10:34 UTC)
+
+Phases 1–4 are now running on the host. The binary swap completed
+without service-affecting regression to chain.db; one systemd
+dependency mechanic (virp-socat pulled down by Requires= but not
+auto-restarted) surfaced and was repaired as a forward fix.
+
+### Pre-flight findings (Phase A)
+
+| Step | Result |
+|------|--------|
+| A1 — HEAD | `f6615ea6e1306745d9f1e165e12056312de96cd4` ✓ |
+| A2 — Tests | 145/145 PASS across all suites ✓ |
+| A3 — Build artifacts | `build/virp-onode-prod` 714,344 B mtime 2026-05-17 10:08:03; `build/libvirp.so` 452,656 B mtime 2026-05-17 10:10:43 ✓ |
+| A4 — Daemon | pid 1272336, uid `virp-onode`, started 2026-05-16 23:27:02 ✓ |
+| A4 — **finding** | `systemctl cat virp-onode` reveals `ExecStartPre=+/bin/sh -c 'cd /root/virp && make prod-full'` followed by `ExecStartPre=+/bin/cp /root/virp/build/virp-onode-prod /usr/local/bin/virp-onode`. **Every `systemctl restart virp-onode` rebuilds from current source and overwrites the deployed binary.** The deployment is therefore source-driven, not artifact-driven. |
+| A5 — Cage state | `socket_allowed_uids=[999]`; onode/bridge/socat all uid virp-onode ✓ |
+| A6 — chain.db baseline | `max_id=1877, total=1877` (observation 1767, validation 108, intent 1, outcome 1) ✓ |
+| A7 — Backup | `/usr/local/bin/virp-onode.pre-phase1-20260517` created, SHA-256 `056548…7067` matches pre-deploy `/usr/local/bin/virp-onode` ✓ |
+
+The A4 finding reshaped Phase B and the rollback plan. The
+original brief assumed a manual `cp` would deploy the binary; the
+systemd unit was already automating that step every restart.
+
+### Cutover (Phase B, adjusted)
+
+The brief's B2/B3 manual `cp` steps were skipped — systemd's
+ExecStartPre does the equivalent on start. Effective cutover was
+three commands:
+
+```
+10:33:10  systemctl stop virp-onode     # B1
+10:34:32  systemctl start virp-onode    # B4 (triggers rebuild + cp via ExecStartPre)
+10:34:49  systemctl restart virp-bridge # B5
+```
+
+Verifications:
+
+- New `/usr/local/bin/virp-onode` mtime 2026-05-17 10:34:31, SHA-256 `545fdc5fc1f1f394b501d79859a0bd562df57e2b6c0dfbdb3b5015ed687c8288` — matches the freshly-rebuilt `build/virp-onode-prod`. Different SHA from pre-deploy `056548…7067` (Phase 1–4 changes baked in).
+- Daemon active, all 43 devices reconnecting cleanly. Sample journal lines:
+  ```
+  [Watchdog] Started — connecting 43 enabled devices
+  [Watchdog] Connecting: fortigate-200g (10.0.10.1)
+  [virp-fg] handshake OK, verifying host key
+  [SSH-HK] Host key verified: 10.0.10.1:22
+  [virp-fg] SSH authenticated to 10.0.10.1:22
+  [Watchdog] Connected: fortigate-200g
+  ```
+- Bridge handshake succeeded, no `Will operate without session` warning:
+  ```
+  [virp-bridge] INFO Handshake: HELLO_ACK received, session_id=edc5f1aa0d41f0e34ba0729d51e8c7b2, version=2
+  [virp-bridge] INFO Handshake complete — session ACTIVE, session_id=edc5f1aa0d41f0e34ba0729d51e8c7b2
+  ```
+
+### Socat dependency mechanic — repaired in forward direction
+
+C3 verification surfaced port 9999 was no longer listening.
+Root cause: `virp-socat.service` is configured with
+`Requires=virp-onode.service`, which pulls socat DOWN when onode
+stops but does NOT bring it back UP when onode starts. The W3-
+hardened unit (User=virp-onode, Group=virp-clients,
+NoNewPrivileges, empty CapabilityBoundingSet) was failed
+(exit-code 143 from the systemd-driven stop).
+
+Forward fix:
+
+```
+10:38:14  systemctl restart virp-socat
+```
+
+Post-restart verification:
+
+- `virp-socat.service`: active (running) since 10:38:14, pid 1283123
+- Port 9999 listening (`ss -tlnp` confirms `socat,pid=1283123`)
+- Process uid: `virp-onode` — W3 hardening preserved
+- All virp services now active: virp-bridge, virp-onode,
+  virp-socat, virp-verify, virp-prometheus-exporter
+
+The forward fix was chosen over rollback because the underlying
+Phase 4 binary was working correctly (onode healthy, bridge
+handshake succeeded, chain.db unchanged from baseline); rollback
+would have left socat in the same failed state since the cause
+was systemd dependency mechanics, not the new binary.
+
+### Duplicate socat units — open item
+
+Three different systemd units in `/etc/systemd/system/` are all
+configured to listen on port 9999 with the same socat command:
+
+| Unit | Hardened? | Current state |
+|------|-----------|--------------|
+| `virp-socat.service` | Yes (User=virp-onode, hardened) | active (running) |
+| `virp-socat-bridge.service` | No | inactive dead |
+| `virp-socket-bridge.service` | No | inactive dead |
+
+The two unhardened duplicates are pre-W3 leftovers and have not
+been active in this deployment timeline. Left alone for now;
+cleanup (disable + remove the duplicates) is housekeeping for
+next session. Risk if leftover-units are accidentally enabled:
+the unhardened version would race the hardened one for the port
+and the hardened one's startup would fail.
+
+### Post-deploy state (Phase C verification complete)
+
+| Check | Result |
+|-------|--------|
+| C1 — chain.db | `max_id=1877, total=1877` — identical to A6 baseline. System was idle through the deploy window; no in-flight writes. |
+| C3 — Cage state | `socket_allowed_uids=[999]`; onode/bridge/socat all uid `virp-onode` ✓ |
+| C4 — Onode log tail (30s) | No new error patterns. Routine connection/heartbeat traffic only. |
+
+The first real exercise of the Phase 4 deployment will come on
+the next dashboard session. CT 210 sees a new wire-format
+response: existing fields work unchanged; new fields
+(`turn_error_class`, `turn_remediation_hint`, per-assertion
+`error_class`/`remediation_hint`) silently dropped by the
+existing client; `state_read` claim_type now BLOCKs as
+`UNKNOWN_CLAIM_TYPE → class=schema → hint=report_schema_gap`
+(clean degradation — not a false-confession trigger). Full
+realization of the typed surface depends on the CT 210 client
+update, which is the next-session work.
+
+### Rollback procedure (corrected)
+
+The original rollback plan (`cp backup binary && systemctl
+restart onode`) WOULD NOT WORK because systemd's ExecStartPre
+rebuilds from source on every start and overwrites the restored
+binary.
+
+Corrected rollback:
+
+```
+# 1. Stop services in reverse dependency order
+systemctl stop virp-bridge virp-socat virp-onode
+
+# 2. Revert source to pre-Phase-1 state.
+#    38591ab is the commit immediately before Phase 1 (dbdd555).
+#    Validator code is present; Phase 1-4 changes are not.
+git checkout 38591ab
+
+# 3. Start virp-onode — ExecStartPre rebuilds from 38591ab source
+#    and copies the result to /usr/local/bin/virp-onode
+systemctl start virp-onode
+
+# 4. Bring up dependent services
+systemctl restart virp-socat virp-bridge
+
+# 5. Verify rollback healthy
+systemctl status virp-onode virp-bridge virp-socat --no-pager | head -20
+
+# 6. After rollback validation, return source tree to working branch
+git checkout raise-validator-manifest-caps
+```
+
+The pre-deploy binary backup at
+`/usr/local/bin/virp-onode.pre-phase1-20260517` is kept as
+forensic evidence of the exact pre-deploy state (SHA-256 `056548…7067`)
+and as a manual-fallback binary if a non-systemd rollback is
+ever needed.
+
+### Files changed in addendum 8
+
+- **Created:** `/usr/local/bin/virp-onode.pre-phase1-20260517`
+  (pre-deploy binary backup, SHA-256 `056548…7067`)
+- **Modified at deploy time (by systemd ExecStartPre, not by hand):**
+  `/usr/local/bin/virp-onode` (now SHA-256 `545fdc…8288`,
+  mtime 10:34:31)
+- **Service state changes:** virp-onode restart, virp-bridge
+  restart, virp-socat restart. virp-prometheus-exporter and
+  virp-verify untouched.
+- **Modified:** `audit/evidence-2026-05-16-w3-socat.md` — this
+  addendum.
+- **No source changes.** No new commits beyond this addendum.
+- **No push.**
+
+### Open items for next session
+
+1. **Duplicate socat units cleanup.** `virp-socat-bridge.service`
+   and `virp-socket-bridge.service` are pre-W3 leftovers that
+   could race the hardened `virp-socat.service` for port 9999 if
+   accidentally enabled. Disable + remove them as part of next
+   session's housekeeping.
+2. **virp-socat auto-restart with virp-onode.** The current
+   `Requires=virp-onode.service` directive pulls socat down with
+   onode but doesn't auto-restart it. Adding
+   `BindsTo=virp-onode.service` plus a propagation override could
+   make socat track onode's lifecycle automatically. Alternative:
+   `PartOf=virp-onode.service` on the dependent units. Worth
+   discussing the right systemd primitive for this relationship
+   before changing it — there are good reasons either way.
+3. **CT 210 client update.** Adopt new claim_types
+   (`state_observation`, comparison, recommendation, synthesis,
+   outcome_verification), call `validation_resolve_device`
+   pre-emission to canonicalize device references, parse the new
+   wire fields (`turn_error_class`, `turn_remediation_hint`,
+   per-assertion variants). The validator's typed surface,
+   vocabulary, and entity binding all reward this work; without
+   it, the dashboard sees structured banners but doesn't fully
+   realize the typed surface.
+4. **First real production exercise.** Monitor the next dashboard
+   session's chain entries — verify `validation` entries continue
+   to land (chain_entries) AND that their bodies persist
+   (artifacts table). The Phase 2 persistence fix is now live;
+   should see the first non-empty artifacts.validation row from
+   the next dashboard interaction.
+5. **finding-2026-05-16-false-confession.md.** Still unwritten.
+   Original brief asked for a standalone summary doc; the work
+   ended up in the seven audit addenda instead. Worth drafting
+   before the next IETF cycle.
+
+### Cumulative state at end of Phase 4 deployment
+
+| Item | State |
+|------|-------|
+| Branch | `raise-validator-manifest-caps` |
+| HEAD (pre-Addendum-8 commit) | `f6615ea feat(validator): Phase 4 commit 2 — Python ctypes exposure + Addendum 7` |
+| Deployed onode | `/usr/local/bin/virp-onode`, SHA-256 `545fdc…8288`, mtime 2026-05-17 10:34:31 (Phase 4 binary live) |
+| Pre-deploy backup | `/usr/local/bin/virp-onode.pre-phase1-20260517`, SHA-256 `056548…7067` (pre-Phase-1 binary, forensic kept) |
+| Pre-Phase-1 rollback | `pre-phase1-validator-typing-20260517 → dbdd555` (git tag); rollback path documented in this addendum |
+| Tests | **145/145 PASS** (last run before deploy); deployed binary built from this commit |
+| Cage state | unchanged through deploy (`socket_allowed_uids=[999]`, all client procs as uid 999); virp-socat restart preserved hardened uid |
+| chain.db | `max_id=1877, total=1877` — unchanged through deploy. Next chain entries will be Phase 4-typed. |
+| Services | virp-onode, virp-bridge, virp-socat, virp-prometheus-exporter, virp-verify all active (running). Two duplicate socat units inactive (open item). |
+| CT 210 client | Unchanged. Sees new wire fields silently; receives schema-class BLOCKs for `state_read` legacy emissions. Next-session work to fully consume new surface. |
+| Phases 1–4 outcome | **Live.** Typed errors, claim-type vocabulary, entity binding, Python ctypes exposure — all running. False-confession finding closed in code AND in production runtime. |
+
+
