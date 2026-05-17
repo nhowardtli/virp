@@ -94,6 +94,13 @@ class Violation(IntEnum):
     MANIFEST_MALFORMED = 7
     MANIFEST_TOO_LARGE = 8
     MANIFEST_MISSING = 9
+    # Phase 3: analytical claim types
+    EVIDENCE_REFS_MISSING     = 10
+    DERIVED_FROM_MISSING      = 11
+    ACTION_REF_MISSING        = 12
+    ACTION_REF_NOT_IN_CHAIN   = 13
+    DERIVED_FROM_NOT_IN_CHAIN = 14
+    OUTCOME_NOT_AFTER_ACTION  = 15
 
 
 # Error class + remediation hint mirror include/virp_validator.h.
@@ -132,6 +139,13 @@ _VIOLATION_TO_CLASS = {
     Violation.MANIFEST_MALFORMED:       ErrorClass.FORMAT,
     Violation.MANIFEST_TOO_LARGE:       ErrorClass.FORMAT,
     Violation.MANIFEST_MISSING:         ErrorClass.PROVENANCE,
+    # Phase 3 analytical-claim violations
+    Violation.EVIDENCE_REFS_MISSING:      ErrorClass.PROVENANCE,
+    Violation.DERIVED_FROM_MISSING:       ErrorClass.PROVENANCE,
+    Violation.ACTION_REF_MISSING:         ErrorClass.PROVENANCE,
+    Violation.ACTION_REF_NOT_IN_CHAIN:    ErrorClass.CONTENT,
+    Violation.DERIVED_FROM_NOT_IN_CHAIN:  ErrorClass.CONTENT,
+    Violation.OUTCOME_NOT_AFTER_ACTION:   ErrorClass.CONTENT,
 }
 
 _CLASS_TO_HINT = {
@@ -155,23 +169,47 @@ def violation_hint(v: Violation) -> RemediationHint:
 
 @dataclass
 class Assertion:
-    """One per device-state claim the AI makes in this turn's prose.
+    """One per claim the AI makes in this turn's prose.
 
-    `evidence_ref` is the 64-hex SHA-256 of an artifact the O-Node
-    produced this turn. Set to None for explicit "no evidence"; the
-    contract requires either a real ref OR an explicit None, never a
-    missing field (though the C parser is lenient and accepts both).
+    Pre-Phase-3 fields (single evidence):
+      `evidence_ref` is the 64-hex SHA-256 of an artifact the O-Node
+      produced this turn. Set to None for explicit "no evidence"; the
+      contract requires either a real ref OR an explicit None, never a
+      missing field (though the C parser is lenient and accepts both).
+
+    Phase 3 fields (analytical claim types):
+      `evidence_refs`: list of 64-hex strings, used by `comparison` and
+        `synthesis` claim types (≥2 refs required, each in chain+turn).
+      `derived_from`: list of 64-hex strings, used by `recommendation`
+        (≥1 ref required, each in chain — no turn requirement).
+      `action_ref`: single 64-hex string, used by `outcome_verification`
+        alongside `evidence_ref`; validator enforces
+        ts(evidence_ref) > ts(action_ref) in chain.
+
+    Legal claim_type values (Phase 3 vocabulary):
+      state_observation, state_change, config_change, comparison,
+      recommendation, synthesis, outcome_verification.
     """
     device: str
-    claim_type: str  # "state_read" | "state_change" | "config_change"
+    claim_type: str
     evidence_ref: Optional[str] = None
+    evidence_refs: Optional[list] = None
+    derived_from: Optional[list] = None
+    action_ref: Optional[str] = None
 
     def to_manifest(self) -> dict:
-        return {
+        d = {
             "device": self.device,
             "claim_type": self.claim_type,
             "evidence_ref": self.evidence_ref,
         }
+        if self.evidence_refs is not None:
+            d["evidence_refs"] = list(self.evidence_refs)
+        if self.derived_from is not None:
+            d["derived_from"] = list(self.derived_from)
+        if self.action_ref is not None:
+            d["action_ref"] = self.action_ref
+        return d
 
 
 def sha256_hex(data: bytes) -> str:

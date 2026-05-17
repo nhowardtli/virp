@@ -64,7 +64,12 @@ prose is delivered without an entry in chain.db.
   "assertions": [
     {
       "device":       "<string, [A-Za-z0-9._-]{1..63}>",
-      "claim_type":   "state_read" | "state_change" | "config_change",
+      "claim_type":   "state_observation" | "state_change" | "config_change"
+                    | "comparison" | "recommendation" | "synthesis"
+                    | "outcome_verification",
+      "evidence_refs": ["<64-hex>", ...],     // optional, used by comparison & synthesis
+      "derived_from":  ["<64-hex>", ...],     // optional, used by recommendation
+      "action_ref":    "<64-hex>" | null,     // optional, used by outcome_verification
       "evidence_ref": "<64-hex>" | null
     }
     // ... up to VALIDATOR_MAX_ASSERTIONS (32) entries
@@ -97,20 +102,30 @@ prose is delivered without an entry in chain.db.
   assertion. Don't work around this by renaming — flag it so the
   validator's token policy is revised.
 
-- **`assertions[].claim_type`** — one of three literal strings.
+- **`assertions[].claim_type`** — one of seven literal strings.
   Anything else parses successfully to `UNKNOWN` and is evaluated as
-  BLOCK. The three legal values and their evidence semantics:
+  BLOCK with `class=schema`. The seven legal values and their
+  provenance rules:
 
-  | claim_type      | no evidence | evidence present |
-  |-----------------|-------------|-------------------|
-  | `state_read`    | WARN        | chain + turn check |
-  | `state_change`  | **BLOCK**   | chain + turn check |
-  | `config_change` | **BLOCK**   | chain + turn check |
+  | claim_type             | required fields                    | rules |
+  |------------------------|------------------------------------|-------|
+  | `state_observation`    | evidence_ref (or null → WARN)      | evidence_ref in turn + chain |
+  | `state_change`         | evidence_ref (BLOCK if null)       | evidence_ref in turn + chain |
+  | `config_change`        | evidence_ref (BLOCK if null)       | evidence_ref in turn + chain |
+  | `comparison`           | evidence_refs[] with ≥2 entries    | each ref in turn + chain |
+  | `synthesis`            | evidence_refs[] with ≥2 entries    | each ref in turn + chain |
+  | `recommendation`       | derived_from[] with ≥1 entry       | each ref in chain (turn not required — recommendations may cite earlier turns of the same session) |
+  | `outcome_verification` | evidence_ref + action_ref          | both in chain; evidence_ref in turn; **ts(evidence_ref) > ts(action_ref)** — the protocol property that catches "I made the change" overclaims |
 
-  `state_read` is the lenient default for "I am reporting current
-  device state." `state_change` is any claim about a runtime event
-  (adjacency flap, interface toggle, route withdrawal). `config_change`
-  is any claim about configuration having been modified.
+  `state_observation` is the lenient default for "I am reporting
+  current device state" (renamed from `state_read` in Phase 3 — old
+  string no longer parses; callers see `class=schema` until updated).
+  `state_change` and `config_change` are stricter. The four new
+  analytical types target distinct prose shapes: side-by-side
+  contrast (`comparison`), summarization across observations
+  (`synthesis`), suggested action with cited motivation
+  (`recommendation`), and post-action confirmation
+  (`outcome_verification`).
 
 - **`assertions[].evidence_ref`** — either a 64-lowercase-hex
   SHA-256, or JSON `null`. A missing key is accepted as equivalent to
@@ -129,8 +144,11 @@ banner.
 
 1. **Every device-state claim in prose has an assertion.** If the
    prose says "BGP peer up on r1" the manifest has one assertion with
-   `device: "r1"`, `claim_type: "state_read"`. If the prose makes
-   three claims, the manifest has three assertions.
+   `device: "r1"`, `claim_type: "state_observation"`. If the prose
+   makes three claims, the manifest has three assertions. Analytical
+   prose (cross-observation comparison, synthesis, recommendation,
+   post-action confirmation) uses the Phase 3 claim types — each with
+   its own provenance fields.
 
 2. **Every assertion has an explicit `evidence_ref`.** Either a
    64-hex pointing to an artifact_hash produced by this turn, or
@@ -162,19 +180,26 @@ that fail-close to BLOCK:
 |-----------|---------------------------------------------|
 | Manifest missing (no `manifest` key, or empty) | `MANIFEST_MISSING` |
 | Manifest unparseable JSON | `MANIFEST_MALFORMED` |
-| Manifest exceeds 32 assertions or 64 tool_call_refs | `MANIFEST_TOO_LARGE` |
+| Manifest exceeds caps (1024 assertions, 512 tool_call_refs, 8 evidence_refs or derived_from per assertion) | `MANIFEST_TOO_LARGE` |
 | Manifest structurally invalid (non-hex hash, non-string device, etc.) | `MANIFEST_MALFORMED` |
 | `SHA-256(prose) != prose_hash` | `PROSE_HASH_MISMATCH` |
-| claim_type not in the three legal strings | `UNKNOWN_CLAIM_TYPE` |
+| claim_type not in the seven legal strings | `UNKNOWN_CLAIM_TYPE` |
 | `state_change` or `config_change` with `evidence_ref: null` | `NO_EVIDENCE_STATE_CHANGE` |
 | `evidence_ref` not present in `tool_call_refs` | `EVIDENCE_NOT_IN_TURN` |
 | `evidence_ref` in `tool_call_refs` but not in chain.db for this session | `EVIDENCE_NOT_IN_CHAIN` |
+| **Phase 3 — analytical claim types** | |
+| `comparison` or `synthesis` with fewer than 2 `evidence_refs` | `EVIDENCE_REFS_MISSING` |
+| `recommendation` with empty or missing `derived_from` | `DERIVED_FROM_MISSING` |
+| `outcome_verification` missing `action_ref` | `ACTION_REF_MISSING` |
+| `outcome_verification` `action_ref` not in chain.db | `ACTION_REF_NOT_IN_CHAIN` |
+| `recommendation` `derived_from` ref not in chain.db | `DERIVED_FROM_NOT_IN_CHAIN` |
+| `outcome_verification` post-action observation has `ts ≤ action_ref.ts` | `OUTCOME_NOT_AFTER_ACTION` |
 
 WARN is reserved for exactly one case:
 
 | Condition | violation |
 |-----------|-----------|
-| `state_read` with `evidence_ref: null` | `NO_EVIDENCE_STATE_READ` |
+| `state_observation` with `evidence_ref: null` | `NO_EVIDENCE_STATE_READ` |
 
 This is the only soft outcome. Everything else is either PASS or BLOCK.
 
@@ -235,6 +260,12 @@ violation code:
 |---------------------------------|----------------|--------------------------|
 | `NONE`                          | `none`         | `none`                   |
 | `NO_EVIDENCE_STATE_READ`        | `provenance`   | `rerun_with_tools`       |
+| `EVIDENCE_REFS_MISSING`         | `provenance`   | `rerun_with_tools`       |
+| `DERIVED_FROM_MISSING`          | `provenance`   | `rerun_with_tools`       |
+| `ACTION_REF_MISSING`            | `provenance`   | `rerun_with_tools`       |
+| `ACTION_REF_NOT_IN_CHAIN`       | `content`      | `fabrication_detected`   |
+| `DERIVED_FROM_NOT_IN_CHAIN`     | `content`      | `fabrication_detected`   |
+| `OUTCOME_NOT_AFTER_ACTION`      | `content`      | `fabrication_detected`   |
 | `NO_EVIDENCE_STATE_CHANGE`      | `provenance`   | `rerun_with_tools`       |
 | `EVIDENCE_NOT_IN_TURN`          | `provenance`   | `rerun_with_tools`       |
 | `EVIDENCE_NOT_IN_CHAIN`         | `content`      | `fabrication_detected`   |

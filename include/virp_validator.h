@@ -41,24 +41,50 @@
 #define VALIDATOR_HASH_HEX_LEN          64      /* SHA-256 hex, no NUL */
 #define VALIDATOR_CLAIM_TYPE_MAX        32
 #define VALIDATOR_SESSION_ID_MAX        64      /* mirrors virp_chain_entry_t */
+/* Phase 3: per-assertion multi-evidence + analytical claim types */
+#define VALIDATOR_MAX_EVIDENCE_REFS     8       /* comparison, synthesis */
+#define VALIDATOR_MAX_DERIVED_FROM      8       /* recommendation */
 
 /* =========================================================================
  * Claim types
  *
- * state_read    — AI asserts current device state (BGP peer up, route X,
- *                 interface counter Y). Missing evidence is a WARN.
- * state_change  — AI asserts a runtime change occurred (interface toggled,
- *                 adjacency flapped). Missing evidence is a BLOCK.
- * config_change — AI asserts configuration was modified. Missing evidence
- *                 is a BLOCK.
- * unknown       — parser could not map the string. Always BLOCK.
+ * state_observation     — AI asserts current device state (BGP peer up,
+ *                         route X, interface counter Y). Missing evidence
+ *                         is a WARN. Renamed from state_read in Phase 3.
+ * state_change          — AI asserts a runtime change occurred (interface
+ *                         toggled, adjacency flapped). Missing evidence
+ *                         is a BLOCK.
+ * config_change         — AI asserts configuration was modified. Missing
+ *                         evidence is a BLOCK.
+ * comparison            — AI is contrasting 2+ observations. Requires
+ *                         evidence_refs[] with ≥2 entries, all in chain.
+ * recommendation        — AI is suggesting an action based on observations.
+ *                         Requires derived_from[] with ≥1 entry pointing
+ *                         at observations that triggered the suggestion.
+ *                         No evidence_ref required (recommendation is
+ *                         analysis, not a state read).
+ * synthesis             — AI is summarizing across observations. Requires
+ *                         evidence_refs[] with ≥2 entries, all in chain.
+ * outcome_verification  — AI claims a prior action succeeded. Requires
+ *                         BOTH evidence_ref (the post-action observation)
+ *                         AND action_ref (the action that was taken).
+ *                         Validator checks both in chain AND timestamp
+ *                         ordering: evidence_ref.ts > action_ref.ts. The
+ *                         protocol-significant claim type added to catch
+ *                         "I made the change" overclaims without a
+ *                         re-pulled state observation.
+ * unknown               — parser could not map the string. Always BLOCK.
  * ========================================================================= */
 
 typedef enum {
-    VALIDATOR_CLAIM_UNKNOWN       = 0,
-    VALIDATOR_CLAIM_STATE_READ    = 1,
-    VALIDATOR_CLAIM_STATE_CHANGE  = 2,
-    VALIDATOR_CLAIM_CONFIG_CHANGE = 3
+    VALIDATOR_CLAIM_UNKNOWN              = 0,
+    VALIDATOR_CLAIM_STATE_OBSERVATION    = 1,  /* renamed from STATE_READ */
+    VALIDATOR_CLAIM_STATE_CHANGE         = 2,
+    VALIDATOR_CLAIM_CONFIG_CHANGE        = 3,
+    VALIDATOR_CLAIM_COMPARISON           = 4,
+    VALIDATOR_CLAIM_RECOMMENDATION       = 5,
+    VALIDATOR_CLAIM_SYNTHESIS            = 6,
+    VALIDATOR_CLAIM_OUTCOME_VERIFICATION = 7
 } validator_claim_type_t;
 
 /* =========================================================================
@@ -76,16 +102,23 @@ typedef enum {
 } validator_decision_t;
 
 typedef enum {
-    VALIDATOR_VIOLATION_NONE                    = 0,
-    VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ  = 1,  /* → WARN  */
-    VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE= 2,  /* → BLOCK */
-    VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN    = 3,  /* → BLOCK */
-    VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN   = 4,  /* → BLOCK */
-    VALIDATOR_VIOLATION_UNKNOWN_CLAIM_TYPE      = 5,  /* → BLOCK */
-    VALIDATOR_VIOLATION_PROSE_HASH_MISMATCH     = 6,  /* → BLOCK (turn) */
-    VALIDATOR_VIOLATION_MANIFEST_MALFORMED      = 7,  /* → BLOCK (turn) */
-    VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE      = 8,  /* → BLOCK (turn) */
-    VALIDATOR_VIOLATION_MANIFEST_MISSING        = 9   /* → BLOCK (turn) */
+    VALIDATOR_VIOLATION_NONE                       = 0,
+    VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ     = 1,  /* → WARN  (state_observation/no evidence) */
+    VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE   = 2,  /* → BLOCK */
+    VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN       = 3,  /* → BLOCK */
+    VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN      = 4,  /* → BLOCK */
+    VALIDATOR_VIOLATION_UNKNOWN_CLAIM_TYPE         = 5,  /* → BLOCK */
+    VALIDATOR_VIOLATION_PROSE_HASH_MISMATCH        = 6,  /* → BLOCK (turn) */
+    VALIDATOR_VIOLATION_MANIFEST_MALFORMED         = 7,  /* → BLOCK (turn) */
+    VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE         = 8,  /* → BLOCK (turn) */
+    VALIDATOR_VIOLATION_MANIFEST_MISSING           = 9,  /* → BLOCK (turn) */
+    /* Phase 3: analytical claim types */
+    VALIDATOR_VIOLATION_EVIDENCE_REFS_MISSING      = 10, /* → BLOCK (comparison/synthesis need ≥2) */
+    VALIDATOR_VIOLATION_DERIVED_FROM_MISSING       = 11, /* → BLOCK (recommendation needs ≥1) */
+    VALIDATOR_VIOLATION_ACTION_REF_MISSING         = 12, /* → BLOCK (outcome_verification needs it) */
+    VALIDATOR_VIOLATION_ACTION_REF_NOT_IN_CHAIN    = 13, /* → BLOCK */
+    VALIDATOR_VIOLATION_DERIVED_FROM_NOT_IN_CHAIN  = 14, /* → BLOCK */
+    VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION   = 15  /* → BLOCK (timestamp ordering) */
 } validator_violation_code_t;
 
 /* =========================================================================
@@ -136,6 +169,17 @@ typedef struct {
     validator_claim_type_t   claim_type;
     bool                     has_evidence;                       /* false if JSON null or omitted */
     char                     evidence_ref[VALIDATOR_HASH_HEX_LEN + 1];
+
+    /* Phase 3: multi-evidence and analytical-claim fields. All optional;
+     * required-by-type rules enforced at evaluate time. */
+    char                     evidence_refs[VALIDATOR_MAX_EVIDENCE_REFS]
+                                          [VALIDATOR_HASH_HEX_LEN + 1];
+    size_t                   evidence_refs_count;
+    char                     derived_from[VALIDATOR_MAX_DERIVED_FROM]
+                                          [VALIDATOR_HASH_HEX_LEN + 1];
+    size_t                   derived_from_count;
+    bool                     has_action_ref;
+    char                     action_ref[VALIDATOR_HASH_HEX_LEN + 1];
 } validator_assertion_t;
 
 typedef struct {

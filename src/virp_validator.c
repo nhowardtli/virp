@@ -69,9 +69,13 @@ static void sha256_hex(const unsigned char *data, size_t len, char out[VALIDATOR
 static validator_claim_type_t parse_claim_type(const char *s)
 {
     if (s == NULL) return VALIDATOR_CLAIM_UNKNOWN;
-    if (strcmp(s, "state_read") == 0)    return VALIDATOR_CLAIM_STATE_READ;
-    if (strcmp(s, "state_change") == 0)  return VALIDATOR_CLAIM_STATE_CHANGE;
-    if (strcmp(s, "config_change") == 0) return VALIDATOR_CLAIM_CONFIG_CHANGE;
+    if (strcmp(s, "state_observation") == 0)    return VALIDATOR_CLAIM_STATE_OBSERVATION;
+    if (strcmp(s, "state_change") == 0)         return VALIDATOR_CLAIM_STATE_CHANGE;
+    if (strcmp(s, "config_change") == 0)        return VALIDATOR_CLAIM_CONFIG_CHANGE;
+    if (strcmp(s, "comparison") == 0)           return VALIDATOR_CLAIM_COMPARISON;
+    if (strcmp(s, "recommendation") == 0)       return VALIDATOR_CLAIM_RECOMMENDATION;
+    if (strcmp(s, "synthesis") == 0)            return VALIDATOR_CLAIM_SYNTHESIS;
+    if (strcmp(s, "outcome_verification") == 0) return VALIDATOR_CLAIM_OUTCOME_VERIFICATION;
     return VALIDATOR_CLAIM_UNKNOWN;
 }
 
@@ -98,16 +102,22 @@ const char *validator_decision_str(validator_decision_t d)
 const char *validator_violation_str(validator_violation_code_t v)
 {
     switch (v) {
-        case VALIDATOR_VIOLATION_NONE:                     return "none";
-        case VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ:   return "no_evidence_state_read";
-        case VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE: return "no_evidence_state_change";
-        case VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN:     return "evidence_not_in_turn";
-        case VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN:    return "evidence_not_in_chain";
-        case VALIDATOR_VIOLATION_UNKNOWN_CLAIM_TYPE:       return "unknown_claim_type";
-        case VALIDATOR_VIOLATION_PROSE_HASH_MISMATCH:      return "prose_hash_mismatch";
-        case VALIDATOR_VIOLATION_MANIFEST_MALFORMED:       return "manifest_malformed";
-        case VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE:       return "manifest_too_large";
-        case VALIDATOR_VIOLATION_MANIFEST_MISSING:         return "manifest_missing";
+        case VALIDATOR_VIOLATION_NONE:                       return "none";
+        case VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ:     return "no_evidence_state_read";
+        case VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE:   return "no_evidence_state_change";
+        case VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN:       return "evidence_not_in_turn";
+        case VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN:      return "evidence_not_in_chain";
+        case VALIDATOR_VIOLATION_UNKNOWN_CLAIM_TYPE:         return "unknown_claim_type";
+        case VALIDATOR_VIOLATION_PROSE_HASH_MISMATCH:        return "prose_hash_mismatch";
+        case VALIDATOR_VIOLATION_MANIFEST_MALFORMED:         return "manifest_malformed";
+        case VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE:         return "manifest_too_large";
+        case VALIDATOR_VIOLATION_MANIFEST_MISSING:           return "manifest_missing";
+        case VALIDATOR_VIOLATION_EVIDENCE_REFS_MISSING:      return "evidence_refs_missing";
+        case VALIDATOR_VIOLATION_DERIVED_FROM_MISSING:       return "derived_from_missing";
+        case VALIDATOR_VIOLATION_ACTION_REF_MISSING:         return "action_ref_missing";
+        case VALIDATOR_VIOLATION_ACTION_REF_NOT_IN_CHAIN:    return "action_ref_not_in_chain";
+        case VALIDATOR_VIOLATION_DERIVED_FROM_NOT_IN_CHAIN:  return "derived_from_not_in_chain";
+        case VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION:   return "outcome_not_after_action";
     }
     return "unknown";
 }
@@ -115,10 +125,14 @@ const char *validator_violation_str(validator_violation_code_t v)
 const char *validator_claim_type_str(validator_claim_type_t t)
 {
     switch (t) {
-        case VALIDATOR_CLAIM_STATE_READ:    return "state_read";
-        case VALIDATOR_CLAIM_STATE_CHANGE:  return "state_change";
-        case VALIDATOR_CLAIM_CONFIG_CHANGE: return "config_change";
-        case VALIDATOR_CLAIM_UNKNOWN:       return "unknown";
+        case VALIDATOR_CLAIM_STATE_OBSERVATION:    return "state_observation";
+        case VALIDATOR_CLAIM_STATE_CHANGE:         return "state_change";
+        case VALIDATOR_CLAIM_CONFIG_CHANGE:        return "config_change";
+        case VALIDATOR_CLAIM_COMPARISON:           return "comparison";
+        case VALIDATOR_CLAIM_RECOMMENDATION:       return "recommendation";
+        case VALIDATOR_CLAIM_SYNTHESIS:            return "synthesis";
+        case VALIDATOR_CLAIM_OUTCOME_VERIFICATION: return "outcome_verification";
+        case VALIDATOR_CLAIM_UNKNOWN:              return "unknown";
     }
     return "unknown";
 }
@@ -161,9 +175,19 @@ validator_error_class_t validator_violation_class(validator_violation_code_t v)
         case VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE:
         case VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN:
         case VALIDATOR_VIOLATION_MANIFEST_MISSING:
+        /* Phase 3 provenance failures: missing required ref fields. */
+        case VALIDATOR_VIOLATION_EVIDENCE_REFS_MISSING:
+        case VALIDATOR_VIOLATION_DERIVED_FROM_MISSING:
+        case VALIDATOR_VIOLATION_ACTION_REF_MISSING:
             return VALIDATOR_ERROR_CLASS_PROVENANCE;
         case VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN:
         case VALIDATOR_VIOLATION_PROSE_HASH_MISMATCH:
+        /* Phase 3 content failures: referenced artifact missing from
+         * chain, or post-action observation precedes the action
+         * (the outcome_verification gotcha). */
+        case VALIDATOR_VIOLATION_ACTION_REF_NOT_IN_CHAIN:
+        case VALIDATOR_VIOLATION_DERIVED_FROM_NOT_IN_CHAIN:
+        case VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION:
             return VALIDATOR_ERROR_CLASS_CONTENT;
     }
     return VALIDATOR_ERROR_CLASS_NONE;
@@ -210,6 +234,38 @@ static virp_error_t parse_tool_call_refs(const cJSON *arr, validator_manifest_t 
     return VIRP_OK;
 }
 
+/* Parse an array of hex64 strings into a fixed-size slot. Returns the
+ * count via *count_out, or sets *reason_out to MANIFEST_MALFORMED /
+ * MANIFEST_TOO_LARGE on failure. Used by both evidence_refs and
+ * derived_from. */
+static virp_error_t parse_hex_array(const cJSON *arr,
+                                    char (*slot)[VALIDATOR_HASH_HEX_LEN + 1],
+                                    size_t max_n,
+                                    size_t *count_out,
+                                    validator_violation_code_t *reason_out)
+{
+    if (!cJSON_IsArray(arr)) {
+        *reason_out = VALIDATOR_VIOLATION_MANIFEST_MALFORMED;
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+    size_t n = 0;
+    const cJSON *item;
+    cJSON_ArrayForEach(item, arr) {
+        if (n >= max_n) {
+            *reason_out = VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE;
+            return VIRP_ERR_INVALID_LENGTH;
+        }
+        if (!cJSON_IsString(item) || !is_hex64(item->valuestring)) {
+            *reason_out = VALIDATOR_VIOLATION_MANIFEST_MALFORMED;
+            return VIRP_ERR_INVALID_LENGTH;
+        }
+        memcpy(slot[n], item->valuestring, VALIDATOR_HASH_HEX_LEN + 1);
+        n++;
+    }
+    *count_out = n;
+    return VIRP_OK;
+}
+
 static virp_error_t parse_one_assertion(const cJSON *obj, validator_assertion_t *a,
                                         validator_violation_code_t *reason_out)
 {
@@ -249,6 +305,39 @@ static virp_error_t parse_one_assertion(const cJSON *obj, validator_assertion_t 
     } else {
         *reason_out = VALIDATOR_VIOLATION_MANIFEST_MALFORMED;
         return VIRP_ERR_INVALID_LENGTH;
+    }
+
+    /* Phase 3: optional multi-evidence + analytical fields. All zero-init
+     * by caller (memset(manifest, 0, ...) in validator_parse_manifest). */
+    a->evidence_refs_count = 0;
+    a->derived_from_count  = 0;
+    a->has_action_ref      = false;
+    a->action_ref[0]       = '\0';
+
+    const cJSON *erefs = cJSON_GetObjectItemCaseSensitive(obj, "evidence_refs");
+    if (erefs != NULL && !cJSON_IsNull(erefs)) {
+        virp_error_t e = parse_hex_array(erefs, a->evidence_refs,
+                                         VALIDATOR_MAX_EVIDENCE_REFS,
+                                         &a->evidence_refs_count, reason_out);
+        if (e != VIRP_OK) return e;
+    }
+
+    const cJSON *dfrom = cJSON_GetObjectItemCaseSensitive(obj, "derived_from");
+    if (dfrom != NULL && !cJSON_IsNull(dfrom)) {
+        virp_error_t e = parse_hex_array(dfrom, a->derived_from,
+                                         VALIDATOR_MAX_DERIVED_FROM,
+                                         &a->derived_from_count, reason_out);
+        if (e != VIRP_OK) return e;
+    }
+
+    const cJSON *aref = cJSON_GetObjectItemCaseSensitive(obj, "action_ref");
+    if (aref != NULL && !cJSON_IsNull(aref)) {
+        if (!cJSON_IsString(aref) || !is_hex64(aref->valuestring)) {
+            *reason_out = VALIDATOR_VIOLATION_MANIFEST_MALFORMED;
+            return VIRP_ERR_INVALID_LENGTH;
+        }
+        a->has_action_ref = true;
+        memcpy(a->action_ref, aref->valuestring, VALIDATOR_HASH_HEX_LEN + 1);
     }
 
     return VIRP_OK;
@@ -370,6 +459,45 @@ static virp_error_t ref_in_chain(virp_chain_state_t *chain,
     return VIRP_OK;
 }
 
+/* Like ref_in_chain but also returns the earliest timestamp_ns of any
+ * chain_entries row for this (session_id, artifact_hash) pair. Used by
+ * outcome_verification to enforce post-action ordering: the
+ * post-action observation must have ts > action's ts. */
+static virp_error_t ref_in_chain_with_ts(virp_chain_state_t *chain,
+                                         const char *session_id,
+                                         const char *artifact_hash_hex,
+                                         bool *found,
+                                         int64_t *ts_ns_out)
+{
+    *found = false;
+    *ts_ns_out = 0;
+    const char *sql =
+        "SELECT MIN(timestamp_ns) FROM chain_entries "
+        "WHERE session_id = ? AND artifact_hash = ?";
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(chain->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return VIRP_ERR_CHAIN_DB;
+
+    rc = sqlite3_bind_text(stmt, 1, session_id, -1, SQLITE_STATIC);
+    if (rc != SQLITE_OK) { sqlite3_finalize(stmt); return VIRP_ERR_CHAIN_DB; }
+    rc = sqlite3_bind_text(stmt, 2, artifact_hash_hex, -1, SQLITE_STATIC);
+    if (rc != SQLITE_OK) { sqlite3_finalize(stmt); return VIRP_ERR_CHAIN_DB; }
+
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        /* MIN over zero rows returns NULL; check column type. */
+        if (sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+            *found = true;
+            *ts_ns_out = (int64_t)sqlite3_column_int64(stmt, 0);
+        }
+    } else if (rc != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        return VIRP_ERR_CHAIN_DB;
+    }
+    sqlite3_finalize(stmt);
+    return VIRP_OK;
+}
+
 static void evaluate_assertion(virp_chain_state_t *chain,
                                const validator_manifest_t *m,
                                const validator_assertion_t *a,
@@ -378,35 +506,137 @@ static void evaluate_assertion(virp_chain_state_t *chain,
     r->decision  = VALIDATOR_DECISION_PASS;
     r->violation = VALIDATOR_VIOLATION_NONE;
 
-    if (a->claim_type == VALIDATOR_CLAIM_UNKNOWN) {
+    switch (a->claim_type) {
+
+    case VALIDATOR_CLAIM_UNKNOWN:
         r->decision  = VALIDATOR_DECISION_BLOCK;
         r->violation = VALIDATOR_VIOLATION_UNKNOWN_CLAIM_TYPE;
         return;
-    }
 
-    if (!a->has_evidence) {
-        if (a->claim_type == VALIDATOR_CLAIM_STATE_READ) {
-            r->decision  = VALIDATOR_DECISION_WARN;
-            r->violation = VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ;
-        } else {
+    case VALIDATOR_CLAIM_STATE_OBSERVATION:
+    case VALIDATOR_CLAIM_STATE_CHANGE:
+    case VALIDATOR_CLAIM_CONFIG_CHANGE: {
+        /* Single-evidence path (pre-Phase-3 semantics, kept verbatim
+         * apart from the STATE_READ → STATE_OBSERVATION rename). */
+        if (!a->has_evidence) {
+            if (a->claim_type == VALIDATOR_CLAIM_STATE_OBSERVATION) {
+                r->decision  = VALIDATOR_DECISION_WARN;
+                r->violation = VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ;
+            } else {
+                r->decision  = VALIDATOR_DECISION_BLOCK;
+                r->violation = VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE;
+            }
+            return;
+        }
+        if (!ref_in_turn(m, a->evidence_ref)) {
             r->decision  = VALIDATOR_DECISION_BLOCK;
-            r->violation = VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE;
+            r->violation = VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN;
+            return;
+        }
+        bool in_chain = false;
+        virp_error_t err = ref_in_chain(chain, m->session_id,
+                                        a->evidence_ref, &in_chain);
+        if (err != VIRP_OK || !in_chain) {
+            r->decision  = VALIDATOR_DECISION_BLOCK;
+            r->violation = VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN;
+            return;
         }
         return;
     }
 
-    if (!ref_in_turn(m, a->evidence_ref)) {
-        r->decision  = VALIDATOR_DECISION_BLOCK;
-        r->violation = VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN;
+    case VALIDATOR_CLAIM_COMPARISON:
+    case VALIDATOR_CLAIM_SYNTHESIS:
+        /* Multi-evidence: require ≥2 evidence_refs, each in turn and
+         * chain. Same provenance rigor as single-evidence; the only
+         * structural difference is the count. */
+        if (a->evidence_refs_count < 2) {
+            r->decision  = VALIDATOR_DECISION_BLOCK;
+            r->violation = VALIDATOR_VIOLATION_EVIDENCE_REFS_MISSING;
+            return;
+        }
+        for (size_t i = 0; i < a->evidence_refs_count; i++) {
+            if (!ref_in_turn(m, a->evidence_refs[i])) {
+                r->decision  = VALIDATOR_DECISION_BLOCK;
+                r->violation = VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN;
+                return;
+            }
+            bool in_chain = false;
+            virp_error_t err = ref_in_chain(chain, m->session_id,
+                                            a->evidence_refs[i], &in_chain);
+            if (err != VIRP_OK || !in_chain) {
+                r->decision  = VALIDATOR_DECISION_BLOCK;
+                r->violation = VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN;
+                return;
+            }
+        }
+        return;
+
+    case VALIDATOR_CLAIM_RECOMMENDATION:
+        /* Recommendations cite observations that triggered them.
+         * Refs must be in chain for this session, but NOT necessarily
+         * in this turn's tool_call_refs — a recommendation can draw
+         * on observations from earlier turns of the same session. */
+        if (a->derived_from_count < 1) {
+            r->decision  = VALIDATOR_DECISION_BLOCK;
+            r->violation = VALIDATOR_VIOLATION_DERIVED_FROM_MISSING;
+            return;
+        }
+        for (size_t i = 0; i < a->derived_from_count; i++) {
+            bool in_chain = false;
+            virp_error_t err = ref_in_chain(chain, m->session_id,
+                                            a->derived_from[i], &in_chain);
+            if (err != VIRP_OK || !in_chain) {
+                r->decision  = VALIDATOR_DECISION_BLOCK;
+                r->violation = VALIDATOR_VIOLATION_DERIVED_FROM_NOT_IN_CHAIN;
+                return;
+            }
+        }
+        return;
+
+    case VALIDATOR_CLAIM_OUTCOME_VERIFICATION: {
+        /* Both refs required; both in chain; evidence ts > action ts.
+         * The timestamp check is what catches "I made the change"
+         * overclaims: if the AI didn't re-pull state after acting,
+         * the cited observation will be from before the action and
+         * this check fails BLOCK with OUTCOME_NOT_AFTER_ACTION. */
+        if (!a->has_evidence) {
+            r->decision  = VALIDATOR_DECISION_BLOCK;
+            r->violation = VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE;
+            return;
+        }
+        if (!a->has_action_ref) {
+            r->decision  = VALIDATOR_DECISION_BLOCK;
+            r->violation = VALIDATOR_VIOLATION_ACTION_REF_MISSING;
+            return;
+        }
+        if (!ref_in_turn(m, a->evidence_ref)) {
+            r->decision  = VALIDATOR_DECISION_BLOCK;
+            r->violation = VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN;
+            return;
+        }
+        bool ev_in = false; int64_t ev_ts = 0;
+        virp_error_t eerr = ref_in_chain_with_ts(chain, m->session_id,
+                                                 a->evidence_ref, &ev_in, &ev_ts);
+        if (eerr != VIRP_OK || !ev_in) {
+            r->decision  = VALIDATOR_DECISION_BLOCK;
+            r->violation = VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN;
+            return;
+        }
+        bool ac_in = false; int64_t ac_ts = 0;
+        virp_error_t aerr = ref_in_chain_with_ts(chain, m->session_id,
+                                                 a->action_ref, &ac_in, &ac_ts);
+        if (aerr != VIRP_OK || !ac_in) {
+            r->decision  = VALIDATOR_DECISION_BLOCK;
+            r->violation = VALIDATOR_VIOLATION_ACTION_REF_NOT_IN_CHAIN;
+            return;
+        }
+        if (ev_ts <= ac_ts) {
+            r->decision  = VALIDATOR_DECISION_BLOCK;
+            r->violation = VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION;
+            return;
+        }
         return;
     }
-
-    bool in_chain = false;
-    virp_error_t err = ref_in_chain(chain, m->session_id, a->evidence_ref, &in_chain);
-    if (err != VIRP_OK || !in_chain) {
-        r->decision  = VALIDATOR_DECISION_BLOCK;
-        r->violation = VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN;
-        return;
     }
 }
 
@@ -497,7 +727,8 @@ static int build_canonical_decision(const validator_manifest_t *m,
             "\"decision\":\"%s\","
             "\"violation\":%d,"
             "\"error_class\":\"%s\","
-            "\"remediation_hint\":\"%s\"}",
+            "\"remediation_hint\":\"%s\","
+            "\"evidence_refs\":[",
             (i == 0) ? "" : ",",
             a->device,
             validator_claim_type_str(a->claim_type),
@@ -505,6 +736,34 @@ static int build_canonical_decision(const validator_manifest_t *m,
             (int)ar->violation,
             validator_error_class_str(ar->error_class),
             validator_remediation_hint_str(ar->remediation_hint));
+        if (w < 0 || (size_t)w >= buf_len - (size_t)off) return -1;
+        off += w;
+
+        for (size_t j = 0; j < a->evidence_refs_count; j++) {
+            w = snprintf(buf + off, buf_len - (size_t)off, "%s\"%s\"",
+                         (j == 0) ? "" : ",", a->evidence_refs[j]);
+            if (w < 0 || (size_t)w >= buf_len - (size_t)off) return -1;
+            off += w;
+        }
+
+        w = snprintf(buf + off, buf_len - (size_t)off, "],\"derived_from\":[");
+        if (w < 0 || (size_t)w >= buf_len - (size_t)off) return -1;
+        off += w;
+
+        for (size_t j = 0; j < a->derived_from_count; j++) {
+            w = snprintf(buf + off, buf_len - (size_t)off, "%s\"%s\"",
+                         (j == 0) ? "" : ",", a->derived_from[j]);
+            if (w < 0 || (size_t)w >= buf_len - (size_t)off) return -1;
+            off += w;
+        }
+
+        if (a->has_action_ref) {
+            w = snprintf(buf + off, buf_len - (size_t)off,
+                         "],\"action_ref\":\"%s\"}", a->action_ref);
+        } else {
+            w = snprintf(buf + off, buf_len - (size_t)off,
+                         "],\"action_ref\":null}");
+        }
         if (w < 0 || (size_t)w >= buf_len - (size_t)off) return -1;
         off += w;
     }
@@ -521,8 +780,14 @@ virp_error_t validator_commit_decision(virp_chain_state_t *chain,
 {
     if (chain == NULL || manifest == NULL || result == NULL) return VIRP_ERR_NULL_PTR;
 
-    /* Canonical JSON buffer: big enough for MAX_ASSERTIONS plus preamble. */
-    char canonical[8192];
+    /* Canonical JSON buffer.
+     * Phase 3: per-assertion entries now carry evidence_refs[≤8] and
+     * derived_from[≤8] arrays plus action_ref, so each entry can be
+     * up to ~1.5 KB. 64 KB comfortably handles realistic turns (≤32
+     * assertions); MAX_ASSERTIONS=1024 is over-budgeted in this buffer
+     * by design — the parser caps at 1024 but the canonical body
+     * truncates with VIRP_ERR_BUFFER_TOO_SMALL well before that. */
+    char canonical[65536];
     int n = build_canonical_decision(manifest, result, canonical, sizeof(canonical));
     if (n < 0) return VIRP_ERR_BUFFER_TOO_SMALL;
 

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static int tests_passed = 0;
@@ -103,7 +104,7 @@ static void test_pass_full(void)
         "{\"session_id\":\"sess-pass\","
         "\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[\"%s\"],"
-        "\"assertions\":[{\"device\":\"r1\",\"claim_type\":\"state_read\","
+        "\"assertions\":[{\"device\":\"r1\",\"claim_type\":\"state_observation\","
         "\"evidence_ref\":\"%s\"}]}",
         ph, ev, ev);
     ASSERT(n > 0 && n < (int)sizeof(json), "snprintf");
@@ -143,7 +144,7 @@ static void test_warn_state_read_null(void)
     int n = snprintf(json, sizeof(json),
         "{\"session_id\":\"s2\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[],"
-        "\"assertions\":[{\"device\":\"r2\",\"claim_type\":\"state_read\","
+        "\"assertions\":[{\"device\":\"r2\",\"claim_type\":\"state_observation\","
         "\"evidence_ref\":null}]}", ph);
 
     validator_manifest_t m;
@@ -222,7 +223,7 @@ static void test_block_evidence_not_in_turn(void)
     int n = snprintf(json, sizeof(json),
         "{\"session_id\":\"s4\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[],"
-        "\"assertions\":[{\"device\":\"r4\",\"claim_type\":\"state_read\","
+        "\"assertions\":[{\"device\":\"r4\",\"claim_type\":\"state_observation\","
         "\"evidence_ref\":\"%s\"}]}", ph, ev);
 
     validator_manifest_t m; validator_violation_code_t rr;
@@ -261,7 +262,7 @@ static void test_block_evidence_not_in_chain(void)
     int n = snprintf(json, sizeof(json),
         "{\"session_id\":\"s5\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[\"%s\"],"
-        "\"assertions\":[{\"device\":\"r5\",\"claim_type\":\"state_read\","
+        "\"assertions\":[{\"device\":\"r5\",\"claim_type\":\"state_observation\","
         "\"evidence_ref\":\"%s\"}]}", ph, fake, fake);
 
     validator_manifest_t m; validator_violation_code_t rr;
@@ -337,7 +338,7 @@ static void test_manifest_too_large(void)
 
     for (int i = 0; i < VALIDATOR_MAX_ASSERTIONS + 1; i++) {
         int w = snprintf(json + off, cap - (size_t)off,
-            "%s{\"device\":\"r%d\",\"claim_type\":\"state_read\",\"evidence_ref\":null}",
+            "%s{\"device\":\"r%d\",\"claim_type\":\"state_observation\",\"evidence_ref\":null}",
             (i == 0) ? "" : ",", i);
         off += w;
     }
@@ -409,7 +410,7 @@ static void test_parser_edge_cases(void)
     int n1 = snprintf(json1, sizeof(json1),
         "{\"session_id\":\"s9a\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[],"
-        "\"assertions\":[{\"device\":\"r9\",\"claim_type\":\"state_read\","
+        "\"assertions\":[{\"device\":\"r9\",\"claim_type\":\"state_observation\","
         "\"evidence_ref\":\"not-hex\"}]}", ph);
     ASSERT(validator_parse_manifest(json1, (size_t)n1, &m, &reason) != VIRP_OK, "non-hex should fail");
     ASSERT(reason == VALIDATOR_VIOLATION_MANIFEST_MALFORMED, "reason code non-hex");
@@ -419,7 +420,7 @@ static void test_parser_edge_cases(void)
     int n2 = snprintf(json2, sizeof(json2),
         "{\"session_id\":\"s9b\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[],"
-        "\"assertions\":[{\"device\":12345,\"claim_type\":\"state_read\","
+        "\"assertions\":[{\"device\":12345,\"claim_type\":\"state_observation\","
         "\"evidence_ref\":null}]}", ph);
     ASSERT(validator_parse_manifest(json2, (size_t)n2, &m, &reason) != VIRP_OK, "non-string should fail");
     ASSERT(reason == VALIDATOR_VIOLATION_MANIFEST_MALFORMED, "reason code non-string");
@@ -429,7 +430,7 @@ static void test_parser_edge_cases(void)
     int n3 = snprintf(json3, sizeof(json3),
         "{\"session_id\":\"s9c\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[],"
-        "\"assertions\":[{\"device\":\"r9\",\"claim_type\":\"state_read\","
+        "\"assertions\":[{\"device\":\"r9\",\"claim_type\":\"state_observation\","
         "\"evidence_ref\":null}]}", ph);
     ASSERT(validator_parse_manifest(json3, (size_t)n3, &m, &reason) == VIRP_OK, "null should parse");
     ASSERT(!m.assertions[0].has_evidence, "null has_evidence=false");
@@ -439,7 +440,7 @@ static void test_parser_edge_cases(void)
     int n4 = snprintf(json4, sizeof(json4),
         "{\"session_id\":\"s9d\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[],"
-        "\"assertions\":[{\"device\":\"r9\",\"claim_type\":\"state_read\"}]}", ph);
+        "\"assertions\":[{\"device\":\"r9\",\"claim_type\":\"state_observation\"}]}", ph);
     ASSERT(validator_parse_manifest(json4, (size_t)n4, &m, &reason) == VIRP_OK, "missing should parse");
     ASSERT(!m.assertions[0].has_evidence, "missing has_evidence=false");
 
@@ -469,7 +470,7 @@ static void test_commit_decision(void)
     int n = snprintf(json, sizeof(json),
         "{\"session_id\":\"s10\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[\"%s\"],"
-        "\"assertions\":[{\"device\":\"r10\",\"claim_type\":\"state_read\","
+        "\"assertions\":[{\"device\":\"r10\",\"claim_type\":\"state_observation\","
         "\"evidence_ref\":\"%s\"}]}", ph, ev, ev);
 
     validator_manifest_t m; validator_violation_code_t rr;
@@ -539,8 +540,8 @@ static void test_precedence(void)
             "{\"session_id\":\"s11\",\"prose_hash\":\"%s\","
             "\"tool_call_refs\":[\"%s\"],"
             "\"assertions\":["
-              "{\"device\":\"r11\",\"claim_type\":\"state_read\",\"evidence_ref\":null},"
-              "{\"device\":\"r11\",\"claim_type\":\"state_read\",\"evidence_ref\":\"%s\"}"
+              "{\"device\":\"r11\",\"claim_type\":\"state_observation\",\"evidence_ref\":null},"
+              "{\"device\":\"r11\",\"claim_type\":\"state_observation\",\"evidence_ref\":\"%s\"}"
             "]}", ph, ev, ev);
 
         validator_manifest_t m; validator_violation_code_t rr;
@@ -560,7 +561,7 @@ static void test_precedence(void)
             "{\"session_id\":\"s11\",\"prose_hash\":\"%s\","
             "\"tool_call_refs\":[],"
             "\"assertions\":["
-              "{\"device\":\"r11\",\"claim_type\":\"state_read\",\"evidence_ref\":null},"
+              "{\"device\":\"r11\",\"claim_type\":\"state_observation\",\"evidence_ref\":null},"
               "{\"device\":\"r11\",\"claim_type\":\"state_change\",\"evidence_ref\":null}"
             "]}", ph);
 
@@ -593,16 +594,23 @@ static void test_class_hint_mapping(void)
         validator_error_class_t      expect_class;
         validator_remediation_hint_t expect_hint;
     } cases[] = {
-        { VALIDATOR_VIOLATION_NONE,                     VALIDATOR_ERROR_CLASS_NONE,       VALIDATOR_HINT_NONE                 },
-        { VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ,   VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
-        { VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE, VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
-        { VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN,     VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
-        { VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN,    VALIDATOR_ERROR_CLASS_CONTENT,    VALIDATOR_HINT_FABRICATION_DETECTED },
-        { VALIDATOR_VIOLATION_UNKNOWN_CLAIM_TYPE,       VALIDATOR_ERROR_CLASS_SCHEMA,     VALIDATOR_HINT_REPORT_SCHEMA_GAP    },
-        { VALIDATOR_VIOLATION_PROSE_HASH_MISMATCH,      VALIDATOR_ERROR_CLASS_CONTENT,    VALIDATOR_HINT_FABRICATION_DETECTED },
-        { VALIDATOR_VIOLATION_MANIFEST_MALFORMED,       VALIDATOR_ERROR_CLASS_FORMAT,     VALIDATOR_HINT_REGENERATE_MANIFEST  },
-        { VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE,       VALIDATOR_ERROR_CLASS_FORMAT,     VALIDATOR_HINT_REGENERATE_MANIFEST  },
-        { VALIDATOR_VIOLATION_MANIFEST_MISSING,         VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        { VALIDATOR_VIOLATION_NONE,                       VALIDATOR_ERROR_CLASS_NONE,       VALIDATOR_HINT_NONE                 },
+        { VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ,     VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        { VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE,   VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        { VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN,       VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        { VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN,      VALIDATOR_ERROR_CLASS_CONTENT,    VALIDATOR_HINT_FABRICATION_DETECTED },
+        { VALIDATOR_VIOLATION_UNKNOWN_CLAIM_TYPE,         VALIDATOR_ERROR_CLASS_SCHEMA,     VALIDATOR_HINT_REPORT_SCHEMA_GAP    },
+        { VALIDATOR_VIOLATION_PROSE_HASH_MISMATCH,        VALIDATOR_ERROR_CLASS_CONTENT,    VALIDATOR_HINT_FABRICATION_DETECTED },
+        { VALIDATOR_VIOLATION_MANIFEST_MALFORMED,         VALIDATOR_ERROR_CLASS_FORMAT,     VALIDATOR_HINT_REGENERATE_MANIFEST  },
+        { VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE,         VALIDATOR_ERROR_CLASS_FORMAT,     VALIDATOR_HINT_REGENERATE_MANIFEST  },
+        { VALIDATOR_VIOLATION_MANIFEST_MISSING,           VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        /* Phase 3 mappings */
+        { VALIDATOR_VIOLATION_EVIDENCE_REFS_MISSING,      VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        { VALIDATOR_VIOLATION_DERIVED_FROM_MISSING,       VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        { VALIDATOR_VIOLATION_ACTION_REF_MISSING,         VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        { VALIDATOR_VIOLATION_ACTION_REF_NOT_IN_CHAIN,    VALIDATOR_ERROR_CLASS_CONTENT,    VALIDATOR_HINT_FABRICATION_DETECTED },
+        { VALIDATOR_VIOLATION_DERIVED_FROM_NOT_IN_CHAIN,  VALIDATOR_ERROR_CLASS_CONTENT,    VALIDATOR_HINT_FABRICATION_DETECTED },
+        { VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION,   VALIDATOR_ERROR_CLASS_CONTENT,    VALIDATOR_HINT_FABRICATION_DETECTED },
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -666,6 +674,348 @@ static void test_manifest_missing_provenance(void)
 }
 
 /* =========================================================================
+ * Test 14: comparison PASS — evidence_refs with 2 entries, both seeded
+ * ========================================================================= */
+
+static void test_comparison_pass(void)
+{
+    TEST("PASS: comparison with 2 evidence_refs, both in chain+turn");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    char ev1[65], ev2[65];
+    seed_artifact(&st, "s-cmp", "obs-1", "before reading", ev1);
+    seed_artifact(&st, "s-cmp", "obs-2", "after reading",  ev2);
+
+    const char *prose = "BGP table grew from 17 to 19 routes between snapshots.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[2048];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-cmp\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[\"%s\",\"%s\"],"
+        "\"assertions\":[{\"device\":\"r1\",\"claim_type\":\"comparison\","
+        "\"evidence_refs\":[\"%s\",\"%s\"]}]}", ph, ev1, ev2, ev1, ev2);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+    ASSERT(m.assertions[0].evidence_refs_count == 2, "parsed 2 refs");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    ASSERT(r.decision == VALIDATOR_DECISION_PASS, "comparison should PASS");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 15: comparison BLOCK — only 1 evidence_ref (needs ≥2)
+ * ========================================================================= */
+
+static void test_comparison_block_too_few(void)
+{
+    TEST("BLOCK: comparison with <2 evidence_refs → EVIDENCE_REFS_MISSING");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    char ev1[65];
+    seed_artifact(&st, "s-cmp2", "obs-1", "only one obs", ev1);
+
+    const char *prose = "Comparing one thing to itself.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[1024];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-cmp2\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[\"%s\"],"
+        "\"assertions\":[{\"device\":\"r1\",\"claim_type\":\"comparison\","
+        "\"evidence_refs\":[\"%s\"]}]}", ph, ev1, ev1);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    ASSERT(r.decision == VALIDATOR_DECISION_BLOCK, "BLOCK");
+    ASSERT(r.per_assertion[0].violation == VALIDATOR_VIOLATION_EVIDENCE_REFS_MISSING, "violation");
+    ASSERT(r.per_assertion[0].error_class == VALIDATOR_ERROR_CLASS_PROVENANCE, "class provenance");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 16: recommendation PASS — derived_from in chain (no turn req)
+ * ========================================================================= */
+
+static void test_recommendation_pass(void)
+{
+    TEST("PASS: recommendation with derived_from in chain");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    char ev1[65];
+    seed_artifact(&st, "s-rec", "obs-1", "high cpu observation", ev1);
+
+    const char *prose = "Consider rebalancing the BGP best-path computation; recent CPU spikes suggest churn.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    /* Note: tool_call_refs is empty — recommendation doesn't need turn ref. */
+    char json[1024];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-rec\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[],"
+        "\"assertions\":[{\"device\":\"r1\",\"claim_type\":\"recommendation\","
+        "\"derived_from\":[\"%s\"]}]}", ph, ev1);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+    ASSERT(m.assertions[0].derived_from_count == 1, "parsed 1 derived_from");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    ASSERT(r.decision == VALIDATOR_DECISION_PASS, "recommendation should PASS");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 17: recommendation BLOCK — derived_from missing
+ * ========================================================================= */
+
+static void test_recommendation_block_no_derived(void)
+{
+    TEST("BLOCK: recommendation without derived_from → DERIVED_FROM_MISSING");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    const char *prose = "Suggest doing the thing.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[512];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-rec2\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[],"
+        "\"assertions\":[{\"device\":\"r1\",\"claim_type\":\"recommendation\","
+        "\"evidence_ref\":null}]}", ph);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    ASSERT(r.decision == VALIDATOR_DECISION_BLOCK, "BLOCK");
+    ASSERT(r.per_assertion[0].violation == VALIDATOR_VIOLATION_DERIVED_FROM_MISSING, "violation");
+    ASSERT(r.per_assertion[0].error_class == VALIDATOR_ERROR_CLASS_PROVENANCE, "class provenance");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 18: synthesis PASS — 3 evidence_refs, all seeded
+ * ========================================================================= */
+
+static void test_synthesis_pass(void)
+{
+    TEST("PASS: synthesis across 3 evidence_refs");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    char ev1[65], ev2[65], ev3[65];
+    seed_artifact(&st, "s-syn", "obs-1", "r1 bgp", ev1);
+    seed_artifact(&st, "s-syn", "obs-2", "r2 bgp", ev2);
+    seed_artifact(&st, "s-syn", "obs-3", "r3 bgp", ev3);
+
+    const char *prose = "Across r1, r2, r3 the BGP session count is stable at 4 peers each.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[2048];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-syn\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[\"%s\",\"%s\",\"%s\"],"
+        "\"assertions\":[{\"device\":\"fabric\",\"claim_type\":\"synthesis\","
+        "\"evidence_refs\":[\"%s\",\"%s\",\"%s\"]}]}",
+        ph, ev1, ev2, ev3, ev1, ev2, ev3);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+    ASSERT(m.assertions[0].evidence_refs_count == 3, "parsed 3 refs");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    ASSERT(r.decision == VALIDATOR_DECISION_PASS, "synthesis should PASS");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 19: outcome_verification PASS — post-action observation later than action
+ * ========================================================================= */
+
+static void test_outcome_verification_pass(void)
+{
+    TEST("PASS: outcome_verification with evidence ts > action ts");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    char action_h[65];
+    seed_artifact(&st, "s-out", "action-1", "config change applied", action_h);
+    /* Tiny sleep ensures monotonic timestamp delta; chain_append uses
+     * get_wall_ns() which has ns resolution but sub-µs ordering of
+     * back-to-back inserts is not formally guaranteed without a sleep. */
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 };  /* 2ms */
+    nanosleep(&ts, NULL);
+    char post_h[65];
+    seed_artifact(&st, "s-out", "post-1", "device state after change", post_h);
+
+    const char *prose = "The interface is now up after the no shutdown.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[1536];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-out\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[\"%s\",\"%s\"],"
+        "\"assertions\":[{\"device\":\"r1\",\"claim_type\":\"outcome_verification\","
+        "\"evidence_ref\":\"%s\",\"action_ref\":\"%s\"}]}",
+        ph, action_h, post_h, post_h, action_h);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+    ASSERT(m.assertions[0].has_action_ref, "parsed action_ref");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    if (r.decision != VALIDATOR_DECISION_PASS) {
+        char msg[200];
+        snprintf(msg, sizeof(msg),
+                 "outcome_verification PASS expected, got %s (%s)",
+                 validator_decision_str(r.decision),
+                 validator_violation_str(r.per_assertion[0].violation));
+        FAIL(msg);
+        virp_chain_destroy(&st);
+        return;
+    }
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 20: outcome_verification BLOCK — observation precedes action
+ *
+ * This is the protocol-significant regression: the FortiGate-style
+ * "I made the change" overclaim where the AI cites a pre-action
+ * observation as proof of post-action state. Without this check,
+ * the AI's manifest looks structurally valid; the timestamp
+ * comparison is the only structural property that catches it.
+ * ========================================================================= */
+
+static void test_outcome_verification_block_pre_action(void)
+{
+    TEST("BLOCK: outcome_verification with evidence ts ≤ action ts");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    /* Seed observation FIRST, then action. AI claims the observation
+     * proves the post-action state, but the observation is older
+     * than the action — exactly the overclaim shape. */
+    char pre_h[65];
+    seed_artifact(&st, "s-pre", "pre-obs", "device state before change", pre_h);
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 };
+    nanosleep(&ts, NULL);
+    char action_h[65];
+    seed_artifact(&st, "s-pre", "action-1", "the action", action_h);
+
+    const char *prose = "Interface is up after the change [fabricated re-pull].";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[1536];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-pre\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[\"%s\",\"%s\"],"
+        "\"assertions\":[{\"device\":\"r1\",\"claim_type\":\"outcome_verification\","
+        "\"evidence_ref\":\"%s\",\"action_ref\":\"%s\"}]}",
+        ph, pre_h, action_h, pre_h, action_h);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    ASSERT(r.decision == VALIDATOR_DECISION_BLOCK, "BLOCK");
+    ASSERT(r.per_assertion[0].violation == VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION, "violation");
+    ASSERT(r.per_assertion[0].error_class == VALIDATOR_ERROR_CLASS_CONTENT, "class CONTENT");
+    ASSERT(r.per_assertion[0].remediation_hint == VALIDATOR_HINT_FABRICATION_DETECTED, "hint fabrication_detected");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 21: outcome_verification BLOCK — action_ref missing entirely
+ * ========================================================================= */
+
+static void test_outcome_verification_block_no_action_ref(void)
+{
+    TEST("BLOCK: outcome_verification without action_ref → ACTION_REF_MISSING");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    char ev[65];
+    seed_artifact(&st, "s-noac", "obs-1", "post obs but no action ref", ev);
+
+    const char *prose = "Outcome verified but I forgot to cite the action.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[1024];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-noac\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[\"%s\"],"
+        "\"assertions\":[{\"device\":\"r1\",\"claim_type\":\"outcome_verification\","
+        "\"evidence_ref\":\"%s\"}]}", ph, ev, ev);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    ASSERT(r.decision == VALIDATOR_DECISION_BLOCK, "BLOCK");
+    ASSERT(r.per_assertion[0].violation == VALIDATOR_VIOLATION_ACTION_REF_MISSING, "violation");
+    ASSERT(r.per_assertion[0].error_class == VALIDATOR_ERROR_CLASS_PROVENANCE, "class provenance");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -686,6 +1036,15 @@ int main(void)
     test_precedence();
     test_class_hint_mapping();
     test_manifest_missing_provenance();
+    /* Phase 3 — new claim types */
+    test_comparison_pass();
+    test_comparison_block_too_few();
+    test_recommendation_pass();
+    test_recommendation_block_no_derived();
+    test_synthesis_pass();
+    test_outcome_verification_pass();
+    test_outcome_verification_block_pre_action();
+    test_outcome_verification_block_no_action_ref();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

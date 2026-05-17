@@ -186,7 +186,7 @@ class ValidatorE2E(unittest.TestCase):
             tool_call_refs=[self.seed_hash],
             assertions=[
                 Assertion(device="r1",
-                          claim_type="state_read",
+                          claim_type="state_observation",
                           evidence_ref=self.seed_hash),
             ],
         )
@@ -224,7 +224,7 @@ class ValidatorE2E(unittest.TestCase):
             tool_call_refs=[],
             assertions=[
                 Assertion(device="r1",
-                          claim_type="state_read",
+                          claim_type="state_observation",
                           evidence_ref=None),
             ],
         )

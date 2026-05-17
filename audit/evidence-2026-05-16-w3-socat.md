@@ -1376,3 +1376,245 @@ recovered from chain.db alone, with full structured detail.
 | Phase 3 scope | claim_type vocabulary extension; design already drafted in the original session brief; can start fresh next session |
 
 
+## Addendum 6 — Phase 3 claim_type vocabulary extension (2026-05-17)
+
+Phase 3 lands. The validator now accepts four new analytical claim
+types — `comparison`, `recommendation`, `synthesis`,
+`outcome_verification` — and renames `state_read` to
+`state_observation`. The protocol-significant addition is
+`outcome_verification`, which enforces a timestamp ordering check
+(post-action observation must strictly follow the action) — exactly
+the property that would have caught tonight's FortiGate over-claim.
+
+### Design decisions locked before implementation
+
+User-confirmed on 2026-05-17 (open questions 1–4 from Phase 3
+design review):
+
+1. **Rename `state_read` → `state_observation`**, keeping
+   WARN-on-missing semantics. Pure rename. Pre-Phase-3 callers using
+   `"state_read"` now hit `UNKNOWN_CLAIM_TYPE`, which Phase 2's
+   typing routes as `class=schema hint=report_schema_gap` — a clean
+   degradation that doesn't trigger false confessions.
+2. **Multi-evidence via new optional `evidence_refs[]` field.**
+   Single `evidence_ref` continues to work for state types.
+   `comparison` and `synthesis` require `evidence_refs[]` with ≥2
+   entries; each must be in turn (`tool_call_refs`) AND in chain
+   for the session. Forward-compat: pre-Phase-3 manifests parse
+   unchanged.
+3. **`recommendation` cites prior observations via `derived_from[]`.**
+   ≥1 entry required, each in chain. **No turn requirement** — a
+   recommendation can reference observations from earlier turns of
+   the same session (the typical pattern: oncall draws a conclusion
+   from yesterday's incident data).
+4. **`outcome_verification` minimum viable:** carries `evidence_ref`
+   (post-action observation, must be in turn) AND `action_ref`
+   (the action manifest's hash); validator checks both in chain
+   AND `ts(evidence_ref) > ts(action_ref)`. Doesn't parse
+   observation body (preserves the "validator doesn't parse prose"
+   non-goal); the timestamp ordering is the structural signal that
+   catches the AI not re-pulling state after acting.
+
+### What changed (files)
+
+- **`include/virp_validator.h`** — claim_type enum gains 4 new
+  values (COMPARISON, RECOMMENDATION, SYNTHESIS,
+  OUTCOME_VERIFICATION) and renames STATE_READ → STATE_OBSERVATION.
+  Six new violation codes (10–15) for the new failure modes.
+  `validator_assertion_t` gains `evidence_refs[8]`,
+  `derived_from[8]`, `action_ref`, plus `has_action_ref` bool and
+  the two count fields. New limits:
+  `VALIDATOR_MAX_EVIDENCE_REFS = 8`, `VALIDATOR_MAX_DERIVED_FROM = 8`.
+
+- **`src/virp_validator.c`** — claim-type string map adds 4 new
+  literals. Violation string map adds 6 new literals.
+  `validator_violation_class()` extended for Phase 3 violations:
+  `*_MISSING` → provenance, `*_NOT_IN_CHAIN` and
+  `OUTCOME_NOT_AFTER_ACTION` → content (the latter being the
+  fabrication signal).
+
+  New `parse_hex_array()` helper shared by `evidence_refs` and
+  `derived_from` parsing. `parse_one_assertion()` extended to
+  consume the three new optional fields (all null-tolerant for
+  forward compat).
+
+  `evaluate_assertion()` rewritten as a switch over claim_type:
+    - state types: existing behavior (rename only)
+    - comparison/synthesis: ≥2 evidence_refs, each in turn+chain
+    - recommendation: ≥1 derived_from, each in chain (no turn)
+    - outcome_verification: evidence_ref+action_ref both in chain,
+      evidence_ref in turn, ts(evidence) > ts(action)
+
+  New `ref_in_chain_with_ts()` helper returns the earliest
+  timestamp_ns for a (session, hash) pair via `MIN(timestamp_ns)`.
+
+  `build_canonical_decision()` extended to serialize
+  `evidence_refs`, `derived_from`, and `action_ref` per assertion,
+  so the forensic body fully records what the validator saw.
+
+  Canonical buffer grown from 8 KB → 64 KB. The Phase 3
+  per-assertion shape can carry up to ~1.5 KB; 64 KB comfortably
+  handles realistic turn sizes.
+
+- **`api/validator/__init__.py`** — `Violation` IntEnum extended
+  with 6 new codes (10–15). `_VIOLATION_TO_CLASS` map extended.
+  `Assertion` dataclass gains `evidence_refs`, `derived_from`,
+  `action_ref` (all optional). `to_manifest()` only emits the new
+  fields when set, so existing single-evidence manifests serialize
+  identically.
+
+- **`tests/test_validator.c`** — 8 new unit tests:
+    - test 14: comparison PASS with 2 evidence_refs
+    - test 15: comparison BLOCK on <2 refs (EVIDENCE_REFS_MISSING)
+    - test 16: recommendation PASS with derived_from
+    - test 17: recommendation BLOCK on missing derived_from
+    - test 18: synthesis PASS across 3 evidence_refs
+    - test 19: outcome_verification PASS (post-action timestamp ordering valid)
+    - **test 20: outcome_verification BLOCK on pre-action observation**
+      (the FortiGate-style regression — the protocol property that
+      catches "I made the change" overclaims)
+    - test 21: outcome_verification BLOCK on missing action_ref
+
+  `test_class_hint_mapping` (test 12) extended with 6 new
+  Phase 3 mapping rows — every violation code is now in the truth
+  table.
+
+  All existing tests (1–11, 13) had `"state_read"` →
+  `"state_observation"` migrated in their inline JSON.
+
+- **`tests/test_validator_e2e.py`** — claim_type literal updated to
+  `"state_observation"` in the two PASS/WARN round-trip cases.
+
+- **`docs/VALIDATOR-MANIFEST-CONTRACT.md`** — §3 manifest schema
+  shows full claim_type union and the three new optional fields.
+  §3 claim_type table redrawn with all seven types and their
+  provenance rules. §5 fail-closed enumeration extended with the
+  6 new BLOCK conditions. §6.1 class catalog extended with the
+  6 new violation rows. Rule 1 in §4 updated to reference
+  `state_observation` and the analytical claim types.
+
+### Test evidence
+
+| Target          | Result |
+|-----------------|--------|
+| `test`          | 36/36 PASS |
+| `test-onode`    | 31/31 PASS |
+| `test-chain`    | 9/9 PASS |
+| `test-federation` | 9/9 PASS |
+| `test-session`  | 8/8 PASS |
+| `test-session-key` | 6/6 PASS |
+| `test-validator` | **21/21 PASS** (8 new Phase 3 + 2 Phase 2 + 11 original) |
+| `test-validator-e2e` | 3/3 PASS |
+
+**Total: 123/123 PASS.** Build clean under
+`-Wall -Wextra -Werror -pedantic -std=c11 -O2`. Test 20
+specifically locks the FortiGate-class regression in code.
+
+### How Phase 3 closes the false-confession finding
+
+Phases 1–3 together address the root cause from three angles:
+
+- **Phase 1 (diagnostic)** mapped the validator surface and
+  surfaced the asymmetric persistence gap + the off-host dashboard
+  consumer.
+- **Phase 2 (typing)** routes BLOCK verdicts by error class so the
+  model can distinguish format/schema/provenance/content failures.
+  A `class=schema` BLOCK no longer reads as "I fabricated prose"
+  because the hint is `report_schema_gap`, not
+  `fabrication_detected`.
+- **Phase 3 (vocabulary)** gives the AI layer the right claim
+  types for analytical responses. Pre-Phase-3, every analytical
+  claim hit `UNKNOWN_CLAIM_TYPE` (which now correctly routes as
+  `schema/report_schema_gap`); post-Phase-3, analytical responses
+  declare the right type and either PASS (with proper provenance)
+  or BLOCK with the matching `*_MISSING` violation that points the
+  model at exactly what's missing.
+
+The `outcome_verification` type adds a new protocol property:
+provenance-on-result, not just provenance-on-input. Until tonight,
+the validator could confirm "you cite a real observation"; now it
+can confirm "your cited observation is from after the action you
+claim succeeded." That's the protocol fix for the FortiGate
+"I made the change" failure mode.
+
+### What was NOT done in Phase 3
+
+- **Live deployment.** `/usr/local/bin/virp-onode` unchanged. The
+  Phase 3 binary lives at `build/virp-onode-prod` and is verified
+  by the e2e harness against a subprocess.
+- **CT 210 client update.** The dashboard's validator client needs
+  to learn the new claim types and emit `evidence_refs`,
+  `derived_from`, `action_ref` per-type. Until then, the dashboard
+  emits `"state_read"` which now BLOCKs with
+  `class=schema hint=report_schema_gap` — the model receives a
+  clean schema-gap signal and won't self-attribute fabrication.
+  But analytical claims won't reach PASS until CT 210 emits the
+  new claim types.
+- **chain.db reconciliation.** Pre-Phase-3 chain entries reference
+  the old `state_read` claim type name in their artifact bodies
+  (where bodies exist — Phase 2 onwards). No backfill; the
+  historical bodies remain as they were emitted. Tools reading
+  the chain need to accept both spellings.
+
+### Open questions for next session
+
+1. **Live deployment.** Same question as Phase 2: when to install
+   `build/virp-onode-prod`. The wire change to claim_type names
+   is additive on the receive side (CT 211 now accepts more
+   types) and breaking on the send side (CT 210 emitting
+   `state_read` hits UNKNOWN). The strongest argument for
+   deploying tonight: the typed BLOCK signal protects against
+   false confessions even while CT 210 is still emitting
+   `state_read`. Without deployment, tonight's false-confession
+   fix is in code but not running.
+2. **CT 210 client work.** Update CT 210 dashboard's validator
+   client to:
+   (a) emit `state_observation` instead of `state_read`,
+   (b) emit `comparison`/`recommendation`/`synthesis` for
+       analytical prose,
+   (c) emit `outcome_verification` for "I made the change" claims,
+       with the action's hash as `action_ref`.
+3. **Documentation propagation.** The IETF draft work mentioned in
+   the original session brief should reference the Phase 3 claim
+   types. `outcome_verification`'s timestamp-ordering rule is
+   protocol-significant and worth a dedicated section in the
+   draft.
+4. **Phase 4 — entity normalization.** The original brief listed
+   Phase 4 ("fortigate" should resolve to "fortigate-200g") as
+   smallest, do last. Worth scoping next session.
+5. **outcome_verification timestamp semantics.** Phase 3 uses
+   `MIN(timestamp_ns)` from chain_entries to compare action and
+   evidence timestamps. The chain enforces monotonic ordering
+   per session via the sequence column, so MIN ≈ insertion order.
+   Worth confirming: are there cases where the same artifact_hash
+   could appear in multiple chain_entries for the same session
+   with different timestamps? If so, which timestamp matters? The
+   current code takes the earliest occurrence; could change to
+   "latest before claim time" for stricter semantics. Defer
+   unless an edge case surfaces.
+
+### Files changed in addendum 6
+
+- **Modified:** `include/virp_validator.h`, `src/virp_validator.c`,
+  `api/validator/__init__.py`, `tests/test_validator.c`,
+  `tests/test_validator_e2e.py`,
+  `docs/VALIDATOR-MANIFEST-CONTRACT.md`
+- **Modified:** `audit/evidence-2026-05-16-w3-socat.md` — this
+  addendum appended
+- **No changes to live deploy state.** No restart, no install.
+
+### Cumulative state at end of Phase 3
+
+| Item | State |
+|------|-------|
+| Branch | `raise-validator-manifest-caps` |
+| Phase 1 commit | `dbdd555 docs(audit): Phase 1 validator-typing diagnostic — Addendum 4` |
+| Phase 2 commit | `5294063 feat(validator): typed error_class + remediation_hint surface + artifact persistence` |
+| Phase 3 commit | (this commit, after addendum lands) |
+| Pre-Phase-1 rollback | `pre-phase1-validator-typing-20260517 → dbdd555` (Phase 1 boundary) |
+| Tests | 123/123 PASS; build clean -Werror; Phase 3 adds 8 unit tests including 2 outcome_verification cases |
+| Deployed onode | unchanged at `/usr/local/bin/virp-onode`; new typed-and-vocabulary-extended binary at `build/virp-onode-prod` |
+| Cage state | unchanged (`socket_allowed_uids=[999]`, all client procs as uid 999) |
+| Phase 4 scope | entity normalization (resolver: "fortigate" → "fortigate-200g"); smallest, do last per session brief |
+
+
