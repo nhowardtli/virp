@@ -395,4 +395,13 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
+# Phase 4 commit 2: Python-side resolver parity. Loads libvirp.so via
+# ctypes and confirms validation_resolve_device returns the same
+# RESOLVED/AMBIGUOUS/UNRESOLVED + canonical/candidates as the C-side
+# unit tests for the same inputs. Plus a /run/virp/devices.json
+# integration test (auto-skipped if the runtime file is absent).
+.PHONY: test-validator-resolver-py
+test-validator-resolver-py: $(SHLIB)
+	python3 tests/test_validator_resolver_py.py
+
 all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-validator

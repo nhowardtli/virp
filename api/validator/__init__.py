@@ -57,14 +57,19 @@ Copyright 2026 Third Level IT LLC.
 # layer is required to emit manifests).
 # ---------------------------------------------------------------------------
 
+import ctypes
+import ctypes.util
 import hashlib
 import json
+import logging
 import os
 import socket
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import Optional
+from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # Defaults mirror api/server.py so the same env overrides apply.
@@ -453,11 +458,171 @@ def attach_banner(prose: str,
     return f"{banner}\n\n{prose}"
 
 
+# ── Phase 4: canonical device-id resolver (ctypes binding) ──────────────
+#
+# Surfaces the C-side validator_resolve_device() from libvirp.so to
+# Python callers (typically CT 210 dashboard pre-resolving a free-form
+# device reference against the registry before emitting a manifest).
+# The C code is the single source of truth for the matching rules;
+# this binding is a thin marshaling wrapper.
+
+# Mirror include/virp_validator.h constants.
+_VALIDATOR_DEVICE_MAX            = 64
+_VALIDATOR_RESOLVE_MAX_CANDIDATES = 16
+
+
+class ResolveStatus(IntEnum):
+    RESOLVED   = 0
+    AMBIGUOUS  = 1
+    UNRESOLVED = 2
+
+
+@dataclass
+class ResolveResult:
+    """Outcome of validation_resolve_device().
+
+    - On RESOLVED, `canonical` is the registry-cased canonical device_id.
+    - On AMBIGUOUS, `candidates` lists the canonicals that matched
+      (up to VALIDATOR_RESOLVE_MAX_CANDIDATES = 16; the rest are
+      truncated by the C side).
+    - On UNRESOLVED, both fields are empty.
+    """
+    status: ResolveStatus
+    canonical: str = ""
+    candidates: List[str] = field(default_factory=list)
+
+
+class _ValidatorResolveResult(ctypes.Structure):
+    """Memory-layout mirror of include/virp_validator.h
+    validator_resolve_result_t. Field order is load-bearing: it must
+    match the C struct byte-for-byte."""
+    _fields_ = [
+        ("status",          ctypes.c_int),
+        ("canonical",       ctypes.c_char * _VALIDATOR_DEVICE_MAX),
+        ("candidates",      (ctypes.c_char * _VALIDATOR_DEVICE_MAX)
+                            * _VALIDATOR_RESOLVE_MAX_CANDIDATES),
+        ("candidate_count", ctypes.c_size_t),
+    ]
+
+
+def _load_libvirp() -> ctypes.CDLL:
+    """Load libvirp.so. Search paths mirror api/virp_bridge.py:_load_libvirp
+    so the same env override (VIRP_LIB_PATH) and repo-relative resolution
+    work in both modules. No Python fallback — the resolver is the C code."""
+    _repo_build = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "..", "..", "build", "libvirp.so")
+    )
+    search_paths = [
+        os.environ.get("VIRP_LIB_PATH", ""),
+        _repo_build,
+        "/opt/virp/build/libvirp.so",
+        "/usr/local/lib/libvirp.so",
+        "/usr/lib/libvirp.so",
+    ]
+    found = ctypes.util.find_library("virp")
+    if found:
+        search_paths.insert(0, found)
+
+    for path in search_paths:
+        if path and os.path.exists(path):
+            try:
+                lib = ctypes.CDLL(path)
+                logger.info("api.validator: loaded libvirp from %s", path)
+                return lib
+            except OSError as e:
+                logger.warning("api.validator: failed to load %s: %s", path, e)
+
+    raise RuntimeError(
+        "libvirp.so not found. Build with: cd /root/virp && make build/libvirp.so"
+    )
+
+
+_lib: Optional[ctypes.CDLL] = None
+
+
+def _get_lib() -> ctypes.CDLL:
+    """Lazy library load. Defers libvirp.so search to first resolver call
+    so importing this module without libvirp present (e.g. in test or
+    documentation contexts) still works for the wire-format parts."""
+    global _lib
+    if _lib is not None:
+        return _lib
+    lib = _load_libvirp()
+    # void validator_resolve_device(const char *claim_ref,
+    #                               const char *const *canonicals,
+    #                               size_t canonical_count,
+    #                               validator_resolve_result_t *out);
+    lib.validator_resolve_device.argtypes = [
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.c_size_t,
+        ctypes.POINTER(_ValidatorResolveResult),
+    ]
+    lib.validator_resolve_device.restype = None
+    _lib = lib
+    return _lib
+
+
+def validation_resolve_device(claim_ref: str, candidates: List[str]) -> ResolveResult:
+    """Resolve `claim_ref` against `candidates` via the C resolver.
+
+    Matching rules (locked in src/virp_validator.c, mirrored in tests):
+      1. Exact match (case-insensitive) wins.
+      2. Hyphen-token prefix: claim_ref must be a complete prefix of
+         a canonical's hyphen-token sequence AND be ≥4 characters.
+         "fortigate" matches "fortigate-200g". "fort" does not.
+      3. No-hyphen canonicals require exact match.
+      4. ≥2 prefix matches → AMBIGUOUS with candidate list.
+
+    Args:
+        claim_ref: free-form device reference (e.g. "fortigate")
+        candidates: list of canonical device_ids (e.g. devices.json
+                    `hostname` values); empty list always returns
+                    UNRESOLVED.
+
+    Returns:
+        ResolveResult with status + (canonical | candidates).
+    """
+    lib = _get_lib()
+
+    claim_b = (claim_ref or "").encode("utf-8")
+
+    n = len(candidates)
+    arr_t = ctypes.c_char_p * max(n, 1)
+    arr = arr_t(*[c.encode("utf-8") for c in candidates])
+
+    out = _ValidatorResolveResult()
+    # On n == 0 the C side treats it as UNRESOLVED; pass through cleanly.
+    lib.validator_resolve_device(
+        claim_b,
+        ctypes.cast(arr, ctypes.POINTER(ctypes.c_char_p)),
+        ctypes.c_size_t(n),
+        ctypes.byref(out),
+    )
+
+    status = ResolveStatus(out.status)
+    if status == ResolveStatus.RESOLVED:
+        return ResolveResult(
+            status=status,
+            canonical=out.canonical.decode("utf-8", errors="replace"),
+        )
+    if status == ResolveStatus.AMBIGUOUS:
+        cands = [
+            bytes(out.candidates[i]).rstrip(b"\x00").decode("utf-8", errors="replace")
+            for i in range(out.candidate_count)
+        ]
+        return ResolveResult(status=status, candidates=cands)
+    return ResolveResult(status=status)
+
+
 __all__ = [
     "Decision",
     "Violation",
     "ErrorClass",
     "RemediationHint",
+    "ResolveStatus",
+    "ResolveResult",
     "Assertion",
     "ValidationResult",
     "sha256_hex",
@@ -466,5 +631,6 @@ __all__ = [
     "attach_banner",
     "violation_class",
     "violation_hint",
+    "validation_resolve_device",
     "VIRP_OBS_VALIDATION_DECISION",
 ]

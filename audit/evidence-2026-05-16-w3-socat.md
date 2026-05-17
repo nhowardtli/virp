@@ -1618,3 +1618,289 @@ claim succeeded." That's the protocol fix for the FortiGate
 | Phase 4 scope | entity normalization (resolver: "fortigate" → "fortigate-200g"); smallest, do last per session brief |
 
 
+## Addendum 7 — Phase 4 entity normalization (2026-05-17)
+
+Phase 4 lands as two commits: a C-side resolver + binding check
+(commit `edfce8e`) and a Python ctypes exposure (this commit). The
+diagnostic in 4a forced a scope pivot — the original brief assumed
+the validator already did literal string matching on entity
+references, but the validator did no entity matching at all. Phase 4
+is therefore a *feature add* that introduces the cross-check the
+brief described, not a normalization layer on top of an existing
+match.
+
+### 4a diagnostic — the premise pivot
+
+The brief stated: *"Today the lookup is literal string match, which
+produces UNVERIFIED on otherwise-correct responses (we saw this
+twice in the FortiGate turns tonight)."*
+
+Diagnostic findings (`src/virp_validator.c` line citations):
+
+- `assertion.device` is **only** read at parse (line 277) and write
+  (lines 725, 733) — never compared against anything.
+- `grep -rn UNVERIFIED` across `src/` and `include/` returns only
+  `VIRP_ERR_FED_UNVERIFIED` (federation-related, not validator).
+  The validator literally cannot emit "UNVERIFIED."
+- The two UNVERIFIED events the user observed during FortiGate
+  turns tonight must have come from a different layer — most
+  likely the CT 210 Observation Gate referenced in
+  `docs/VALIDATOR-MANIFEST-CONTRACT.md:232–236` ("Pass 1 — device
+  reference check"). That gate runs on the AI-layer side, before
+  manifests reach `validate_turn` on CT 211. Fixing it requires
+  touching CT 210 code, which is off-host.
+
+Two additional findings reshaped the design:
+
+- `/run/virp/devices.json` (43 devices) and `chain.db` agree the
+  device-id format is **not** consistent — `fortigate-200g` is
+  lowercase-hyphen, `SW-3850` and `ASA-5525` are UPPERCASE-hyphen,
+  `R1`…`R35` have no hyphen at all, `Proxmox-Colo` is mixed case,
+  `Wazuh` is mixed case no hyphen. The brief's "always lowercase-
+  hyphen-separated" assumption was wrong. Resolver must be
+  case-insensitive throughout and gracefully handle no-hyphen
+  canonicals.
+- The `artifact_id` format is `obs:<device>:<ts_ns>` for 1754 of
+  1767 observation rows in `chain.db`, set by
+  `virp-bridge.py:389`. The remaining 13 are legacy (`virp...`,
+  `veri...`, `test...`, etc.) — the resolver-binding integration
+  in evaluate_assertion needs a graceful skip for these so the
+  validator doesn't reject historically-shaped chain entries.
+
+### Phase 4 became a feature add
+
+The validator now does what the brief implicitly assumed it
+already did:
+
+- Cross-reference `assertion.device` against the chain entry the
+  `evidence_ref` points to.
+- Resolve abbreviated/case-varied references canonically before
+  rejecting (so "fortigate" successfully binds to a chain entry
+  with device segment "fortigate-200g").
+- Emit `ENTITY_DEVICE_MISMATCH` when the AI's declared device
+  contradicts the chain entry — class=content,
+  hint=fabrication_detected (this is AI mislabeling — real
+  warrant-for-self-correction signal).
+- Emit `ENTITY_AMBIGUOUS` when a resolver call against a wider
+  candidate set finds multiple matches — class=schema,
+  hint=report_schema_gap (AI gave an ambiguous reference; ask
+  it to disambiguate, not apologize).
+
+Currently `ENTITY_AMBIGUOUS` is unreachable from
+`evaluate_assertion`'s per-evidence binding (single-candidate set
+can't be ambiguous). It is reachable through the Python API
+exposure when a caller resolves against the full device registry.
+
+### Resolver design (locked)
+
+`validator_resolve_device(claim_ref, canonicals[], count, *out)`
+in `src/virp_validator.c`.
+
+Three-status return:
+
+- `VALIDATOR_RESOLVE_RESOLVED`   — `out->canonical` filled with
+                                    the matched canonical (in its
+                                    registry case)
+- `VALIDATOR_RESOLVE_AMBIGUOUS`  — `out->candidates[..count]` lists
+                                    the matched canonicals
+- `VALIDATOR_RESOLVE_UNRESOLVED` — no match
+
+Matching rules, in priority order (case-insensitive throughout):
+
+1. **Exact match** against any canonical → `RESOLVED` (priority
+   over prefix; if exact and prefix both match, exact wins).
+2. **Hyphen-token prefix**: `claim_ref` must equal a complete
+   prefix of the canonical's hyphen-token sequence AND be ≥4
+   characters. Tokens are delimited by `-`. Example: canonical
+   `fortigate-200g` has legal prefixes `fortigate` and
+   `fortigate-200g`. Claim `fort` is rejected (mid-token).
+   Claim `fortigate-20` is rejected (mid-token).
+3. **No-hyphen canonicals**: exact match only. `R1`→`R1` resolves
+   but `R`→`R1` does not. Determinism > leniency for short names.
+4. ≥2 prefix matches → `AMBIGUOUS` with candidate list.
+5. Else → `UNRESOLVED`.
+
+Canonical preserves the candidate-list case: claim `sw-3850`
+against a registry containing `SW-3850` resolves to canonical
+`SW-3850`, not lowercase `sw-3850`. Mirrors DNS / hostname
+convention.
+
+### Entity-binding check in evaluate_assertion
+
+The binding fires for **single-evidence claim types only**:
+`state_observation`, `state_change`, `config_change`,
+`outcome_verification` (for the post-action `evidence_ref` —
+not `action_ref`, which may legitimately point at a different
+device's action).
+
+Path inside `evaluate_assertion` (after the existing chain check
+succeeds):
+
+1. Query `chain_entries` for the (session, artifact_hash) entry
+   to retrieve its `artifact_id`
+   (`get_chain_entry_artifact_id` helper).
+2. Parse the `obs:<device>:<ts>` shape to extract the device
+   segment (`extract_device_from_artifact_id`). On non-`obs:`
+   prefix or empty device — return false; binding is skipped
+   silently (legacy data tolerated).
+3. Call `validator_resolve_device` with a single-candidate set
+   `{chain_device}`.
+4. If `RESOLVED` — pass continues. Otherwise (UNRESOLVED, since
+   AMBIGUOUS is impossible with size-1 candidates) — emit
+   `ENTITY_DEVICE_MISMATCH` BLOCK with class=content,
+   hint=fabrication_detected.
+
+**Skipped for multi-evidence types** (`comparison`, `synthesis`,
+`recommendation`): `assertion.device` may be intentionally
+abstracted ("fabric", "topology", or empty) when the claim spans
+multiple devices. Adding binding here would force callers to pick
+an arbitrary representative device, which defeats the point of
+the analytical claim type.
+
+### Python ctypes binding (commit 2)
+
+`api/validator/__init__.py:validation_resolve_device(claim_ref,
+candidates)` returns a `ResolveResult` dataclass with status +
+canonical + candidates.
+
+Implementation choices:
+
+- **ctypes binding to the C resolver** — the C code is the single
+  source of truth. No pure-Python reimplementation, no drift
+  surface to maintain across two implementations of the same
+  rules.
+- **Lazy library load** — `_get_lib()` defers libvirp.so resolution
+  to first call, so importing `api.validator` for the wire-format
+  pieces alone (e.g. parsing `ValidationResult`) doesn't require
+  libvirp to be present.
+- **Path search mirrors `api/virp_bridge.py`** — same
+  `VIRP_LIB_PATH` env override, same repo-relative resolution
+  through `/build/libvirp.so`, same fallback paths
+  (`/opt/virp/build/`, `/usr/local/lib/`, `/usr/lib/`). Two
+  modules, one convention.
+- **ctypes struct mirrors C struct byte-for-byte** —
+  `_ValidatorResolveResult._fields_` order is load-bearing.
+  Constants (`_VALIDATOR_DEVICE_MAX = 64`,
+  `_VALIDATOR_RESOLVE_MAX_CANDIDATES = 16`) are duplicated from
+  `include/virp_validator.h`; any future change to those constants
+  must update both sides.
+
+### Test evidence
+
+| Target | Result |
+|--------|--------|
+| `test` | 36/36 PASS |
+| `test-onode` | 31/31 PASS |
+| `test-chain` | 9/9 PASS |
+| `test-federation` | 9/9 PASS |
+| `test-session` | 8/8 PASS |
+| `test-session-key` | 6/6 PASS |
+| `test-validator` (C unit) | **32/32 PASS** — includes 11 new Phase 4 cases (resolver + binding) |
+| `test-validator-e2e` | 3/3 PASS |
+| `test-validator-resolver-py` (new) | **11/11 PASS** — 8 parity + 3 registry integration |
+
+**Total: 145/145 PASS.** Build clean under
+`-Wall -Wextra -Werror -pedantic -std=c11 -O2`.
+
+The C parity test (`test_class_hint_mapping` truth table) and the
+Python parity test (`ResolverParity`) cover the same input set
+and assert identical outputs. The registry integration test loads
+`/run/virp/devices.json` at runtime and confirms `"fortigate"`
+resolves to `"fortigate-200g"` against the live fleet — the
+specific case from tonight's FortiGate turns that motivated Phase
+4.
+
+### Notes on edge cases handled
+
+- Legacy `artifact_id` shapes (`obs-1`, `virp...`, `veri...`,
+  numeric): `extract_device_from_artifact_id` returns false →
+  binding silently skipped. Provenance is still verified via
+  hash; the device cross-check just can't run. Tested by
+  `test_entity_binding_legacy_artifact_skip`.
+- Empty device segment in artifact_id (`obs::ts`): same path —
+  binding skipped.
+- Empty `claim_ref`: resolver returns `UNRESOLVED`. Tested.
+- Empty candidate list: resolver returns `UNRESOLVED`. Tested.
+- Case mismatch between assertion.device and chain entry
+  (e.g. assertion says `fortigate-200G`, chain says
+  `fortigate-200g`): resolver matches case-insensitively. PASS.
+
+### What was NOT done in Phase 4
+
+- **Live deployment.** `/usr/local/bin/virp-onode` unchanged.
+  Phase 4 lives at `build/virp-onode-prod` and is verified by
+  the e2e harness against a subprocess. `build/libvirp.so` is
+  updated (the ctypes binding loads it locally) but the
+  systemd-managed daemon does not.
+- **CT 210 client update.** The Python wrapper is in place;
+  the dashboard's adoption — calling
+  `validation_resolve_device` before emitting a manifest — is
+  the next CT-210-side change. Until then, CT 210 emits
+  whatever device strings it has; the validator's binding check
+  catches mismatches.
+- **CT 210 Observation Gate.** The pre-validator gate the user
+  observed UNVERIFIED from tonight remains on CT 210. Phase 4
+  does not touch it. The Phase 4 work prevents the validator
+  from emitting analogous false-negatives once CT 210 routes
+  through `validate_turn`; the upstream gate is a separate
+  engagement.
+- **Registry alias support.** The locked design called for
+  Rule 2 to consult a registered alias table after exact match.
+  No alias table exists in `/run/virp/devices.json` today. If
+  one is added later (e.g. `aliases: ["fg", "firewall"]`), the
+  resolver can be extended without changing call sites; the
+  hook is documented but the table isn't wired.
+
+### Open questions for next session
+
+1. **Deployment cadence.** Phases 1–4 are committed locally on
+   `raise-validator-manifest-caps`. The build at
+   `build/virp-onode-prod` carries all four phases.
+   `/usr/local/bin/virp-onode` is unchanged. When to install?
+   Suggested: review the four addenda (4, 5, 6, 7) in one
+   sitting, then install + restart in a maintenance window.
+2. **CT 210 client.** Update CT 210 dashboard's validator client
+   to: emit `state_observation` instead of `state_read`; emit
+   `comparison`/`synthesis`/`recommendation` for analytical
+   prose; emit `outcome_verification` with `action_ref` for "I
+   made the change" claims; call `validation_resolve_device` to
+   canonicalize device references before manifest emission.
+3. **IETF draft work.** Sardar/Farrel review of the Phase 2
+   typed-error surface and Phase 3 outcome_verification protocol
+   is the next external milestone. The audit doc and the still-
+   unwritten `finding-2026-05-16-false-confession.md` should be
+   drafted before the next IETF cycle.
+4. **finding-2026-05-16-false-confession.md.** The original
+   session brief asked for a standalone document at
+   `/root/virp/audit/finding-2026-05-16-false-confession.md`.
+   That document wasn't written; the work was bundled into the
+   six audit-log addenda instead. The standalone document would
+   summarize the finding for external reviewers without
+   requiring them to read the full W3 audit log. Defer to next
+   session.
+
+### Files changed in addendum 7
+
+- **Modified:** `api/validator/__init__.py` (commit 2 — ctypes binding)
+- **New:** `tests/test_validator_resolver_py.py` (commit 2)
+- **Modified:** `Makefile` (commit 2 — new target `test-validator-resolver-py`)
+- **Modified:** `audit/evidence-2026-05-16-w3-socat.md` — this addendum
+- **No changes to live deploy state.** No install, no restart.
+
+### Cumulative state at end of Phase 4
+
+| Item | State |
+|------|-------|
+| Branch | `raise-validator-manifest-caps` |
+| Phase 1 commit | `dbdd555 docs(audit): Phase 1 validator-typing diagnostic — Addendum 4` |
+| Phase 2 commit | `5294063 feat(validator): typed error_class + remediation_hint + persistence` |
+| Phase 3 commit | `cf4918c feat(validator): claim_type vocabulary extension` |
+| Phase 4 commit 1 | `edfce8e feat(validator): canonical device-id resolver + entity binding (C-side)` |
+| Phase 4 commit 2 | (this commit, after addendum lands) — Python ctypes exposure |
+| Pre-Phase-1 rollback | `pre-phase1-validator-typing-20260517 → dbdd555` |
+| Tests | **145/145 PASS** (C 32, Python resolver 11, plus pre-existing 102). Build clean -Werror. |
+| Deployed onode | unchanged at `/usr/local/bin/virp-onode` (mtime 2026-05-16 23:27:01); fully-phased binary at `build/virp-onode-prod` and shared library at `build/libvirp.so` (mtime 2026-05-17, includes resolver symbol) |
+| Cage state | unchanged (`socket_allowed_uids=[999]`, all client procs as uid 999) |
+| Phases 1–4 outcome | False-confession finding closed at three angles: typed errors (Phase 2), correct claim-type vocabulary (Phase 3), entity canonicalization (Phase 4). All four phases additive and forward-compatible; CT 210 sees the typed banner string + new wire fields, the live system continues to operate, and the binary swap + CT 210 client update are sequenced for next session. |
+
+
