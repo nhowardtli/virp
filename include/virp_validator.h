@@ -89,6 +89,45 @@ typedef enum {
 } validator_violation_code_t;
 
 /* =========================================================================
+ * Error class and remediation hint (Phase 2 — typed error surface)
+ *
+ * Maps each violation code to a class (format / schema / provenance /
+ * content) and a remediation hint string. The model receiving a BLOCK
+ * verdict reads these to route its response: format/schema errors are
+ * validator-side gaps (regenerate or report); provenance errors mean
+ * the AI layer needs to rerun tools; content errors are the only
+ * class that warrants self-correction.
+ *
+ * Mapping (locked 2026-05-17, validator-typing pass):
+ *   NONE                       → none / none
+ *   MANIFEST_MALFORMED         → format / regenerate_manifest
+ *   MANIFEST_TOO_LARGE         → format / regenerate_manifest
+ *   MANIFEST_MISSING           → provenance / rerun_with_tools
+ *   UNKNOWN_CLAIM_TYPE         → schema / report_schema_gap
+ *   NO_EVIDENCE_STATE_READ     → provenance / rerun_with_tools
+ *   NO_EVIDENCE_STATE_CHANGE   → provenance / rerun_with_tools
+ *   EVIDENCE_NOT_IN_TURN       → provenance / rerun_with_tools
+ *   EVIDENCE_NOT_IN_CHAIN      → content / fabrication_detected
+ *   PROSE_HASH_MISMATCH        → content / fabrication_detected
+ * ========================================================================= */
+
+typedef enum {
+    VALIDATOR_ERROR_CLASS_NONE       = 0,
+    VALIDATOR_ERROR_CLASS_FORMAT     = 1,
+    VALIDATOR_ERROR_CLASS_SCHEMA     = 2,
+    VALIDATOR_ERROR_CLASS_PROVENANCE = 3,
+    VALIDATOR_ERROR_CLASS_CONTENT    = 4
+} validator_error_class_t;
+
+typedef enum {
+    VALIDATOR_HINT_NONE                 = 0,
+    VALIDATOR_HINT_REGENERATE_MANIFEST  = 1,
+    VALIDATOR_HINT_REPORT_SCHEMA_GAP    = 2,
+    VALIDATOR_HINT_RERUN_WITH_TOOLS     = 3,
+    VALIDATOR_HINT_FABRICATION_DETECTED = 4
+} validator_remediation_hint_t;
+
+/* =========================================================================
  * Manifest — parsed form of the JSON sidecar
  * ========================================================================= */
 
@@ -116,11 +155,15 @@ typedef struct {
 typedef struct {
     validator_decision_t          decision;
     validator_violation_code_t    violation;
+    validator_error_class_t       error_class;        /* derived from violation */
+    validator_remediation_hint_t  remediation_hint;   /* derived from violation */
 } validator_assertion_result_t;
 
 typedef struct {
     validator_decision_t          decision;               /* rollup */
     validator_violation_code_t    turn_violation;         /* non-assertion-scoped */
+    validator_error_class_t       turn_error_class;       /* derived from turn_violation */
+    validator_remediation_hint_t  turn_remediation_hint;  /* derived from turn_violation */
     validator_assertion_result_t  per_assertion[VALIDATOR_MAX_ASSERTIONS];
     size_t                        per_assertion_count;
 
@@ -201,5 +244,11 @@ virp_error_t validator_run_turn(virp_chain_state_t *chain,
 const char *validator_decision_str(validator_decision_t d);
 const char *validator_violation_str(validator_violation_code_t v);
 const char *validator_claim_type_str(validator_claim_type_t t);
+const char *validator_error_class_str(validator_error_class_t c);
+const char *validator_remediation_hint_str(validator_remediation_hint_t h);
+
+/* Mapping: violation code → error class / remediation hint. Pure functions. */
+validator_error_class_t      validator_violation_class(validator_violation_code_t v);
+validator_remediation_hint_t validator_violation_hint(validator_violation_code_t v);
 
 #endif /* VIRP_VALIDATOR_H */

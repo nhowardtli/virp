@@ -63,7 +63,7 @@ import os
 import socket
 import struct
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import Optional
 
 
@@ -94,6 +94,61 @@ class Violation(IntEnum):
     MANIFEST_MALFORMED = 7
     MANIFEST_TOO_LARGE = 8
     MANIFEST_MISSING = 9
+
+
+# Error class + remediation hint mirror include/virp_validator.h.
+# Wire format uses lowercase string values; the C side serializes
+# these via validator_error_class_str() and
+# validator_remediation_hint_str().
+class ErrorClass(str, Enum):
+    NONE       = "none"
+    FORMAT     = "format"
+    SCHEMA     = "schema"
+    PROVENANCE = "provenance"
+    CONTENT    = "content"
+
+
+class RemediationHint(str, Enum):
+    NONE                 = "none"
+    REGENERATE_MANIFEST  = "regenerate_manifest"
+    REPORT_SCHEMA_GAP    = "report_schema_gap"
+    RERUN_WITH_TOOLS     = "rerun_with_tools"
+    FABRICATION_DETECTED = "fabrication_detected"
+
+
+# Map from Violation code to (ErrorClass, RemediationHint). Mirrors
+# validator_violation_class() / validator_violation_hint() in
+# src/virp_validator.c. The C side is the source of truth on the
+# wire; this map is for client-side use when the wire doesn't carry
+# the fields (e.g. an older onode build before Phase 2).
+_VIOLATION_TO_CLASS = {
+    Violation.NONE:                     ErrorClass.NONE,
+    Violation.NO_EVIDENCE_STATE_READ:   ErrorClass.PROVENANCE,
+    Violation.NO_EVIDENCE_STATE_CHANGE: ErrorClass.PROVENANCE,
+    Violation.EVIDENCE_NOT_IN_TURN:     ErrorClass.PROVENANCE,
+    Violation.EVIDENCE_NOT_IN_CHAIN:    ErrorClass.CONTENT,
+    Violation.UNKNOWN_CLAIM_TYPE:       ErrorClass.SCHEMA,
+    Violation.PROSE_HASH_MISMATCH:      ErrorClass.CONTENT,
+    Violation.MANIFEST_MALFORMED:       ErrorClass.FORMAT,
+    Violation.MANIFEST_TOO_LARGE:       ErrorClass.FORMAT,
+    Violation.MANIFEST_MISSING:         ErrorClass.PROVENANCE,
+}
+
+_CLASS_TO_HINT = {
+    ErrorClass.NONE:       RemediationHint.NONE,
+    ErrorClass.FORMAT:     RemediationHint.REGENERATE_MANIFEST,
+    ErrorClass.SCHEMA:     RemediationHint.REPORT_SCHEMA_GAP,
+    ErrorClass.PROVENANCE: RemediationHint.RERUN_WITH_TOOLS,
+    ErrorClass.CONTENT:    RemediationHint.FABRICATION_DETECTED,
+}
+
+
+def violation_class(v: Violation) -> ErrorClass:
+    return _VIOLATION_TO_CLASS.get(v, ErrorClass.NONE)
+
+
+def violation_hint(v: Violation) -> RemediationHint:
+    return _CLASS_TO_HINT.get(violation_class(v), RemediationHint.NONE)
 
 
 # -- Manifest construction helpers -----------------------------------------
@@ -201,9 +256,11 @@ class ValidationResult:
     chain_sequence: int
     chain_entry_hash: str
     artifact_hash: str
-    per_assertion: list   # [(Decision, Violation), ...]
+    per_assertion: list   # [(Decision, Violation, ErrorClass, RemediationHint), ...]
     signature_hex: str
     verified: bool        # True only if an HMAC-capable bridge was supplied
+    turn_error_class: ErrorClass = ErrorClass.NONE
+    turn_remediation_hint: RemediationHint = RemediationHint.NONE
 
     def banner(self) -> Optional[str]:
         """Return a short banner string for non-PASS decisions.
@@ -211,25 +268,41 @@ class ValidationResult:
         Per the locked UX: non-PASS attaches a banner, never censors the
         prose. BLOCK still returns only a banner here — the caller
         decides whether to additionally withhold the prose.
+
+        Phase 2: banner now carries error_class and remediation_hint as
+        structured tokens after the violation name. A model receiving
+        a BLOCK can route by class without substring-parsing English.
+        The historical prefix `[VIRP VALIDATOR BLOCK] <code>
+        (chain seq N)` is preserved; new `[class=... hint=...]` tail
+        is appended.
         """
         if self.decision == Decision.PASS:
             return None
         if self.decision == Decision.WARN:
             return (
                 f"[VIRP VALIDATOR WARN] one or more claims lack evidence "
-                f"(chain seq {self.chain_sequence})"
+                f"(chain seq {self.chain_sequence}) "
+                f"[class={self.turn_error_class.value} "
+                f"hint={self.turn_remediation_hint.value}]"
             )
         reason = self.turn_violation.name
+        klass  = self.turn_error_class
+        hint   = self.turn_remediation_hint
         if reason == "NONE":
             # Turn-wide was clean, so the BLOCK came from an assertion.
-            # Surface the first offender.
-            for d, v in self.per_assertion:
+            # Surface the first offender — pull its class/hint too.
+            for tup in self.per_assertion:
+                d = tup[0]
+                v = tup[1]
                 if d == Decision.BLOCK:
                     reason = v.name
+                    klass  = tup[2] if len(tup) > 2 else violation_class(v)
+                    hint   = tup[3] if len(tup) > 3 else violation_hint(v)
                     break
         return (
             f"[VIRP VALIDATOR BLOCK] {reason} "
-            f"(chain seq {self.chain_sequence})"
+            f"(chain seq {self.chain_sequence}) "
+            f"[class={klass.value} hint={hint.value}]"
         )
 
 
@@ -285,20 +358,38 @@ def validate_turn(session_id: str,
         except Exception:
             verified = False
 
-    per = [
-        (Decision[a["decision"].upper()], Violation(int(a["violation"])))
-        for a in decision.get("assertions", [])
-    ]
+    # Parse per-assertion: violation → class/hint via .get() defaults so
+    # an older onode that doesn't yet emit class/hint still produces a
+    # valid 4-tuple (derived client-side from the violation code).
+    per = []
+    for a in decision.get("assertions", []):
+        d = Decision[a["decision"].upper()]
+        v = Violation(int(a["violation"]))
+        ec_raw = a.get("error_class")
+        rh_raw = a.get("remediation_hint")
+        ec = ErrorClass(ec_raw) if ec_raw else violation_class(v)
+        rh = RemediationHint(rh_raw) if rh_raw else violation_hint(v)
+        per.append((d, v, ec, rh))
+
+    # Turn-level class/hint: wire fields if present, else derive from
+    # turn_violation. Forward-compatible if onode doesn't emit them yet.
+    turn_v = Violation(int(decision["turn_violation"]))
+    tec_raw = decision.get("turn_error_class")
+    trh_raw = decision.get("turn_remediation_hint")
+    turn_ec = ErrorClass(tec_raw) if tec_raw else violation_class(turn_v)
+    turn_rh = RemediationHint(trh_raw) if trh_raw else violation_hint(turn_v)
 
     return ValidationResult(
         decision=Decision[decision["decision"].upper()],
-        turn_violation=Violation(int(decision["turn_violation"])),
+        turn_violation=turn_v,
         chain_sequence=int(decision["chain_sequence"]),
         chain_entry_hash=decision["chain_entry_hash"],
         artifact_hash=decision["artifact_hash"],
         per_assertion=per,
         signature_hex=hmac_hex,
         verified=verified,
+        turn_error_class=turn_ec,
+        turn_remediation_hint=turn_rh,
     )
 
 
@@ -327,11 +418,15 @@ def attach_banner(prose: str,
 __all__ = [
     "Decision",
     "Violation",
+    "ErrorClass",
+    "RemediationHint",
     "Assertion",
     "ValidationResult",
     "sha256_hex",
     "build_manifest",
     "validate_turn",
     "attach_banner",
+    "violation_class",
+    "violation_hint",
     "VIRP_OBS_VALIDATION_DECISION",
 ]

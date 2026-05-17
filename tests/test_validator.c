@@ -155,6 +155,8 @@ static void test_warn_state_read_null(void)
     validator_evaluate(&st, &m, prose, strlen(prose), &r);
     ASSERT(r.decision == VALIDATOR_DECISION_WARN, "decision not WARN");
     ASSERT(r.per_assertion[0].violation == VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ, "violation code");
+    ASSERT(r.per_assertion[0].error_class == VALIDATOR_ERROR_CLASS_PROVENANCE, "class should be provenance");
+    ASSERT(r.per_assertion[0].remediation_hint == VALIDATOR_HINT_RERUN_WITH_TOOLS, "hint should be rerun_with_tools");
 
     virp_chain_destroy(&st);
     PASS();
@@ -269,6 +271,8 @@ static void test_block_evidence_not_in_chain(void)
     validator_evaluate(&st, &m, prose, strlen(prose), &r);
     ASSERT(r.decision == VALIDATOR_DECISION_BLOCK, "decision not BLOCK");
     ASSERT(r.per_assertion[0].violation == VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN, "violation");
+    ASSERT(r.per_assertion[0].error_class == VALIDATOR_ERROR_CLASS_CONTENT, "class should be content");
+    ASSERT(r.per_assertion[0].remediation_hint == VALIDATOR_HINT_FABRICATION_DETECTED, "hint should be fabrication_detected");
 
     virp_chain_destroy(&st);
     PASS();
@@ -318,23 +322,31 @@ static void test_manifest_too_large(void)
     cleanup();
     create_test_key();
 
-    char json[16384];
+    /* MAX_ASSERTIONS+1 entries × ~70 B each + envelope. 96 KB is
+     * comfortable; the prior 16 KB sizing relied on stack layout
+     * tolerating the OOB write that snprintf-loop accumulation
+     * triggered when off exceeded sizeof(json). Sized for honesty,
+     * not luck. */
+    char *json = (char *)malloc(96 * 1024);
+    ASSERT(json != NULL, "alloc");
+    size_t cap = 96 * 1024;
     const char *ph = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    int off = snprintf(json, sizeof(json),
+    int off = snprintf(json, cap,
         "{\"session_id\":\"s7\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[],\"assertions\":[", ph);
 
     for (int i = 0; i < VALIDATOR_MAX_ASSERTIONS + 1; i++) {
-        int w = snprintf(json + off, sizeof(json) - (size_t)off,
+        int w = snprintf(json + off, cap - (size_t)off,
             "%s{\"device\":\"r%d\",\"claim_type\":\"state_read\",\"evidence_ref\":null}",
             (i == 0) ? "" : ",", i);
         off += w;
     }
-    off += snprintf(json + off, sizeof(json) - (size_t)off, "]}");
+    off += snprintf(json + off, cap - (size_t)off, "]}");
 
     validator_manifest_t m;
     validator_violation_code_t reason;
     virp_error_t err = validator_parse_manifest(json, (size_t)off, &m, &reason);
+    free(json);
     ASSERT(err != VIRP_OK, "parser should reject");
     ASSERT(reason == VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE, "reason code");
     PASS();
@@ -481,6 +493,20 @@ static void test_commit_decision(void)
     sqlite3_finalize(stmt);
     ASSERT(count == 1, "should be exactly one validation row");
 
+    /* Phase 2: the canonical decision body must also be persisted to
+     * artifacts so post-hoc forensic comparison is possible. Prior to
+     * Phase 2 the artifacts table had 0 validation rows; now it has 1. */
+    const char *qa = "SELECT artifact_content FROM artifacts "
+                     "WHERE session_id='s10' AND artifact_type='validation'";
+    ASSERT(sqlite3_prepare_v2(st.db, qa, -1, &stmt, NULL) == SQLITE_OK, "prepare artifacts");
+    ASSERT(sqlite3_step(stmt) == SQLITE_ROW, "artifacts row should exist");
+    const unsigned char *body = sqlite3_column_text(stmt, 0);
+    ASSERT(body != NULL, "artifact_content non-null");
+    /* Spot-check the body contains the new turn_error_class field. */
+    ASSERT(strstr((const char *)body, "\"turn_error_class\":\"none\"") != NULL,
+           "canonical JSON should embed turn_error_class=none for PASS");
+    sqlite3_finalize(stmt);
+
     virp_chain_destroy(&st);
     PASS();
 }
@@ -552,6 +578,94 @@ static void test_precedence(void)
 }
 
 /* =========================================================================
+ * Test 12: violation → error_class + remediation_hint mapping (full table)
+ *
+ * Walks every violation code and checks the mapping function returns
+ * the locked class+hint. This is the truth table for the wire format.
+ * ========================================================================= */
+
+static void test_class_hint_mapping(void)
+{
+    TEST("Mapping: every violation code maps to expected class + hint");
+
+    struct {
+        validator_violation_code_t   v;
+        validator_error_class_t      expect_class;
+        validator_remediation_hint_t expect_hint;
+    } cases[] = {
+        { VALIDATOR_VIOLATION_NONE,                     VALIDATOR_ERROR_CLASS_NONE,       VALIDATOR_HINT_NONE                 },
+        { VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ,   VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        { VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE, VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        { VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_TURN,     VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+        { VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN,    VALIDATOR_ERROR_CLASS_CONTENT,    VALIDATOR_HINT_FABRICATION_DETECTED },
+        { VALIDATOR_VIOLATION_UNKNOWN_CLAIM_TYPE,       VALIDATOR_ERROR_CLASS_SCHEMA,     VALIDATOR_HINT_REPORT_SCHEMA_GAP    },
+        { VALIDATOR_VIOLATION_PROSE_HASH_MISMATCH,      VALIDATOR_ERROR_CLASS_CONTENT,    VALIDATOR_HINT_FABRICATION_DETECTED },
+        { VALIDATOR_VIOLATION_MANIFEST_MALFORMED,       VALIDATOR_ERROR_CLASS_FORMAT,     VALIDATOR_HINT_REGENERATE_MANIFEST  },
+        { VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE,       VALIDATOR_ERROR_CLASS_FORMAT,     VALIDATOR_HINT_REGENERATE_MANIFEST  },
+        { VALIDATOR_VIOLATION_MANIFEST_MISSING,         VALIDATOR_ERROR_CLASS_PROVENANCE, VALIDATOR_HINT_RERUN_WITH_TOOLS     },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        validator_error_class_t gc      = validator_violation_class(cases[i].v);
+        validator_remediation_hint_t gh = validator_violation_hint(cases[i].v);
+        if (gc != cases[i].expect_class) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "violation %d: class %s, expected %s",
+                     (int)cases[i].v,
+                     validator_error_class_str(gc),
+                     validator_error_class_str(cases[i].expect_class));
+            FAIL(msg);
+            return;
+        }
+        if (gh != cases[i].expect_hint) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "violation %d: hint %s, expected %s",
+                     (int)cases[i].v,
+                     validator_remediation_hint_str(gh),
+                     validator_remediation_hint_str(cases[i].expect_hint));
+            FAIL(msg);
+            return;
+        }
+    }
+    PASS();
+}
+
+/* =========================================================================
+ * Test 13: MANIFEST_MISSING (NULL/0-len input) classes as provenance
+ *
+ * Belt-and-suspenders for the locked taxonomy decision: the AI layer
+ * failing to emit any manifest is a provenance failure (no inputs
+ * supplied), not a format failure (nothing to be malformed about).
+ * ========================================================================= */
+
+static void test_manifest_missing_provenance(void)
+{
+    TEST("validator_run_turn: MISSING manifest classes as provenance");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    validator_result_t r;
+    virp_error_t err = validator_run_turn(&st,
+                                          NULL, 0,
+                                          NULL, 0,
+                                          "sess-missing",
+                                          &r);
+    ASSERT(err == VIRP_OK, "run_turn should succeed (commit-on-fail path)");
+    ASSERT(r.decision == VALIDATOR_DECISION_BLOCK, "decision BLOCK");
+    ASSERT(r.turn_violation == VALIDATOR_VIOLATION_MANIFEST_MISSING, "turn_violation MISSING");
+    ASSERT(r.turn_error_class == VALIDATOR_ERROR_CLASS_PROVENANCE, "class provenance");
+    ASSERT(r.turn_remediation_hint == VALIDATOR_HINT_RERUN_WITH_TOOLS, "hint rerun_with_tools");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -570,6 +684,8 @@ int main(void)
     test_parser_edge_cases();
     test_commit_decision();
     test_precedence();
+    test_class_hint_mapping();
+    test_manifest_missing_provenance();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

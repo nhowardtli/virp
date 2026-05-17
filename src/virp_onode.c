@@ -1407,22 +1407,29 @@ static void handle_client(onode_state_t *state, int client_fd)
         int joff = snprintf(json_buf, sizeof(json_buf),
             "{\"decision\":\"%s\","
             "\"turn_violation\":%d,"
+            "\"turn_error_class\":\"%s\","
+            "\"turn_remediation_hint\":\"%s\","
             "\"chain_sequence\":%lld,"
             "\"chain_entry_hash\":\"%s\","
             "\"artifact_hash\":\"%s\","
             "\"assertions\":[",
             validator_decision_str(vr.decision),
             (int)vr.turn_violation,
+            validator_error_class_str(vr.turn_error_class),
+            validator_remediation_hint_str(vr.turn_remediation_hint),
             (long long)vr.chain_sequence,
             vr.chain_entry_hash,
             vr.artifact_hash);
 
         for (size_t i = 0; i < vr.per_assertion_count; i++) {
             int jw = snprintf(json_buf + joff, sizeof(json_buf) - (size_t)joff,
-                "%s{\"decision\":\"%s\",\"violation\":%d}",
+                "%s{\"decision\":\"%s\",\"violation\":%d,"
+                "\"error_class\":\"%s\",\"remediation_hint\":\"%s\"}",
                 (i == 0) ? "" : ",",
                 validator_decision_str(vr.per_assertion[i].decision),
-                (int)vr.per_assertion[i].violation);
+                (int)vr.per_assertion[i].violation,
+                validator_error_class_str(vr.per_assertion[i].error_class),
+                validator_remediation_hint_str(vr.per_assertion[i].remediation_hint));
             if (jw < 0 || (size_t)jw >= sizeof(json_buf) - (size_t)joff) {
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 goto validate_turn_done;

@@ -1118,3 +1118,261 @@ inspected. One-line lesson: paths against code, not against `ls`.
 | Phase 2 scope | 5–8 hr realistic; do-not-start-tonight per session brief threshold |
 
 
+## Addendum 5 — Phase 2 validator-typing implementation (2026-05-17)
+
+Phase 2 lands. Validator now emits typed error_class +
+remediation_hint structured tokens, persists the canonical decision
+body to the `artifacts` table, and surfaces the typed surface
+through the Python client and onode wire format. CT 211 only —
+CT 210 dashboard update remains a separate engagement.
+
+### Design decisions locked before implementation
+
+User-confirmed on 2026-05-17 (open questions 1–4 from Addendum 4):
+
+1. **`MANIFEST_MISSING` → provenance class**, paired with
+   `rerun_with_tools` hint. Treated as the AI layer failing to emit
+   any manifest at all; the prose has no inputs supplied. Distinct
+   from `MANIFEST_MALFORMED` (format) where structure is broken.
+2. **4 per-class remediation hints**, locked to:
+   `regenerate_manifest` (format), `report_schema_gap` (schema),
+   `rerun_with_tools` (provenance), `fabrication_detected`
+   (content). No per-violation overrides.
+3. **Best-effort persistence.** The new
+   `virp_chain_artifact_store()` call inside
+   `validator_commit_decision()` runs after `virp_chain_append`
+   succeeds. If artifact_store fails, a warning is written to
+   stderr (captured by systemd journal); the call still returns
+   `VIRP_OK`. Matches today's semantics where the chain entry is
+   canonical and artifact rows are best-effort.
+4. **Phase 2 = CT 211 only.** C-side enums + onode response JSON +
+   Python client. CT 210 dashboard pickup of the new fields is a
+   follow-on; new fields are additive and forward-compatible.
+
+### What changed (files)
+
+- **`include/virp_validator.h`** (+49 lines)
+  - New enum `validator_error_class_t` (5 values)
+  - New enum `validator_remediation_hint_t` (5 values)
+  - `validator_assertion_result_t` gains `error_class` and
+    `remediation_hint` fields
+  - `validator_result_t` gains `turn_error_class` and
+    `turn_remediation_hint` fields
+  - Four new helper declarations:
+    `validator_error_class_str()`,
+    `validator_remediation_hint_str()`,
+    `validator_violation_class()`,
+    `validator_violation_hint()`
+  - Header comment block documents the locked mapping
+
+- **`src/virp_validator.c`** (+104 lines)
+  - `validator_error_class_str()` and
+    `validator_remediation_hint_str()` — string serialization
+    matching the wire-format tokens
+  - `validator_violation_class()` — pure switch from violation code
+    to class, single source of truth for the taxonomy
+  - `validator_violation_hint()` — derives from class (one hint per
+    class per the locked spec)
+  - `validator_evaluate()` — appended finalization loop that fills
+    `turn_error_class`, `turn_remediation_hint`, and per-assertion
+    `error_class` / `remediation_hint` from violation codes. Emit
+    sites untouched — typing is derived, not duplicated
+  - `validator_run_turn()` parse-fail path — also derives
+    class/hint from `turn_violation` so the early-fail BLOCK has
+    the typed surface populated before `validator_commit_decision`
+    is called
+  - `build_canonical_decision()` — canonical JSON now includes
+    `turn_error_class`, `turn_remediation_hint`, and per-assertion
+    `error_class`, `remediation_hint`. Hash basis changes for
+    every new entry; pre-Phase-2 chain entries are unaffected
+  - `validator_commit_decision()` — new
+    `virp_chain_artifact_store()` call after `virp_chain_append`,
+    persisting `canonical` (the 8 KB decision body) to the
+    `artifacts` table. Best-effort; failure logs to stderr and
+    returns `VIRP_OK`
+
+- **`src/virp_onode.c`** (+11 lines)
+  - `ONODE_ACTION_VALIDATE_TURN` response JSON (lines 1407–1432)
+    emits `turn_error_class`, `turn_remediation_hint`, and
+    per-assertion `error_class`, `remediation_hint` strings. Buffer
+    capacity (8 KB) still comfortable: 32 assertions × ~80
+    added bytes ≈ 2.5 KB; the truncation-detection branch already
+    handles the overflow case and is preserved
+
+- **`api/validator/__init__.py`** (+117 lines)
+  - New `ErrorClass(str, Enum)` and `RemediationHint(str, Enum)`
+    mirror the C enums
+  - `_VIOLATION_TO_CLASS` and `_CLASS_TO_HINT` maps and the
+    `violation_class()` / `violation_hint()` helpers — used as a
+    client-side fallback if talking to an older onode whose wire
+    doesn't include the new fields (forward-compat)
+  - `ValidationResult` dataclass gains `turn_error_class` and
+    `turn_remediation_hint` fields with `None`/`NONE` defaults
+  - `per_assertion` list is now a 4-tuple
+    `(Decision, Violation, ErrorClass, RemediationHint)` — existing
+    2-index access `per[0][0]` and `per[0][1]` is preserved; index
+    2 and 3 are new
+  - `validate_turn()` parses new fields with `.get()` defaults
+    falling back to the derivation helpers — forward-compat
+    with older onodes
+  - `attach_banner()` banner string now appends
+    `[class=<value> hint=<value>]` after the historical
+    `[VIRP VALIDATOR BLOCK] <code> (chain seq N)` prefix; old
+    callers regex'ing the prefix still match
+  - Module `__all__` re-exports the new types and helpers
+
+- **`tests/test_validator.c`** (+124 lines, -2 lines)
+  - Test 2 (WARN/state_read/null) extended with
+    `error_class == PROVENANCE` and
+    `remediation_hint == RERUN_WITH_TOOLS` assertions
+  - Test 5 (BLOCK/evidence_not_in_chain) extended with
+    `error_class == CONTENT` and
+    `remediation_hint == FABRICATION_DETECTED` assertions
+  - Test 10 (commit_decision) extended: now queries the
+    `artifacts` table and asserts the validation row's
+    `artifact_content` exists and contains
+    `"turn_error_class":"none"` — the Phase 2 persistence guarantee
+  - **NEW Test 12** (`test_class_hint_mapping`) — table-driven
+    check of every violation code's class and hint, the locked
+    taxonomy in executable form
+  - **NEW Test 13** (`test_manifest_missing_provenance`) — end-to-
+    end `validator_run_turn(NULL, 0, NULL, 0)` asserts
+    `MANIFEST_MISSING` rolls up to BLOCK with `class=provenance`
+    and `hint=rerun_with_tools`, locking question-1's decision in
+    a regression test
+  - **Pre-existing bug fixed in test 7** (`test_manifest_too_large`):
+    the `json[16384]` stack buffer overflowed via cumulative
+    `snprintf` past EOB whenever the loop wrote >16 KB. The
+    test passed by stack-layout luck before; with the Phase 2
+    `validator_result_t` doubling in size (per_assertion array
+    grew from 1024×8 B to 1024×16 B), the OOB write started
+    segfaulting. Replaced with a 96 KB heap allocation. Not part
+    of the typing work but surfaced by it; flagged here for
+    transparency
+
+- **`docs/VALIDATOR-MANIFEST-CONTRACT.md`** (+88 lines)
+  - §6 response format JSON updated with new fields
+  - **NEW §6.1** documenting the error class / remediation hint
+    catalog, including the per-class routing guidance for the model
+    (do/don't apologize for fabrication by class)
+  - **NEW §6.2** documenting Phase 2 persistence behavior
+  - **NEW §6.3** backward-compatibility guarantees
+
+### Test evidence
+
+```
+make test test-onode test-chain test-federation test-session
+     test-session-key test-validator
+```
+
+| Target          | Result |
+|-----------------|--------|
+| `test`          | 36/36 PASS |
+| `test-onode`    | 31/31 PASS |
+| `test-chain`    | 9/9 PASS |
+| `test-federation` | 9/9 PASS |
+| `test-session`  | 8/8 PASS |
+| `test-session-key` | 6/6 PASS |
+| `test-validator` | 13/13 PASS (including 2 new Phase 2 tests + extended commit_decision artifact-row assertion) |
+| `test-validator-e2e` | 3/3 PASS (live wire format round-trip against subprocess virp-onode-prod) |
+
+**Total: 115/115 PASS.** (`test-interop` skipped — Go toolchain
+not installed on this host; pre-existing and unrelated to Phase 2.)
+
+Build clean under `-Wall -Wextra -Werror -pedantic -std=c11 -O2`.
+
+### Persistence verified at the test level
+
+Test 10 (`commit_decision`) asserts:
+
+1. `chain_entries` row exists with `artifact_type = 'validation'`
+2. `artifacts` row exists with the same `session_id` and
+   `artifact_type = 'validation'`
+3. `artifacts.artifact_content` contains the
+   `"turn_error_class":"none"` token — confirming the canonical
+   JSON now embeds the typed surface
+
+This is the post-hoc forensic property the false-confession
+investigation needs: any future validator decision can be
+recovered from chain.db alone, with full structured detail.
+
+### What was NOT done in Phase 2
+
+- **Live deployment.** `/usr/local/bin/virp-onode` is unchanged.
+  The new build at `build/virp-onode-prod` is verified by the
+  e2e harness against a temp socket but not installed to replace
+  the production binary. Per session brief constraints ("commits
+  stay local, no pushes"), install + restart is a separate
+  decision pending review.
+- **CT 210 dashboard regression (SW-3850 show-version round-trip
+  through dashboard).** The dashboard runs on CT 210 (off-host),
+  generating `dash_<unixtime>` validations. Live round-trip cannot
+  be exercised from CT 211 alone. Coverage substitute: 3 e2e
+  cases (PASS, WARN, BLOCK) round-trip through the new wire
+  format against a real virp-onode-prod subprocess.
+- **CT 210 client update.** Per the locked design decision, the
+  CT 210 validator client pickup of the new typed fields is a
+  follow-on engagement, not part of Phase 2. New wire fields are
+  additive and silently dropped by the existing client.
+
+### Open questions for next session
+
+1. **Deployment timing.** When to install
+   `build/virp-onode-prod` as the live `/usr/local/bin/virp-onode`?
+   Suggested gate: review of this addendum, confirmation that the
+   wire-format change won't surprise CT 210's existing parser
+   (additive only — should be safe), and a maintenance window.
+2. **CT 210 client pickup.** The new typed surface only routes
+   the model's response if the CT 210 dashboard's validator client
+   consumes the new fields. Until then, the dashboard sees the
+   structured banner string `[class=... hint=...]` appended to
+   each non-PASS verdict — already useful, but not as clean as
+   reading the structured `ValidationResult.turn_error_class`.
+3. **Phase 3 trigger — claim_type vocabulary extension.** Phase 2
+   added the typing for *errors*. Phase 3 (per the original
+   session brief) adds new claim_types: `state_observation`,
+   `comparison`, `recommendation`, `synthesis`,
+   `outcome_verification`. The `UNKNOWN_CLAIM_TYPE` → `schema`
+   class now makes Phase 3 easy to surface — the model will see
+   `class=schema hint=report_schema_gap` for each analytical
+   claim type until Phase 3 lands, which is the right routing
+   signal.
+4. **Outcome-verification gap.** Tonight's FortiGate over-claim
+   case (model claimed configuration changed when device state
+   didn't) is exactly the case Phase 3's `outcome_verification`
+   claim type targets. Until Phase 3, the validator can't
+   distinguish "AI says action succeeded" from any other state
+   claim. Worth scheduling Phase 3 promptly given the
+   FortiGate-class risk surface.
+5. **Tag semantics post-Phase-2.** The
+   `pre-phase1-validator-typing-20260517` tag was moved to the
+   Phase 1 diagnostic commit `dbdd555`. If Phase 2 lands as a
+   commit, options: (a) move the tag forward again (continuing
+   the "current-state" pattern), (b) leave it at `dbdd555`
+   (Phase 1 boundary) and add a separate
+   `pre-phase3-claim-type-extension-20260517` tag at the Phase 2
+   landing commit. Naming is the only material question.
+
+### Files changed in addendum 5
+
+- **Modified:** `include/virp_validator.h`, `src/virp_validator.c`,
+  `src/virp_onode.c`, `api/validator/__init__.py`,
+  `tests/test_validator.c`, `docs/VALIDATOR-MANIFEST-CONTRACT.md`
+- **Modified:** `audit/evidence-2026-05-16-w3-socat.md` — this
+  addendum appended
+- **No commits to live deploy state.** No restart, no install, no
+  `/etc/systemd/...` touches.
+
+### Cumulative state at end of Phase 2
+
+| Item | State |
+|------|-------|
+| Branch | `raise-validator-manifest-caps` |
+| Working tree | all Phase 2 source changes + this addendum, modified |
+| Rollback tag (pre-Phase-1) | `pre-phase1-validator-typing-20260517` at `dbdd555` (Phase 1 diagnostic commit) |
+| Tests | 115/115 PASS (incl. 2 new validator tests + 3 e2e); build clean -Werror |
+| Deployed onode | unchanged (`/usr/local/bin/virp-onode` mtime 23:27:01); the new typed binary is at `build/virp-onode-prod` |
+| Cage state | unchanged (`socket_allowed_uids=[999]`, all client procs as uid 999) |
+| Phase 3 scope | claim_type vocabulary extension; design already drafted in the original session brief; can start fresh next session |
+
+

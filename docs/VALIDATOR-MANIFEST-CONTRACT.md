@@ -189,12 +189,16 @@ VIRP_OBS_VALIDATION_DECISION = 0x10`) whose payload is UTF-8 JSON:
 {
   "decision": "pass" | "warn" | "block",
   "turn_violation": 0,
+  "turn_error_class":      "none|format|schema|provenance|content",
+  "turn_remediation_hint": "none|regenerate_manifest|report_schema_gap|rerun_with_tools|fabrication_detected",
   "chain_sequence": 42,
   "chain_entry_hash": "<64-hex>",
   "artifact_hash":    "<64-hex>",
   "assertions": [
-    {"decision": "pass", "violation": 0},
-    {"decision": "warn", "violation": 1}
+    {"decision": "pass", "violation": 0,
+     "error_class": "none", "remediation_hint": "none"},
+    {"decision": "warn", "violation": 1,
+     "error_class": "provenance", "remediation_hint": "rerun_with_tools"}
   ]
 }
 ```
@@ -219,6 +223,86 @@ VIRP_OBS_VALIDATION_DECISION = 0x10`) whose payload is UTF-8 JSON:
   rollup is BLOCK but `turn_violation == 0`, the cause is the
   first per-assertion BLOCK — the banner helper in
   `api/validator/__init__.py` does this fallback.
+
+### 6.1 Error class and remediation hint (Phase 2)
+
+Every non-PASS verdict carries two structured tokens that route the
+model's response: `error_class` is the category, `remediation_hint`
+is what the model should do. The mapping is a pure function of the
+violation code:
+
+| Violation                       | error_class    | remediation_hint        |
+|---------------------------------|----------------|--------------------------|
+| `NONE`                          | `none`         | `none`                   |
+| `NO_EVIDENCE_STATE_READ`        | `provenance`   | `rerun_with_tools`       |
+| `NO_EVIDENCE_STATE_CHANGE`      | `provenance`   | `rerun_with_tools`       |
+| `EVIDENCE_NOT_IN_TURN`          | `provenance`   | `rerun_with_tools`       |
+| `EVIDENCE_NOT_IN_CHAIN`         | `content`      | `fabrication_detected`   |
+| `UNKNOWN_CLAIM_TYPE`            | `schema`       | `report_schema_gap`      |
+| `PROSE_HASH_MISMATCH`           | `content`      | `fabrication_detected`   |
+| `MANIFEST_MALFORMED`            | `format`       | `regenerate_manifest`    |
+| `MANIFEST_TOO_LARGE`            | `format`       | `regenerate_manifest`    |
+| `MANIFEST_MISSING`              | `provenance`   | `rerun_with_tools`       |
+
+**How a well-aligned model should route each class:**
+
+- `format` → the validator could not parse the manifest. Regenerate
+  the manifest. **Do not** apologize for fabricating prose; this is
+  a structural input failure, not a content failure.
+- `schema` → the validator does not recognize a claim_type the model
+  emitted. This is a known protocol gap. Report it; **do not**
+  self-correct prose.
+- `provenance` → evidence is missing or not from this turn. The
+  remediation is to rerun the tool that should have produced the
+  evidence and reattach the resulting artifact_hash. **Do not**
+  apologize for fabrication; the prose may be substantively correct
+  but is unverifiable as emitted.
+- `content` → the prose either contradicts chain.db (the cited
+  evidence does not exist for this session) or the declared
+  prose_hash does not match the bytes actually emitted. This is the
+  only class that warrants self-correction. Investigate whether the
+  prose was fabricated, then either correct or withdraw it.
+
+The false-confession failure mode the typed surface guards against:
+a model that reads a `format` or `schema` BLOCK as a `content` BLOCK
+and self-attributes fabrication that did not occur. The
+`remediation_hint` token is the canonical signal — if the hint is
+not `fabrication_detected`, the model should not apologize for
+fabricating.
+
+### 6.2 Persistence (Phase 2)
+
+Every validation commit now writes both a `chain_entries` row
+(`artifact_type = "validation"`, as before) **and** an `artifacts`
+row holding the canonical decision JSON as `artifact_content`. The
+two rows share `artifact_id = "val-<first-16-hex-of-hash>"`.
+
+This enables post-hoc forensic comparison: a future auditor with
+chain.db can read what the validator *actually said*, not just its
+hash. Prior to Phase 2, the `artifacts` table contained 0 validation
+rows; the validator's verdict bodies were unrecoverable. The Phase 2
+behavior is additive — the chain header is still the canonical
+record, and the artifact write is best-effort (a failure to persist
+the body logs a warning on the daemon's stderr but does not fail
+the validate_turn call).
+
+### 6.3 Backward compatibility
+
+The wire format change is additive. A pre-Phase-2 CT 210 client
+that reads only the original fields (`decision`, `turn_violation`,
+`chain_sequence`, `chain_entry_hash`, `artifact_hash`, and the
+per-assertion `decision` + `violation`) continues to work — the new
+fields are silently dropped. A Phase-2-aware client receives the
+typed surface.
+
+The Python client in `api/validator/__init__.py` provides
+`violation_class()` and `violation_hint()` helpers that derive
+class/hint from violation code, so a client talking to an older
+onode (where the wire doesn't carry the new fields) can still
+populate `ValidationResult.turn_error_class` and
+`turn_remediation_hint` from the violation. Forward-compat: the
+client uses `.get()` accessors on the new fields and falls back to
+the derivation helpers when absent.
 
 ---
 
