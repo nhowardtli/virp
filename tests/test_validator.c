@@ -79,6 +79,23 @@ static void seed_artifact(virp_chain_state_t *st, const char *session,
     virp_chain_append(st, session, "observation", artifact_id, hash_out, &e);
 }
 
+/* Phase 4 helper: seed an artifact whose artifact_id follows the
+ * "obs:<device>:<ts_ns>" shape that virp-bridge.py:389 produces in
+ * production. Required for tests that exercise the entity-binding
+ * check (which only fires on obs:device:ts shapes). */
+static void seed_obs_artifact(virp_chain_state_t *st, const char *session,
+                              const char *device, const char *content,
+                              char hash_out[65])
+{
+    sha256_hex((const unsigned char *)content, strlen(content), hash_out);
+    char aid[128];
+    snprintf(aid, sizeof(aid), "obs:%s:%lld", device,
+             (long long)( ((long long)1778979300LL * 1000000000LL)
+                          + (long long)(rand() & 0xfffff) ));
+    virp_chain_entry_t e;
+    virp_chain_append(st, session, "observation", aid, hash_out, &e);
+}
+
 /* =========================================================================
  * Test 1: PASS — evidence in turn AND in chain, prose hash matches
  * ========================================================================= */
@@ -1016,6 +1033,369 @@ static void test_outcome_verification_block_no_action_ref(void)
 }
 
 /* =========================================================================
+ * Test 22: resolver — exact match (case-insensitive) RESOLVED
+ * ========================================================================= */
+
+static void test_resolver_exact_match(void)
+{
+    TEST("Resolver: exact match (case-insensitive) → RESOLVED");
+    const char *fleet[] = {"SW-3850", "fortigate-200g", "R1", "Wazuh"};
+    validator_resolve_result_t r;
+
+    /* Same case */
+    validator_resolve_device("SW-3850", fleet, 4, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_RESOLVED, "SW-3850 → RESOLVED");
+    ASSERT(strcmp(r.canonical, "SW-3850") == 0, "canonical SW-3850");
+
+    /* Different case still resolves and preserves registry casing */
+    validator_resolve_device("sw-3850", fleet, 4, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_RESOLVED, "sw-3850 → RESOLVED");
+    ASSERT(strcmp(r.canonical, "SW-3850") == 0, "canonical preserves SW-3850 case");
+
+    validator_resolve_device("WAZUH", fleet, 4, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_RESOLVED, "WAZUH → RESOLVED");
+    ASSERT(strcmp(r.canonical, "Wazuh") == 0, "canonical preserves Wazuh case");
+
+    PASS();
+}
+
+/* =========================================================================
+ * Test 23: resolver — hyphen-token prefix RESOLVED
+ * ========================================================================= */
+
+static void test_resolver_token_prefix(void)
+{
+    TEST("Resolver: hyphen-token prefix → RESOLVED");
+    const char *fleet[] = {"fortigate-200g", "SW-3850", "pa-850", "R1"};
+    validator_resolve_result_t r;
+
+    validator_resolve_device("fortigate", fleet, 4, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_RESOLVED, "fortigate → RESOLVED");
+    ASSERT(strcmp(r.canonical, "fortigate-200g") == 0, "canonical fortigate-200g");
+
+    /* Case-insensitive */
+    validator_resolve_device("FORTIGATE", fleet, 4, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_RESOLVED, "FORTIGATE → RESOLVED");
+    ASSERT(strcmp(r.canonical, "fortigate-200g") == 0, "canonical preserves case");
+
+    PASS();
+}
+
+/* =========================================================================
+ * Test 24: resolver — prefix too short / mid-token UNRESOLVED
+ * ========================================================================= */
+
+static void test_resolver_prefix_rejects_too_short_and_midtoken(void)
+{
+    TEST("Resolver: <4 char prefix and mid-token prefix → UNRESOLVED");
+    const char *fleet[] = {"fortigate-200g"};
+    validator_resolve_result_t r;
+
+    /* Too short: "fort" is <4 chars... actually it's 4 chars. Test with 3. */
+    validator_resolve_device("for", fleet, 1, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_UNRESOLVED, "for → UNRESOLVED (too short)");
+
+    /* 4-char "fort" is the minimum length but doesn't end at a hyphen boundary */
+    validator_resolve_device("fort", fleet, 1, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_UNRESOLVED, "fort → UNRESOLVED (mid-token)");
+
+    /* Mid-second-token, not at boundary */
+    validator_resolve_device("fortigate-20", fleet, 1, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_UNRESOLVED, "fortigate-20 → UNRESOLVED (mid-token)");
+
+    PASS();
+}
+
+/* =========================================================================
+ * Test 25: resolver — no-hyphen canonicals: exact match only
+ * ========================================================================= */
+
+static void test_resolver_no_hyphen_exact_only(void)
+{
+    TEST("Resolver: no-hyphen canonical requires exact match");
+    const char *fleet[] = {"R1", "R12", "Wazuh"};
+    validator_resolve_result_t r;
+
+    validator_resolve_device("R1", fleet, 3, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_RESOLVED, "R1 → RESOLVED (exact)");
+    ASSERT(strcmp(r.canonical, "R1") == 0, "canonical R1");
+
+    /* R1 is a prefix of R12 lexicographically, but no-hyphen rule says
+     * prefix matching only applies to hyphenated canonicals → no fuzzy
+     * match. R1 must match R1 exactly even though R12 starts with R1. */
+    /* (The above is covered by the exact match above resolving to R1
+     *  uniquely. Now verify "R" alone doesn't resolve.) */
+    validator_resolve_device("R", fleet, 3, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_UNRESOLVED, "R → UNRESOLVED");
+
+    /* "router" doesn't match R1 even though semantically related */
+    validator_resolve_device("router", fleet, 3, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_UNRESOLVED, "router → UNRESOLVED");
+
+    /* Wazuh exact case-insensitive */
+    validator_resolve_device("wazuh", fleet, 3, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_RESOLVED, "wazuh → RESOLVED");
+    ASSERT(strcmp(r.canonical, "Wazuh") == 0, "canonical Wazuh");
+
+    PASS();
+}
+
+/* =========================================================================
+ * Test 26: resolver — AMBIGUOUS when two canonicals match by prefix
+ * ========================================================================= */
+
+static void test_resolver_ambiguous(void)
+{
+    TEST("Resolver: prefix matching ≥2 canonicals → AMBIGUOUS");
+    const char *fleet[] = {"fortigate-200g", "fortigate-100f", "fortiwifi-60f"};
+    validator_resolve_result_t r;
+
+    validator_resolve_device("fortigate", fleet, 3, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_AMBIGUOUS, "fortigate → AMBIGUOUS");
+    ASSERT(r.candidate_count == 2, "2 candidates");
+    /* candidate order: appearance in input list */
+    ASSERT(strcmp(r.candidates[0], "fortigate-200g") == 0, "candidate 0");
+    ASSERT(strcmp(r.candidates[1], "fortigate-100f") == 0, "candidate 1");
+
+    /* "forti" matches fortigate-200g, fortigate-100f, fortiwifi-60f
+     * — all three because "forti" is ≥4 chars and is a prefix that
+     * ends at... wait, "forti" doesn't end at a hyphen in any of these.
+     * Let's check: "fortigate-200g"[5] = 'g', not '-'. So "forti" does
+     * NOT match by token prefix. Should be UNRESOLVED. */
+    validator_resolve_device("forti", fleet, 3, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_UNRESOLVED, "forti → UNRESOLVED (mid-token)");
+
+    PASS();
+}
+
+/* =========================================================================
+ * Test 27: resolver — exact takes priority over prefix
+ *
+ * If claim_ref matches one canonical exactly AND another by prefix
+ * (hypothetical because of devices.json being a flat list), exact
+ * wins. Construct: ["fortigate", "fortigate-200g"] + claim "fortigate"
+ * → RESOLVED to "fortigate" exact, not AMBIGUOUS.
+ * ========================================================================= */
+
+static void test_resolver_exact_priority_over_prefix(void)
+{
+    TEST("Resolver: exact match wins over prefix match");
+    const char *fleet[] = {"fortigate", "fortigate-200g"};
+    validator_resolve_result_t r;
+    validator_resolve_device("fortigate", fleet, 2, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_RESOLVED, "RESOLVED (not AMBIGUOUS)");
+    ASSERT(strcmp(r.canonical, "fortigate") == 0, "canonical exact match");
+    PASS();
+}
+
+/* =========================================================================
+ * Test 28: resolver — no match
+ * ========================================================================= */
+
+static void test_resolver_no_match(void)
+{
+    TEST("Resolver: unrelated claim_ref → UNRESOLVED");
+    const char *fleet[] = {"fortigate-200g", "SW-3850"};
+    validator_resolve_result_t r;
+
+    validator_resolve_device("the firewall", fleet, 2, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_UNRESOLVED, "the firewall → UNRESOLVED");
+
+    validator_resolve_device("", fleet, 2, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_UNRESOLVED, "empty string → UNRESOLVED");
+
+    validator_resolve_device("nonexistent-device-99", fleet, 2, &r);
+    ASSERT(r.status == VALIDATOR_RESOLVE_UNRESOLVED, "nonexistent → UNRESOLVED");
+
+    PASS();
+}
+
+/* =========================================================================
+ * Test 29: entity binding — exact match PASS
+ * ========================================================================= */
+
+static void test_entity_binding_exact_pass(void)
+{
+    TEST("Entity binding: assertion.device exact match → PASS");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    char ev[65];
+    seed_obs_artifact(&st, "s-eb1", "fortigate-200g",
+                      "fortigate bgp state", ev);
+
+    const char *prose = "fortigate-200g BGP peer is established.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[1024];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-eb1\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[\"%s\"],"
+        "\"assertions\":[{\"device\":\"fortigate-200g\","
+        "\"claim_type\":\"state_observation\","
+        "\"evidence_ref\":\"%s\"}]}", ph, ev, ev);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    ASSERT(r.decision == VALIDATOR_DECISION_PASS, "PASS");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 30: entity binding — canonical resolution PASS
+ *
+ * The case the original brief described: assertion says "fortigate",
+ * chain entry's device segment is "fortigate-200g". Pre-Phase-4 this
+ * was a hypothetical false negative; the validator didn't check device
+ * at all. Post-Phase-4 the check binds and resolves.
+ * ========================================================================= */
+
+static void test_entity_binding_canonical_pass(void)
+{
+    TEST("Entity binding: 'fortigate' → 'fortigate-200g' canonical → PASS");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    char ev[65];
+    seed_obs_artifact(&st, "s-eb2", "fortigate-200g", "config diff", ev);
+
+    const char *prose = "fortigate config changed; rule 17 added.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[1024];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-eb2\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[\"%s\"],"
+        "\"assertions\":[{\"device\":\"fortigate\","
+        "\"claim_type\":\"config_change\","
+        "\"evidence_ref\":\"%s\"}]}", ph, ev, ev);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    if (r.decision != VALIDATOR_DECISION_PASS) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "expected PASS, got %s/%s",
+                 validator_decision_str(r.decision),
+                 validator_violation_str(r.per_assertion[0].violation));
+        FAIL(msg);
+        virp_chain_destroy(&st);
+        return;
+    }
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 31: entity binding — device mismatch BLOCK
+ *
+ * Assertion claims device="r1" but evidence_ref points at a chain entry
+ * for fortigate-200g. AI mislabeling — class=content,
+ * hint=fabrication_detected.
+ * ========================================================================= */
+
+static void test_entity_binding_mismatch_block(void)
+{
+    TEST("Entity binding: device mismatch → BLOCK with ENTITY_DEVICE_MISMATCH");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    char ev[65];
+    seed_obs_artifact(&st, "s-eb3", "fortigate-200g", "actually fg state", ev);
+
+    const char *prose = "R1 routing table looks normal.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[1024];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-eb3\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[\"%s\"],"
+        "\"assertions\":[{\"device\":\"r1\","
+        "\"claim_type\":\"state_observation\","
+        "\"evidence_ref\":\"%s\"}]}", ph, ev, ev);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    ASSERT(r.decision == VALIDATOR_DECISION_BLOCK, "BLOCK");
+    ASSERT(r.per_assertion[0].violation == VALIDATOR_VIOLATION_ENTITY_DEVICE_MISMATCH,
+           "ENTITY_DEVICE_MISMATCH");
+    ASSERT(r.per_assertion[0].error_class == VALIDATOR_ERROR_CLASS_CONTENT,
+           "class=content");
+    ASSERT(r.per_assertion[0].remediation_hint == VALIDATOR_HINT_FABRICATION_DETECTED,
+           "hint=fabrication_detected");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 32: entity binding — legacy artifact_id (no obs:device:ts)
+ *                          skipped silently
+ *
+ * Chain entries from before the obs:device:ts convention (or from
+ * external test seeders) won't have a parseable device segment.
+ * Binding skips silently — provenance is still verified via hash,
+ * but the device cross-check can't run. Assertion PASSes if hash
+ * provenance is good.
+ * ========================================================================= */
+
+static void test_entity_binding_legacy_artifact_skip(void)
+{
+    TEST("Entity binding: non-obs: artifact_id → binding skipped, PASS");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t st;
+    virp_chain_init(&st, TEST_DB, TEST_KEY, 1, "local");
+
+    /* seed_artifact (NOT seed_obs_artifact) writes artifact_id as
+     * the literal "obs-legacy-1" — starts with "obs-" not "obs:". */
+    char ev[65];
+    seed_artifact(&st, "s-eb4", "obs-legacy-1", "old style content", ev);
+
+    const char *prose = "Anything goes here, device unverifiable.";
+    char ph[65]; sha256_hex((const unsigned char *)prose, strlen(prose), ph);
+
+    char json[1024];
+    int n = snprintf(json, sizeof(json),
+        "{\"session_id\":\"s-eb4\",\"prose_hash\":\"%s\","
+        "\"tool_call_refs\":[\"%s\"],"
+        "\"assertions\":[{\"device\":\"anything\","
+        "\"claim_type\":\"state_observation\","
+        "\"evidence_ref\":\"%s\"}]}", ph, ev, ev);
+
+    validator_manifest_t m; validator_violation_code_t rr;
+    ASSERT(validator_parse_manifest(json, (size_t)n, &m, &rr) == VIRP_OK, "parse");
+
+    validator_result_t r;
+    validator_evaluate(&st, &m, prose, strlen(prose), &r);
+    ASSERT(r.decision == VALIDATOR_DECISION_PASS, "PASS (binding skipped)");
+
+    virp_chain_destroy(&st);
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -1045,6 +1425,18 @@ int main(void)
     test_outcome_verification_pass();
     test_outcome_verification_block_pre_action();
     test_outcome_verification_block_no_action_ref();
+    /* Phase 4 — canonical resolver + entity binding */
+    test_resolver_exact_match();
+    test_resolver_token_prefix();
+    test_resolver_prefix_rejects_too_short_and_midtoken();
+    test_resolver_no_hyphen_exact_only();
+    test_resolver_ambiguous();
+    test_resolver_exact_priority_over_prefix();
+    test_resolver_no_match();
+    test_entity_binding_exact_pass();
+    test_entity_binding_canonical_pass();
+    test_entity_binding_mismatch_block();
+    test_entity_binding_legacy_artifact_skip();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

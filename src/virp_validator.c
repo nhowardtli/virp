@@ -118,6 +118,8 @@ const char *validator_violation_str(validator_violation_code_t v)
         case VALIDATOR_VIOLATION_ACTION_REF_NOT_IN_CHAIN:    return "action_ref_not_in_chain";
         case VALIDATOR_VIOLATION_DERIVED_FROM_NOT_IN_CHAIN:  return "derived_from_not_in_chain";
         case VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION:   return "outcome_not_after_action";
+        case VALIDATOR_VIOLATION_ENTITY_DEVICE_MISMATCH:     return "entity_device_mismatch";
+        case VALIDATOR_VIOLATION_ENTITY_AMBIGUOUS:           return "entity_ambiguous";
     }
     return "unknown";
 }
@@ -170,6 +172,7 @@ validator_error_class_t validator_violation_class(validator_violation_code_t v)
         case VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE:
             return VALIDATOR_ERROR_CLASS_FORMAT;
         case VALIDATOR_VIOLATION_UNKNOWN_CLAIM_TYPE:
+        case VALIDATOR_VIOLATION_ENTITY_AMBIGUOUS:
             return VALIDATOR_ERROR_CLASS_SCHEMA;
         case VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_READ:
         case VALIDATOR_VIOLATION_NO_EVIDENCE_STATE_CHANGE:
@@ -188,6 +191,9 @@ validator_error_class_t validator_violation_class(validator_violation_code_t v)
         case VALIDATOR_VIOLATION_ACTION_REF_NOT_IN_CHAIN:
         case VALIDATOR_VIOLATION_DERIVED_FROM_NOT_IN_CHAIN:
         case VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION:
+        /* Phase 4 content failure: AI declared a device that doesn't
+         * match the chain entry the evidence_ref points to. */
+        case VALIDATOR_VIOLATION_ENTITY_DEVICE_MISMATCH:
             return VALIDATOR_ERROR_CLASS_CONTENT;
     }
     return VALIDATOR_ERROR_CLASS_NONE;
@@ -203,6 +209,132 @@ validator_remediation_hint_t validator_violation_hint(validator_violation_code_t
         case VALIDATOR_ERROR_CLASS_CONTENT:    return VALIDATOR_HINT_FABRICATION_DETECTED;
     }
     return VALIDATOR_HINT_NONE;
+}
+
+/* =========================================================================
+ * Phase 4 — Canonical device-id resolver
+ * ========================================================================= */
+
+static int ascii_tolower(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c;
+}
+
+static bool ieq(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) return false;
+    while (*a && *b) {
+        if (ascii_tolower((unsigned char)*a) != ascii_tolower((unsigned char)*b))
+            return false;
+        a++; b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* Token-prefix match: does claim_ref equal a complete hyphen-token
+ * prefix of canonical? Both case-insensitive.
+ *
+ * canonical = "fortigate-200g"  →  legal prefixes: "fortigate", "fortigate-200g"
+ * canonical = "a-b-c-d"         →  legal prefixes: "a", "a-b", "a-b-c", "a-b-c-d"
+ *
+ * The full canonical itself is a legal "prefix" — handled by the exact
+ * match path before this function, but the loop below would also match
+ * it. The ≥4-character minimum on claim_ref applies here only — exact
+ * match is handled separately and not subject to the 4-char floor. */
+static bool is_token_prefix(const char *claim_ref, const char *canonical)
+{
+    if (claim_ref == NULL || canonical == NULL) return false;
+
+    size_t claim_len = strlen(claim_ref);
+    if (claim_len < 4) return false;
+
+    /* Walk both, lowercased, comparing char-by-char. After each match,
+     * if we hit the end of claim_ref, the next canonical char must be
+     * '-' (or end of string for the trivial "claim equals canonical"
+     * case, which the exact path handles separately). */
+    size_t i = 0;
+    while (i < claim_len && canonical[i] != '\0') {
+        if (ascii_tolower((unsigned char)claim_ref[i]) !=
+            ascii_tolower((unsigned char)canonical[i])) {
+            return false;
+        }
+        i++;
+    }
+    if (i < claim_len) return false;          /* claim_ref longer than canonical */
+    if (canonical[i] == '\0') return false;   /* trivially equal — exact path handles it */
+    return canonical[i] == '-';
+}
+
+static bool has_hyphen(const char *s)
+{
+    for (; *s; s++) if (*s == '-') return true;
+    return false;
+}
+
+void validator_resolve_device(const char *claim_ref,
+                              const char *const *canonicals,
+                              size_t canonical_count,
+                              validator_resolve_result_t *out)
+{
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    out->status = VALIDATOR_RESOLVE_UNRESOLVED;
+    if (claim_ref == NULL || canonicals == NULL || canonical_count == 0) return;
+
+    /* Pass 1: exact match (case-insensitive). If any canonical matches
+     * exactly, that wins — even if a different canonical also matches
+     * by prefix. Exact > prefix in priority. */
+    for (size_t i = 0; i < canonical_count; i++) {
+        if (canonicals[i] == NULL) continue;
+        if (ieq(claim_ref, canonicals[i])) {
+            out->status = VALIDATOR_RESOLVE_RESOLVED;
+            (void)snprintf(out->canonical, sizeof(out->canonical), "%s",
+                           canonicals[i]);
+            return;
+        }
+    }
+
+    /* Pass 2: token-prefix matches. Collect all matches; if exactly
+     * one, RESOLVED. If more than one, AMBIGUOUS. If zero, UNRESOLVED.
+     * Devices without a hyphen never participate in pass 2 (per the
+     * locked rule: no-hyphen canonicals require exact match). */
+    size_t match_count = 0;
+    size_t first_match_idx = 0;
+    char (*candidates)[VALIDATOR_DEVICE_MAX] = out->candidates;
+    size_t cand_max = VALIDATOR_RESOLVE_MAX_CANDIDATES;
+    size_t cand_n = 0;
+
+    for (size_t i = 0; i < canonical_count; i++) {
+        if (canonicals[i] == NULL) continue;
+        if (!has_hyphen(canonicals[i])) continue;
+        if (!is_token_prefix(claim_ref, canonicals[i])) continue;
+
+        if (match_count == 0) {
+            first_match_idx = i;
+        }
+        match_count++;
+        if (cand_n < cand_max) {
+            (void)snprintf(candidates[cand_n], VALIDATOR_DEVICE_MAX, "%s",
+                           canonicals[i]);
+            cand_n++;
+        }
+    }
+
+    if (match_count == 1) {
+        out->status = VALIDATOR_RESOLVE_RESOLVED;
+        (void)snprintf(out->canonical, sizeof(out->canonical), "%s",
+                       canonicals[first_match_idx]);
+        /* Clear candidates list — only populated on AMBIGUOUS. */
+        memset(out->candidates, 0, sizeof(out->candidates));
+        out->candidate_count = 0;
+        return;
+    }
+    if (match_count >= 2) {
+        out->status = VALIDATOR_RESOLVE_AMBIGUOUS;
+        out->candidate_count = cand_n;
+        return;
+    }
+    /* match_count == 0 → leave UNRESOLVED. */
 }
 
 /* =========================================================================
@@ -459,6 +591,67 @@ static virp_error_t ref_in_chain(virp_chain_state_t *chain,
     return VIRP_OK;
 }
 
+/* Fetch the artifact_id for a (session, hash) chain entry, used by the
+ * Phase 4 entity binding to compare the AI's declared device against
+ * the device segment of the chain entry's artifact_id.
+ *
+ * The bridge stores artifact_ids as "obs:<device>:<ts_ns>"
+ * (virp-bridge.py:389). Legacy entries may use other shapes — see
+ * extract_device_from_artifact_id() for graceful handling. */
+static virp_error_t get_chain_entry_artifact_id(virp_chain_state_t *chain,
+                                                const char *session_id,
+                                                const char *artifact_hash_hex,
+                                                bool *found,
+                                                char *out_buf,
+                                                size_t out_buf_len)
+{
+    *found = false;
+    if (out_buf_len > 0) out_buf[0] = '\0';
+    const char *sql =
+        "SELECT artifact_id FROM chain_entries "
+        "WHERE session_id = ? AND artifact_hash = ? LIMIT 1";
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(chain->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return VIRP_ERR_CHAIN_DB;
+
+    sqlite3_bind_text(stmt, 1, session_id, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, artifact_hash_hex, -1, SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const unsigned char *t = sqlite3_column_text(stmt, 0);
+        if (t != NULL) {
+            *found = true;
+            (void)snprintf(out_buf, out_buf_len, "%s", (const char *)t);
+        }
+    } else if (rc != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        return VIRP_ERR_CHAIN_DB;
+    }
+    sqlite3_finalize(stmt);
+    return VIRP_OK;
+}
+
+/* Extract the device segment from an artifact_id of the form
+ * "obs:<device>:<ts>". Returns false if the format doesn't match
+ * (legacy "virp..." / "veri..." / etc., or empty device segment).
+ * Callers should treat false as "device unknown" and skip the binding
+ * check rather than failing the assertion. */
+static bool extract_device_from_artifact_id(const char *artifact_id,
+                                            char *out, size_t out_len)
+{
+    if (artifact_id == NULL || out == NULL || out_len == 0) return false;
+    if (strncmp(artifact_id, "obs:", 4) != 0) return false;
+    const char *device_start = artifact_id + 4;
+    const char *colon = strchr(device_start, ':');
+    if (colon == NULL) return false;
+    size_t len = (size_t)(colon - device_start);
+    if (len == 0 || len >= out_len) return false;
+    memcpy(out, device_start, len);
+    out[len] = '\0';
+    return true;
+}
+
 /* Like ref_in_chain but also returns the earliest timestamp_ns of any
  * chain_entries row for this (session_id, artifact_hash) pair. Used by
  * outcome_verification to enforce post-action ordering: the
@@ -540,6 +733,37 @@ static void evaluate_assertion(virp_chain_state_t *chain,
             r->decision  = VALIDATOR_DECISION_BLOCK;
             r->violation = VALIDATOR_VIOLATION_EVIDENCE_NOT_IN_CHAIN;
             return;
+        }
+
+        /* Phase 4: entity binding. Verify assertion.device matches
+         * the chain entry's device segment, with canonical resolution
+         * allowing abbreviated references ("fortigate" →
+         * "fortigate-200g"). Skipped silently if the chain entry has
+         * a non-obs: artifact_id (legacy or test data) — extracting
+         * a device from those isn't possible. */
+        char chain_artifact_id[128];
+        bool got_aid = false;
+        virp_error_t aerr = get_chain_entry_artifact_id(chain, m->session_id,
+                                                         a->evidence_ref,
+                                                         &got_aid,
+                                                         chain_artifact_id,
+                                                         sizeof(chain_artifact_id));
+        if (aerr == VIRP_OK && got_aid) {
+            char chain_device[VALIDATOR_DEVICE_MAX];
+            if (extract_device_from_artifact_id(chain_artifact_id,
+                                                chain_device,
+                                                sizeof(chain_device))) {
+                const char *cands[1] = { chain_device };
+                validator_resolve_result_t rr;
+                validator_resolve_device(a->device, cands, 1, &rr);
+                if (rr.status != VALIDATOR_RESOLVE_RESOLVED) {
+                    r->decision  = VALIDATOR_DECISION_BLOCK;
+                    r->violation = VALIDATOR_VIOLATION_ENTITY_DEVICE_MISMATCH;
+                    return;
+                }
+            }
+            /* Else: legacy artifact_id (no obs:device:ts shape) →
+             * skip binding; provenance still verified via hash. */
         }
         return;
     }
@@ -634,6 +858,32 @@ static void evaluate_assertion(virp_chain_state_t *chain,
             r->decision  = VALIDATOR_DECISION_BLOCK;
             r->violation = VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION;
             return;
+        }
+
+        /* Phase 4: entity binding via evidence_ref (the post-action
+         * observation). action_ref is intentionally not bound here —
+         * the action may legitimately be commanded against a different
+         * device than the verification observation (e.g., a network
+         * change verified by a downstream peer's BGP state). */
+        char ov_aid[128];
+        bool ov_got = false;
+        virp_error_t oerr = get_chain_entry_artifact_id(chain, m->session_id,
+                                                         a->evidence_ref,
+                                                         &ov_got, ov_aid,
+                                                         sizeof(ov_aid));
+        if (oerr == VIRP_OK && ov_got) {
+            char ov_device[VALIDATOR_DEVICE_MAX];
+            if (extract_device_from_artifact_id(ov_aid, ov_device,
+                                                sizeof(ov_device))) {
+                const char *cands[1] = { ov_device };
+                validator_resolve_result_t rr;
+                validator_resolve_device(a->device, cands, 1, &rr);
+                if (rr.status != VALIDATOR_RESOLVE_RESOLVED) {
+                    r->decision  = VALIDATOR_DECISION_BLOCK;
+                    r->violation = VALIDATOR_VIOLATION_ENTITY_DEVICE_MISMATCH;
+                    return;
+                }
+            }
         }
         return;
     }

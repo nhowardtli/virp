@@ -118,7 +118,10 @@ typedef enum {
     VALIDATOR_VIOLATION_ACTION_REF_MISSING         = 12, /* → BLOCK (outcome_verification needs it) */
     VALIDATOR_VIOLATION_ACTION_REF_NOT_IN_CHAIN    = 13, /* → BLOCK */
     VALIDATOR_VIOLATION_DERIVED_FROM_NOT_IN_CHAIN  = 14, /* → BLOCK */
-    VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION   = 15  /* → BLOCK (timestamp ordering) */
+    VALIDATOR_VIOLATION_OUTCOME_NOT_AFTER_ACTION   = 15, /* → BLOCK (timestamp ordering) */
+    /* Phase 4: entity normalization (assertion.device ↔ chain-entry device) */
+    VALIDATOR_VIOLATION_ENTITY_DEVICE_MISMATCH     = 16, /* → BLOCK (content — AI mislabeled) */
+    VALIDATOR_VIOLATION_ENTITY_AMBIGUOUS           = 17  /* → BLOCK (schema — ambiguous claim_ref) */
 } validator_violation_code_t;
 
 /* =========================================================================
@@ -294,5 +297,65 @@ const char *validator_remediation_hint_str(validator_remediation_hint_t h);
 /* Mapping: violation code → error class / remediation hint. Pure functions. */
 validator_error_class_t      validator_violation_class(validator_violation_code_t v);
 validator_remediation_hint_t validator_violation_hint(validator_violation_code_t v);
+
+/* =========================================================================
+ * Phase 4 — Canonical device-id resolver
+ *
+ * Resolves a claim_ref (the AI's free-form device reference in an
+ * assertion's `device` field) against a candidate set of canonical
+ * device_ids. Three outcomes:
+ *
+ *   RESOLVED   — exactly one canonical matches; result->canonical is filled
+ *   AMBIGUOUS  — multiple canonicals match; result->candidates[..count] listed
+ *   UNRESOLVED — no canonical matches; both fields empty
+ *
+ * Matching rules, in priority order:
+ *   1. Exact match (case-insensitive) → RESOLVED if unique
+ *   2. Hyphen-token prefix: claim_ref equals a complete prefix of the
+ *      canonical's hyphen-token sequence AND is ≥4 characters.
+ *      "fortigate" matches "fortigate-200g" (1-token prefix of [fortigate,
+ *      200g]). "fort" does not (too short). "fortigate-200" does not
+ *      (mid-token, not a complete token prefix).
+ *   3. No-hyphen canonicals: exact match only.
+ *
+ * Case-insensitive throughout. The canonical name returned preserves the
+ * case from the candidate list (e.g., "sw-3850" resolves to "SW-3850" if
+ * that's how it appears in the registry).
+ *
+ * Used by:
+ *   - validator_evaluate (binding check): claim_ref vs single chain-entry
+ *     device. Single-candidate context — AMBIGUOUS not reachable.
+ *   - api/validator/__init__.py exposure (Phase 4 commit 2): claim_ref
+ *     vs full /run/virp/devices.json registry. AMBIGUOUS reachable.
+ * ========================================================================= */
+
+#define VALIDATOR_RESOLVE_MAX_CANDIDATES 16
+
+typedef enum {
+    VALIDATOR_RESOLVE_RESOLVED   = 0,
+    VALIDATOR_RESOLVE_AMBIGUOUS  = 1,
+    VALIDATOR_RESOLVE_UNRESOLVED = 2
+} validator_resolve_status_t;
+
+typedef struct {
+    validator_resolve_status_t status;
+    char canonical[VALIDATOR_DEVICE_MAX];  /* populated when RESOLVED */
+    char candidates[VALIDATOR_RESOLVE_MAX_CANDIDATES][VALIDATOR_DEVICE_MAX];
+    size_t candidate_count;                /* populated when AMBIGUOUS */
+} validator_resolve_result_t;
+
+/* Resolve claim_ref against a set of canonical device_ids.
+ *
+ * canonicals: array of NUL-terminated strings (max VALIDATOR_DEVICE_MAX
+ *             chars each); use a char ** for ergonomic stack init.
+ * canonical_count: number of entries in canonicals.
+ *
+ * On AMBIGUOUS, up to VALIDATOR_RESOLVE_MAX_CANDIDATES candidates are
+ * copied; the rest are truncated (the candidate_count reflects the
+ * truncated value). */
+void validator_resolve_device(const char *claim_ref,
+                              const char *const *canonicals,
+                              size_t canonical_count,
+                              validator_resolve_result_t *out);
 
 #endif /* VIRP_VALIDATOR_H */
