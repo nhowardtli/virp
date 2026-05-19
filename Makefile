@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Third Level IT LLC. All rights reserved.
-# VIRP — Verified Intent Routing Protocol
+# VIRP — Verified Infrastructure Response Protocol
 #
 # Build with Cisco driver:     make CISCO=1
 # Build with FortiGate driver: make FORTIGATE=1
