@@ -94,6 +94,9 @@ extern void virp_driver_fortinet_init(void);
 #ifdef VIRP_DRIVER_PALOALTO
 extern void virp_driver_paloalto_init(void);
 #endif
+#ifdef VIRP_DRIVER_CISCO_ASA
+extern void virp_driver_asa_init(void);
+#endif
 #ifdef VIRP_DRIVER_WAZUH
 extern void virp_driver_wazuh_init(void);
 #include <curl/curl.h>
@@ -342,6 +345,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_PALOALTO
     virp_driver_paloalto_init();
+#endif
+#ifdef VIRP_DRIVER_CISCO_ASA
+    virp_driver_asa_init();
 #endif
 #ifdef VIRP_DRIVER_WAZUH
     virp_driver_wazuh_init();
