@@ -111,6 +111,44 @@ static void kbd_interactive_callback(const char *name, int name_len,
 }
 
 /* =========================================================================
+ * KEX method preference (issue #5)
+ *
+ * The default list covers every IOS-XE release and most in-service
+ * classic IOS. The legacy list additionally offers
+ * diffie-hellman-group1-sha1 for pre-2014 IOS 12.x trains (older 7200
+ * NPE images, some catalyst classic) — these advertise only group1
+ * and libssh2 will refuse to negotiate it unless we explicitly include
+ * it. group1 is weak, so it stays gated on device->ssh_legacy.
+ *
+ * Exposed (non-static) so tests/test_driver_cisco.c can assert that
+ * the default list is unaffected when ssh_legacy is false.
+ * ========================================================================= */
+
+static const char CISCO_KEX_DEFAULT[] =
+    "ecdh-sha2-nistp256,"
+    "ecdh-sha2-nistp384,"
+    "ecdh-sha2-nistp521,"
+    "diffie-hellman-group14-sha256,"
+    "diffie-hellman-group14-sha1,"
+    "diffie-hellman-group-exchange-sha256,"
+    "diffie-hellman-group-exchange-sha1";
+
+static const char CISCO_KEX_LEGACY[] =
+    "ecdh-sha2-nistp256,"
+    "ecdh-sha2-nistp384,"
+    "ecdh-sha2-nistp521,"
+    "diffie-hellman-group14-sha256,"
+    "diffie-hellman-group14-sha1,"
+    "diffie-hellman-group-exchange-sha256,"
+    "diffie-hellman-group-exchange-sha1,"
+    "diffie-hellman-group1-sha1";
+
+const char *virp_cisco_kex_list(bool ssh_legacy)
+{
+    return ssh_legacy ? CISCO_KEX_LEGACY : CISCO_KEX_DEFAULT;
+}
+
+/* =========================================================================
  * TCP Connection
  * ========================================================================= */
 
@@ -265,15 +303,28 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
         return NULL;
     }
 
-    /* Set preferred algorithms — modern IOS first, legacy fallback */
+    /*
+     * KEX preference (issue #5).
+     *
+     * Default: modern ECDH first, group14/group-exchange fallbacks. This
+     * covers every IOS-XE release and most in-service classic IOS.
+     *
+     * When the device opts in via ssh_legacy=true, the very old
+     * diffie-hellman-group1-sha1 is appended. group1 is the only KEX
+     * advertised by some pre-2014 IOS 12.x trains (e.g. older 7200 NPE
+     * images) and libssh2 won't negotiate it unless we explicitly offer
+     * it. group1 stays opt-in because it's weak — adding it to every
+     * Cisco session would silently lower the bar for modern devices.
+     */
     libssh2_session_method_pref(conn->session, LIBSSH2_METHOD_KEX,
-        "ecdh-sha2-nistp256,"
-        "ecdh-sha2-nistp384,"
-        "ecdh-sha2-nistp521,"
-        "diffie-hellman-group14-sha256,"
-        "diffie-hellman-group14-sha1,"
-        "diffie-hellman-group-exchange-sha256,"
-        "diffie-hellman-group-exchange-sha1");
+        virp_cisco_kex_list(device->ssh_legacy));
+
+    if (device->ssh_legacy) {
+        fprintf(stderr,
+            "[Cisco] WARNING: ssh_legacy=true for %s — offering weak "
+            "diffie-hellman-group1-sha1 KEX\n",
+            device->hostname[0] ? device->hostname : device->host);
+    }
 
     libssh2_session_method_pref(conn->session, LIBSSH2_METHOD_CRYPT_CS,
         "aes256-ctr,aes128-ctr,aes256-cbc,aes128-cbc,3des-cbc");
