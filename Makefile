@@ -297,6 +297,17 @@ $(TEST_ASA): tests/test_driver_asa.c $(LIB)
 test-asa: $(TEST_ASA)
 	./$(TEST_ASA)
 
+# Cisco driver tests (KEX list — issue #5). Requires CISCO=1 so driver_cisco.o
+# is built into libvirp.a; the test only exercises the in-process KEX accessor
+# (no SSH).
+TEST_CISCO = $(BUILD_DIR)/test_driver_cisco
+
+$(TEST_CISCO): tests/test_driver_cisco.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-cisco: $(TEST_CISCO)
+	./$(TEST_CISCO)
+
 # Concurrent onode_execute smoke test (connection lifetime race)
 TEST_ONODE_CONC = $(BUILD_DIR)/test_onode_concurrency
 
