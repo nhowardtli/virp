@@ -1035,6 +1035,115 @@ TEST(test_peer_uid_rejected)
 }
 
 /* =========================================================================
+ * Issue #7: wrong-type values in devices.json must not crash the parser
+ *
+ * Pre-fix, the prod load_devices() called json_object_get_string(val)
+ * unconditionally and fed the result to snprintf("%s", ...). When val
+ * was a JSON int/bool/null (e.g. an operator typed "enable": 0), the
+ * get_string returned NULL and snprintf hit undefined behaviour —
+ * segfault on glibc. P. Snowacki (NCIA) hit this during external impl
+ * testing against Cisco gear.
+ *
+ * The fix: type-checked accessors that treat wrong-type values as
+ * absent. This test loads a config where five different fields have
+ * wrong types and asserts the parser keeps loading instead of dying.
+ * ========================================================================= */
+
+extern int load_devices(onode_state_t *state, const char *path);
+
+#define WRONG_TYPE_CFG  "/tmp/virp-onode-wrongtype.json"
+
+TEST(test_load_devices_wrong_type_does_not_crash)
+{
+    FILE *f = fopen(WRONG_TYPE_CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    /* Five wrong-type fields + a couple of well-typed ones, so the
+     * device still has enough to be added (hostname/host/vendor). */
+    fprintf(f,
+        "{\n"
+        "  \"devices\": [\n"
+        "    {\n"
+        "      \"hostname\":   \"R-WRONGTYPE\",\n"
+        "      \"host\":       \"10.0.0.99\",\n"
+        "      \"vendor\":     \"mock\",\n"
+        "      \"port\":       22,\n"
+        "      \"username\":   \"u\",\n"
+        "      \"password\":   \"p\",\n"
+        "      \"enable\":     0,\n"
+        "      \"node_id\":    null,\n"
+        "      \"api_token\":  true,\n"
+        "      \"vdom\":       1234,\n"
+        "      \"verify_tls\": \"yes\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    /* Stand up a throwaway onode_state_t so load_devices can call
+     * onode_add_device(). Not started — we never bind a socket. */
+    onode_state_t tmp;
+    const char *tmp_sock = "/tmp/virp-onode-wrongtype.sock";
+    /* NULL okey_path → generate a fresh in-memory O-Key. We never start
+     * the event loop so the socket path is just a placeholder. */
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0001, NULL, tmp_sock));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    /* The crash bug: this call segfaulted pre-fix. */
+    int loaded = load_devices(&tmp, WRONG_TYPE_CFG);
+    ASSERT_EQ(loaded, 1);
+    ASSERT_EQ(tmp.device_count, 1);
+
+    /* Well-typed fields must come through intact. */
+    ASSERT_EQ(strcmp(tmp.devices[0].hostname, "R-WRONGTYPE"), 0);
+    ASSERT_EQ(strcmp(tmp.devices[0].host, "10.0.0.99"), 0);
+    ASSERT_EQ((int)tmp.devices[0].port, 22);
+    ASSERT_EQ((int)tmp.devices[0].vendor, (int)VIRP_VENDOR_MOCK);
+    ASSERT_EQ(strcmp(tmp.devices[0].username, "u"), 0);
+    ASSERT_EQ(strcmp(tmp.devices[0].password, "p"), 0);
+
+    /* Wrong-type fields must be treated as absent — zeroed by memset. */
+    ASSERT_EQ((int)tmp.devices[0].enable_password[0], 0);  /* "enable": int */
+    ASSERT_EQ((int)tmp.devices[0].node_id, 0);             /* "node_id": null */
+    ASSERT_EQ((int)tmp.devices[0].api_token[0], 0);        /* "api_token": bool */
+    ASSERT_EQ((int)tmp.devices[0].vdom[0], 0);             /* "vdom": int */
+    ASSERT_EQ((int)tmp.devices[0].verify_tls, 0);          /* "verify_tls": str */
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(WRONG_TYPE_CFG);
+}
+
+TEST(test_load_devices_skips_missing_required_fields)
+{
+    /* hostname-as-int means hostname is treated as absent, which means
+     * the device is skipped — loaded must be 0, not a crash. */
+    FILE *f = fopen(WRONG_TYPE_CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": 42, \"host\": \"1.2.3.4\", \"vendor\": \"mock\" }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    const char *tmp_sock = "/tmp/virp-onode-wrongtype.sock";
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0002, NULL, tmp_sock));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    int loaded = load_devices(&tmp, WRONG_TYPE_CFG);
+    ASSERT_EQ(loaded, 0);
+    ASSERT_EQ(tmp.device_count, 0);
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(WRONG_TYPE_CFG);
+}
+
+/* =========================================================================
  * hex_decode unit tests
  * ========================================================================= */
 
@@ -1152,7 +1261,11 @@ int main(void)
     pthread_create(&server_thread, NULL, onode_thread, NULL);
     usleep(200000);  /* Wait for socket to be ready */
 
-    printf("[hex_decode Unit Tests]\n");
+    printf("[Device Config Parser Robustness (issue #7)]\n");
+    RUN_TEST(test_load_devices_wrong_type_does_not_crash);
+    RUN_TEST(test_load_devices_skips_missing_required_fields);
+
+    printf("\n[hex_decode Unit Tests]\n");
     RUN_TEST(test_hex_decode_empty_string);
     RUN_TEST(test_hex_decode_odd_length);
     RUN_TEST(test_hex_decode_valid_lowercase);

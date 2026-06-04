@@ -204,8 +204,14 @@ $(TOOL_BIN): src/virp_tool.c $(LIB)
 $(ONODE_BIN): src/virp_onode_main.c $(LIB)
 	$(CC) $(CFLAGS) src/virp_onode_main.c $(LIB) $(LDFLAGS) -ljson-c -o $@
 
-$(TEST_ONODE): tests/test_onode.c $(LIB)
-	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+# Prod parser compiled with main() omitted (-DVIRP_ONODE_PROD_NO_MAIN) so
+# the issue-#7 regression test in test_onode.c can link the real
+# load_devices() without conflicting with the daemon's main().
+$(BUILD_DIR)/virp_onode_prod_lib.o: src/virp_onode_prod.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DVIRP_ONODE_PROD_NO_MAIN -c $< -o $@
+
+$(TEST_ONODE): tests/test_onode.c $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB)
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB) $(LDFLAGS) -ljson-c -o $@
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)

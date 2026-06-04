@@ -25,6 +25,15 @@
 #include <getopt.h>
 #include <json-c/json.h>
 
+/*
+ * Everything between here and the end of main() is the daemon's process
+ * entry point. The issue-#7 regression test links the parser (above) into
+ * the test binary by compiling this same source with
+ * -DVIRP_ONODE_PROD_NO_MAIN, which excludes the daemon scaffolding so
+ * there's no duplicate main()/g_state and no unused-static warnings.
+ */
+#ifndef VIRP_ONODE_PROD_NO_MAIN
+
 static onode_state_t g_state;
 
 /* Forward declare drivers */
@@ -58,6 +67,8 @@ static void signal_handler(int sig)
     fprintf(stderr, "\n[O-Node] Signal received, shutting down...\n");
     onode_shutdown(&g_state);
 }
+
+#endif  /* !VIRP_ONODE_PROD_NO_MAIN — end of daemon scaffolding */
 
 /* =========================================================================
  * Load devices from JSON config file
@@ -95,6 +106,49 @@ static virp_vendor_t vendor_from_string(const char *s)
     if (strcmp(s, "wazuh") == 0)     return VIRP_VENDOR_WAZUH;
     if (strcmp(s, "mock") == 0)      return VIRP_VENDOR_MOCK;
     return VIRP_VENDOR_UNKNOWN;
+}
+
+/*
+ * Type-checked JSON accessors. Each returns true only when the key is
+ * present AND the value has the expected type. Wrong-type values are
+ * reported as absent so the caller's destination is left untouched.
+ *
+ * Why: bare json_object_get_string(val) returns NULL when val is not a
+ * JSON string, and snprintf("%s", NULL) is undefined behaviour — on glibc
+ * it segfaults. A config with e.g. "enable": 0 took the daemon down at
+ * startup before this guard existed (issue #7).
+ *
+ * Mirrors json_get_string() in virp_onode_main.c and the safe pattern
+ * already used by load_socket_path_override() above.
+ */
+static bool json_get_string(struct json_object *obj, const char *key,
+                            char *out, size_t out_sz)
+{
+    struct json_object *val;
+    if (!json_object_object_get_ex(obj, key, &val)) return false;
+    if (!json_object_is_type(val, json_type_string)) return false;
+    const char *s = json_object_get_string(val);
+    if (!s) return false;
+    snprintf(out, out_sz, "%s", s);
+    return true;
+}
+
+static bool json_get_int(struct json_object *obj, const char *key, int *out)
+{
+    struct json_object *val;
+    if (!json_object_object_get_ex(obj, key, &val)) return false;
+    if (!json_object_is_type(val, json_type_int)) return false;
+    *out = json_object_get_int(val);
+    return true;
+}
+
+static bool json_get_bool(struct json_object *obj, const char *key, bool *out)
+{
+    struct json_object *val;
+    if (!json_object_object_get_ex(obj, key, &val)) return false;
+    if (!json_object_is_type(val, json_type_boolean)) return false;
+    *out = json_object_get_boolean(val);
+    return true;
 }
 
 /*
@@ -153,7 +207,12 @@ static char *load_socket_path_override(struct json_object *root)
     return (s && *s) ? strdup(s) : NULL;
 }
 
-static int load_devices(onode_state_t *state, const char *path)
+/*
+ * Not static: the issue #7 regression test in tests/test_onode.c links
+ * against the prod parser (via the *_lib.o object compiled with
+ * VIRP_ONODE_PROD_NO_MAIN) and calls this directly.
+ */
+int load_devices(onode_state_t *state, const char *path)
 {
     struct json_object *root = json_object_from_file(path);
     if (!root) {
@@ -191,63 +250,65 @@ static int load_devices(onode_state_t *state, const char *path)
 
     for (int i = 0; i < count; i++) {
         struct json_object *dev_obj = json_object_array_get_idx(devices_arr, i);
-        if (!dev_obj) continue;
+        if (!dev_obj || !json_object_is_type(dev_obj, json_type_object))
+            continue;
 
         virp_device_t device;
         memset(&device, 0, sizeof(device));
         device.enabled = true;
+        device.port = 22;
 
-        struct json_object *val;
+        json_get_string(dev_obj, "hostname", device.hostname,
+                        sizeof(device.hostname));
+        json_get_string(dev_obj, "host",     device.host,
+                        sizeof(device.host));
+        json_get_string(dev_obj, "username", device.username,
+                        sizeof(device.username));
+        json_get_string(dev_obj, "password", device.password,
+                        sizeof(device.password));
+        json_get_string(dev_obj, "enable",   device.enable_password,
+                        sizeof(device.enable_password));
 
-        if (json_object_object_get_ex(dev_obj, "hostname", &val))
-            snprintf(device.hostname, sizeof(device.hostname), "%s",
-                     json_object_get_string(val));
+        int port_val;
+        if (json_get_int(dev_obj, "port", &port_val))
+            device.port = (uint16_t)port_val;
 
-        if (json_object_object_get_ex(dev_obj, "host", &val))
-            snprintf(device.host, sizeof(device.host), "%s",
-                     json_object_get_string(val));
+        char vendor_str[32] = {0};
+        if (json_get_string(dev_obj, "vendor", vendor_str, sizeof(vendor_str)))
+            device.vendor = vendor_from_string(vendor_str);
 
-        if (json_object_object_get_ex(dev_obj, "port", &val))
-            device.port = (uint16_t)json_object_get_int(val);
-        else
-            device.port = 22;
-
-        if (json_object_object_get_ex(dev_obj, "vendor", &val))
-            device.vendor = vendor_from_string(json_object_get_string(val));
-
-        if (json_object_object_get_ex(dev_obj, "username", &val))
-            snprintf(device.username, sizeof(device.username), "%s",
-                     json_object_get_string(val));
-
-        if (json_object_object_get_ex(dev_obj, "password", &val))
-            snprintf(device.password, sizeof(device.password), "%s",
-                     json_object_get_string(val));
-
-        if (json_object_object_get_ex(dev_obj, "enable", &val))
-            snprintf(device.enable_password, sizeof(device.enable_password),
-                     "%s", json_object_get_string(val));
-
-        if (json_object_object_get_ex(dev_obj, "node_id", &val))
-            device.node_id = (uint32_t)strtoul(
-                json_object_get_string(val), NULL, 16);
+        /*
+         * node_id accepts either a hex string ("0A0000FD") or a JSON int,
+         * matching virp_onode_main.c's dev parser. Other JSON types are
+         * silently ignored (treated as absent) — pre-fix code dereferenced
+         * a NULL string here when the value was an int/bool/null.
+         */
+        struct json_object *nid_val;
+        if (json_object_object_get_ex(dev_obj, "node_id", &nid_val)) {
+            if (json_object_is_type(nid_val, json_type_string)) {
+                const char *s = json_object_get_string(nid_val);
+                if (s) device.node_id = (uint32_t)strtoul(s, NULL, 16);
+            } else if (json_object_is_type(nid_val, json_type_int)) {
+                device.node_id = (uint32_t)json_object_get_int64(nid_val);
+            }
+        }
 
         /* FortiGate-specific fields (ignored for other vendors) */
-        if (json_object_object_get_ex(dev_obj, "api_token", &val))
-            snprintf(device.api_token, sizeof(device.api_token), "%s",
-                     json_object_get_string(val));
+        json_get_string(dev_obj, "api_token", device.api_token,
+                        sizeof(device.api_token));
 
-        if (json_object_object_get_ex(dev_obj, "api_port", &val))
-            device.api_port = (uint16_t)json_object_get_int(val);
+        int api_port_val;
+        if (json_get_int(dev_obj, "api_port", &api_port_val))
+            device.api_port = (uint16_t)api_port_val;
 
-        if (json_object_object_get_ex(dev_obj, "vdom", &val))
-            snprintf(device.vdom, sizeof(device.vdom), "%s",
-                     json_object_get_string(val));
+        json_get_string(dev_obj, "vdom", device.vdom, sizeof(device.vdom));
 
-        if (json_object_object_get_ex(dev_obj, "verify_tls", &val))
-            device.verify_tls = json_object_get_boolean(val);
+        bool bool_val;
+        if (json_get_bool(dev_obj, "verify_tls", &bool_val))
+            device.verify_tls = bool_val;
 
-        if (json_object_object_get_ex(dev_obj, "ssh_legacy", &val))
-            device.ssh_legacy = json_object_get_boolean(val);
+        if (json_get_bool(dev_obj, "ssh_legacy", &bool_val))
+            device.ssh_legacy = bool_val;
 
         if (device.hostname[0] == '\0' || device.host[0] == '\0') {
             fprintf(stderr, "[O-Node] Skipping device %d: missing hostname/host\n", i);
@@ -277,6 +338,8 @@ static int load_devices(onode_state_t *state, const char *path)
 
     return loaded;
 }
+
+#ifndef VIRP_ONODE_PROD_NO_MAIN
 
 static void usage(const char *prog)
 {
@@ -439,3 +502,5 @@ int main(int argc, char **argv)
 
     return (err == VIRP_OK) ? 0 : 1;
 }
+
+#endif  /* !VIRP_ONODE_PROD_NO_MAIN */
