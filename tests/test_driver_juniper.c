@@ -163,13 +163,13 @@ static void test_command_routing(void)
     assert(junos_route_command("show firewall") == VIRP_TIER_YELLOW);
     PASS();
 
-    /* RED tier — full config */
-    TEST("show configuration → RED");
-    assert(junos_route_command("show configuration") == VIRP_TIER_RED);
+    /* Config reads — YELLOW (config-read reconciliation) */
+    TEST("show configuration → YELLOW (config-read reconciliation)");
+    assert(junos_route_command("show configuration") == VIRP_TIER_YELLOW);
     PASS();
 
-    TEST("show configuration | display set → RED (longest match)");
-    assert(junos_route_command("show configuration | display set") == VIRP_TIER_RED);
+    TEST("show configuration | display set → YELLOW (config-read reconciliation)");
+    assert(junos_route_command("show configuration | display set") == VIRP_TIER_YELLOW);
     PASS();
 
     TEST("show configuration protocols → YELLOW (longest match over RED)");
@@ -193,25 +193,25 @@ static void test_command_routing(void)
     assert(junos_route_command("file delete /var/tmp/test") == VIRP_TIER_BLACK);
     PASS();
 
-    /* ── Write Operations: YELLOW tier ── */
-    TEST("set security address-book → YELLOW");
-    assert(junos_route_command("set security address-book global address TEST 1.2.3.4/32") == VIRP_TIER_YELLOW);
+    /* ── Write Operations: ALL RED (no config write rides YELLOW) ── */
+    TEST("set security address-book → RED (all writes RED)");
+    assert(junos_route_command("set security address-book global address TEST 1.2.3.4/32") == VIRP_TIER_RED);
     PASS();
 
-    TEST("set security policies → YELLOW");
-    assert(junos_route_command("set security policies from-zone trust to-zone untrust policy FOO") == VIRP_TIER_YELLOW);
+    TEST("set security policies → RED (all writes RED)");
+    assert(junos_route_command("set security policies from-zone trust to-zone untrust policy FOO") == VIRP_TIER_RED);
     PASS();
 
-    TEST("set system services dhcp → YELLOW");
-    assert(junos_route_command("set system services dhcp pool POOL") == VIRP_TIER_YELLOW);
+    TEST("set system services dhcp → RED (all writes RED)");
+    assert(junos_route_command("set system services dhcp pool POOL") == VIRP_TIER_RED);
     PASS();
 
-    TEST("delete security address-book → YELLOW");
-    assert(junos_route_command("delete security address-book global address TEST") == VIRP_TIER_YELLOW);
+    TEST("delete security address-book → RED (all writes RED)");
+    assert(junos_route_command("delete security address-book global address TEST") == VIRP_TIER_RED);
     PASS();
 
-    TEST("delete security policies → YELLOW");
-    assert(junos_route_command("delete security policies from-zone trust to-zone untrust policy FOO") == VIRP_TIER_YELLOW);
+    TEST("delete security policies → RED (destructive delete no longer rides YELLOW)");
+    assert(junos_route_command("delete security policies from-zone trust to-zone untrust policy FOO") == VIRP_TIER_RED);
     PASS();
 
     /* ── Write Operations: RED tier ── */
@@ -264,8 +264,12 @@ static void test_command_routing(void)
     assert(junos_route_command("show snmp mib walk jnxOperatingTable") == VIRP_TIER_YELLOW);
     PASS();
 
-    TEST("unmapped set command → YELLOW (default)");
-    assert(junos_route_command("set system host-name foo") == VIRP_TIER_YELLOW);
+    TEST("set system host-name → RED (bare 'set ' catch-all, no write rides YELLOW)");
+    assert(junos_route_command("set system host-name foo") == VIRP_TIER_RED);
+    PASS();
+
+    TEST("set system login (create admin) → RED (credential write)");
+    assert(junos_route_command("set system login user hacker class super-user") == VIRP_TIER_RED);
     PASS();
 
     TEST("null command → YELLOW");

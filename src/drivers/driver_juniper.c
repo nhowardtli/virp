@@ -99,9 +99,10 @@ const junos_command_route_t JUNOS_ROUTE_TABLE[] = {
     { "show firewall",                  VIRP_TIER_YELLOW },
     { "show policy-options",            VIRP_TIER_YELLOW },
 
-    /* ── Tier 3: RED — Full config / sensitive (multi-approval) ── */
-    { "show configuration",             VIRP_TIER_RED    },
-    { "show configuration | display set", VIRP_TIER_RED  },
+    /* Config-visibility reads — YELLOW to match the FortiGate/ASA
+     * config-read precedent (config reads = YELLOW; writes stay RED). */
+    { "show configuration",             VIRP_TIER_YELLOW },
+    { "show configuration | display set", VIRP_TIER_YELLOW },
 
     /* ── BLACK — Destructive operations (never transmitted) ────── */
     { "request system reboot",          VIRP_TIER_BLACK  },
@@ -111,16 +112,16 @@ const junos_command_route_t JUNOS_ROUTE_TABLE[] = {
     { "file delete",                    VIRP_TIER_BLACK  },
     { "request system software delete", VIRP_TIER_BLACK  },
 
-    /* ── Write Ops: YELLOW — address book, policies, DHCP ──────── */
-    { "set security address-book",          VIRP_TIER_YELLOW },
-    { "set security policies",              VIRP_TIER_YELLOW },
-    { "set system services dhcp",           VIRP_TIER_YELLOW },
-    { "delete security address-book",       VIRP_TIER_YELLOW },
-    { "delete security policies",           VIRP_TIER_YELLOW },
-    { "delete system services dhcp",        VIRP_TIER_YELLOW },
-
-    /* ── Write Ops: RED — NAT, routing, interfaces, commit ─────── */
+    /* ── Write Ops: RED — ALL config writes are RED ────────────────
+     * Bare "set "/"delete" catch-alls ensure EVERY config write maps RED,
+     * including credential writes ("set system login", "set system
+     * root-authentication") and policy deletes ("delete security
+     * policies") that previously fell to the YELLOW default / YELLOW
+     * carve-outs. Longer entries below are redundant with the catch-alls
+     * but kept to document the high-impact write paths. No config write
+     * rides YELLOW. */
     { "configure",                          VIRP_TIER_RED    },
+    { "set ",                               VIRP_TIER_RED    },
     { "set security nat",                   VIRP_TIER_RED    },
     { "set interfaces",                     VIRP_TIER_RED    },
     { "set routing-options",                VIRP_TIER_RED    },
