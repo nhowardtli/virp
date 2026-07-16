@@ -36,6 +36,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <openssl/crypto.h>
+#include <openssl/evp.h>
 #include "cJSON.h"
 
 /* =========================================================================
@@ -467,6 +468,30 @@ static virp_trust_tier_t gate_classify(const virp_driver_t *drv,
 }
 
 /*
+ * Clamp a classified tier to a value valid on an observation header.
+ * GREEN/YELLOW/RED pass through unchanged; UNCLASSIFIED (no classifier
+ * table) and BLACK (blocked at the driver, never a real output tier) fall
+ * back to GREEN so the observation still builds and validates.
+ */
+static uint8_t gate_obs_tier(virp_trust_tier_t t)
+{
+    if (t == VIRP_TIER_GREEN || t == VIRP_TIER_YELLOW || t == VIRP_TIER_RED)
+        return (uint8_t)t;
+    return VIRP_TIER_GREEN;
+}
+
+/* SHA-256 → lowercase hex (65 bytes incl. NUL). Used to hash a gate
+ * rejection record before persisting it to the trust chain. */
+static void gate_sha256_hex(const void *data, size_t len, char out[65])
+{
+    unsigned char md[32];
+    unsigned int mdlen = 0;
+    EVP_Digest(data, len, md, &mdlen, EVP_sha256(), NULL);
+    for (int i = 0; i < 32; i++)
+        snprintf(out + i * 2, 3, "%02x", md[i]);
+}
+
+/*
  * Effective gate mode for a driver: its per-driver override if present in
  * gate_overrides, else gate_default_mode. Matched by driver name (drv->name).
  */
@@ -546,21 +571,23 @@ virp_error_t onode_execute(onode_state_t *state,
                                       &state->okey);
     }
 
-    /* ── Tier-enforcement gate (Phase B) ──────────────────────────────
+    /* ── Tier-enforcement gate (Phase B/C) ────────────────────────────
      * Classify at the boundary, decide allow/block against the configured
      * max tier, and log. SHADOW logs and proceeds; ENFORCE hard-rejects
-     * over-tier / unclassified commands before the driver runs. */
+     * over-tier / unclassified commands before the driver runs. The
+     * classified tier is hoisted to function scope so the success
+     * observation below can be stamped with it (Phase C truth-fix). */
+    virp_trust_tier_t gate_tier = gate_classify(drv, command);
     {
         onode_gate_mode_t mode = gate_effective_mode(state, drv->name);
-        virp_trust_tier_t tier = gate_classify(drv, command);
-        bool block = gate_tier_blocks(tier, state->gate_max_tier);
+        bool block = gate_tier_blocks(gate_tier, state->gate_max_tier);
 
         fprintf(stderr,
                 "[GATE] mode=%s device=%s driver=%s tier=%s threshold=%s "
                 "decision=%s command=\"%s\"\n",
                 mode == GATE_MODE_ENFORCE ? "ENFORCE" : "SHADOW",
                 device_name, drv->name,
-                gate_tier_name(tier),
+                gate_tier_name(gate_tier),
                 gate_tier_name(state->gate_max_tier),
                 block ? "would-block" : "would-allow",
                 command);
@@ -571,12 +598,46 @@ virp_error_t onode_execute(onode_state_t *state,
             snprintf(err_msg, sizeof(err_msg),
                      "ERROR: tier gate blocked '%s' on '%s' "
                      "(tier=%s max=%s)",
-                     command, device_name, gate_tier_name(tier),
+                     command, device_name, gate_tier_name(gate_tier),
                      gate_tier_name(state->gate_max_tier));
-            return virp_build_observation(out_buf, out_buf_len, out_len,
+
+            /* Phase C — rejection persistence: write a durable, HMAC-signed
+             * entry to the trust chain via the same append path the AI
+             * layer uses, so a refused command leaves an auditable record.
+             * Best-effort: a chain failure must not alter the rejection.
+             * DORMANT under SHADOW — this branch runs only in ENFORCE.
+             * NOTE: virp_chain_append serializes writes with BEGIN
+             * IMMEDIATE but shares prepared statements with the AI-path
+             * chain_append handler; a dedicated chain mutex shared by both
+             * paths is the proper hardening before high-concurrency enforce. */
+            if (state->chain_enabled) {
+                char artifact_hash[65];
+                gate_sha256_hex(err_msg, strlen(err_msg), artifact_hash);
+                char artifact_id[64];
+                snprintf(artifact_id, sizeof(artifact_id),
+                         "gatereject-%.16s", artifact_hash);
+                char session_id[96];
+                snprintf(session_id, sizeof(session_id),
+                         "gate-enforce:%s", device_name);
+                virp_chain_entry_t ce;
+                virp_error_t cerr = virp_chain_append(&state->chain, session_id,
+                                                      "gate_rejection",
+                                                      artifact_id, artifact_hash,
+                                                      &ce);
+                if (cerr == VIRP_OK)
+                    fprintf(stderr, "[GATE] rejection persisted: session=%s "
+                            "seq=%lld hash=%.16s\n", session_id,
+                            (long long)ce.sequence, ce.chain_entry_hash);
+                else
+                    fprintf(stderr, "[GATE] rejection chain_append failed: %s\n",
+                            virp_error_str(cerr));
+            }
+
+            return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                           state->devices[dev_idx].node_id,
                                           onode_next_seq(state),
                                           VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                          gate_obs_tier(gate_tier),
                                           (const uint8_t *)err_msg,
                                           (uint16_t)strlen(err_msg),
                                           &state->okey);
@@ -641,11 +702,15 @@ virp_error_t onode_execute(onode_state_t *state,
                     65530 : (uint16_t)result.output_len;
     }
 
-    err = virp_build_observation(out_buf, out_buf_len, out_len,
+    /* Phase C truth-fix: stamp the observation with the command's real
+     * gate-classified tier (clamped to a transmittable tier) instead of a
+     * blanket GREEN. show system admin → RED; get system status → GREEN. */
+    err = virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                  state->devices[dev_idx].node_id,
                                  onode_next_seq(state),
                                  VIRP_OBS_DEVICE_OUTPUT,
                                  VIRP_SCOPE_LOCAL,
+                                 gate_obs_tier(gate_tier),
                                  obs_data, data_len,
                                  &state->okey);
 

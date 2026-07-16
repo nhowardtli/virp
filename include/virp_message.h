@@ -81,6 +81,23 @@ virp_error_t virp_build_observation(uint8_t *buf, size_t buf_len,
                                     const virp_signing_key_t *sk);
 
 /*
+ * As virp_build_observation(), but stamps the observation header with an
+ * explicit trust tier (GREEN/YELLOW/RED) instead of the GREEN default.
+ * Used by the O-Node execute path to reflect the gate-classified tier of
+ * the command. tier must be a transmittable tier (not BLACK); callers
+ * clamp UNCLASSIFIED/BLACK to GREEN before calling.
+ */
+virp_error_t virp_build_observation_tiered(uint8_t *buf, size_t buf_len,
+                                    size_t *out_len,
+                                    uint32_t node_id,
+                                    uint32_t seq_num,
+                                    uint8_t obs_type,
+                                    uint8_t obs_scope,
+                                    uint8_t tier,
+                                    const uint8_t *data, uint16_t data_len,
+                                    const virp_signing_key_t *sk);
+
+/*
  * Parse an OBSERVATION message payload.
  * Header must already be deserialized and validated.
  *

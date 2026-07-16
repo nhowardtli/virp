@@ -314,12 +314,13 @@ static virp_error_t build_and_sign(uint8_t *buf, size_t buf_len,
  * Observation Messages
  * ========================================================================= */
 
-virp_error_t virp_build_observation(uint8_t *buf, size_t buf_len,
+virp_error_t virp_build_observation_tiered(uint8_t *buf, size_t buf_len,
                                     size_t *out_len,
                                     uint32_t node_id,
                                     uint32_t seq_num,
                                     uint8_t obs_type,
                                     uint8_t obs_scope,
+                                    uint8_t tier,
                                     const uint8_t *data, uint16_t data_len,
                                     const virp_signing_key_t *sk)
 {
@@ -343,9 +344,27 @@ virp_error_t virp_build_observation(uint8_t *buf, size_t buf_len,
 
     return build_and_sign(buf, buf_len, out_len,
                           VIRP_MSG_OBSERVATION, VIRP_CHANNEL_OC,
-                          VIRP_TIER_GREEN,
+                          tier,
                           node_id, seq_num,
                           payload, payload_len, sk);
+}
+
+virp_error_t virp_build_observation(uint8_t *buf, size_t buf_len,
+                                    size_t *out_len,
+                                    uint32_t node_id,
+                                    uint32_t seq_num,
+                                    uint8_t obs_type,
+                                    uint8_t obs_scope,
+                                    const uint8_t *data, uint16_t data_len,
+                                    const virp_signing_key_t *sk)
+{
+    /* Backward-compatible default: GREEN. Callers that carry a real,
+     * gate-classified trust tier (the O-Node command-execution path) use
+     * virp_build_observation_tiered() so the observation reflects the
+     * command's actual sensitivity instead of a blanket GREEN. */
+    return virp_build_observation_tiered(buf, buf_len, out_len, node_id,
+                                         seq_num, obs_type, obs_scope,
+                                         VIRP_TIER_GREEN, data, data_len, sk);
 }
 
 virp_error_t virp_parse_observation(const uint8_t *payload, size_t payload_len,
