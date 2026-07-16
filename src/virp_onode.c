@@ -468,16 +468,34 @@ static virp_trust_tier_t gate_classify(const virp_driver_t *drv,
 }
 
 /*
- * Clamp a classified tier to a value valid on an observation header.
- * GREEN/YELLOW/RED pass through unchanged; UNCLASSIFIED (no classifier
- * table) and BLACK (blocked at the driver, never a real output tier) fall
- * back to GREEN so the observation still builds and validates.
+ * Map a gate-computed tier to the value stamped on the observation header.
+ *
+ * Audit honesty (Snow): record the ACTUAL computed tier. GREEN/YELLOW/RED
+ * AND UNCLASSIFIED all pass through unchanged, so a blocked or unclassified
+ * op is NOT recorded in the chain as GREEN (the integrity gap this fixes).
+ * UNCLASSIFIED is 0x00, which is a valid on-wire tier (virp_header_validate
+ * accepts it; only BLACK and tier > RED are rejected).
+ *
+ * BLACK is the sole clamp: the protocol forbids BLACK on the wire
+ * (virp_header_init / virp_header_validate reject 0xFF), so a BLACK-
+ * classified op's observation cannot be built as BLACK. It is stamped RED —
+ * the highest transmittable tier — which OVER-reports sensitivity and never
+ * under-reports it, the safe direction for an audit record.
+ *
+ * Non-static so the hardening unit tests can assert this mapping directly.
  */
-static uint8_t gate_obs_tier(virp_trust_tier_t t)
+uint8_t gate_obs_tier(virp_trust_tier_t t)
 {
-    if (t == VIRP_TIER_GREEN || t == VIRP_TIER_YELLOW || t == VIRP_TIER_RED)
+    switch (t) {
+    case VIRP_TIER_GREEN:
+    case VIRP_TIER_YELLOW:
+    case VIRP_TIER_RED:
+    case VIRP_TIER_UNCLASSIFIED:
         return (uint8_t)t;
-    return VIRP_TIER_GREEN;
+    case VIRP_TIER_BLACK:
+    default:
+        return VIRP_TIER_RED;
+    }
 }
 
 /* SHA-256 → lowercase hex (65 bytes incl. NUL). Used to hash a gate

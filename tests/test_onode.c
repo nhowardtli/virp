@@ -165,7 +165,11 @@ TEST(test_execute_show_ip_route)
 
     ASSERT_EQ(hdr.type, VIRP_MSG_OBSERVATION);
     ASSERT_EQ(hdr.channel, VIRP_CHANNEL_OC);
-    ASSERT_EQ(hdr.tier, VIRP_TIER_GREEN);
+    /* Item 1 audit-honesty: R6 uses the mock driver, which has no
+     * route_command classifier, so the command is UNCLASSIFIED — and the
+     * observation now records that honestly (previously clamped to GREEN).
+     * This asserts the end-to-end fix through the full execute path. */
+    ASSERT_EQ(hdr.tier, VIRP_TIER_UNCLASSIFIED);
     ASSERT_EQ(hdr.node_id, 0x06060606);    /* R6's node ID */
 
     /* Parse the observation payload */
@@ -1214,6 +1218,22 @@ TEST(test_hex_decode_oversized_input)
 }
 
 /* =========================================================================
+ * gate_obs_tier — audit-honesty mapping (Item 1 hardening)
+ * ========================================================================= */
+
+TEST(test_gate_obs_tier_honesty)
+{
+    /* Real tiers pass through; UNCLASSIFIED is preserved (NOT clamped to
+     * GREEN) so a blocked/unclassified op records honestly in the chain. */
+    ASSERT_EQ(gate_obs_tier(VIRP_TIER_GREEN),        VIRP_TIER_GREEN);
+    ASSERT_EQ(gate_obs_tier(VIRP_TIER_YELLOW),       VIRP_TIER_YELLOW);
+    ASSERT_EQ(gate_obs_tier(VIRP_TIER_RED),          VIRP_TIER_RED);
+    ASSERT_EQ(gate_obs_tier(VIRP_TIER_UNCLASSIFIED), VIRP_TIER_UNCLASSIFIED);
+    /* BLACK is untransmittable -> over-reported as RED, never GREEN. */
+    ASSERT_EQ(gate_obs_tier(VIRP_TIER_BLACK),        VIRP_TIER_RED);
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -1264,6 +1284,9 @@ int main(void)
     printf("[Device Config Parser Robustness (issue #7)]\n");
     RUN_TEST(test_load_devices_wrong_type_does_not_crash);
     RUN_TEST(test_load_devices_skips_missing_required_fields);
+
+    printf("\n[Gate observation-tier honesty (Item 1 hardening)]\n");
+    RUN_TEST(test_gate_obs_tier_honesty);
 
     printf("\n[hex_decode Unit Tests]\n");
     RUN_TEST(test_hex_decode_empty_string);

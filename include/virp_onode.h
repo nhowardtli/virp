@@ -316,6 +316,14 @@ void onode_destroy(onode_state_t *state);
  * ========================================================================= */
 
 /*
+ * Map a gate-computed trust tier to the tier stamped on the observation
+ * header. GREEN/YELLOW/RED/UNCLASSIFIED pass through (honest audit record);
+ * BLACK -> RED (BLACK is not transmittable on the wire). Exposed for the
+ * hardening unit tests; the execute path uses it internally.
+ */
+uint8_t gate_obs_tier(virp_trust_tier_t t);
+
+/*
  * Execute a command on a device and return a signed OBSERVATION.
  *
  * state:       O-Node state

@@ -952,6 +952,7 @@ const char *virp_channel_str(uint8_t channel)
 const char *virp_tier_str(uint8_t tier)
 {
     switch (tier) {
+    case VIRP_TIER_UNCLASSIFIED: return "UNCLASSIFIED";
     case VIRP_TIER_BLACK:  return "BLACK (forbidden)";
     case VIRP_TIER_GREEN:  return "GREEN (passive)";
     case VIRP_TIER_YELLOW: return "YELLOW (active)";

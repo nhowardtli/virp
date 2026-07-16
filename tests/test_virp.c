@@ -265,6 +265,66 @@ TEST(test_hmac_detects_header_tamper)
 }
 
 /* =========================================================================
+ * 6b. AUDIT HONESTY: observation records the ACTUAL tier (incl. UNCLASSIFIED)
+ * ========================================================================= */
+
+TEST(test_observation_tier_honesty)
+{
+    uint8_t buf[256];
+    size_t out_len;
+    uint8_t data[] = "device output";
+    virp_header_t hdr;
+
+    /* UNCLASSIFIED (0x00) must stamp as UNCLASSIFIED and validate on the
+     * wire — NOT clamped to GREEN. This is the Snow audit-integrity fix. */
+    virp_error_t err = virp_build_observation_tiered(
+        buf, sizeof(buf), &out_len, 0x0A0B0C0D, 7,
+        VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL,
+        VIRP_TIER_UNCLASSIFIED, data, sizeof(data), &okey);
+    ASSERT_OK(err);
+    ASSERT_EQ(buf[9], VIRP_TIER_UNCLASSIFIED);   /* header tier byte @ offset 9 */
+    ASSERT_OK(virp_validate_message(buf, out_len, &okey, &hdr));
+    ASSERT_EQ(hdr.tier, VIRP_TIER_UNCLASSIFIED);
+
+    /* GREEN/YELLOW/RED pass through faithfully. */
+    uint8_t tiers[] = { VIRP_TIER_GREEN, VIRP_TIER_YELLOW, VIRP_TIER_RED };
+    for (size_t i = 0; i < sizeof(tiers); i++) {
+        err = virp_build_observation_tiered(
+            buf, sizeof(buf), &out_len, 1, 1,
+            VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL,
+            tiers[i], data, sizeof(data), &okey);
+        ASSERT_OK(err);
+        ASSERT_EQ(buf[9], tiers[i]);
+        ASSERT_OK(virp_validate_message(buf, out_len, &okey, &hdr));
+    }
+
+    /* BLACK is untransmittable — the builder MUST refuse it. This is why
+     * gate_obs_tier maps BLACK->RED before ever calling the builder. */
+    err = virp_build_observation_tiered(
+        buf, sizeof(buf), &out_len, 1, 1,
+        VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL,
+        VIRP_TIER_BLACK, data, sizeof(data), &okey);
+    ASSERT_EQ(err, VIRP_ERR_TIER_VIOLATION);
+}
+
+TEST(test_observation_wrapper_unchanged_green)
+{
+    /* The 16 non-command callers use virp_build_observation (no tier arg).
+     * It must still stamp GREEN, byte-for-byte unchanged behavior. */
+    uint8_t buf[256];
+    size_t out_len;
+    uint8_t data[] = "legacy caller";
+    virp_header_t hdr;
+    virp_error_t err = virp_build_observation(
+        buf, sizeof(buf), &out_len, 1, 1,
+        VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL, data, sizeof(data), &okey);
+    ASSERT_OK(err);
+    ASSERT_EQ(buf[9], VIRP_TIER_GREEN);
+    ASSERT_OK(virp_validate_message(buf, out_len, &okey, &hdr));
+    ASSERT_EQ(hdr.tier, VIRP_TIER_GREEN);
+}
+
+/* =========================================================================
  * 7. STRUCTURAL GUARANTEE: Wrong key cannot verify
  * ========================================================================= */
 
@@ -852,6 +912,8 @@ int main(void)
     printf("\n[HMAC Integrity]\n");
     RUN_TEST(test_hmac_detects_tamper);
     RUN_TEST(test_hmac_detects_header_tamper);
+    RUN_TEST(test_observation_tier_honesty);
+    RUN_TEST(test_observation_wrapper_unchanged_green);
     RUN_TEST(test_wrong_key_fails_verify);
 
     printf("\n[Channel-Type Consistency]\n");
