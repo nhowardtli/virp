@@ -418,6 +418,71 @@ static virp_conn_t *get_connection(onode_state_t *state, int dev_idx)
 }
 
 /* =========================================================================
+ * Tier-Enforcement Gate (Phase B) — helpers
+ *
+ * The gate sits in onode_execute() between driver lookup and driver
+ * execution. It classifies the command via the driver's optional
+ * route_command() hook and compares the result to state->gate_max_tier.
+ *
+ * SHADOW mode logs the decision and proceeds. ENFORCE mode hard-rejects
+ * over-tier and UNCLASSIFIED commands. The GREEN-hardcoded response tier
+ * and rejection persistence are deliberately out of scope here (Phase C).
+ * ========================================================================= */
+
+static const char *gate_tier_name(virp_trust_tier_t t)
+{
+    switch (t) {
+    case VIRP_TIER_UNCLASSIFIED: return "UNCLASSIFIED";
+    case VIRP_TIER_GREEN:        return "GREEN";
+    case VIRP_TIER_YELLOW:       return "YELLOW";
+    case VIRP_TIER_RED:          return "RED";
+    case VIRP_TIER_BLACK:        return "BLACK";
+    default:                     return "?";
+    }
+}
+
+/*
+ * Would this tier be blocked under max_tier? Fail closed on UNCLASSIFIED
+ * (driver has no classifier table) and always block BLACK. Otherwise
+ * order is GREEN(1) < YELLOW(2) < RED(3): block anything above the max.
+ */
+static bool gate_tier_blocks(virp_trust_tier_t tier, virp_trust_tier_t max_tier)
+{
+    if (tier == VIRP_TIER_UNCLASSIFIED) return true;
+    if (tier == VIRP_TIER_BLACK)        return true;
+    return tier > max_tier;
+}
+
+/*
+ * Classify a command via the driver's optional route_command() hook.
+ * Drivers without a classifier (NULL hook) yield UNCLASSIFIED, which the
+ * gate treats as block-worthy (fail closed).
+ */
+static virp_trust_tier_t gate_classify(const virp_driver_t *drv,
+                                       const char *command)
+{
+    if (drv && drv->route_command)
+        return drv->route_command(command);
+    return VIRP_TIER_UNCLASSIFIED;
+}
+
+/*
+ * Effective gate mode for a driver: its per-driver override if present in
+ * gate_overrides, else gate_default_mode. Matched by driver name (drv->name).
+ */
+static onode_gate_mode_t gate_effective_mode(const onode_state_t *state,
+                                             const char *driver_name)
+{
+    if (driver_name) {
+        for (size_t i = 0; i < state->gate_overrides_count; i++) {
+            if (strcmp(state->gate_overrides[i].driver, driver_name) == 0)
+                return state->gate_overrides[i].mode;
+        }
+    }
+    return state->gate_default_mode;
+}
+
+/* =========================================================================
  * O-Node Operations
  * ========================================================================= */
 
@@ -479,6 +544,43 @@ virp_error_t onode_execute(onode_state_t *state,
                                       (const uint8_t *)err_msg,
                                       (uint16_t)strlen(err_msg),
                                       &state->okey);
+    }
+
+    /* ── Tier-enforcement gate (Phase B) ──────────────────────────────
+     * Classify at the boundary, decide allow/block against the configured
+     * max tier, and log. SHADOW logs and proceeds; ENFORCE hard-rejects
+     * over-tier / unclassified commands before the driver runs. */
+    {
+        onode_gate_mode_t mode = gate_effective_mode(state, drv->name);
+        virp_trust_tier_t tier = gate_classify(drv, command);
+        bool block = gate_tier_blocks(tier, state->gate_max_tier);
+
+        fprintf(stderr,
+                "[GATE] mode=%s device=%s driver=%s tier=%s threshold=%s "
+                "decision=%s command=\"%s\"\n",
+                mode == GATE_MODE_ENFORCE ? "ENFORCE" : "SHADOW",
+                device_name, drv->name,
+                gate_tier_name(tier),
+                gate_tier_name(state->gate_max_tier),
+                block ? "would-block" : "would-allow",
+                command);
+
+        if (mode == GATE_MODE_ENFORCE && block) {
+            pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+            char err_msg[256];
+            snprintf(err_msg, sizeof(err_msg),
+                     "ERROR: tier gate blocked '%s' on '%s' "
+                     "(tier=%s max=%s)",
+                     command, device_name, gate_tier_name(tier),
+                     gate_tier_name(state->gate_max_tier));
+            return virp_build_observation(out_buf, out_buf_len, out_len,
+                                          state->devices[dev_idx].node_id,
+                                          onode_next_seq(state),
+                                          VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                          (const uint8_t *)err_msg,
+                                          (uint16_t)strlen(err_msg),
+                                          &state->okey);
+        }
     }
 
     virp_exec_result_t result;
@@ -1867,6 +1969,14 @@ virp_error_t onode_init(onode_state_t *state,
     state->seq_num = 0;
     state->listen_fd = -1;
     state->running = false;
+
+    /* Tier-enforcement gate default posture: observe-only for every driver,
+     * block RED. GATE_MODE_SHADOW is 0 so the memset already selects it; set
+     * explicitly for clarity. Config (gate_default_mode / gate_modes /
+     * gate_max_tier) may override in load_devices() before onode_start(). */
+    state->gate_default_mode = GATE_MODE_SHADOW;
+    state->gate_overrides_count = 0;
+    state->gate_max_tier = VIRP_TIER_YELLOW;
     state->uptime_start = (uint32_t)time(NULL);
     state->watchdog_running = false;
     pthread_mutex_init(&state->state_mutex, NULL);

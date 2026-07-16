@@ -1188,6 +1188,7 @@ static virp_driver_t junos_driver = {
     .disconnect = junos_disconnect,
     .detect     = junos_detect,
     .health_check = junos_health_check,
+    .route_command = junos_route_command,
 };
 
 const virp_driver_t *virp_driver_juniper(void)

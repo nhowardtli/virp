@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp for gate_mode / gate_max_tier parsing */
 #include <signal.h>
 #include <getopt.h>
 #include <json-c/json.h>
@@ -207,6 +208,101 @@ static char *load_socket_path_override(struct json_object *root)
     return (s && *s) ? strdup(s) : NULL;
 }
 
+/* Parse a gate mode string ("shadow"/"enforce"). Returns true on success. */
+static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
+{
+    if (strcasecmp(s, "enforce") == 0) { *out = GATE_MODE_ENFORCE; return true; }
+    if (strcasecmp(s, "shadow")  == 0) { *out = GATE_MODE_SHADOW;  return true; }
+    return false;
+}
+
+/*
+ * Parse the optional tier-enforcement gate config (per-driver scoped):
+ *
+ *   "gate_max_tier":     "green" | "yellow" (default) | "red"
+ *   "gate_default_mode": "shadow" (default) | "enforce"   -- applied to any
+ *                        driver not named in gate_modes
+ *   "gate_modes":        { "<driver>": "shadow"|"enforce", ... }  -- optional
+ *                        per-driver overrides, keyed by driver name
+ *                        (e.g. "fortigate", "cisco_ios", "cisco_asa",
+ *                        "juniper", "panos", "linux", "proxmox", "wazuh").
+ *
+ * ("gate_mode" is accepted as a deprecated alias for gate_default_mode.)
+ *
+ * Absent keys leave the onode_init() defaults (SHADOW default / no
+ * overrides / YELLOW) in place. Unrecognized values are logged and ignored.
+ */
+static void load_gate_config(onode_state_t *state, struct json_object *root)
+{
+    struct json_object *v;
+
+    /* Max tier. */
+    if (json_object_object_get_ex(root, "gate_max_tier", &v) &&
+        json_object_is_type(v, json_type_string)) {
+        const char *s = json_object_get_string(v);
+        if      (strcasecmp(s, "green")  == 0) state->gate_max_tier = VIRP_TIER_GREEN;
+        else if (strcasecmp(s, "yellow") == 0) state->gate_max_tier = VIRP_TIER_YELLOW;
+        else if (strcasecmp(s, "red")    == 0) state->gate_max_tier = VIRP_TIER_RED;
+        else fprintf(stderr, "[O-Node] gate_max_tier '%s' unrecognized — "
+                             "keeping YELLOW\n", s);
+    }
+
+    /* Default mode: gate_default_mode (canonical) or gate_mode (deprecated). */
+    if (json_object_object_get_ex(root, "gate_default_mode", &v) &&
+        json_object_is_type(v, json_type_string)) {
+        const char *s = json_object_get_string(v);
+        if (!parse_gate_mode(s, &state->gate_default_mode))
+            fprintf(stderr, "[O-Node] gate_default_mode '%s' unrecognized — "
+                            "keeping SHADOW\n", s);
+    } else if (json_object_object_get_ex(root, "gate_mode", &v) &&
+               json_object_is_type(v, json_type_string)) {
+        const char *s = json_object_get_string(v);
+        if (parse_gate_mode(s, &state->gate_default_mode))
+            fprintf(stderr, "[O-Node] gate_mode is deprecated — "
+                            "use gate_default_mode\n");
+        else
+            fprintf(stderr, "[O-Node] gate_mode '%s' unrecognized — "
+                            "keeping SHADOW\n", s);
+    }
+
+    /* Per-driver overrides. */
+    if (json_object_object_get_ex(root, "gate_modes", &v) &&
+        json_object_is_type(v, json_type_object)) {
+        json_object_object_foreach(v, drv_name, mode_obj) {
+            if (!json_object_is_type(mode_obj, json_type_string))
+                continue;
+            if (state->gate_overrides_count >= ONODE_MAX_GATE_OVERRIDES) {
+                fprintf(stderr, "[O-Node] gate_modes: override limit reached, "
+                                "ignoring '%s'\n", drv_name);
+                continue;
+            }
+            onode_gate_mode_t m;
+            const char *ms = json_object_get_string(mode_obj);
+            if (!parse_gate_mode(ms, &m)) {
+                fprintf(stderr, "[O-Node] gate_modes['%s']='%s' unrecognized — "
+                                "ignoring\n", drv_name, ms);
+                continue;
+            }
+            size_t idx = state->gate_overrides_count++;
+            snprintf(state->gate_overrides[idx].driver,
+                     sizeof(state->gate_overrides[idx].driver), "%s", drv_name);
+            state->gate_overrides[idx].mode = m;
+        }
+    }
+
+    /* Log resolved posture. */
+    fprintf(stderr, "[O-Node] tier gate: default=%s max_tier=%s overrides=%zu\n",
+            state->gate_default_mode == GATE_MODE_ENFORCE ? "ENFORCE" : "SHADOW",
+            state->gate_max_tier == VIRP_TIER_GREEN  ? "GREEN"  :
+            state->gate_max_tier == VIRP_TIER_RED    ? "RED"    : "YELLOW",
+            state->gate_overrides_count);
+    for (size_t i = 0; i < state->gate_overrides_count; i++)
+        fprintf(stderr, "[O-Node]   override: %s=%s\n",
+                state->gate_overrides[i].driver,
+                state->gate_overrides[i].mode == GATE_MODE_ENFORCE
+                    ? "ENFORCE" : "SHADOW");
+}
+
 /*
  * Not static: the issue #7 regression test in tests/test_onode.c links
  * against the prod parser (via the *_lib.o object compiled with
@@ -222,6 +318,10 @@ int load_devices(onode_state_t *state, const char *path)
 
     /* Socket access gate: install allowlist before onode_start(). */
     load_socket_allowed_uids(state, root);
+
+    /* Tier-enforcement gate (Phase B): override SHADOW/YELLOW defaults
+     * from config if present. Installed before onode_start(). */
+    load_gate_config(state, root);
 
     /*
      * Optional socket_path override from config. Takes precedence over

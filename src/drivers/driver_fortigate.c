@@ -360,6 +360,88 @@ static virp_conn_t *fg_connect(const virp_device_t *device)
 
 
 /* ══════════════════════════════════════════════════════════════════
+ * Command Routing Table — FortiOS commands → trust tiers
+ *
+ * Prefix-matched, longest match wins (mirrors asa_route_command /
+ * junos_route_command). Unmapped commands default to YELLOW.
+ *
+ * Tiering policy for this fleet:
+ *   GREEN  — passive monitoring reads (status, perf, routing table)
+ *   YELLOW — config-visibility reads, backups, active diagnostics.
+ *            'show full-configuration' is the backup path and MUST stay
+ *            at/under a YELLOW threshold so scheduled backups keep working.
+ *   RED    — credential / admin-account reads and any config-mode change
+ *            (approval-worthy).
+ *
+ * NOTE: destructive ops (reboot/factoryreset/…) are handled separately
+ * by fg_is_black_tier() and are intentionally NOT in this table.
+ * ══════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const char        *command_pattern;   /* CLI command prefix */
+    virp_trust_tier_t  tier;
+} fg_command_route_t;
+
+static const fg_command_route_t FG_ROUTE_TABLE[] = {
+    /* ── GREEN — passive monitoring (no approval) ──────────────── */
+    { "get system status",          VIRP_TIER_GREEN  },
+    { "get system performance",     VIRP_TIER_GREEN  },
+    { "get hardware",               VIRP_TIER_GREEN  },
+    { "get system interface",       VIRP_TIER_GREEN  },
+    { "get router info",            VIRP_TIER_GREEN  },
+    { "get router",                 VIRP_TIER_GREEN  },
+    { "show router",                VIRP_TIER_GREEN  },
+
+    /* ── YELLOW — config reads, backups, active diagnostics ────── */
+    { "show full-configuration",    VIRP_TIER_YELLOW },  /* backup path — keep <= YELLOW */
+    { "execute backup",             VIRP_TIER_YELLOW },  /* alternate backup path */
+    { "diagnose",                   VIRP_TIER_YELLOW },  /* active diagnostics */
+    { "execute ping",               VIRP_TIER_YELLOW },
+    { "execute traceroute",         VIRP_TIER_YELLOW },
+    { "show system interface",      VIRP_TIER_YELLOW },
+    { "show firewall",              VIRP_TIER_YELLOW },
+    { "show vpn",                   VIRP_TIER_YELLOW },
+    { "show",                       VIRP_TIER_YELLOW },  /* generic config-section read */
+
+    /* ── RED — credential/admin reads + config-mode changes ────── */
+    { "show system admin",          VIRP_TIER_RED    },  /* admin accounts, pw hashes, tokens */
+    { "get system admin",           VIRP_TIER_RED    },
+    { "show system api-user",       VIRP_TIER_RED    },  /* API credentials */
+    { "get system api-user",        VIRP_TIER_RED    },
+    { "show user",                  VIRP_TIER_RED    },  /* credential/user reads */
+    { "get user",                   VIRP_TIER_RED    },
+    { "config system admin",        VIRP_TIER_RED    },  /* admin-account change */
+    { "config",                     VIRP_TIER_RED    },  /* any config-mode change */
+};
+
+static const size_t FG_ROUTE_TABLE_SIZE =
+    sizeof(FG_ROUTE_TABLE) / sizeof(FG_ROUTE_TABLE[0]);
+
+virp_trust_tier_t fg_route_command(const char *command)
+{
+    if (!command) return VIRP_TIER_YELLOW;
+
+    /* Skip leading whitespace so " show system admin" still classifies. */
+    while (*command == ' ' || *command == '\t') command++;
+
+    const fg_command_route_t *best = NULL;
+    size_t best_len = 0;
+
+    for (size_t i = 0; i < FG_ROUTE_TABLE_SIZE; i++) {
+        size_t plen = strlen(FG_ROUTE_TABLE[i].command_pattern);
+        if (strncasecmp(command, FG_ROUTE_TABLE[i].command_pattern, plen) == 0) {
+            if (plen > best_len) {
+                best = &FG_ROUTE_TABLE[i];
+                best_len = plen;
+            }
+        }
+    }
+
+    return best ? best->tier : VIRP_TIER_YELLOW;
+}
+
+
+/* ══════════════════════════════════════════════════════════════════
  * BLACK Tier — Destructive commands that must never reach the wire.
  *
  * Prefix-matched (case-insensitive).  Any command that starts with
@@ -499,6 +581,7 @@ static const virp_driver_t fg_driver = {
     .disconnect  = fg_disconnect,
     .detect      = fg_detect,
     .health_check = fg_health_check,
+    .route_command = fg_route_command,
 };
 
 void virp_driver_fortinet_init(void)

@@ -54,6 +54,7 @@
  *   BLACK  → Tier 0 (impossible — not in message format)
  * ========================================================================= */
 
+#define VIRP_TIER_UNCLASSIFIED  0x00    /* No classifier table matched — gate fails closed */
 #define VIRP_TIER_GREEN         0x01    /* Passive — no approval required */
 #define VIRP_TIER_YELLOW        0x02    /* Active — single approval required */
 #define VIRP_TIER_RED           0x03    /* Critical — multi-human approval */

@@ -32,6 +32,14 @@ void virp_driver_fortinet_init(void);
  */
 bool fg_is_black_tier(const char *command);
 
+/*
+ * Route a command to its trust tier for the O-Node enforcement gate.
+ * Prefix-matched, longest match wins. Returns the tier for the
+ * best-matching prefix, or VIRP_TIER_YELLOW for unmapped commands
+ * (matching the ASA/JunOS default). Read-only, no side effects.
+ */
+virp_trust_tier_t fg_route_command(const char *command);
+
 #ifdef __cplusplus
 }
 #endif

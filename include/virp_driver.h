@@ -147,6 +147,18 @@ typedef struct virp_driver {
      */
     virp_error_t (*health_check)(virp_conn_t *conn);
 
+    /*
+     * route_command — OPTIONAL classifier for the O-Node's Phase-B
+     * tier-enforcement gate. Given a command string, return its trust
+     * tier (GREEN/YELLOW/RED, or BLACK for tables that carry it).
+     *
+     * Drivers that ship a classifier table set this pointer. Drivers
+     * without one leave it NULL (designated initializers zero-fill it),
+     * which the gate treats as VIRP_TIER_UNCLASSIFIED — i.e. fail
+     * closed. Must be read-only and side-effect free.
+     */
+    virp_trust_tier_t (*route_command)(const char *command);
+
 } virp_driver_t;
 
 /* =========================================================================

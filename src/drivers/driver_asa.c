@@ -821,6 +821,7 @@ static virp_driver_t asa_driver = {
     .disconnect = asa_disconnect,
     .detect     = asa_detect,
     .health_check = asa_health_check,
+    .route_command = asa_route_command,
 };
 
 const virp_driver_t *virp_driver_asa(void)

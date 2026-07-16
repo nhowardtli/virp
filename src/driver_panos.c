@@ -871,6 +871,7 @@ static virp_driver_t pa_driver = {
     .disconnect = pa_disconnect,
     .detect     = pa_detect,
     .health_check = pa_health_check,
+    .route_command = pa_route_command,
 };
 
 void virp_driver_paloalto_init(void)

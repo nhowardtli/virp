@@ -41,6 +41,7 @@
 #define ONODE_RECV_TIMEOUT_SEC  5
 #define ONODE_MAX_REQUEST_SIZE  24576
 #define ONODE_MAX_ALLOWED_UIDS  16
+#define ONODE_MAX_GATE_OVERRIDES 16   /* per-driver gate mode overrides */
 
 /*
  * Worker pool bound. Each accepted connection is handled by its own
@@ -119,6 +120,27 @@ typedef struct {
 } onode_reconnect_t;
 
 /* =========================================================================
+ * Tier-Enforcement Gate (Phase B)
+ *
+ * The gate classifies each command at the execute boundary and compares
+ * its tier to a configured maximum. Two modes:
+ *   SHADOW  (default) — log the would-allow/would-block decision, then
+ *                       execute anyway. Nothing is blocked.
+ *   ENFORCE           — hard-reject commands above the max tier (and any
+ *                       UNCLASSIFIED command) with a signed error
+ *                       observation, before the driver runs.
+ *
+ * Default posture (set in onode_init, before any config is read):
+ * SHADOW mode, max tier YELLOW. Fail-safe: an absent/garbled config
+ * leaves the gate observing only.
+ * ========================================================================= */
+
+typedef enum {
+    GATE_MODE_SHADOW  = 0,   /* default — observe/log only, never block */
+    GATE_MODE_ENFORCE = 1,   /* hard-reject over-tier / unclassified     */
+} onode_gate_mode_t;
+
+/* =========================================================================
  * O-Node State
  * ========================================================================= */
 
@@ -126,6 +148,28 @@ typedef struct {
     /* Identity */
     uint32_t            node_id;
     virp_signing_key_t  okey;           /* THE key — never leaves this process */
+
+    /*
+     * Tier-enforcement gate (Phase B), per-driver scoped.
+     *
+     *   gate_default_mode — mode for any driver NOT named in the override
+     *                       map. Default SHADOW.
+     *   gate_overrides    — optional per-driver mode overrides, keyed by
+     *                       driver name (drv->name, e.g. "fortigate",
+     *                       "cisco_ios"). A driver's effective mode is its
+     *                       override if present, else gate_default_mode.
+     *   gate_max_tier     — one of VIRP_TIER_GREEN/YELLOW/RED. Default YELLOW.
+     *
+     * Configured from the JSON config's optional gate_default_mode /
+     * gate_modes / gate_max_tier keys; defaults applied in onode_init().
+     */
+    onode_gate_mode_t   gate_default_mode;
+    struct {
+        char              driver[VIRP_DRIVER_NAME_MAX];
+        onode_gate_mode_t mode;
+    }                   gate_overrides[ONODE_MAX_GATE_OVERRIDES];
+    size_t              gate_overrides_count;
+    virp_trust_tier_t   gate_max_tier;
 
     /* Devices */
     virp_device_t       devices[ONODE_MAX_DEVICES];
