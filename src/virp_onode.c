@@ -1871,9 +1871,15 @@ static void watchdog_try_connect(onode_state_t *state, int dev_idx,
     }
 }
 
+/* Defined below (near connection_worker); used by both non-main threads. */
+static void block_shutdown_signals(void);
+
 static void *watchdog_thread_fn(void *arg)
 {
     onode_state_t *state = (onode_state_t *)arg;
+
+    /* Shutdown signals go to the main thread only (prompt clean exit). */
+    block_shutdown_signals();
 
     /* Count enabled devices for logging */
     int enabled = 0;
@@ -2016,8 +2022,28 @@ typedef struct {
     int            client_fd;
 } worker_arg_t;
 
+/*
+ * Block SIGINT/SIGTERM in the calling (non-main) thread so those signals
+ * are always delivered to the MAIN thread, whose select() loop then wakes
+ * immediately (EINTR) and begins a clean drain. Without this, a SIGTERM
+ * landing on a worker or the watchdog leaves the main select() blocked
+ * until its 30s heartbeat timeout — the intermittent "SIGKILLed on restart"
+ * behavior, which under concurrent load can exceed the stop timeout and
+ * lose in-flight audit (chain) writes.
+ */
+static void block_shutdown_signals(void)
+{
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+}
+
 static void *connection_worker(void *raw_arg)
 {
+    block_shutdown_signals();
+
     worker_arg_t *arg = (worker_arg_t *)raw_arg;
     onode_state_t *state = arg->state;
     int fd = arg->client_fd;
@@ -2355,12 +2381,18 @@ virp_error_t onode_start(onode_state_t *state)
     fprintf(stderr, "[O-Node] Shutting down...\n");
 
     /*
-     * Drain the worker pool. Workers are detached (no pthread_join),
-     * so we wait on the counter they maintain under state_mutex.
-     * Bounded wait: up to ~5 seconds, after which we warn and return
-     * — preferable to blocking teardown forever on a wedged SSH call.
+     * Drain the worker pool. Workers are detached (no pthread_join), so we
+     * wait on the counter they maintain under state_mutex. This lets each
+     * in-flight request finish its execute AND its chain (audit) write
+     * before teardown, so a restart cannot truncate a durable record.
+     *
+     * Bounded to ~30s — comfortably longer than the worst-case in-flight
+     * request (SSH read timeout ~10-15s + a fast SQLite chain append) yet
+     * well inside systemd's 90s stop timeout, so a genuinely wedged worker
+     * still can't push us past the deadline into a SIGKILL. If it does time
+     * out we warn (audit visibility) rather than block forever.
      */
-    for (int waited = 0; waited < 50; waited++) {
+    for (int waited = 0; waited < 300; waited++) {   /* 300 * 100ms = 30s */
         pthread_mutex_lock(&state->state_mutex);
         uint32_t live = state->workers_live;
         pthread_mutex_unlock(&state->state_mutex);
