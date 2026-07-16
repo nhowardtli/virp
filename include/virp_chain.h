@@ -17,6 +17,7 @@
 #include "virp.h"
 #include "virp_crypto.h"
 #include <sqlite3.h>
+#include <pthread.h>
 
 /* =========================================================================
  * Constants
@@ -78,6 +79,19 @@ typedef struct {
     sqlite3_stmt       *stmt_intent_execute;
     /* Artifact store */
     sqlite3_stmt       *stmt_artifact_insert;
+
+    /*
+     * Serializes ALL chain operations. The db + prepared statements above
+     * are shared mutable state; sqlite3_stmt objects are not safe to use
+     * from concurrent threads. Snow's cage operator drives concurrent
+     * traffic, so every public chain entry point takes this lock for the
+     * duration of its DB work. Non-recursive: public wrappers lock once and
+     * call an internal *_locked core; cores call other cores directly, so
+     * the lock is never re-entered. Held only inside the chain module (which
+     * never acquires exec_mutex), so there is no lock-ordering/deadlock risk
+     * with the execute path.
+     */
+    pthread_mutex_t     lock;
 } virp_chain_state_t;
 
 /* =========================================================================

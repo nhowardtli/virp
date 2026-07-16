@@ -21,6 +21,136 @@
 #include <openssl/sha.h>
 
 /* =========================================================================
+ * Thread safety (Item 3 hardening)
+ *
+ * The chain owns shared mutable state (the sqlite3 db handle + prepared
+ * statements) that is NOT safe under concurrent use. Snow's cage operator
+ * drives concurrent traffic, so every public entry point is a thin wrapper
+ * that holds state->lock for the duration of its DB work and calls an
+ * internal *_locked core. Cores call other cores directly (never the public
+ * wrappers), so the lock is non-recursive and never re-entered. The lock is
+ * held only inside this module — which never acquires the O-Node exec_mutex
+ * — so there is no lock-ordering/deadlock risk with the execute path.
+ * ========================================================================= */
+
+static virp_error_t chain_append_locked(virp_chain_state_t *state,
+                                        const char *session_id,
+                                        const char *artifact_type,
+                                        const char *artifact_id,
+                                        const char *artifact_hash,
+                                        virp_chain_entry_t *entry);
+static virp_error_t chain_verify_locked(virp_chain_state_t *state,
+                                        const char *session_id,
+                                        int64_t from_sequence,
+                                        int64_t to_sequence,
+                                        virp_chain_verify_result_t *result);
+static virp_error_t chain_get_last_locked(virp_chain_state_t *state,
+                                          const char *session_id,
+                                          virp_chain_entry_t *entry);
+static virp_error_t chain_intent_store_locked(virp_chain_state_t *state,
+                                              virp_intent_entry_t *entry);
+static virp_error_t chain_intent_get_locked(virp_chain_state_t *state,
+                                            const char *intent_id,
+                                            virp_intent_entry_t *entry);
+static virp_error_t chain_intent_execute_locked(virp_chain_state_t *state,
+                                                const char *intent_id,
+                                                virp_intent_entry_t *entry);
+static virp_error_t chain_artifact_store_locked(virp_chain_state_t *state,
+                                                const char *artifact_id,
+                                                const char *artifact_type,
+                                                const char *artifact_content,
+                                                const char *artifact_hash,
+                                                const char *session_id);
+
+virp_error_t virp_chain_append(virp_chain_state_t *state,
+                               const char *session_id,
+                               const char *artifact_type,
+                               const char *artifact_id,
+                               const char *artifact_hash,
+                               virp_chain_entry_t *entry)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_append_locked(state, session_id, artifact_type,
+                                          artifact_id, artifact_hash, entry);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+virp_error_t virp_chain_verify(virp_chain_state_t *state,
+                               const char *session_id,
+                               int64_t from_sequence,
+                               int64_t to_sequence,
+                               virp_chain_verify_result_t *result)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_verify_locked(state, session_id, from_sequence,
+                                          to_sequence, result);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+virp_error_t virp_chain_get_last(virp_chain_state_t *state,
+                                 const char *session_id,
+                                 virp_chain_entry_t *entry)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_get_last_locked(state, session_id, entry);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+virp_error_t virp_chain_intent_store(virp_chain_state_t *state,
+                                     virp_intent_entry_t *entry)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_intent_store_locked(state, entry);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+virp_error_t virp_chain_intent_get(virp_chain_state_t *state,
+                                   const char *intent_id,
+                                   virp_intent_entry_t *entry)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_intent_get_locked(state, intent_id, entry);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+virp_error_t virp_chain_intent_execute(virp_chain_state_t *state,
+                                       const char *intent_id,
+                                       virp_intent_entry_t *entry)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_intent_execute_locked(state, intent_id, entry);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+virp_error_t virp_chain_artifact_store(virp_chain_state_t *state,
+                                       const char *artifact_id,
+                                       const char *artifact_type,
+                                       const char *artifact_content,
+                                       const char *artifact_hash,
+                                       const char *session_id)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_artifact_store_locked(state, artifact_id,
+                                                  artifact_type, artifact_content,
+                                                  artifact_hash, session_id);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+/* =========================================================================
  * SQL Schema
  * ========================================================================= */
 
@@ -307,6 +437,7 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
         return VIRP_ERR_NULL_PTR;
 
     memset(state, 0, sizeof(*state));
+    pthread_mutex_init(&state->lock, NULL);   /* before any error return below */
     state->node_id = node_id;
     snprintf(state->org_id, sizeof(state->org_id), "%s",
              org_id ? org_id : "local");
@@ -390,7 +521,7 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
  * Append
  * ========================================================================= */
 
-virp_error_t virp_chain_append(virp_chain_state_t *state,
+static virp_error_t chain_append_locked(virp_chain_state_t *state,
                                const char *session_id,
                                const char *artifact_type,
                                const char *artifact_id,
@@ -505,7 +636,7 @@ virp_error_t virp_chain_append(virp_chain_state_t *state,
  * Verify
  * ========================================================================= */
 
-virp_error_t virp_chain_verify(virp_chain_state_t *state,
+static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                                const char *session_id,
                                int64_t from_sequence,
                                int64_t to_sequence,
@@ -628,7 +759,7 @@ virp_error_t virp_chain_verify(virp_chain_state_t *state,
  * Get Last
  * ========================================================================= */
 
-virp_error_t virp_chain_get_last(virp_chain_state_t *state,
+static virp_error_t chain_get_last_locked(virp_chain_state_t *state,
                                  const char *session_id,
                                  virp_chain_entry_t *entry)
 {
@@ -677,6 +808,10 @@ void virp_chain_destroy(virp_chain_state_t *state)
 
     virp_key_destroy(&state->chain_key);
 
+    /* Safe: destroy runs only after the worker drain (Item 2), so no thread
+     * still holds the lock. Destroy before the memset zeroes it. */
+    pthread_mutex_destroy(&state->lock);
+
     memset(state, 0, sizeof(*state));
     fprintf(stderr, "[Chain] Destroyed\n");
 }
@@ -710,7 +845,7 @@ static void populate_intent_from_row(sqlite3_stmt *stmt,
     entry->created_at_ns = sqlite3_column_int64(stmt, 12);
 }
 
-virp_error_t virp_chain_intent_store(virp_chain_state_t *state,
+static virp_error_t chain_intent_store_locked(virp_chain_state_t *state,
                                       virp_intent_entry_t *entry)
 {
     if (!state || !state->db || !entry)
@@ -752,7 +887,7 @@ virp_error_t virp_chain_intent_store(virp_chain_state_t *state,
     return VIRP_OK;
 }
 
-virp_error_t virp_chain_intent_get(virp_chain_state_t *state,
+static virp_error_t chain_intent_get_locked(virp_chain_state_t *state,
                                     const char *intent_id,
                                     virp_intent_entry_t *entry)
 {
@@ -772,7 +907,7 @@ virp_error_t virp_chain_intent_get(virp_chain_state_t *state,
     return VIRP_ERR_INTENT_NOT_FOUND;
 }
 
-virp_error_t virp_chain_intent_execute(virp_chain_state_t *state,
+static virp_error_t chain_intent_execute_locked(virp_chain_state_t *state,
                                         const char *intent_id,
                                         virp_intent_entry_t *entry)
 {
@@ -793,21 +928,21 @@ virp_error_t virp_chain_intent_execute(virp_chain_state_t *state,
 
     if (sqlite3_changes(state->db) == 0) {
         /* Either intent not found, or already at max_commands */
-        virp_error_t err = virp_chain_intent_get(state, intent_id, entry);
+        virp_error_t err = chain_intent_get_locked(state, intent_id, entry);
         if (err != VIRP_OK)
             return VIRP_ERR_INTENT_NOT_FOUND;
         return VIRP_ERR_INTENT_EXHAUSTED;
     }
 
     /* Return updated entry */
-    return virp_chain_intent_get(state, intent_id, entry);
+    return chain_intent_get_locked(state, intent_id, entry);
 }
 
 /* =========================================================================
  * Artifact Store
  * ========================================================================= */
 
-virp_error_t virp_chain_artifact_store(virp_chain_state_t *state,
+static virp_error_t chain_artifact_store_locked(virp_chain_state_t *state,
                                         const char *artifact_id,
                                         const char *artifact_type,
                                         const char *artifact_content,

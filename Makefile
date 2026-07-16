@@ -241,6 +241,15 @@ $(TEST_FED): tests/test_federation.c $(LIB)
 test-chain: $(TEST_CHAIN)
 	./$(TEST_CHAIN)
 
+# Chain concurrency test (Item 3 hardening — shared prepared-statement race)
+TEST_CHAIN_CONC = $(BUILD_DIR)/test_chain_concurrency
+
+$(TEST_CHAIN_CONC): tests/test_chain_concurrency.c $(LIB)
+	$(CC) $(CFLAGS) tests/test_chain_concurrency.c $(LIB) $(LDFLAGS) -o $@
+
+test-chain-concurrency: $(TEST_CHAIN_CONC)
+	./$(TEST_CHAIN_CONC)
+
 test-federation: $(TEST_FED)
 	./$(TEST_FED)
 
