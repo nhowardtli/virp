@@ -307,6 +307,15 @@ $(TEST_ASA): tests/test_driver_asa.c $(LIB)
 test-asa: $(TEST_ASA)
 	./$(TEST_ASA)
 
+# PAN-OS driver tests (build with PANOS=1 so driver_panos.o is in $(LIB))
+TEST_PANOS = $(BUILD_DIR)/test_driver_panos
+
+$(TEST_PANOS): tests/test_driver_panos.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-panos: $(TEST_PANOS)
+	./$(TEST_PANOS)
+
 # Cisco driver tests (KEX list — issue #5). Requires CISCO=1 so driver_cisco.o
 # is built into libvirp.a; the test only exercises the in-process KEX accessor
 # (no SSH).

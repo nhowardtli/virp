@@ -129,16 +129,21 @@ const pa_command_route_t PA_ROUTE_TABLE[] = {
     { "traceroute",                         VIRP_TIER_YELLOW },
     { "less",                               VIRP_TIER_YELLOW },
     { "tail",                               VIRP_TIER_YELLOW },
+    /* Operational/topology reads — NOT credential-exposing; YELLOW to
+     * match the config-read precedent. show panorama-status reveals the
+     * Panorama mgmt IP + connection state; show device-group reveals
+     * group membership / pushed config. (No earlier entry word-boundary-
+     * matches these, so placement here is order-safe for first-match.) */
+    { "show device-group",                  VIRP_TIER_YELLOW },
+    { "show panorama-status",               VIRP_TIER_YELLOW },
 
-    /* RED TIER — security-sensitive reads */
+    /* RED TIER — credential-exposing reads only */
     { "show admins",                        VIRP_TIER_RED },
     { "show user ip-user-mapping",          VIRP_TIER_RED },
     { "show user group",                    VIRP_TIER_RED },
     { "show user",                          VIRP_TIER_RED },
     { "show certificate",                   VIRP_TIER_RED },
     { "request password-hash",              VIRP_TIER_RED },
-    { "show device-group",                  VIRP_TIER_RED },
-    { "show panorama-status",              VIRP_TIER_RED },
 };
 
 const size_t PA_ROUTE_TABLE_SIZE =
