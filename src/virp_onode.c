@@ -762,6 +762,7 @@ static virp_error_t onode_list_devices(onode_state_t *state,
         const char *vendor_str = "unknown";
         switch (state->devices[i].vendor) {
         case VIRP_VENDOR_CISCO_IOS: vendor_str = "cisco_ios"; break;
+        case VIRP_VENDOR_CISCO_IOSXE: vendor_str = "cisco_iosxe"; break;
         case VIRP_VENDOR_FORTINET:  vendor_str = "fortinet"; break;
         case VIRP_VENDOR_LINUX:     vendor_str = "linux"; break;
         case VIRP_VENDOR_JUNIPER:   vendor_str = "juniper"; break;

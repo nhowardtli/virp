@@ -128,6 +128,7 @@ static virp_vendor_t vendor_from_string(const char *s)
     if (!s) return VIRP_VENDOR_UNKNOWN;
     if (strcmp(s, "cisco_ios") == 0) return VIRP_VENDOR_CISCO_IOS;
     if (strcmp(s, "cisco") == 0)     return VIRP_VENDOR_CISCO_IOS;
+    if (strcmp(s, "cisco_iosxe") == 0) return VIRP_VENDOR_CISCO_IOSXE;
     if (strcmp(s, "fortinet") == 0)  return VIRP_VENDOR_FORTINET;
     if (strcmp(s, "linux") == 0)     return VIRP_VENDOR_LINUX;
     if (strcmp(s, "juniper") == 0)   return VIRP_VENDOR_JUNIPER;

@@ -528,6 +528,96 @@ bool cisco_is_black_tier(const char *command)
     return false;
 }
 
+/* =========================================================================
+ * Gate classifier — SHARED CORE for classic IOS and IOS-XE
+ *
+ * Longest-prefix match, case-insensitive. FAIL-CLOSED: unmatched -> RED.
+ * BLACK is handled separately by cisco_is_black_tier() and is NOT in this
+ * table. The XE-delta table is intentionally empty for now — cisco_ios and
+ * cisco_iosxe share this core until shadow evidence justifies a delta.
+ * ========================================================================= */
+
+typedef struct { const char *prefix; virp_trust_tier_t tier; } cisco_route_t;
+
+static const cisco_route_t CISCO_GATE_TABLE[] = {
+    /* ── GREEN — read-only status/monitoring (explicit allow-list) ── */
+    { "show version",                 VIRP_TIER_GREEN  },
+    { "show ip interface brief",      VIRP_TIER_GREEN  },
+    { "show interfaces",              VIRP_TIER_GREEN  },
+    { "show ip route",                VIRP_TIER_GREEN  },
+    { "show cdp neighbors",           VIRP_TIER_GREEN  },
+    { "show lldp neighbors",          VIRP_TIER_GREEN  },
+    { "show inventory",               VIRP_TIER_GREEN  },
+    { "show processes",               VIRP_TIER_GREEN  },
+    { "show clock",                   VIRP_TIER_GREEN  },
+    { "show environment",             VIRP_TIER_GREEN  },
+    { "show ip protocols",            VIRP_TIER_GREEN  },
+    { "show vlan",                    VIRP_TIER_GREEN  },
+    { "show spanning-tree",           VIRP_TIER_GREEN  },
+    { "show mac address-table",       VIRP_TIER_GREEN  },
+    { "show ip arp",                  VIRP_TIER_GREEN  },
+
+    /* ── YELLOW — config-visibility reads (backups/audits) ────────── */
+    { "show running-config",          VIRP_TIER_YELLOW },
+    { "show startup-config",          VIRP_TIER_YELLOW },
+    { "show access-lists",            VIRP_TIER_YELLOW },
+    { "show ip nat translations",     VIRP_TIER_YELLOW },
+    { "show tech-support",            VIRP_TIER_YELLOW },  /* dump incl. config */
+
+    /* ── RED — config writes (explicit for audit; default also RED) ── */
+    { "configure terminal",           VIRP_TIER_RED    },
+    { "configure",                    VIRP_TIER_RED    },
+    { "conf t",                       VIRP_TIER_RED    },
+    { "interface",                    VIRP_TIER_RED    },
+    { "ip route",                     VIRP_TIER_RED    },
+    { "router bgp",                   VIRP_TIER_RED    },
+    { "router ospf",                  VIRP_TIER_RED    },
+    { "router eigrp",                 VIRP_TIER_RED    },
+    { "router",                       VIRP_TIER_RED    },
+    { "no ",                          VIRP_TIER_RED    },  /* negation = write */
+    { "hostname",                     VIRP_TIER_RED    },
+
+    /* ── RED — credential/security writes (adversarial; each tested) ─ */
+    { "username",                     VIRP_TIER_RED    },  /* incl. privilege 15 / secret / password */
+    { "enable secret",                VIRP_TIER_RED    },
+    { "enable password",              VIRP_TIER_RED    },
+    { "aaa",                          VIRP_TIER_RED    },
+    { "tacacs-server",                VIRP_TIER_RED    },
+    { "tacacs server",                VIRP_TIER_RED    },  /* IOS-XE form */
+    { "radius-server",                VIRP_TIER_RED    },
+    { "radius server",                VIRP_TIER_RED    },  /* IOS-XE form */
+    { "snmp-server community",        VIRP_TIER_RED    },
+    { "snmp-server",                  VIRP_TIER_RED    },
+    { "crypto key",                   VIRP_TIER_RED    },
+    { "crypto pki",                   VIRP_TIER_RED    },
+    { "crypto",                       VIRP_TIER_RED    },
+    { "key chain",                    VIRP_TIER_RED    },
+    { "key config-key",               VIRP_TIER_RED    },  /* master key */
+    { "line vty",                     VIRP_TIER_RED    },
+    { "line",                         VIRP_TIER_RED    },
+    { "login",                        VIRP_TIER_RED    },
+    { "password",                     VIRP_TIER_RED    },
+};
+static const size_t CISCO_GATE_TABLE_SIZE =
+    sizeof(CISCO_GATE_TABLE) / sizeof(CISCO_GATE_TABLE[0]);
+
+virp_trust_tier_t cisco_gate_tier(const char *command)
+{
+    if (!command) return VIRP_TIER_RED;              /* fail closed */
+    while (*command == ' ' || *command == '\t') command++;
+
+    const cisco_route_t *best = NULL;
+    size_t best_len = 0;
+    for (size_t i = 0; i < CISCO_GATE_TABLE_SIZE; i++) {
+        size_t plen = strlen(CISCO_GATE_TABLE[i].prefix);
+        if (strncasecmp(command, CISCO_GATE_TABLE[i].prefix, plen) == 0) {
+            if (plen > best_len) { best = &CISCO_GATE_TABLE[i]; best_len = plen; }
+        }
+    }
+    /* Fail-closed: anything not explicitly GREEN/YELLOW/RED-listed is RED. */
+    return best ? best->tier : VIRP_TIER_RED;
+}
+
 static virp_error_t cisco_execute(virp_conn_t *conn,
                                   const char *command,
                                   virp_exec_result_t *result)
@@ -689,8 +779,9 @@ static bool cisco_detect(virp_conn_t *conn)
     if (!conn || !conn->connected) return false;
 
     /* If the prompt contains # or > and we got a response to
-     * "terminal length 0" without error, it's probably IOS */
-    return conn->device.vendor == VIRP_VENDOR_CISCO_IOS;
+     * "terminal length 0" without error, it's probably IOS/IOS-XE */
+    return conn->device.vendor == VIRP_VENDOR_CISCO_IOS ||
+           conn->device.vendor == VIRP_VENDOR_CISCO_IOSXE;
 }
 
 /* =========================================================================
@@ -722,9 +813,26 @@ static virp_driver_t cisco_driver = {
     .disconnect = cisco_disconnect,
     .detect     = cisco_detect,
     .health_check = cisco_health_check,
+    .route_command = cisco_gate_tier,
+};
+
+/* IOS-XE: identical driver functions + the SAME shared gate core
+ * (cisco_gate_tier). Distinct vendor/name so the gate can address IOS vs
+ * IOS-XE independently (separate gate_modes keys) and log which variant a
+ * command hit, while the classifier itself is shared. */
+static virp_driver_t cisco_iosxe_driver = {
+    .name       = "cisco_iosxe",
+    .vendor     = VIRP_VENDOR_CISCO_IOSXE,
+    .connect    = cisco_connect,
+    .execute    = cisco_execute,
+    .disconnect = cisco_disconnect,
+    .detect     = cisco_detect,
+    .health_check = cisco_health_check,
+    .route_command = cisco_gate_tier,
 };
 
 void virp_driver_cisco_init(void)
 {
     virp_driver_register(&cisco_driver);
+    virp_driver_register(&cisco_iosxe_driver);
 }

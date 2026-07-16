@@ -327,6 +327,15 @@ $(TEST_CISCO): tests/test_driver_cisco.c $(LIB)
 test-cisco: $(TEST_CISCO)
 	./$(TEST_CISCO)
 
+# Cisco IOS/IOS-XE gate-classifier tests (build with CISCO=1)
+TEST_CISCO_GATE = $(BUILD_DIR)/test_driver_cisco_gate
+
+$(TEST_CISCO_GATE): tests/test_driver_cisco_gate.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-cisco-gate: $(TEST_CISCO_GATE)
+	./$(TEST_CISCO_GATE)
+
 # Concurrent onode_execute smoke test (connection lifetime race)
 TEST_ONODE_CONC = $(BUILD_DIR)/test_onode_concurrency
 

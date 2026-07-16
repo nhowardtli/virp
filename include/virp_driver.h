@@ -36,6 +36,7 @@ typedef enum {
     VIRP_VENDOR_PROXMOX     = 7,
     VIRP_VENDOR_CISCO_ASA   = 8,
     VIRP_VENDOR_WAZUH       = 9,
+    VIRP_VENDOR_CISCO_IOSXE = 10,  /* Cisco IOS-XE (Catalyst/ISR-XE); shares the cisco driver + gate core */
     VIRP_VENDOR_MOCK        = 99,   /* Testing only */
 } virp_vendor_t;
 
