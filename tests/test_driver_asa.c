@@ -137,16 +137,24 @@ static void test_command_routing(void)
     assert(asa_route_command("show logging") == VIRP_TIER_YELLOW);
     PASS();
 
-    TEST("show running-config → RED");
-    assert(asa_route_command("show running-config") == VIRP_TIER_RED);
+    TEST("show running-config → YELLOW (config-read reconciliation)");
+    assert(asa_route_command("show running-config") == VIRP_TIER_YELLOW);
     PASS();
 
     TEST("show running-config access-list → YELLOW (longest match)");
     assert(asa_route_command("show running-config access-list") == VIRP_TIER_YELLOW);
     PASS();
 
-    TEST("show startup-config → RED");
-    assert(asa_route_command("show startup-config") == VIRP_TIER_RED);
+    TEST("show startup-config → YELLOW (config-read reconciliation)");
+    assert(asa_route_command("show startup-config") == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("show aaa-server → RED (credential read stays sensitive)");
+    assert(asa_route_command("show aaa-server") == VIRP_TIER_RED);
+    PASS();
+
+    TEST("show ssh sessions → RED (session read stays sensitive)");
+    assert(asa_route_command("show ssh sessions") == VIRP_TIER_RED);
     PASS();
 
     TEST("erase → BLACK");

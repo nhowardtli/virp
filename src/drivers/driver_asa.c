@@ -88,10 +88,13 @@ const asa_command_route_t ASA_ROUTE_TABLE[] = {
     { "show nat",                   VIRP_TIER_YELLOW },
     { "show object",                VIRP_TIER_YELLOW },
     { "show object-group",          VIRP_TIER_YELLOW },
+    /* Config-visibility reads — YELLOW to match the FortiGate precedent
+     * (config reads = YELLOW; keep backups/audits under the threshold).
+     * Sensitive credential/session reads stay RED below. */
+    { "show running-config",        VIRP_TIER_YELLOW },
+    { "show startup-config",        VIRP_TIER_YELLOW },
 
-    /* ── Tier 3: RED — Full config / sensitive (multi-approval) ── */
-    { "show running-config",        VIRP_TIER_RED    },
-    { "show startup-config",        VIRP_TIER_RED    },
+    /* ── Tier 3: RED — Sensitive credential/session reads (multi-approval) */
     { "show aaa-server",            VIRP_TIER_RED    },
     { "show ssh sessions",          VIRP_TIER_RED    },
 
