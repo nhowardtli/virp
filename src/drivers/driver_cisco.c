@@ -556,6 +556,20 @@ static const cisco_route_t CISCO_GATE_TABLE[] = {
     { "show spanning-tree",           VIRP_TIER_GREEN  },
     { "show mac address-table",       VIRP_TIER_GREEN  },
     { "show ip arp",                  VIRP_TIER_GREEN  },
+    /* Shadow-evidence promotions (2026-07-16): routing adjacency + status */
+    { "show ip ospf",                 VIRP_TIER_GREEN  },
+    { "show ip bgp",                  VIRP_TIER_GREEN  },
+    { "show ip eigrp",                VIRP_TIER_GREEN  },
+    { "show ip ssh",                  VIRP_TIER_GREEN  },
+    { "show arp",                     VIRP_TIER_GREEN  },
+    { "show etherchannel",            VIRP_TIER_GREEN  },
+    { "show redundancy",              VIRP_TIER_GREEN  },
+    { "show platform",                VIRP_TIER_GREEN  },
+    { "show memory",                  VIRP_TIER_GREEN  },
+    { "show ntp",                     VIRP_TIER_GREEN  },
+    { "show bootvar",                 VIRP_TIER_GREEN  },
+    { "show boot",                    VIRP_TIER_GREEN  },
+    { "show file systems",            VIRP_TIER_GREEN  },
 
     /* ── YELLOW — config-visibility reads (backups/audits) ────────── */
     { "show running-config",          VIRP_TIER_YELLOW },
@@ -563,6 +577,16 @@ static const cisco_route_t CISCO_GATE_TABLE[] = {
     { "show access-lists",            VIRP_TIER_YELLOW },
     { "show ip nat translations",     VIRP_TIER_YELLOW },
     { "show tech-support",            VIRP_TIER_YELLOW },  /* dump incl. config */
+    /* Shadow-evidence promotions (2026-07-16): config-visibility, security
+     * posture (SA state), session visibility, and active diagnostics.
+     * "show crypto" (read) is distinct from bare "crypto" (write=RED). */
+    { "show ip access-lists",         VIRP_TIER_YELLOW },
+    { "show crypto",                  VIRP_TIER_YELLOW },
+    { "show logging",                 VIRP_TIER_YELLOW },
+    { "show users",                   VIRP_TIER_YELLOW },
+    { "show port-security",           VIRP_TIER_YELLOW },  /* per-port security config */
+    { "ping",                         VIRP_TIER_YELLOW },
+    { "traceroute",                   VIRP_TIER_YELLOW },
 
     /* ── RED — config writes (explicit for audit; default also RED) ── */
     { "configure terminal",           VIRP_TIER_RED    },
