@@ -38,6 +38,24 @@ virp_error_t virp_header_serialize(const virp_header_t *hdr,
                                    uint8_t *buf, size_t buf_len);
 
 /*
+ * Serialize a v2 observation header to its wire format (explicit
+ * network-byte-order layout, exactly VIRP_OBS_V2_HEADER_SIZE bytes).
+ * This is the ONLY way v2 header bytes are produced for signing or
+ * transmission — a raw struct memcpy would sign compiler padding.
+ * hdr->_reserved must be zero.
+ */
+virp_error_t virp_obs_header_v2_serialize(const virp_obs_header_v2_t *hdr,
+                                          uint8_t *buf, size_t buf_len);
+
+/*
+ * Deserialize a v2 observation header from wire bytes. Performs no
+ * semantic validation beyond buffer length — callers must verify the
+ * signature and field bindings via virp_verify_observation_v2().
+ */
+virp_error_t virp_obs_header_v2_deserialize(virp_obs_header_v2_t *hdr,
+                                            const uint8_t *buf, size_t buf_len);
+
+/*
  * Deserialize a header from network byte order.
  * Reads exactly VIRP_HEADER_SIZE bytes from buf.
  */

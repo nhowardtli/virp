@@ -226,6 +226,19 @@ static int load_devices_json(onode_state_t *state, const char *path)
             continue;
         }
 
+        /* device_id — hex string or int, like node_id; derived from the
+         * hostname when the config omits it (see virp_driver.h). */
+        if (json_object_object_get_ex(dev_obj, "device_id", &val)) {
+            if (json_object_is_type(val, json_type_string)) {
+                const char *s = json_object_get_string(val);
+                if (s) device.device_id = (uint64_t)strtoull(s, NULL, 16);
+            } else if (json_object_is_type(val, json_type_int)) {
+                device.device_id = (uint64_t)json_object_get_int64(val);
+            }
+        }
+        if (device.device_id == 0)
+            device.device_id = virp_device_id_from_hostname(device.hostname);
+
         virp_error_t err = onode_add_device(state, &device);
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] Failed to add %s: %s\n",

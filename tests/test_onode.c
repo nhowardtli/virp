@@ -165,11 +165,13 @@ TEST(test_execute_show_ip_route)
 
     ASSERT_EQ(hdr.type, VIRP_MSG_OBSERVATION);
     ASSERT_EQ(hdr.channel, VIRP_CHANNEL_OC);
-    /* Item 1 audit-honesty: R6 uses the mock driver, which has no
-     * route_command classifier, so the command is UNCLASSIFIED — and the
-     * observation now records that honestly (previously clamped to GREEN).
-     * This asserts the end-to-end fix through the full execute path. */
-    ASSERT_EQ(hdr.tier, VIRP_TIER_UNCLASSIFIED);
+    /* Item 1 audit-honesty: the observation records the ACTUAL
+     * gate-classified tier. The mock driver's classifier routes
+     * "show ip route" to GREEN, so GREEN must appear on the wire.
+     * (UNCLASSIFIED honesty is asserted end-to-end by
+     * test_gate_enforce_blocks_unclassified below, where the ENFORCE
+     * default rejects an unclassifiable command.) */
+    ASSERT_EQ(hdr.tier, VIRP_TIER_GREEN);
     ASSERT_EQ(hdr.node_id, 0x06060606);    /* R6's node ID */
 
     /* Parse the observation payload */
@@ -188,6 +190,168 @@ TEST(test_execute_show_ip_route)
     ASSERT_TRUE(strstr((const char *)data, "R6#show ip route") != NULL);
     ASSERT_TRUE(strstr((const char *)data, "6.6.6.6") != NULL);
     ASSERT_TRUE(strstr((const char *)data, "10.0.56.0") != NULL);
+}
+
+/*
+ * ENFORCE-default gate: a command the classifier cannot place
+ * (UNCLASSIFIED) must be hard-rejected before the driver runs, and the
+ * signed error observation must record UNCLASSIFIED honestly.
+ */
+TEST(test_gate_enforce_blocks_unclassified)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request(
+        "{\"action\": \"execute\", \"device\": \"R6\", "
+        "\"command\": \"frobnicate the flux capacitor\"}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+
+    virp_header_t hdr;
+    virp_error_t err = virp_validate_message(resp, (size_t)n,
+                                             &g_state.okey, &hdr);
+    ASSERT_OK(err);
+    ASSERT_EQ(hdr.tier, VIRP_TIER_UNCLASSIFIED);
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    err = virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                                 (size_t)n - VIRP_HEADER_SIZE,
+                                 &obs, &data, &data_len);
+    ASSERT_OK(err);
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr((const char *)data, "tier gate blocked") != NULL);
+}
+
+/*
+ * v2 observations are session-bound: an execute with obs_version 2 and
+ * no ACTIVE session must fail with SESSION_INVALID — never silently
+ * fall back to master-key signing.
+ */
+TEST(test_execute_v2_without_session_fails)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request(
+        "{\"action\": \"execute\", \"device\": \"R6\", "
+        "\"command\": \"show version\", \"obs_version\": 2}",
+        resp, sizeof(resp));
+
+    /* Framed error: exactly 4 bytes, big-endian error code */
+    ASSERT_EQ((int)n, 4);
+    uint32_t code_n;
+    memcpy(&code_n, resp, 4);
+    ASSERT_EQ((int32_t)ntohl(code_n), (int32_t)VIRP_ERR_SESSION_INVALID);
+}
+
+/* Tiny JSON string extractor for the handshake responses (test-only). */
+static bool json_find_str(const char *json, const char *key,
+                          char *out, size_t out_sz)
+{
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    size_t i = 0;
+    while (p[i] && p[i] != '"' && i < out_sz - 1) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+    return p[i] == '"';
+}
+
+/*
+ * Full v2 round trip over the socket: JSON handshake to ACTIVE, execute
+ * with obs_version 2, verify the returned wire message with
+ * virp_verify_observation_v2 (same-process ctx doubles as the verifier
+ * context), then demonstrate the negative properties end-to-end:
+ * replay, command substitution, device substitution.
+ */
+TEST(test_execute_v2_session_bound_roundtrip)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+
+    /* 1 — SESSION_HELLO */
+    ssize_t n = client_request(
+        "{\"action\": \"session_hello\", \"client_id\": \"test-onode-v2\", "
+        "\"client_nonce\": \"0011223344556677\"}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n > 0);
+    resp[n] = '\0';
+
+    char sid[64], cn[32], sn[32];
+    ASSERT_TRUE(json_find_str((const char *)resp, "session_id",
+                              sid, sizeof(sid)));
+    ASSERT_TRUE(json_find_str((const char *)resp, "client_nonce",
+                              cn, sizeof(cn)));
+    ASSERT_TRUE(json_find_str((const char *)resp, "server_nonce",
+                              sn, sizeof(sn)));
+
+    /* 2 — SESSION_BIND (daemon derives the session key → ACTIVE) */
+    char bind_req[512];
+    snprintf(bind_req, sizeof(bind_req),
+             "{\"action\": \"session_bind\", \"client_id\": \"test-onode-v2\", "
+             "\"session_id\": \"%s\", \"client_nonce\": \"%s\", "
+             "\"server_nonce\": \"%s\"}", sid, cn, sn);
+    n = client_request(bind_req, resp, sizeof(resp));
+    ASSERT_TRUE(n > 0);
+    resp[n] = '\0';
+    ASSERT_TRUE(strstr((const char *)resp, "\"bound\"") != NULL);
+
+    /* 3 — execute with obs_version 2 */
+    n = client_request(
+        "{\"action\": \"execute\", \"device\": \"R6\", "
+        "\"command\": \"show ip route\", \"obs_version\": 2}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n >= (ssize_t)VIRP_OBS_V2_MIN_SIZE);
+
+    /* 4 — verify with the session context */
+    virp_seqstore_t store;
+    ASSERT_OK(virp_seqstore_init(&store, NULL));
+
+    uint64_t r6_id = virp_device_id_from_hostname("R6");
+    virp_obs_header_v2_t hdr;
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+    virp_error_t err = virp_verify_observation_v2(
+        g_state.ctx, r6_id, "show ip route",
+        resp, (size_t)n, 0, &store, &hdr, &payload, &payload_len);
+    ASSERT_OK(err);
+    ASSERT_EQ(hdr.version, VIRP_VERSION_2);
+    ASSERT_EQ(hdr.tier, VIRP_TIER_GREEN);
+    ASSERT_TRUE(hdr.device_id == r6_id);
+    ASSERT_TRUE(payload != NULL && payload_len > 0);
+    ASSERT_TRUE(payload != NULL &&
+                memmem(payload, payload_len, "6.6.6.6", 7) != NULL);
+
+    /* 5 — REPLAY: the identical bytes must be rejected */
+    err = virp_verify_observation_v2(
+        g_state.ctx, r6_id, "show ip route",
+        resp, (size_t)n, 0, &store, NULL, NULL, NULL);
+    ASSERT_EQ(err, VIRP_ERR_REPLAY_DETECTED);
+
+    /* 6 — COMMAND SUBSTITUTION: a validly signed observation for
+     * command A must not verify against a request for command B */
+    virp_seqstore_t store2;
+    ASSERT_OK(virp_seqstore_init(&store2, NULL));
+    err = virp_verify_observation_v2(
+        g_state.ctx, r6_id, "show running-config",
+        resp, (size_t)n, 0, &store2, NULL, NULL, NULL);
+    ASSERT_EQ(err, VIRP_ERR_CONTEXT_MISMATCH);
+
+    /* 7 — DEVICE SUBSTITUTION: same bytes, wrong expected device */
+    err = virp_verify_observation_v2(
+        g_state.ctx, virp_device_id_from_hostname("R7"), "show ip route",
+        resp, (size_t)n, 0, &store2, NULL, NULL, NULL);
+    ASSERT_EQ(err, VIRP_ERR_CONTEXT_MISMATCH);
+
+    virp_seqstore_destroy(&store);
+    virp_seqstore_destroy(&store2);
+
+    /* 8 — close the session so later tests see no active session */
+    n = client_request("{\"action\": \"session_close\"}", resp, sizeof(resp));
+    ASSERT_TRUE(n > 0);
 }
 
 TEST(test_execute_show_bgp_summary)
@@ -1301,6 +1465,9 @@ int main(void)
 
     printf("\n[O-Node Pipeline Tests]\n");
     RUN_TEST(test_execute_show_ip_route);
+    RUN_TEST(test_gate_enforce_blocks_unclassified);
+    RUN_TEST(test_execute_v2_without_session_fails);
+    RUN_TEST(test_execute_v2_session_bound_roundtrip);
     RUN_TEST(test_execute_show_bgp_summary);
     RUN_TEST(test_execute_different_devices);
     RUN_TEST(test_device_not_found);

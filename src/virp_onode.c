@@ -60,6 +60,7 @@ typedef struct {
     onode_action_t  action;
     char            device[64];
     char            command[1024];
+    int32_t         obs_version;            /* 1 = legacy O-Key, 2 = session-bound */
     /* Chain fields (Primitive 6) */
     char            session_id[64];
     char            artifact_type[16];
@@ -208,6 +209,24 @@ static bool parse_request(const char *json, onode_request_t *req)
     /* Extract optional string fields */
     EXTRACT_STR("device", req->device, sizeof(req->device));
     EXTRACT_STR("command", req->command, sizeof(req->command));
+
+    /*
+     * Observation version for execute/health. Absent → 1 (legacy
+     * master-key signing, the compatibility default). Only 1 and 2 are
+     * meaningful; anything else present-but-invalid rejects the request
+     * so a client typo cannot silently downgrade to v1.
+     */
+    req->obs_version = 1;
+    {
+        uint64_t v = 0;
+        if (json_extract_u64_bounded(root, "obs_version", 2, &v)) {
+            if (v < 1) { cJSON_Delete(root); return false; }
+            req->obs_version = (int32_t)v;
+        } else if (cJSON_GetObjectItemCaseSensitive(root, "obs_version")) {
+            cJSON_Delete(root);
+            return false;
+        }
+    }
 
     /* Chain fields */
     EXTRACT_STR("session_id", req->session_id, sizeof(req->session_id));
@@ -535,8 +554,37 @@ virp_error_t onode_execute(onode_state_t *state,
                            uint8_t *out_buf, size_t out_buf_len,
                            size_t *out_len)
 {
+    return onode_execute_obs(state, device_name, command, 1,
+                             out_buf, out_buf_len, out_len);
+}
+
+virp_error_t onode_execute_obs(onode_state_t *state,
+                               const char *device_name,
+                               const char *command,
+                               int obs_version,
+                               uint8_t *out_buf, size_t out_buf_len,
+                               size_t *out_len)
+{
     if (!state || !device_name || !command || !out_buf || !out_len)
         return VIRP_ERR_NULL_PTR;
+    if (obs_version != 1 && obs_version != 2)
+        return VIRP_ERR_VERSION_MISMATCH;
+
+    /*
+     * v2 requires an ACTIVE session BEFORE any device I/O. Checked
+     * again at signing time (the session can idle out mid-command),
+     * but failing early avoids running a command whose observation
+     * could never be delivered in the requested form.
+     */
+    if (obs_version == 2) {
+        pthread_mutex_lock(&state->session_mutex);
+        bool ok = state->ctx &&
+                  virp_session_require_active(state->ctx) == VIRP_OK &&
+                  state->ctx->session.session_key_valid;
+        pthread_mutex_unlock(&state->session_mutex);
+        if (!ok)
+            return VIRP_ERR_SESSION_INVALID;
+    }
 
     /* Find device */
     int dev_idx = find_device(state, device_name);
@@ -723,7 +771,41 @@ virp_error_t onode_execute(onode_state_t *state,
     /* Phase C truth-fix: stamp the observation with the command's real
      * gate-classified tier (clamped to a transmittable tier) instead of a
      * blanket GREEN. show system admin → RED; get system status → GREEN. */
-    err = virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+    if (obs_version == 2) {
+        /*
+         * v2 success path: session-bound observation signed with the
+         * HKDF session key. seq_num is per-session monotonic
+         * (session.last_seq under session_mutex), which is what the
+         * verifier's replay high-water store checks against. If the
+         * session died while the command ran, fail — never downgrade
+         * to master-key signing on a v2 request.
+         */
+        pthread_mutex_lock(&state->session_mutex);
+        if (!state->ctx ||
+            virp_session_require_active(state->ctx) != VIRP_OK ||
+            !state->ctx->session.session_key_valid) {
+            err = VIRP_ERR_SESSION_INVALID;
+        } else {
+            /* Truncate like the v1 path does rather than erroring:
+             * total message (88 hdr + payload + 32 sig) must fit in
+             * VIRP_MAX_MESSAGE_SIZE. */
+            if ((size_t)data_len > VIRP_MAX_MESSAGE_SIZE -
+                                   VIRP_OBS_V2_HEADER_SIZE -
+                                   VIRP_OBS_V2_SIG_SIZE)
+                data_len = (uint16_t)(VIRP_MAX_MESSAGE_SIZE -
+                                      VIRP_OBS_V2_HEADER_SIZE -
+                                      VIRP_OBS_V2_SIG_SIZE);
+            uint64_t seq = ++state->ctx->session.last_seq;
+            err = virp_build_observation_v2(state->ctx,
+                                     (uint64_t)state->devices[dev_idx].node_id,
+                                     state->devices[dev_idx].device_id,
+                                     gate_obs_tier(gate_tier), seq, command,
+                                     obs_data, data_len,
+                                     out_buf, out_buf_len, out_len);
+        }
+        pthread_mutex_unlock(&state->session_mutex);
+    } else {
+        err = virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                  state->devices[dev_idx].node_id,
                                  onode_next_seq(state),
                                  VIRP_OBS_DEVICE_OUTPUT,
@@ -731,6 +813,7 @@ virp_error_t onode_execute(onode_state_t *state,
                                  gate_obs_tier(gate_tier),
                                  obs_data, data_len,
                                  &state->okey);
+    }
 
     if (err == VIRP_OK) {
         pthread_mutex_lock(&state->state_mutex);
@@ -1097,8 +1180,9 @@ static void handle_client(onode_state_t *state, int client_fd)
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
-        err = onode_execute(state, req.device, req.command,
-                            resp_buf, sizeof(resp_buf), &resp_len);
+        err = onode_execute_obs(state, req.device, req.command,
+                                req.obs_version,
+                                resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
         else {
@@ -1112,8 +1196,9 @@ static void handle_client(onode_state_t *state, int client_fd)
             break;
         }
         /* Health check — execute a simple command */
-        err = onode_execute(state, req.device, "show version",
-                            resp_buf, sizeof(resp_buf), &resp_len);
+        err = onode_execute_obs(state, req.device, "show version",
+                                req.obs_version,
+                                resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
         else {
@@ -2080,11 +2165,16 @@ virp_error_t onode_init(onode_state_t *state,
     state->listen_fd = -1;
     state->running = false;
 
-    /* Tier-enforcement gate default posture: observe-only for every driver,
-     * block RED. GATE_MODE_SHADOW is 0 so the memset already selects it; set
-     * explicitly for clarity. Config (gate_default_mode / gate_modes /
-     * gate_max_tier) may override in load_devices() before onode_start(). */
-    state->gate_default_mode = GATE_MODE_SHADOW;
+    /* Tier-enforcement gate default posture: ENFORCE — hard-reject
+     * over-tier and UNCLASSIFIED commands. This is the intended v1
+     * default: an absent or garbled config must fail CLOSED, not fall
+     * back to observe-only. Drivers with no classifier (linux, wazuh,
+     * proxmox) yield UNCLASSIFIED for everything and are therefore
+     * blocked under this default; deployments that need them must opt
+     * them into shadow explicitly via gate_modes in devices.json.
+     * Config (gate_default_mode / gate_modes / gate_max_tier) may
+     * override in load_devices() before onode_start(). */
+    state->gate_default_mode = GATE_MODE_ENFORCE;
     state->gate_overrides_count = 0;
     state->gate_max_tier = VIRP_TIER_YELLOW;
     state->uptime_start = (uint32_t)time(NULL);
@@ -2148,6 +2238,15 @@ virp_error_t onode_add_device(onode_state_t *state,
         return VIRP_ERR_MESSAGE_TOO_LARGE;
 
     memcpy(&state->devices[state->device_count], device, sizeof(*device));
+
+    /* Single choke point for device identity: any device that arrives
+     * without an explicit device_id gets the deterministic
+     * SHA-256(hostname) derivation, so v2 observations never carry a
+     * zero device_id regardless of which loader added the device. */
+    if (state->devices[state->device_count].device_id == 0)
+        state->devices[state->device_count].device_id =
+            virp_device_id_from_hostname(device->hostname);
+
     state->connections[state->device_count] = NULL;
     state->device_count++;
 

@@ -72,6 +72,16 @@ typedef struct {
     char            enable_password[128];
     virp_vendor_t   vendor;
     uint32_t        node_id;            /* VIRP node ID for this device */
+    /*
+     * Stable 64-bit device identity carried in v2 observation headers.
+     * Loaded from devices.json ("device_id", hex string or int); when
+     * the config omits it, load_devices() derives it deterministically
+     * as the first 8 bytes (big-endian) of SHA-256(hostname) via
+     * virp_device_id_from_hostname(). Unlike node_id (32-bit routing
+     * id), device_id never collides with wire routing concerns and is
+     * what virp_verify_observation_v2() binds against.
+     */
+    uint64_t        device_id;
     bool            enabled;
     /* Vendor-optional (FortiGate) — zero-initialized for other vendors */
     char            api_token[256];     /* REST API Bearer token */
@@ -184,6 +194,14 @@ const virp_driver_t *virp_driver_lookup(virp_vendor_t vendor);
  * Get count of registered drivers.
  */
 int virp_driver_count(void);
+
+/*
+ * Deterministic fallback device identity: first 8 bytes of
+ * SHA-256(hostname), big-endian. Used when devices.json carries no
+ * explicit "device_id" for a device. Stable across restarts, hosts,
+ * and rebuilds — it depends only on the hostname string.
+ */
+uint64_t virp_device_id_from_hostname(const char *hostname);
 
 /* =========================================================================
  * Built-in Drivers (linked at compile time)

@@ -6,6 +6,7 @@
 
 #include "virp_driver.h"
 #include <string.h>
+#include <openssl/sha.h>
 
 static virp_driver_t registry[VIRP_DRIVER_MAX];
 static int registry_count = 0;
@@ -40,4 +41,18 @@ const virp_driver_t *virp_driver_lookup(virp_vendor_t vendor)
 int virp_driver_count(void)
 {
     return registry_count;
+}
+
+uint64_t virp_device_id_from_hostname(const char *hostname)
+{
+    if (!hostname)
+        return 0;
+
+    uint8_t digest[32];
+    SHA256((const uint8_t *)hostname, strlen(hostname), digest);
+
+    uint64_t id = 0;
+    for (int i = 0; i < 8; i++)
+        id = (id << 8) | digest[i];
+    return id;
 }

@@ -15,6 +15,7 @@
 
 #include "virp.h"
 #include "virp_session.h"  /* virp_context_t forward decl */
+#include "virp_seqstore.h" /* replay high-water store for v2 verification */
 
 /* =========================================================================
  * Key Management
@@ -168,6 +169,57 @@ virp_error_t virp_sign_observation_v2(
     const uint8_t *payload, size_t payload_len,
     virp_obs_header_v2_t *hdr_out,
     uint8_t sig_out[32]);
+
+/*
+ * Build a complete v2 observation wire message:
+ *   [serialized header (88)] [payload] [HMAC sig (32)]
+ * Signs via virp_sign_observation_v2() with the session key.
+ * Session must be ACTIVE with a valid derived key.
+ */
+virp_error_t virp_build_observation_v2(
+    virp_context_t *ctx,
+    uint64_t node_id, uint64_t device_id,
+    uint8_t tier, uint64_t seq_num,
+    const char *command,
+    const uint8_t *payload, size_t payload_len,
+    uint8_t *out_buf, size_t out_buf_len, size_t *out_len);
+
+/*
+ * Verify a v2 observation wire message. This is the single home for
+ * every check an accepting verifier must make:
+ *
+ *   1. HMAC-SHA256 over serialized header || payload with the active
+ *      session's HKDF-derived key, constant-time compare
+ *      → VIRP_ERR_HMAC_FAILED
+ *   2. header sanity: version/channel/tier/reserved/payload_len
+ *   3. session binding: header session_id == active session's id
+ *      → VIRP_ERR_SESSION_INVALID
+ *   4. device binding: header device_id == expected_device_id
+ *      → VIRP_ERR_CONTEXT_MISMATCH
+ *   5. command binding: header command_hash ==
+ *      SHA256(virp_canonicalize_command(expected_command))
+ *      → VIRP_ERR_CONTEXT_MISMATCH
+ *   6. freshness: |now − signed timestamp_ns| ≤
+ *      VIRP_OBS_V2_FRESHNESS_WINDOW_NS → VIRP_ERR_STALE_OBSERVATION
+ *   7. replay: seq_num strictly above the (session_id, node_id)
+ *      high-water mark in seq_store → VIRP_ERR_REPLAY_DETECTED.
+ *      The mark is only advanced after checks 1–6 pass.
+ *
+ * now_ns: verifier clock in nanoseconds; pass 0 to use CLOCK_REALTIME.
+ *         (Injectable so staleness is testable with a mocked clock.)
+ * seq_store: required — replay protection is not optional.
+ * hdr_out / payload_out / payload_len_out: optional; filled only on
+ *         VIRP_OK. payload_out points into msg.
+ */
+virp_error_t virp_verify_observation_v2(
+    virp_context_t *ctx,
+    uint64_t expected_device_id,
+    const char *expected_command,
+    const uint8_t *msg, size_t msg_len,
+    uint64_t now_ns,
+    virp_seqstore_t *seq_store,
+    virp_obs_header_v2_t *hdr_out,
+    const uint8_t **payload_out, uint32_t *payload_len_out);
 
 /* =========================================================================
  * Process hardening

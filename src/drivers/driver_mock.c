@@ -196,6 +196,35 @@ static virp_error_t mock_health_check(virp_conn_t *conn)
  * Driver Registration
  * ========================================================================= */
 
+/*
+ * Minimal gate classifier so the mock driver behaves like a production
+ * driver under the fail-closed ENFORCE default: read-only commands are
+ * GREEN, state-changing ones YELLOW, destructive ones RED, anything
+ * unrecognized stays UNCLASSIFIED (blocked under ENFORCE).
+ */
+static virp_trust_tier_t mock_route_command(const char *command)
+{
+    if (!command) return VIRP_TIER_UNCLASSIFIED;
+    while (*command == ' ' || *command == '\t') command++;
+
+    if (strncmp(command, "show ", 5) == 0 ||
+        strcmp(command, "show") == 0 ||
+        strncmp(command, "get ", 4) == 0)
+        return VIRP_TIER_GREEN;
+
+    if (strncmp(command, "configure", 9) == 0 ||
+        strncmp(command, "clear ", 6) == 0 ||
+        strncmp(command, "write", 5) == 0 ||
+        strncmp(command, "copy ", 5) == 0)
+        return VIRP_TIER_YELLOW;
+
+    if (strncmp(command, "reload", 6) == 0 ||
+        strncmp(command, "erase ", 6) == 0)
+        return VIRP_TIER_RED;
+
+    return VIRP_TIER_UNCLASSIFIED;
+}
+
 static virp_driver_t mock_driver = {
     .name       = "mock",
     .vendor     = VIRP_VENDOR_MOCK,
@@ -204,6 +233,7 @@ static virp_driver_t mock_driver = {
     .disconnect = mock_disconnect,
     .detect     = mock_detect,
     .health_check = mock_health_check,
+    .route_command = mock_route_command,
 };
 
 void virp_driver_mock_init(void)

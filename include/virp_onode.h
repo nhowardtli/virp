@@ -124,20 +124,23 @@ typedef struct {
  *
  * The gate classifies each command at the execute boundary and compares
  * its tier to a configured maximum. Two modes:
- *   SHADOW  (default) — log the would-allow/would-block decision, then
+ *   SHADOW            — log the would-allow/would-block decision, then
  *                       execute anyway. Nothing is blocked.
- *   ENFORCE           — hard-reject commands above the max tier (and any
+ *   ENFORCE (default) — hard-reject commands above the max tier (and any
  *                       UNCLASSIFIED command) with a signed error
  *                       observation, before the driver runs.
  *
  * Default posture (set in onode_init, before any config is read):
- * SHADOW mode, max tier YELLOW. Fail-safe: an absent/garbled config
- * leaves the gate observing only.
+ * ENFORCE mode, max tier YELLOW. Fail-closed: an absent/garbled config
+ * blocks over-tier and unclassified commands rather than silently
+ * observing them. Drivers without a classifier must be opted into
+ * SHADOW explicitly via the gate_modes config map.
  * ========================================================================= */
 
 typedef enum {
-    GATE_MODE_SHADOW  = 0,   /* default — observe/log only, never block */
-    GATE_MODE_ENFORCE = 1,   /* hard-reject over-tier / unclassified     */
+    GATE_MODE_SHADOW  = 0,   /* observe/log only, never block            */
+    GATE_MODE_ENFORCE = 1,   /* default — hard-reject over-tier /
+                                unclassified                             */
 } onode_gate_mode_t;
 
 /* =========================================================================
@@ -153,7 +156,7 @@ typedef struct {
      * Tier-enforcement gate (Phase B), per-driver scoped.
      *
      *   gate_default_mode — mode for any driver NOT named in the override
-     *                       map. Default SHADOW.
+     *                       map. Default ENFORCE (fail closed).
      *   gate_overrides    — optional per-driver mode overrides, keyed by
      *                       driver name (drv->name, e.g. "fortigate",
      *                       "cisco_ios"). A driver's effective mode is its
@@ -338,6 +341,40 @@ virp_error_t onode_execute(onode_state_t *state,
                            const char *command,
                            uint8_t *out_buf, size_t out_buf_len,
                            size_t *out_len);
+
+/*
+ * Versioned execute. obs_version selects the observation signing path:
+ *
+ *   1 — legacy: v1 message signed with the static master O-Key.
+ *       Compatibility default for clients that predate session-bound
+ *       observations (they cannot derive the session key; the
+ *       handshake transcript includes server-stamped timestamps the
+ *       socket protocol does not yet echo back).
+ *
+ *   2 — session-bound: the SUCCESS observation is a v2 wire message
+ *       ([88-byte header][payload][32-byte sig]) signed with the
+ *       HKDF-derived session key via virp_sign_observation_v2. The
+ *       header binds session_id, device_id, seq_num, timestamp and
+ *       SHA-256(canonical command). Requires an ACTIVE session; if
+ *       none exists the call FAILS with VIRP_ERR_SESSION_INVALID —
+ *       there is deliberately no silent fallback to v1, because a
+ *       client that asked for session binding must never accept a
+ *       downgraded observation.
+ *
+ * Scope note: error observations (device not found, connect/driver
+ * failure, tier-gate rejection) are still emitted as v1 messages even
+ * when obs_version == 2. They carry no device output; binding them is
+ * follow-up work. A v2-requesting client must treat any v1 response as
+ * unverified diagnostics, never as device truth.
+ *
+ * onode_execute() is exactly onode_execute_obs(..., obs_version=1).
+ */
+virp_error_t onode_execute_obs(onode_state_t *state,
+                               const char *device_name,
+                               const char *command,
+                               int obs_version,
+                               uint8_t *out_buf, size_t out_buf_len,
+                               size_t *out_len);
 
 /*
  * Generate a HEARTBEAT message.

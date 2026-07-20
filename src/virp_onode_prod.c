@@ -221,7 +221,7 @@ static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
  * Parse the optional tier-enforcement gate config (per-driver scoped):
  *
  *   "gate_max_tier":     "green" | "yellow" (default) | "red"
- *   "gate_default_mode": "shadow" (default) | "enforce"   -- applied to any
+ *   "gate_default_mode": "shadow" | "enforce" (default)   -- applied to any
  *                        driver not named in gate_modes
  *   "gate_modes":        { "<driver>": "shadow"|"enforce", ... }  -- optional
  *                        per-driver overrides, keyed by driver name
@@ -230,7 +230,7 @@ static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
  *
  * ("gate_mode" is accepted as a deprecated alias for gate_default_mode.)
  *
- * Absent keys leave the onode_init() defaults (SHADOW default / no
+ * Absent keys leave the onode_init() defaults (ENFORCE default / no
  * overrides / YELLOW) in place. Unrecognized values are logged and ignored.
  */
 static void load_gate_config(onode_state_t *state, struct json_object *root)
@@ -254,7 +254,7 @@ static void load_gate_config(onode_state_t *state, struct json_object *root)
         const char *s = json_object_get_string(v);
         if (!parse_gate_mode(s, &state->gate_default_mode))
             fprintf(stderr, "[O-Node] gate_default_mode '%s' unrecognized — "
-                            "keeping SHADOW\n", s);
+                            "keeping ENFORCE default\n", s);
     } else if (json_object_object_get_ex(root, "gate_mode", &v) &&
                json_object_is_type(v, json_type_string)) {
         const char *s = json_object_get_string(v);
@@ -263,7 +263,7 @@ static void load_gate_config(onode_state_t *state, struct json_object *root)
                             "use gate_default_mode\n");
         else
             fprintf(stderr, "[O-Node] gate_mode '%s' unrecognized — "
-                            "keeping SHADOW\n", s);
+                            "keeping ENFORCE default\n", s);
     }
 
     /* Per-driver overrides. */
@@ -394,6 +394,23 @@ int load_devices(onode_state_t *state, const char *path)
             }
         }
 
+        /*
+         * device_id — stable 64-bit identity bound into v2 observation
+         * headers. Accepts a hex string or JSON int, mirroring node_id.
+         * Absent (the common case for existing configs): derived
+         * deterministically from SHA-256(hostname) after the
+         * hostname-presence check below.
+         */
+        struct json_object *did_val;
+        if (json_object_object_get_ex(dev_obj, "device_id", &did_val)) {
+            if (json_object_is_type(did_val, json_type_string)) {
+                const char *s = json_object_get_string(did_val);
+                if (s) device.device_id = (uint64_t)strtoull(s, NULL, 16);
+            } else if (json_object_is_type(did_val, json_type_int)) {
+                device.device_id = (uint64_t)json_object_get_int64(did_val);
+            }
+        }
+
         /* FortiGate-specific fields (ignored for other vendors) */
         json_get_string(dev_obj, "api_token", device.api_token,
                         sizeof(device.api_token));
@@ -421,6 +438,9 @@ int load_devices(onode_state_t *state, const char *path)
                     device.hostname);
             continue;
         }
+
+        if (device.device_id == 0)
+            device.device_id = virp_device_id_from_hostname(device.hostname);
 
         virp_error_t err = onode_add_device(state, &device);
         if (err != VIRP_OK) {

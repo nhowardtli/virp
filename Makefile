@@ -27,6 +27,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_onode.o \
              $(BUILD_DIR)/virp_chain.o \
              $(BUILD_DIR)/virp_federation.o \
+             $(BUILD_DIR)/virp_seqstore.o \
              $(BUILD_DIR)/virp_session.o \
              $(BUILD_DIR)/virp_handshake.o \
              $(BUILD_DIR)/virp_transcript.o \
@@ -181,6 +182,9 @@ $(BUILD_DIR)/virp_federation.o: src/virp_federation.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_session.o: src/virp_session.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_seqstore.o: src/virp_seqstore.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_handshake.o: src/virp_handshake.c | $(BUILD_DIR)
@@ -372,6 +376,16 @@ $(TEST_SESSION_NEG): tests/test_session_negative.c $(LIB)
 test-session: $(TEST_SESSION_NEG)
 	./$(TEST_SESSION_NEG)
 
+# v2 observation negative tests (replay / staleness / substitution /
+# session binding / wire format)
+TEST_OBS_V2 = $(BUILD_DIR)/test_obs_v2
+
+$(TEST_OBS_V2): tests/test_obs_v2.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-obs-v2: $(TEST_OBS_V2)
+	./$(TEST_OBS_V2)
+
 # Session key derivation tests
 TEST_SESSION_KEY = $(BUILD_DIR)/test_session_key
 
@@ -389,6 +403,18 @@ $(TEST_JUNIPER): tests/test_driver_juniper.c $(LIB)
 
 test-juniper: $(TEST_JUNIPER)
 	./$(TEST_JUNIPER)
+
+# ProVerif proofs — re-check the v2 observation model. Requires the
+# proverif binary (see proofs/README.md for build-from-source steps).
+# Fails if any query stops proving.
+.PHONY: proofs
+proofs:
+	@command -v proverif >/dev/null || { echo "proverif not installed — see proofs/README.md"; exit 1; }
+	proverif proofs/virp_obs_v2.pv | tee /tmp/virp-proofs-run.out
+	@grep -q "RESULT not attacker(mk\[\]) is true" /tmp/virp-proofs-run.out
+	@grep -q "RESULT not attacker(kprobe\[\]) is true" /tmp/virp-proofs-run.out
+	@grep -q "RESULT inj-event(accepted(.*)) ==> inj-event(signed(.*)) is true" /tmp/virp-proofs-run.out
+	@echo "  PASS: all 3 ProVerif queries proved"
 
 # Lint: fail build if sprintf( appears in src/ (use snprintf instead)
 .PHONY: lint-sprintf
@@ -449,4 +475,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-validator
+all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator

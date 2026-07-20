@@ -1,0 +1,170 @@
+(*
+ * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
+ * VIRP — ProVerif model of v2 observation signing and verification
+ *
+ * Models EXACTLY the deployed verify function virp_verify_observation_v2()
+ * (src/virp_crypto.c) against a Dolev-Yao attacker on the transport:
+ *
+ *   sign   (src/virp_crypto.c:virp_sign_observation_v2):
+ *     sig = HMAC-SHA256(k_session,
+ *                       ser(session_id, device_id, SHA256(canon(cmd)),
+ *                           seq, payload))
+ *     k_session = HKDF(master_okey, transcript(cn, sn, session_id))
+ *
+ *   verify (src/virp_crypto.c:virp_verify_observation_v2):
+ *     1. HMAC over the received bytes with the session key
+ *     2. session_id  == active session's id
+ *     3. device_id   == the device the request targeted
+ *     4. command_hash == SHA256(canon(requested command))
+ *     5. seq accepted at most once per (session, seq) — high-water store
+ *
+ * Modeling choices, stated explicitly:
+ *
+ *  - The handshake nonces and session_id travel in the clear (as on the
+ *    real Unix-socket transport); only the master O-Key is private. The
+ *    attacker picks the client nonce, every command, and every device,
+ *    and fully controls the network.
+ *
+ *  - The replay high-water store is stateful; ProVerif's Horn-clause
+ *    abstraction is stateless (facts are persistent), so the store is
+ *    encoded as a RESTRICTION on traces: the slotused(sid, seq) event
+ *    fires at most once per (session, seq). That is precisely the
+ *    guarantee virp_seqstore_accept() provides — it is called on the
+ *    verify path after all other checks and rejects any seq at or
+ *    below the per-(session, node) high-water mark — and precisely
+ *    what the C negative tests demonstrate operationally
+ *    (tests/test_obs_v2.c: test_replay_same_sequence_rejected,
+ *    test_non_monotonic_sequence_rejected,
+ *    test_replay_rejected_across_store_restart). The injective
+ *    agreement below is therefore proved MODULO the correctness of
+ *    the high-water store, which carries its own tests.
+ *
+ *  - Freshness (the 300 s timestamp window) is NOT modeled: symbolic
+ *    Dolev-Yao models have no clock. Staleness rejection is
+ *    demonstrated operationally by tests/test_obs_v2.c
+ *    (test_stale_observation_rejected, mocked verifier clock).
+ *
+ * Verified queries (see checked-in output virp_obs_v2.out):
+ *   1. secrecy of the master O-Key
+ *   2. secrecy of every derived session key (probe encryption)
+ *   3. INJECTIVE agreement: every accept corresponds to exactly one
+ *      distinct sign with the same session, device, command hash,
+ *      sequence and payload — i.e. no forgery, no cross-session or
+ *      cross-device/command substitution, no replay.
+ *)
+
+free c: channel.                    (* public transport *)
+
+type key.
+type nonce.
+type sessionid.
+type seqt.
+
+(* Master observation key. Shared by the O-Node (signer) and the
+ * verifier; never transmitted. *)
+free mk: key [private].
+
+(* HKDF-SHA256 session key from master key + handshake transcript.
+ * Constructor only — one-way, as HKDF over HMAC-SHA256 is in the
+ * symbolic model. *)
+fun hkdf(key, nonce, nonce, sessionid): key.
+
+(* HMAC-SHA256 — keyed one-way MAC, constructor only. *)
+fun hmac(key, bitstring): bitstring.
+
+(* SHA-256 of the canonicalized command. *)
+fun h(bitstring): bitstring.
+
+(* Explicit v2 header||payload serialization (virp_obs_header_v2_serialize):
+ * injective data constructor = unambiguous field encoding. *)
+fun ser(sessionid, bitstring, bitstring, seqt, bitstring): bitstring [data].
+
+(* Symmetric encryption, used only to probe session-key secrecy. *)
+fun senc(bitstring, key): bitstring.
+reduc forall m: bitstring, k: key; sdec(senc(m, k), k) = m.
+
+(* signed(sid, device, command_hash, seq, payload) — the O-Node produced
+ * this observation. accepted(...) — the verifier accepted it.
+ * slotused(sid, seq) — the verifier consumed the (session, seq) slot in
+ * its high-water store, immediately before accepting. *)
+event signed(sessionid, bitstring, bitstring, seqt, bitstring).
+event accepted(sessionid, bitstring, bitstring, seqt, bitstring).
+event slotused(sessionid, seqt, bitstring).
+
+(* The seqstore contract, as a restriction on admissible traces: a
+ * given (session, seq) is consumed at most once. Each verifier run
+ * tags its consumption with a run-fresh token; requiring equal tokens
+ * for equal (session, seq) excludes any trace where two DISTINCT runs
+ * consume the same slot — exactly virp_seqstore_accept()'s
+ * check-and-advance, demonstrated operationally by the replay tests
+ * in tests/test_obs_v2.c. *)
+restriction rsid: sessionid, rs: seqt, tok1: bitstring, tok2: bitstring;
+    event(slotused(rsid, rs, tok1)) && event(slotused(rsid, rs, tok2))
+        ==> tok1 = tok2.
+
+(* ── Queries ─────────────────────────────────────────────────────── *)
+
+(* 1 — master key secrecy *)
+query attacker(mk).
+
+(* 2 — session key secrecy: kprobe is only ever sent encrypted under a
+ * derived session key, so its secrecy is the key's secrecy. *)
+free kprobe: bitstring [private].
+query attacker(kprobe).
+
+(* 3 — injective agreement: accept ==> unique matching sign. *)
+query qsid: sessionid, qdev: bitstring, qch: bitstring, qs: seqt,
+      qp: bitstring;
+    inj-event(accepted(qsid, qdev, qch, qs, qp)) ==>
+    inj-event(signed(qsid, qdev, qch, qs, qp)).
+
+(* ── O-Node signer ───────────────────────────────────────────────── *)
+
+let Onode(sk: key, osid: sessionid) =
+    (* the requester (attacker-controlled) picks device and command *)
+    in(c, (dev: bitstring, cmd: bitstring));
+    (* device output; fresh per execution *)
+    new p: bitstring;
+    (* per-session monotonic counter: each seq value is used once *)
+    new s: seqt;
+    event signed(osid, dev, h(cmd), s, p);
+    out(c, (osid, dev, h(cmd), s, p,
+            hmac(sk, ser(osid, dev, h(cmd), s, p)))).
+
+(* ── Verifier (virp_verify_observation_v2) ───────────────────────── *)
+
+let Verifier(vk: key, vsid: sessionid) =
+    (* what THIS verifier requested — attacker may choose it *)
+    in(c, (edev: bitstring, ecmd: bitstring));
+    (* the observation as delivered by the network (attacker) *)
+    in(c, (sid': sessionid, dev': bitstring, ch': bitstring,
+           s': seqt, p': bitstring, m': bitstring));
+    (* check 1: HMAC over the serialized message, session key       *)
+    if m' = hmac(vk, ser(sid', dev', ch', s', p')) then
+    (* check 2: session binding                                     *)
+    if sid' = vsid then
+    (* checks 3+4: device and command binding to THIS request       *)
+    if dev' = edev then
+    if ch' = h(ecmd) then
+    (* check 5: replay — consume the (session, seq) slot; the
+     * restriction above admits each slot at most once, exactly the
+     * seqstore's check-and-advance *)
+    new tok: bitstring;
+    event slotused(vsid, s', tok);
+    event accepted(vsid, edev, h(ecmd), s', p').
+
+(* ── Sessions ────────────────────────────────────────────────────── *)
+
+process
+    ! (
+        (* handshake: attacker supplies the client nonce; server nonce
+         * and session id are fresh; all three are public on the wire *)
+        in(c, cn: nonce);
+        new sn: nonce;
+        new ssid: sessionid;
+        out(c, (ssid, sn));
+        let k = hkdf(mk, cn, sn, ssid) in
+        (* session-key secrecy probe *)
+        out(c, senc(kprobe, k));
+        ( (!Onode(k, ssid)) | (!Verifier(k, ssid)) )
+      )

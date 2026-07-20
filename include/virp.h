@@ -312,6 +312,11 @@ typedef struct __attribute__((packed)) {
  *
  * Extended header for v2 observations. Carries session context,
  * device identity, and a SHA-256 hash of the canonicalized command.
+ *
+ * This struct is the IN-MEMORY representation only. The wire format is
+ * produced exclusively by virp_obs_header_v2_serialize() (explicit
+ * network-byte-order field layout, VIRP_OBS_V2_HEADER_SIZE bytes) —
+ * never by memcpy of the struct, whose padding is ABI-dependent.
  */
 typedef struct {
     uint8_t  version;           /* VIRP_VERSION_2 */
@@ -329,6 +334,33 @@ typedef struct {
     uint8_t  command_hash[32];  /* SHA-256 of canonical command */
     uint32_t payload_len;       /* length of observation payload in bytes */
 } virp_obs_header_v2_t;
+
+/*
+ * V2 observation wire format:
+ *
+ *   [ serialized header : 88 bytes ][ payload : payload_len ][ sig : 32 ]
+ *
+ * Serialized header layout (all multi-byte fields big-endian):
+ *   off  0  version(1) channel(1) tier(1) reserved(1)
+ *   off  4  node_id(8)
+ *   off 12  timestamp_ns(8)
+ *   off 20  seq_num(8)
+ *   off 28  session_id(16)
+ *   off 44  device_id(8)
+ *   off 52  command_hash(32)
+ *   off 84  payload_len(4)
+ *   = 88 bytes, no padding.
+ *
+ * The signature is HMAC-SHA256(session_key, serialized_header || payload).
+ */
+#define VIRP_OBS_V2_HEADER_SIZE   88
+#define VIRP_OBS_V2_SIG_SIZE      32
+#define VIRP_OBS_V2_MIN_SIZE      (VIRP_OBS_V2_HEADER_SIZE + VIRP_OBS_V2_SIG_SIZE)
+
+/* Freshness window for v2 observation verification: the signed
+ * timestamp_ns must be within this many nanoseconds of the verifier's
+ * clock (in either direction) or the observation is rejected as stale. */
+#define VIRP_OBS_V2_FRESHNESS_WINDOW_NS  (300ULL * 1000000000ULL)  /* 300 s */
 
 /*
  * VIRP signing key pair — one per key type (O-Key or R-Key)

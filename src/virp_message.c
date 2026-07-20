@@ -133,6 +133,70 @@ virp_error_t virp_header_deserialize(virp_header_t *hdr,
     return VIRP_OK;
 }
 
+virp_error_t virp_obs_header_v2_serialize(const virp_obs_header_v2_t *hdr,
+                                          uint8_t *buf, size_t buf_len)
+{
+    if (!hdr || !buf)
+        return VIRP_ERR_NULL_PTR;
+    if (buf_len < VIRP_OBS_V2_HEADER_SIZE)
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+    if (hdr->_reserved != 0)
+        return VIRP_ERR_RESERVED_NONZERO;
+
+    buf[0] = hdr->version;
+    buf[1] = hdr->channel;
+    buf[2] = hdr->tier;
+    buf[3] = 0;                              /* reserved */
+    uint64_t nid_n = htonll(hdr->node_id);
+    memcpy(buf + 4, &nid_n, 8);
+    uint64_t ts_n = htonll(hdr->timestamp_ns);
+    memcpy(buf + 12, &ts_n, 8);
+    uint64_t seq_n = htonll(hdr->seq_num);
+    memcpy(buf + 20, &seq_n, 8);
+    memcpy(buf + 28, hdr->session_id, 16);
+    uint64_t did_n = htonll(hdr->device_id);
+    memcpy(buf + 44, &did_n, 8);
+    memcpy(buf + 52, hdr->command_hash, 32);
+    uint32_t pl_n = htonl(hdr->payload_len);
+    memcpy(buf + 84, &pl_n, 4);
+
+    return VIRP_OK;
+}
+
+virp_error_t virp_obs_header_v2_deserialize(virp_obs_header_v2_t *hdr,
+                                            const uint8_t *buf, size_t buf_len)
+{
+    if (!hdr || !buf)
+        return VIRP_ERR_NULL_PTR;
+    if (buf_len < VIRP_OBS_V2_HEADER_SIZE)
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->version   = buf[0];
+    hdr->channel   = buf[1];
+    hdr->tier      = buf[2];
+    hdr->_reserved = buf[3];
+    uint64_t nid_n;
+    memcpy(&nid_n, buf + 4, 8);
+    hdr->node_id = ntohll(nid_n);
+    uint64_t ts_n;
+    memcpy(&ts_n, buf + 12, 8);
+    hdr->timestamp_ns = ntohll(ts_n);
+    uint64_t seq_n;
+    memcpy(&seq_n, buf + 20, 8);
+    hdr->seq_num = ntohll(seq_n);
+    memcpy(hdr->session_id, buf + 28, 16);
+    uint64_t did_n;
+    memcpy(&did_n, buf + 44, 8);
+    hdr->device_id = ntohll(did_n);
+    memcpy(hdr->command_hash, buf + 52, 32);
+    uint32_t pl_n;
+    memcpy(&pl_n, buf + 84, 4);
+    hdr->payload_len = ntohl(pl_n);
+
+    return VIRP_OK;
+}
+
 virp_error_t virp_header_validate(const virp_header_t *hdr)
 {
     if (!hdr)

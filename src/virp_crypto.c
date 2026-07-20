@@ -460,14 +460,20 @@ virp_error_t virp_sign_observation_v2(
     if (canon_len < 0) return VIRP_ERR_INVALID_LENGTH;
     SHA256((uint8_t *)canon, (size_t)canon_len, hdr.command_hash);
 
-    /* HMAC-SHA256 over header || payload */
-    size_t sign_len = sizeof(hdr) + payload_len;
+    /*
+     * HMAC-SHA256 over serialized header || payload. The signed bytes
+     * are the explicit wire encoding — never a raw struct memcpy, which
+     * would sign ABI-dependent compiler padding.
+     */
+    size_t sign_len = VIRP_OBS_V2_HEADER_SIZE + payload_len;
     if (sign_len > VIRP_MAX_MESSAGE_SIZE)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
 
     uint8_t sign_buf[VIRP_MAX_MESSAGE_SIZE];
-    memcpy(sign_buf, &hdr, sizeof(hdr));
-    memcpy(sign_buf + sizeof(hdr), payload, payload_len);
+    virp_error_t herr = virp_obs_header_v2_serialize(&hdr, sign_buf,
+                                                     sizeof(sign_buf));
+    if (herr != VIRP_OK) return herr;
+    memcpy(sign_buf + VIRP_OBS_V2_HEADER_SIZE, payload, payload_len);
 
     unsigned int sig_len = 32;
     if (!HMAC(EVP_sha256(),
@@ -476,6 +482,149 @@ virp_error_t virp_sign_observation_v2(
         return VIRP_ERR_CRYPTO;
 
     *hdr_out = hdr;
+    return VIRP_OK;
+}
+
+virp_error_t virp_build_observation_v2(
+    virp_context_t *ctx,
+    uint64_t node_id, uint64_t device_id,
+    uint8_t tier, uint64_t seq_num,
+    const char *command,
+    const uint8_t *payload, size_t payload_len,
+    uint8_t *out_buf, size_t out_buf_len, size_t *out_len)
+{
+    if (!out_buf || !out_len)
+        return VIRP_ERR_NULL_PTR;
+
+    size_t total = VIRP_OBS_V2_HEADER_SIZE + payload_len +
+                   VIRP_OBS_V2_SIG_SIZE;
+    if (total > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+    if (out_buf_len < total)
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+
+    virp_obs_header_v2_t hdr;
+    uint8_t sig[VIRP_OBS_V2_SIG_SIZE];
+    virp_error_t err = virp_sign_observation_v2(ctx, node_id, device_id,
+                                                tier, seq_num, command,
+                                                payload, payload_len,
+                                                &hdr, sig);
+    if (err != VIRP_OK) return err;
+
+    err = virp_obs_header_v2_serialize(&hdr, out_buf, out_buf_len);
+    if (err != VIRP_OK) return err;
+    memcpy(out_buf + VIRP_OBS_V2_HEADER_SIZE, payload, payload_len);
+    memcpy(out_buf + VIRP_OBS_V2_HEADER_SIZE + payload_len, sig,
+           VIRP_OBS_V2_SIG_SIZE);
+
+    *out_len = total;
+    return VIRP_OK;
+}
+
+virp_error_t virp_verify_observation_v2(
+    virp_context_t *ctx,
+    uint64_t expected_device_id,
+    const char *expected_command,
+    const uint8_t *msg, size_t msg_len,
+    uint64_t now_ns,
+    virp_seqstore_t *seq_store,
+    virp_obs_header_v2_t *hdr_out,
+    const uint8_t **payload_out, uint32_t *payload_len_out)
+{
+    if (!ctx || !expected_command || !msg || !seq_store)
+        return VIRP_ERR_NULL_PTR;
+
+    if (msg_len < VIRP_OBS_V2_MIN_SIZE)
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+    if (msg_len > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+
+    /* v2 observations verify against an active session's derived key */
+    virp_error_t serr = virp_session_require_active(ctx);
+    if (serr != VIRP_OK) return serr;
+    if (!ctx->session.session_key_valid)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    /*
+     * Check 1 — HMAC first. Nothing unauthenticated influences any
+     * later decision except the message length itself. The signature
+     * is the trailing 32 bytes; it covers everything before it.
+     */
+    size_t signed_len = msg_len - VIRP_OBS_V2_SIG_SIZE;
+    uint8_t expected_sig[VIRP_OBS_V2_SIG_SIZE];
+    unsigned int sig_len = VIRP_OBS_V2_SIG_SIZE;
+    if (!HMAC(EVP_sha256(), ctx->session.session_key, 32,
+              msg, signed_len, expected_sig, &sig_len))
+        return VIRP_ERR_CRYPTO;
+    if (!virp_consttime_eq(msg + signed_len, expected_sig,
+                           VIRP_OBS_V2_SIG_SIZE))
+        return VIRP_ERR_HMAC_FAILED;
+
+    /* Check 2 — header sanity */
+    virp_obs_header_v2_t hdr;
+    virp_error_t err = virp_obs_header_v2_deserialize(&hdr, msg, msg_len);
+    if (err != VIRP_OK) return err;
+
+    if (hdr.version != VIRP_VERSION_2)
+        return VIRP_ERR_VERSION_MISMATCH;
+    if (hdr.channel != VIRP_CHANNEL_OBS)
+        return VIRP_ERR_INVALID_CHANNEL;
+    if (hdr.tier == VIRP_TIER_BLACK)
+        return VIRP_ERR_TIER_VIOLATION;
+    if (hdr.tier > VIRP_TIER_RED)
+        return VIRP_ERR_INVALID_TIER;
+    if (hdr._reserved != 0)
+        return VIRP_ERR_RESERVED_NONZERO;
+    if ((size_t)hdr.payload_len !=
+        msg_len - VIRP_OBS_V2_HEADER_SIZE - VIRP_OBS_V2_SIG_SIZE)
+        return VIRP_ERR_INVALID_LENGTH;
+
+    /* Check 3 — session binding */
+    if (!virp_consttime_eq(hdr.session_id, ctx->session.session_id, 16))
+        return VIRP_ERR_SESSION_INVALID;
+
+    /* Check 4 — device binding */
+    if (hdr.device_id != expected_device_id)
+        return VIRP_ERR_CONTEXT_MISMATCH;
+
+    /* Check 5 — command binding */
+    {
+        char canon[512];
+        int canon_len = virp_canonicalize_command(expected_command, canon,
+                                                  sizeof(canon));
+        if (canon_len < 0) return VIRP_ERR_INVALID_LENGTH;
+        uint8_t expected_hash[32];
+        SHA256((uint8_t *)canon, (size_t)canon_len, expected_hash);
+        if (!virp_consttime_eq(hdr.command_hash, expected_hash, 32))
+            return VIRP_ERR_CONTEXT_MISMATCH;
+    }
+
+    /* Check 6 — freshness, measured against the SIGNED timestamp */
+    {
+        if (now_ns == 0) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            now_ns = (uint64_t)ts.tv_sec * 1000000000ULL +
+                     (uint64_t)ts.tv_nsec;
+        }
+        uint64_t skew = (now_ns > hdr.timestamp_ns)
+                            ? now_ns - hdr.timestamp_ns
+                            : hdr.timestamp_ns - now_ns;
+        if (skew > VIRP_OBS_V2_FRESHNESS_WINDOW_NS)
+            return VIRP_ERR_STALE_OBSERVATION;
+    }
+
+    /* Check 7 — replay. Advance the high-water mark only now, after
+     * every other check has passed, so a rejected message can never
+     * poison the store. */
+    err = virp_seqstore_accept(seq_store, hdr.session_id, hdr.node_id,
+                               hdr.seq_num);
+    if (err != VIRP_OK) return err;
+
+    if (hdr_out) *hdr_out = hdr;
+    if (payload_out) *payload_out = msg + VIRP_OBS_V2_HEADER_SIZE;
+    if (payload_len_out) *payload_len_out = hdr.payload_len;
+
     return VIRP_OK;
 }
 

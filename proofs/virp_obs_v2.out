@@ -1,0 +1,100 @@
+Process 0 (that is, the initial process):
+{1}!
+{2}in(c, cn: nonce);
+{3}new sn: nonce;
+{4}new ssid: sessionid;
+{5}out(c, (ssid,sn));
+{6}let k: key = hkdf(mk,cn,sn,ssid) in
+{7}out(c, senc(kprobe,k));
+(
+    {8}!
+    {9}let osid: sessionid = ssid in
+    {10}in(c, (dev: bitstring,cmd: bitstring));
+    {11}new p: bitstring;
+    {12}new s: seqt;
+    {13}event signed(osid,dev,h(cmd),s,p);
+    {14}out(c, (osid,dev,h(cmd),s,p,hmac(k,ser(osid,dev,h(cmd),s,p))))
+) | (
+    {15}!
+    {16}let vsid: sessionid = ssid in
+    {17}in(c, (edev: bitstring,ecmd: bitstring));
+    {18}in(c, (sid': sessionid,dev': bitstring,ch': bitstring,s': seqt,p': bitstring,m': bitstring));
+    {19}if (m' = hmac(k,ser(sid',dev',ch',s',p'))) then
+    {20}if (sid' = vsid) then
+    {21}if (dev' = edev) then
+    {22}if (ch' = h(ecmd)) then
+    {23}new tok: bitstring;
+    {24}event slotused(vsid,s',tok);
+    {25}event accepted(vsid,edev,h(ecmd),s',p')
+)
+
+--  Process 1 (that is, process 0, with let moved downwards):
+{1}!
+{2}in(c, cn: nonce);
+{3}new sn: nonce;
+{4}new ssid: sessionid;
+{5}out(c, (ssid,sn));
+{6}let k: key = hkdf(mk,cn,sn,ssid) in
+{7}out(c, senc(kprobe,k));
+(
+    {8}!
+    {10}in(c, (dev: bitstring,cmd: bitstring));
+    {11}new p: bitstring;
+    {12}new s: seqt;
+    {9}let osid: sessionid = ssid in
+    {13}event signed(osid,dev,h(cmd),s,p);
+    {14}out(c, (osid,dev,h(cmd),s,p,hmac(k,ser(osid,dev,h(cmd),s,p))))
+) | (
+    {15}!
+    {17}in(c, (edev: bitstring,ecmd: bitstring));
+    {18}in(c, (sid': sessionid,dev': bitstring,ch': bitstring,s': seqt,p': bitstring,m': bitstring));
+    {19}if (m' = hmac(k,ser(sid',dev',ch',s',p'))) then
+    {16}let vsid: sessionid = ssid in
+    {20}if (sid' = vsid) then
+    {21}if (dev' = edev) then
+    {22}if (ch' = h(ecmd)) then
+    {23}new tok: bitstring;
+    {24}event slotused(vsid,s',tok);
+    {25}event accepted(vsid,edev,h(ecmd),s',p')
+)
+
+-- Restriction event(slotused(rsid,rs,tok1)) && event(slotused(rsid,rs,tok2)) ==> tok1 = tok2 in process 1.
+-- Query not attacker(mk[]) in process 1.
+Translating the process into Horn clauses...
+Completing...
+Starting query not attacker(mk[])
+RESULT not attacker(mk[]) is true.
+-- Query not attacker(kprobe[]) in process 1.
+Translating the process into Horn clauses...
+Completing...
+Starting query not attacker(kprobe[])
+RESULT not attacker(kprobe[]) is true.
+-- Query inj-event(accepted(qsid,qdev,qch,qs,qp)) ==> inj-event(signed(qsid,qdev,qch,qs,qp)) in process 1.
+Translating the process into Horn clauses...
+Completing...
+Starting query inj-event(accepted(qsid,qdev,qch,qs,qp)) ==> inj-event(signed(qsid,qdev,qch,qs,qp))
+goal reachable: b-event(slotused(ssid_1,s_1,tok_1)) && b-inj-event(signed(ssid_1,qdev,h(ecmd_1),s_1,p_1),@occ13_1) && attacker(qdev) && attacker(ecmd_1) && attacker(cn_1) -> inj-event(accepted(ssid_1,qdev,h(ecmd_1),s_1,p_1),@occ25_1)
+The 1st, 2nd hypotheses occur strictly before the conclusion.
+The 3rd, 4th, 5th hypotheses occur before the conclusion.
+Abbreviations:
+ssid_1 = ssid[cn = cn_1,!1 = @sid]
+s_1 = s[cmd = ecmd_1,dev = qdev,!2 = @sid_1,cn = cn_1,!1 = @sid]
+p_1 = p[cmd = ecmd_1,dev = qdev,!2 = @sid_1,cn = cn_1,!1 = @sid]
+sn_1 = sn[cn = cn_1,!1 = @sid]
+@occ25_1 = @occ25[m' = hmac(hkdf(mk[],cn_1,sn_1,ssid_1),ser(ssid_1,qdev,h(ecmd_1),s_1,p_1)),p' = p_1,s' = s_1,ch' = h(ecmd_1),dev' = qdev,sid' = ssid_1,ecmd = ecmd_1,edev = qdev,!2 = @sid_2,cn = cn_1,!1 = @sid]
+tok_1 = tok[m' = hmac(hkdf(mk[],cn_1,sn_1,ssid_1),ser(ssid_1,qdev,h(ecmd_1),s_1,p_1)),p' = p_1,s' = s_1,ch' = h(ecmd_1),dev' = qdev,sid' = ssid_1,ecmd = ecmd_1,edev = qdev,!2 = @sid_2,cn = cn_1,!1 = @sid]
+@occ13_1 = @occ13[cmd = ecmd_1,dev = qdev,!2 = @sid_1,cn = cn_1,!1 = @sid]
+RESULT inj-event(accepted(qsid,qdev,qch,qs,qp)) ==> inj-event(signed(qsid,qdev,qch,qs,qp)) is true.
+
+--------------------------------------------------------------
+Verification summary:
+
+Query(ies):
+ - Query not attacker(mk[]) is true.
+ - Query not attacker(kprobe[]) is true.
+ - Query inj-event(accepted(qsid,qdev,qch,qs,qp)) ==> inj-event(signed(qsid,qdev,qch,qs,qp)) is true.
+Associated restriction(s):
+ - Restriction event(slotused(rsid,rs,tok1)) && event(slotused(rsid,rs,tok2)) ==> tok1 = tok2 in process 1.
+
+--------------------------------------------------------------
+
