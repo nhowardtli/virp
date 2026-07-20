@@ -355,4 +355,25 @@ A reference implementation will be published at `github.com/nhowardtli/virp` alo
 
 -----
 
+## Appendix A. Security Claim Status (implementation review inventory)
+
+Status of the July 2026 cold-review security-claim inventory for the
+protocol properties this layer inherits from VIRP Core. DEMONSTRATED
+means a negative test or checked-in machine proof in this repository
+exercises the property; every pointer below is a file in this tree.
+
+| Claim | Property | Status | Evidence |
+|---|---|---|---|
+| C5 | Replay of a captured observation is rejected | DEMONSTRATED | `tests/test_obs_v2.c`: `test_replay_same_sequence_rejected`, `test_non_monotonic_sequence_rejected`, `test_replay_rejected_across_store_restart`; injective agreement in `proofs/virp_obs_v2.pv` |
+| C6 | Stale observations (outside the freshness window) are rejected | DEMONSTRATED | `tests/test_obs_v2.c`: `test_stale_observation_rejected` (injected verifier clock, both directions, signed-timestamp tamper) |
+| C7 | A signed observation for command/device A cannot satisfy a request for command/device B | DEMONSTRATED | `tests/test_obs_v2.c`: `test_command_substitution_rejected`, `test_device_substitution_rejected`; end-to-end in `tests/test_onode.c`: `test_execute_v2_session_bound_roundtrip` |
+| C8 | Observations are bound to the session that produced them | DEMONSTRATED | `tests/test_obs_v2.c`: `test_cross_session_replay_rejected`; ProVerif session-key secrecy query in `proofs/virp_obs_v2.out` |
+| C16 | The signed v2 header bytes are an explicit, padding-free wire encoding | DEMONSTRATED | `virp_obs_header_v2_serialize()` in `src/virp_message.c`; golden-offset test `test_serialization_roundtrip_and_layout` in `tests/test_obs_v2.c` |
+
+Statuses above apply to the v2 observation path
+(`virp_verify_observation_v2`, `src/virp_crypto.c`). The legacy v1
+message path performs none of these checks at verify time.
+
+-----
+
 *This document is an informational draft. Feedback and critique welcome at nhoward@thirdlevelit.com.*

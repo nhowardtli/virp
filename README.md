@@ -200,7 +200,21 @@ Yes. VIRP is a protocol and a reference implementation. IronClaw is one consumer
 ## Protocol Specification
 
 - **IETF Draft:** `draft-howard-virp-05` (drafts -01 through -05 submitted)
-- **Formal verification:** machine-verified in ProVerif and Tamarin (Phase 1: HMAC key secrecy + non-injective agreement under Dolev-Yao)
+- **Formal verification:** (1) injective agreement (every accepted v2
+  observation corresponds to exactly one signing) and key secrecy
+  (master O-Key and derived session keys) are machine-verified in
+  ProVerif 2.05; the model and raw output are checked in at
+  [`proofs/virp_obs_v2.pv`](proofs/virp_obs_v2.pv) and
+  [`proofs/virp_obs_v2.out`](proofs/virp_obs_v2.out), re-runnable via
+  `make proofs`. (2) The proof holds under a stated trace restriction
+  matching `virp_seqstore_accept()`; that store's correctness is
+  demonstrated by the replay negative tests in `tests/test_obs_v2.c`,
+  including persistence across verifier restart. (3) Timestamp
+  freshness is test-verified only (`test_stale_observation_rejected`),
+  not modeled. There is no Tamarin model — that is future work. The
+  proofs cover the v2 observation path only; `draft-howard-virp-05`
+  §16.1 still cites the older, broader claim and needs the same
+  correction in its next revision.
 - **License:** Apache 2.0
 
 ---

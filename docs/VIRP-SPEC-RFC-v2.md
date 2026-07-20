@@ -1875,6 +1875,20 @@ Table of Contents
        Depends on: Sequence tracking, clock synchronization
        within the freshness tolerance
 
+       Reference implementation conformance: enforced on the
+       v2 observation verify path in
+       virp_verify_observation_v2() (src/virp_crypto.c) —
+       sequence tracking via a persistent per-(session, node)
+       high-water store (virp_seqstore_accept(),
+       src/virp_seqstore.c), which is stricter than the
+       1000-behind bound stated above (any sequence number at
+       or below the high-water mark is rejected with
+       VIRP_ERR_REPLAY_DETECTED); freshness via the 300 s
+       window (VIRP_OBS_V2_FRESHNESS_WINDOW_NS), rejected
+       with VIRP_ERR_STALE_OBSERVATION. Negative tests:
+       tests/test_obs_v2.c. The legacy v1 message path does
+       not enforce this property at verify time.
+
    Property 6 (Fabrication Non-Existence):
        The R-Node cannot produce data that a conformant
        implementation would accept as a verified observation.

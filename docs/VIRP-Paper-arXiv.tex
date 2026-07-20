@@ -395,7 +395,7 @@ The AI's fabrication in test 6 was not malicious---it was a natural consequence 
 
 \section{Limitations}
 
-\textbf{O-Node trust.} VIRP assumes the O-Node is trusted. A compromised O-Node can produce signed fabrications. Hardware trust anchors (TPM) and formal verification of the O-Node binary are planned mitigations. Phase~1 of the formal verification effort (protocol-level, not binary-level) is already complete: HMAC key secrecy and non-injective agreement are machine-verified in ProVerif and Tamarin under a Dolev--Yao attacker \cite{draft-howard-virp-05}. Injective agreement and counter uniqueness remain open.
+\textbf{O-Node trust.} VIRP assumes the O-Node is trusted. A compromised O-Node can produce signed fabrications. Hardware trust anchors (TPM) and formal verification of the O-Node binary are planned mitigations. At the protocol level (not binary-level): (1)~injective agreement between v2 observation acceptance and signing, plus master-key and session-key secrecy, are machine-verified in ProVerif~2.05 under a Dolev--Yao attacker; the model and raw output are checked into the reference implementation at \texttt{proofs/virp\_obs\_v2.pv} and \texttt{proofs/virp\_obs\_v2.out}, re-runnable via \texttt{make proofs}. (2)~The proof holds under a stated trace restriction matching \texttt{virp\_seqstore\_accept()}, whose correctness is demonstrated by the replay negative tests in \texttt{tests/test\_obs\_v2.c}, including persistence across verifier restart. (3)~Timestamp freshness is test-verified only, not modeled. There is no Tamarin model; the legacy v1 message path is not covered by the proofs.
 
 \textbf{Correlation fabrication.} VIRP prevents the AI from fabricating observations (T1--T3) but does not fully prevent fabricated correlations between real observations (T4). An AI could claim that a real BGP state change was caused by a real (but unrelated) interface error.
 
@@ -415,7 +415,7 @@ The AI's fabrication in test 6 was not malicious---it was a natural consequence 
 
 \textbf{SIEM integration.} Wazuh and Splunk as signed event sources, enabling AI correlation of security alerts with verified network state.
 
-\textbf{Formal verification (Phase 2).} Phase~1 machine-verified HMAC key secrecy and non-injective agreement in ProVerif and Tamarin under Dolev--Yao \cite{draft-howard-virp-05}. Phase~2 targets the two properties that remain open---injective agreement and counter uniqueness---and extends the model to channel-key binding and tier enforcement logic.
+\textbf{Formal verification (Phase 2).} The checked-in ProVerif~2.05 model covers key secrecy and injective agreement for the v2 observation path, under the stated replay-counter restriction (see \texttt{proofs/} in the reference implementation). Phase~2 targets a stateful-verifier model (Tamarin or StatVerif — future work) that discharges the replay-counter restriction inside the model itself, adds the freshness window, and extends coverage to channel-key binding and tier enforcement logic.
 
 \textbf{Post-quantum cryptography.} Transition path from HMAC-SHA256 to post-quantum signature schemes as standards mature.
 
