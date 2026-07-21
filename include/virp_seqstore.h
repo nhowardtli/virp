@@ -33,7 +33,12 @@ typedef struct {
     uint8_t  session_id[16];
     uint64_t node_id;
     uint64_t last_seq;      /* highest accepted seq_num */
-    uint64_t touched;       /* LRU tick for eviction when the table fills */
+    uint64_t touched;       /* LRU tick; eviction only ever selects an
+                               entry from a DIFFERENT session than the
+                               one being inserted — a full table of
+                               same-session marks fails closed
+                               (VIRP_ERR_MESSAGE_TOO_LARGE) rather than
+                               reopening any replay window */
 } virp_seqstore_entry_t;
 
 typedef struct {

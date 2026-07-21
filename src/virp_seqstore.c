@@ -146,24 +146,44 @@ virp_error_t virp_seqstore_accept(virp_seqstore_t *st,
         }
     }
 
+    bool     was_new = false;
+    uint64_t old_seq = 0, old_touched = 0;
+    virp_seqstore_entry_t evicted;
+
     if (e) {
         if (seq <= e->last_seq) {
             pthread_mutex_unlock(&st->mu);
             return VIRP_ERR_REPLAY_DETECTED;
         }
+        old_seq     = e->last_seq;
+        old_touched = e->touched;
         e->last_seq = seq;
         e->touched  = ++st->tick;
     } else {
+        was_new = true;
         if (st->count < VIRP_SEQSTORE_MAX_ENTRIES) {
             e = &st->entries[st->count++];
+            memset(&evicted, 0, sizeof(evicted));
         } else {
-            /* Table full: evict the least-recently-touched entry.
-             * Sessions are short-lived relative to the table size, so
-             * the evictee is a dead session's mark. */
-            e = &st->entries[0];
-            for (size_t i = 1; i < VIRP_SEQSTORE_MAX_ENTRIES; i++)
-                if (st->entries[i].touched < e->touched)
+            /*
+             * Table full: evict the least-recently-touched entry that
+             * belongs to a DIFFERENT session. Evicting one of the
+             * current session's own marks would silently reopen the
+             * replay window for that device, so if every slot belongs
+             * to this session we fail closed instead of degrading.
+             */
+            e = NULL;
+            for (size_t i = 0; i < VIRP_SEQSTORE_MAX_ENTRIES; i++) {
+                if (memcmp(st->entries[i].session_id, session_id, 16) == 0)
+                    continue;
+                if (!e || st->entries[i].touched < e->touched)
                     e = &st->entries[i];
+            }
+            if (!e) {
+                pthread_mutex_unlock(&st->mu);
+                return VIRP_ERR_MESSAGE_TOO_LARGE;   /* store exhausted */
+            }
+            evicted = *e;
         }
         memcpy(e->session_id, session_id, 16);
         e->node_id  = node_id;
@@ -172,6 +192,26 @@ virp_error_t virp_seqstore_accept(virp_seqstore_t *st,
     }
 
     virp_error_t perr = seqstore_save(st);
+    if (perr != VIRP_OK) {
+        /*
+         * Persist failed: roll the in-memory state back so a transient
+         * disk error cannot poison the high-water mark — otherwise the
+         * caller's legitimate retry of this same seq would be rejected
+         * as a replay forever. Contract: on any non-OK return the
+         * store is unchanged.
+         */
+        if (was_new) {
+            if (evicted.touched != 0) {
+                *e = evicted;                        /* restore evictee */
+            } else {
+                memset(e, 0, sizeof(*e));
+                st->count--;                         /* drop appended slot */
+            }
+        } else {
+            e->last_seq = old_seq;
+            e->touched  = old_touched;
+        }
+    }
     pthread_mutex_unlock(&st->mu);
     return perr;
 }

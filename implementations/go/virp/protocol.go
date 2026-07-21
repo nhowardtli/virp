@@ -148,6 +148,10 @@ const (
 	ErrIntentNotFound   Error = -24
 	ErrIntentExpired    Error = -25
 	ErrIntentExhausted  Error = -26
+	// ErrSessionInvalid mirrors VIRP_ERR_SESSION_INVALID in the C
+	// implementation (include/virp.h). Returned when a client requests
+	// session-bound v2 observations, which this port does not support.
+	ErrSessionInvalid Error = -30
 )
 
 func (e Error) Error() string {

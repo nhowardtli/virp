@@ -504,6 +504,80 @@ static void test_verify_requires_active_session(void)
     printf("PASS\n");
 }
 
+/* ── seqstore hardening ────────────────────────────────────────────── */
+
+static void test_seqstore_eviction_never_hits_own_session(void)
+{
+    printf("  test_seqstore_eviction_never_hits_own_session... ");
+    virp_seqstore_t st;
+    assert(virp_seqstore_init(&st, NULL) == VIRP_OK);
+
+    uint8_t live_sid[16], dead_sid[16];
+    memset(live_sid, 0x11, 16);
+    memset(dead_sid, 0x22, 16);
+
+    /* One dead-session mark, then fill the rest with the live session */
+    assert(virp_seqstore_accept(&st, dead_sid, 9999, 1) == VIRP_OK);
+    for (uint64_t n = 0; n < VIRP_SEQSTORE_MAX_ENTRIES - 1; n++)
+        assert(virp_seqstore_accept(&st, live_sid, n, 10) == VIRP_OK);
+
+    /* Table full. A new live-session pair must evict the DEAD entry,
+     * never one of the live session's own marks... */
+    assert(virp_seqstore_accept(&st, live_sid, 100000, 10) == VIRP_OK);
+
+    /* ...so every live mark still enforces replay */
+    for (uint64_t n = 0; n < VIRP_SEQSTORE_MAX_ENTRIES - 1; n++)
+        assert(virp_seqstore_accept(&st, live_sid, n, 10) ==
+               VIRP_ERR_REPLAY_DETECTED);
+    assert(virp_seqstore_accept(&st, live_sid, 100000, 10) ==
+           VIRP_ERR_REPLAY_DETECTED);
+
+    /* And with the table now 100% live-session, a further new pair
+     * fails closed instead of silently evicting a live mark */
+    assert(virp_seqstore_accept(&st, live_sid, 200000, 10) ==
+           VIRP_ERR_MESSAGE_TOO_LARGE);
+
+    virp_seqstore_destroy(&st);
+    printf("PASS\n");
+}
+
+static void test_seqstore_persist_failure_does_not_poison_mark(void)
+{
+    printf("  test_seqstore_persist_failure_does_not_poison_mark... ");
+    unlink(SEQSTORE_FILE);
+
+    virp_seqstore_t st;
+    assert(virp_seqstore_init(&st, SEQSTORE_FILE) == VIRP_OK);
+
+    uint8_t sid[16];
+    memset(sid, 0x33, 16);
+    assert(virp_seqstore_accept(&st, sid, 1, 5) == VIRP_OK);
+
+    /* Simulate disk failure: point the store at an unwritable path */
+    char good_path[VIRP_SEQSTORE_PATH_MAX];
+    memcpy(good_path, st.path, sizeof(good_path));
+    snprintf(st.path, sizeof(st.path), "/nonexistent-dir/seqstore.txt");
+
+    /* Update of an existing pair fails to persist → error, and the
+     * in-memory mark must roll back... */
+    assert(virp_seqstore_accept(&st, sid, 1, 6) == VIRP_ERR_CHAIN_DB);
+    /* ...as must a brand-new pair appended during the failure */
+    assert(virp_seqstore_accept(&st, sid, 2, 1) == VIRP_ERR_CHAIN_DB);
+
+    /* Disk "recovers": the same seqs must now be accepted — a poisoned
+     * mark would report VIRP_ERR_REPLAY_DETECTED here */
+    memcpy(st.path, good_path, sizeof(st.path));
+    assert(virp_seqstore_accept(&st, sid, 1, 6) == VIRP_OK);
+    assert(virp_seqstore_accept(&st, sid, 2, 1) == VIRP_OK);
+
+    /* And replay is still enforced after recovery */
+    assert(virp_seqstore_accept(&st, sid, 1, 6) == VIRP_ERR_REPLAY_DETECTED);
+
+    virp_seqstore_destroy(&st);
+    unlink(SEQSTORE_FILE);
+    printf("PASS\n");
+}
+
 int main(void)
 {
     printf("=== VIRP v2 Observation Negative Tests ===\n");
@@ -519,6 +593,8 @@ int main(void)
     test_master_key_signature_rejected();
     test_payload_tamper_rejected();
     test_verify_requires_active_session();
-    printf("=== All 12 v2 observation tests passed ===\n");
+    test_seqstore_eviction_never_hits_own_session();
+    test_seqstore_persist_failure_does_not_poison_mark();
+    printf("=== All 14 v2 observation tests passed ===\n");
     return 0;
 }

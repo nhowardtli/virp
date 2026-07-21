@@ -664,6 +664,98 @@ TEST(test_batch_execute_two_devices)
     ASSERT_TRUE(strstr((const char *)data, "10.0.56.0") != NULL);
 }
 
+/*
+ * Batch must honor obs_version: a batch that asked for session binding
+ * gets v2 observations for every item — and with no session, every
+ * item fails with SESSION_INVALID instead of silently downgrading to
+ * master-key v1 signing.
+ */
+TEST(test_batch_execute_v2_honors_obs_version)
+{
+    uint8_t resp[4][VIRP_MAX_MESSAGE_SIZE];
+    size_t resp_len[4];
+
+    /* No session yet: every item must be a 4-byte SESSION_INVALID */
+    int count = client_batch_request(
+        "{\"action\":\"batch_execute\",\"obs_version\":2,\"commands\":["
+        "{\"device\":\"R5\",\"command\":\"show version\"},"
+        "{\"device\":\"R6\",\"command\":\"show ip route\"}"
+        "]}",
+        resp, resp_len, 4);
+    ASSERT_EQ(count, 2);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ((int)resp_len[i], 4);
+        uint32_t code_n;
+        memcpy(&code_n, resp[i], 4);
+        ASSERT_EQ((int32_t)ntohl(code_n), (int32_t)VIRP_ERR_SESSION_INVALID);
+    }
+
+    /* Handshake, then the same batch must yield verifiable v2 wire
+     * messages for both items */
+    uint8_t hs[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request(
+        "{\"action\": \"session_hello\", \"client_id\": \"batch-v2\", "
+        "\"client_nonce\": \"8899aabbccddeeff\"}", hs, sizeof(hs));
+    ASSERT_TRUE(n > 0);
+    hs[n] = '\0';
+    char sid[64], cn[32], sn[32];
+    ASSERT_TRUE(json_find_str((const char *)hs, "session_id", sid, sizeof(sid)));
+    ASSERT_TRUE(json_find_str((const char *)hs, "client_nonce", cn, sizeof(cn)));
+    ASSERT_TRUE(json_find_str((const char *)hs, "server_nonce", sn, sizeof(sn)));
+    char bind_req[512];
+    snprintf(bind_req, sizeof(bind_req),
+             "{\"action\": \"session_bind\", \"client_id\": \"batch-v2\", "
+             "\"session_id\": \"%s\", \"client_nonce\": \"%s\", "
+             "\"server_nonce\": \"%s\"}", sid, cn, sn);
+    n = client_request(bind_req, hs, sizeof(hs));
+    ASSERT_TRUE(n > 0);
+
+    count = client_batch_request(
+        "{\"action\":\"batch_execute\",\"obs_version\":2,\"commands\":["
+        "{\"device\":\"R5\",\"command\":\"show version\"},"
+        "{\"device\":\"R6\",\"command\":\"show ip route\"}"
+        "]}",
+        resp, resp_len, 4);
+    ASSERT_EQ(count, 2);
+
+    virp_seqstore_t store;
+    ASSERT_OK(virp_seqstore_init(&store, NULL));
+    virp_obs_header_v2_t hdr;
+
+    ASSERT_OK(virp_verify_observation_v2(g_state.ctx,
+        virp_device_id_from_hostname("R5"), "show version",
+        resp[0], resp_len[0], 0, &store, &hdr, NULL, NULL));
+    ASSERT_EQ(hdr.version, VIRP_VERSION_2);
+
+    ASSERT_OK(virp_verify_observation_v2(g_state.ctx,
+        virp_device_id_from_hostname("R6"), "show ip route",
+        resp[1], resp_len[1], 0, &store, &hdr, NULL, NULL));
+    ASSERT_EQ(hdr.version, VIRP_VERSION_2);
+
+    virp_seqstore_destroy(&store);
+
+    /* Over-long command pre-flight: must fail BEFORE device I/O with
+     * INVALID_LENGTH (canonical form exceeds the 512-byte hash buffer) */
+    {
+        char long_cmd[700];
+        memset(long_cmd, 'x', sizeof(long_cmd) - 1);
+        long_cmd[sizeof(long_cmd) - 1] = '\0';
+        char req_buf[1200];
+        snprintf(req_buf, sizeof(req_buf),
+                 "{\"action\":\"execute\",\"device\":\"R6\","
+                 "\"command\":\"%s\",\"obs_version\":2}", long_cmd);
+        uint8_t r2[64];
+        ssize_t rn = client_request(req_buf, r2, sizeof(r2));
+        ASSERT_EQ((int)rn, 4);
+        uint32_t code_n;
+        memcpy(&code_n, r2, 4);
+        ASSERT_EQ((int32_t)ntohl(code_n), (int32_t)VIRP_ERR_INVALID_LENGTH);
+    }
+
+    n = client_request("{\"action\": \"session_close\"}", hs, sizeof(hs));
+    ASSERT_TRUE(n > 0);
+}
+
 TEST(test_batch_execute_four_devices)
 {
     uint8_t resp[4][VIRP_MAX_MESSAGE_SIZE];
@@ -1221,6 +1313,57 @@ extern int load_devices(onode_state_t *state, const char *path);
 
 #define WRONG_TYPE_CFG  "/tmp/virp-onode-wrongtype.json"
 
+/*
+ * SHADOW-mode audit honesty on the SUCCESS path (Item 1 hardening):
+ * an unclassifiable command that EXECUTES under SHADOW must be stamped
+ * UNCLASSIFIED on the wire — not clamped to GREEN. This coverage moved
+ * here when the mock driver gained a classifier and the daemon default
+ * became ENFORCE (where unclassified commands are blocked instead).
+ */
+TEST(test_shadow_executes_unclassified_with_honest_tier)
+{
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0003, NULL,
+                         "/tmp/virp-onode-shadow.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+    tmp.gate_default_mode = GATE_MODE_SHADOW;    /* explicit opt-in */
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "R-SHADOW");
+    snprintf(dev.host, sizeof(dev.host), "10.0.0.98");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0BADCAFE;
+    dev.enabled = true;
+    ASSERT_OK(onode_add_device(&tmp, &dev));
+
+    /* "frobnicate ..." is UNCLASSIFIED for the mock classifier; under
+     * SHADOW it must still execute (mock returns an IOS-style error
+     * output) and the observation must record UNCLASSIFIED honestly */
+    uint8_t obs_buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t obs_len = 0;
+    ASSERT_OK(onode_execute(&tmp, "R-SHADOW", "frobnicate the widget",
+                            obs_buf, sizeof(obs_buf), &obs_len));
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs_buf, obs_len, &tmp.okey, &hdr));
+    ASSERT_EQ(hdr.tier, VIRP_TIER_UNCLASSIFIED);
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs_buf + VIRP_HEADER_SIZE,
+                                     obs_len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    /* the command actually ran (mock echoes hostname#command) */
+    ASSERT_TRUE(strstr((const char *)data, "R-SHADOW#frobnicate") != NULL);
+
+    virp_context_destroy(tmp.ctx);
+    onode_destroy(&tmp);
+}
+
 TEST(test_load_devices_wrong_type_does_not_crash)
 {
     FILE *f = fopen(WRONG_TYPE_CFG, "w");
@@ -1451,6 +1594,7 @@ int main(void)
 
     printf("\n[Gate observation-tier honesty (Item 1 hardening)]\n");
     RUN_TEST(test_gate_obs_tier_honesty);
+    RUN_TEST(test_shadow_executes_unclassified_with_honest_tier);
 
     printf("\n[hex_decode Unit Tests]\n");
     RUN_TEST(test_hex_decode_empty_string);
@@ -1479,6 +1623,7 @@ int main(void)
 
     printf("\n[O-Node Batch Execution Tests]\n");
     RUN_TEST(test_batch_execute_two_devices);
+    RUN_TEST(test_batch_execute_v2_honors_obs_version);
     RUN_TEST(test_batch_execute_four_devices);
     RUN_TEST(test_batch_execute_not_found_device);
     RUN_TEST(test_batch_execute_parallel_timing);

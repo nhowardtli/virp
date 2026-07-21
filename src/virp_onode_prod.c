@@ -439,9 +439,8 @@ int load_devices(onode_state_t *state, const char *path)
             continue;
         }
 
-        if (device.device_id == 0)
-            device.device_id = virp_device_id_from_hostname(device.hostname);
-
+        /* device_id == 0 (absent/unparseable) is derived from the
+         * hostname inside onode_add_device — the single choke point. */
         virp_error_t err = onode_add_device(state, &device);
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] Failed to add %s: %s\n",

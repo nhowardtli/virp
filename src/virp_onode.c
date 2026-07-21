@@ -584,6 +584,17 @@ virp_error_t onode_execute_obs(onode_state_t *state,
         pthread_mutex_unlock(&state->session_mutex);
         if (!ok)
             return VIRP_ERR_SESSION_INVALID;
+
+        /* The v2 header binds SHA-256 of the canonicalized command,
+         * which virp_sign_observation_v2 canonicalizes into a 512-byte
+         * buffer. Check that limit BEFORE any device I/O — otherwise
+         * an over-long command would execute on the device and only
+         * then fail signing, leaving a state change with no signed
+         * observation of it. */
+        char canon_probe[512];
+        if (virp_canonicalize_command(command, canon_probe,
+                                      sizeof(canon_probe)) < 0)
+            return VIRP_ERR_INVALID_LENGTH;
     }
 
     /* Find device */
@@ -902,6 +913,7 @@ typedef struct {
     onode_state_t   *state;
     char            device[64];
     char            command[1024];
+    int             obs_version;    /* 1 = legacy O-Key, 2 = session-bound */
     uint8_t         *resp_buf;      /* heap-allocated, VIRP_MAX_MESSAGE_SIZE */
     size_t          resp_len;
     virp_error_t    err;
@@ -911,9 +923,10 @@ static void *batch_execute_thread(void *arg)
 {
     batch_thread_arg_t *bta = (batch_thread_arg_t *)arg;
     bta->resp_len = 0;
-    bta->err = onode_execute(bta->state, bta->device, bta->command,
-                              bta->resp_buf, VIRP_MAX_MESSAGE_SIZE,
-                              &bta->resp_len);
+    bta->err = onode_execute_obs(bta->state, bta->device, bta->command,
+                                 bta->obs_version,
+                                 bta->resp_buf, VIRP_MAX_MESSAGE_SIZE,
+                                 &bta->resp_len);
     return NULL;
 }
 
@@ -1550,6 +1563,10 @@ static void handle_client(onode_state_t *state, int client_fd)
         bool alloc_ok = true;
         for (int i = 0; i < cmd_count; i++) {
             args[i].state = state;
+            /* Top-level obs_version applies to every batch item — a
+             * batch that asked for session binding must never be
+             * silently served master-key v1 observations. */
+            args[i].obs_version = req.obs_version;
             args[i].resp_buf = malloc(VIRP_MAX_MESSAGE_SIZE);
             if (!args[i].resp_buf) { alloc_ok = false; break; }
         }
@@ -2173,7 +2190,10 @@ virp_error_t onode_init(onode_state_t *state,
      * blocked under this default; deployments that need them must opt
      * them into shadow explicitly via gate_modes in devices.json.
      * Config (gate_default_mode / gate_modes / gate_max_tier) may
-     * override in load_devices() before onode_start(). */
+     * override via the PROD loader (load_gate_config in
+     * virp_onode_prod.c) before onode_start(); the dev loader in
+     * virp_onode_main.c parses no gate keys, so the dev binary always
+     * runs the compiled-in ENFORCE default. */
     state->gate_default_mode = GATE_MODE_ENFORCE;
     state->gate_overrides_count = 0;
     state->gate_max_tier = VIRP_TIER_YELLOW;

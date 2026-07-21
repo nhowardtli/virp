@@ -208,6 +208,13 @@ virp_error_t virp_build_observation_v2(
  * now_ns: verifier clock in nanoseconds; pass 0 to use CLOCK_REALTIME.
  *         (Injectable so staleness is testable with a mocked clock.)
  * seq_store: required — replay protection is not optional.
+ *         Ordering caveat: seq acceptance is strictly monotonic per
+ *         (session_id, node_id). A client that issues CONCURRENT
+ *         requests on one session for the same device and verifies
+ *         responses out of arrival order will reject the late-arriving
+ *         (lower-seq) genuine observation as a replay. Serialize
+ *         verification per (session, device), or use one session per
+ *         concurrent stream.
  * hdr_out / payload_out / payload_len_out: optional; filled only on
  *         VIRP_OK. payload_out points into msg.
  */

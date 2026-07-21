@@ -35,6 +35,14 @@ type ONodeRequest struct {
 	Device  string `json:"device,omitempty"`
 	Command string `json:"command,omitempty"`
 
+	// ObsVersion selects the observation signing path. This Go port
+	// implements only v1 (static O-Key); it has no session handshake,
+	// so a request for session-bound v2 observations MUST be refused
+	// with ErrSessionInvalid — never silently served v1. Mirrors the
+	// C daemon's contract in include/virp_onode.h. Zero (absent)
+	// means v1.
+	ObsVersion int `json:"obs_version,omitempty"`
+
 	// Chain fields
 	SessionID    string `json:"session_id,omitempty"`
 	ArtifactType string `json:"artifact_type,omitempty"`
@@ -255,6 +263,12 @@ func (on *ONode) handleExecute(conn net.Conn, req *ONodeRequest) {
 		on.sendErrorCode(conn, ErrNullPtr)
 		return
 	}
+	if req.ObsVersion >= 2 {
+		// No session support in this port: refuse rather than
+		// silently downgrade a session-binding request to v1.
+		on.sendErrorCode(conn, ErrSessionInvalid)
+		return
+	}
 
 	dev := on.findDevice(req.Device)
 	if dev == nil {
@@ -286,6 +300,10 @@ func (on *ONode) handleExecute(conn net.Conn, req *ONodeRequest) {
 func (on *ONode) handleHealth(conn net.Conn, req *ONodeRequest) {
 	if req.Device == "" {
 		on.sendErrorCode(conn, ErrNullPtr)
+		return
+	}
+	if req.ObsVersion >= 2 {
+		on.sendErrorCode(conn, ErrSessionInvalid)
 		return
 	}
 	dev := on.findDevice(req.Device)

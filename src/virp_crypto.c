@@ -406,6 +406,22 @@ virp_error_t virp_verify(virp_context_t *ctx,
  * V2 Observation Signing
  * ========================================================================= */
 
+/*
+ * SHA-256 of the canonicalized command — the ONE definition of the v2
+ * command hash, shared by signer and verifier. Two inlined copies here
+ * previously had to stay byte-identical or signer and verifier would
+ * disagree on every command.
+ */
+static virp_error_t command_hash(const char *command, uint8_t out[32])
+{
+    char canon[512];
+    int canon_len = virp_canonicalize_command(command, canon, sizeof(canon));
+    if (canon_len < 0)
+        return VIRP_ERR_INVALID_LENGTH;
+    SHA256((uint8_t *)canon, (size_t)canon_len, out);
+    return VIRP_OK;
+}
+
 virp_error_t virp_sign_observation_v2(
     virp_context_t *ctx,
     uint64_t       node_id,
@@ -419,6 +435,12 @@ virp_error_t virp_sign_observation_v2(
 {
     if (!ctx || !command || !payload || !hdr_out || !sig_out)
         return VIRP_ERR_NULL_PTR;
+
+    /* Bound payload_len BEFORE any size arithmetic: a huge value (e.g.
+     * a negative length cast to size_t) would wrap the sums below and
+     * defeat the buffer checks. */
+    if (payload_len > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
 
     /* v2 observations require an active session with derived key */
     virp_error_t serr = virp_session_require_active(ctx);
@@ -455,10 +477,8 @@ virp_error_t virp_sign_observation_v2(
     memcpy(hdr.session_id, ctx->session.session_id, 16);
 
     /* canonicalize command and hash it */
-    char canon[512];
-    int canon_len = virp_canonicalize_command(command, canon, sizeof(canon));
-    if (canon_len < 0) return VIRP_ERR_INVALID_LENGTH;
-    SHA256((uint8_t *)canon, (size_t)canon_len, hdr.command_hash);
+    virp_error_t cherr = command_hash(command, hdr.command_hash);
+    if (cherr != VIRP_OK) return cherr;
 
     /*
      * HMAC-SHA256 over serialized header || payload. The signed bytes
@@ -495,6 +515,10 @@ virp_error_t virp_build_observation_v2(
 {
     if (!out_buf || !out_len)
         return VIRP_ERR_NULL_PTR;
+
+    /* Same wraparound guard as sign: bound before arithmetic. */
+    if (payload_len > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
 
     size_t total = VIRP_OBS_V2_HEADER_SIZE + payload_len +
                    VIRP_OBS_V2_SIG_SIZE;
@@ -552,10 +576,8 @@ virp_error_t virp_verify_observation_v2(
      */
     size_t signed_len = msg_len - VIRP_OBS_V2_SIG_SIZE;
     uint8_t expected_sig[VIRP_OBS_V2_SIG_SIZE];
-    unsigned int sig_len = VIRP_OBS_V2_SIG_SIZE;
-    if (!HMAC(EVP_sha256(), ctx->session.session_key, 32,
-              msg, signed_len, expected_sig, &sig_len))
-        return VIRP_ERR_CRYPTO;
+    virp_hmac_sha256(ctx->session.session_key, msg, signed_len,
+                     expected_sig);
     if (!virp_consttime_eq(msg + signed_len, expected_sig,
                            VIRP_OBS_V2_SIG_SIZE))
         return VIRP_ERR_HMAC_FAILED;
@@ -589,12 +611,9 @@ virp_error_t virp_verify_observation_v2(
 
     /* Check 5 — command binding */
     {
-        char canon[512];
-        int canon_len = virp_canonicalize_command(expected_command, canon,
-                                                  sizeof(canon));
-        if (canon_len < 0) return VIRP_ERR_INVALID_LENGTH;
         uint8_t expected_hash[32];
-        SHA256((uint8_t *)canon, (size_t)canon_len, expected_hash);
+        err = command_hash(expected_command, expected_hash);
+        if (err != VIRP_OK) return err;
         if (!virp_consttime_eq(hdr.command_hash, expected_hash, 32))
             return VIRP_ERR_CONTEXT_MISMATCH;
     }
