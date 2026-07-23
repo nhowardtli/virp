@@ -22,7 +22,16 @@ import (
 	"time"
 )
 
-const cInteropBin = "/opt/virp/build/test_interop_c"
+// cInteropBin resolves the C interop tool. VIRP_INTEROP_BIN overrides
+// the deployed default so the artifact-based interop tests can run
+// pre-deploy against a local build (the Makefile's test-interop target
+// points it at build/test_interop_c).
+var cInteropBin = func() string {
+	if p := os.Getenv("VIRP_INTEROP_BIN"); p != "" {
+		return p
+	}
+	return "/opt/virp/build/test_interop_c"
+}()
 
 // writeMsgFile writes messages in the interop format: [4-byte BE length][message]
 func writeMsgFile(path string, messages [][]byte) error {
@@ -295,8 +304,21 @@ func TestInterop_BidirectionalRoundTrip(t *testing.T) {
 	t.Logf("Go validated %d C messages OK", len(cMsgs))
 }
 
-// TestInterop_LiveCONode talks to the running C O-Node daemon over its socket.
+// TestInterop_LiveCONode talks to the running C O-Node daemon over its
+// socket — and through it to REAL devices (FORTIGATE-200G, SW-3850).
+//
+// Fenced behind VIRP_LIVE_INTEROP=1 (`make live-interop`): a default
+// `make all-tests` run must never touch a live device. KNOWN STALE:
+// this test still speaks the pre-framing protocol (raw JSON, single
+// read) which the daemon now rejects by design; it needs a rewrite to
+// the v2 framed protocol ([4-byte BE length][version][JSON] requests,
+// length-prefixed responses) before it can pass again. It must also run
+// as a uid on the daemon's SO_PEERCRED allowlist.
 func TestInterop_LiveCONode(t *testing.T) {
+	if os.Getenv("VIRP_LIVE_INTEROP") != "1" {
+		t.Skip("live-device test — opt in with VIRP_LIVE_INTEROP=1 (make live-interop)")
+	}
+
 	socketPath := "/tmp/virp-onode.sock"
 	okeyPath := "/etc/virp/keys/onode.key"
 

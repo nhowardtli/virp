@@ -313,8 +313,24 @@ GO_DIR       = implementations/go
 $(TEST_INTEROP): tests/test_interop_c.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
+# Artifact-based C<->Go interop tests. VIRP_INTEROP_BIN points the Go
+# tests at the freshly built local binary so they run pre-deploy
+# (unset, they fall back to the deployed /opt/virp/build path). The
+# live-daemon test is NOT run here — it is fenced behind
+# VIRP_LIVE_INTEROP=1 (see live-interop below) so the default battery
+# never touches a live device.
 test-interop: $(TEST_INTEROP)
-	cd $(GO_DIR) && go test ./virp/ -run TestInterop -v -count=1
+	cd $(GO_DIR) && VIRP_INTEROP_BIN=$(abspath $(TEST_INTEROP)) \
+		go test ./virp/ -run TestInterop -v -count=1
+
+# Opt-in ONLY: drives the deployed daemon and REAL devices
+# (FORTIGATE-200G, SW-3850). Known stale — needs the framed-protocol
+# rewrite (see TestInterop_LiveCONode) — and must run as a uid on the
+# daemon's SO_PEERCRED allowlist.
+.PHONY: live-interop
+live-interop:
+	cd $(GO_DIR) && VIRP_LIVE_INTEROP=1 \
+		go test ./virp/ -run TestInterop_LiveCONode -v -count=1
 
 # ASA driver tests
 TEST_ASA = $(BUILD_DIR)/test_driver_asa
