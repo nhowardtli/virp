@@ -54,6 +54,21 @@
 #define VIRP_APPROVAL_ID_HEX_LEN    32      /* 16 random bytes, lowercase hex */
 #define VIRP_APPROVAL_DIR_MAX       256
 
+/*
+ * Canonical approval payload — the exact bytes the approver signs.
+ * Padding-free, network byte order, built by the daemon from its own
+ * proposal record (never from client input). Layout:
+ *   off  0  magic        "VAP1" (4 bytes)
+ *   off  4  proposal_id  (16 bytes — the raw random id)
+ *   off 20  command_hash (32 bytes — SHA-256 of the canonical command)
+ *   off 52  device_id    (8 bytes, big-endian — device node_id)
+ *   off 60  approved_at  (8 bytes, big-endian — ns since epoch)
+ *   off 68  ttl_seconds  (4 bytes, big-endian)
+ *   = 72 bytes
+ */
+#define VIRP_APPROVAL_CANON_SIZE    72
+#define VIRP_APPROVAL_CANON_MAGIC   "VAP1"
+
 typedef struct {
     char     proposal_id[VIRP_APPROVAL_ID_HEX_LEN + 1];
     char     session_id[64];
@@ -75,7 +90,8 @@ typedef struct {
     uint64_t approved_at_ns;
     uint32_t ttl_seconds;
     char     approver_key_id[2 * VIRP_FED_KEYID_SIZE + 1];
-    uint8_t  sig[VIRP_FED_SIG_SIZE];
+    char     operator[64];              /* enrolled operator, "" if unknown */
+    uint8_t  sig[VIRP_APPROVER_SIG_SIZE];  /* over the canonical payload */
     char     chain_entry_hash[65];      /* APPROVAL chain entry ("" if none) */
 } virp_approval_rec_t;
 
@@ -104,29 +120,75 @@ virp_error_t virp_approval_load_proposal(const char *dir,
                                          const char *proposal_id,
                                          virp_proposal_rec_t *out);
 
-/*
- * APPROVE. Loads the proposal, binds {command_hash, device,
- * device_node_id, approved_at=now, ttl=300s}, signs with kp (Ed25519
- * approval keypair), writes the approval record, and (when chain is
- * non-NULL) appends an APPROVAL chain entry with artifact_id
- * "approval:<id>". Fills *out.
- */
-virp_error_t virp_approval_approve(const char *dir,
-                                   const virp_fed_keypair_t *kp,
-                                   const char *proposal_id,
-                                   virp_chain_state_t *chain,
-                                   virp_approval_rec_t *out);
+/* Result of virp_approval_challenge() — the bytes to sign plus the
+ * proposal summary fields a client shows the approver before signing. */
+typedef struct {
+    char     proposal_id[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    uint8_t  canonical[VIRP_APPROVAL_CANON_SIZE];
+    char     device[64];
+    char     command[1024];
+    char     command_hash[65];
+    char     tier[16];
+    uint32_t device_node_id;
+    uint64_t approved_at_ns;
+    uint32_t ttl_seconds;
+} virp_approval_challenge_t;
 
 /*
- * Test/administrative helper: sign rec with kp and write it as the
- * approval record for rec->proposal_id. virp_approval_approve() uses
- * this internally; negative-path tests use it to craft approvals with
- * hostile bindings (elapsed TTL, wrong hash/device) that still carry a
- * valid signature.
+ * Build the VIRP_APPROVAL_CANON_SIZE canonical payload from its fields.
+ * proposal_id_hex (32 hex) and command_hash_hex (64 hex) are decoded to
+ * raw bytes; device_id/approved_at/ttl are stamped big-endian. Exposed
+ * so the daemon, the apply-side verifier, and tests all agree byte for
+ * byte. Returns VIRP_OK or VIRP_ERR_INVALID_LENGTH on bad hex.
  */
-virp_error_t virp_approval_write_signed(const char *dir,
-                                        const virp_fed_keypair_t *kp,
-                                        virp_approval_rec_t *rec);
+virp_error_t virp_approval_build_canonical(const char *proposal_id_hex,
+                                           const char *command_hash_hex,
+                                           uint32_t device_node_id,
+                                           uint64_t approved_at_ns,
+                                           uint32_t ttl_seconds,
+                                           uint8_t out[VIRP_APPROVAL_CANON_SIZE]);
+
+/*
+ * CHALLENGE. Builds the canonical payload to sign for proposal_id and
+ * persists a pending-challenge record (so submit reconstructs the exact
+ * bytes). Stamps approved_at = now_ns (0 = CLOCK_REALTIME) and
+ * ttl = 300 s. Refuses with VIRP_ERR_APPROVAL_CONSUMED if the proposal
+ * already has an OUTCOME chain entry (chain must be non-NULL for that
+ * check; NULL skips it). VIRP_ERR_APPROVAL_NOT_FOUND if no such proposal.
+ */
+virp_error_t virp_approval_challenge(const char *dir,
+                                     virp_chain_state_t *chain,
+                                     const char *proposal_id,
+                                     uint64_t now_ns,
+                                     virp_approval_challenge_t *out);
+
+/*
+ * SUBMIT. Reconstructs the canonical bytes from the pending challenge,
+ * verifies sig against the enrolled key_id in reg (unenrolled -> -43,
+ * disabled -> -44, bad signature -> -40), then — as the SOLE chain
+ * writer — appends the APPROVAL chain entry (carrying key_id + operator)
+ * and writes the approval record apply will read. Refuses with
+ * VIRP_ERR_APPROVAL_CONSUMED if an OUTCOME already exists. Fills *out.
+ */
+virp_error_t virp_approval_submit(const char *dir,
+                                  const virp_approver_registry_t *reg,
+                                  virp_chain_state_t *chain,
+                                  const char *proposal_id,
+                                  const char *key_id,
+                                  const uint8_t *sig, size_t sig_len,
+                                  virp_approval_rec_t *out);
+
+/*
+ * Test/administrative helper: write the approval record for
+ * rec->proposal_id carrying sig (over the canonical bytes) and
+ * rec->chain_entry_hash. virp_approval_submit() uses it internally;
+ * negative-path tests use it to craft approvals with hostile bindings
+ * (elapsed TTL, wrong hash/device) that still carry a valid signature
+ * over their (hostile) canonical bytes.
+ */
+virp_error_t virp_approval_write_record(const char *dir,
+                                        const virp_approval_rec_t *rec,
+                                        const uint8_t *sig, size_t sig_len);
 
 /*
  * APPLY-side verification. Runs the checks IN ORDER and returns the

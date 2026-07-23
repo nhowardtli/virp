@@ -195,6 +195,64 @@ static int propose_via_block(onode_state_t *st, const char *device,
     return extract_pid(payload, pid_out);
 }
 
+static void keyid_hex(const virp_fed_keypair_t *kp, char out[33])
+{
+    for (int i = 0; i < VIRP_FED_KEYID_SIZE; i++)
+        snprintf(out + i * 2, 3, "%02x", kp->key_id[i]);
+}
+
+/* Full library-level approve: challenge -> sign canonical with kp ->
+ * submit (daemon writes the APPROVAL chain entry). */
+static virp_error_t do_approve_kp(const char *pid, const virp_fed_keypair_t *kp,
+                                  virp_approval_rec_t *apr)
+{
+    virp_approval_challenge_t ch;
+    virp_error_t err = virp_approval_challenge(DIR, &g.chain, pid, 0, &ch);
+    if (err != VIRP_OK) return err;
+    uint8_t sig[VIRP_APPROVER_SIG_SIZE];
+    if (virp_fed_sign(kp, ch.canonical, VIRP_APPROVAL_CANON_SIZE, sig)
+            != VIRP_OK)
+        return VIRP_ERR_CRYPTO;
+    char kid[33];
+    keyid_hex(kp, kid);
+    return virp_approval_submit(DIR, &g.approvers, &g.chain, pid, kid,
+                                sig, sizeof(sig), apr);
+}
+
+static virp_error_t do_approve(const char *pid, virp_approval_rec_t *apr)
+{
+    return do_approve_kp(pid, &g_kp, apr);
+}
+
+/* Craft an approval record signed by kp over hostile canonical bytes
+ * (arbitrary command_hash / device_node_id / approved_at / ttl) and write
+ * it directly — bypassing challenge/submit — so apply-side checks can be
+ * exercised against a validly-signed-but-hostile approval. */
+static virp_error_t craft_record(const char *pid, const virp_fed_keypair_t *kp,
+                                 const char *command_hash, const char *device,
+                                 uint32_t node_id, uint64_t approved_at_ns,
+                                 uint32_t ttl)
+{
+    uint8_t canon[VIRP_APPROVAL_CANON_SIZE];
+    virp_error_t err = virp_approval_build_canonical(pid, command_hash, node_id,
+                                                     approved_at_ns, ttl, canon);
+    if (err != VIRP_OK) return err;
+    uint8_t sig[VIRP_APPROVER_SIG_SIZE];
+    if (virp_fed_sign(kp, canon, sizeof(canon), sig) != VIRP_OK)
+        return VIRP_ERR_CRYPTO;
+
+    virp_approval_rec_t rec;
+    memset(&rec, 0, sizeof(rec));
+    snprintf(rec.proposal_id, sizeof(rec.proposal_id), "%s", pid);
+    snprintf(rec.command_hash, sizeof(rec.command_hash), "%s", command_hash);
+    snprintf(rec.device, sizeof(rec.device), "%s", device);
+    rec.device_node_id = node_id;
+    rec.approved_at_ns = approved_at_ns;
+    rec.ttl_seconds = ttl;
+    keyid_hex(kp, rec.approver_key_id);
+    return virp_approval_write_record(DIR, &rec, sig, sizeof(sig));
+}
+
 /* =========================================================================
  * Tests
  * ========================================================================= */
@@ -239,10 +297,11 @@ static void test_e2e_propose_approve_apply(void)
 {
     TEST("E2E: propose -> approve -> apply -> OUTCOME linked");
     virp_approval_rec_t apr;
-    ASSERT(virp_approval_approve(DIR, &g_kp, g_pid_e2e, &g.chain, &apr)
-               == VIRP_OK, "approve failed");
+    ASSERT(do_approve(g_pid_e2e, &apr) == VIRP_OK, "approve failed");
     ASSERT(apr.ttl_seconds == VIRP_APPROVAL_TTL_SECONDS, "TTL not 300s");
     ASSERT(apr.chain_entry_hash[0] != '\0', "APPROVAL chain entry missing");
+    ASSERT(strcmp(apr.operator, "test-operator") == 0,
+           "APPROVAL must carry the enrolled operator");
 
     uint8_t ot, tier;
     char payload[2048];
@@ -295,18 +354,12 @@ static void test_expired_approval_rejected(void)
     virp_proposal_rec_t prop;
     ASSERT(virp_approval_load_proposal(DIR, pid, &prop) == VIRP_OK,
            "proposal missing");
-    virp_approval_rec_t apr;
-    memset(&apr, 0, sizeof(apr));
-    snprintf(apr.proposal_id, sizeof(apr.proposal_id), "%s", pid);
-    snprintf(apr.command_hash, sizeof(apr.command_hash), "%s",
-             prop.command_hash);
-    snprintf(apr.device, sizeof(apr.device), "%s", prop.device);
-    apr.device_node_id = prop.device_node_id;
-    apr.approved_at_ns = now_ns() -
+    uint64_t elapsed = now_ns() -
         ((uint64_t)VIRP_APPROVAL_TTL_SECONDS + 100) * 1000000000ULL;
-    apr.ttl_seconds = VIRP_APPROVAL_TTL_SECONDS;
-    ASSERT(virp_approval_write_signed(DIR, &g_kp, &apr) == VIRP_OK,
-           "write_signed failed");
+    ASSERT(craft_record(pid, &g_kp, prop.command_hash, prop.device,
+                        prop.device_node_id, elapsed,
+                        VIRP_APPROVAL_TTL_SECONDS) == VIRP_OK,
+           "craft expired record failed");
 
     uint8_t ot, tier;
     char payload[2048];
@@ -325,8 +378,7 @@ static void test_hash_mismatch_rejected(void)
     ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0,
            "propose failed");
     virp_approval_rec_t apr;
-    ASSERT(virp_approval_approve(DIR, &g_kp, pid, &g.chain, &apr) == VIRP_OK,
-           "approve failed");
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "approve failed");
 
     /* Apply a DIFFERENT (also RED) command under the same approval. */
     uint8_t ot, tier;
@@ -347,8 +399,7 @@ static void test_device_mismatch_rejected(void)
     ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0,
            "propose failed");
     virp_approval_rec_t apr;
-    ASSERT(virp_approval_approve(DIR, &g_kp, pid, &g.chain, &apr) == VIRP_OK,
-           "approve failed");
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "approve failed");
 
     uint8_t ot, tier;
     char payload[2048];
@@ -369,24 +420,18 @@ static void test_unenrolled_key_rejected(void)
            "propose failed");
 
     /* A rogue keypair (NOT in the registry) signs an otherwise-perfect
-     * approval. Its key_id resolves to nothing enrolled, so the daemon
-     * rejects it as unenrolled before ever checking the signature. */
+     * approval over correct canonical bytes. Its key_id resolves to
+     * nothing enrolled, so the daemon rejects it as unenrolled before
+     * ever checking the signature. */
     virp_fed_keypair_t rogue;
     ASSERT(virp_fed_generate(&rogue, 1) == VIRP_OK, "rogue keygen failed");
     virp_proposal_rec_t prop;
     ASSERT(virp_approval_load_proposal(DIR, pid, &prop) == VIRP_OK,
            "proposal missing");
-    virp_approval_rec_t apr;
-    memset(&apr, 0, sizeof(apr));
-    snprintf(apr.proposal_id, sizeof(apr.proposal_id), "%s", pid);
-    snprintf(apr.command_hash, sizeof(apr.command_hash), "%s",
-             prop.command_hash);
-    snprintf(apr.device, sizeof(apr.device), "%s", prop.device);
-    apr.device_node_id = prop.device_node_id;
-    apr.approved_at_ns = now_ns();
-    apr.ttl_seconds = VIRP_APPROVAL_TTL_SECONDS;
-    ASSERT(virp_approval_write_signed(DIR, &rogue, &apr) == VIRP_OK,
-           "write_signed failed");
+    ASSERT(craft_record(pid, &rogue, prop.command_hash, prop.device,
+                        prop.device_node_id, now_ns(),
+                        VIRP_APPROVAL_TTL_SECONDS) == VIRP_OK,
+           "craft rogue record failed");
     virp_fed_destroy(&rogue);
 
     uint8_t ot, tier;
@@ -435,8 +480,7 @@ static void test_reuse_survives_restart(void)
     ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0,
            "propose failed");
     virp_approval_rec_t apr;
-    ASSERT(virp_approval_approve(DIR, &g_kp, pid, &g.chain, &apr) == VIRP_OK,
-           "approve failed");
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "approve failed");
     uint8_t ot, tier;
     char payload[2048];
     ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,

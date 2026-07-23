@@ -114,6 +114,8 @@
 #define VIRP_OBS_INTENT_EXECUTED    0x0E    /* Intent execution counter updated */
 #define VIRP_OBS_ERROR              0x0F    /* Signed error: driver/transport failure */
 #define VIRP_OBS_VALIDATION_DECISION 0x10   /* Response-validator decision, signed by O-Node */
+#define VIRP_OBS_APPROVAL_CHALLENGE 0x11    /* Approval challenge: canonical bytes to sign */
+#define VIRP_OBS_APPROVAL_RESULT    0x12    /* Approval submit result (accepted) */
 
 /* =========================================================================
  * Observation Scope

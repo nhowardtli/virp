@@ -143,6 +143,16 @@ virp_error_t virp_chain_get_last(virp_chain_state_t *state,
                                  virp_chain_entry_t *entry);
 
 /*
+ * Set *exists to true iff any chain entry has the given artifact_id.
+ * Used by the approval flow to detect an existing OUTCOME (artifact_id
+ * "outcome:<proposal_id>") — the L1 enforcement point. Returns VIRP_OK
+ * on a successful query (whether or not it matched), an error otherwise.
+ */
+virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
+                                        const char *artifact_id,
+                                        bool *exists);
+
+/*
  * Clean up all resources.
  */
 void virp_chain_destroy(virp_chain_state_t *state);

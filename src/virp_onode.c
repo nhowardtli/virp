@@ -62,7 +62,9 @@ typedef struct {
     char            device[64];
     char            command[1024];
     int32_t         obs_version;            /* 1 = legacy O-Key, 2 = session-bound */
-    char            proposal_id[VIRP_APPROVAL_ID_HEX_LEN + 1]; /* apply ref */
+    char            proposal_id[VIRP_APPROVAL_ID_HEX_LEN + 1]; /* apply/approve ref */
+    char            signature[2 * VIRP_APPROVER_SIG_SIZE + 1]; /* approval submit sig (hex) */
+    char            key_id[VIRP_APPROVER_KEYID_HEX + 1];       /* approval submit key_id */
     /* Chain fields (Primitive 6) */
     char            session_id[64];
     char            artifact_type[16];
@@ -193,6 +195,10 @@ static bool parse_request(const char *json, onode_request_t *req)
         req->action = ONODE_ACTION_BATCH_EXECUTE;
     else if (strcmp(action_str, "validate_turn") == 0)
         req->action = ONODE_ACTION_VALIDATE_TURN;
+    else if (strcmp(action_str, "approval_challenge") == 0)
+        req->action = ONODE_ACTION_APPROVAL_CHALLENGE;
+    else if (strcmp(action_str, "approval_submit") == 0)
+        req->action = ONODE_ACTION_APPROVAL_SUBMIT;
     else if (strcmp(action_str, "session_hello") == 0)
         req->action = ONODE_ACTION_SESSION_HELLO;
     else if (strcmp(action_str, "session_bind") == 0)
@@ -232,6 +238,34 @@ static bool parse_request(const char *json, onode_request_t *req)
             }
             snprintf(req->proposal_id, sizeof(req->proposal_id), "%s",
                      pid->valuestring);
+        }
+    }
+
+    /* Approval submit: signature (128 hex) + key_id (32 hex). Strictly
+     * validated on the raw value; a malformed field rejects the request. */
+    {
+        cJSON *sg = cJSON_GetObjectItemCaseSensitive(root, "signature");
+        if (sg) {
+            if (!cJSON_IsString(sg) || !sg->valuestring ||
+                strlen(sg->valuestring) != 2 * VIRP_APPROVER_SIG_SIZE ||
+                strspn(sg->valuestring, "0123456789abcdef")
+                    != 2 * VIRP_APPROVER_SIG_SIZE) {
+                cJSON_Delete(root);
+                return false;
+            }
+            snprintf(req->signature, sizeof(req->signature), "%s",
+                     sg->valuestring);
+        }
+        cJSON *kd = cJSON_GetObjectItemCaseSensitive(root, "key_id");
+        if (kd) {
+            if (!cJSON_IsString(kd) || !kd->valuestring ||
+                strlen(kd->valuestring) != VIRP_APPROVER_KEYID_HEX ||
+                strspn(kd->valuestring, "0123456789abcdef")
+                    != VIRP_APPROVER_KEYID_HEX) {
+                cJSON_Delete(root);
+                return false;
+            }
+            snprintf(req->key_id, sizeof(req->key_id), "%s", kd->valuestring);
         }
     }
 
@@ -690,6 +724,123 @@ virp_error_t onode_set_approvers(onode_state_t *state,
     fprintf(stderr, "[APPROVAL] enabled: dir=%s registry=%s keys=%zu\n",
             dir, registry_path, state->approvers.count);
     return VIRP_OK;
+}
+
+/* =========================================================================
+ * Approval submission handlers (daemon is the sole chain writer)
+ * ========================================================================= */
+
+static void hex_of(const uint8_t *in, size_t n, char *out)
+{
+    for (size_t i = 0; i < n; i++)
+        snprintf(out + i * 2, 3, "%02x", in[i]);
+}
+
+/* APPROVAL_CHALLENGE: return the canonical bytes to sign plus the proposal
+ * summary, as an O-Key-signed observation. */
+static virp_error_t onode_approval_challenge(onode_state_t *state,
+                                             const char *proposal_id,
+                                             uint8_t *out_buf,
+                                             size_t out_buf_len,
+                                             size_t *out_len)
+{
+    if (!state->approval_dir[0] || !state->approvers_loaded)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    virp_approval_challenge_t ch;
+    virp_error_t err = virp_approval_challenge(
+            state->approval_dir,
+            state->chain_enabled ? &state->chain : NULL,
+            proposal_id, 0, &ch);
+    if (err != VIRP_OK) {
+        fprintf(stderr, "[APPROVAL] challenge rejected: proposal=%s code=%d "
+                "(%s)\n", proposal_id, (int)err, virp_approval_err_name(err));
+        return err;
+    }
+
+    char canon_hex[2 * VIRP_APPROVAL_CANON_SIZE + 1];
+    hex_of(ch.canonical, VIRP_APPROVAL_CANON_SIZE, canon_hex);
+
+    cJSON *o = cJSON_CreateObject();
+    if (!o) return VIRP_ERR_BUFFER_TOO_SMALL;
+    cJSON_AddStringToObject(o, "proposal_id", ch.proposal_id);
+    cJSON_AddStringToObject(o, "canonical", canon_hex);
+    cJSON_AddStringToObject(o, "device", ch.device);
+    cJSON_AddStringToObject(o, "command", ch.command);
+    cJSON_AddStringToObject(o, "command_hash", ch.command_hash);
+    cJSON_AddStringToObject(o, "tier", ch.tier);
+    cJSON_AddNumberToObject(o, "device_node_id", (double)ch.device_node_id);
+    cJSON_AddNumberToObject(o, "approved_at_ns", (double)ch.approved_at_ns);
+    cJSON_AddNumberToObject(o, "ttl_seconds", (double)ch.ttl_seconds);
+    char *json = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    if (!json) return VIRP_ERR_BUFFER_TOO_SMALL;
+
+    fprintf(stderr, "[APPROVAL] challenge issued: proposal=%s device=%s "
+            "tier=%s approved_at=%llu ttl=%u\n", ch.proposal_id, ch.device,
+            ch.tier, (unsigned long long)ch.approved_at_ns, ch.ttl_seconds);
+
+    err = virp_build_observation(out_buf, out_buf_len, out_len,
+                                 state->node_id, onode_next_seq(state),
+                                 VIRP_OBS_APPROVAL_CHALLENGE, VIRP_SCOPE_LOCAL,
+                                 (const uint8_t *)json, (uint16_t)strlen(json),
+                                 &state->okey);
+    cJSON_free(json);
+    return err;
+}
+
+/* APPROVAL_SUBMIT: verify the signature against the enrolled key, append
+ * the APPROVAL chain entry (daemon-side), return an O-Key-signed result. */
+static virp_error_t onode_approval_submit(onode_state_t *state,
+                                          const char *proposal_id,
+                                          const char *key_id,
+                                          const char *sig_hex,
+                                          uint8_t *out_buf, size_t out_buf_len,
+                                          size_t *out_len)
+{
+    if (!state->approval_dir[0] || !state->approvers_loaded)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    uint8_t sig[VIRP_APPROVER_SIG_SIZE];
+    if (virp_hex_decode(sig_hex, sig, sizeof(sig)) != (int)sizeof(sig))
+        return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
+
+    virp_approval_rec_t apr;
+    virp_error_t err = virp_approval_submit(
+            state->approval_dir, &state->approvers,
+            state->chain_enabled ? &state->chain : NULL,
+            proposal_id, key_id, sig, sizeof(sig), &apr);
+    if (err != VIRP_OK) {
+        fprintf(stderr, "[APPROVAL] submit rejected: proposal=%s key_id=%s "
+                "code=%d (%s)\n", proposal_id, key_id, (int)err,
+                virp_approval_err_name(err));
+        return err;
+    }
+
+    fprintf(stderr, "[APPROVAL] submitted: proposal=%s key_id=%s operator=%s "
+            "chain=%.16s\n", apr.proposal_id, apr.approver_key_id,
+            apr.operator[0] ? apr.operator : "(unknown)",
+            apr.chain_entry_hash[0] ? apr.chain_entry_hash : "-");
+
+    cJSON *o = cJSON_CreateObject();
+    if (!o) return VIRP_ERR_BUFFER_TOO_SMALL;
+    cJSON_AddStringToObject(o, "proposal_id", apr.proposal_id);
+    cJSON_AddStringToObject(o, "approver_key_id", apr.approver_key_id);
+    cJSON_AddStringToObject(o, "operator", apr.operator);
+    cJSON_AddStringToObject(o, "chain_entry_hash", apr.chain_entry_hash);
+    cJSON_AddNumberToObject(o, "approved_at_ns", (double)apr.approved_at_ns);
+    cJSON_AddNumberToObject(o, "ttl_seconds", (double)apr.ttl_seconds);
+    char *json = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    if (!json) return VIRP_ERR_BUFFER_TOO_SMALL;
+
+    err = virp_build_observation(out_buf, out_buf_len, out_len,
+                                 state->node_id, onode_next_seq(state),
+                                 VIRP_OBS_APPROVAL_RESULT, VIRP_SCOPE_LOCAL,
+                                 (const uint8_t *)json, (uint16_t)strlen(json),
+                                 &state->okey);
+    cJSON_free(json);
+    return err;
 }
 
 /* Proposer identity for a PROPOSAL record: the active v2 session id if
@@ -2053,6 +2204,38 @@ static void handle_client(onode_state_t *state, int client_fd)
     validate_turn_done:
         break;
     }
+
+    case ONODE_ACTION_APPROVAL_CHALLENGE:
+        if (req.proposal_id[0] == '\0') {
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
+            break;
+        }
+        err = onode_approval_challenge(state, req.proposal_id,
+                                       resp_buf, sizeof(resp_buf), &resp_len);
+        if (err == VIRP_OK && resp_len > 0) {
+            send_framed(client_fd, resp_buf, resp_len);
+            onode_inc_observations(state);
+        } else {
+            send_framed_error(client_fd, err);
+        }
+        break;
+
+    case ONODE_ACTION_APPROVAL_SUBMIT:
+        if (req.proposal_id[0] == '\0' || req.signature[0] == '\0' ||
+            req.key_id[0] == '\0') {
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
+            break;
+        }
+        err = onode_approval_submit(state, req.proposal_id, req.key_id,
+                                    req.signature,
+                                    resp_buf, sizeof(resp_buf), &resp_len);
+        if (err == VIRP_OK && resp_len > 0) {
+            send_framed(client_fd, resp_buf, resp_len);
+            onode_inc_observations(state);
+        } else {
+            send_framed_error(client_fd, err);
+        }
+        break;
 
     case ONODE_ACTION_SESSION_HELLO: {
         if (req.client_id[0] == '\0') {

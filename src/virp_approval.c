@@ -3,10 +3,13 @@
  * VIRP — Verified Infrastructure Response Protocol
  * Approval flow: propose → approve → apply (see include/virp_approval.h)
  *
- * Record files carry the signed JSON as EXACT BYTES on line 1; the
- * Ed25519 signature covers those bytes verbatim, so verification never
- * depends on re-canonicalizing JSON. cJSON handles quoting/escaping of
- * operator-controlled strings (commands may contain quotes).
+ * The approver signs the padding-free CANONICAL payload (72 bytes, built
+ * by virp_approval_build_canonical), NOT the JSON record. The record's
+ * line-1 JSON is metadata; apply reconstructs the canonical bytes from
+ * those fields and re-verifies, so a tampered field fails the signature.
+ * Nanosecond timestamps are stored as decimal STRINGS: they exceed 2^53
+ * and a JSON number (cJSON uses doubles) would round-trip lossily and
+ * corrupt the canonical bytes.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -16,6 +19,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -104,7 +108,8 @@ static int hexval(char c)
     return -1;
 }
 
-/* Ensure dir, dir/proposals, dir/approvals exist (0700; EEXIST is fine). */
+/* Ensure dir and its proposals/, approvals/, challenges/ subdirs exist
+ * (0700; EEXIST is fine). */
 static virp_error_t ensure_dirs(const char *dir)
 {
     char sub[VIRP_APPROVAL_DIR_MAX + 16];
@@ -112,12 +117,56 @@ static virp_error_t ensure_dirs(const char *dir)
         return VIRP_ERR_INVALID_LENGTH;
     if (mkdir(dir, 0700) != 0 && errno != EEXIST)
         return VIRP_ERR_CHAIN_DB;
-    snprintf(sub, sizeof(sub), "%s/proposals", dir);
-    if (mkdir(sub, 0700) != 0 && errno != EEXIST)
-        return VIRP_ERR_CHAIN_DB;
-    snprintf(sub, sizeof(sub), "%s/approvals", dir);
-    if (mkdir(sub, 0700) != 0 && errno != EEXIST)
-        return VIRP_ERR_CHAIN_DB;
+    const char *subs[] = { "proposals", "approvals", "challenges" };
+    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+        snprintf(sub, sizeof(sub), "%s/%s", dir, subs[i]);
+        if (mkdir(sub, 0700) != 0 && errno != EEXIST)
+            return VIRP_ERR_CHAIN_DB;
+    }
+    return VIRP_OK;
+}
+
+/* Decode `n` hex chars into `out` (n/2 bytes). Returns 0 or -1. */
+static int hex2bin(const char *hex, size_t n, uint8_t *out)
+{
+    if (strlen(hex) < n) return -1;
+    for (size_t i = 0; i < n; i += 2) {
+        int hi = hexval(hex[i]), lo = hexval(hex[i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i / 2] = (uint8_t)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+static void put_be64(uint8_t *p, uint64_t v)
+{
+    for (int i = 7; i >= 0; i--) { p[i] = (uint8_t)(v & 0xff); v >>= 8; }
+}
+static void put_be32(uint8_t *p, uint32_t v)
+{
+    for (int i = 3; i >= 0; i--) { p[i] = (uint8_t)(v & 0xff); v >>= 8; }
+}
+
+virp_error_t virp_approval_build_canonical(const char *proposal_id_hex,
+                                           const char *command_hash_hex,
+                                           uint32_t device_node_id,
+                                           uint64_t approved_at_ns,
+                                           uint32_t ttl_seconds,
+                                           uint8_t out[VIRP_APPROVAL_CANON_SIZE])
+{
+    if (!proposal_id_hex || !command_hash_hex || !out)
+        return VIRP_ERR_NULL_PTR;
+    if (!proposal_id_valid(proposal_id_hex) || !hex64_valid(command_hash_hex))
+        return VIRP_ERR_INVALID_LENGTH;
+
+    memcpy(out, VIRP_APPROVAL_CANON_MAGIC, 4);
+    if (hex2bin(proposal_id_hex, 32, out + 4) != 0)     /* 16 bytes */
+        return VIRP_ERR_INVALID_LENGTH;
+    if (hex2bin(command_hash_hex, 64, out + 20) != 0)   /* 32 bytes */
+        return VIRP_ERR_INVALID_LENGTH;
+    put_be64(out + 52, (uint64_t)device_node_id);
+    put_be64(out + 60, approved_at_ns);
+    put_be32(out + 68, ttl_seconds);
     return VIRP_OK;
 }
 
@@ -192,6 +241,33 @@ static bool jget_u64(cJSON *root, const char *key, uint64_t *out)
     return true;
 }
 
+/*
+ * Read a uint64 stored as a DECIMAL STRING. Nanosecond timestamps exceed
+ * 2^53 and a JSON number (cJSON stores doubles) would round-trip lossily,
+ * corrupting the canonical bytes the signature covers. Timestamps are
+ * therefore serialized as strings.
+ */
+static bool jget_u64str(cJSON *root, const char *key, uint64_t *out)
+{
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsString(it) || !it->valuestring || !it->valuestring[0])
+        return false;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(it->valuestring, &end, 10);
+    if (errno != 0 || *end != '\0') return false;
+    *out = (uint64_t)v;
+    return true;
+}
+
+/* Add a uint64 as a decimal string (see jget_u64str). */
+static bool jadd_u64str(cJSON *o, const char *key, uint64_t v)
+{
+    char s[24];
+    snprintf(s, sizeof(s), "%llu", (unsigned long long)v);
+    return cJSON_AddStringToObject(o, key, s) != NULL;
+}
+
 /* =========================================================================
  * Proposal
  * ========================================================================= */
@@ -222,7 +298,7 @@ static virp_error_t proposal_json(const virp_proposal_rec_t *p,
         cJSON_AddStringToObject(o, "command", p->command) &&
         cJSON_AddStringToObject(o, "command_hash", p->command_hash) &&
         cJSON_AddStringToObject(o, "proposer", p->proposer) &&
-        cJSON_AddNumberToObject(o, "timestamp_ns", (double)p->timestamp_ns) &&
+        jadd_u64str(o, "timestamp_ns", p->timestamp_ns) &&
         cJSON_AddStringToObject(o, "tier", p->tier);
     if (!ok) { cJSON_Delete(o); return VIRP_ERR_BUFFER_TOO_SMALL; }
     char *s = cJSON_PrintUnformatted(o);
@@ -338,7 +414,7 @@ virp_error_t virp_approval_load_proposal(const char *dir,
         jget_str(o, "command", out->command, sizeof(out->command)) &&
         jget_str(o, "command_hash", out->command_hash, sizeof(out->command_hash)) &&
         jget_str(o, "proposer", out->proposer, sizeof(out->proposer)) &&
-        jget_u64(o, "timestamp_ns", &ts) &&
+        jget_u64str(o, "timestamp_ns", &ts) &&
         jget_str(o, "tier", out->tier, sizeof(out->tier));
     cJSON_Delete(o);
     if (!ok || nid > UINT32_MAX ||
@@ -358,6 +434,13 @@ virp_error_t virp_approval_load_proposal(const char *dir,
  * Approval
  * ========================================================================= */
 
+/* Serializes the SUBMIT critical section (OUTCOME/existing-approval check
+ * → chain append → record write) so two concurrent submits for one
+ * proposal produce exactly one APPROVAL chain entry. */
+static pthread_mutex_t submit_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Metadata JSON for the approval record (line 1). NOT the signed bytes —
+ * the signature is over the 72-byte canonical payload. */
 static virp_error_t approval_json(const virp_approval_rec_t *a,
                                   char *out, size_t out_len)
 {
@@ -368,9 +451,10 @@ static virp_error_t approval_json(const virp_approval_rec_t *a,
         cJSON_AddStringToObject(o, "command_hash", a->command_hash) &&
         cJSON_AddStringToObject(o, "device", a->device) &&
         cJSON_AddNumberToObject(o, "device_node_id", (double)a->device_node_id) &&
-        cJSON_AddNumberToObject(o, "approved_at_ns", (double)a->approved_at_ns) &&
+        jadd_u64str(o, "approved_at_ns", a->approved_at_ns) &&
         cJSON_AddNumberToObject(o, "ttl_seconds", (double)a->ttl_seconds) &&
-        cJSON_AddStringToObject(o, "approver_key_id", a->approver_key_id);
+        cJSON_AddStringToObject(o, "approver_key_id", a->approver_key_id) &&
+        cJSON_AddStringToObject(o, "operator", a->operator);
     if (!ok) { cJSON_Delete(o); return VIRP_ERR_BUFFER_TOO_SMALL; }
     char *s = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -382,95 +466,258 @@ static virp_error_t approval_json(const virp_approval_rec_t *a,
     return VIRP_OK;
 }
 
-virp_error_t virp_approval_write_signed(const char *dir,
-                                        const virp_fed_keypair_t *kp,
-                                        virp_approval_rec_t *rec)
+virp_error_t virp_approval_write_record(const char *dir,
+                                        const virp_approval_rec_t *rec,
+                                        const uint8_t *sig, size_t sig_len)
 {
-    if (!dir || !kp || !rec)
+    if (!dir || !rec || !sig)
         return VIRP_ERR_NULL_PTR;
-    if (!kp->loaded)
-        return VIRP_ERR_KEY_NOT_LOADED;
+    if (sig_len != VIRP_APPROVER_SIG_SIZE)
+        return VIRP_ERR_INVALID_LENGTH;
     if (!proposal_id_valid(rec->proposal_id))
         return VIRP_ERR_APPROVAL_NOT_FOUND;
 
     virp_error_t err = ensure_dirs(dir);
     if (err != VIRP_OK) return err;
 
-    for (int i = 0; i < VIRP_FED_KEYID_SIZE; i++)
-        snprintf(rec->approver_key_id + i * 2, 3, "%02x", kp->key_id[i]);
-
-    char body[1600];
+    char body[1700];
     err = approval_json(rec, body, sizeof(body));
     if (err != VIRP_OK) return err;
 
-    err = virp_fed_sign(kp, (const uint8_t *)body, strlen(body), rec->sig);
-    if (err != VIRP_OK) return err;
+    char sig_hex[2 * VIRP_APPROVER_SIG_SIZE + 1];
+    for (size_t i = 0; i < sig_len; i++)
+        snprintf(sig_hex + i * 2, 3, "%02x", sig[i]);
 
-    char sig_hex[2 * VIRP_FED_SIG_SIZE + 1];
-    for (int i = 0; i < VIRP_FED_SIG_SIZE; i++)
-        snprintf(sig_hex + i * 2, 3, "%02x", rec->sig[i]);
-
-    char filebuf[2048];
+    char filebuf[2200];
     snprintf(filebuf, sizeof(filebuf), "%s\n%s\n%s\n", body, sig_hex,
              rec->chain_entry_hash[0] ? rec->chain_entry_hash : "-");
 
     char path[VIRP_APPROVAL_DIR_MAX + 64];
     approval_path(dir, rec->proposal_id, path, sizeof(path));
-    /* 0644: the record is a signed public statement; the daemon (often a
-     * different uid than the approving human) must be able to read it. */
+    /* 0644: a signed public statement the daemon (any uid) must read. */
     return write_file_durable(path, 0644, filebuf);
 }
 
-virp_error_t virp_approval_approve(const char *dir,
-                                   const virp_fed_keypair_t *kp,
-                                   const char *proposal_id,
-                                   virp_chain_state_t *chain,
-                                   virp_approval_rec_t *out)
+/* =========================================================================
+ * Challenge (pending) records
+ * ========================================================================= */
+
+static void challenge_path(const char *dir, const char *id,
+                           char *out, size_t out_len)
 {
-    if (!dir || !kp || !proposal_id || !out)
+    snprintf(out, out_len, "%s/challenges/%s.rec", dir, id);
+}
+
+static virp_error_t challenge_write(const char *dir,
+                                    const virp_approval_challenge_t *c)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (!o) return VIRP_ERR_BUFFER_TOO_SMALL;
+    bool ok =
+        cJSON_AddStringToObject(o, "proposal_id", c->proposal_id) &&
+        cJSON_AddStringToObject(o, "command_hash", c->command_hash) &&
+        cJSON_AddStringToObject(o, "device", c->device) &&
+        cJSON_AddNumberToObject(o, "device_node_id", (double)c->device_node_id) &&
+        jadd_u64str(o, "approved_at_ns", c->approved_at_ns) &&
+        cJSON_AddNumberToObject(o, "ttl_seconds", (double)c->ttl_seconds);
+    if (!ok) { cJSON_Delete(o); return VIRP_ERR_BUFFER_TOO_SMALL; }
+    char *s = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    if (!s) return VIRP_ERR_BUFFER_TOO_SMALL;
+    char path[VIRP_APPROVAL_DIR_MAX + 64];
+    challenge_path(dir, c->proposal_id, path, sizeof(path));
+    virp_error_t err = write_file_durable(path, 0640, s);
+    cJSON_free(s);
+    return err;
+}
+
+/* Load a pending challenge and reconstruct its canonical bytes. */
+static virp_error_t challenge_load(const char *dir, const char *proposal_id,
+                                   virp_approval_challenge_t *out)
+{
+    char path[VIRP_APPROVAL_DIR_MAX + 64];
+    challenge_path(dir, proposal_id, path, sizeof(path));
+    char buf[2048];
+    if (read_file(path, buf, sizeof(buf)) < 0)
+        return VIRP_ERR_APPROVAL_NOT_FOUND;
+
+    cJSON *o = cJSON_Parse(buf);
+    if (!o || !cJSON_IsObject(o)) {
+        if (o) cJSON_Delete(o);
+        return VIRP_ERR_CHAIN_DB;
+    }
+    memset(out, 0, sizeof(*out));
+    uint64_t nid = 0, at = 0, ttl = 0;
+    bool ok =
+        jget_str(o, "proposal_id", out->proposal_id, sizeof(out->proposal_id)) &&
+        jget_str(o, "command_hash", out->command_hash, sizeof(out->command_hash)) &&
+        jget_str(o, "device", out->device, sizeof(out->device)) &&
+        jget_u64(o, "device_node_id", &nid) &&
+        jget_u64str(o, "approved_at_ns", &at) &&
+        jget_u64(o, "ttl_seconds", &ttl);
+    cJSON_Delete(o);
+    if (!ok || nid > UINT32_MAX || ttl > 86400 ||
+        strcmp(out->proposal_id, proposal_id) != 0 ||
+        !hex64_valid(out->command_hash))
+        return VIRP_ERR_CHAIN_DB;
+    out->device_node_id = (uint32_t)nid;
+    out->approved_at_ns = at;
+    out->ttl_seconds = (uint32_t)ttl;
+    return virp_approval_build_canonical(out->proposal_id, out->command_hash,
+                                         out->device_node_id,
+                                         out->approved_at_ns,
+                                         out->ttl_seconds, out->canonical);
+}
+
+/* L1 enforcement: does an OUTCOME chain entry already exist? On query
+ * error, fail CLOSED (treat as consumed) so a second approval is never
+ * minted when we cannot prove the first did not run. */
+static bool approval_has_outcome(virp_chain_state_t *chain,
+                                 const char *proposal_id)
+{
+    if (!chain) return false;
+    char aid[64];
+    snprintf(aid, sizeof(aid), "outcome:%s", proposal_id);
+    bool exists = false;
+    if (virp_chain_artifact_exists(chain, aid, &exists) != VIRP_OK)
+        return true;
+    return exists;
+}
+
+/* =========================================================================
+ * Challenge / Submit (daemon-side; daemon is the sole chain writer)
+ * ========================================================================= */
+
+virp_error_t virp_approval_challenge(const char *dir,
+                                     virp_chain_state_t *chain,
+                                     const char *proposal_id,
+                                     uint64_t now_ns,
+                                     virp_approval_challenge_t *out)
+{
+    if (!dir || !proposal_id || !out)
         return VIRP_ERR_NULL_PTR;
+    if (!proposal_id_valid(proposal_id))
+        return VIRP_ERR_APPROVAL_NOT_FOUND;
+
+    /* L1: no challenge for a proposal that already produced an outcome. */
+    if (approval_has_outcome(chain, proposal_id))
+        return VIRP_ERR_APPROVAL_CONSUMED;
 
     virp_proposal_rec_t prop;
     virp_error_t err = virp_approval_load_proposal(dir, proposal_id, &prop);
     if (err != VIRP_OK) return err;
 
+    err = ensure_dirs(dir);
+    if (err != VIRP_OK) return err;
+
     memset(out, 0, sizeof(*out));
     snprintf(out->proposal_id, sizeof(out->proposal_id), "%s", prop.proposal_id);
-    snprintf(out->command_hash, sizeof(out->command_hash), "%s", prop.command_hash);
     snprintf(out->device, sizeof(out->device), "%s", prop.device);
+    snprintf(out->command, sizeof(out->command), "%s", prop.command);
+    snprintf(out->command_hash, sizeof(out->command_hash), "%s",
+             prop.command_hash);
+    snprintf(out->tier, sizeof(out->tier), "%s", prop.tier);
     out->device_node_id = prop.device_node_id;
-    out->approved_at_ns = now_realtime_ns();
+    out->approved_at_ns = now_ns ? now_ns : now_realtime_ns();
     out->ttl_seconds = VIRP_APPROVAL_TTL_SECONDS;
 
-    /* APPROVAL chain entry first so the written record carries its hash. */
+    err = virp_approval_build_canonical(out->proposal_id, out->command_hash,
+                                        out->device_node_id,
+                                        out->approved_at_ns, out->ttl_seconds,
+                                        out->canonical);
+    if (err != VIRP_OK) return err;
+
+    return challenge_write(dir, out);
+}
+
+virp_error_t virp_approval_submit(const char *dir,
+                                  const virp_approver_registry_t *reg,
+                                  virp_chain_state_t *chain,
+                                  const char *proposal_id,
+                                  const char *key_id,
+                                  const uint8_t *sig, size_t sig_len,
+                                  virp_approval_rec_t *out)
+{
+    if (!dir || !reg || !proposal_id || !key_id || !sig || !out)
+        return VIRP_ERR_NULL_PTR;
+    if (!proposal_id_valid(proposal_id))
+        return VIRP_ERR_APPROVAL_NOT_FOUND;
+    if (sig_len != VIRP_APPROVER_SIG_SIZE)
+        return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
+
+    /* key_id must be enrolled (and enabled). */
+    const virp_approver_t *ent = virp_approver_registry_find_any(reg, key_id);
+    if (!ent)
+        return VIRP_ERR_APPROVAL_KEY_UNENROLLED;
+    if (!ent->enabled)
+        return VIRP_ERR_APPROVAL_KEY_DISABLED;
+
+    /* Reconstruct the exact canonical bytes from the pending challenge. */
+    virp_approval_challenge_t ch;
+    virp_error_t err = challenge_load(dir, proposal_id, &ch);
+    if (err != VIRP_OK) return err;
+
+    /* Verify the signature over the canonical bytes with the enrolled key. */
+    if (virp_approver_verify(ent, ch.canonical, VIRP_APPROVAL_CANON_SIZE,
+                             sig, sig_len) != VIRP_OK)
+        return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
+
+    memset(out, 0, sizeof(*out));
+    snprintf(out->proposal_id, sizeof(out->proposal_id), "%s", ch.proposal_id);
+    snprintf(out->command_hash, sizeof(out->command_hash), "%s", ch.command_hash);
+    snprintf(out->device, sizeof(out->device), "%s", ch.device);
+    out->device_node_id = ch.device_node_id;
+    out->approved_at_ns = ch.approved_at_ns;
+    out->ttl_seconds = ch.ttl_seconds;
+    snprintf(out->approver_key_id, sizeof(out->approver_key_id), "%s",
+             ent->key_id);
+    snprintf(out->operator, sizeof(out->operator), "%s", ent->operator);
+    memcpy(out->sig, sig, sig_len);
+
+    /* Serialize the chain-append + record-write so concurrent submits for
+     * one proposal yield exactly one APPROVAL entry. */
+    pthread_mutex_lock(&submit_mu);
+
+    /* Re-check L1 under the lock, and short-circuit if this proposal was
+     * already submitted (idempotent: load the existing record, one entry). */
+    if (approval_has_outcome(chain, proposal_id)) {
+        pthread_mutex_unlock(&submit_mu);
+        return VIRP_ERR_APPROVAL_CONSUMED;
+    }
+    char apath[VIRP_APPROVAL_DIR_MAX + 64];
+    approval_path(dir, proposal_id, apath, sizeof(apath));
+    char probe[16];
+    if (read_file(apath, probe, sizeof(probe)) >= 0) {
+        /* Already approved by a concurrent/earlier submit — idempotent. */
+        pthread_mutex_unlock(&submit_mu);
+        return VIRP_OK;
+    }
+
     if (chain) {
-        char probe[1600];
-        char key_id_hex[2 * VIRP_FED_KEYID_SIZE + 1];
-        for (int i = 0; i < VIRP_FED_KEYID_SIZE; i++)
-            snprintf(key_id_hex + i * 2, 3, "%02x", kp->key_id[i]);
-        snprintf(out->approver_key_id, sizeof(out->approver_key_id), "%s",
-                 key_id_hex);
-        virp_error_t jerr = approval_json(out, probe, sizeof(probe));
-        if (jerr != VIRP_OK) return jerr;
+        char content[1700];
+        err = approval_json(out, content, sizeof(content));
+        if (err != VIRP_OK) { pthread_mutex_unlock(&submit_mu); return err; }
         char artifact_hash[65];
-        sha256_hex(probe, strlen(probe), artifact_hash);
+        sha256_hex(content, strlen(content), artifact_hash);
         char artifact_id[64];
         snprintf(artifact_id, sizeof(artifact_id), "approval:%s",
                  out->proposal_id);
         char chain_session[96];
         snprintf(chain_session, sizeof(chain_session), "approval:%s",
-                 prop.device);
+                 out->device);
         virp_chain_entry_t ce;
-        jerr = virp_chain_append(chain, chain_session, "approval",
-                                 artifact_id, artifact_hash, &ce);
-        if (jerr != VIRP_OK) return jerr;
+        err = virp_chain_append(chain, chain_session, "approval",
+                                artifact_id, artifact_hash, &ce);
+        if (err != VIRP_OK) { pthread_mutex_unlock(&submit_mu); return err; }
         virp_chain_artifact_store(chain, artifact_id, "approval",
-                                  probe, artifact_hash, chain_session);
+                                  content, artifact_hash, chain_session);
         snprintf(out->chain_entry_hash, sizeof(out->chain_entry_hash), "%s",
                  ce.chain_entry_hash);
     }
 
-    return virp_approval_write_signed(dir, kp, out);
+    err = virp_approval_write_record(dir, out, sig, sig_len);
+    pthread_mutex_unlock(&submit_mu);
+    return err;
 }
 
 /* =========================================================================
@@ -600,10 +847,11 @@ virp_error_t virp_approval_verify_consume(const char *dir,
         jget_str(o, "command_hash", out->command_hash, sizeof(out->command_hash)) &&
         jget_str(o, "device", out->device, sizeof(out->device)) &&
         jget_u64(o, "device_node_id", &nid) &&
-        jget_u64(o, "approved_at_ns", &at) &&
+        jget_u64str(o, "approved_at_ns", &at) &&
         jget_u64(o, "ttl_seconds", &ttl) &&
         jget_str(o, "approver_key_id", out->approver_key_id,
                  sizeof(out->approver_key_id));
+    jget_str(o, "operator", out->operator, sizeof(out->operator));
     cJSON_Delete(o);
     if (!ok || nid > UINT32_MAX || ttl > 86400 ||
         strcmp(out->proposal_id, proposal_id) != 0 ||
@@ -625,9 +873,15 @@ virp_error_t virp_approval_verify_consume(const char *dir,
     if (!ent->enabled)
         return VIRP_ERR_APPROVAL_KEY_DISABLED;
 
-    /* 2. Signature over the exact stored bytes, verified with the
-     * enrolled key (dispatch on its algorithm). */
-    if (virp_approver_verify(ent, (const uint8_t *)body, strlen(body),
+    /* 2. Signature over the canonical payload reconstructed from the
+     * record's own fields — a tampered field (e.g. one bit of
+     * command_hash) changes the canonical bytes and fails the check. */
+    uint8_t canon[VIRP_APPROVAL_CANON_SIZE];
+    if (virp_approval_build_canonical(out->proposal_id, out->command_hash,
+                                      out->device_node_id, out->approved_at_ns,
+                                      out->ttl_seconds, canon) != VIRP_OK)
+        return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
+    if (virp_approver_verify(ent, canon, sizeof(canon),
                              sig, sizeof(sig)) != VIRP_OK)
         return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
 

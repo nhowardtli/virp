@@ -16,8 +16,10 @@
 #include "virp_crypto.h"
 #include "virp_message.h"
 #include "virp_approval.h"
+#include "virp_approver_registry.h"
 #include "virp_chain.h"
 #include "virp_federation.h"
+#include "cJSON.h"
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +27,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+/* From virp_onode.c (in libvirp.a); prototyped here to avoid pulling the
+ * whole onode header into the CLI. */
+int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len);
 
 #define APPROVAL_DEFAULT_DIR  "/var/lib/virp/approvals"
 #define APPROVAL_DEFAULT_KEY  "/etc/virp/keys/approval.key"
@@ -528,99 +534,6 @@ static int cmd_build(int argc, char **argv)
 }
 
 /* =========================================================================
- * approve — sign an approval for a gate-blocked proposal
- * ========================================================================= */
-
-static int cmd_approve(int argc, char **argv)
-{
-    if (argc < 1) {
-        fprintf(stderr,
-            "Usage: virp approve <proposal-id> [--dir DIR] [--key SK] [--pub PK]\n"
-            "                    [--chain-db PATH --chain-key PATH]\n"
-            "Defaults: --dir %s\n"
-            "          --key %s --pub %s\n",
-            APPROVAL_DEFAULT_DIR, APPROVAL_DEFAULT_KEY, APPROVAL_DEFAULT_PUB);
-        return 1;
-    }
-
-    const char *proposal_id = argv[0];
-    const char *dir = APPROVAL_DEFAULT_DIR;
-    const char *sk_path = APPROVAL_DEFAULT_KEY;
-    const char *pk_path = APPROVAL_DEFAULT_PUB;
-    const char *chain_db = NULL, *chain_key = NULL;
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--dir") == 0 && i + 1 < argc) dir = argv[++i];
-        else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) sk_path = argv[++i];
-        else if (strcmp(argv[i], "--pub") == 0 && i + 1 < argc) pk_path = argv[++i];
-        else if (strcmp(argv[i], "--chain-db") == 0 && i + 1 < argc) chain_db = argv[++i];
-        else if (strcmp(argv[i], "--chain-key") == 0 && i + 1 < argc) chain_key = argv[++i];
-        else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
-    }
-
-    virp_proposal_rec_t prop;
-    virp_error_t err = virp_approval_load_proposal(dir, proposal_id, &prop);
-    if (err != VIRP_OK) {
-        fprintf(stderr, "Error: cannot load proposal %s from %s: %s\n",
-                proposal_id, dir, virp_error_str(err));
-        return 1;
-    }
-
-    printf("Proposal %s:\n", prop.proposal_id);
-    printf("  Device:       %s (node_id=0x%08x)\n", prop.device, prop.device_node_id);
-    printf("  Command:      %s\n", prop.command);
-    printf("  Command hash: %s\n", prop.command_hash);
-    printf("  Proposer:     %s\n", prop.proposer);
-    printf("  Tier:         %s\n", prop.tier);
-
-    if (virp_fed_init() != VIRP_OK) {
-        fprintf(stderr, "Error: libsodium init failed\n");
-        return 1;
-    }
-    virp_fed_keypair_t kp;
-    err = virp_fed_load(&kp, pk_path, sk_path, 1);
-    if (err != VIRP_OK) {
-        fprintf(stderr, "Error: cannot load approval keypair (%s / %s): %s\n"
-                "The approval key is a dedicated Ed25519 keypair — generate "
-                "with `virp-tool keygen approval <prefix>`. The O-Key can "
-                "NEVER be used here.\n",
-                pk_path, sk_path, virp_error_str(err));
-        return 1;
-    }
-
-    virp_chain_state_t chain;
-    virp_chain_state_t *chain_ptr = NULL;
-    if (chain_db && chain_key) {
-        err = virp_chain_init(&chain, chain_db, chain_key, 0, "local");
-        if (err != VIRP_OK) {
-            fprintf(stderr, "Error: chain init failed (%s): %s\n",
-                    chain_db, virp_error_str(err));
-            virp_fed_destroy(&kp);
-            return 1;
-        }
-        chain_ptr = &chain;
-    }
-
-    virp_approval_rec_t apr;
-    err = virp_approval_approve(dir, &kp, proposal_id, chain_ptr, &apr);
-    if (chain_ptr) virp_chain_destroy(chain_ptr);
-    virp_fed_destroy(&kp);
-    if (err != VIRP_OK) {
-        fprintf(stderr, "Error: approval failed: %s\n", virp_error_str(err));
-        return 1;
-    }
-
-    printf("\nAPPROVED — single use, TTL %us from now.\n", apr.ttl_seconds);
-    printf("  Approver key: %s\n", apr.approver_key_id);
-    if (apr.chain_entry_hash[0])
-        printf("  Chain entry:  %s\n", apr.chain_entry_hash);
-    else
-        printf("  Chain entry:  (not registered — no --chain-db given)\n");
-    printf("Re-submit within the TTL:  virp apply %s\n", apr.proposal_id);
-    return 0;
-}
-
-/* =========================================================================
  * Framed O-Node client path — shared by `apply` and `exec`.
  *
  * This is a CLIENT, not a bypass: requests go through the daemon's
@@ -766,6 +679,42 @@ static int print_execute_response(const uint8_t *resp, uint32_t resp_len)
     return is_rejection ? 2 : 0;
 }
 
+/*
+ * Send req_json and, on a signed-observation response, copy the
+ * observation payload (JSON) into out and set *obs_type. Returns:
+ *   0  success (out holds the payload)
+ *  <0  the O-Node error code from a 4-byte error frame
+ *   1  transport / parse failure
+ */
+static int client_obs_payload(const char *sock, const char *req_json,
+                              uint8_t *obs_type_out, char *out, size_t out_max)
+{
+    static uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    uint32_t resp_len = 0;
+    if (onode_framed_roundtrip(sock, req_json, strlen(req_json),
+                               resp, sizeof(resp), &resp_len) != 0)
+        return 1;
+    if (resp_len == 4)
+        return (int)(int32_t)ntohl(*(uint32_t *)resp);   /* negative error */
+
+    virp_header_t hdr;
+    if (virp_header_deserialize(&hdr, resp, resp_len) != VIRP_OK ||
+        resp_len <= VIRP_HEADER_SIZE)
+        return 1;
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    if (virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                               resp_len - VIRP_HEADER_SIZE,
+                               &obs, &data, &data_len) != VIRP_OK)
+        return 1;
+    if (obs_type_out) *obs_type_out = obs.obs_type;
+    size_t n = data_len < out_max - 1 ? data_len : out_max - 1;
+    memcpy(out, data, n);
+    out[n] = '\0';
+    return 0;
+}
+
 /* Build + submit an execute request; proposal_id may be NULL. */
 static int submit_execute(const char *sock_path, const char *device,
                           const char *command, const char *proposal_id)
@@ -857,6 +806,286 @@ static int cmd_apply(int argc, char **argv)
            prop.device, prop.command, prop.proposal_id);
     return submit_execute(sock_path, prop.device, prop.command,
                           prop.proposal_id);
+}
+
+/* =========================================================================
+ * approve — CLIENT of the daemon: challenge -> sign -> submit
+ *
+ * The CLI never opens chain.db and never signs an approval record on
+ * disk. It fetches the canonical bytes from the daemon (APPROVAL_
+ * CHALLENGE), signs them with the approver's private key, and submits
+ * the signature (APPROVAL_SUBMIT); the daemon verifies against its
+ * registry and, as the SOLE chain writer, appends the APPROVAL entry.
+ * ========================================================================= */
+
+/* Signer abstraction: fills sig (64 bytes raw) over the canonical bytes
+ * and key_id_out (32 hex). Software (Ed25519 key file) here; the PKCS#11
+ * signer is added by the pkcs11 build. Returns 0 on success. */
+struct approve_opts {
+    const char *sock;
+    const char *key_path;   /* Ed25519 public key file (software signer) */
+    const char *sk_path;    /* Ed25519 secret key file (software signer) */
+    const char *pkcs11_module;
+    const char *pkcs11_slot;
+    const char *pkcs11_label;
+};
+
+static int sign_software(const struct approve_opts *o,
+                         const uint8_t *canon, size_t len,
+                         uint8_t sig[VIRP_APPROVER_SIG_SIZE],
+                         char key_id_out[33])
+{
+    if (virp_fed_init() != VIRP_OK) {
+        fprintf(stderr, "Error: libsodium init failed\n");
+        return -1;
+    }
+    virp_fed_keypair_t kp;
+    if (virp_fed_load(&kp, o->key_path, o->sk_path, 1) != VIRP_OK) {
+        fprintf(stderr, "Error: cannot load Ed25519 approver key (%s / %s).\n"
+                "Generate with `virp-tool keygen approval <prefix>` and enroll "
+                "the .pub in /etc/virp/approvers.json (see `virp enroll`).\n",
+                o->key_path, o->sk_path);
+        return -1;
+    }
+    int rc = -1;
+    if (virp_fed_sign(&kp, canon, len, sig) == VIRP_OK) {
+        for (int i = 0; i < VIRP_FED_KEYID_SIZE; i++)
+            snprintf(key_id_out + i * 2, 3, "%02x", kp.key_id[i]);
+        rc = 0;
+    }
+    virp_fed_destroy(&kp);
+    return rc;
+}
+
+/* PKCS#11 signer. The real implementation lives in
+ * src/virp_tool_pkcs11.c and is compiled in only when the tool is built
+ * with VIRP_PKCS11 (see `make virp-tool-pkcs11`). The default build
+ * provides the stub below so `--pkcs11` fails cleanly. */
+int virp_tool_sign_pkcs11(const char *module, const char *slot,
+                          const char *label,
+                          const uint8_t *canon, size_t len,
+                          uint8_t sig[VIRP_APPROVER_SIG_SIZE],
+                          char key_id_out[33]);
+#ifndef VIRP_PKCS11
+int virp_tool_sign_pkcs11(const char *module, const char *slot,
+                          const char *label,
+                          const uint8_t *canon, size_t len,
+                          uint8_t sig[VIRP_APPROVER_SIG_SIZE],
+                          char key_id_out[33])
+{
+    (void)module; (void)slot; (void)label;
+    (void)canon; (void)len; (void)sig; (void)key_id_out;
+    fprintf(stderr, "Error: this build has no PKCS#11 support. Rebuild with "
+            "`make virp-tool-pkcs11` (needs pkcs11 headers), or use a "
+            "software key.\n");
+    return -1;
+}
+#endif
+
+static int cmd_approve(int argc, char **argv)
+{
+    if (argc < 1) {
+        fprintf(stderr,
+            "Usage: virp approve <proposal-id> [--socket PATH]\n"
+            "  Software key:  [--key <pub>] [--sk <secret>]\n"
+            "  PKCS#11/PIV:   --pkcs11 <module.so> --slot 9c [--key-label L]\n"
+            "Fetches the challenge from the daemon, signs the canonical bytes,\n"
+            "and submits. The daemon appends the APPROVAL chain entry.\n");
+        return 1;
+    }
+    const char *proposal_id = argv[0];
+    struct approve_opts o = {
+        .sock = ONODE_DEFAULT_SOCKET,
+        .key_path = APPROVAL_DEFAULT_PUB,
+        .sk_path = APPROVAL_DEFAULT_KEY,
+        .pkcs11_module = NULL, .pkcs11_slot = "9c", .pkcs11_label = NULL,
+    };
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) o.sock = argv[++i];
+        else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) o.key_path = argv[++i];
+        else if (strcmp(argv[i], "--sk") == 0 && i + 1 < argc) o.sk_path = argv[++i];
+        else if (strcmp(argv[i], "--pkcs11") == 0 && i + 1 < argc) o.pkcs11_module = argv[++i];
+        else if (strcmp(argv[i], "--slot") == 0 && i + 1 < argc) o.pkcs11_slot = argv[++i];
+        else if (strcmp(argv[i], "--key-label") == 0 && i + 1 < argc) o.pkcs11_label = argv[++i];
+        else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
+    }
+    if (strspn(proposal_id, "0123456789abcdef") != VIRP_APPROVAL_ID_HEX_LEN ||
+        proposal_id[VIRP_APPROVAL_ID_HEX_LEN] != '\0') {
+        fprintf(stderr, "Error: proposal-id must be 32 lowercase hex\n");
+        return 1;
+    }
+
+    /* 1. CHALLENGE. */
+    char req[256];
+    snprintf(req, sizeof(req),
+             "{\"action\":\"approval_challenge\",\"proposal_id\":\"%s\"}",
+             proposal_id);
+    char payload[4096];
+    uint8_t otype = 0;
+    int rc = client_obs_payload(o.sock, req, &otype, payload, sizeof(payload));
+    if (rc < 0) {
+        fprintf(stderr, "Challenge rejected: O-Node error %d (%s)\n", rc,
+                virp_error_str((virp_error_t)rc));
+        return 2;
+    }
+    if (rc != 0) return 1;
+
+    cJSON *ch = cJSON_Parse(payload);
+    if (!ch) { fprintf(stderr, "Error: bad challenge JSON\n"); return 1; }
+    const cJSON *j_canon = cJSON_GetObjectItemCaseSensitive(ch, "canonical");
+    const cJSON *j_dev   = cJSON_GetObjectItemCaseSensitive(ch, "device");
+    const cJSON *j_cmd   = cJSON_GetObjectItemCaseSensitive(ch, "command");
+    const cJSON *j_tier  = cJSON_GetObjectItemCaseSensitive(ch, "tier");
+    const cJSON *j_ch    = cJSON_GetObjectItemCaseSensitive(ch, "command_hash");
+    if (!cJSON_IsString(j_canon) ||
+        strlen(j_canon->valuestring) != 2 * VIRP_APPROVAL_CANON_SIZE) {
+        fprintf(stderr, "Error: challenge missing canonical bytes\n");
+        cJSON_Delete(ch); return 1;
+    }
+    uint8_t canon[VIRP_APPROVAL_CANON_SIZE];
+    if (virp_hex_decode(j_canon->valuestring, canon, sizeof(canon))
+            != (int)sizeof(canon)) {
+        fprintf(stderr, "Error: bad canonical hex\n");
+        cJSON_Delete(ch); return 1;
+    }
+
+    printf("Proposal %s:\n", proposal_id);
+    printf("  Device:       %s\n", cJSON_IsString(j_dev) ? j_dev->valuestring : "?");
+    printf("  Command:      %s\n", cJSON_IsString(j_cmd) ? j_cmd->valuestring : "?");
+    printf("  Command hash: %s\n", cJSON_IsString(j_ch) ? j_ch->valuestring : "?");
+    printf("  Tier:         %s\n", cJSON_IsString(j_tier) ? j_tier->valuestring : "?");
+    cJSON_Delete(ch);
+
+    /* 2. SIGN the canonical bytes. */
+    uint8_t sig[VIRP_APPROVER_SIG_SIZE];
+    char key_id[33];
+    if (o.pkcs11_module) {
+        rc = virp_tool_sign_pkcs11(o.pkcs11_module, o.pkcs11_slot,
+                                   o.pkcs11_label, canon, sizeof(canon),
+                                   sig, key_id);
+    } else {
+        rc = sign_software(&o, canon, sizeof(canon), sig, key_id);
+    }
+    if (rc != 0) return 1;
+
+    char sig_hex[2 * VIRP_APPROVER_SIG_SIZE + 1];
+    for (size_t i = 0; i < sizeof(sig); i++)
+        snprintf(sig_hex + i * 2, 3, "%02x", sig[i]);
+
+    /* 3. SUBMIT (signature is 128 hex + key_id 32 + framing). */
+    char req2[512];
+    snprintf(req2, sizeof(req2),
+             "{\"action\":\"approval_submit\",\"proposal_id\":\"%s\","
+             "\"key_id\":\"%s\",\"signature\":\"%s\"}",
+             proposal_id, key_id, sig_hex);
+    rc = client_obs_payload(o.sock, req2, &otype, payload, sizeof(payload));
+    if (rc < 0) {
+        fprintf(stderr, "Submit rejected: O-Node error %d (%s)\n", rc,
+                virp_error_str((virp_error_t)rc));
+        return 2;
+    }
+    if (rc != 0) return 1;
+
+    printf("\nAPPROVED — single use, TTL 300s from approval time.\n");
+    printf("  key_id: %s\n", key_id);
+    printf("  %s\n", payload);
+    printf("Re-submit within the TTL:  virp apply %s\n", proposal_id);
+    return 0;
+}
+
+/* =========================================================================
+ * enroll — print an approvers.json entry for a public key
+ * ========================================================================= */
+
+static int cmd_enroll(int argc, char **argv)
+{
+    const char *key_path = NULL;   /* Ed25519 .pub (32 raw bytes) */
+    const char *spki_b64 = NULL;   /* base64 SPKI (e.g. PIV P-256 export) */
+    const char *operator = "operator";
+    bool enabled = true;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) key_path = argv[++i];
+        else if (strcmp(argv[i], "--spki") == 0 && i + 1 < argc) spki_b64 = argv[++i];
+        else if (strcmp(argv[i], "--operator") == 0 && i + 1 < argc) operator = argv[++i];
+        else if (strcmp(argv[i], "--disabled") == 0) enabled = false;
+        else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
+    }
+    if (!key_path && !spki_b64) {
+        fprintf(stderr,
+            "Usage: virp enroll (--key <ed25519.pub> | --spki <base64-SPKI>)\n"
+            "                   [--operator NAME] [--disabled]\n"
+            "Prints one approvers.json entry. For a YubiKey PIV P-256 key:\n"
+            "  ykman piv keys export 9c - | openssl pkey -pubin -outform DER | base64 -w0\n"
+            "then pass that base64 to --spki.\n");
+        return 1;
+    }
+
+    uint8_t spki[VIRP_APPROVER_SPKI_MAX];
+    size_t spki_len = 0;
+    if (key_path) {
+        FILE *f = fopen(key_path, "rb");
+        if (!f) { fprintf(stderr, "Error: cannot read %s\n", key_path); return 1; }
+        uint8_t pub[32];
+        size_t n = fread(pub, 1, sizeof(pub), f);
+        int extra = fgetc(f);
+        fclose(f);
+        if (n != 32 || extra != EOF) {
+            fprintf(stderr, "Error: %s is not a 32-byte Ed25519 public key\n",
+                    key_path);
+            return 1;
+        }
+        uint8_t der[44];
+        virp_approver_ed25519_spki(pub, der);
+        memcpy(spki, der, sizeof(der));
+        spki_len = sizeof(der);
+    } else {
+        /* Decode base64 SPKI via OpenSSL-free path: reuse the registry by
+         * building an entry directly is simplest — but we need raw DER.
+         * Decode with a tiny base64 here. */
+        extern int virp_tool_b64_decode(const char *in, uint8_t *out, size_t max);
+        int d = virp_tool_b64_decode(spki_b64, spki, sizeof(spki));
+        if (d <= 0) { fprintf(stderr, "Error: bad base64 SPKI\n"); return 1; }
+        spki_len = (size_t)d;
+    }
+
+    char entry[1024];
+    virp_error_t err = virp_approver_entry_json(spki, spki_len, operator,
+                                                enabled, entry, sizeof(entry));
+    if (err != VIRP_OK) {
+        fprintf(stderr, "Error: %s (unsupported key type?)\n",
+                virp_error_str(err));
+        return 1;
+    }
+    printf("%s\n", entry);
+    return 0;
+}
+
+/* Minimal base64 decode for `virp enroll --spki` (registry's decoder is
+ * static; this mirrors it). */
+int virp_tool_b64_decode(const char *in, uint8_t *out, size_t max)
+{
+    static const char A[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t len = strlen(in);
+    if (len == 0 || (len % 4) != 0) return -1;
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 4) {
+        int v[4], pad = 0;
+        for (int j = 0; j < 4; j++) {
+            char c = in[i + j];
+            if (c == '=') { if (i + 4 < len || j < 2) return -1; v[j] = 0; pad++; }
+            else { const char *q = strchr(A, c); if (!q || c == 0) return -1;
+                   v[j] = (int)(q - A); }
+        }
+        uint32_t acc = ((uint32_t)v[0] << 18) | ((uint32_t)v[1] << 12) |
+                       ((uint32_t)v[2] << 6) | (uint32_t)v[3];
+        int nb = 3 - pad;
+        if (o + (size_t)nb > max) return -1;
+        if (nb > 0) out[o++] = (acc >> 16) & 0xff;
+        if (nb > 1) out[o++] = (acc >> 8) & 0xff;
+        if (nb > 2) out[o++] = acc & 0xff;
+    }
+    return (int)o;
 }
 
 /* =========================================================================
@@ -978,6 +1207,7 @@ static void usage(void)
     printf("  hexdump  <msg_file>                       Raw hex dump\n");
     printf("  approve  <proposal-id> [options]          Approve a gate-blocked proposal\n");
     printf("  apply    <proposal-id> [options]          Re-submit an approved command\n");
+    printf("  enroll   (--key|--spki) [--operator N]    Print an approvers.json entry\n");
     printf("  exec     <device> \"<command>\" [options]   Submit a command through the gate\n");
     printf("  chain    tail [-n N] [--db PATH]          Show last N chain entries\n");
     printf("\n");
@@ -1004,6 +1234,8 @@ int main(int argc, char **argv)
         return cmd_approve(argc - 2, argv + 2);
     else if (strcmp(cmd, "apply") == 0)
         return cmd_apply(argc - 2, argv + 2);
+    else if (strcmp(cmd, "enroll") == 0)
+        return cmd_enroll(argc - 2, argv + 2);
     else if (strcmp(cmd, "exec") == 0)
         return cmd_exec(argc - 2, argv + 2);
     else if (strcmp(cmd, "chain") == 0)
