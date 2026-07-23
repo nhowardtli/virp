@@ -587,6 +587,10 @@ static const cisco_route_t CISCO_GATE_TABLE[] = {
     { "show port-security",           VIRP_TIER_YELLOW },  /* per-port security config */
     { "ping",                         VIRP_TIER_YELLOW },
     { "traceroute",                   VIRP_TIER_YELLOW },
+    /* Reclassified RED → YELLOW (2026-07-23): counter reset is a
+     * diagnostic action, not a config write. Bare "clear " stays RED
+     * via the fail-closed default. */
+    { "clear counters",               VIRP_TIER_YELLOW },
 
     /* ── RED — config writes (explicit for audit; default also RED) ── */
     { "configure terminal",           VIRP_TIER_RED    },
