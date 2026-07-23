@@ -621,6 +621,210 @@ static int cmd_approve(int argc, char **argv)
 }
 
 /* =========================================================================
+ * Framed O-Node client path — shared by `apply` and `exec`.
+ *
+ * This is a CLIENT, not a bypass: requests go through the daemon's
+ * normal framed socket and hit the exact same tier gate as any other
+ * submission, and the caller must run under a uid on the daemon's
+ * SO_PEERCRED allowlist.
+ * ========================================================================= */
+
+static const char *tool_tier_name(uint8_t t)
+{
+    switch (t) {
+    case 0x00: return "UNCLASSIFIED";
+    case 0x01: return "GREEN";
+    case 0x02: return "YELLOW";
+    case 0x03: return "RED";
+    case 0xFF: return "BLACK";
+    default:   return "?";
+    }
+}
+
+/* JSON-escape src into dst (quotes and backslashes). */
+static void json_escape(const char *src, char *dst, size_t dst_len)
+{
+    size_t o = 0;
+    for (const char *p = src; *p && o + 2 < dst_len; p++) {
+        if (*p == '"' || *p == '\\') dst[o++] = '\\';
+        dst[o++] = *p;
+    }
+    dst[o] = '\0';
+}
+
+/* Send one framed JSON request, read one framed response.
+ * Returns 0 and fills resp/resp_len on success, -1 on transport error. */
+static int onode_framed_roundtrip(const char *sock_path,
+                                  const char *json, size_t json_len,
+                                  uint8_t *resp, size_t resp_cap,
+                                  uint32_t *resp_len)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
+    if (fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "Error: cannot connect to O-Node at %s\n"
+                "(run as a uid on the daemon's SO_PEERCRED allowlist)\n",
+                sock_path);
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+
+    /* v2 framing: [4-byte BE length][version byte][JSON] */
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+    uint8_t version = VIRP_FRAME_VERSION;
+    if (write(fd, &frame_len, 4) != 4 || write(fd, &version, 1) != 1 ||
+        write(fd, json, json_len) != (ssize_t)json_len) {
+        fprintf(stderr, "Error: send failed\n");
+        close(fd);
+        return -1;
+    }
+
+    uint8_t hdr4[4];
+    size_t got = 0;
+    while (got < 4) {
+        ssize_t n = read(fd, hdr4 + got, 4 - got);
+        if (n <= 0) { fprintf(stderr, "Error: short read\n"); close(fd); return -1; }
+        got += (size_t)n;
+    }
+    uint32_t rlen = ntohl(*(uint32_t *)hdr4);
+    if (rlen == 0 || rlen > resp_cap) {
+        fprintf(stderr, "Error: bad response length %u\n", rlen);
+        close(fd);
+        return -1;
+    }
+    got = 0;
+    while (got < rlen) {
+        ssize_t n = read(fd, resp + got, rlen - got);
+        if (n <= 0) { fprintf(stderr, "Error: short read\n"); close(fd); return -1; }
+        got += (size_t)n;
+    }
+    close(fd);
+    *resp_len = rlen;
+    return 0;
+}
+
+/*
+ * Print a full execute response: tier resolution, gate decision, and
+ * the signed observation / signed rejection payload verbatim (error
+ * codes included). Returns 0 for an executed observation, 2 for a
+ * signed rejection (OBS_ERROR), 1 for anything unparseable.
+ *
+ * The message is printed unverified — verify via the bridge or
+ * `virp-tool inspect` with the O-Key if needed.
+ */
+static int print_execute_response(const uint8_t *resp, uint32_t resp_len)
+{
+    if (resp_len == 4) {
+        int32_t code = (int32_t)ntohl(*(const uint32_t *)resp);
+        fprintf(stderr, "O-Node error code %d (%s)\n", code,
+                virp_error_str((virp_error_t)code));
+        return 1;
+    }
+
+    virp_header_t hdr;
+    if (virp_header_deserialize(&hdr, resp, resp_len) != VIRP_OK ||
+        resp_len <= VIRP_HEADER_SIZE) {
+        fprintf(stderr, "Unparseable response (%u bytes)\n", resp_len);
+        return 1;
+    }
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    if (virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                               resp_len - VIRP_HEADER_SIZE,
+                               &obs, &data, &data_len) != VIRP_OK) {
+        fprintf(stderr, "Unparseable response (%u bytes)\n", resp_len);
+        return 1;
+    }
+
+    int is_rejection = (obs.obs_type == VIRP_OBS_ERROR);
+    printf("trust_tier=%s (0x%02x)  seq=%u  obs_type=0x%02x (%s)\n",
+           tool_tier_name(hdr.tier), hdr.tier, hdr.seq_num, obs.obs_type,
+           is_rejection ? "ERROR — signed rejection, nothing executed"
+                        : "signed observation");
+    printf("gate_decision=%s\n", is_rejection ? "blocked" : "allowed");
+    printf("payload:\n%.*s\n", (int)data_len, (const char *)data);
+
+    /* Surface a filed proposal_id on its own line for easy capture. */
+    if (is_rejection) {
+        char payload[2048];
+        size_t n = data_len < sizeof(payload) - 1 ? data_len
+                                                  : sizeof(payload) - 1;
+        memcpy(payload, data, n);
+        payload[n] = '\0';
+        const char *p = strstr(payload, "proposal_id=");
+        if (p) {
+            p += strlen("proposal_id=");
+            size_t hexn = strspn(p, "0123456789abcdef");
+            if (hexn == VIRP_APPROVAL_ID_HEX_LEN)
+                printf("proposal_id=%.*s\n", (int)hexn, p);
+        }
+    }
+    return is_rejection ? 2 : 0;
+}
+
+/* Build + submit an execute request; proposal_id may be NULL. */
+static int submit_execute(const char *sock_path, const char *device,
+                          const char *command, const char *proposal_id)
+{
+    char esc_cmd[2200];
+    json_escape(command, esc_cmd, sizeof(esc_cmd));
+
+    char json[3072];
+    int jl;
+    if (proposal_id)
+        jl = snprintf(json, sizeof(json),
+                      "{\"action\":\"execute\",\"device\":\"%s\","
+                      "\"command\":\"%s\",\"proposal_id\":\"%s\"}",
+                      device, esc_cmd, proposal_id);
+    else
+        jl = snprintf(json, sizeof(json),
+                      "{\"action\":\"execute\",\"device\":\"%s\","
+                      "\"command\":\"%s\"}",
+                      device, esc_cmd);
+    if (jl < 0 || (size_t)jl >= sizeof(json)) {
+        fprintf(stderr, "Error: request too large\n");
+        return 1;
+    }
+
+    static uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    uint32_t resp_len = 0;
+    if (onode_framed_roundtrip(sock_path, json, (size_t)jl,
+                               resp, sizeof(resp), &resp_len) != 0)
+        return 1;
+    return print_execute_response(resp, resp_len);
+}
+
+/* =========================================================================
+ * exec — direct human submission of one command through the gate
+ * ========================================================================= */
+
+static int cmd_exec(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr,
+            "Usage: virp exec <device> \"<command>\" [--socket PATH]\n"
+            "Submits through the normal framed socket and tier gate (a\n"
+            "client, not a bypass) and prints the signed response.\n");
+        return 1;
+    }
+    const char *device = argv[0];
+    const char *command = argv[1];
+    const char *sock_path = ONODE_DEFAULT_SOCKET;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
+            sock_path = argv[++i];
+        else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
+    }
+
+    printf("device=%s command=\"%s\"\n", device, command);
+    return submit_execute(sock_path, device, command, NULL);
+}
+
+/* =========================================================================
  * apply — re-submit a proposed command with its approval reference
  * ========================================================================= */
 
@@ -648,95 +852,114 @@ static int cmd_apply(int argc, char **argv)
         return 1;
     }
 
-    /* Build the framed execute request re-submitting the EXACT proposed
-     * command with the approval reference. */
-    char esc_cmd[2200];
-    size_t o = 0;
-    for (const char *p = prop.command; *p && o + 2 < sizeof(esc_cmd); p++) {
-        if (*p == '"' || *p == '\\') esc_cmd[o++] = '\\';
-        esc_cmd[o++] = *p;
-    }
-    esc_cmd[o] = '\0';
+    /* Re-submit the EXACT proposed command with the approval reference. */
+    printf("device=%s command=\"%s\" proposal_id=%s\n",
+           prop.device, prop.command, prop.proposal_id);
+    return submit_execute(sock_path, prop.device, prop.command,
+                          prop.proposal_id);
+}
 
-    char json[3072];
-    int jl = snprintf(json, sizeof(json),
-                      "{\"action\":\"execute\",\"device\":\"%s\","
-                      "\"command\":\"%s\",\"proposal_id\":\"%s\"}",
-                      prop.device, esc_cmd, prop.proposal_id);
-    if (jl < 0 || (size_t)jl >= sizeof(json)) {
-        fprintf(stderr, "Error: request too large\n");
-        return 1;
-    }
+/* =========================================================================
+ * chain tail — print the last N trust-chain entries
+ * ========================================================================= */
 
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
-    if (fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        fprintf(stderr, "Error: cannot connect to O-Node at %s\n", sock_path);
-        if (fd >= 0) close(fd);
-        return 1;
-    }
-
-    /* v2 framing: [4-byte BE length][version byte][JSON] */
-    uint32_t frame_len = htonl((uint32_t)(1 + jl));
-    uint8_t version = VIRP_FRAME_VERSION;
-    if (write(fd, &frame_len, 4) != 4 || write(fd, &version, 1) != 1 ||
-        write(fd, json, (size_t)jl) != (ssize_t)jl) {
-        fprintf(stderr, "Error: send failed\n");
-        close(fd);
-        return 1;
-    }
-
-    uint8_t hdr4[4];
-    size_t got = 0;
-    while (got < 4) {
-        ssize_t n = read(fd, hdr4 + got, 4 - got);
-        if (n <= 0) { fprintf(stderr, "Error: short read\n"); close(fd); return 1; }
-        got += (size_t)n;
-    }
-    uint32_t resp_len = ntohl(*(uint32_t *)hdr4);
-    if (resp_len == 0 || resp_len > VIRP_MAX_MESSAGE_SIZE) {
-        fprintf(stderr, "Error: bad response length %u\n", resp_len);
-        close(fd);
-        return 1;
-    }
-    static uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
-    got = 0;
-    while (got < resp_len) {
-        ssize_t n = read(fd, resp + got, resp_len - got);
-        if (n <= 0) { fprintf(stderr, "Error: short read\n"); close(fd); return 1; }
-        got += (size_t)n;
-    }
-    close(fd);
-
-    if (resp_len == 4) {
-        int32_t code = (int32_t)ntohl(*(uint32_t *)resp);
-        fprintf(stderr, "O-Node error code %d (%s)\n", code,
-                virp_error_str((virp_error_t)code));
-        return 1;
-    }
-
-    /* Print the observation (unverified here — verify via the bridge or
-     * `virp-tool inspect` with the O-Key if needed). */
-    virp_header_t hdr;
-    if (virp_header_deserialize(&hdr, resp, resp_len) == VIRP_OK &&
-        resp_len > VIRP_HEADER_SIZE) {
-        virp_observation_t obs;
-        const uint8_t *data;
-        uint16_t data_len;
-        if (virp_parse_observation(resp + VIRP_HEADER_SIZE,
-                                   resp_len - VIRP_HEADER_SIZE,
-                                   &obs, &data, &data_len) == VIRP_OK) {
-            printf("obs_type=0x%02x tier=0x%02x seq=%u\n%.*s\n",
-                   obs.obs_type, hdr.tier, hdr.seq_num,
-                   (int)data_len, (const char *)data);
-            return obs.obs_type == 0x0F ? 2 : 0;   /* 2 = signed rejection */
+static int cmd_chain_tail(int argc, char **argv)
+{
+    const char *db_path = "/var/lib/virp/chain.db";
+    int n = 10;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n = atoi(argv[++i]);
+            if (n < 1 || n > 1000) {
+                fprintf(stderr, "Error: -n must be 1..1000\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
+            db_path = argv[++i];
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return 1;
         }
     }
-    fprintf(stderr, "Unparseable response (%u bytes)\n", resp_len);
-    return 1;
+
+    /* Read-only open: never creates or mutates the daemon's DB. */
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL)
+            != SQLITE_OK) {
+        fprintf(stderr, "Error: cannot open %s read-only: %s\n",
+                db_path, db ? sqlite3_errmsg(db) : "open failed");
+        if (db) sqlite3_close(db);
+        return 1;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT session_id, sequence, artifact_type, artifact_id, "
+        "       chain_entry_hash, previous_entry_hash, timestamp_ns "
+        "FROM chain_entries ORDER BY id DESC LIMIT ?";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "Error: query failed: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return 1;
+    }
+    sqlite3_bind_int(stmt, 1, n);
+
+    /* Collect newest-first, print oldest-first (chain order). */
+    struct row {
+        char session[64], type[16], artifact[128];
+        char entry[65], prev[65];
+        long long seq;
+        unsigned long long ts_ns;
+    };
+    struct row *rows = calloc((size_t)n, sizeof(*rows));
+    if (!rows) { sqlite3_finalize(stmt); sqlite3_close(db); return 1; }
+    int count = 0;
+    while (count < n && sqlite3_step(stmt) == SQLITE_ROW) {
+        struct row *r = &rows[count++];
+        snprintf(r->session, sizeof(r->session), "%s",
+                 (const char *)sqlite3_column_text(stmt, 0));
+        r->seq = sqlite3_column_int64(stmt, 1);
+        snprintf(r->type, sizeof(r->type), "%s",
+                 (const char *)sqlite3_column_text(stmt, 2));
+        snprintf(r->artifact, sizeof(r->artifact), "%s",
+                 (const char *)sqlite3_column_text(stmt, 3));
+        snprintf(r->entry, sizeof(r->entry), "%s",
+                 (const char *)sqlite3_column_text(stmt, 4));
+        snprintf(r->prev, sizeof(r->prev), "%s",
+                 (const char *)sqlite3_column_text(stmt, 5));
+        r->ts_ns = (unsigned long long)sqlite3_column_int64(stmt, 6);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    if (count == 0) {
+        printf("(no chain entries in %s)\n", db_path);
+        free(rows);
+        return 0;
+    }
+
+    printf("%-24s %-5s %-14s %-34s %-16s %-16s\n",
+           "SESSION", "SEQ", "TYPE", "ARTIFACT_ID", "ENTRY_HASH",
+           "PREV_HASH");
+    for (int i = count - 1; i >= 0; i--) {
+        const struct row *r = &rows[i];
+        printf("%-24s %-5lld %-14s %-34s %-16.16s %-16.16s\n",
+               r->session, r->seq, r->type, r->artifact, r->entry, r->prev);
+    }
+    free(rows);
+    return 0;
+}
+
+static int cmd_chain(int argc, char **argv)
+{
+    if (argc < 1 || strcmp(argv[0], "tail") != 0) {
+        fprintf(stderr,
+            "Usage: virp chain tail [-n N] [--db PATH]\n"
+            "Prints the last N chain entries (default 10, oldest first),\n"
+            "read-only, so a PROPOSAL->APPROVAL->OUTCOME audit is one command.\n");
+        return 1;
+    }
+    return cmd_chain_tail(argc - 1, argv + 1);
 }
 
 /* =========================================================================
@@ -755,6 +978,8 @@ static void usage(void)
     printf("  hexdump  <msg_file>                       Raw hex dump\n");
     printf("  approve  <proposal-id> [options]          Approve a gate-blocked proposal\n");
     printf("  apply    <proposal-id> [options]          Re-submit an approved command\n");
+    printf("  exec     <device> \"<command>\" [options]   Submit a command through the gate\n");
+    printf("  chain    tail [-n N] [--db PATH]          Show last N chain entries\n");
     printf("\n");
 }
 
@@ -779,6 +1004,10 @@ int main(int argc, char **argv)
         return cmd_approve(argc - 2, argv + 2);
     else if (strcmp(cmd, "apply") == 0)
         return cmd_apply(argc - 2, argv + 2);
+    else if (strcmp(cmd, "exec") == 0)
+        return cmd_exec(argc - 2, argv + 2);
+    else if (strcmp(cmd, "chain") == 0)
+        return cmd_chain(argc - 2, argv + 2);
     else if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0)
         usage();
     else {

@@ -479,13 +479,15 @@ fuzz-libfuzzer: $(LIB)
 	      -lstdc++ -o $(FUZZ_LIBFUZZER)
 	@echo "Built $(FUZZ_LIBFUZZER) — run with: ./$(FUZZ_LIBFUZZER) [corpus_dir]"
 
-# Approval flow tests (propose -> approve -> apply)
+# Approval flow tests (propose -> approve -> apply). Depends on the CLI
+# binary too: the suite drives `virp exec` / `virp chain tail` as
+# subprocesses against a served test daemon.
 TEST_APPROVAL = $(BUILD_DIR)/test_approval
 
 $(TEST_APPROVAL): tests/test_approval.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
-test-approval: $(TEST_APPROVAL)
+test-approval: $(TEST_APPROVAL) $(TOOL_BIN)
 	./$(TEST_APPROVAL)
 
 # Response validator tests

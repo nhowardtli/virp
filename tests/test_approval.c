@@ -14,6 +14,7 @@
  *       verification key (approver/observer key separation).
  */
 
+#define _DEFAULT_SOURCE         /* usleep */
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp.h"
@@ -429,6 +430,105 @@ static void test_reuse_survives_restart(void)
     PASS();
 }
 
+/* =========================================================================
+ * CLI tests — `virp exec` and `virp chain tail` against the served
+ * daemon. The CLI is a client: everything goes through the framed
+ * socket and the same tier gate as any other submission.
+ * ========================================================================= */
+
+#include <pthread.h>
+#include <sys/wait.h>
+
+#define CLI_BIN "./build/virp"
+
+static void *serve_thread(void *arg)
+{
+    onode_start((onode_state_t *)arg);
+    return NULL;
+}
+
+/* Run a CLI command, capture combined output and exit status. */
+static int run_cli(const char *cmdline, char *out, size_t out_len)
+{
+    char full[1024];
+    snprintf(full, sizeof(full), "%s 2>&1", cmdline);
+    FILE *p = popen(full, "r");
+    if (!p) return -1;
+    size_t got = fread(out, 1, out_len - 1, p);
+    out[got] = '\0';
+    int status = pclose(p);
+    if (status == -1 || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+static void test_cli_exec_green_executes(void)
+{
+    TEST("CLI: virp exec GREEN read executes");
+    char out[8192], cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " exec R-APP \"show version\" --socket %s",
+             g.socket_path);
+    int rc = run_cli(cmd, out, sizeof(out));
+    ASSERT(rc == 0, "exit code should be 0 (executed)");
+    ASSERT(strstr(out, "trust_tier=GREEN") != NULL, "tier resolution missing");
+    ASSERT(strstr(out, "gate_decision=allowed") != NULL, "gate decision missing");
+    ASSERT(strstr(out, "R-APP#show version") != NULL, "device output missing");
+    PASS();
+}
+
+static void test_cli_exec_red_rejected_with_proposal(void)
+{
+    TEST("CLI: virp exec RED returns rejection + proposal_id");
+    char out[8192], cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " exec R-APP \"reload\" --socket %s", g.socket_path);
+    int rc = run_cli(cmd, out, sizeof(out));
+    ASSERT(rc == 2, "exit code should be 2 (signed rejection)");
+    ASSERT(strstr(out, "trust_tier=RED") != NULL, "tier resolution missing");
+    ASSERT(strstr(out, "gate_decision=blocked") != NULL, "gate decision missing");
+    ASSERT(strstr(out, "signed rejection") != NULL, "rejection label missing");
+    ASSERT(strstr(out, "tier gate blocked") != NULL,
+           "rejection payload missing");
+    /* proposal_id surfaced on its own line, 32 hex */
+    const char *p = strstr(out, "\nproposal_id=");
+    ASSERT(p != NULL, "standalone proposal_id line missing");
+    p += strlen("\nproposal_id=");
+    ASSERT(strspn(p, "0123456789abcdef") == VIRP_APPROVAL_ID_HEX_LEN,
+           "proposal_id not 32 hex");
+    ASSERT(strstr(out, "R-APP#reload") == NULL, "command must not execute");
+    PASS();
+}
+
+static void test_cli_chain_tail_format(void)
+{
+    TEST("CLI: virp chain tail shows linked entries, oldest first");
+    char out[16384], cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " chain tail -n 50 --db %s", CHAIN_DB);
+    int rc = run_cli(cmd, out, sizeof(out));
+    ASSERT(rc == 0, "exit code should be 0");
+    /* Column header */
+    ASSERT(strstr(out, "SESSION") != NULL && strstr(out, "TYPE") != NULL &&
+           strstr(out, "ARTIFACT_ID") != NULL &&
+           strstr(out, "ENTRY_HASH") != NULL &&
+           strstr(out, "PREV_HASH") != NULL, "column header missing");
+    /* The e2e flow left proposal, approval, and outcome entries; tail
+     * must show all three artifact kinds under the approval session. */
+    char want[64];
+    snprintf(want, sizeof(want), "proposal:%s", g_pid_e2e);
+    const char *prop = strstr(out, want);
+    ASSERT(prop != NULL, "proposal entry missing");
+    snprintf(want, sizeof(want), "approval:%s", g_pid_e2e);
+    const char *appr = strstr(out, want);
+    ASSERT(appr != NULL, "approval entry missing");
+    snprintf(want, sizeof(want), "outcome:%s", g_pid_e2e);
+    const char *outc = strstr(out, want);
+    ASSERT(outc != NULL, "outcome entry missing");
+    /* Oldest-first: PROPOSAL before APPROVAL before OUTCOME. */
+    ASSERT(prop < appr && appr < outc, "entries not in chain order");
+    PASS();
+}
+
 static void test_daemon_refuses_secret_key(void)
 {
     TEST("Key separation: daemon refuses approval SECRET key");
@@ -488,6 +588,17 @@ int main(void)
     test_wrong_key_rejected();
     test_no_approval_plain_block();
     test_reuse_survives_restart();
+
+    /* Serve the daemon socket for the CLI client tests. */
+    pthread_t srv;
+    pthread_create(&srv, NULL, serve_thread, &g);
+    usleep(200000);
+    test_cli_exec_green_executes();
+    test_cli_exec_red_rejected_with_proposal();
+    test_cli_chain_tail_format();
+    onode_shutdown(&g);
+    pthread_join(srv, NULL);
+
     test_daemon_refuses_secret_key();
 
     onode_down(&g);
