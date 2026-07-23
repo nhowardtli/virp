@@ -48,6 +48,7 @@
 #include "virp.h"
 #include "virp_chain.h"
 #include "virp_federation.h"
+#include "virp_approver_registry.h"
 
 #define VIRP_APPROVAL_TTL_SECONDS   300
 #define VIRP_APPROVAL_ID_HEX_LEN    32      /* 16 random bytes, lowercase hex */
@@ -130,15 +131,18 @@ virp_error_t virp_approval_write_signed(const char *dir,
 /*
  * APPLY-side verification. Runs the checks IN ORDER and returns the
  * first failure:
- *   1. signature over the approval bytes with pk
+ *   1. key_id (from the record) enrolled in `reg`
+ *        → VIRP_ERR_APPROVAL_KEY_UNENROLLED / _KEY_DISABLED
+ *   2. signature over the approval bytes, verified with the enrolled
+ *        key (dispatching on its algorithm)
  *        → VIRP_ERR_APPROVAL_BAD_SIGNATURE
- *   2. command_hash == SHA-256(canonical submitted command)
+ *   3. command_hash == SHA-256(canonical submitted command)
  *        → VIRP_ERR_APPROVAL_HASH_MISMATCH
- *   3. device + device_node_id binding
+ *   4. device + device_node_id binding
  *        → VIRP_ERR_APPROVAL_DEVICE_MISMATCH
- *   4. TTL unexpired at now_ns (0 = CLOCK_REALTIME)
+ *   5. TTL unexpired at now_ns (0 = CLOCK_REALTIME)
  *        → VIRP_ERR_APPROVAL_EXPIRED
- *   5. single-use consume via consumed.list
+ *   6. single-use consume via consumed.list
  *        → VIRP_ERR_APPROVAL_REUSED; a failed persist of the consume
  *          record returns VIRP_ERR_CHAIN_DB and the approval is NOT
  *          treated as valid (fail closed).
@@ -146,7 +150,7 @@ virp_error_t virp_approval_write_signed(const char *dir,
  * On VIRP_OK the approval has been durably consumed and *out is filled.
  */
 virp_error_t virp_approval_verify_consume(const char *dir,
-                                          const uint8_t pk[VIRP_FED_PK_SIZE],
+                                          const virp_approver_registry_t *reg,
                                           const char *proposal_id,
                                           const char *device,
                                           uint32_t device_node_id,

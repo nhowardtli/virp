@@ -420,8 +420,11 @@ typedef enum {
     VIRP_ERR_APPROVAL_REUSED          = -37,  /* Approval already consumed */
     VIRP_ERR_APPROVAL_HASH_MISMATCH   = -38,  /* command_hash does not match */
     VIRP_ERR_APPROVAL_DEVICE_MISMATCH = -39,  /* Bound to a different device */
-    VIRP_ERR_APPROVAL_BAD_SIGNATURE   = -40,  /* Not signed by approval key */
+    VIRP_ERR_APPROVAL_BAD_SIGNATURE   = -40,  /* Not signed by an enrolled key */
     VIRP_ERR_APPROVAL_NOT_FOUND       = -41,  /* No such proposal/approval */
+    VIRP_ERR_APPROVAL_CONSUMED        = -42,  /* Proposal already has an OUTCOME */
+    VIRP_ERR_APPROVAL_KEY_UNENROLLED  = -43,  /* key_id not in the registry */
+    VIRP_ERR_APPROVAL_KEY_DISABLED    = -44,  /* enrolled key marked disabled */
 } virp_error_t;
 
 /* =========================================================================

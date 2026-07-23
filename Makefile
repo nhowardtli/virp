@@ -33,6 +33,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_transcript.o \
              $(BUILD_DIR)/virp_validator.o \
              $(BUILD_DIR)/virp_approval.o \
+             $(BUILD_DIR)/virp_approver_registry.o \
              $(BUILD_DIR)/cJSON.o
 
 # Optional Cisco driver (requires libssh2)
@@ -198,6 +199,9 @@ $(BUILD_DIR)/virp_validator.o: src/virp_validator.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_approval.o: src/virp_approval.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_approver_registry.o: src/virp_approver_registry.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(LIB): $(LIB_OBJS)
@@ -490,6 +494,15 @@ $(TEST_APPROVAL): tests/test_approval.c $(LIB)
 test-approval: $(TEST_APPROVAL) $(TOOL_BIN)
 	./$(TEST_APPROVAL)
 
+# Approver registry tests (Ed25519 + ECDSA-P256 verify, fixed KATs)
+TEST_APPROVERS = $(BUILD_DIR)/test_approver_registry
+
+$(TEST_APPROVERS): tests/test_approver_registry.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-approvers: $(TEST_APPROVERS)
+	./$(TEST_APPROVERS)
+
 # Response validator tests
 TEST_VALIDATOR = $(BUILD_DIR)/test_validator
 
@@ -507,4 +520,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval
+all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers

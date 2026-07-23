@@ -474,7 +474,7 @@ static void usage(const char *prog)
     printf("  -c <path>   Chain database path (enables Primitive 6 trust chain)\n");
     printf("  -C <path>   Chain key path (32-byte key file, required with -c)\n");
     printf("  -a <path>   Approval store dir (default: /var/lib/virp/approvals)\n");
-    printf("  -A <path>   Approval public key (default: /etc/virp/keys/approval.pub)\n");
+    printf("  -A <path>   Approver registry (default: /etc/virp/approvers.json)\n");
     printf("  -h          Show this help\n");
     printf("\n");
 }
@@ -487,7 +487,7 @@ int main(int argc, char **argv)
     const char *chain_db_path = NULL;
     const char *chain_key_path = NULL;
     const char *approval_dir = "/var/lib/virp/approvals";
-    const char *approval_pub = "/etc/virp/keys/approval.pub";
+    const char *approvers_path = "/etc/virp/approvers.json";
     uint32_t node_id = 0x00000001;
 
     int opt;
@@ -515,7 +515,7 @@ int main(int argc, char **argv)
             approval_dir = optarg;
             break;
         case 'A':
-            approval_pub = optarg;
+            approvers_path = optarg;
             break;
         case 'h':
         default:
@@ -619,18 +619,18 @@ int main(int argc, char **argv)
     }
 
     /*
-     * Approval flow (propose → approve → apply). Loads only the Ed25519
-     * approval PUBLIC key; a missing key simply leaves the flow disabled
-     * (plain gate blocking unchanged). Generate the keypair with
-     * `virp-tool keygen approval /etc/virp/keys/approval` — rotation in
+     * Approval flow (propose → approve → apply). Loads the approver
+     * registry (public keys only); a missing/empty registry simply
+     * leaves the flow disabled (plain gate blocking unchanged). Enroll
+     * keys in /etc/virp/approvers.json — schema and PIV enrollment in
      * docs/APPROVAL-FLOW.md.
      */
     {
-        virp_error_t aerr = onode_set_approval(&g_state, approval_dir,
-                                               approval_pub);
+        virp_error_t aerr = onode_set_approvers(&g_state, approval_dir,
+                                                approvers_path);
         if (aerr != VIRP_OK)
-            fprintf(stderr, "[O-Node] Approval flow disabled: cannot load "
-                    "%s (%s)\n", approval_pub, virp_error_str(aerr));
+            fprintf(stderr, "[O-Node] Approval flow disabled: registry "
+                    "%s (%s)\n", approvers_path, virp_error_str(aerr));
     }
 
     /* Install signal handlers */

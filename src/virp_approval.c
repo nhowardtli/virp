@@ -44,6 +44,9 @@ const char *virp_approval_err_name(virp_error_t err)
     case VIRP_ERR_APPROVAL_DEVICE_MISMATCH: return "approval_device_mismatch";
     case VIRP_ERR_APPROVAL_BAD_SIGNATURE:   return "approval_bad_signature";
     case VIRP_ERR_APPROVAL_NOT_FOUND:       return "approval_not_found";
+    case VIRP_ERR_APPROVAL_CONSUMED:        return "approval_proposal_consumed";
+    case VIRP_ERR_APPROVAL_KEY_UNENROLLED:  return "approval_key_unenrolled";
+    case VIRP_ERR_APPROVAL_KEY_DISABLED:    return "approval_key_disabled";
     default:                                return "error";
     }
 }
@@ -563,7 +566,7 @@ static virp_error_t consume_once(const char *dir, const char *proposal_id)
 }
 
 virp_error_t virp_approval_verify_consume(const char *dir,
-                                          const uint8_t pk[VIRP_FED_PK_SIZE],
+                                          const virp_approver_registry_t *reg,
                                           const char *proposal_id,
                                           const char *device,
                                           uint32_t device_node_id,
@@ -571,7 +574,7 @@ virp_error_t virp_approval_verify_consume(const char *dir,
                                           uint64_t now_ns,
                                           virp_approval_rec_t *out)
 {
-    if (!dir || !pk || !device || !command || !out)
+    if (!dir || !reg || !device || !command || !out)
         return VIRP_ERR_NULL_PTR;
     if (!proposal_id_valid(proposal_id))
         return VIRP_ERR_APPROVAL_NOT_FOUND;
@@ -583,12 +586,8 @@ virp_error_t virp_approval_verify_consume(const char *dir,
                                          sig, chain_hash);
     if (err != VIRP_OK) return err;
 
-    /* 1. Signature over the exact stored bytes, approval key only. */
-    if (virp_fed_verify(pk, (const uint8_t *)body, strlen(body), sig)
-            != VIRP_OK)
-        return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
-
-    /* Signed bytes verified — now parse the binding. */
+    /* Parse the binding (untrusted until the signature check below, which
+     * covers the whole body — a tampered field changes the signed bytes). */
     cJSON *o = cJSON_Parse(body);
     if (!o || !cJSON_IsObject(o)) {
         if (o) cJSON_Delete(o);
@@ -617,18 +616,33 @@ virp_error_t virp_approval_verify_consume(const char *dir,
     snprintf(out->chain_entry_hash, sizeof(out->chain_entry_hash), "%s",
              chain_hash);
 
-    /* 2. Command binding. */
+    /* 1. The signing key must be enrolled (and enabled). Distinguish
+     * unenrolled from disabled so the rejection names the true cause. */
+    const virp_approver_t *ent =
+        virp_approver_registry_find_any(reg, out->approver_key_id);
+    if (!ent)
+        return VIRP_ERR_APPROVAL_KEY_UNENROLLED;
+    if (!ent->enabled)
+        return VIRP_ERR_APPROVAL_KEY_DISABLED;
+
+    /* 2. Signature over the exact stored bytes, verified with the
+     * enrolled key (dispatch on its algorithm). */
+    if (virp_approver_verify(ent, (const uint8_t *)body, strlen(body),
+                             sig, sizeof(sig)) != VIRP_OK)
+        return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
+
+    /* 3. Command binding. */
     char cmd_hash[65];
     if (command_hash_hex(command, cmd_hash) != VIRP_OK ||
         strcmp(cmd_hash, out->command_hash) != 0)
         return VIRP_ERR_APPROVAL_HASH_MISMATCH;
 
-    /* 3. Device binding. */
+    /* 4. Device binding. */
     if (strcmp(device, out->device) != 0 ||
         device_node_id != out->device_node_id)
         return VIRP_ERR_APPROVAL_DEVICE_MISMATCH;
 
-    /* 4. TTL. A future-dated approval (beyond 60s clock skew) is treated
+    /* 5. TTL. A future-dated approval (beyond 60s clock skew) is treated
      * as expired rather than granted a longer window. */
     if (now_ns == 0)
         now_ns = now_realtime_ns();
@@ -638,6 +652,6 @@ virp_error_t virp_approval_verify_consume(const char *dir,
         out->approved_at_ns > now_ns + 60ULL * 1000000000ULL)
         return VIRP_ERR_APPROVAL_EXPIRED;
 
-    /* 5. Single-use consume (durable; persist failure fails closed). */
+    /* 6. Single-use consume (durable; persist failure fails closed). */
     return consume_once(dir, proposal_id);
 }

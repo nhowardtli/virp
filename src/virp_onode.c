@@ -664,33 +664,31 @@ virp_error_t onode_execute_obs(onode_state_t *state,
                                 NULL, out_buf, out_buf_len, out_len);
 }
 
-virp_error_t onode_set_approval(onode_state_t *state,
-                                const char *dir,
-                                const char *pubkey_path)
+virp_error_t onode_set_approvers(onode_state_t *state,
+                                 const char *dir,
+                                 const char *registry_path)
 {
-    if (!state || !dir || !pubkey_path)
+    if (!state || !dir || !registry_path)
         return VIRP_ERR_NULL_PTR;
     if (strlen(dir) >= sizeof(state->approval_dir))
         return VIRP_ERR_INVALID_LENGTH;
 
-    FILE *f = fopen(pubkey_path, "rb");
-    if (!f)
+    virp_error_t err = virp_approver_registry_load(&state->approvers,
+                                                   registry_path);
+    if (err != VIRP_OK) {
+        state->approvers_loaded = false;
+        return err;
+    }
+    if (state->approvers.count == 0) {
+        /* File parsed but nothing usable enrolled — leave disabled. */
+        state->approvers_loaded = false;
         return VIRP_ERR_KEY_NOT_LOADED;
-    uint8_t pk[32];
-    size_t got = fread(pk, 1, sizeof(pk), f);
-    /* Exactly 32 bytes: reject truncated files AND anything larger — a
-     * 64-byte read here would mean someone pointed the daemon at the
-     * SECRET key file, which must never happen. */
-    int extra = fgetc(f);
-    fclose(f);
-    if (got != sizeof(pk) || extra != EOF)
-        return VIRP_ERR_KEY_NOT_LOADED;
+    }
 
     snprintf(state->approval_dir, sizeof(state->approval_dir), "%s", dir);
-    memcpy(state->approval_pk, pk, sizeof(pk));
-    state->approval_pk_loaded = true;
-    fprintf(stderr, "[APPROVAL] enabled: dir=%s pubkey=%s\n",
-            dir, pubkey_path);
+    state->approvers_loaded = true;
+    fprintf(stderr, "[APPROVAL] enabled: dir=%s registry=%s keys=%zu\n",
+            dir, registry_path, state->approvers.count);
     return VIRP_OK;
 }
 
@@ -865,21 +863,24 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             virp_error_t aerr;
             if (gate_tier == VIRP_TIER_BLACK)
                 aerr = VIRP_ERR_TIER_VIOLATION;
-            else if (!state->approval_dir[0] || !state->approval_pk_loaded)
+            else if (!state->approval_dir[0] || !state->approvers_loaded)
                 aerr = VIRP_ERR_KEY_NOT_LOADED;
             else
                 aerr = virp_approval_verify_consume(state->approval_dir,
-                                                    state->approval_pk,
+                                                    &state->approvers,
                                                     proposal_id,
                                                     device_name,
                                                     state->devices[dev_idx].node_id,
                                                     command, 0, &apr);
             if (aerr == VIRP_OK) {
                 approved = true;
+                const virp_approver_t *ent = virp_approver_registry_find_any(
+                        &state->approvers, apr.approver_key_id);
                 fprintf(stderr, "[GATE] approval verified: proposal=%s "
-                        "device=%s tier=%s key_id=%.8s — executing\n",
+                        "device=%s tier=%s key_id=%s operator=%s — executing\n",
                         proposal_id, device_name,
-                        gate_tier_name(gate_tier), apr.approver_key_id);
+                        gate_tier_name(gate_tier), apr.approver_key_id,
+                        (ent && ent->operator[0]) ? ent->operator : "(unknown)");
                 /* fall through: the approved command executes below */
             } else {
                 pthread_mutex_unlock(&state->exec_mutex[dev_idx]);

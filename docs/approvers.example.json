@@ -1,0 +1,16 @@
+[
+  {
+    "key_id": "e6d67937b0a11c446e166ddc8f157ba9",
+    "algorithm": "ecdsa-p256",
+    "public_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEPunEJQ1WRSrSDlBhL6MRlYkJoLInUnLDH0zozZ40uEGnnt/MSp0Bkht4+q1jakqnwz141u58E1pn9fkDAOxcAw==",
+    "operator": "nhoward-yubikey-piv-9c",
+    "enabled": true
+  },
+  {
+    "key_id": "REPLACE_WITH_BACKUP_KEY_ID",
+    "algorithm": "ecdsa-p256",
+    "public_key": "REPLACE_WITH_BASE64_SPKI_OF_BACKUP_PIV_KEY",
+    "operator": "nhoward-backup-yubikey",
+    "enabled": false
+  }
+]

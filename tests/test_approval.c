@@ -19,6 +19,7 @@
 
 #include "virp.h"
 #include "virp_approval.h"
+#include "virp_approver_registry.h"
 #include "virp_chain.h"
 #include "virp_crypto.h"
 #include "virp_federation.h"
@@ -46,16 +47,40 @@ static int tests_failed = 0;
 #define ASSERT(cond, msg) \
     do { if (!(cond)) { FAIL(msg); return; } } while (0)
 
-static const char *DIR      = "/tmp/virp-test-approvals";
-static const char *CHAIN_DB = "/tmp/virp-test-approval-chain.db";
+static const char *DIR       = "/tmp/virp-test-approvals";
+static const char *CHAIN_DB  = "/tmp/virp-test-approval-chain.db";
 static const char *CHAIN_KEY = "/tmp/virp-test-approval-chain.key";
-static const char *AP_PUB   = "/tmp/virp-test-approval.pub";
-static const char *AP_KEY   = "/tmp/virp-test-approval.key";
+static const char *REGISTRY  = "/tmp/virp-test-approvers.json";
 
 extern void virp_driver_mock_init(void);
 
 static onode_state_t g;
-static virp_fed_keypair_t g_kp;      /* the real approval keypair */
+static virp_fed_keypair_t g_kp;      /* the enrolled Ed25519 approver key */
+
+/* Write an approvers.json enrolling g_kp (Ed25519). `enabled` toggles the
+ * entry's enabled flag; `bad` writes a corrupt-SPKI entry instead so the
+ * loader skips it (used to prove the flow stays disabled). */
+static int write_registry(const char *path, bool enabled, bool bad)
+{
+    char entry[1024];
+    if (bad) {
+        snprintf(entry, sizeof(entry),
+            "{\"key_id\":\"00000000000000000000000000000000\","
+            "\"algorithm\":\"ed25519\",\"public_key\":\"bm90LWEta2V5\","
+            "\"operator\":\"nobody\",\"enabled\":true}");
+    } else {
+        uint8_t spki[44];
+        virp_approver_ed25519_spki(g_kp.public_key, spki);
+        if (virp_approver_entry_json(spki, sizeof(spki), "test-operator",
+                                     enabled, entry, sizeof(entry)) != VIRP_OK)
+            return -1;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "[%s]\n", entry);
+    fclose(f);
+    return 0;
+}
 
 static uint64_t now_ns(void)
 {
@@ -71,8 +96,7 @@ static void nuke_store(void)
     snprintf(cmd, sizeof(cmd), "rm -rf %s", DIR);
     if (system(cmd) != 0) { /* best-effort */ }
     unlink(CHAIN_DB);
-    unlink(AP_PUB);
-    unlink(AP_KEY);
+    unlink(REGISTRY);
     unlink(CHAIN_KEY);
 }
 
@@ -104,7 +128,7 @@ static int onode_up(onode_state_t *st)
         return -1;
     st->chain_enabled = true;
 
-    if (onode_set_approval(st, DIR, AP_PUB) != VIRP_OK)
+    if (onode_set_approvers(st, DIR, REGISTRY) != VIRP_OK)
         return -1;
     return 0;
 }
@@ -337,14 +361,16 @@ static void test_device_mismatch_rejected(void)
     PASS();
 }
 
-static void test_wrong_key_rejected(void)
+static void test_unenrolled_key_rejected(void)
 {
-    TEST("Negative: wrong signing key -> approval_bad_signature (-40)");
+    TEST("Negative: unenrolled signing key -> approval_key_unenrolled (-43)");
     char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
     ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0,
            "propose failed");
 
-    /* A rogue keypair signs an otherwise-perfect approval. */
+    /* A rogue keypair (NOT in the registry) signs an otherwise-perfect
+     * approval. Its key_id resolves to nothing enrolled, so the daemon
+     * rejects it as unenrolled before ever checking the signature. */
     virp_fed_keypair_t rogue;
     ASSERT(virp_fed_generate(&rogue, 1) == VIRP_OK, "rogue keygen failed");
     virp_proposal_rec_t prop;
@@ -368,9 +394,9 @@ static void test_wrong_key_rejected(void)
     ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
                    sizeof(payload)) == 0, "apply failed");
     ASSERT(ot == VIRP_OBS_ERROR, "must be rejected");
-    ASSERT(strstr(payload, "approval_bad_signature") != NULL,
+    ASSERT(strstr(payload, "approval_key_unenrolled") != NULL,
            "wrong failure mode");
-    ASSERT(strstr(payload, "err=-40") != NULL, "wrong error code");
+    ASSERT(strstr(payload, "err=-43") != NULL, "wrong error code");
     PASS();
 }
 
@@ -529,19 +555,25 @@ static void test_cli_chain_tail_format(void)
     PASS();
 }
 
-static void test_daemon_refuses_secret_key(void)
+static void test_registry_zero_keys_disables_flow(void)
 {
-    TEST("Key separation: daemon refuses approval SECRET key");
+    TEST("Key separation: registry with no usable key disables flow");
+    /* The registry only ever carries public SPKI — there is no secret to
+     * point the daemon at. A registry whose sole entry is unusable (bad
+     * SPKI) enrolls zero keys, and the flow must stay DISABLED (fail
+     * safe) rather than accept anything. */
+    ASSERT(write_registry(REGISTRY, true, /*bad=*/true) == 0,
+           "write bad registry");
     onode_state_t tmp;
     ASSERT(onode_init(&tmp, 0xA9900002, NULL,
                       "/tmp/virp-test-approval2.sock") == VIRP_OK,
            "init failed");
-    /* Pointing the daemon at the 64-byte Ed25519 secret key must fail —
-     * only the 32-byte public half is loadable. */
-    ASSERT(onode_set_approval(&tmp, DIR, AP_KEY) == VIRP_ERR_KEY_NOT_LOADED,
-           "daemon accepted a secret key file");
-    ASSERT(!tmp.approval_pk_loaded, "flow must stay disabled");
+    ASSERT(onode_set_approvers(&tmp, DIR, REGISTRY)
+               == VIRP_ERR_KEY_NOT_LOADED, "empty registry must not enable");
+    ASSERT(!tmp.approvers_loaded, "flow must stay disabled");
     onode_destroy(&tmp);
+    /* Restore the good registry for any later use. */
+    ASSERT(write_registry(REGISTRY, true, false) == 0, "restore registry");
     PASS();
 }
 
@@ -568,9 +600,13 @@ int main(void)
     virp_key_save_file(&ck, CHAIN_KEY);
     virp_key_destroy(&ck);
 
-    if (virp_fed_generate(&g_kp, 1) != VIRP_OK ||
-        virp_fed_save(&g_kp, AP_PUB, AP_KEY) != VIRP_OK) {
+    if (virp_fed_generate(&g_kp, 1) != VIRP_OK) {
         fprintf(stderr, "approval keygen failed\n");
+        return 1;
+    }
+    /* Enroll the Ed25519 approver key in the registry the daemon reads. */
+    if (write_registry(REGISTRY, /*enabled=*/true, /*bad=*/false) != 0) {
+        fprintf(stderr, "registry write failed\n");
         return 1;
     }
 
@@ -585,7 +621,7 @@ int main(void)
     test_expired_approval_rejected();
     test_hash_mismatch_rejected();
     test_device_mismatch_rejected();
-    test_wrong_key_rejected();
+    test_unenrolled_key_rejected();
     test_no_approval_plain_block();
     test_reuse_survives_restart();
 
@@ -599,7 +635,7 @@ int main(void)
     onode_shutdown(&g);
     pthread_join(srv, NULL);
 
-    test_daemon_refuses_secret_key();
+    test_registry_zero_keys_disables_flow();
 
     onode_down(&g);
     virp_fed_destroy(&g_kp);

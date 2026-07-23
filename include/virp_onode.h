@@ -24,6 +24,7 @@
 #include "virp_driver.h"
 #include "virp_chain.h"
 #include "virp_context.h"
+#include "virp_approver_registry.h"
 #include <pthread.h>
 #include <semaphore.h>   /* sem_t for worker pool cap */
 #include <stdint.h>
@@ -203,16 +204,17 @@ typedef struct {
 
     /*
      * Approval flow (propose → approve → apply). Disabled until
-     * onode_set_approval() provides a store directory and the approval
-     * PUBLIC key. The daemon never holds the approval SECRET key — it
-     * only verifies; `virp approve` (virp-tool) signs. This keeps the
-     * approver and observer roles on cryptographically distinct keys:
-     * the O-Key is a symmetric HMAC key this process owns, the approval
-     * key is an Ed25519 keypair whose secret half lives with the human.
+     * onode_set_approvers() provides a store directory and an approver
+     * registry (/etc/virp/approvers.json). The daemon holds ONLY public
+     * keys — it verifies approvals, never signs them. Approver and
+     * observer roles stay on cryptographically distinct keys: the O-Key
+     * is a symmetric HMAC key this process owns; approval keys are
+     * enrolled Ed25519 / ECDSA-P256 public keys whose secret halves live
+     * with the humans (or their PIV hardware).
      */
-    char                approval_dir[256];
-    uint8_t             approval_pk[32];        /* Ed25519 public key */
-    bool                approval_pk_loaded;
+    char                     approval_dir[256];
+    virp_approver_registry_t approvers;
+    bool                     approvers_loaded;
 
     /* Thread safety */
     pthread_mutex_t     state_mutex;    /* Protects seq_num, observations_sent */
@@ -391,15 +393,17 @@ virp_error_t onode_execute_obs(onode_state_t *state,
 
 /*
  * Configure the approval flow: `dir` is the approval store directory
- * (proposals/, approvals/, consumed.list) and `pubkey_path` the 32-byte
- * Ed25519 approval PUBLIC key file. Loading the key never loads any
- * secret material into the daemon. Returns VIRP_ERR_KEY_NOT_LOADED if
- * the public key file cannot be read (approval flow stays disabled;
- * plain gate blocking is unaffected).
+ * (proposals/, approvals/, consumed.list) and `registry_path` the
+ * approver registry (/etc/virp/approvers.json). Only public keys are
+ * loaded — no secret material ever enters the daemon. Returns
+ * VIRP_ERR_CHAIN_DB if the registry file is unreadable or not a JSON
+ * array, or VIRP_ERR_KEY_NOT_LOADED if it parses but enrolls zero keys
+ * (approval flow stays disabled in both cases; plain gate blocking is
+ * unaffected).
  */
-virp_error_t onode_set_approval(onode_state_t *state,
-                                const char *dir,
-                                const char *pubkey_path);
+virp_error_t onode_set_approvers(onode_state_t *state,
+                                 const char *dir,
+                                 const char *registry_path);
 
 /*
  * As onode_execute_obs(), plus an optional approval reference.
