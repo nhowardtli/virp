@@ -133,6 +133,29 @@ consumed by the attempt, not by success.
   approval record, submits it over the framed socket, and the DAEMON
   appends the APPROVAL chain entry (single writer, chain key never
   leaves the daemon). Not changed in this session.
+- **FINDING L1 (from live testing 2026-07-23, deferred): re-approval of
+  an executed proposal mints a valid new approval.** Single-use is
+  keyed on the consumed proposal_id at APPLY time; `virp approve` will
+  re-sign a proposal whose OUTCOME already exists (live evidence: chain
+  `approval:R1` seq=6 re-approves f9e1… 32 s after its outcome at
+  seq=4 — see `docs/LIVE-PROOF-2026-07-23.md`). The consumed store
+  still blocks re-execution, but the fresh approval record is
+  misleading audit state. Fix direction: `virp approve` refuses a
+  proposal that already has an OUTCOME chain entry unless an explicit
+  `--re-approve` flag is given. Not implemented.
+- **FINDING L2 (from live testing 2026-07-23, deferred): interactive
+  prompts and config mode wedge the SSH session.** IOS `[confirm]`
+  prompts are not answered by the driver (console hangs; next
+  submission reports `cannot connect` until the watchdog recycles),
+  and a successful `configure terminal` apply leaves the device in
+  config mode, blocking subsequent connects. Fix direction: the driver
+  answers/declines confirmation prompts explicitly and exits config
+  mode (or resets the session) after an approved config-entering
+  command. Not implemented.
+- **FINDING L3 (pre-existing, now observed live): a blocked command to
+  a busy/unreachable device reports connect-failure instead of the
+  gate decision** — the gate check runs after the connection attempt.
+  Fix direction: evaluate the gate before connecting. Not implemented.
 
 - The Go port implements none of this and REFUSES any execute carrying
   `proposal_id` with `ErrApprovalNotFound` (-41) rather than silently

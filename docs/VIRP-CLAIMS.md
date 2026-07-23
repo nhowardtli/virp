@@ -369,10 +369,20 @@ exercises the property; every pointer below is a file in this tree.
 | C7 | A signed observation for command/device A cannot satisfy a request for command/device B | DEMONSTRATED | `tests/test_obs_v2.c`: `test_command_substitution_rejected`, `test_device_substitution_rejected`; end-to-end in `tests/test_onode.c`: `test_execute_v2_session_bound_roundtrip` |
 | C8 | Observations are bound to the session that produced them | DEMONSTRATED | `tests/test_obs_v2.c`: `test_cross_session_replay_rejected`; ProVerif session-key secrecy query in `proofs/virp_obs_v2.out` |
 | C16 | The signed v2 header bytes are an explicit, padding-free wire encoding | DEMONSTRATED | `virp_obs_header_v2_serialize()` in `src/virp_message.c`; golden-offset test `test_serialization_roundtrip_and_layout` in `tests/test_obs_v2.c` |
+| C17 | Error observations are typed `VIRP_OBS_ERROR` (0x0f) and carry the command's true classified tier — never the executed-output type or a blanket GREEN | DEMONSTRATED (live + suite) | Negative tests `test_error_obs_connect_failure_is_error_with_true_tier`, `test_error_obs_driver_refusal_is_error_not_output`, `test_error_obs_gate_block_logs_as_error_not_change` in `tests/test_onode.c`; live rejections 2026-07-23 (`docs/LIVE-PROOF-2026-07-23.md` §T2–T4, T6–T7) |
+| C18 | A tier-gate block files a signed PROPOSAL (chain entry + proposal_id in the rejection) and executes nothing | DEMONSTRATED (live + suite) | `tests/test_approval.c`: `test_block_files_proposal`; live: `docs/LIVE-PROOF-2026-07-23.md` §T2 |
+| C19 | An approval binds command_hash + device + 300 s TTL, signed by a dedicated Ed25519 key the daemon can verify but never sign with | DEMONSTRATED (live + suite) | `tests/test_approval.c`: `test_e2e_propose_approve_apply`, `test_wrong_key_rejected`, `test_daemon_refuses_secret_key`; live: `docs/LIVE-PROOF-2026-07-23.md` §T5, T8 |
+| C20 | An approved apply executes exactly once; reuse, expiry, hash/device mismatch, and missing approval are rejected with distinct codes (-36…-41), reuse surviving daemon restart | DEMONSTRATED (live + suite) | `tests/test_approval.c`: `test_reused_approval_rejected`, `test_expired_approval_rejected`, `test_hash_mismatch_rejected`, `test_device_mismatch_rejected`, `test_no_approval_plain_block`, `test_reuse_survives_restart`; live: `docs/LIVE-PROOF-2026-07-23.md` §T4–T7 |
+| C21 | PROPOSAL → APPROVAL → OUTCOME are hash-linked on the trust chain | DEMONSTRATED (live + suite) | `tests/test_approval.c`: `test_e2e_propose_approve_apply`, `test_cli_chain_tail_format`; live: `docs/LIVE-PROOF-2026-07-23.md` §T8 |
 
 Statuses above apply to the v2 observation path
-(`virp_verify_observation_v2`, `src/virp_crypto.c`). The legacy v1
-message path performs none of these checks at verify time.
+(`virp_verify_observation_v2`, `src/virp_crypto.c`) for C5–C16, and to
+the approval/error-observation paths (`src/virp_approval.c`,
+`onode_execute_obs_ex`) for C17–C21. The legacy v1 message path
+performs none of the C5–C16 checks at verify time; C17–C21 live
+evidence was collected over the v1 bridge path (see the caveats in
+`docs/LIVE-PROOF-2026-07-23.md`). The approval flow has no ProVerif
+model yet (deferred).
 
 -----
 
