@@ -43,19 +43,25 @@ static const uint8_t MOCK_POINT[65] = {
 #define H_PRIV 10UL
 #define H_PUB  11UL
 
+static EVP_PKEY *g_key;   /* freed in C_Finalize (keeps LSan quiet) */
+
 static EVP_PKEY *load_key(void)
 {
-    static EVP_PKEY *k = NULL;
-    if (!k) {
+    if (!g_key) {
         BIO *b = BIO_new_mem_buf(MOCK_KEY_PEM, -1);
-        k = PEM_read_bio_PrivateKey(b, NULL, NULL, NULL);
+        g_key = PEM_read_bio_PrivateKey(b, NULL, NULL, NULL);
         BIO_free(b);
     }
-    return k;
+    return g_key;
 }
 
 CK_RV C_Initialize(CK_VOID_PTR a) { (void)a; return CKR_OK; }
-CK_RV C_Finalize(CK_VOID_PTR a) { (void)a; return CKR_OK; }
+CK_RV C_Finalize(CK_VOID_PTR a)
+{
+    (void)a;
+    if (g_key) { EVP_PKEY_free(g_key); g_key = NULL; }
+    return CKR_OK;
+}
 
 CK_RV C_GetSlotList(CK_BBOOL present, CK_SLOT_ID *list, CK_ULONG *n)
 {

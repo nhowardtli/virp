@@ -2,16 +2,23 @@
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
  * VIRP — Approval flow tests (propose → approve → apply)
  *
- * Required coverage (Task 3):
- *   negative: expired / reused / hash mismatch / device mismatch /
- *             wrong key / no approval at all — each asserting its
- *             DISTINCT error code in the signed rejection
- *   positive: propose → approve → apply → OUTCOME chain entry present
- *             and linked
- *   persistence: a consumed approval stays consumed across a daemon
- *             restart (fresh onode state, same approval store)
- * Plus: the daemon must refuse to load the approval SECRET key as its
- *       verification key (approver/observer key separation).
+ * Coverage:
+ *   negatives (each asserting its DISTINCT code): expired (-36),
+ *     reused (-37), hash mismatch (-38), device mismatch (-39), bad
+ *     signature / altered payload / wrong-algorithm (-40), not found
+ *     (-41), consumed proposal (-42), unenrolled key (-43), disabled
+ *     key (-44), plain block with no approval reference.
+ *   positive: library e2e (challenge→submit→apply→OUTCOME linked) and a
+ *     CLI e2e through the framed socket with a software approver key.
+ *   L1 fix: challenge + submit both refuse a proposal that already has
+ *     an OUTCOME (-42).
+ *   persistence: a consumed approval stays rejected across a restart.
+ *   concurrency: two simultaneous submits for one proposal → exactly one
+ *     APPROVAL chain entry.
+ *   fail-safe: a registry enrolling no usable key leaves the flow off.
+ * Approvals are signed over the padding-free canonical payload and
+ * verified through the approver registry (Ed25519 here; ECDSA-P256 KAT
+ * lives in test_approver_registry / test_pkcs11_plumbing).
  */
 
 #define _DEFAULT_SOURCE         /* usleep */
@@ -31,6 +38,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sqlite3.h>
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -500,6 +508,260 @@ static void test_reuse_survives_restart(void)
     PASS();
 }
 
+/* Overwrite the on-disk approval record's stored command_hash with one
+ * flipped hex nibble (leaving the signature untouched). Apply rebuilds
+ * the canonical bytes from the altered hash, so the signature no longer
+ * verifies. Returns 0 on success. */
+static int flip_record_command_hash(const char *pid)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/approvals/%s.rec", DIR, pid);
+    char buf[4096];
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    char *k = strstr(buf, "\"command_hash\":\"");
+    if (!k) return -1;
+    k += strlen("\"command_hash\":\"");
+    k[0] = (k[0] == 'a') ? 'b' : 'a';   /* flip one hex digit */
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fwrite(buf, 1, strlen(buf), f);
+    fclose(f);
+    return 0;
+}
+
+static void test_disabled_key_rejected(void)
+{
+    TEST("Negative: disabled enrolled key -> approval_key_disabled (-44)");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_proposal_rec_t prop;
+    ASSERT(virp_approval_load_proposal(DIR, pid, &prop) == VIRP_OK, "load");
+    /* Record validly signed by g_kp over correct canonical bytes. */
+    ASSERT(craft_record(pid, &g_kp, prop.command_hash, prop.device,
+                        prop.device_node_id, now_ns(),
+                        VIRP_APPROVAL_TTL_SECONDS) == VIRP_OK, "craft");
+
+    /* Reload the registry with g_kp DISABLED. */
+    ASSERT(write_registry(REGISTRY, /*enabled=*/false, false) == 0, "reg");
+    ASSERT(onode_set_approvers(&g, DIR, REGISTRY) == VIRP_OK, "reload reg");
+
+    uint8_t ot, tier; char payload[2048];
+    ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                   sizeof(payload)) == 0, "apply");
+    ASSERT(ot == VIRP_OBS_ERROR, "must be rejected");
+    ASSERT(strstr(payload, "approval_key_disabled") != NULL, "wrong mode");
+    ASSERT(strstr(payload, "err=-44") != NULL, "wrong code");
+
+    /* Restore the enabled registry for later tests. */
+    ASSERT(write_registry(REGISTRY, true, false) == 0, "restore reg");
+    ASSERT(onode_set_approvers(&g, DIR, REGISTRY) == VIRP_OK, "restore reload");
+    PASS();
+}
+
+static void test_altered_payload_rejected(void)
+{
+    TEST("Negative: altered command_hash -> approval_bad_signature (-40)");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_approval_rec_t apr;
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "approve");
+    /* Tamper the stored command_hash after signing. */
+    ASSERT(flip_record_command_hash(pid) == 0, "flip");
+
+    uint8_t ot, tier; char payload[2048];
+    ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                   sizeof(payload)) == 0, "apply");
+    ASSERT(ot == VIRP_OBS_ERROR, "must be rejected");
+    ASSERT(strstr(payload, "approval_bad_signature") != NULL, "wrong mode");
+    ASSERT(strstr(payload, "err=-40") != NULL, "wrong code");
+    PASS();
+}
+
+static void test_challenge_and_submit_consumed_refused(void)
+{
+    TEST("L1: challenge + submit for a consumed proposal -> -42");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_approval_rec_t apr;
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "approve");
+    uint8_t ot, tier; char payload[2048];
+    ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                   sizeof(payload)) == 0, "apply");
+    ASSERT(strstr(payload, "R-APP#reload") != NULL, "first apply ran");
+
+    /* An OUTCOME now exists. Re-challenge and re-submit must both refuse
+     * with approval_proposal_consumed (-42) — the L1 fix. */
+    virp_approval_challenge_t ch;
+    ASSERT(virp_approval_challenge(DIR, &g.chain, pid, 0, &ch)
+               == VIRP_ERR_APPROVAL_CONSUMED, "re-challenge must be -42");
+
+    uint8_t sig[VIRP_APPROVER_SIG_SIZE];
+    char kid[33];
+    keyid_hex(&g_kp, kid);
+    /* Any signature bytes: the consumed check precedes verification. */
+    memset(sig, 0x11, sizeof(sig));
+    ASSERT(virp_approval_submit(DIR, &g.approvers, &g.chain, pid, kid,
+                                sig, sizeof(sig), &apr)
+               == VIRP_ERR_APPROVAL_CONSUMED, "re-submit must be -42");
+    PASS();
+}
+
+static void test_wrong_algorithm_rejected(void)
+{
+    TEST("Negative: wrong-algorithm sig for enrolled key -> -40");
+    /* Enroll BOTH g_kp (ed25519) and the mock's ECDSA-P256 key, then
+     * write a record whose key_id is the ECDSA key but whose signature is
+     * an Ed25519 signature. The daemon dispatches ECDSA verify on Ed25519
+     * bytes -> bad signature. */
+    static const char MOCK_SPKI[] =
+        "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEUlaSetRmRWfyHZV0CjHUP09tdnES"
+        "vruJo7n5ZnZ8Wov7B1OMrkI0pzOLn8WDLTown1WsdvcEi1BYbbJACMgUNg==";
+    /* Compute the ECDSA key_id + build a 2-key registry. */
+    char ed[1024], ec[1024];
+    uint8_t ed_spki[44];
+    virp_approver_ed25519_spki(g_kp.public_key, ed_spki);
+    ASSERT(virp_approver_entry_json(ed_spki, sizeof(ed_spki), "op", true,
+                                    ed, sizeof(ed)) == VIRP_OK, "ed entry");
+    /* Decode the mock SPKI base64 to DER for entry_json. */
+    uint8_t der[256];
+    static const char A[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t bl = strlen(MOCK_SPKI), o = 0;
+    for (size_t i = 0; i < bl; i += 4) {
+        int v[4], pad = 0;
+        for (int j = 0; j < 4; j++) {
+            char cc = MOCK_SPKI[i + j];
+            if (cc == '=') { v[j] = 0; pad++; }
+            else { const char *q = strchr(A, cc); v[j] = q ? (int)(q - A) : 0; }
+        }
+        uint32_t acc = ((uint32_t)v[0] << 18) | ((uint32_t)v[1] << 12) |
+                       ((uint32_t)v[2] << 6) | (uint32_t)v[3];
+        if (pad < 3) der[o++] = (acc >> 16) & 0xff;
+        if (pad < 2) der[o++] = (acc >> 8) & 0xff;
+        if (pad < 1) der[o++] = acc & 0xff;
+    }
+    ASSERT(virp_approver_entry_json(der, o, "mock", true, ec, sizeof(ec))
+               == VIRP_OK, "ec entry");
+    FILE *f = fopen(REGISTRY, "w");
+    ASSERT(f != NULL, "reg open");
+    fprintf(f, "[%s,%s]\n", ed, ec);
+    fclose(f);
+    ASSERT(onode_set_approvers(&g, DIR, REGISTRY) == VIRP_OK, "reload 2-key");
+
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_proposal_rec_t prop;
+    ASSERT(virp_approval_load_proposal(DIR, pid, &prop) == VIRP_OK, "load");
+
+    /* Ed25519 signature over the correct canonical bytes... */
+    uint8_t canon[VIRP_APPROVAL_CANON_SIZE];
+    uint64_t at = now_ns();
+    ASSERT(virp_approval_build_canonical(pid, prop.command_hash,
+               prop.device_node_id, at, VIRP_APPROVAL_TTL_SECONDS, canon)
+               == VIRP_OK, "canon");
+    uint8_t sig[VIRP_APPROVER_SIG_SIZE];
+    ASSERT(virp_fed_sign(&g_kp, canon, sizeof(canon), sig) == VIRP_OK, "sign");
+    /* ...but written under the ECDSA key's key_id. */
+    virp_approver_alg_t alg;
+    uint8_t raw[65]; size_t rawlen;
+    (void)alg; (void)raw; (void)rawlen;
+    virp_approval_rec_t rec;
+    memset(&rec, 0, sizeof(rec));
+    snprintf(rec.proposal_id, sizeof(rec.proposal_id), "%s", pid);
+    snprintf(rec.command_hash, sizeof(rec.command_hash), "%s", prop.command_hash);
+    snprintf(rec.device, sizeof(rec.device), "%s", prop.device);
+    rec.device_node_id = prop.device_node_id;
+    rec.approved_at_ns = at;
+    rec.ttl_seconds = VIRP_APPROVAL_TTL_SECONDS;
+    /* ECDSA key's key_id (derive via a throwaway registry lookup). */
+    {
+        virp_approver_registry_t r2;
+        char one[1024];
+        virp_approver_entry_json(der, o, "mock", true, one, sizeof(one));
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "/tmp/virp-test-wrongalg.json");
+        FILE *g2 = fopen(tmp, "w"); fprintf(g2, "[%s]\n", one); fclose(g2);
+        virp_approver_registry_load(&r2, tmp);
+        snprintf(rec.approver_key_id, sizeof(rec.approver_key_id), "%s",
+                 r2.entries[0].key_id);
+        unlink(tmp);
+    }
+    ASSERT(virp_approval_write_record(DIR, &rec, sig, sizeof(sig)) == VIRP_OK,
+           "write record");
+
+    uint8_t ot, tier; char payload[2048];
+    ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                   sizeof(payload)) == 0, "apply");
+    ASSERT(ot == VIRP_OBS_ERROR, "must be rejected");
+    ASSERT(strstr(payload, "approval_bad_signature") != NULL, "wrong mode");
+    ASSERT(strstr(payload, "err=-40") != NULL, "wrong code");
+
+    /* Restore the single-key enabled registry. */
+    ASSERT(write_registry(REGISTRY, true, false) == 0, "restore");
+    ASSERT(onode_set_approvers(&g, DIR, REGISTRY) == VIRP_OK, "restore reload");
+    PASS();
+}
+
+/* Concurrency: two simultaneous SUBMITs for one proposal must yield
+ * exactly ONE APPROVAL chain entry. */
+struct submit_arg { char pid[33]; uint8_t sig[VIRP_APPROVER_SIG_SIZE];
+                    char kid[33]; virp_error_t rc; };
+static void *submit_thread(void *a)
+{
+    struct submit_arg *s = a;
+    virp_approval_rec_t apr;
+    s->rc = virp_approval_submit(DIR, &g.approvers, &g.chain, s->pid,
+                                 s->kid, s->sig, VIRP_APPROVER_SIG_SIZE, &apr);
+    return NULL;
+}
+
+static void test_concurrent_submit_one_entry(void)
+{
+    TEST("Concurrency: two submits for one proposal -> one chain entry");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_approval_challenge_t ch;
+    ASSERT(virp_approval_challenge(DIR, &g.chain, pid, 0, &ch) == VIRP_OK,
+           "challenge");
+
+    struct submit_arg a1, a2;
+    memset(&a1, 0, sizeof(a1)); memset(&a2, 0, sizeof(a2));
+    snprintf(a1.pid, sizeof(a1.pid), "%s", pid);
+    snprintf(a2.pid, sizeof(a2.pid), "%s", pid);
+    keyid_hex(&g_kp, a1.kid); keyid_hex(&g_kp, a2.kid);
+    ASSERT(virp_fed_sign(&g_kp, ch.canonical, VIRP_APPROVAL_CANON_SIZE,
+                         a1.sig) == VIRP_OK, "sign1");
+    memcpy(a2.sig, a1.sig, sizeof(a2.sig));
+
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, submit_thread, &a1);
+    pthread_create(&t2, NULL, submit_thread, &a2);
+    pthread_join(t1, NULL); pthread_join(t2, NULL);
+    ASSERT(a1.rc == VIRP_OK && a2.rc == VIRP_OK, "both submits ok/idempotent");
+
+    /* EXACTLY one APPROVAL chain entry for this proposal — count directly. */
+    char aid[64];
+    snprintf(aid, sizeof(aid), "approval:%s", pid);
+    sqlite3 *db = NULL;
+    ASSERT(sqlite3_open_v2(CHAIN_DB, &db, SQLITE_OPEN_READONLY, NULL)
+               == SQLITE_OK, "open chain ro");
+    sqlite3_stmt *st = NULL;
+    ASSERT(sqlite3_prepare_v2(db,
+               "SELECT COUNT(*) FROM chain_entries WHERE artifact_id = ?",
+               -1, &st, NULL) == SQLITE_OK, "prepare");
+    sqlite3_bind_text(st, 1, aid, -1, SQLITE_TRANSIENT);
+    ASSERT(sqlite3_step(st) == SQLITE_ROW, "step");
+    int count = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    ASSERT(count == 1, "must be exactly one APPROVAL entry");
+    PASS();
+}
+
 /* =========================================================================
  * CLI tests — `virp exec` and `virp chain tail` against the served
  * daemon. The CLI is a client: everything goes through the framed
@@ -599,6 +861,53 @@ static void test_cli_chain_tail_format(void)
     PASS();
 }
 
+/* Full positive e2e THROUGH THE CLI + framed socket + daemon:
+ * propose -> `virp approve` (challenge/sign/submit) -> `virp apply`.
+ * Uses g_kp saved to key files as the software approver key. */
+static void test_cli_approve_apply_e2e(void)
+{
+    TEST("CLI e2e: exec(block) -> approve -> apply executes");
+    /* Save g_kp so the CLI's software signer can load it. */
+    const char *pub = "/tmp/virp-test-cli.pub", *sk = "/tmp/virp-test-cli.key";
+    ASSERT(virp_fed_save(&g_kp, pub, sk) == VIRP_OK, "save key");
+
+    /* 1. Block a fresh RED command via the CLI to file a proposal.
+     * ("reload" is RED for the mock classifier; "configure" is YELLOW.) */
+    char out[8192], cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " exec R-APP \"reload\" --socket %s", g.socket_path);
+    ASSERT(run_cli(cmd, out, sizeof(out)) == 2, "exec must be a rejection");
+    const char *p = strstr(out, "\nproposal_id=");
+    ASSERT(p != NULL, "no proposal_id");
+    p += strlen("\nproposal_id=");
+    char pid[33]; memcpy(pid, p, 32); pid[32] = '\0';
+
+    /* 2. Approve via the CLI (challenge -> sign with the software key ->
+     * submit; the daemon writes the APPROVAL chain entry). */
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " approve %s --socket %s --key %s --sk %s",
+             pid, g.socket_path, pub, sk);
+    ASSERT(run_cli(cmd, out, sizeof(out)) == 0, "approve failed");
+    ASSERT(strstr(out, "APPROVED") != NULL, "no APPROVED banner");
+
+    /* 3. Apply via the CLI — the command executes. */
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " apply %s --dir %s --socket %s", pid, DIR, g.socket_path);
+    int rc = run_cli(cmd, out, sizeof(out));
+    ASSERT(rc == 0, "apply should execute (exit 0)");
+    ASSERT(strstr(out, "R-APP#reload") != NULL, "command did not execute");
+
+    /* Chain shows the daemon-written APPROVAL with operator. */
+    char tail[16384];
+    snprintf(cmd, sizeof(cmd), CLI_BIN " chain tail -n 60 --db %s", CHAIN_DB);
+    ASSERT(run_cli(cmd, tail, sizeof(tail)) == 0, "chain tail");
+    char want[64];
+    snprintf(want, sizeof(want), "approval:%s", pid);
+    ASSERT(strstr(tail, want) != NULL, "APPROVAL entry missing");
+    unlink(pub); unlink(sk);
+    PASS();
+}
+
 static void test_registry_zero_keys_disables_flow(void)
 {
     TEST("Key separation: registry with no usable key disables flow");
@@ -666,8 +975,13 @@ int main(void)
     test_hash_mismatch_rejected();
     test_device_mismatch_rejected();
     test_unenrolled_key_rejected();
+    test_disabled_key_rejected();
+    test_altered_payload_rejected();
+    test_challenge_and_submit_consumed_refused();
+    test_wrong_algorithm_rejected();
     test_no_approval_plain_block();
     test_reuse_survives_restart();
+    test_concurrent_submit_one_entry();
 
     /* Serve the daemon socket for the CLI client tests. */
     pthread_t srv;
@@ -675,6 +989,7 @@ int main(void)
     usleep(200000);
     test_cli_exec_green_executes();
     test_cli_exec_red_rejected_with_proposal();
+    test_cli_approve_apply_e2e();
     test_cli_chain_tail_format();
     onode_shutdown(&g);
     pthread_join(srv, NULL);

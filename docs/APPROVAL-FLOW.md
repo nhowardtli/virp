@@ -1,166 +1,220 @@
 # VIRP Approval Flow — propose → approve → apply
 
-Status: implemented (C daemon + virp-tool). ProVerif modeling of this
-flow is deliberately deferred to a follow-up session.
+Status: implemented (C daemon + virp-tool). The daemon is the SOLE
+chain.db writer; approvals are signed externally (software key or PKCS#11
+hardware) and submitted over the socket. Approver keys are enrolled in a
+registry. ProVerif modeling of the approval flow is deferred.
 
 ## What it is
 
-Commands blocked by the tier gate under ENFORCE (tier above
-`gate_max_tier`, or UNCLASSIFIED) can be escalated to a human instead of
-dying at the gate. The default gate max tier is unchanged. BLACK-tier
-commands are never proposable or approvable.
+A command the tier gate blocks under ENFORCE (tier above `gate_max_tier`,
+or UNCLASSIFIED) can be escalated to a human instead of dying at the gate.
+The default gate max tier is unchanged. BLACK-tier commands are never
+proposable or approvable.
 
 ```
-AI layer                    O-Node (CT 211)              Human approver
---------                    ---------------              --------------
-execute "configure ..."  →  gate: block (RED > YELLOW)
-                            + signed rejection
-                            + PROPOSAL chain entry
-                            + proposals/<id>.rec
-                            payload carries proposal_id=<id>
-                                                         virp approve <id>
-                                                         (signs with approval.key,
-                                                          APPROVAL chain entry,
-                                                          approvals/<id>.rec,
-                                                          300 s TTL, single use)
-execute + proposal_id    →  gate: verify approval
-                            sig → hash → device → TTL → consume
-                            → execute → OUTCOME chain entry
-                              (links PROPOSAL + APPROVAL)
+AI layer                 O-Node (CT 211, sole chain writer)     Approver
+--------                 ----------------------------------     --------
+execute "configure…"  →  gate: block (RED > YELLOW)
+                         + signed rejection (proposal_id=…)
+                         + PROPOSAL chain entry
+                                            virp approve <id>:
+                              ← APPROVAL_CHALLENGE ─ canonical bytes ─→
+                                            sign canonical (SW key / PIV)
+                              ← APPROVAL_SUBMIT {sig, key_id} ─────────
+                         verify sig vs registry
+                         + APPROVAL chain entry (key_id + operator)
+execute + proposal_id →  gate: verify approval
+                         sig → hash → device → TTL → consume
+                         → execute → OUTCOME chain entry
+                           (links PROPOSAL + APPROVAL)
 ```
 
-Apply-side check order and DISTINCT rejection codes:
+## Canonical payload (the signed bytes)
 
-| Check                         | Failure code                             |
-|-------------------------------|------------------------------------------|
-| Ed25519 signature (approval key) | `VIRP_ERR_APPROVAL_BAD_SIGNATURE` (-40) |
-| command_hash match            | `VIRP_ERR_APPROVAL_HASH_MISMATCH` (-38)  |
-| device + node_id match        | `VIRP_ERR_APPROVAL_DEVICE_MISMATCH` (-39)|
-| TTL (300 s from approval)     | `VIRP_ERR_APPROVAL_EXPIRED` (-36)        |
-| single-use consume            | `VIRP_ERR_APPROVAL_REUSED` (-37)         |
-| no approval record on disk    | `VIRP_ERR_APPROVAL_NOT_FOUND` (-41)      |
-
-Single-use consumption is persisted to `<dir>/consumed.list` with the
-same write-temp → fsync → rename pattern as the observation seqstore;
-a failed persist REJECTS the apply (fail closed, matching af92763).
-Consumed state survives daemon restarts.
-
-## Keys — generation, separation, rotation
-
-The approval key is a dedicated **Ed25519 keypair**, cryptographically
-distinct from the O-Key (a 32-byte symmetric HMAC secret). The daemon
-loads ONLY the public half and refuses a 64-byte secret-key file; the
-secret half lives with the approver. The observer therefore can never
-mint approvals for its own escalations, and the approver never holds
-observation-signing material.
-
-Generate (run once, as root, on CT 211):
+The approver signs a padding-free binary payload the daemon builds from
+its own proposal record (never from client input), the same discipline as
+v2 observations. All multi-byte fields are big-endian:
 
 ```
-build/virp-tool keygen approval /etc/virp/keys/approval
-# → /etc/virp/keys/approval.pub  (0644 ok — public)
-# → /etc/virp/keys/approval.key  (0600 — approver only)
+off  0  magic        "VAP1"              (4 bytes)
+off  4  proposal_id  raw 16 bytes        (the random id, hex-decoded)
+off 20  command_hash raw 32 bytes        (SHA-256 of the canonical command)
+off 52  device_id    8 bytes             (device node_id)
+off 60  approved_at  8 bytes             (ns since epoch)
+off 68  ttl_seconds  4 bytes
+= 72 bytes
 ```
 
-The prod daemon picks up `/etc/virp/keys/approval.pub` and
-`/var/lib/virp/approvals` by default (`-A` / `-a` to override). If the
-public key is absent the flow is disabled and plain gate blocking is
-unchanged.
+CHALLENGE stamps `approved_at = now`, `ttl = 300 s`, persists a pending
+challenge so SUBMIT reconstructs the exact bytes, and returns the 72 bytes
+(hex) plus the proposal summary for display. SUBMIT reconstructs the bytes
+itself and verifies. APPLY reconstructs them from the stored approval
+record and re-verifies, so a tampered record field fails the signature.
+(Nanosecond timestamps are stored in the JSON records as decimal strings —
+they exceed 2^53 and a JSON number would round-trip lossily.)
 
-### Rotation procedure
+### Signature encodings (wire choice)
 
-1. Generate the new pair under a staging name:
-   `virp-tool keygen approval /etc/virp/keys/approval-new`
-2. Let any in-flight approvals expire (TTL is 300 s — wait 5 minutes,
-   or verify `approvals/` holds nothing unconsumed you care about).
-3. Atomically swap: `mv approval-new.pub approval.pub && mv
-   approval-new.key approval.key`
-4. Restart virp-onode at the next deliberate deploy (the daemon reads
-   the pub key at startup). Old approvals become invalid the moment the
-   daemon holds the new public key — signature check fails first.
-5. Record the new key id (printed at keygen) in the ops log.
+Signatures are a fixed 64 bytes on the wire for both algorithms:
 
-Rotate immediately if: the approver's workstation/session is suspected
-compromised, an approval appears on the chain that no human remembers
-issuing, or as part of the scheduled credential-rotation window.
+- **ECDSA-P256** — raw `r || s` (each 32 bytes). This is exactly what
+  `CKM_ECDSA` returns from a PIV token; the daemon converts it to DER for
+  OpenSSL verification. For CKM_ECDSA the client pre-hashes (SHA-256) the
+  canonical bytes.
+- **Ed25519** — the native 64-byte signature over the canonical bytes.
 
-## Operator workflow (live proof sequence shape)
+## Apply-side check order and DISTINCT rejection codes
+
+| Check                                   | Failure code                              |
+|-----------------------------------------|-------------------------------------------|
+| proposal not already outcome-consumed   | `VIRP_ERR_APPROVAL_CONSUMED` (-42)        |
+| key_id enrolled                         | `VIRP_ERR_APPROVAL_KEY_UNENROLLED` (-43)  |
+| enrolled key enabled                    | `VIRP_ERR_APPROVAL_KEY_DISABLED` (-44)    |
+| signature over canonical (enrolled key) | `VIRP_ERR_APPROVAL_BAD_SIGNATURE` (-40)   |
+| command_hash match                      | `VIRP_ERR_APPROVAL_HASH_MISMATCH` (-38)   |
+| device + node_id match                  | `VIRP_ERR_APPROVAL_DEVICE_MISMATCH` (-39) |
+| TTL (300 s from approval)               | `VIRP_ERR_APPROVAL_EXPIRED` (-36)         |
+| single-use consume                      | `VIRP_ERR_APPROVAL_REUSED` (-37)          |
+| no approval record / proposal           | `VIRP_ERR_APPROVAL_NOT_FOUND` (-41)       |
+
+Single-use consumption is persisted to `<dir>/consumed.list` (write-temp →
+fsync → rename); a failed persist REJECTS the apply (fail closed). Consumed
+state survives restarts.
+
+### L1 — RESOLVED
+
+The live-proof finding L1 (re-approval of an already-executed proposal
+minted a fresh, misleading approval) is **fixed**. Enforcement point:
+both `APPROVAL_CHALLENGE` and `APPROVAL_SUBMIT` refuse a proposal that
+already has an `outcome:<id>` chain entry, with the distinct code
+`approval_proposal_consumed` (-42). The check
+(`virp_chain_artifact_exists`) runs before signature verification and
+fails closed on a query error. There is no override flag this session.
+
+## Approver registry — /etc/virp/approvers.json
+
+The daemon enrolls approver PUBLIC keys from `/etc/virp/approvers.json`
+(only public keys — no secret material ever enters the daemon). It is a
+JSON array of:
+
+```json
+{
+  "key_id":     "<32 lowercase hex>",   // SHA-256(raw pubkey)[:16]
+  "algorithm":  "ecdsa-p256" | "ed25519",
+  "public_key": "<base64 SubjectPublicKeyInfo (DER)>",
+  "operator":   "<human identifier>",
+  "enabled":    true
+}
+```
+
+- `key_id` is uniformly `SHA-256(raw public key)[:16]` (the 32-byte
+  Ed25519 key, or the 65-byte uncompressed EC point). The declared
+  `key_id`/`algorithm` are cross-checked against the actual key at load;
+  a mislabeled entry is rejected.
+- Malformed entries are logged and skipped — one bad entry never disables
+  the rest. A registry that enrolls zero usable keys leaves the flow
+  disabled (fail safe).
+- **Revocation = set `"enabled": false`** (or remove the entry) and
+  restart at the next deliberate deploy. Applies signed by a disabled key
+  are rejected with -44.
+- **Two-key recommendation:** enroll a primary and a backup key (e.g. two
+  YubiKeys), the backup `"enabled": false` until needed, so a lost primary
+  never locks out approvals.
+
+An example ships at `docs/approvers.example.json`. Generate entries with
+`virp enroll` (below) — never hand-compute `key_id`.
+
+## YubiKey PIV enrollment (slot 9c, touch-policy ALWAYS)
+
+Generate the signing key ON the token so the private key never exists off
+it, with touch required for every signature:
 
 ```
-# 1. AI submits a blocked command; the signed rejection contains
-#    "proposal_id=<32 hex>". [GATE] log shows "proposal filed".
-# 2. Approve (run as root or the daemon user so file perms line up):
-build/virp approve <proposal-id> \
-    --chain-db /var/lib/virp/chain.db --chain-key <chain-key-path>
-# 3. Apply — re-submits the EXACT proposed command with the reference:
-build/virp apply <proposal-id>
-# 4. A second `virp apply <proposal-id>` must return
-#    "apply rejected (approval_reused, err=-37)".
+ykman piv keys generate --algorithm ECCP256 \
+    --pin-policy ONCE --touch-policy ALWAYS 9c /tmp/9c.pub.pem
+ykman piv certificates generate --subject "CN=virp-approver" 9c /tmp/9c.pub.pem
+# Export the public SPKI as base64 and build the registry entry:
+SPKI=$(openssl pkey -pubin -in /tmp/9c.pub.pem -outform DER | base64 -w0)
+build/virp enroll --spki "$SPKI" --operator nhoward-yubikey-9c
 ```
 
-`virp` is a hardlink of `virp-tool` created by the build. `approve`
-defaults to `--dir /var/lib/virp/approvals --key
-/etc/virp/keys/approval.key --pub /etc/virp/keys/approval.pub`; pass
-`--chain-db/--chain-key` so the APPROVAL entry lands on the same chain
-the daemon writes (multi-process SQLite access is safe — appends use
-BEGIN IMMEDIATE).
+Paste the printed JSON object into `/etc/virp/approvers.json` and deploy.
+For a software (Ed25519) key instead: `virp-tool keygen approval <prefix>`
+then `virp enroll --key <prefix>.pub --operator <name>`.
 
-File permissions: proposals are written by the daemon (0640), approvals
-by the approver (0644 — a signed public statement the daemon must be
-able to read regardless of which user approved).
+## Operator workflow / live proof sequence
+
+The daemon loads `/etc/virp/approvers.json` (`-A`) and uses
+`/var/lib/virp/approvals` (`-a`) by default. `virp` is a hardlink of
+`virp-tool`. The PKCS#11 build (`make virp-tool-pkcs11`) adds `--pkcs11`.
+
+```
+# 1. A blocked command files a proposal; capture proposal_id.
+sudo -u virp-onode virp exec R1 "configure terminal"
+
+# 2. Approve with the PIV key (challenge → sign on token → submit).
+#    Prompts for the PIN on the terminal, then "touch your key".
+virp approve <proposal-id> \
+    --pkcs11 /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so --slot 9c
+
+# 3. Apply — re-submits the exact command with the reference.
+sudo -u virp-onode virp apply <proposal-id>
+
+# 4. A second apply must be rejected: approval_reused (-37).
+sudo -u virp-onode virp apply <proposal-id>
+
+# 5. A re-approve of the executed proposal must be rejected:
+#    approval_proposal_consumed (-42)  [L1].
+virp approve <proposal-id> --pkcs11 … --slot 9c
+
+# 6. Audit: PROPOSAL → APPROVAL(key_id, operator) → OUTCOME, hash-linked.
+virp chain tail -n 12
+```
+
+`virp approve` never opens chain.db and never writes an approval record —
+it is a pure client of `APPROVAL_CHALLENGE`/`APPROVAL_SUBMIT`. All chain
+writes (PROPOSAL, APPROVAL, OUTCOME) are made by the daemon.
 
 ## Chain audit trail
 
 All three entries share chain session `approval:<device>`:
 
-- `proposal:<id>` — artifact: proposal JSON (device, session, exact
-  command, command_hash, proposer, timestamp)
-- `approval:<id>` — artifact: signed approval JSON (binding + key id)
-- `outcome:<id>` — artifact: links `proposal_entry_hash` +
-  `approval_entry_hash`, device, command_hash, and whether the device
-  reported success
+- `proposal:<id>` — proposal JSON (device, session, exact command,
+  command_hash, proposer, timestamp)
+- `approval:<id>` — approval binding + **key_id + operator** (daemon-written)
+- `outcome:<id>` — links `proposal_entry_hash` + `approval_entry_hash`,
+  device, command_hash, success
 
-An approved apply that reaches execution ALWAYS emits an OUTCOME entry,
-even if the device itself then fails the command — the approval is
-consumed by the attempt, not by success.
+An approved apply that reaches execution ALWAYS emits an OUTCOME, even if
+the device itself then fails the command — the approval is consumed by the
+attempt, not by success.
+
+## PKCS#11 note
+
+Real-hardware exercise (YubiKey PIV via `opensc-pkcs11.so`) is out of
+scope in the CI/build container (no token, no module). The signer plumbing
+is validated against a mock PKCS#11 module
+(`tests/mock_pkcs11.c`, `make test-pkcs11`) driven through the real signer:
+it produces a raw `r||s` signature the daemon's registry verify path
+accepts. The PIN is read from the terminal (getpass), never argv;
+`VIRP_PKCS11_PIN` is an env-only automation hook.
+
+## Deferred / findings
+
+- **Approval-flow ProVerif model** — not modeled this session.
+- **L2 (from live testing):** interactive `[confirm]` prompts and config
+  mode wedge the SSH session; the driver should answer/decline prompts and
+  exit config mode after an approved config-entering command. Not fixed.
+- **L3 (from live testing):** a blocked command to a busy/unreachable
+  device reports connect-failure instead of the gate decision (the gate
+  runs after the connection attempt). Not fixed.
 
 ## Scope notes
 
-- **FINDING (next session): second chain writer.** `virp approve
-  --chain-db/--chain-key` writes chain.db directly from the CLI using
-  the daemon's chain key — a second writer on the daemon's database and
-  a second holder of K_chain. Better design: the CLI only signs the
-  approval record, submits it over the framed socket, and the DAEMON
-  appends the APPROVAL chain entry (single writer, chain key never
-  leaves the daemon). Not changed in this session.
-- **FINDING L1 (from live testing 2026-07-23, deferred): re-approval of
-  an executed proposal mints a valid new approval.** Single-use is
-  keyed on the consumed proposal_id at APPLY time; `virp approve` will
-  re-sign a proposal whose OUTCOME already exists (live evidence: chain
-  `approval:R1` seq=6 re-approves f9e1… 32 s after its outcome at
-  seq=4 — see `docs/LIVE-PROOF-2026-07-23.md`). The consumed store
-  still blocks re-execution, but the fresh approval record is
-  misleading audit state. Fix direction: `virp approve` refuses a
-  proposal that already has an OUTCOME chain entry unless an explicit
-  `--re-approve` flag is given. Not implemented.
-- **FINDING L2 (from live testing 2026-07-23, deferred): interactive
-  prompts and config mode wedge the SSH session.** IOS `[confirm]`
-  prompts are not answered by the driver (console hangs; next
-  submission reports `cannot connect` until the watchdog recycles),
-  and a successful `configure terminal` apply leaves the device in
-  config mode, blocking subsequent connects. Fix direction: the driver
-  answers/declines confirmation prompts explicitly and exits config
-  mode (or resets the session) after an approved config-entering
-  command. Not implemented.
-- **FINDING L3 (pre-existing, now observed live): a blocked command to
-  a busy/unreachable device reports connect-failure instead of the
-  gate decision** — the gate check runs after the connection attempt.
-  Fix direction: evaluate the gate before connecting. Not implemented.
-
 - The Go port implements none of this and REFUSES any execute carrying
-  `proposal_id` with `ErrApprovalNotFound` (-41) rather than silently
-  serving it as a plain execute.
+  `proposal_id` with `ErrApprovalNotFound` (-41).
 - `batch_execute` items may not carry `proposal_id`; the whole batch is
   refused. Approvals are single-command by design.
 - Error observations (including approval rejections) are v1
-  master-key-signed messages — same as every other error path today.
+  master-key-signed messages.

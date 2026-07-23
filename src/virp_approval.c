@@ -645,6 +645,12 @@ virp_error_t virp_approval_submit(const char *dir,
     if (sig_len != VIRP_APPROVER_SIG_SIZE)
         return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
 
+    /* L1: a proposal that already produced an OUTCOME cannot be approved
+     * again — checked BEFORE signature verification so the rejection names
+     * the consumed state, not a signature problem. */
+    if (approval_has_outcome(chain, proposal_id))
+        return VIRP_ERR_APPROVAL_CONSUMED;
+
     /* key_id must be enrolled (and enabled). */
     const virp_approver_t *ent = virp_approver_registry_find_any(reg, key_id);
     if (!ent)
