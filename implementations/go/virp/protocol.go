@@ -152,6 +152,18 @@ const (
 	// implementation (include/virp.h). Returned when a client requests
 	// session-bound v2 observations, which this port does not support.
 	ErrSessionInvalid Error = -30
+
+	// Approval-flow error codes, mirroring VIRP_ERR_APPROVAL_* in
+	// include/virp.h. This port implements none of the approval flow;
+	// the codes exist so an apply request can be REFUSED with the
+	// correct wire code instead of silently dropping the field (the
+	// same standard as the ObsVersion refusal above).
+	ErrApprovalExpired        Error = -36
+	ErrApprovalReused         Error = -37
+	ErrApprovalHashMismatch   Error = -38
+	ErrApprovalDeviceMismatch Error = -39
+	ErrApprovalBadSignature   Error = -40
+	ErrApprovalNotFound       Error = -41
 )
 
 func (e Error) Error() string {

@@ -985,6 +985,12 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_HOST_KEY_MISMATCH:   return "SSH host key mismatch (possible MITM)";
     case VIRP_ERR_HOST_KEY_UNKNOWN:    return "SSH host key not in known_hosts";
     case VIRP_ERR_PROTOCOL_VERSION:   return "Unframed v1 request (upgrade client)";
+    case VIRP_ERR_APPROVAL_EXPIRED:         return "Approval expired (TTL elapsed)";
+    case VIRP_ERR_APPROVAL_REUSED:          return "Approval already consumed (single-use)";
+    case VIRP_ERR_APPROVAL_HASH_MISMATCH:   return "Approval bound to a different command";
+    case VIRP_ERR_APPROVAL_DEVICE_MISMATCH: return "Approval bound to a different device";
+    case VIRP_ERR_APPROVAL_BAD_SIGNATURE:   return "Approval signature invalid";
+    case VIRP_ERR_APPROVAL_NOT_FOUND:       return "Proposal or approval not found";
     default:                         return "Unknown error";
     }
 }

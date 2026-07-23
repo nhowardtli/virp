@@ -43,6 +43,14 @@ type ONodeRequest struct {
 	// means v1.
 	ObsVersion int `json:"obs_version,omitempty"`
 
+	// ProposalID is the approval reference of an APPLY re-submission
+	// (C daemon: onode_execute_obs_ex). This port has no approval
+	// store or approval public key, so it can verify nothing: an
+	// execute carrying a ProposalID MUST be refused with
+	// ErrApprovalNotFound — never silently served as a plain execute.
+	// Same unknown-field standard as ObsVersion above.
+	ProposalID string `json:"proposal_id,omitempty"`
+
 	// Chain fields
 	SessionID    string `json:"session_id,omitempty"`
 	ArtifactType string `json:"artifact_type,omitempty"`
@@ -267,6 +275,12 @@ func (on *ONode) handleExecute(conn net.Conn, req *ONodeRequest) {
 		// No session support in this port: refuse rather than
 		// silently downgrade a session-binding request to v1.
 		on.sendErrorCode(conn, ErrSessionInvalid)
+		return
+	}
+	if req.ProposalID != "" {
+		// No approval flow in this port: refuse an apply outright
+		// rather than silently executing it as a plain command.
+		on.sendErrorCode(conn, ErrApprovalNotFound)
 		return
 	}
 

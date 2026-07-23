@@ -413,6 +413,15 @@ typedef enum {
     VIRP_ERR_HOST_KEY_MISMATCH   = -33,  /* SSH host key changed (possible MITM) */
     VIRP_ERR_HOST_KEY_UNKNOWN    = -34,  /* SSH host key not in known_hosts */
     VIRP_ERR_PROTOCOL_VERSION    = -35,  /* Client sent unframed v1 request */
+
+    /* Approval-flow error codes (propose → approve → apply). Each apply
+     * check failure has its own code so rejections are unambiguous. */
+    VIRP_ERR_APPROVAL_EXPIRED         = -36,  /* Approval TTL elapsed */
+    VIRP_ERR_APPROVAL_REUSED          = -37,  /* Approval already consumed */
+    VIRP_ERR_APPROVAL_HASH_MISMATCH   = -38,  /* command_hash does not match */
+    VIRP_ERR_APPROVAL_DEVICE_MISMATCH = -39,  /* Bound to a different device */
+    VIRP_ERR_APPROVAL_BAD_SIGNATURE   = -40,  /* Not signed by approval key */
+    VIRP_ERR_APPROVAL_NOT_FOUND       = -41,  /* No such proposal/approval */
 } virp_error_t;
 
 /* =========================================================================

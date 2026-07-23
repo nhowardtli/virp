@@ -38,6 +38,7 @@
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include "cJSON.h"
+#include "virp_approval.h"
 
 /* =========================================================================
  * JSON Request Parsing
@@ -61,6 +62,7 @@ typedef struct {
     char            device[64];
     char            command[1024];
     int32_t         obs_version;            /* 1 = legacy O-Key, 2 = session-bound */
+    char            proposal_id[VIRP_APPROVAL_ID_HEX_LEN + 1]; /* apply ref */
     /* Chain fields (Primitive 6) */
     char            session_id[64];
     char            artifact_type[16];
@@ -209,6 +211,29 @@ static bool parse_request(const char *json, onode_request_t *req)
     /* Extract optional string fields */
     EXTRACT_STR("device", req->device, sizeof(req->device));
     EXTRACT_STR("command", req->command, sizeof(req->command));
+
+    /*
+     * Approval reference for apply. If present it must be exactly the
+     * 32-lowercase-hex proposal id — anything else rejects the request
+     * outright (the value becomes a path component downstream, and a
+     * malformed reference must never silently degrade to a plain
+     * execute). Validated on the raw JSON value so truncation can never
+     * disguise an over-long id.
+     */
+    {
+        cJSON *pid = cJSON_GetObjectItemCaseSensitive(root, "proposal_id");
+        if (pid) {
+            if (!cJSON_IsString(pid) || !pid->valuestring ||
+                strlen(pid->valuestring) != VIRP_APPROVAL_ID_HEX_LEN ||
+                strspn(pid->valuestring, "0123456789abcdef")
+                    != VIRP_APPROVAL_ID_HEX_LEN) {
+                cJSON_Delete(root);
+                return false;
+            }
+            snprintf(req->proposal_id, sizeof(req->proposal_id), "%s",
+                     pid->valuestring);
+        }
+    }
 
     /*
      * Observation version for execute/health. Absent → 1 (legacy
@@ -562,14 +587,70 @@ static onode_gate_mode_t gate_effective_mode(const onode_state_t *state,
  * O-Node Operations
  * ========================================================================= */
 
+/*
+ * Emit the OUTCOME chain entry for an approved apply, linking the
+ * PROPOSAL and APPROVAL entries (by their chain entry hashes and by the
+ * shared "approval:<device>" chain session). Best-effort like the other
+ * gate chain writes: a chain failure is logged and never alters the
+ * execution result already in hand.
+ */
+static void approval_emit_outcome(onode_state_t *state,
+                                  const char *proposal_id,
+                                  const virp_approval_rec_t *apr,
+                                  const char *device_name,
+                                  bool success)
+{
+    if (!state->chain_enabled)
+        return;
+
+    virp_proposal_rec_t prop;
+    bool have_prop = state->approval_dir[0] &&
+        virp_approval_load_proposal(state->approval_dir, proposal_id,
+                                    &prop) == VIRP_OK;
+
+    char content[1024];
+    snprintf(content, sizeof(content),
+             "{\"proposal_id\":\"%s\",\"proposal_entry_hash\":\"%s\","
+             "\"approval_entry_hash\":\"%s\",\"device\":\"%s\","
+             "\"command_hash\":\"%s\",\"success\":%s}",
+             proposal_id,
+             have_prop ? prop.chain_entry_hash : "",
+             apr->chain_entry_hash,
+             device_name, apr->command_hash,
+             success ? "true" : "false");
+
+    char artifact_hash[65];
+    gate_sha256_hex(content, strlen(content), artifact_hash);
+    char artifact_id[64];
+    snprintf(artifact_id, sizeof(artifact_id), "outcome:%s", proposal_id);
+    char chain_session[96];
+    snprintf(chain_session, sizeof(chain_session), "approval:%s", device_name);
+
+    virp_chain_entry_t ce;
+    virp_error_t cerr = virp_chain_append(&state->chain, chain_session,
+                                          "outcome", artifact_id,
+                                          artifact_hash, &ce);
+    if (cerr == VIRP_OK) {
+        virp_chain_artifact_store(&state->chain, artifact_id, "outcome",
+                                  content, artifact_hash, chain_session);
+        fprintf(stderr, "[GATE] outcome persisted: proposal=%s seq=%lld "
+                "hash=%.16s success=%s\n", proposal_id,
+                (long long)ce.sequence, ce.chain_entry_hash,
+                success ? "true" : "false");
+    } else {
+        fprintf(stderr, "[GATE] outcome chain_append failed: %s\n",
+                virp_error_str(cerr));
+    }
+}
+
 virp_error_t onode_execute(onode_state_t *state,
                            const char *device_name,
                            const char *command,
                            uint8_t *out_buf, size_t out_buf_len,
                            size_t *out_len)
 {
-    return onode_execute_obs(state, device_name, command, 1,
-                             out_buf, out_buf_len, out_len);
+    return onode_execute_obs_ex(state, device_name, command, 1, NULL,
+                                out_buf, out_buf_len, out_len);
 }
 
 virp_error_t onode_execute_obs(onode_state_t *state,
@@ -578,6 +659,69 @@ virp_error_t onode_execute_obs(onode_state_t *state,
                                int obs_version,
                                uint8_t *out_buf, size_t out_buf_len,
                                size_t *out_len)
+{
+    return onode_execute_obs_ex(state, device_name, command, obs_version,
+                                NULL, out_buf, out_buf_len, out_len);
+}
+
+virp_error_t onode_set_approval(onode_state_t *state,
+                                const char *dir,
+                                const char *pubkey_path)
+{
+    if (!state || !dir || !pubkey_path)
+        return VIRP_ERR_NULL_PTR;
+    if (strlen(dir) >= sizeof(state->approval_dir))
+        return VIRP_ERR_INVALID_LENGTH;
+
+    FILE *f = fopen(pubkey_path, "rb");
+    if (!f)
+        return VIRP_ERR_KEY_NOT_LOADED;
+    uint8_t pk[32];
+    size_t got = fread(pk, 1, sizeof(pk), f);
+    /* Exactly 32 bytes: reject truncated files AND anything larger — a
+     * 64-byte read here would mean someone pointed the daemon at the
+     * SECRET key file, which must never happen. */
+    int extra = fgetc(f);
+    fclose(f);
+    if (got != sizeof(pk) || extra != EOF)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    snprintf(state->approval_dir, sizeof(state->approval_dir), "%s", dir);
+    memcpy(state->approval_pk, pk, sizeof(pk));
+    state->approval_pk_loaded = true;
+    fprintf(stderr, "[APPROVAL] enabled: dir=%s pubkey=%s\n",
+            dir, pubkey_path);
+    return VIRP_OK;
+}
+
+/* Proposer identity for a PROPOSAL record: the active v2 session id if
+ * one is bound, else a fixed marker for legacy v1 clients. */
+static void approval_proposer_id(onode_state_t *state, int obs_version,
+                                 char *out, size_t out_len)
+{
+    if (obs_version == 2) {
+        pthread_mutex_lock(&state->session_mutex);
+        if (state->ctx &&
+            virp_session_require_active(state->ctx) == VIRP_OK) {
+            int off = snprintf(out, out_len, "session:");
+            for (int i = 0; i < 8 && off + 2 < (int)out_len; i++)
+                off += snprintf(out + off, out_len - off, "%02x",
+                                state->ctx->session.session_id[i]);
+            pthread_mutex_unlock(&state->session_mutex);
+            return;
+        }
+        pthread_mutex_unlock(&state->session_mutex);
+    }
+    snprintf(out, out_len, "unauthenticated-v1");
+}
+
+virp_error_t onode_execute_obs_ex(onode_state_t *state,
+                                  const char *device_name,
+                                  const char *command,
+                                  int obs_version,
+                                  const char *proposal_id,
+                                  uint8_t *out_buf, size_t out_buf_len,
+                                  size_t *out_len)
 {
     if (!state || !device_name || !command || !out_buf || !out_len)
         return VIRP_ERR_NULL_PTR;
@@ -651,6 +795,13 @@ virp_error_t onode_execute_obs(onode_state_t *state,
     }
     virp_trust_tier_t gate_tier = gate_classify(drv, command);
 
+    /* Approval-apply state: set when a valid, consumed approval admits a
+     * gate-blocked command; the post-execution paths then emit the
+     * OUTCOME chain entry. */
+    bool approved = false;
+    virp_approval_rec_t apr;
+    memset(&apr, 0, sizeof(apr));
+
     /*
      * Per-device execution lock — serializes all command execution on
      * this connection so that batch_execute threads targeting the same
@@ -701,14 +852,103 @@ virp_error_t onode_execute_obs(onode_state_t *state,
                     : (block ? "would-block" : "would-allow"),
                 command);
 
-        if (mode == GATE_MODE_ENFORCE && block) {
+        if (mode == GATE_MODE_ENFORCE && block &&
+            proposal_id && proposal_id[0]) {
+            /*
+             * APPLY: a re-submission carrying an approval reference.
+             * Verification order (each failure a distinct code):
+             * signature → command_hash → device → TTL → single-use
+             * consume (durable; persist failure fails closed). BLACK
+             * stays unapprovable, and an unconfigured approval store
+             * verifies nothing (fail closed).
+             */
+            virp_error_t aerr;
+            if (gate_tier == VIRP_TIER_BLACK)
+                aerr = VIRP_ERR_TIER_VIOLATION;
+            else if (!state->approval_dir[0] || !state->approval_pk_loaded)
+                aerr = VIRP_ERR_KEY_NOT_LOADED;
+            else
+                aerr = virp_approval_verify_consume(state->approval_dir,
+                                                    state->approval_pk,
+                                                    proposal_id,
+                                                    device_name,
+                                                    state->devices[dev_idx].node_id,
+                                                    command, 0, &apr);
+            if (aerr == VIRP_OK) {
+                approved = true;
+                fprintf(stderr, "[GATE] approval verified: proposal=%s "
+                        "device=%s tier=%s key_id=%.8s — executing\n",
+                        proposal_id, device_name,
+                        gate_tier_name(gate_tier), apr.approver_key_id);
+                /* fall through: the approved command executes below */
+            } else {
+                pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+                char err_msg[384];
+                snprintf(err_msg, sizeof(err_msg),
+                         "ERROR: apply rejected (%s, err=%d) for proposal "
+                         "%s on '%s' (tier=%s max=%s)",
+                         virp_approval_err_name(aerr), (int)aerr,
+                         proposal_id, device_name,
+                         gate_tier_name(gate_tier),
+                         gate_tier_name(state->gate_max_tier));
+                fprintf(stderr, "[GATE] apply rejected: proposal=%s "
+                        "device=%s code=%d (%s)\n",
+                        proposal_id, device_name, (int)aerr,
+                        virp_approval_err_name(aerr));
+                log_error_obs(device_name, gate_tier, err_msg);
+                return virp_build_observation_tiered(out_buf, out_buf_len,
+                                              out_len,
+                                              state->devices[dev_idx].node_id,
+                                              onode_next_seq(state),
+                                              VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                              gate_obs_tier(gate_tier),
+                                              (const uint8_t *)err_msg,
+                                              (uint16_t)strlen(err_msg),
+                                              &state->okey);
+            }
+        } else if (mode == GATE_MODE_ENFORCE && block) {
             pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
-            char err_msg[256];
+            char err_msg[448];
             snprintf(err_msg, sizeof(err_msg),
                      "ERROR: tier gate blocked '%s' on '%s' "
                      "(tier=%s max=%s)",
                      command, device_name, gate_tier_name(gate_tier),
                      gate_tier_name(state->gate_max_tier));
+
+            /*
+             * PROPOSE: file a signed proposal so a human can escalate
+             * this exact command via `virp approve`. Best-effort — a
+             * proposal failure never weakens the rejection — and never
+             * offered for BLACK. The rejection payload carries the
+             * proposal_id so the caller can capture it.
+             */
+            if (state->approval_dir[0] && gate_tier != VIRP_TIER_BLACK) {
+                char proposer[80];
+                approval_proposer_id(state, obs_version, proposer,
+                                     sizeof(proposer));
+                virp_proposal_rec_t prop;
+                virp_error_t perr = virp_approval_propose(
+                        state->approval_dir,
+                        state->chain_enabled ? &state->chain : NULL,
+                        proposer, device_name,
+                        state->devices[dev_idx].node_id,
+                        command, proposer, gate_tier_name(gate_tier),
+                        &prop);
+                if (perr == VIRP_OK) {
+                    size_t off = strlen(err_msg);
+                    snprintf(err_msg + off, sizeof(err_msg) - off,
+                             " proposal_id=%s", prop.proposal_id);
+                    fprintf(stderr, "[GATE] proposal filed: proposal=%s "
+                            "device=%s tier=%s chain=%.16s\n",
+                            prop.proposal_id, device_name,
+                            gate_tier_name(gate_tier),
+                            prop.chain_entry_hash[0] ? prop.chain_entry_hash
+                                                     : "-");
+                } else {
+                    fprintf(stderr, "[GATE] proposal filing failed: %s\n",
+                            virp_error_str(perr));
+                }
+            }
 
             /* Phase C — rejection persistence: write a durable, HMAC-signed
              * entry to the trust chain via the same append path the AI
@@ -763,6 +1003,9 @@ virp_error_t onode_execute_obs(onode_state_t *state,
         snprintf(err_msg, sizeof(err_msg),
                  "ERROR: driver execute failed on '%s': %s",
                  device_name, virp_error_str(err));
+        if (approved)
+            approval_emit_outcome(state, proposal_id, &apr,
+                                  device_name, false);
         log_error_obs(device_name, gate_tier, err_msg);
         return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
@@ -788,6 +1031,9 @@ virp_error_t onode_execute_obs(onode_state_t *state,
                 snprintf(err_msg, sizeof(err_msg),
                          "ERROR: driver execute failed on '%s' (retry): %s",
                          device_name, virp_error_str(err));
+                if (approved)
+                    approval_emit_outcome(state, proposal_id, &apr,
+                                          device_name, false);
                 log_error_obs(device_name, gate_tier, err_msg);
                 return virp_build_observation_tiered(
                     out_buf, out_buf_len, out_len,
@@ -818,6 +1064,9 @@ virp_error_t onode_execute_obs(onode_state_t *state,
         snprintf(err_msg, sizeof(err_msg),
                  "ERROR: driver refused '%s': %s",
                  device_name, result.error_msg);
+        if (approved)
+            approval_emit_outcome(state, proposal_id, &apr,
+                                  device_name, false);
         log_error_obs(device_name, gate_tier, err_msg);
         return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
@@ -879,6 +1128,12 @@ virp_error_t onode_execute_obs(onode_state_t *state,
                                  obs_data, data_len,
                                  &state->okey);
     }
+
+    /* Approved apply reached execution: link PROPOSAL + APPROVAL to the
+     * outcome, whatever the device reported. */
+    if (approved)
+        approval_emit_outcome(state, proposal_id, &apr,
+                              device_name, result.success);
 
     if (err == VIRP_OK) {
         pthread_mutex_lock(&state->state_mutex);
@@ -1010,6 +1265,14 @@ static int parse_batch_commands(const char *json,
     cJSON_ArrayForEach(item, commands) {
         if (count >= max_cmds) break;
         if (!cJSON_IsObject(item)) continue;
+
+        /* Approval applies are single-command by design. Refuse the
+         * whole batch rather than silently dropping the field (the
+         * unknown-field standard from the obs_version fix). */
+        if (cJSON_GetObjectItemCaseSensitive(item, "proposal_id")) {
+            cJSON_Delete(root);
+            return 0;
+        }
 
         cJSON *dev = cJSON_GetObjectItemCaseSensitive(item, "device");
         cJSON *cmd = cJSON_GetObjectItemCaseSensitive(item, "command");
@@ -1247,8 +1510,9 @@ static void handle_client(onode_state_t *state, int client_fd)
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
-        err = onode_execute_obs(state, req.device, req.command,
+        err = onode_execute_obs_ex(state, req.device, req.command,
                                 req.obs_version,
+                                req.proposal_id[0] ? req.proposal_id : NULL,
                                 resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);

@@ -201,6 +201,19 @@ typedef struct {
     virp_chain_state_t  chain;
     bool                chain_enabled;
 
+    /*
+     * Approval flow (propose → approve → apply). Disabled until
+     * onode_set_approval() provides a store directory and the approval
+     * PUBLIC key. The daemon never holds the approval SECRET key — it
+     * only verifies; `virp approve` (virp-tool) signs. This keeps the
+     * approver and observer roles on cryptographically distinct keys:
+     * the O-Key is a symmetric HMAC key this process owns, the approval
+     * key is an Ed25519 keypair whose secret half lives with the human.
+     */
+    char                approval_dir[256];
+    uint8_t             approval_pk[32];        /* Ed25519 public key */
+    bool                approval_pk_loaded;
+
     /* Thread safety */
     pthread_mutex_t     state_mutex;    /* Protects seq_num, observations_sent */
     pthread_mutex_t     conn_mutex;     /* Protects connections[] and reconnect[] */
@@ -375,6 +388,41 @@ virp_error_t onode_execute_obs(onode_state_t *state,
                                int obs_version,
                                uint8_t *out_buf, size_t out_buf_len,
                                size_t *out_len);
+
+/*
+ * Configure the approval flow: `dir` is the approval store directory
+ * (proposals/, approvals/, consumed.list) and `pubkey_path` the 32-byte
+ * Ed25519 approval PUBLIC key file. Loading the key never loads any
+ * secret material into the daemon. Returns VIRP_ERR_KEY_NOT_LOADED if
+ * the public key file cannot be read (approval flow stays disabled;
+ * plain gate blocking is unaffected).
+ */
+virp_error_t onode_set_approval(onode_state_t *state,
+                                const char *dir,
+                                const char *pubkey_path);
+
+/*
+ * As onode_execute_obs(), plus an optional approval reference.
+ *
+ * proposal_id == NULL / ""  — identical to onode_execute_obs(). A
+ *   gate-blocked command additionally files a PROPOSAL (when the
+ *   approval store is configured) and the signed rejection carries the
+ *   proposal_id.
+ *
+ * proposal_id set — APPLY: the gate verifies the on-disk approval
+ *   (signature → command_hash → device → TTL → single-use consume) and
+ *   on success executes the command and emits an OUTCOME chain entry
+ *   linked to the PROPOSAL and APPROVAL entries. Any check failure
+ *   returns a signed rejection whose payload names the distinct
+ *   VIRP_ERR_APPROVAL_* code. BLACK-tier commands are never approvable.
+ */
+virp_error_t onode_execute_obs_ex(onode_state_t *state,
+                                  const char *device_name,
+                                  const char *command,
+                                  int obs_version,
+                                  const char *proposal_id,
+                                  uint8_t *out_buf, size_t out_buf_len,
+                                  size_t *out_len);
 
 /*
  * Generate a HEARTBEAT message.

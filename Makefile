@@ -32,6 +32,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_handshake.o \
              $(BUILD_DIR)/virp_transcript.o \
              $(BUILD_DIR)/virp_validator.o \
+             $(BUILD_DIR)/virp_approval.o \
              $(BUILD_DIR)/cJSON.o
 
 # Optional Cisco driver (requires libssh2)
@@ -196,6 +197,9 @@ $(BUILD_DIR)/virp_transcript.o: src/virp_transcript.c | $(BUILD_DIR)
 $(BUILD_DIR)/virp_validator.o: src/virp_validator.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/virp_approval.o: src/virp_approval.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(LIB): $(LIB_OBJS)
 	ar rcs $@ $^
 
@@ -210,6 +214,7 @@ $(FUZZ_BIN): tests/fuzz_virp.c $(LIB)
 
 $(TOOL_BIN): src/virp_tool.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+	ln -f $@ $(BUILD_DIR)/virp   # `virp approve <id>` alias
 
 $(ONODE_BIN): src/virp_onode_main.c $(LIB)
 	$(CC) $(CFLAGS) src/virp_onode_main.c $(LIB) $(LDFLAGS) -ljson-c -o $@
@@ -458,6 +463,15 @@ fuzz-libfuzzer: $(LIB)
 	      -lstdc++ -o $(FUZZ_LIBFUZZER)
 	@echo "Built $(FUZZ_LIBFUZZER) — run with: ./$(FUZZ_LIBFUZZER) [corpus_dir]"
 
+# Approval flow tests (propose -> approve -> apply)
+TEST_APPROVAL = $(BUILD_DIR)/test_approval
+
+$(TEST_APPROVAL): tests/test_approval.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-approval: $(TEST_APPROVAL)
+	./$(TEST_APPROVAL)
+
 # Response validator tests
 TEST_VALIDATOR = $(BUILD_DIR)/test_validator
 
@@ -475,4 +489,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator
+all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval

@@ -473,6 +473,8 @@ static void usage(const char *prog)
     printf("  -n <hex>    Node ID in hex (default: 0x00000001)\n");
     printf("  -c <path>   Chain database path (enables Primitive 6 trust chain)\n");
     printf("  -C <path>   Chain key path (32-byte key file, required with -c)\n");
+    printf("  -a <path>   Approval store dir (default: /var/lib/virp/approvals)\n");
+    printf("  -A <path>   Approval public key (default: /etc/virp/keys/approval.pub)\n");
     printf("  -h          Show this help\n");
     printf("\n");
 }
@@ -484,10 +486,12 @@ int main(int argc, char **argv)
     const char *devices_path = NULL;
     const char *chain_db_path = NULL;
     const char *chain_key_path = NULL;
+    const char *approval_dir = "/var/lib/virp/approvals";
+    const char *approval_pub = "/etc/virp/keys/approval.pub";
     uint32_t node_id = 0x00000001;
 
     int opt;
-    while ((opt = getopt(argc, argv, "k:s:d:n:c:C:h")) != -1) {
+    while ((opt = getopt(argc, argv, "k:s:d:n:c:C:a:A:h")) != -1) {
         switch (opt) {
         case 'k':
             okey_path = optarg;
@@ -506,6 +510,12 @@ int main(int argc, char **argv)
             break;
         case 'C':
             chain_key_path = optarg;
+            break;
+        case 'a':
+            approval_dir = optarg;
+            break;
+        case 'A':
+            approval_pub = optarg;
             break;
         case 'h':
         default:
@@ -606,6 +616,21 @@ int main(int argc, char **argv)
                     "(continuing without chain)\n",
                     virp_error_str(chain_err));
         }
+    }
+
+    /*
+     * Approval flow (propose → approve → apply). Loads only the Ed25519
+     * approval PUBLIC key; a missing key simply leaves the flow disabled
+     * (plain gate blocking unchanged). Generate the keypair with
+     * `virp-tool keygen approval /etc/virp/keys/approval` — rotation in
+     * docs/APPROVAL-FLOW.md.
+     */
+    {
+        virp_error_t aerr = onode_set_approval(&g_state, approval_dir,
+                                               approval_pub);
+        if (aerr != VIRP_OK)
+            fprintf(stderr, "[O-Node] Approval flow disabled: cannot load "
+                    "%s (%s)\n", approval_pub, virp_error_str(aerr));
     }
 
     /* Install signal handlers */
