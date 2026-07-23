@@ -103,6 +103,28 @@ virp_error_t virp_fed_load(virp_fed_keypair_t *kp,
     return VIRP_OK;
 }
 
+virp_error_t virp_fed_from_secret(virp_fed_keypair_t *kp,
+                                  const uint8_t sk[VIRP_FED_SK_SIZE],
+                                  uint32_t key_version)
+{
+    if (!kp || !sk)
+        return VIRP_ERR_NULL_PTR;
+
+    memset(kp, 0, sizeof(*kp));
+    memcpy(kp->secret_key, sk, VIRP_FED_SK_SIZE);
+
+    /* Derive the public key from the secret key (sk = seed || pk). */
+    if (crypto_sign_ed25519_sk_to_pk(kp->public_key, kp->secret_key) != 0)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    virp_fed_compute_key_id(kp->public_key, kp->key_id);
+    kp->key_version = key_version;
+    kp->loaded = true;
+
+    virp_fed_mlock_key(kp);
+    return VIRP_OK;
+}
+
 /* =========================================================================
  * Save
  * ========================================================================= */

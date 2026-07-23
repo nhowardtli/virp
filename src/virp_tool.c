@@ -21,10 +21,13 @@
 #include "virp_federation.h"
 #include "cJSON.h"
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -823,38 +826,97 @@ static int cmd_apply(int argc, char **argv)
  * signer is added by the pkcs11 build. Returns 0 on success. */
 struct approve_opts {
     const char *sock;
-    const char *key_path;   /* Ed25519 public key file (software signer) */
-    const char *sk_path;    /* Ed25519 secret key file (software signer) */
+    const char *key_path;   /* Ed25519 SECRET key file (64 bytes; software) */
     const char *pkcs11_module;
     const char *pkcs11_slot;
     const char *pkcs11_label;
 };
 
-static int sign_software(const struct approve_opts *o,
-                         const uint8_t *canon, size_t len,
-                         uint8_t sig[VIRP_APPROVER_SIG_SIZE],
-                         char key_id_out[33])
+/*
+ * Load the approver's Ed25519 SECRET key from a single file (the 64-byte
+ * `<prefix>.key` that `keygen approval` writes — the public key is derived
+ * from it). Emits a SPECIFIC message per failure cause so a bad invocation
+ * is diagnosable at a glance. Returns 0 on success (kp filled), -1 else.
+ */
+static int load_approver_secret(const char *path, virp_fed_keypair_t *kp)
 {
-    if (virp_fed_init() != VIRP_OK) {
-        fprintf(stderr, "Error: libsodium init failed\n");
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT)
+            fprintf(stderr, "Error: approver key file not found: %s\n"
+                    "  (this is the 64-byte SECRET key `<prefix>.key` from "
+                    "`virp-tool keygen approval <prefix>`.)\n", path);
+        else if (errno == EACCES)
+            fprintf(stderr, "Error: permission denied reading %s\n"
+                    "  Run as the file's owner (e.g. sudo -u virp-onode) or "
+                    "root.\n", path);
+        else if (errno == ELOOP)
+            fprintf(stderr, "Error: %s is a symlink — refusing to follow.\n",
+                    path);
+        else
+            fprintf(stderr, "Error: cannot open %s: %s\n", path,
+                    strerror(errno));
         return -1;
     }
-    virp_fed_keypair_t kp;
-    if (virp_fed_load(&kp, o->key_path, o->sk_path, 1) != VIRP_OK) {
-        fprintf(stderr, "Error: cannot load Ed25519 approver key (%s / %s).\n"
-                "Generate with `virp-tool keygen approval <prefix>` and enroll "
-                "the .pub in /etc/virp/approvers.json (see `virp enroll`).\n",
-                o->key_path, o->sk_path);
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "Error: cannot stat %s: %s\n", path, strerror(errno));
+        close(fd);
         return -1;
     }
-    int rc = -1;
-    if (virp_fed_sign(&kp, canon, len, sig) == VIRP_OK) {
-        for (int i = 0; i < VIRP_FED_KEYID_SIZE; i++)
-            snprintf(key_id_out + i * 2, 3, "%02x", kp.key_id[i]);
-        rc = 0;
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "Error: %s is not a regular file.\n", path);
+        close(fd);
+        return -1;
     }
-    virp_fed_destroy(&kp);
-    return rc;
+    /* Size checks first — the likeliest mistake is pointing --key at the
+     * `.pub` — so the message is helpful even though .pub is world-readable. */
+    if (st.st_size == VIRP_FED_PK_SIZE) {
+        fprintf(stderr, "Error: %s is %d bytes — that is a PUBLIC key.\n"
+                "  --key needs the 64-byte SECRET key (`<prefix>.key`), not "
+                "`<prefix>.pub`.\n", path, VIRP_FED_PK_SIZE);
+        close(fd);
+        return -1;
+    }
+    if (st.st_size != VIRP_FED_SK_SIZE) {
+        fprintf(stderr, "Error: %s is %lld bytes — expected a %d-byte "
+                "libsodium Ed25519 secret key.\n",
+                path, (long long)st.st_size, VIRP_FED_SK_SIZE);
+        close(fd);
+        return -1;
+    }
+    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+        fprintf(stderr, "Error: %s has insecure permissions 0%o — a secret "
+                "key must be 0600.\n  Run: chmod 600 %s\n",
+                path, (unsigned)(st.st_mode & 07777), path);
+        close(fd);
+        return -1;
+    }
+    if (!virp_key_owner_ok(st.st_uid, geteuid())) {
+        fprintf(stderr, "Error: %s is owned by uid=%u but you are euid=%u.\n"
+                "  Run as that user (e.g. sudo -u <owner>) or root.\n",
+                path, (unsigned)st.st_uid, (unsigned)geteuid());
+        close(fd);
+        return -1;
+    }
+
+    uint8_t sk[VIRP_FED_SK_SIZE];
+    ssize_t n = read(fd, sk, sizeof(sk));
+    close(fd);
+    if (n != (ssize_t)sizeof(sk)) {
+        fprintf(stderr, "Error: short read of %s.\n", path);
+        return -1;
+    }
+    virp_error_t err = virp_fed_from_secret(kp, sk, 1);
+    volatile uint8_t *p = sk;
+    for (size_t i = 0; i < sizeof(sk); i++) p[i] = 0;
+    if (err != VIRP_OK) {
+        fprintf(stderr, "Error: %s is not a valid Ed25519 secret key "
+                "(wrong format?).\n", path);
+        return -1;
+    }
+    return 0;
 }
 
 /* PKCS#11 signer. The real implementation lives in
@@ -887,23 +949,26 @@ static int cmd_approve(int argc, char **argv)
     if (argc < 1) {
         fprintf(stderr,
             "Usage: virp approve <proposal-id> [--socket PATH]\n"
-            "  Software key:  [--key <pub>] [--sk <secret>]\n"
+            "  Software key:  --key <secret.key>   (the 64-byte `<prefix>.key`\n"
+            "                 from `virp-tool keygen approval <prefix>`;\n"
+            "                 default %s)\n"
             "  PKCS#11/PIV:   --pkcs11 <module.so> --slot 9c [--key-label L]\n"
             "Fetches the challenge from the daemon, signs the canonical bytes,\n"
-            "and submits. The daemon appends the APPROVAL chain entry.\n");
+            "and submits. The daemon appends the APPROVAL chain entry.\n",
+            APPROVAL_DEFAULT_KEY);
         return 1;
     }
     const char *proposal_id = argv[0];
     struct approve_opts o = {
         .sock = ONODE_DEFAULT_SOCKET,
-        .key_path = APPROVAL_DEFAULT_PUB,
-        .sk_path = APPROVAL_DEFAULT_KEY,
+        .key_path = APPROVAL_DEFAULT_KEY,   /* the 64-byte SECRET key file */
         .pkcs11_module = NULL, .pkcs11_slot = "9c", .pkcs11_label = NULL,
     };
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) o.sock = argv[++i];
         else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) o.key_path = argv[++i];
-        else if (strcmp(argv[i], "--sk") == 0 && i + 1 < argc) o.sk_path = argv[++i];
+        /* --sk kept as a back-compat alias for --key (both = secret file). */
+        else if (strcmp(argv[i], "--sk") == 0 && i + 1 < argc) o.key_path = argv[++i];
         else if (strcmp(argv[i], "--pkcs11") == 0 && i + 1 < argc) o.pkcs11_module = argv[++i];
         else if (strcmp(argv[i], "--slot") == 0 && i + 1 < argc) o.pkcs11_slot = argv[++i];
         else if (strcmp(argv[i], "--key-label") == 0 && i + 1 < argc) o.pkcs11_label = argv[++i];
@@ -913,6 +978,21 @@ static int cmd_approve(int argc, char **argv)
         proposal_id[VIRP_APPROVAL_ID_HEX_LEN] != '\0') {
         fprintf(stderr, "Error: proposal-id must be 32 lowercase hex\n");
         return 1;
+    }
+
+    /* 0. For the software path, load the approver key UP FRONT so a bad
+     * key file fails immediately (with a specific message) before any
+     * daemon round-trip or challenge record is created. */
+    virp_fed_keypair_t sw_kp;
+    bool sw_loaded = false;
+    if (!o.pkcs11_module) {
+        if (virp_fed_init() != VIRP_OK) {
+            fprintf(stderr, "Error: libsodium init failed\n");
+            return 1;
+        }
+        if (load_approver_secret(o.key_path, &sw_kp) != 0)
+            return 1;
+        sw_loaded = true;
     }
 
     /* 1. CHALLENGE. */
@@ -964,8 +1044,15 @@ static int cmd_approve(int argc, char **argv)
                                    o.pkcs11_label, canon, sizeof(canon),
                                    sig, key_id);
     } else {
-        rc = sign_software(&o, canon, sizeof(canon), sig, key_id);
+        rc = virp_fed_sign(&sw_kp, canon, sizeof(canon), sig) == VIRP_OK
+             ? 0 : -1;
+        if (rc == 0)
+            for (int i = 0; i < VIRP_FED_KEYID_SIZE; i++)
+                snprintf(key_id + i * 2, 3, "%02x", sw_kp.key_id[i]);
+        else
+            fprintf(stderr, "Error: signing failed.\n");
     }
+    if (sw_loaded) virp_fed_destroy(&sw_kp);
     if (rc != 0) return 1;
 
     char sig_hex[2 * VIRP_APPROVER_SIG_SIZE + 1];
@@ -1195,12 +1282,29 @@ static int cmd_chain(int argc, char **argv)
  * Main
  * ========================================================================= */
 
+#ifndef VIRP_GIT_HASH
+#define VIRP_GIT_HASH "unknown"
+#endif
+
+static void print_version(void)
+{
+    printf("virp-tool %s%s\n", VIRP_GIT_HASH,
+#ifdef VIRP_PKCS11
+           " (pkcs11)"
+#else
+           ""
+#endif
+    );
+}
+
 static void usage(void)
 {
     printf("\n");
     printf("VIRP Tool — Verified Infrastructure Response Protocol\n");
-    printf("Copyright (c) 2026 Third Level IT LLC\n\n");
-    printf("Commands:\n");
+    printf("Copyright (c) 2026 Third Level IT LLC\n");
+    printf("build: ");
+    print_version();
+    printf("\nCommands:\n");
     printf("  keygen   <okey|rkey|approval> <output>    Generate signing key\n");
     printf("  inspect  <msg_file> <key_file> <type>    Inspect and verify message\n");
     printf("  build    <type> [options]                 Build test message\n");
@@ -1210,6 +1314,7 @@ static void usage(void)
     printf("  enroll   (--key|--spki) [--operator N]    Print an approvers.json entry\n");
     printf("  exec     <device> \"<command>\" [options]   Submit a command through the gate\n");
     printf("  chain    tail [-n N] [--db PATH]          Show last N chain entries\n");
+    printf("  version                                   Print build git hash\n");
     printf("\n");
 }
 
@@ -1240,6 +1345,8 @@ int main(int argc, char **argv)
         return cmd_exec(argc - 2, argv + 2);
     else if (strcmp(cmd, "chain") == 0)
         return cmd_chain(argc - 2, argv + 2);
+    else if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0)
+        print_version();
     else if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0)
         usage();
     else {

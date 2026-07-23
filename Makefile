@@ -216,8 +216,19 @@ $(TEST_BIN): tests/test_virp.c $(LIB)
 $(FUZZ_BIN): tests/fuzz_virp.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
-$(TOOL_BIN): src/virp_tool.c $(LIB)
-	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+# Git hash stamped into virp-tool for `virp --version` (helps catch a
+# stale client talking to a newer daemon). Falls back to "unknown" when
+# git is unavailable (e.g. tarball build).
+GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+
+# FORCE so the git hash stamped for `virp --version` always tracks HEAD,
+# even when only unrelated files changed since the last build (one cheap
+# recompile of virp_tool.c per make).
+.PHONY: FORCE
+FORCE:
+
+$(TOOL_BIN): src/virp_tool.c $(LIB) FORCE
+	$(CC) $(CFLAGS) -DVIRP_GIT_HASH='"$(GIT_HASH)"' $< $(LIB) $(LDFLAGS) -o $@
 	ln -f $@ $(BUILD_DIR)/virp   # `virp approve <id>` alias
 
 $(ONODE_BIN): src/virp_onode_main.c $(LIB)
@@ -511,7 +522,8 @@ $(BUILD_DIR)/virp_tool_pkcs11.o: src/virp_tool_pkcs11.c | $(BUILD_DIR)
 
 .PHONY: virp-tool-pkcs11
 virp-tool-pkcs11: $(LIB) $(BUILD_DIR)/virp_tool_pkcs11.o
-	$(CC) $(CFLAGS) -DVIRP_PKCS11 src/virp_tool.c \
+	$(CC) $(CFLAGS) -DVIRP_PKCS11 -DVIRP_GIT_HASH='"$(GIT_HASH)"' \
+	    src/virp_tool.c \
 	    $(BUILD_DIR)/virp_tool_pkcs11.o $(LIB) $(LDFLAGS) -ldl \
 	    -o $(BUILD_DIR)/virp-tool
 	ln -f $(BUILD_DIR)/virp-tool $(BUILD_DIR)/virp

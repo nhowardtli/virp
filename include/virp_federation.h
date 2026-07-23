@@ -64,6 +64,17 @@ virp_error_t virp_fed_load(virp_fed_keypair_t *kp,
                            uint32_t key_version);
 
 /*
+ * Build a keypair from a 64-byte libsodium Ed25519 secret key alone. A
+ * libsodium crypto_sign secret key is seed(32) || public_key(32), so the
+ * public key and key_id are derived from it — no separate public-key file
+ * is needed. This is what the approve client uses: the approver holds one
+ * secret-key file. Calls sodium_mlock() on the secret key.
+ */
+virp_error_t virp_fed_from_secret(virp_fed_keypair_t *kp,
+                                  const uint8_t sk[VIRP_FED_SK_SIZE],
+                                  uint32_t key_version);
+
+/*
  * Save a keypair to files (0600 permissions).
  */
 virp_error_t virp_fed_save(const virp_fed_keypair_t *kp,

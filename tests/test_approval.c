@@ -861,13 +861,15 @@ static void test_cli_chain_tail_format(void)
     PASS();
 }
 
-/* Full positive e2e THROUGH THE CLI + framed socket + daemon:
- * propose -> `virp approve` (challenge/sign/submit) -> `virp apply`.
- * Uses g_kp saved to key files as the software approver key. */
+/* Full positive e2e THROUGH THE CLI + framed socket + daemon, using the
+ * SINGLE secret-key file `keygen approval` writes (the exact real-world
+ * path): propose -> `virp approve --key <prefix>.key` -> `virp apply`. */
 static void test_cli_approve_apply_e2e(void)
 {
-    TEST("CLI e2e: exec(block) -> approve -> apply executes");
-    /* Save g_kp so the CLI's software signer can load it. */
+    TEST("CLI e2e: keygen -> approve --key <secret.key> -> apply executes");
+    /* Save g_kp's secret to the 64-byte `.key` file the CLI loads.
+     * (virp_fed_save writes exactly what `keygen approval` writes; the
+     * dedicated keygen-subprocess load is covered by the next test.) */
     const char *pub = "/tmp/virp-test-cli.pub", *sk = "/tmp/virp-test-cli.key";
     ASSERT(virp_fed_save(&g_kp, pub, sk) == VIRP_OK, "save key");
 
@@ -882,11 +884,11 @@ static void test_cli_approve_apply_e2e(void)
     p += strlen("\nproposal_id=");
     char pid[33]; memcpy(pid, p, 32); pid[32] = '\0';
 
-    /* 2. Approve via the CLI (challenge -> sign with the software key ->
-     * submit; the daemon writes the APPROVAL chain entry). */
+    /* 2. Approve via the CLI with ONLY the secret key file (--key), the
+     * way an operator invokes it. The daemon writes the APPROVAL entry. */
     snprintf(cmd, sizeof(cmd),
-             CLI_BIN " approve %s --socket %s --key %s --sk %s",
-             pid, g.socket_path, pub, sk);
+             CLI_BIN " approve %s --socket %s --key %s",
+             pid, g.socket_path, sk);
     ASSERT(run_cli(cmd, out, sizeof(out)) == 0, "approve failed");
     ASSERT(strstr(out, "APPROVED") != NULL, "no APPROVED banner");
 
@@ -904,6 +906,83 @@ static void test_cli_approve_apply_e2e(void)
     char want[64];
     snprintf(want, sizeof(want), "approval:%s", pid);
     ASSERT(strstr(tail, want) != NULL, "APPROVAL entry missing");
+    unlink(pub); unlink(sk);
+    PASS();
+}
+
+/* Regression for the two-file loader bug: the secret key file that
+ * `virp-tool keygen approval` actually writes must load directly via
+ * `virp approve --key <prefix>.key`. Run keygen as a subprocess, then
+ * approve — the key is not enrolled, so submit is rejected -43, which
+ * PROVES the key LOADED and SIGNED (we got past sign_software to submit),
+ * rather than failing at key load. */
+static void test_cli_keygen_key_loads(void)
+{
+    TEST("Regression: keygen `.key` loads via `virp approve --key`");
+    const char *prefix = "/tmp/virp-test-kg";
+    char pubf[64], keyf[64];
+    snprintf(pubf, sizeof(pubf), "%s.pub", prefix);
+    snprintf(keyf, sizeof(keyf), "%s.key", prefix);
+    unlink(pubf); unlink(keyf);
+
+    char out[8192], cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "./build/virp-tool keygen approval %s", prefix);
+    ASSERT(run_cli(cmd, out, sizeof(out)) == 0, "keygen failed");
+
+    /* File a proposal so the challenge succeeds. */
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " exec R-APP \"reload\" --socket %s", g.socket_path);
+    ASSERT(run_cli(cmd, out, sizeof(out)) == 2, "exec block");
+    const char *p = strstr(out, "\nproposal_id=");
+    ASSERT(p != NULL, "no proposal_id");
+    p += strlen("\nproposal_id=");
+    char pid[33]; memcpy(pid, p, 32); pid[32] = '\0';
+
+    /* Approve with the single keygen secret file. The key is NOT enrolled,
+     * so the daemon rejects the SUBMIT as unenrolled (-43) — but only the
+     * signer having loaded and signed gets us that far. */
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " approve %s --socket %s --key %s", pid, g.socket_path,
+             keyf);
+    int rc = run_cli(cmd, out, sizeof(out));
+    ASSERT(strstr(out, "cannot load") == NULL, "key load must NOT fail");
+    ASSERT(strstr(out, "-43") != NULL || strstr(out, "unenrolled") != NULL,
+           "expected unenrolled submit rejection (key loaded + signed)");
+    ASSERT(rc == 2, "submit rejection exit code");
+    unlink(pubf); unlink(keyf);
+    PASS();
+}
+
+/* Each key-load failure cause must produce its OWN message (this is the
+ * bug that burned an hour: one string covered five causes). */
+static void test_cli_approve_key_diagnostics(void)
+{
+    TEST("Loader diagnostics: not-found and public-key give distinct msgs");
+    /* Need a live proposal so the loader is reached (it runs post-challenge). */
+    char out[8192], cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " exec R-APP \"reload\" --socket %s", g.socket_path);
+    ASSERT(run_cli(cmd, out, sizeof(out)) == 2, "exec block");
+    const char *p = strstr(out, "\nproposal_id=");
+    ASSERT(p != NULL, "no proposal_id");
+    p += strlen("\nproposal_id=");
+    char pid[33]; memcpy(pid, p, 32); pid[32] = '\0';
+
+    /* (a) not found */
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " approve %s --socket %s --key /tmp/virp-nope.key",
+             pid, g.socket_path);
+    ASSERT(run_cli(cmd, out, sizeof(out)) != 0, "must fail");
+    ASSERT(strstr(out, "not found") != NULL, "no not-found message");
+
+    /* (b) a 32-byte PUBLIC key passed where the secret is wanted */
+    const char *pub = "/tmp/virp-test-diag.pub", *sk = "/tmp/virp-test-diag.key";
+    ASSERT(virp_fed_save(&g_kp, pub, sk) == VIRP_OK, "save");
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " approve %s --socket %s --key %s", pid, g.socket_path, pub);
+    ASSERT(run_cli(cmd, out, sizeof(out)) != 0, "must fail");
+    ASSERT(strstr(out, "PUBLIC key") != NULL, "no public-key message");
     unlink(pub); unlink(sk);
     PASS();
 }
@@ -990,6 +1069,8 @@ int main(void)
     test_cli_exec_green_executes();
     test_cli_exec_red_rejected_with_proposal();
     test_cli_approve_apply_e2e();
+    test_cli_keygen_key_loads();
+    test_cli_approve_key_diagnostics();
     test_cli_chain_tail_format();
     onode_shutdown(&g);
     pthread_join(srv, NULL);

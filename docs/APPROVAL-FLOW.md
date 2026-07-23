@@ -140,8 +140,22 @@ build/virp enroll --spki "$SPKI" --operator nhoward-yubikey-9c
 ```
 
 Paste the printed JSON object into `/etc/virp/approvers.json` and deploy.
-For a software (Ed25519) key instead: `virp-tool keygen approval <prefix>`
-then `virp enroll --key <prefix>.pub --operator <name>`.
+
+For a software (Ed25519) key instead:
+
+```
+virp-tool keygen approval <prefix>          # writes <prefix>.pub + <prefix>.key
+virp enroll --key <prefix>.pub --operator <name>   # → registry entry
+virp approve <id> --key <prefix>.key         # sign with the 64-byte SECRET
+```
+
+`virp approve --key` takes the **64-byte secret key file** (`<prefix>.key`)
+— the public key and key_id are derived from it, so no separate `.pub` is
+needed at sign time. Point `--key` at the `.pub` (32 bytes) by mistake and
+the client says so explicitly (each load failure — not found, permission,
+wrong owner, insecure mode, wrong size, public-key-not-secret — has its own
+message). `virp --version` prints the build's git hash; compare it against
+the daemon's deploy if a client/daemon mismatch is suspected.
 
 ## Operator workflow / live proof sequence
 
