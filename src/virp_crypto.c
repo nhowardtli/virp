@@ -79,6 +79,22 @@ static ssize_t read_exact(int fd, void *buf, size_t want)
     return (ssize_t)got;
 }
 
+/*
+ * Ownership gate for key files: the file must be owned by the process's
+ * effective UID, OR the process must be root. Root reading a
+ * service-owned key (e.g. `virp approve` as root loading the
+ * virp-onode-owned chain.key) is not a privilege escalation — root can
+ * read everything anyway — and requiring owner==0 there deadlocks
+ * against approval.key being root:0600. The mode-bit checks in
+ * virp_key_load_file are unchanged: group/other access still refuses
+ * the file for everyone, root included. Non-static so the unit tests
+ * can pin all three cases.
+ */
+bool virp_key_owner_ok(uid_t file_owner, uid_t euid)
+{
+    return file_owner == euid || euid == 0;
+}
+
 virp_error_t virp_key_load_file(virp_signing_key_t *sk,
                                 virp_key_type_t type,
                                 const char *path)
@@ -138,7 +154,7 @@ virp_error_t virp_key_load_file(virp_signing_key_t *sk,
     }
 
     uid_t euid = geteuid();
-    if (st.st_uid != euid) {
+    if (!virp_key_owner_ok(st.st_uid, euid)) {
         fprintf(stderr,
                 "[VIRP] Key file %s is owned by uid=%u, expected %u — "
                 "refusing to load\n",

@@ -126,6 +126,14 @@ consumed by the attempt, not by success.
 
 ## Scope notes
 
+- **FINDING (next session): second chain writer.** `virp approve
+  --chain-db/--chain-key` writes chain.db directly from the CLI using
+  the daemon's chain key — a second writer on the daemon's database and
+  a second holder of K_chain. Better design: the CLI only signs the
+  approval record, submits it over the framed socket, and the DAEMON
+  appends the APPROVAL chain entry (single writer, chain key never
+  leaves the daemon). Not changed in this session.
+
 - The Go port implements none of this and REFUSES any execute carrying
   `proposal_id` with `ErrApprovalNotFound` (-41) rather than silently
   serving it as a plain execute.

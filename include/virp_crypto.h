@@ -16,6 +16,7 @@
 #include "virp.h"
 #include "virp_session.h"  /* virp_context_t forward decl */
 #include "virp_seqstore.h" /* replay high-water store for v2 verification */
+#include <sys/types.h>     /* uid_t (virp_key_owner_ok) */
 
 /* =========================================================================
  * Key Management
@@ -44,6 +45,14 @@ typedef struct {
 virp_error_t virp_key_init(virp_signing_key_t *sk,
                            virp_key_type_t type,
                            const uint8_t key_bytes[VIRP_KEY_SIZE]);
+
+/*
+ * Key-file ownership gate: true iff file_owner == euid OR euid == 0
+ * (root reading a service-owned key is not an escalation; mode-bit
+ * checks are enforced separately and unchanged). Exposed for the unit
+ * tests; virp_key_load_file uses it internally.
+ */
+bool virp_key_owner_ok(uid_t file_owner, uid_t euid);
 
 /*
  * Initialize a signing key from a file (32 bytes, raw binary).

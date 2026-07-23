@@ -885,6 +885,68 @@ TEST(test_tlv_buffer_overflow_protection)
 }
 
 /* =========================================================================
+ * Key-file ownership gate (virp_key_owner_ok)
+ *
+ * The gate accepts owner == euid OR euid == 0: root reading a
+ * service-owned key (`virp approve` as root loading the virp-onode-
+ * owned chain.key) is not an escalation. Mode-bit checks are separate
+ * and unchanged — these tests do not touch them.
+ * ========================================================================= */
+
+TEST(test_key_owner_check_predicate)
+{
+    /* owner == euid: accepted */
+    ASSERT_TRUE(virp_key_owner_ok(1234, 1234));
+    ASSERT_TRUE(virp_key_owner_ok(0, 0));
+    /* euid == 0 with a foreign-owned file: accepted */
+    ASSERT_TRUE(virp_key_owner_ok(999, 0));
+    ASSERT_TRUE(virp_key_owner_ok(65534, 0));
+    /* non-root euid with a foreign-owned file: refused */
+    ASSERT_TRUE(!virp_key_owner_ok(999, 1000));
+    ASSERT_TRUE(!virp_key_owner_ok(0, 999));
+}
+
+TEST(test_key_load_ownership_integration)
+{
+    const char *path = "/tmp/virp-test-foreign-owner.key";
+    unlink(path);
+
+    virp_signing_key_t sk;
+    ASSERT_OK(virp_key_generate(&sk, VIRP_KEY_TYPE_OKEY));
+    ASSERT_OK(virp_key_save_file(&sk, path));
+    virp_key_destroy(&sk);
+
+    /* owner == euid loads (all environments) */
+    ASSERT_OK(virp_key_load_file(&sk, VIRP_KEY_TYPE_OKEY, path));
+    virp_key_destroy(&sk);
+
+    if (geteuid() != 0) {
+        /* The root/foreign-owner cases need root; predicate coverage
+         * above still pins the logic. */
+        unlink(path);
+        return;
+    }
+
+    /* euid == 0, service-owned file (the `virp approve` blocker case):
+     * accepted. 65534 = nobody. */
+    ASSERT_EQ(chown(path, 65534, 65534), 0);
+    ASSERT_OK(virp_key_load_file(&sk, VIRP_KEY_TYPE_OKEY, path));
+    virp_key_destroy(&sk);
+
+    /* non-root euid, foreign-owned file: refused. (Owned by root again;
+     * as uid 65534 the load must fail — the 0600 mode alone already
+     * denies the open, and virp_key_owner_ok would refuse it too.) */
+    ASSERT_EQ(chown(path, 0, 0), 0);
+    ASSERT_EQ(seteuid(65534), 0);
+    virp_error_t err = virp_key_load_file(&sk, VIRP_KEY_TYPE_OKEY, path);
+    int restored = seteuid(0);
+    ASSERT_EQ(restored, 0);
+    ASSERT_EQ(err, VIRP_ERR_KEY_NOT_LOADED);
+
+    unlink(path);
+}
+
+/* =========================================================================
  * Main — run all tests
  * ========================================================================= */
 
@@ -952,6 +1014,10 @@ int main(void)
     RUN_TEST(test_tlv_round_trip);
     RUN_TEST(test_tlv_chain);
     RUN_TEST(test_tlv_buffer_overflow_protection);
+
+    printf("\n[Key-File Ownership Gate]\n");
+    RUN_TEST(test_key_owner_check_predicate);
+    RUN_TEST(test_key_load_ownership_integration);
 
     printf("\n================================================================\n");
     printf("  Results: %d/%d passed", tests_passed, tests_run);
