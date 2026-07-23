@@ -503,6 +503,34 @@ $(TEST_APPROVERS): tests/test_approver_registry.c $(LIB)
 test-approvers: $(TEST_APPROVERS)
 	./$(TEST_APPROVERS)
 
+# PKCS#11 approval signer (YubiKey PIV via OpenSC). Built into virp-tool
+# only under VIRP_PKCS11 — uses the vendored minimal Cryptoki header and
+# resolves the C_* entry points with dlsym at runtime.
+$(BUILD_DIR)/virp_tool_pkcs11.o: src/virp_tool_pkcs11.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DVIRP_PKCS11 -c $< -o $@
+
+.PHONY: virp-tool-pkcs11
+virp-tool-pkcs11: $(LIB) $(BUILD_DIR)/virp_tool_pkcs11.o
+	$(CC) $(CFLAGS) -DVIRP_PKCS11 src/virp_tool.c \
+	    $(BUILD_DIR)/virp_tool_pkcs11.o $(LIB) $(LDFLAGS) -ldl \
+	    -o $(BUILD_DIR)/virp-tool
+	ln -f $(BUILD_DIR)/virp-tool $(BUILD_DIR)/virp
+
+# Mock PKCS#11 module (test-only) — a shared object the signer dlopens.
+$(BUILD_DIR)/mock_pkcs11.so: tests/mock_pkcs11.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -shared -fPIC $< -lcrypto -o $@
+
+# PKCS#11 signer plumbing test: drive the signer against the mock module,
+# verify the raw r||s signature through the daemon's registry verify path.
+TEST_PKCS11 = $(BUILD_DIR)/test_pkcs11_plumbing
+
+$(TEST_PKCS11): tests/test_pkcs11_plumbing.c $(BUILD_DIR)/virp_tool_pkcs11.o $(LIB)
+	$(CC) $(CFLAGS) -DVIRP_PKCS11 $< $(BUILD_DIR)/virp_tool_pkcs11.o \
+	    $(LIB) $(LDFLAGS) -ldl -o $@
+
+test-pkcs11: $(TEST_PKCS11) $(BUILD_DIR)/mock_pkcs11.so
+	./$(TEST_PKCS11)
+
 # Response validator tests
 TEST_VALIDATOR = $(BUILD_DIR)/test_validator
 
@@ -520,4 +548,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers
+all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
