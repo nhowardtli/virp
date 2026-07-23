@@ -517,6 +517,20 @@ uint8_t gate_obs_tier(virp_trust_tier_t t)
     }
 }
 
+/*
+ * Log line for every signed ERROR observation. Errors must log AS errors:
+ * before this existed, error paths logged nothing (or only a [GATE] line)
+ * and several were built as DEVICE_OUTPUT observations, so the AI layer
+ * rendered them as executed, change-logged output. executed=no is literal:
+ * an ERROR observation is only emitted when the command did not run.
+ */
+static void log_error_obs(const char *device, virp_trust_tier_t tier,
+                          const char *reason)
+{
+    fprintf(stderr, "[ERROR-OBS] device=%s tier=%s executed=no reason=\"%s\"\n",
+            device, gate_tier_name(tier), reason);
+}
+
 /* SHA-256 → lowercase hex (65 bytes incl. NUL). Used to hash a gate
  * rejection record before persisting it to the trust chain. */
 static void gate_sha256_hex(const void *data, size_t len, char out[65])
@@ -600,15 +614,42 @@ virp_error_t onode_execute_obs(onode_state_t *state,
     /* Find device */
     int dev_idx = find_device(state, device_name);
     if (dev_idx < 0) {
-        /* Device not found — return error observation */
+        /* Device not found — signed ERROR observation. UNCLASSIFIED is
+         * the honest tier: with no device there is no driver, so the
+         * command was never classified. */
         char err_msg[256];
         snprintf(err_msg, sizeof(err_msg), "ERROR: device '%s' not found", device_name);
-        return virp_build_observation(out_buf, out_buf_len, out_len,
+        log_error_obs(device_name, VIRP_TIER_UNCLASSIFIED, err_msg);
+        return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->node_id, onode_next_seq(state),
-                                      VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL,
+                                      VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                      VIRP_TIER_UNCLASSIFIED,
                                       (const uint8_t *)err_msg, (uint16_t)strlen(err_msg),
                                       &state->okey);
     }
+
+    /*
+     * Driver lookup and gate classification happen BEFORE any connection
+     * attempt so every error observation below can carry the command's
+     * true classified tier. (get_connection() also fails on a missing
+     * driver, so hoisting the lookup changes no behavior.)
+     */
+    const virp_driver_t *drv = virp_driver_lookup(state->devices[dev_idx].vendor);
+    if (!drv) {
+        char err_msg[256];
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: no driver for '%s'", device_name);
+        log_error_obs(device_name, VIRP_TIER_UNCLASSIFIED, err_msg);
+        return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                      state->devices[dev_idx].node_id,
+                                      onode_next_seq(state),
+                                      VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                      VIRP_TIER_UNCLASSIFIED,
+                                      (const uint8_t *)err_msg,
+                                      (uint16_t)strlen(err_msg),
+                                      &state->okey);
+    }
+    virp_trust_tier_t gate_tier = gate_classify(drv, command);
 
     /*
      * Per-device execution lock — serializes all command execution on
@@ -624,27 +665,13 @@ virp_error_t onode_execute_obs(onode_state_t *state,
         char err_msg[256];
         snprintf(err_msg, sizeof(err_msg),
                  "ERROR: cannot connect to '%s'", device_name);
-        return virp_build_observation(out_buf, out_buf_len, out_len,
-                                      state->devices[dev_idx].node_id,
-                                      onode_next_seq(state),
-                                      VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL,
-                                      (const uint8_t *)err_msg, (uint16_t)strlen(err_msg),
-                                      &state->okey);
-    }
-
-    /* Execute command through driver */
-    const virp_driver_t *drv = virp_driver_lookup(state->devices[dev_idx].vendor);
-    if (!drv) {
-        pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
-        char err_msg[256];
-        snprintf(err_msg, sizeof(err_msg),
-                 "ERROR: no driver for '%s'", device_name);
-        return virp_build_observation(out_buf, out_buf_len, out_len,
+        log_error_obs(device_name, gate_tier, err_msg);
+        return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
                                       onode_next_seq(state),
                                       VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
-                                      (const uint8_t *)err_msg,
-                                      (uint16_t)strlen(err_msg),
+                                      gate_obs_tier(gate_tier),
+                                      (const uint8_t *)err_msg, (uint16_t)strlen(err_msg),
                                       &state->okey);
     }
 
@@ -652,13 +679,16 @@ virp_error_t onode_execute_obs(onode_state_t *state,
      * Classify at the boundary, decide allow/block against the configured
      * max tier, and log. SHADOW logs and proceeds; ENFORCE hard-rejects
      * over-tier / unclassified commands before the driver runs. The
-     * classified tier is hoisted to function scope so the success
-     * observation below can be stamped with it (Phase C truth-fix). */
-    virp_trust_tier_t gate_tier = gate_classify(drv, command);
+     * classified tier (computed above, before the connection attempt) is
+     * function-scoped so the success observation below can be stamped
+     * with it (Phase C truth-fix). */
     {
         onode_gate_mode_t mode = gate_effective_mode(state, drv->name);
         bool block = gate_tier_blocks(gate_tier, state->gate_max_tier);
 
+        /* ENFORCE states what it did; only SHADOW speaks hypothetically.
+         * The old unconditional "would-block"/"would-allow" wording made
+         * an ENFORCE rejection read like a logged-but-executed change. */
         fprintf(stderr,
                 "[GATE] mode=%s device=%s driver=%s tier=%s threshold=%s "
                 "decision=%s command=\"%s\"\n",
@@ -666,7 +696,9 @@ virp_error_t onode_execute_obs(onode_state_t *state,
                 device_name, drv->name,
                 gate_tier_name(gate_tier),
                 gate_tier_name(state->gate_max_tier),
-                block ? "would-block" : "would-allow",
+                mode == GATE_MODE_ENFORCE
+                    ? (block ? "block" : "allow")
+                    : (block ? "would-block" : "would-allow"),
                 command);
 
         if (mode == GATE_MODE_ENFORCE && block) {
@@ -710,6 +742,7 @@ virp_error_t onode_execute_obs(onode_state_t *state,
                             virp_error_str(cerr));
             }
 
+            log_error_obs(device_name, gate_tier, err_msg);
             return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                           state->devices[dev_idx].node_id,
                                           onode_next_seq(state),
@@ -730,10 +763,12 @@ virp_error_t onode_execute_obs(onode_state_t *state,
         snprintf(err_msg, sizeof(err_msg),
                  "ERROR: driver execute failed on '%s': %s",
                  device_name, virp_error_str(err));
-        return virp_build_observation(out_buf, out_buf_len, out_len,
+        log_error_obs(device_name, gate_tier, err_msg);
+        return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
                                       onode_next_seq(state),
                                       VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                      gate_obs_tier(gate_tier),
                                       (const uint8_t *)err_msg,
                                       (uint16_t)strlen(err_msg),
                                       &state->okey);
@@ -753,11 +788,13 @@ virp_error_t onode_execute_obs(onode_state_t *state,
                 snprintf(err_msg, sizeof(err_msg),
                          "ERROR: driver execute failed on '%s' (retry): %s",
                          device_name, virp_error_str(err));
-                return virp_build_observation(
+                log_error_obs(device_name, gate_tier, err_msg);
+                return virp_build_observation_tiered(
                     out_buf, out_buf_len, out_len,
                     state->devices[dev_idx].node_id,
                     onode_next_seq(state),
                     VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                    gate_obs_tier(gate_tier),
                     (const uint8_t *)err_msg,
                     (uint16_t)strlen(err_msg),
                     &state->okey);
@@ -767,17 +804,34 @@ virp_error_t onode_execute_obs(onode_state_t *state,
 
     pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
 
-    /* If still failed after retry, return error_msg as observation data */
-    const uint8_t *obs_data;
-    uint16_t data_len;
+    /*
+     * Driver soft-failure with no output: the driver refused the command
+     * before any device I/O (VIRP_OK + success=false + error_msg — the
+     * shape REST drivers like Wazuh use for invalid or BLACK-tier
+     * endpoints). Nothing executed, so this must be a signed ERROR
+     * observation carrying the command's true tier — never the
+     * DEVICE_OUTPUT / v2 session-bound constructor used for executed
+     * output, which downstream renders as a logged change.
+     */
     if (!result.success && result.output_len == 0 && result.error_msg[0]) {
-        obs_data = (const uint8_t *)result.error_msg;
-        data_len = (uint16_t)strlen(result.error_msg);
-    } else {
-        obs_data = (const uint8_t *)result.output;
-        data_len = (result.output_len > 65530) ?
-                    65530 : (uint16_t)result.output_len;
+        char err_msg[sizeof(result.error_msg) + 96];
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: driver refused '%s': %s",
+                 device_name, result.error_msg);
+        log_error_obs(device_name, gate_tier, err_msg);
+        return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                      state->devices[dev_idx].node_id,
+                                      onode_next_seq(state),
+                                      VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                      gate_obs_tier(gate_tier),
+                                      (const uint8_t *)err_msg,
+                                      (uint16_t)strlen(err_msg),
+                                      &state->okey);
     }
+
+    const uint8_t *obs_data = (const uint8_t *)result.output;
+    uint16_t data_len = (result.output_len > 65530) ?
+                         65530 : (uint16_t)result.output_len;
 
     /* Phase C truth-fix: stamp the observation with the command's real
      * gate-classified tier (clamped to a transmittable tier) instead of a

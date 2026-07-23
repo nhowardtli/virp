@@ -33,6 +33,7 @@
 #include <sys/un.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 
 /* =========================================================================
  * Test infrastructure
@@ -1243,6 +1244,187 @@ TEST(test_driver_error_returns_signed_observation)
 }
 
 /* =========================================================================
+ * Error-path observation regressions
+ *
+ * Live reproductions (2026-07): error observations were built with the
+ * same constructor as executed device output (VIRP_OBS_DEVICE_OUTPUT /
+ * the v2 session-bound success path), so the AI layer rendered them as
+ * "[YELLOW-tier change — logged]" regardless of actual tier and even
+ * when nothing executed. Each test below pins one repro case: the
+ * observation must be a signed VIRP_OBS_ERROR carrying the command's
+ * true classified tier, and must not look like executed output.
+ * ========================================================================= */
+
+extern void virp_driver_mock_set_connect_fail(int fail);
+extern void virp_driver_mock_set_soft_fail(const char *msg);
+
+/* Stand up a private, socketless onode with one mock device so the
+ * error-path tests don't disturb g_state's connection cache. */
+static int errobs_setup(onode_state_t *tmp, const char *hostname,
+                        uint32_t node_id)
+{
+    if (onode_init(tmp, node_id, NULL, "/tmp/virp-onode-errobs.sock") != VIRP_OK)
+        return -1;
+    tmp->ctx = virp_context_new();
+    if (!tmp->ctx)
+        return -1;
+    /* compiled-in defaults: ENFORCE, max_tier=YELLOW — the live posture */
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "%s", hostname);
+    snprintf(dev.host, sizeof(dev.host), "10.255.0.1");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0E220001;
+    dev.enabled = true;
+    return (onode_add_device(tmp, &dev) == VIRP_OK) ? 0 : -1;
+}
+
+static void errobs_teardown(onode_state_t *tmp)
+{
+    virp_context_destroy(tmp->ctx);
+    onode_destroy(tmp);
+}
+
+/* (a) Connection failure to an unreachable device, GREEN read: the error
+ * observation must be VIRP_OBS_ERROR at tier GREEN (the read's true
+ * tier) — not a DEVICE_OUTPUT observation the consumer logs as a change. */
+TEST(test_error_obs_connect_failure_is_error_with_true_tier)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-UNREACH", 0xE220000A), 0);
+
+    virp_driver_mock_set_connect_fail(1);
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    virp_error_t err = onode_execute(&tmp, "R-UNREACH", "show version",
+                                     buf, sizeof(buf), &len);
+    virp_driver_mock_set_connect_fail(0);
+    ASSERT_OK(err);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(buf, len, &tmp.okey, &hdr));
+    ASSERT_EQ(hdr.tier, VIRP_TIER_GREEN);          /* true tier of the read */
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(buf + VIRP_HEADER_SIZE,
+                                     len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);       /* was DEVICE_OUTPUT */
+    ASSERT_TRUE(strstr((const char *)data, "cannot connect") != NULL);
+
+    errobs_teardown(&tmp);
+}
+
+/* (b) Driver soft-refusal (VIRP_OK + success=false + error_msg, the shape
+ * the Wazuh driver uses for an invalid / BLACK-tier endpoint): nothing
+ * executed, so the observation must be VIRP_OBS_ERROR at the command's
+ * true tier — before the fix it fell through to the success constructor
+ * and went out as DEVICE_OUTPUT. */
+TEST(test_error_obs_driver_refusal_is_error_not_output)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-WZ", 0xE220000B), 0);
+
+    virp_driver_mock_set_soft_fail(
+        "Endpoint blocked (BLACK tier): /manager/restart");
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    /* "clear counters" is YELLOW for the mock classifier: allowed through
+     * the gate (max=YELLOW), refused by the driver. */
+    virp_error_t err = onode_execute(&tmp, "R-WZ", "clear counters",
+                                     buf, sizeof(buf), &len);
+    virp_driver_mock_set_soft_fail(NULL);
+    ASSERT_OK(err);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(buf, len, &tmp.okey, &hdr));
+    ASSERT_EQ(hdr.tier, VIRP_TIER_YELLOW);         /* true tier, honest */
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(buf + VIRP_HEADER_SIZE,
+                                     len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);       /* was DEVICE_OUTPUT */
+    ASSERT_TRUE(strstr((const char *)data,
+                       "Endpoint blocked (BLACK tier)") != NULL);
+    /* Must not look like executed CLI output (mock echoes hostname#cmd) */
+    ASSERT_TRUE(strstr((const char *)data, "R-WZ#") == NULL);
+
+    errobs_teardown(&tmp);
+}
+
+/* (c) Gate-blocked RED command under ENFORCE max=YELLOW (live repro:
+ * "clear counters" on R1 while it was RED-classified): the observation
+ * must be VIRP_OBS_ERROR at tier RED, nothing may execute, and the gate
+ * log must state what it DID ("decision=block") — not the shadow-era
+ * "would-block", which read as a logged-but-executed change. */
+TEST(test_error_obs_gate_block_logs_as_error_not_change)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-GATE", 0xE220000C), 0);
+
+    /* Capture the daemon's stderr log for the duration of the call. */
+    const char *log_path = "/tmp/virp-onode-errobs-gate.log";
+    fflush(stderr);
+    int saved_fd = dup(fileno(stderr));
+    ASSERT_TRUE(saved_fd >= 0);
+    int log_fd = open(log_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    ASSERT_TRUE(log_fd >= 0);
+    dup2(log_fd, fileno(stderr));
+    close(log_fd);
+
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    /* "reload" is RED for the mock classifier — blocked under max=YELLOW */
+    virp_error_t err = onode_execute(&tmp, "R-GATE", "reload",
+                                     buf, sizeof(buf), &len);
+
+    fflush(stderr);
+    dup2(saved_fd, fileno(stderr));
+    close(saved_fd);
+
+    ASSERT_OK(err);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(buf, len, &tmp.okey, &hdr));
+    ASSERT_EQ(hdr.tier, VIRP_TIER_RED);            /* true tier, not YELLOW */
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(buf + VIRP_HEADER_SIZE,
+                                     len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr((const char *)data, "tier gate blocked") != NULL);
+    /* Nothing executed: no mock CLI echo in the payload */
+    ASSERT_TRUE(strstr((const char *)data, "R-GATE#") == NULL);
+
+    /* Log-line regression: ENFORCE states its decision; the error is
+     * logged as an error, never as a change. */
+    FILE *lf = fopen(log_path, "r");
+    ASSERT_TRUE(lf != NULL);
+    char logbuf[4096];
+    size_t got = fread(logbuf, 1, sizeof(logbuf) - 1, lf);
+    fclose(lf);
+    unlink(log_path);
+    logbuf[got] = '\0';
+
+    ASSERT_TRUE(strstr(logbuf, "decision=block") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "would-block") == NULL);
+    ASSERT_TRUE(strstr(logbuf, "[ERROR-OBS] device=R-GATE tier=RED "
+                               "executed=no") != NULL);
+
+    errobs_teardown(&tmp);
+}
+
+/* =========================================================================
  * SO_PEERCRED allowlist tests
  *
  * The daemon's default allowlist (set in onode_start()) is the daemon's
@@ -1640,6 +1822,9 @@ int main(void)
 
     printf("\n[Signed Error Observation Tests]\n");
     RUN_TEST(test_driver_error_returns_signed_observation);
+    RUN_TEST(test_error_obs_connect_failure_is_error_with_true_tier);
+    RUN_TEST(test_error_obs_driver_refusal_is_error_not_output);
+    RUN_TEST(test_error_obs_gate_block_logs_as_error_not_change);
 
     printf("\n[SO_PEERCRED Allowlist Tests]\n");
     RUN_TEST(test_peer_uid_allowed);

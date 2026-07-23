@@ -23,6 +23,17 @@ void virp_driver_mock_set_delay(int ms) { mock_delay_ms = ms; }
 static virp_error_t mock_forced_error = VIRP_OK;
 void virp_driver_mock_set_forced_error(virp_error_t err) { mock_forced_error = err; }
 
+/* Test hook: force connect() to fail (simulates an unreachable device) */
+static bool mock_connect_fail = false;
+void virp_driver_mock_set_connect_fail(bool fail) { mock_connect_fail = fail; }
+
+/* Test hook: execute() returns VIRP_OK with success=false, no output, and
+ * this error_msg — the soft-failure shape REST drivers use for refused
+ * requests (e.g. the Wazuh driver's invalid/BLACK-tier endpoint checks).
+ * NULL disables. */
+static const char *mock_soft_fail_msg = NULL;
+void virp_driver_mock_set_soft_fail(const char *msg) { mock_soft_fail_msg = msg; }
+
 /* =========================================================================
  * Mock connection — just stores the device info
  * ========================================================================= */
@@ -108,6 +119,9 @@ static const char *mock_find_response(const char *command)
 
 static virp_conn_t *mock_connect(const virp_device_t *device)
 {
+    if (mock_connect_fail)
+        return NULL;
+
     virp_conn_t *conn = calloc(1, sizeof(*conn));
     if (!conn) return NULL;
 
@@ -130,6 +144,14 @@ static virp_error_t mock_execute(virp_conn_t *conn,
     /* Test hook: simulate driver-level error (not just result.success=false) */
     if (mock_forced_error != VIRP_OK)
         return mock_forced_error;
+
+    /* Test hook: simulate a driver soft-failure (refused before device I/O) */
+    if (mock_soft_fail_msg) {
+        result->success = false;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "%s", mock_soft_fail_msg);
+        return VIRP_OK;
+    }
 
     if (!conn->connected) {
         result->success = false;
