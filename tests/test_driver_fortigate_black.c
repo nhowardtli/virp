@@ -311,6 +311,78 @@ static void test_table_driven_all_entries(void)
            total - skipped, skipped);
 }
 
+
+/* =========================================================================
+ * Catch-all removal: credential-read variants must fail closed
+ *
+ * The bare { "show", YELLOW } entry used to catch any variant of a RED
+ * credential read that lost its token boundary, handing it YELLOW —
+ * below the gate threshold, so it executed. With the catch-all gone
+ * these fall to the fail-closed RED default.
+ * ========================================================================= */
+
+static void test_credential_read_variants_fail_closed(void)
+{
+    printf("\n=== Credential-read variants fail closed (catch-all removed) ===\n");
+
+    TEST("show system admins -> RED (was YELLOW via catch-all)");
+    assert(fg_route_command("show system admins") == VIRP_TIER_RED); PASS();
+
+    TEST("show system admin-profile -> RED (was YELLOW via catch-all)");
+    assert(fg_route_command("show system admin-profile") == VIRP_TIER_RED); PASS();
+
+    TEST("show system api-users -> RED (was YELLOW via catch-all)");
+    assert(fg_route_command("show system api-users") == VIRP_TIER_RED); PASS();
+
+    TEST("show users -> RED (was YELLOW via catch-all)");
+    assert(fg_route_command("show users") == VIRP_TIER_RED); PASS();
+
+    /* The exact RED entries are unaffected. */
+    TEST("show system admin -> RED (exact entry, unchanged)");
+    assert(fg_route_command("show system admin") == VIRP_TIER_RED); PASS();
+
+    TEST("show user local -> RED (exact entry, unchanged)");
+    assert(fg_route_command("show user local") == VIRP_TIER_RED); PASS();
+
+    /* An arbitrary unlisted show no longer rides a catch-all. */
+    TEST("show blahblah -> RED (no catch-all to inherit)");
+    assert(fg_route_command("show blahblah") == VIRP_TIER_RED); PASS();
+
+    /* The benign reads that lost their only path keep an explicit tier. */
+    TEST("show system global -> YELLOW (explicit config read)");
+    assert(fg_route_command("show system global") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show system dns -> YELLOW (explicit config read)");
+    assert(fg_route_command("show system dns") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show system ha -> YELLOW (explicit config read)");
+    assert(fg_route_command("show system ha") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show system snmp sysinfo -> YELLOW (explicit config read)");
+    assert(fg_route_command("show system snmp sysinfo") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show system dhcp server -> YELLOW (explicit config read)");
+    assert(fg_route_command("show system dhcp server") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show system central-management -> YELLOW (explicit config read)");
+    assert(fg_route_command("show system central-management") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show system fortiguard -> YELLOW (explicit config read)");
+    assert(fg_route_command("show system fortiguard") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show log setting -> YELLOW (explicit config read)");
+    assert(fg_route_command("show log setting") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show antivirus profile -> YELLOW (explicit config read)");
+    assert(fg_route_command("show antivirus profile") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show webfilter profile -> YELLOW (explicit config read)");
+    assert(fg_route_command("show webfilter profile") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show system interface physical -> YELLOW (via show system interface)");
+    assert(fg_route_command("show system interface physical") == VIRP_TIER_YELLOW); PASS();
+}
+
 int main(void)
 {
     printf("VIRP FortiGate Driver — BLACK Tier Enforcement Tests\n");
@@ -323,6 +395,7 @@ int main(void)
     test_legit_matches_unaffected();
     test_no_match_fails_closed();
     test_table_driven_all_entries();
+    test_credential_read_variants_fail_closed();
     printf("\n====================================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

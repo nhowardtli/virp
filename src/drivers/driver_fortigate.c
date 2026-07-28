@@ -402,7 +402,32 @@ static const fg_command_route_t FG_ROUTE_TABLE[] = {
     { "show system interface",      VIRP_TIER_YELLOW },
     { "show firewall",              VIRP_TIER_YELLOW },
     { "show vpn",                   VIRP_TIER_YELLOW },
-    { "show",                       VIRP_TIER_YELLOW },  /* generic config-section read */
+    /*
+     * Explicit config-section reads. These replace the former bare
+     * { "show", YELLOW } catch-all, which was removed because it
+     * UNDERCUT the RED credential entries below: any variant of a RED
+     * read ("show system admins", "show system admin-profile",
+     * "show system api-users", "show users") lost the RED entry's token
+     * boundary at the extra character and landed on the catch-all's
+     * YELLOW instead of failing closed.
+     *
+     * YELLOW, not GREEN, on this table's own principle: `get` is an
+     * operational/status read (GREEN), `show` displays CONFIGURATION
+     * (YELLOW) — the same call already made for "show full-configuration",
+     * "show system interface", "show firewall" and "show vpn".
+     * "show system interface physical" needs no entry: the existing
+     * "show system interface" covers it by longest match.
+     */
+    { "show system global",         VIRP_TIER_YELLOW },
+    { "show system dns",            VIRP_TIER_YELLOW },
+    { "show system ha",             VIRP_TIER_YELLOW },  /* incl. encrypted HA password — same class as show full-configuration */
+    { "show system snmp",           VIRP_TIER_YELLOW },
+    { "show system dhcp",           VIRP_TIER_YELLOW },
+    { "show system central-management", VIRP_TIER_YELLOW },
+    { "show system fortiguard",     VIRP_TIER_YELLOW },
+    { "show log",                   VIRP_TIER_YELLOW },
+    { "show antivirus",             VIRP_TIER_YELLOW },
+    { "show webfilter",             VIRP_TIER_YELLOW },
 
     /* ── RED — credential/admin reads + config-mode changes ────── */
     { "show system admin",          VIRP_TIER_RED    },  /* admin accounts, pw hashes, tokens */
