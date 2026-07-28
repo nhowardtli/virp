@@ -1707,6 +1707,160 @@ TEST(test_hex_decode_oversized_input)
 }
 
 /* =========================================================================
+ * Startup invariant: approval mode requires a working trust chain
+ *
+ * The shipped deploy unit once omitted -c/-C while the default approver
+ * registry path existed on the host, so the daemon came up in approval
+ * mode with NO chain: challenges were issued and approvals accepted with
+ * no PROPOSAL/APPROVAL/OUTCOME history and a vacuous L1 consumed-
+ * proposal check. onode_setup_chain_and_approvals() now refuses that
+ * combination: approval mode + no chain (or chain init failure) must
+ * return non-VIRP_OK so main() exits non-zero. Non-approval startups
+ * keep the historical "continuing without chain" tolerance.
+ * ========================================================================= */
+
+extern virp_error_t onode_setup_chain_and_approvals(onode_state_t *state,
+                                                    uint32_t node_id,
+                                                    const char *chain_db_path,
+                                                    const char *chain_key_path,
+                                                    const char *approval_dir,
+                                                    const char *approvers_path);
+
+#define AP_REGISTRY  "/tmp/virp-onode-test-approvers.json"
+#define AP_DIR       "/tmp/virp-onode-test-approvals"
+#define AP_CHAIN_DB  "/tmp/virp-onode-test-apchain.db"
+#define AP_CHAIN_KEY "/tmp/virp-onode-test-apchain.key"
+#define AP_MISSING   "/tmp/virp-onode-test-no-such-file"
+
+/* One enabled ECDSA-P256 key (the KAT vector from
+ * docs/approvers.example.json) — enough to flip approval mode on. */
+static int write_test_registry(void)
+{
+    FILE *f = fopen(AP_REGISTRY, "w");
+    if (!f) return -1;
+    fprintf(f,
+        "[{\"key_id\":\"e6d67937b0a11c446e166ddc8f157ba9\","
+        "\"algorithm\":\"ecdsa-p256\","
+        "\"public_key\":\"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEPunEJQ1WRSrS"
+        "DlBhL6MRlYkJoLInUnLDH0zozZ40uEGnnt/MSp0Bkht4+q1jakqnwz141u58E1pn"
+        "9fkDAOxcAw==\","
+        "\"operator\":\"test-operator\",\"enabled\":true}]\n");
+    fclose(f);
+    return 0;
+}
+
+static void ap_cleanup_files(void)
+{
+    unlink(AP_REGISTRY);
+    unlink(AP_CHAIN_DB);
+    unlink(AP_CHAIN_DB "-wal");
+    unlink(AP_CHAIN_DB "-shm");
+    unlink(AP_CHAIN_KEY);
+}
+
+TEST(test_approval_mode_without_chain_refuses_start)
+{
+    ASSERT_EQ(write_test_registry(), 0);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0004, NULL,
+                         "/tmp/virp-onode-apchain.sock"));
+
+    /* Approver registry loads, but no -c/-C: startup must be refused. */
+    virp_error_t rc = onode_setup_chain_and_approvals(&tmp, 0xDEAD0004,
+                                                      NULL, NULL,
+                                                      AP_DIR, AP_REGISTRY);
+    ASSERT_TRUE(rc != VIRP_OK);
+    ASSERT_EQ((int)tmp.chain_enabled, 0);
+
+    onode_destroy(&tmp);
+    ap_cleanup_files();
+}
+
+TEST(test_approval_mode_chain_init_failure_refuses_start)
+{
+    ASSERT_EQ(write_test_registry(), 0);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0005, NULL,
+                         "/tmp/virp-onode-apchain.sock"));
+
+    /* Chain configured but uninitializable (key file doesn't exist):
+     * approval mode must refuse to start — no silent continue. */
+    virp_error_t rc = onode_setup_chain_and_approvals(&tmp, 0xDEAD0005,
+                                                      AP_CHAIN_DB, AP_MISSING,
+                                                      AP_DIR, AP_REGISTRY);
+    ASSERT_TRUE(rc != VIRP_OK);
+    ASSERT_EQ((int)tmp.chain_enabled, 0);
+
+    onode_destroy(&tmp);
+    ap_cleanup_files();
+}
+
+TEST(test_approval_mode_with_chain_starts)
+{
+    ASSERT_EQ(write_test_registry(), 0);
+
+    /* A real 32-byte chain key + a fresh SQLite db path. */
+    virp_signing_key_t ck;
+    ASSERT_OK(virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN));
+    ASSERT_OK(virp_key_save_file(&ck, AP_CHAIN_KEY));
+    virp_key_destroy(&ck);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0006, NULL,
+                         "/tmp/virp-onode-apchain.sock"));
+
+    virp_error_t rc = onode_setup_chain_and_approvals(&tmp, 0xDEAD0006,
+                                                      AP_CHAIN_DB,
+                                                      AP_CHAIN_KEY,
+                                                      AP_DIR, AP_REGISTRY);
+    ASSERT_OK(rc);
+    ASSERT_EQ((int)tmp.chain_enabled, 1);
+    ASSERT_EQ((int)tmp.approvers_loaded, 1);
+
+    onode_destroy(&tmp);   /* destroys the chain (chain_enabled) */
+    ap_cleanup_files();
+}
+
+TEST(test_no_approvers_no_chain_still_starts)
+{
+    /* Registry absent → approval mode disabled → chainless startup is
+     * still allowed (unchanged non-approval behavior). */
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0007, NULL,
+                         "/tmp/virp-onode-apchain.sock"));
+
+    virp_error_t rc = onode_setup_chain_and_approvals(&tmp, 0xDEAD0007,
+                                                      NULL, NULL,
+                                                      AP_DIR, AP_MISSING);
+    ASSERT_OK(rc);
+    ASSERT_EQ((int)tmp.approvers_loaded, 0);
+    ASSERT_EQ((int)tmp.chain_enabled, 0);
+
+    onode_destroy(&tmp);
+}
+
+TEST(test_no_approvers_chain_failure_still_starts)
+{
+    /* Chain init fails but approval mode is off: historical
+     * "continuing without chain" tolerance must be preserved. */
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0008, NULL,
+                         "/tmp/virp-onode-apchain.sock"));
+
+    virp_error_t rc = onode_setup_chain_and_approvals(&tmp, 0xDEAD0008,
+                                                      AP_CHAIN_DB, AP_MISSING,
+                                                      AP_DIR, AP_MISSING);
+    ASSERT_OK(rc);
+    ASSERT_EQ((int)tmp.approvers_loaded, 0);
+    ASSERT_EQ((int)tmp.chain_enabled, 0);
+
+    onode_destroy(&tmp);
+    ap_cleanup_files();
+}
+
+/* =========================================================================
  * gate_obs_tier — audit-honesty mapping (Item 1 hardening)
  * ========================================================================= */
 
@@ -1788,6 +1942,13 @@ int main(void)
     RUN_TEST(test_hex_decode_embedded_plus);
     RUN_TEST(test_hex_decode_embedded_0x);
     RUN_TEST(test_hex_decode_oversized_input);
+
+    printf("\n[Approval-Mode-Requires-Chain Startup Tests]\n");
+    RUN_TEST(test_approval_mode_without_chain_refuses_start);
+    RUN_TEST(test_approval_mode_chain_init_failure_refuses_start);
+    RUN_TEST(test_approval_mode_with_chain_starts);
+    RUN_TEST(test_no_approvers_no_chain_still_starts);
+    RUN_TEST(test_no_approvers_chain_failure_still_starts);
 
     printf("\n[O-Node Pipeline Tests]\n");
     RUN_TEST(test_execute_show_ip_route);

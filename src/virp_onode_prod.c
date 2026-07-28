@@ -459,6 +459,88 @@ int load_devices(onode_state_t *state, const char *path)
     return loaded;
 }
 
+/*
+ * Trust chain (Primitive 6) + approval flow startup.
+ *
+ * Invariant enforced here: approval mode NEVER runs without a working
+ * chain. A chainless approval flow issues challenges and accepts
+ * approvals while writing no PROPOSAL/APPROVAL/OUTCOME history, and the
+ * L1 consumed-proposal check in virp_approval.c is vacuous with a NULL
+ * chain — the audit trail LIVE-PROOF-2026-07-23.md documents would
+ * silently not exist. So:
+ *
+ *   - approval mode enabled + no chain configured  → fatal (non-VIRP_OK)
+ *   - approval mode enabled + chain init failed    → fatal (non-VIRP_OK)
+ *   - approval mode disabled                       → chain failure is
+ *     tolerated exactly as before ("continuing without chain")
+ *
+ * Not static: like load_devices() above, tests/test_onode.c links this
+ * via the VIRP_ONODE_PROD_NO_MAIN lib object and calls it directly.
+ * Returns VIRP_OK when the daemon may start; main() exits non-zero
+ * otherwise.
+ */
+virp_error_t onode_setup_chain_and_approvals(onode_state_t *state,
+                                             uint32_t node_id,
+                                             const char *chain_db_path,
+                                             const char *chain_key_path,
+                                             const char *approval_dir,
+                                             const char *approvers_path)
+{
+    if (!state || !approval_dir || !approvers_path)
+        return VIRP_ERR_NULL_PTR;
+
+    bool chain_configured = (chain_db_path != NULL && chain_key_path != NULL);
+    virp_error_t chain_err = VIRP_OK;
+
+    if ((chain_db_path != NULL) != (chain_key_path != NULL))
+        fprintf(stderr, "[O-Node] Warning: -c and -C must be given together "
+                "— chain disabled\n");
+
+    if (chain_configured) {
+        chain_err = virp_chain_init(&state->chain, chain_db_path,
+                                    chain_key_path, node_id, "local");
+        if (chain_err == VIRP_OK) {
+            state->chain_enabled = true;
+            fprintf(stderr, "[O-Node] Trust chain enabled: db=%s\n",
+                    chain_db_path);
+        }
+    }
+
+    /*
+     * Approval flow (propose → approve → apply). Loads the approver
+     * registry (public keys only); a missing/empty registry leaves the
+     * flow disabled (plain gate blocking unchanged). Enroll keys in
+     * /etc/virp/approvers.json — schema and PIV enrollment in
+     * docs/APPROVAL-FLOW.md.
+     */
+    virp_error_t aerr = onode_set_approvers(state, approval_dir,
+                                            approvers_path);
+    if (aerr != VIRP_OK) {
+        fprintf(stderr, "[O-Node] Approval flow disabled: registry "
+                "%s (%s)\n", approvers_path, virp_error_str(aerr));
+        /* Non-approval mode keeps its historical chain tolerance. */
+        if (chain_configured && chain_err != VIRP_OK)
+            fprintf(stderr, "[O-Node] Trust chain init failed: %s "
+                    "(continuing without chain)\n",
+                    virp_error_str(chain_err));
+        return VIRP_OK;
+    }
+
+    if (!chain_configured) {
+        fprintf(stderr, "[O-Node] FATAL: approval mode is enabled (registry "
+                "%s) but no trust chain is configured. Pass -c <chain.db> "
+                "and -C <chain.key>. Refusing to start.\n", approvers_path);
+        return VIRP_ERR_CHAIN_DB;
+    }
+    if (chain_err != VIRP_OK) {
+        fprintf(stderr, "[O-Node] FATAL: approval mode is enabled but trust "
+                "chain init failed: %s. Refusing to start.\n",
+                virp_error_str(chain_err));
+        return chain_err;
+    }
+    return VIRP_OK;
+}
+
 #ifndef VIRP_ONODE_PROD_NO_MAIN
 
 static void usage(const char *prog)
@@ -471,7 +553,9 @@ static void usage(const char *prog)
     printf("  -s <path>   Unix socket path (default: %s)\n", ONODE_SOCKET_PATH);
     printf("  -d <path>   Device config JSON file (required)\n");
     printf("  -n <hex>    Node ID in hex (default: 0x00000001)\n");
-    printf("  -c <path>   Chain database path (enables Primitive 6 trust chain)\n");
+    printf("  -c <path>   Chain database path (enables Primitive 6 trust chain;\n");
+    printf("              REQUIRED when approval mode is enabled — the daemon\n");
+    printf("              refuses to start in approval mode without a chain)\n");
     printf("  -C <path>   Chain key path (32-byte key file, required with -c)\n");
     printf("  -a <path>   Approval store dir (default: /var/lib/virp/approvals)\n");
     printf("  -A <path>   Approver registry (default: /etc/virp/approvers.json)\n");
@@ -601,36 +685,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Initialize trust chain (Primitive 6) if configured */
-    if (chain_db_path && chain_key_path) {
-        virp_error_t chain_err = virp_chain_init(&g_state.chain,
-                                                  chain_db_path,
-                                                  chain_key_path,
-                                                  node_id, "local");
-        if (chain_err == VIRP_OK) {
-            g_state.chain_enabled = true;
-            fprintf(stderr, "[O-Node] Trust chain enabled: db=%s\n",
-                    chain_db_path);
-        } else {
-            fprintf(stderr, "[O-Node] Trust chain init failed: %s "
-                    "(continuing without chain)\n",
-                    virp_error_str(chain_err));
-        }
-    }
-
     /*
-     * Approval flow (propose → approve → apply). Loads the approver
-     * registry (public keys only); a missing/empty registry simply
-     * leaves the flow disabled (plain gate blocking unchanged). Enroll
-     * keys in /etc/virp/approvers.json — schema and PIV enrollment in
-     * docs/APPROVAL-FLOW.md.
+     * Trust chain (Primitive 6) + approval flow. Fatal if approval mode
+     * is enabled without a working chain — see the function's comment.
      */
-    {
-        virp_error_t aerr = onode_set_approvers(&g_state, approval_dir,
-                                                approvers_path);
-        if (aerr != VIRP_OK)
-            fprintf(stderr, "[O-Node] Approval flow disabled: registry "
-                    "%s (%s)\n", approvers_path, virp_error_str(aerr));
+    err = onode_setup_chain_and_approvals(&g_state, node_id,
+                                          chain_db_path, chain_key_path,
+                                          approval_dir, approvers_path);
+    if (err != VIRP_OK) {
+        fprintf(stderr, "[O-Node] Startup aborted: approval mode requires "
+                "a working trust chain (-c/-C). Exiting.\n");
+        onode_destroy(&g_state);
+        virp_context_destroy(ctx);
+        return 1;
     }
 
     /* Install signal handlers */

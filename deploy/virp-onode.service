@@ -19,10 +19,19 @@ Group=virp
 # state under StateDirectory so systemd creates+chowns it for us.
 StateDirectory=virp
 StateDirectoryMode=0750
+# Chain flags (-c/-C) are REQUIRED here: approval mode (enabled whenever
+# /etc/virp/approvers.json enrolls a key) refuses to start without a
+# working trust chain — without it no PROPOSAL/APPROVAL/OUTCOME history
+# is written. Provision the chain key before first start:
+#   head -c 32 /dev/urandom > /etc/virp/keys/chain.key
+#   chown virp:virp /etc/virp/keys/chain.key && chmod 0600 /etc/virp/keys/chain.key
+# `make check-deploy-unit` fails if these flags are removed.
 ExecStart=/opt/virp/build/virp-onode-prod \
     -k /etc/virp/keys/onode.key \
     -s /run/virp/onode.sock \
-    -d /var/lib/virp/devices.json
+    -d /var/lib/virp/devices.json \
+    -c /var/lib/virp/chain.db \
+    -C /etc/virp/keys/chain.key
 
 # Socket directory (RuntimeDirectory is auto-created 0755 virp:virp).
 RuntimeDirectory=virp
