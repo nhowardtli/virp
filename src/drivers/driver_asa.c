@@ -50,7 +50,8 @@
 /* =========================================================================
  * Command Routing Table — ASA-specific commands → trust tiers
  *
- * Prefix-matched, longest match wins. Unmapped commands default YELLOW.
+ * Prefix-matched, longest match wins. FAIL-CLOSED: unmapped commands
+ * default to RED (they used to default YELLOW, which cleared the gate).
  * ========================================================================= */
 
 const asa_command_route_t ASA_ROUTE_TABLE[] = {
@@ -115,7 +116,7 @@ const size_t ASA_ROUTE_TABLE_SIZE =
 
 virp_trust_tier_t asa_route_command(const char *command)
 {
-    if (!command) return VIRP_TIER_YELLOW;
+    if (!command) return VIRP_TIER_RED;              /* fail closed */
 
     /*
      * Layer 3a — a separator-carrying string is not one command, so this
@@ -154,7 +155,10 @@ virp_trust_tier_t asa_route_command(const char *command)
         }
     }
 
-    return best ? best->tier : VIRP_TIER_YELLOW;
+    /* Fail-closed: anything not explicitly listed is RED. An unlisted
+     * command used to return YELLOW, which CLEARED the default YELLOW
+     * gate threshold and executed unreviewed. */
+    return best ? best->tier : VIRP_TIER_RED;
 }
 
 /* =========================================================================

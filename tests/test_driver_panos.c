@@ -172,24 +172,28 @@ static void test_ordering_and_boundary(void)
 
     /* Word boundary: 'show system' alone is not a table entry; 'show system
      * info' is GREEN, but a non-boundary suffix must not false-match. */
-    TEST("show systemfoo -> YELLOW (no boundary, falls through to default)");
-    assert(pa_route_command("show systemfoo") == VIRP_TIER_YELLOW);
+    TEST("show systemfoo -> RED (no boundary, falls through to fail-closed default)");
+    assert(pa_route_command("show systemfoo") == VIRP_TIER_RED);
     PASS();
 
     /* KNOWN word-boundary mis-tier: real PAN-OS interface syntax has no
      * space (ethernet1/1), so it does NOT match "show interface ethernet"
      * and falls to the YELLOW default. Fail-safe (over-restrictive, not
      * dangerous); documented here so the behavior is explicit. */
-    TEST("show interface ethernet1/1 -> YELLOW (word-boundary fall-through)");
-    assert(pa_route_command("show interface ethernet1/1") == VIRP_TIER_YELLOW);
+    /* RELIER on the old YELLOW default — NOT added to the table.
+     * This is a legitimate command that was never listed; it executed
+     * only because the no-match default cleared the gate. Now RED.
+     * Listing it is a deliberate tier decision, not a bug fix. */
+    TEST("show interface ethernet1/1 -> RED (word-boundary fall-through)");
+    assert(pa_route_command("show interface ethernet1/1") == VIRP_TIER_RED);
     PASS();
 
-    TEST("unmapped command -> YELLOW (default)");
-    assert(pa_route_command("show blahblah") == VIRP_TIER_YELLOW);
+    TEST("unmapped command -> RED (fail-closed default)");
+    assert(pa_route_command("show blahblah") == VIRP_TIER_RED);
     PASS();
 
-    TEST("null command -> YELLOW");
-    assert(pa_route_command(NULL) == VIRP_TIER_YELLOW);
+    TEST("null command -> RED (fail closed)");
+    assert(pa_route_command(NULL) == VIRP_TIER_RED);   /* fail closed */
     PASS();
 }
 
@@ -277,6 +281,38 @@ static void test_legit_matches_unaffected(void)
     assert(pa_route_command("show device-group") == VIRP_TIER_YELLOW); PASS();
 }
 
+
+/* =========================================================================
+ * No-match default must FAIL CLOSED (P0)
+ *
+ * PAN-OS's classifier returned YELLOW when no table entry matched. The
+ * default gate threshold is YELLOW, so an unlisted command CLEARED the
+ * gate and executed. Only the Cisco classifier failed closed to RED.
+ *
+ * Each command below is plausible, unlisted, and state-changing or
+ * sensitive — every one of them executed before this change.
+ * ========================================================================= */
+
+static void test_no_match_fails_closed(void)
+{
+    printf("\n=== No-match default fails closed to RED ===\n");
+
+    TEST("unlisted: commit -> RED (applies the entire candidate configuration)");
+    assert(pa_route_command("commit") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: delete rulebase security rules TRUST-ANY -> RED (deletes a firewall rule)");
+    assert(pa_route_command("delete rulebase security rules TRUST-ANY") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: set deviceconfig system permitted-ip 0.0.0.0 -> RED (opens mgmt to the world)");
+    assert(pa_route_command("set deviceconfig system permitted-ip 0.0.0.0") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: request restart system -> RED (reboots the firewall)");
+    assert(pa_route_command("request restart system") == VIRP_TIER_RED); PASS();
+
+    TEST("NULL command -> RED (fail closed)");
+    assert(pa_route_command(NULL) == VIRP_TIER_RED); PASS();
+}
+
 int main(void)
 {
     printf("VIRP PAN-OS Driver — Unit Tests\n");
@@ -289,6 +325,7 @@ int main(void)
 
     test_adversarial_separators();
     test_legit_matches_unaffected();
+    test_no_match_fails_closed();
     printf("\n================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

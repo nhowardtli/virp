@@ -221,6 +221,35 @@ static void test_legit_matches_unaffected(void)
     assert(fg_route_command("config system admin") == VIRP_TIER_RED); PASS();
 }
 
+
+/* =========================================================================
+ * No-match default must FAIL CLOSED (P0)
+ *
+ * FortiGate's classifier returned YELLOW when no table entry matched. The
+ * default gate threshold is YELLOW, so an unlisted command CLEARED the
+ * gate and executed. Only the Cisco classifier failed closed to RED.
+ *
+ * Each command below is plausible, unlisted, and state-changing or
+ * sensitive — every one of them executed before this change.
+ * ========================================================================= */
+
+static void test_no_match_fails_closed(void)
+{
+    printf("\n=== No-match default fails closed to RED ===\n");
+
+    TEST("unlisted: edit 1 -> RED (config-object edit — the config-write verb set)");
+    assert(fg_route_command("edit 1") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: unset admin-lockout-threshold -> RED (removes a security control)");
+    assert(fg_route_command("unset admin-lockout-threshold") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: set password ABC123 -> RED (credential write)");
+    assert(fg_route_command("set password ABC123") == VIRP_TIER_RED); PASS();
+
+    TEST("NULL command -> RED (fail closed)");
+    assert(fg_route_command(NULL) == VIRP_TIER_RED); PASS();
+}
+
 int main(void)
 {
     printf("VIRP FortiGate Driver — BLACK Tier Enforcement Tests\n");
@@ -231,6 +260,7 @@ int main(void)
 
     test_adversarial_separators();
     test_legit_matches_unaffected();
+    test_no_match_fails_closed();
     printf("\n====================================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

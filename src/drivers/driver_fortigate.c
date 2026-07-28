@@ -363,7 +363,8 @@ static virp_conn_t *fg_connect(const virp_device_t *device)
  * Command Routing Table — FortiOS commands → trust tiers
  *
  * Prefix-matched, longest match wins (mirrors asa_route_command /
- * junos_route_command). Unmapped commands default to YELLOW.
+ * junos_route_command). FAIL-CLOSED: unmapped commands default to RED
+ * (they used to default YELLOW, which cleared the gate).
  *
  * Tiering policy for this fleet:
  *   GREEN  — passive monitoring reads (status, perf, routing table)
@@ -419,7 +420,7 @@ static const size_t FG_ROUTE_TABLE_SIZE =
 
 virp_trust_tier_t fg_route_command(const char *command)
 {
-    if (!command) return VIRP_TIER_YELLOW;
+    if (!command) return VIRP_TIER_RED;              /* fail closed */
 
     /*
      * Layer 3a — a separator-carrying string is not one command, so this
@@ -461,7 +462,10 @@ virp_trust_tier_t fg_route_command(const char *command)
         }
     }
 
-    return best ? best->tier : VIRP_TIER_YELLOW;
+    /* Fail-closed: anything not explicitly listed is RED. An unlisted
+     * command used to return YELLOW, which CLEARED the default YELLOW
+     * gate threshold and executed unreviewed. */
+    return best ? best->tier : VIRP_TIER_RED;
 }
 
 

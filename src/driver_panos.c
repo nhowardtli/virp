@@ -65,7 +65,8 @@
  * Command Routing Table — maps CLI commands to VIRP trust tiers
  *
  * Prefix-matched against incoming commands. First match wins.
- * Unmatched commands default to YELLOW tier.
+ * FAIL-CLOSED: unmatched commands default to RED (they used to
+ * default YELLOW, which cleared the gate).
  * ========================================================================= */
 
 const pa_command_route_t PA_ROUTE_TABLE[] = {
@@ -155,7 +156,7 @@ const size_t PA_ROUTE_TABLE_SIZE =
 
 virp_trust_tier_t pa_route_command(const char *command)
 {
-    if (!command) return VIRP_TIER_YELLOW;
+    if (!command) return VIRP_TIER_RED;              /* fail closed */
 
     /*
      * Layer 3a — a separator-carrying string is not one command, so this
@@ -192,8 +193,10 @@ virp_trust_tier_t pa_route_command(const char *command)
         }
     }
 
-    /* No match — default to YELLOW */
-    return VIRP_TIER_YELLOW;
+    /* Fail-closed: anything not explicitly listed is RED. An unlisted
+     * command used to return YELLOW, which CLEARED the default YELLOW
+     * gate threshold and executed unreviewed. */
+    return VIRP_TIER_RED;
 }
 
 /* =========================================================================
