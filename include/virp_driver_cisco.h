@@ -41,15 +41,6 @@ typedef enum {
     CISCO_DS_RUNNING            /* Running configuration             */
 } cisco_datastore_t;
 
-/* ── Command routing table entry ────────────────────────────────── */
-typedef struct {
-    const char            *command_pattern;   /* CLI command prefix       */
-    const char            *restconf_path;     /* RESTCONF URI path        */
-    const char            *yang_module;       /* YANG module name         */
-    cisco_datastore_t      datastore;
-    virp_trust_tier_t      tier;
-} cisco_command_route_t;
-
 /* ── Cisco connection context ───────────────────────────────────── */
 typedef struct {
     virp_conn_t             base;
@@ -93,12 +84,6 @@ typedef struct {
 const virp_driver_t       *virp_driver_cisco(void);
 virp_error_t               virp_driver_cisco_register(void);
 
-virp_error_t cisco_route_command(const char *command,
-                                 cisco_transport_t *transport,
-                                 virp_trust_tier_t *tier,
-                                 const char **restconf_path,
-                                 const char **yang_module);
-
 /*
  * Gate-facing command classifier (VIRP tier-enforcement gate).
  *
@@ -120,9 +105,6 @@ virp_trust_tier_t cisco_gate_tier(const char *command);
  * and must never be transmitted to the device.
  */
 bool cisco_is_black_tier(const char *command);
-
-extern const size_t CISCO_ROUTE_TABLE_SIZE;
-extern const cisco_command_route_t CISCO_ROUTE_TABLE[];
 
 #ifdef __cplusplus
 }

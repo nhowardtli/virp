@@ -101,7 +101,6 @@ const junos_command_route_t JUNOS_ROUTE_TABLE[] = {
     /* Config-visibility reads — YELLOW to match the FortiGate/ASA
      * config-read precedent (config reads = YELLOW; writes stay RED). */
     { "show configuration",             VIRP_TIER_YELLOW },
-    { "show configuration | display set", VIRP_TIER_YELLOW },
 
     /* ── BLACK — Destructive operations (never transmitted) ────── */
     { "request system reboot",          VIRP_TIER_BLACK  },

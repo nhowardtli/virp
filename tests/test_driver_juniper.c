@@ -180,8 +180,10 @@ static void test_command_routing(void)
      * This is not new breakage introduced here — the layer-1 daemon
      * boundary has refused pipe-bearing commands since b3985e1, so this
      * command was already unusable through the daemon; layer 3 only makes
-     * the classifier agree. Kept as an explicit assertion rather than
-     * deleted so the cost of the policy stays visible: if a
+     * the classifier agree. The dead JUNOS_ROUTE_TABLE entry that used to
+     * declare YELLOW for this command has since been deleted — it could
+     * never fire. This assertion is kept: it pins the behavior at the
+     * policy level and keeps the cost of rejecting the pipe visible. If a
      * display-filter carve-out for network CLIs is ever adopted, this is
      * the test that must change back.
      */
@@ -655,13 +657,6 @@ static void test_table_driven_all_entries(void)
     for (size_t i = 0; i < total; i++) {
         const char *cmd = JUNOS_ROUTE_TABLE[i].command_pattern;
         virp_trust_tier_t declared = JUNOS_ROUTE_TABLE[i].tier;
-        /* KNOWN-DEAD ENTRY (reported, deliberately not fixed):
-         * "show configuration | display set" can never fire — the shared
-         * separator policy refuses '|' before this table is consulted, so
-         * the entry is unreachable by construction. Left in place so the
-         * decision to remove it (or to add a display-filter carve-out)
-         * stays an explicit choice. */
-        if (strchr(cmd, '|') != NULL) { skipped++; continue; }
         char label[192];
         snprintf(label, sizeof(label), "entry[%zu] %s -> %s",
                  i, cmd, tier_name(declared));
