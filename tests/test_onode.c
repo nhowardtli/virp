@@ -364,6 +364,117 @@ TEST(test_separator_policy_escapes_control_bytes_in_reason)
     ASSERT_TRUE(strstr(why, "';'") != NULL);
 }
 
+/* =========================================================================
+ * SHADOW-mode refusal (production posture for linux and wazuh)
+ *
+ * The layer-1 rejection is a hard return, NOT a gate verdict: it never
+ * reaches gate_effective_mode or gate_tier_blocks. If it were ever
+ * converted into a tier decision, SHADOW would log-and-proceed and the
+ * bypass would still be open on every SHADOW-override driver.
+ *
+ * Each test below first proves the state really is permissive (an
+ * UNCLASSIFIED command EXECUTES under SHADOW) and only then asserts the
+ * separator-carrying command is refused — so a passing result cannot be
+ * an artifact of ENFORCE quietly doing the work.
+ * ========================================================================= */
+
+/* Stand up a throwaway SHADOW-mode daemon state with one mock device. */
+static int shadow_state_init(onode_state_t *tmp, uint32_t node_id,
+                             const char *sock, const char *hostname)
+{
+    if (onode_init(tmp, node_id, NULL, sock) != VIRP_OK) return -1;
+    tmp->ctx = virp_context_new();
+    if (!tmp->ctx) return -1;
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "%s", hostname);
+    snprintf(dev.host, sizeof(dev.host), "10.255.0.7");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0BADBEEF;
+    dev.enabled = true;
+    return onode_add_device(tmp, &dev) == VIRP_OK ? 0 : -1;
+}
+
+/* Returns the observation type, and reports whether the mock echoed the
+ * command (proof it reached the driver). */
+static int shadow_exec_obs_type(onode_state_t *tmp, const char *host,
+                                const char *cmd, bool *echoed)
+{
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    *echoed = false;
+    if (onode_execute(tmp, host, cmd, buf, sizeof(buf), &len) != VIRP_OK)
+        return -1;
+
+    virp_header_t hdr;
+    if (virp_validate_message(buf, len, &tmp->okey, &hdr) != VIRP_OK)
+        return -1;
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    if (virp_parse_observation(buf + VIRP_HEADER_SIZE,
+                               len - VIRP_HEADER_SIZE,
+                               &obs, &data, &data_len) != VIRP_OK)
+        return -1;
+
+    char needle[96];
+    snprintf(needle, sizeof(needle), "%s#", host);
+    *echoed = (strstr((const char *)data, needle) != NULL);
+    return obs.obs_type;
+}
+
+TEST(test_shadow_default_mode_still_refuses_separator_command)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(shadow_state_init(&tmp, 0xDEAD0009,
+                                "/tmp/virp-onode-shadow-sep.sock", "R-SH1"), 0);
+    tmp.gate_default_mode = GATE_MODE_SHADOW;
+
+    /* Precondition: SHADOW really does let an unclassified command run. */
+    bool echoed = false;
+    ASSERT_EQ(shadow_exec_obs_type(&tmp, "R-SH1", "frobnicate the widget",
+                                   &echoed), VIRP_OBS_DEVICE_OUTPUT);
+    ASSERT_TRUE(echoed);
+
+    /* The separator command must still be refused, unexecuted. */
+    ASSERT_EQ(shadow_exec_obs_type(&tmp, "R-SH1", "show version\nreload",
+                                   &echoed), VIRP_OBS_ERROR);
+    ASSERT_TRUE(!echoed);
+
+    virp_context_destroy(tmp.ctx);
+    onode_destroy(&tmp);
+}
+
+TEST(test_shadow_driver_override_still_refuses_separator_command)
+{
+    /* Mirrors the production posture: a per-driver SHADOW override
+     * (gate_modes) rather than a SHADOW default — how linux and wazuh
+     * are actually configured. */
+    onode_state_t tmp;
+    ASSERT_EQ(shadow_state_init(&tmp, 0xDEAD000A,
+                                "/tmp/virp-onode-shadow-ovr.sock", "R-SH2"), 0);
+    tmp.gate_default_mode = GATE_MODE_ENFORCE;      /* default stays strict */
+    snprintf(tmp.gate_overrides[0].driver,
+             sizeof(tmp.gate_overrides[0].driver), "mock");
+    tmp.gate_overrides[0].mode = GATE_MODE_SHADOW;
+    tmp.gate_overrides_count = 1;
+
+    bool echoed = false;
+    ASSERT_EQ(shadow_exec_obs_type(&tmp, "R-SH2", "frobnicate the widget",
+                                   &echoed), VIRP_OBS_DEVICE_OUTPUT);
+    ASSERT_TRUE(echoed);
+
+    ASSERT_EQ(shadow_exec_obs_type(&tmp, "R-SH2", "show version;reload",
+                                   &echoed), VIRP_OBS_ERROR);
+    ASSERT_TRUE(!echoed);
+
+    virp_context_destroy(tmp.ctx);
+    onode_destroy(&tmp);
+}
+
 /*
  * Per-item batch contract (af92763): a rejected item must not kill the
  * batch, and a good sibling must still be examined and executed on its
@@ -2280,6 +2391,8 @@ int main(void)
     RUN_TEST(test_multicommand_newline_is_blocked);
     RUN_TEST(test_multicommand_newline_is_blocked_batch);
     RUN_TEST(test_multicommand_batch_rejects_per_item_not_whole_batch);
+    RUN_TEST(test_shadow_default_mode_still_refuses_separator_command);
+    RUN_TEST(test_shadow_driver_override_still_refuses_separator_command);
     RUN_TEST(test_execute_v2_without_session_fails);
     RUN_TEST(test_execute_v2_session_bound_roundtrip);
     RUN_TEST(test_execute_show_bgp_summary);

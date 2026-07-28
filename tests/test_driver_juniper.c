@@ -365,62 +365,67 @@ static void test_route_table_coverage(void)
 }
 
 /* =========================================================================
- * Batch Command Detection Tests
+ * Multi-command refusal (was: Batch Command Detection)
+ *
+ * junos_is_batch_command() and the ';'/'\n' splitter it fed have been
+ * deleted: they were the multi-command gate bypass, not a mitigation.
+ * The same JunOS-shaped inputs are pinned here against the shared
+ * separator policy that now refuses them at both the daemon boundary and
+ * inside junos_execute().
  * ========================================================================= */
 
-static void test_batch_detection(void)
+static void test_multicommand_refused(void)
 {
-    printf("\n=== Batch Command Detection ===\n");
+    printf("\n=== Multi-command strings are refused ===\n");
 
-    TEST("single command — not a batch");
-    assert(junos_is_batch_command("show route") == false);
+    TEST("single command — accepted");
+    assert(virp_command_check_separators("show route", NULL, 0) == 0);
     PASS();
 
-    TEST("semicolon-separated — is a batch");
-    assert(junos_is_batch_command("configure; set interfaces ge-0/0/0 unit 0; commit") == true);
+    TEST("semicolon config sequence — refused");
+    assert(virp_command_check_separators(
+        "configure; set interfaces ge-0/0/0 unit 0; commit", NULL, 0) != 0);
     PASS();
 
-    TEST("newline-separated — is a batch");
-    assert(junos_is_batch_command("configure\nset interfaces ge-0/0/0 unit 0\ncommit") == true);
+    TEST("newline config sequence — refused");
+    assert(virp_command_check_separators(
+        "configure\nset interfaces ge-0/0/0 unit 0\ncommit", NULL, 0) != 0);
     PASS();
 
-    TEST("mixed separators — is a batch");
-    assert(junos_is_batch_command("configure; set foo\ncommit check; commit") == true);
+    TEST("mixed separators — refused");
+    assert(virp_command_check_separators(
+        "configure; set foo\ncommit check; commit", NULL, 0) != 0);
     PASS();
 
-    TEST("trailing semicolon only — not a batch (no second command)");
-    /* "show route;" has a ; but strtok would yield one command — still
-     * detected as batch by is_batch_command, which is fine: the dispatch
-     * will parse out one command and execute it as single. */
-    assert(junos_is_batch_command("show route;") == true);
+    TEST("trailing semicolon — refused (no separator is benign)");
+    assert(virp_command_check_separators("show route;", NULL, 0) != 0);
     PASS();
 
-    TEST("trailing newline only — not a batch");
-    assert(junos_is_batch_command("show route\n") == false);
+    TEST("trailing newline — refused");
+    assert(virp_command_check_separators("show route\n", NULL, 0) != 0);
     PASS();
 
-    TEST("empty string — not a batch");
-    assert(junos_is_batch_command("") == false);
+    TEST("empty string — accepted (nothing to split)");
+    assert(virp_command_check_separators("", NULL, 0) == 0);
     PASS();
 
-    TEST("null — not a batch");
-    assert(junos_is_batch_command(NULL) == false);
-    PASS();
-
-    TEST("configure/set/commit check/commit batch");
-    assert(junos_is_batch_command(
+    TEST("full commit batch — refused");
+    assert(virp_command_check_separators(
         "configure; set interfaces ge-0/0/0 unit 0 family inet address "
         "10.0.0.1/24; set routing-options static route 0.0.0.0/0 next-hop "
-        "10.0.0.254; commit check; commit") == true);
+        "10.0.0.254; commit check; commit", NULL, 0) != 0);
     PASS();
 }
 
 /* =========================================================================
  * Batch BLACK Tier Pre-scan Tests
  *
- * The batch executor pre-scans all commands for BLACK tier before running
- * any. These tests verify the routing table catches BLACK commands that
- * would appear in realistic batch sequences.
+ * These verify the routing table catches BLACK commands that appear in
+ * realistic config sequences. NOTE: the "batch executor pre-scan" these
+ * were originally written against never existed in driver_juniper.c —
+ * the batch path classified only the first token. Each command is now
+ * classified individually via the daemon's batch action; these assert
+ * that per-command classification.
  * ========================================================================= */
 
 static void test_batch_tier_prescan(void)
@@ -481,7 +486,7 @@ int main(void)
     test_command_routing();
     test_driver_registration();
     test_route_table_coverage();
-    test_batch_detection();
+    test_multicommand_refused();
     test_batch_tier_prescan();
 
     printf("\n=======================================\n");

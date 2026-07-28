@@ -50,8 +50,6 @@
 #define JUNOS_READ_BUF_SIZE         32768
 #define JUNOS_MAX_PROMPT_LEN        128
 #define JUNOS_FLUSH_TIMEOUT_MS      200     /* Brief drain for stale output   */
-#define JUNOS_BATCH_MAX_CMDS        32      /* Max commands in a single batch  */
-#define JUNOS_BATCH_CMD_BUF         8192    /* Max total batch command length  */
 
 /* =========================================================================
  * Command Routing Table — JunOS-specific commands → trust tiers
@@ -922,39 +920,29 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
 }
 
 /* =========================================================================
- * Batch Command Detection
+ * Driver: execute
  *
- * JunOS candidate configuration is session-bound — when a session closes,
- * uncommitted config is discarded. Config sequences (configure → set →
- * commit check → commit) MUST execute in the same PTY session.
+ * SINGLE COMMAND ONLY.
  *
- * Batch commands use ';' or '\n' as separators:
- *   "configure; set interfaces ge-0/0/0 ...; commit check; commit"
- * ========================================================================= */
-
-bool junos_is_batch_command(const char *command)
-{
-    if (!command) return false;
-    for (const char *p = command; *p; p++) {
-        if (*p == ';') return true;
-        if (*p == '\n' && *(p + 1) != '\0') return true;
-    }
-    return false;
-}
-
-/* =========================================================================
- * Driver: execute — dispatch to single or batch mode
+ * This driver used to accept multi-command strings separated by ';' or
+ * '\n' and run them sequentially in one PTY session, for JunOS config
+ * sequences (configure -> set -> commit check -> commit) whose candidate
+ * config is session-bound. That splitter WAS the multi-command gate
+ * bypass, not a mitigation for it: the daemon classified the string once,
+ * on its first token, and the driver then executed every sub-command
+ * after the separator ungated. Its documented "pre-scan for BLACK before
+ * running any command" never existed in this file.
  *
- * If the command contains ';' or '\n' separators, all sub-commands run
- * sequentially in the same PTY session, preserving candidate config.
+ * The splitter is deleted rather than left dead so it cannot be rewired,
+ * and the guard below fails closed independently of the daemon's layer-1
+ * boundary check — junos_execute is reachable by any direct caller, not
+ * only through onode_execute_obs_ex.
  *
- * Batch semantics:
- *   - Pre-scan: any BLACK-tier command → entire batch rejected
- *   - Config state (config_error, commit_check_ok) tracked across batch
- *   - If set/delete fails, remaining set/delete are skipped
- *     (rollback, commit check, exit, show commands still execute)
- *   - result->success = false if ANY sub-command failed
- *   - Output: each sub-command formatted as hostname>cmd\noutput
+ * Multi-command submission is the daemon's batch action, where each item
+ * is classified and gated separately. Session-bound config sequences that
+ * genuinely require one PTY need a driver-level transaction primitive
+ * with per-command classification; they must not come back as string
+ * splitting.
  * ========================================================================= */
 
 static virp_error_t junos_execute(virp_conn_t *conn,
@@ -964,155 +952,24 @@ static virp_error_t junos_execute(virp_conn_t *conn,
     if (!conn || !command || !result)
         return VIRP_ERR_NULL_PTR;
 
-    /* Single command — fast path */
-    if (!junos_is_batch_command(command))
-        return junos_execute_single(conn, command, result);
-
-    /* ── Batch mode ── */
-    memset(result, 0, sizeof(*result));
-
-    if (!conn->connected) {
+    char why[160];
+    if (virp_command_check_separators(command, why, sizeof(why)) != 0) {
+        memset(result, 0, sizeof(*result));
         result->success = false;
+        result->exit_code = 1;
         snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Not connected to %s", conn->device.hostname);
+                 "multi-command string refused on %.64s: %.150s",
+                 conn->device.hostname, why);
+        fprintf(stderr, "[JunOS] Multi-command refused on %s: %s\n",
+                conn->device.hostname, why);
+        int w = snprintf(result->output, sizeof(result->output),
+                         "%s> multi-command string refused: %s",
+                         conn->device.hostname, why);
+        result->output_len = (w > 0) ? (size_t)w : 0;
         return VIRP_OK;
     }
 
-    /* Copy command string for tokenization */
-    size_t cmd_len = strlen(command);
-    if (cmd_len >= JUNOS_BATCH_CMD_BUF) {
-        result->success = false;
-        snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Batch too long (%zu bytes, max %d)",
-                 cmd_len, JUNOS_BATCH_CMD_BUF - 1);
-        return VIRP_OK;
-    }
-
-    char cmds_copy[JUNOS_BATCH_CMD_BUF];
-    memcpy(cmds_copy, command, cmd_len + 1);
-
-    /* Split by ';' or '\n', trim whitespace */
-    char *cmd_ptrs[JUNOS_BATCH_MAX_CMDS];
-    int cmd_count = 0;
-
-    char *saveptr;
-    char *tok = strtok_r(cmds_copy, ";\n", &saveptr);
-    while (tok && cmd_count < JUNOS_BATCH_MAX_CMDS) {
-        while (*tok == ' ' || *tok == '\t') tok++;
-        size_t tlen = strlen(tok);
-        while (tlen > 0 && (tok[tlen - 1] == ' ' || tok[tlen - 1] == '\t' ||
-                             tok[tlen - 1] == '\r'))
-            tok[--tlen] = '\0';
-
-        if (tlen > 0)
-            cmd_ptrs[cmd_count++] = tok;
-
-        tok = strtok_r(NULL, ";\n", &saveptr);
-    }
-
-    if (cmd_count == 0) {
-        result->success = false;
-        snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Empty batch on %s", conn->device.hostname);
-        return VIRP_OK;
-    }
-
-    /* Pre-scan for BLACK tier — reject entire batch upfront */
-    for (int i = 0; i < cmd_count; i++) {
-        if (junos_route_command(cmd_ptrs[i]) == VIRP_TIER_BLACK) {
-            result->success = false;
-            result->exit_code = 1;
-            snprintf(result->error_msg, sizeof(result->error_msg),
-                     "BLACK tier: batch rejected — '%s' blocked on %s",
-                     cmd_ptrs[i], conn->device.hostname);
-            int w = snprintf(result->output, sizeof(result->output),
-                             "%s>[batch]\nBLACK tier: command '%s' "
-                             "forbidden — entire batch rejected",
-                             conn->device.hostname, cmd_ptrs[i]);
-            result->output_len = (w > 0) ? (size_t)w : 0;
-            fprintf(stderr, "[JunOS] BLACK tier in batch — "
-                    "rejected '%s' on %s\n",
-                    cmd_ptrs[i], conn->device.hostname);
-            return VIRP_OK;
-        }
-    }
-
-    /* Execute each command sequentially in the same session */
-    struct timespec batch_start, batch_end;
-    clock_gettime(CLOCK_MONOTONIC, &batch_start);
-
-    result->success = true;
-    size_t out_off = 0;
-    bool skip_config = false;
-
-    fprintf(stderr, "[JunOS] Batch: %d commands on %s\n",
-            cmd_count, conn->device.hostname);
-
-    for (int i = 0; i < cmd_count; i++) {
-        bool is_sd = (strncasecmp(cmd_ptrs[i], "set ", 4) == 0 ||
-                      strncasecmp(cmd_ptrs[i], "delete ", 7) == 0);
-
-        /* Skip set/delete after config error — allow rollback, commit check,
-         * exit, and show commands to continue so the session stays clean */
-        if (skip_config && is_sd) {
-            int w = snprintf(result->output + out_off,
-                             sizeof(result->output) - out_off,
-                             "%s%s>%s\nskipped: prior config error",
-                             out_off > 0 ? "\n" : "",
-                             conn->device.hostname, cmd_ptrs[i]);
-            if (w > 0 && out_off + (size_t)w < sizeof(result->output))
-                out_off += (size_t)w;
-            fprintf(stderr, "[JunOS] Batch skip (config error): %s\n",
-                    cmd_ptrs[i]);
-            continue;
-        }
-
-        virp_exec_result_t sub;
-        virp_error_t err = junos_execute_single(conn, cmd_ptrs[i], &sub);
-        if (err != VIRP_OK) {
-            result->success = false;
-            snprintf(result->error_msg, sizeof(result->error_msg),
-                     "Driver error on command %d/%d: %s",
-                     i + 1, cmd_count, cmd_ptrs[i]);
-            break;
-        }
-
-        /* Append sub-command output */
-        int w = snprintf(result->output + out_off,
-                         sizeof(result->output) - out_off,
-                         "%s%s",
-                         out_off > 0 ? "\n" : "",
-                         sub.output);
-        if (w > 0 && out_off + (size_t)w < sizeof(result->output))
-            out_off += (size_t)w;
-
-        if (!sub.success) {
-            result->success = false;
-            if (result->error_msg[0] == '\0')
-                snprintf(result->error_msg, sizeof(result->error_msg),
-                         "%s", sub.error_msg);
-
-            if (is_sd && conn->current_mode == JUNOS_MODE_CONFIGURE) {
-                skip_config = true;
-                fprintf(stderr, "[JunOS] Batch config error at cmd %d, "
-                        "skipping remaining set/delete\n", i + 1);
-            }
-        }
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &batch_end);
-    result->exec_time_ms = (uint64_t)(
-        (batch_end.tv_sec - batch_start.tv_sec) * 1000 +
-        (batch_end.tv_nsec - batch_start.tv_nsec) / 1000000);
-    result->output_len = out_off;
-    result->exit_code = result->success ? 0 : 1;
-
-    fprintf(stderr, "[JunOS] Batch done on %s: %d cmds, %s, %lums\n",
-            conn->device.hostname, cmd_count,
-            result->success ? "OK" : "FAILED",
-            (unsigned long)result->exec_time_ms);
-
-    return VIRP_OK;
+    return junos_execute_single(conn, command, result);
 }
 
 /* =========================================================================

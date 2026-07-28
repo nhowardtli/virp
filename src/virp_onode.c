@@ -896,10 +896,16 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * yields its own signed rejection while siblings are still examined
      * individually — the per-item contract from af92763.
      *
-     * The refusal is a signed typed ERROR observation carrying
-     * UNCLASSIFIED, which is honest: the command was never classified.
-     * UNCLASSIFIED is also unconditionally blocked by gate_tier_blocks,
-     * so this can never be read as an allow.
+     * The refusal is a HARD RETURN, not a gate decision. It is NOT
+     * mediated by gate_tier_blocks and never reaches
+     * gate_effective_mode, so a SHADOW-mode driver cannot log-and-
+     * proceed past it — which matters because linux and wazuh run with
+     * SHADOW overrides in production. Do not convert this into a
+     * gate-tier verdict: SHADOW would then execute the command.
+     * (test_onode.c pins this for both SHADOW forms.)
+     *
+     * The observation carries UNCLASSIFIED purely for audit honesty —
+     * the command was never classified. That tier is not what blocks it.
      */
     {
         char why[160];

@@ -55,13 +55,14 @@ virp_trust_tier_t junos_route_command(const char *command);
 junos_mode_t junos_parse_mode(const char *prompt);
 
 /*
- * Detect if a command string is a batch (contains ';' or '\n' separators).
- * Batch commands are executed sequentially in a single PTY session,
- * preserving JunOS candidate configuration between commands.
- *
- * Example: "configure; set interfaces ge-0/0/0 ...; commit check; commit"
+ * NOTE: junos_is_batch_command() and the ';'/'\n' batch splitter it fed
+ * were REMOVED. They were the multi-command gate bypass — the daemon
+ * classified such a string once, on its first token, and the driver then
+ * executed everything after the separator ungated. junos_execute() now
+ * refuses separator-carrying commands outright (see driver_juniper.c).
+ * Multi-command submission is the daemon's batch action, which classifies
+ * and gates each item separately. Do not reintroduce string splitting.
  */
-bool junos_is_batch_command(const char *command);
 
 extern const size_t JUNOS_ROUTE_TABLE_SIZE;
 extern const junos_command_route_t JUNOS_ROUTE_TABLE[];
