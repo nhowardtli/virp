@@ -224,6 +224,195 @@ TEST(test_gate_enforce_blocks_unclassified)
     ASSERT_TRUE(strstr((const char *)data, "tier gate blocked") != NULL);
 }
 
+/* =========================================================================
+ * Multi-command gate bypass (REPRODUCTION — expected to FAIL pre-fix)
+ *
+ * The request parser applies no character validation to "command", so a
+ * JSON \n escape decodes to a real embedded newline. Every classifier
+ * (mock, cisco, asa, panos, juniper) prefix-matches from index 0 only,
+ * so "show version\nreload" classifies on its FIRST line and returns
+ * GREEN. The gate then allows it and the driver sends the WHOLE string
+ * to the device, where the newline is a command separator — so `reload`
+ * reaches the wire having never been classified or gated.
+ *
+ * Exercised through the socket (not the in-process onode_execute
+ * harness) deliberately: the newline enters at the JSON parse stage,
+ * which only the socket path exercises.
+ *
+ * Asserted behavior: the request must be BLOCKED. Pre-fix this fails
+ * because the command is allowed and executed.
+ * ========================================================================= */
+
+/* The JSON "\\n" below is a two-character escape in the JSON text that
+ * cJSON decodes into one real newline byte in req.command. */
+#define MULTICMD_JSON \
+    "{\"action\": \"execute\", \"device\": \"R6\", " \
+    "\"command\": \"show version\\nreload\"}"
+
+TEST(test_multicommand_newline_is_blocked)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request(MULTICMD_JSON, resp, sizeof(resp));
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+
+    virp_header_t hdr;
+    virp_error_t err = virp_validate_message(resp, (size_t)n,
+                                             &g_state.okey, &hdr);
+    ASSERT_OK(err);
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    err = virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                                 (size_t)n - VIRP_HEADER_SIZE,
+                                 &obs, &data, &data_len);
+    ASSERT_OK(err);
+
+    /* Must be a signed refusal, NOT executed device output. */
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+
+    /* And the second command must never have reached the driver: the
+     * mock echoes "<host>#<command>" on execute, so an echo containing
+     * "reload" proves it went to the wire. */
+    ASSERT_TRUE(strstr((const char *)data, "R6#show version") == NULL);
+}
+
+/*
+ * Same bypass via the BATCH ingress. parse_batch_commands() is a second,
+ * independent parse path — batch items never pass through
+ * parse_request(), so a boundary check installed there would not cover
+ * this case. Both paths do converge on onode_execute_obs_ex().
+ *
+ * Batch response framing: [4-byte count][4-byte len][obs]...
+ */
+TEST(test_multicommand_newline_is_blocked_batch)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request(
+        "{\"action\": \"batch_execute\", \"commands\": ["
+        "{\"device\": \"R6\", \"command\": \"show version\\nreload\"}]}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n > 8);
+
+    uint32_t count, item_len;
+    memcpy(&count, resp, 4);
+    count = ntohl(count);
+    ASSERT_EQ((int)count, 1);
+    memcpy(&item_len, resp + 4, 4);
+    item_len = ntohl(item_len);
+    ASSERT_TRUE(item_len > VIRP_HEADER_SIZE);
+    ASSERT_TRUE(8 + (size_t)item_len <= (size_t)n);
+
+    const uint8_t *item = resp + 8;
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(item, item_len, &g_state.okey, &hdr));
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(item + VIRP_HEADER_SIZE,
+                                     (size_t)item_len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr((const char *)data, "R6#show version") == NULL);
+}
+
+/*
+ * Layer 1 unit coverage for the shared separator policy itself. Each
+ * rejected class is pinned here so a future edit to the policy has to
+ * face them individually.
+ */
+TEST(test_separator_policy_accepts_single_commands)
+{
+    ASSERT_EQ(virp_command_check_separators("show version", NULL, 0), 0);
+    ASSERT_EQ(virp_command_check_separators(
+                  "show interfaces GigabitEthernet0/0", NULL, 0), 0);
+    ASSERT_EQ(virp_command_check_separators("", NULL, 0), 0);
+    /* '$' alone is not an expansion and must stay legal (IOS regex). */
+    ASSERT_EQ(virp_command_check_separators("show ip route 10$", NULL, 0), 0);
+}
+
+TEST(test_separator_policy_rejects_every_class)
+{
+    ASSERT_EQ(virp_command_check_separators("show version\nreload", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show version\rreload", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show version\treload", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show version;reload", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show version|reload", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show version&reload", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show version&&reload", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show `reload`", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show $(reload)", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show ${x}", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show \x7fversion", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators(NULL, NULL, 0), -1);
+}
+
+/* Control bytes must be escaped in the reason text — it is copied
+ * verbatim into logs and into the signed error observation. */
+TEST(test_separator_policy_escapes_control_bytes_in_reason)
+{
+    char why[160];
+    ASSERT_EQ(virp_command_check_separators("show version\nreload",
+                                            why, sizeof(why)), -1);
+    ASSERT_TRUE(strstr(why, "\\x0a") != NULL);   /* escaped, not raw */
+    ASSERT_TRUE(strchr(why, '\n') == NULL);      /* no raw newline */
+    ASSERT_TRUE(strstr(why, "offset 12") != NULL);
+
+    ASSERT_EQ(virp_command_check_separators("show;reload", why, sizeof(why)), -1);
+    ASSERT_TRUE(strstr(why, "';'") != NULL);
+}
+
+/*
+ * Per-item batch contract (af92763): a rejected item must not kill the
+ * batch, and a good sibling must still be examined and executed on its
+ * own merits.
+ */
+TEST(test_multicommand_batch_rejects_per_item_not_whole_batch)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request(
+        "{\"action\": \"batch_execute\", \"commands\": ["
+        "{\"device\": \"R6\", \"command\": \"show version\\nreload\"},"
+        "{\"device\": \"R6\", \"command\": \"show ip route\"}]}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n > 8);
+
+    uint32_t count;
+    memcpy(&count, resp, 4);
+    ASSERT_EQ((int)ntohl(count), 2);
+
+    /* Walk both items; each is [4-byte len][observation]. */
+    size_t off = 4;
+    int obs_types[2] = { -1, -1 };
+    for (int i = 0; i < 2; i++) {
+        uint32_t item_len;
+        ASSERT_TRUE(off + 4 <= (size_t)n);
+        memcpy(&item_len, resp + off, 4);
+        item_len = ntohl(item_len);
+        off += 4;
+        ASSERT_TRUE(off + item_len <= (size_t)n);
+        ASSERT_TRUE(item_len > VIRP_HEADER_SIZE);
+
+        virp_header_t hdr;
+        ASSERT_OK(virp_validate_message(resp + off, item_len,
+                                        &g_state.okey, &hdr));
+        virp_observation_t obs;
+        const uint8_t *data;
+        uint16_t data_len;
+        ASSERT_OK(virp_parse_observation(resp + off + VIRP_HEADER_SIZE,
+                                         (size_t)item_len - VIRP_HEADER_SIZE,
+                                         &obs, &data, &data_len));
+        obs_types[i] = obs.obs_type;
+        off += item_len;
+    }
+
+    /* Item 0 rejected, item 1 executed normally. */
+    ASSERT_EQ(obs_types[0], VIRP_OBS_ERROR);
+    ASSERT_EQ(obs_types[1], VIRP_OBS_DEVICE_OUTPUT);
+}
+
 /*
  * v2 observations are session-bound: an execute with obs_version 2 and
  * no ACTIVE session must fail with SESSION_INVALID — never silently
@@ -2083,6 +2272,14 @@ int main(void)
     printf("\n[O-Node Pipeline Tests]\n");
     RUN_TEST(test_execute_show_ip_route);
     RUN_TEST(test_gate_enforce_blocks_unclassified);
+
+    printf("\n[Multi-Command Gate Bypass (layer 1)]\n");
+    RUN_TEST(test_separator_policy_accepts_single_commands);
+    RUN_TEST(test_separator_policy_rejects_every_class);
+    RUN_TEST(test_separator_policy_escapes_control_bytes_in_reason);
+    RUN_TEST(test_multicommand_newline_is_blocked);
+    RUN_TEST(test_multicommand_newline_is_blocked_batch);
+    RUN_TEST(test_multicommand_batch_rejects_per_item_not_whole_batch);
     RUN_TEST(test_execute_v2_without_session_fails);
     RUN_TEST(test_execute_v2_session_bound_roundtrip);
     RUN_TEST(test_execute_show_bgp_summary);

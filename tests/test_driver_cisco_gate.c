@@ -163,6 +163,114 @@ static void test_prefix_safety(void)
     PASS();
 }
 
+/*
+ * Multi-command bypass reproduction (expected to FAIL pre-fix).
+ *
+ * cisco_gate_tier() prefix-matches from index 0 and its leading-
+ * whitespace skip covers only ' ' and '\t' — not '\n'. So a string whose
+ * FIRST line is GREEN classifies GREEN no matter what follows the
+ * newline, while cisco_execute() sends the whole string to the device
+ * where '\n' separates commands. Anything past the first newline reaches
+ * the wire unclassified.
+ */
+static void test_multicommand_bypass(void)
+{
+    printf("\n=== Multi-command (embedded newline) must not classify GREEN ===\n");
+
+    TEST("show version\\nreload -> not GREEN");
+    assert(cisco_gate_tier("show version\nreload") != VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("show version\\nconfigure terminal -> not GREEN");
+    assert(cisco_gate_tier("show version\nconfigure terminal") != VIRP_TIER_GREEN);
+    PASS();
+
+    /* Semicolon and CR are the same class of separator. */
+    TEST("show clock\\r\\nreload -> not GREEN");
+    assert(cisco_gate_tier("show clock\r\nreload") != VIRP_TIER_GREEN);
+    PASS();
+
+    /* The BLACK list is anchored at index 0 too, so an embedded
+     * destructive command is invisible to it. */
+    TEST("show version\\nerase startup-config -> not GREEN");
+    assert(cisco_gate_tier("show version\nerase startup-config") != VIRP_TIER_GREEN);
+    PASS();
+}
+
+/*
+ * Layer 2a — every separator class fails closed in the classifier
+ * itself, independently of the daemon's layer-1 boundary rejection.
+ */
+static void test_separator_fails_closed(void)
+{
+    printf("\n=== Layer 2a — separators fail closed to RED ===\n");
+
+    TEST("semicolon: show version;reload -> RED");
+    assert(cisco_gate_tier("show version;reload") == VIRP_TIER_RED); PASS();
+
+    TEST("pipe: show version|reload -> RED");
+    assert(cisco_gate_tier("show version|reload") == VIRP_TIER_RED); PASS();
+
+    TEST("ampersand: show version&reload -> RED");
+    assert(cisco_gate_tier("show version&reload") == VIRP_TIER_RED); PASS();
+
+    TEST("backtick: show version`reload` -> RED");
+    assert(cisco_gate_tier("show version`reload`") == VIRP_TIER_RED); PASS();
+
+    TEST("command subst: show version$(reload) -> RED");
+    assert(cisco_gate_tier("show version$(reload)") == VIRP_TIER_RED); PASS();
+
+    TEST("brace expansion: show version${x} -> RED");
+    assert(cisco_gate_tier("show version${x}") == VIRP_TIER_RED); PASS();
+
+    TEST("embedded tab: show version\\treload -> RED");
+    assert(cisco_gate_tier("show version\treload") == VIRP_TIER_RED); PASS();
+
+    TEST("trailing newline: show version\\n -> RED");
+    assert(cisco_gate_tier("show version\n") == VIRP_TIER_RED); PASS();
+}
+
+/*
+ * Layer 2b — a matched prefix must end on a token boundary, so a listed
+ * entry can never stand in for a longer word. This is a distinct bug
+ * class from the separator check: no separator is involved.
+ */
+static void test_token_boundary(void)
+{
+    printf("\n=== Layer 2b — matches must end on a token boundary ===\n");
+
+    /* "show boot" is GREEN; a longer word starting with it must not
+     * inherit that tier. */
+    TEST("show bootleg -> not GREEN (show boot must not cover it)");
+    assert(cisco_gate_tier("show bootleg") != VIRP_TIER_GREEN); PASS();
+
+    TEST("show versionitis -> not GREEN");
+    assert(cisco_gate_tier("show versionitis") != VIRP_TIER_GREEN); PASS();
+
+    TEST("show clockwork -> not GREEN");
+    assert(cisco_gate_tier("show clockwork") != VIRP_TIER_GREEN); PASS();
+
+    TEST("pingu -> not YELLOW (ping must not cover it)");
+    assert(cisco_gate_tier("pingu") != VIRP_TIER_YELLOW); PASS();
+
+    /* Boundary rule must not break legitimate matches: exact match,
+     * match followed by arguments, and self-terminated entries. */
+    TEST("exact match still classifies: show version -> GREEN");
+    assert(cisco_gate_tier("show version") == VIRP_TIER_GREEN); PASS();
+
+    TEST("args still classify: show interfaces Gi0/0 -> GREEN");
+    assert(cisco_gate_tier("show interfaces GigabitEthernet0/0")
+           == VIRP_TIER_GREEN); PASS();
+
+    TEST("self-terminated entry: no shutdown -> RED (via \"no \")");
+    assert(cisco_gate_tier("no shutdown") == VIRP_TIER_RED); PASS();
+
+    /* Longest-valid-match still wins once short matches are boundary-
+     * rejected: "show bootvar" must beat "show boot". */
+    TEST("longest valid match wins: show bootvar -> GREEN");
+    assert(cisco_gate_tier("show bootvar") == VIRP_TIER_GREEN); PASS();
+}
+
 int main(void)
 {
     printf("VIRP Cisco IOS/IOS-XE Gate Classifier — Unit Tests\n");
@@ -174,6 +282,9 @@ int main(void)
     test_fail_closed();
     test_promotions();
     test_prefix_safety();
+    test_multicommand_bypass();
+    test_separator_fails_closed();
+    test_token_boundary();
     printf("\n==================================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

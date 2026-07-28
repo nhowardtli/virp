@@ -877,6 +877,48 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     if (obs_version != 1 && obs_version != 2)
         return VIRP_ERR_VERSION_MISMATCH;
 
+    /* ── Layer 1: single-command boundary ─────────────────────────────
+     * Every classifier prefix-matches from index 0 while the drivers
+     * send the WHOLE string to the device, so "show version\nreload"
+     * classified GREEN on its first line and the reload reached the wire
+     * ungated. Reject separator-carrying commands here, at the TOP:
+     *
+     *  - This is the one point BOTH request ingresses pass through.
+     *    parse_batch_commands() is a second, independent parse that
+     *    never touches parse_request(), so a check placed at either
+     *    parser would miss the other; both converge here.
+     *  - It precedes the v2 canonicalization probe below, so the signed
+     *    command hash is never computed over a string we will refuse.
+     *  - It precedes gate_classify(), so no classifier in any driver can
+     *    tier a multi-command string in the first place.
+     *
+     * Batch items each arrive here on their own thread, so one bad item
+     * yields its own signed rejection while siblings are still examined
+     * individually — the per-item contract from af92763.
+     *
+     * The refusal is a signed typed ERROR observation carrying
+     * UNCLASSIFIED, which is honest: the command was never classified.
+     * UNCLASSIFIED is also unconditionally blocked by gate_tier_blocks,
+     * so this can never be read as an allow.
+     */
+    {
+        char why[160];
+        if (virp_command_check_separators(command, why, sizeof(why)) != 0) {
+            char err_msg[256];
+            snprintf(err_msg, sizeof(err_msg),
+                     "ERROR: multi-command / illegal separator rejected "
+                     "for '%s': %s", device_name, why);
+            log_error_obs(device_name, VIRP_TIER_UNCLASSIFIED, err_msg);
+            return virp_build_observation_tiered(
+                        out_buf, out_buf_len, out_len,
+                        state->node_id, onode_next_seq(state),
+                        VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                        VIRP_TIER_UNCLASSIFIED,
+                        (const uint8_t *)err_msg, (uint16_t)strlen(err_msg),
+                        &state->okey);
+        }
+    }
+
     /*
      * v2 requires an ACTIVE session BEFORE any device I/O. Checked
      * again at signing time (the session can idle out mid-command),

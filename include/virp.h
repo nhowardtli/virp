@@ -430,6 +430,35 @@ typedef enum {
 } virp_error_t;
 
 /* =========================================================================
+ * Command separator policy
+ *
+ * Single source of truth for "is this ONE command?", shared by the
+ * daemon's ingress boundary check and the per-driver gate classifiers so
+ * the two can never disagree.
+ *
+ * A command carrying an embedded separator is not classifiable: every
+ * classifier prefix-matches from index 0, so only the FIRST command in
+ * such a string is ever tiered while the driver hands the WHOLE string
+ * to the device, where the separator splits it. Anything past the first
+ * separator would reach the wire ungated.
+ *
+ * Rejected: all control bytes (< 0x20, including newline, carriage
+ * return and tab) and DEL; the CLI/shell separators ';' '|' '&' '`';
+ * and the shell expansions "$(" and "${".
+ *
+ * Returns 0 when `cmd` is a single separator-free command, else -1. When
+ * `why` is non-NULL it receives a human-readable reason naming the
+ * offending byte. Control bytes are rendered as \xNN so an attacker-
+ * controlled command can never smuggle raw control characters into logs
+ * or into the signed error observation built from this text.
+ *
+ * REJECT, never strip: silently rewriting "show version\nreload" into
+ * "show versionreload" would be its own hazard.
+ * ========================================================================= */
+
+int virp_command_check_separators(const char *cmd, char *why, size_t why_len);
+
+/* =========================================================================
  * Human-readable helpers
  * ========================================================================= */
 

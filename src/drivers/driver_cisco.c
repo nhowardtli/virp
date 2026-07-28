@@ -632,15 +632,42 @@ static const size_t CISCO_GATE_TABLE_SIZE =
 virp_trust_tier_t cisco_gate_tier(const char *command)
 {
     if (!command) return VIRP_TIER_RED;              /* fail closed */
+
+    /*
+     * Layer 2a — a separator-carrying string is not one command, so this
+     * table cannot vouch for it. Fail closed here as well as at the
+     * daemon boundary: the classifier is called directly by tests and
+     * (via route_command) by any future caller, and must not hand back a
+     * benign tier for "show version;reload" just because the daemon
+     * would have refused it first.
+     */
+    if (virp_command_check_separators(command, NULL, 0) != 0)
+        return VIRP_TIER_RED;
+
     while (*command == ' ' || *command == '\t') command++;
 
     const cisco_route_t *best = NULL;
     size_t best_len = 0;
     for (size_t i = 0; i < CISCO_GATE_TABLE_SIZE; i++) {
         size_t plen = strlen(CISCO_GATE_TABLE[i].prefix);
-        if (strncasecmp(command, CISCO_GATE_TABLE[i].prefix, plen) == 0) {
-            if (plen > best_len) { best = &CISCO_GATE_TABLE[i]; best_len = plen; }
-        }
+        if (strncasecmp(command, CISCO_GATE_TABLE[i].prefix, plen) != 0)
+            continue;
+
+        /*
+         * Layer 2b — the match must END on a token boundary, so a listed
+         * prefix can never stand in for a longer word: "show boot"
+         * (GREEN) must not classify "show bootleg", and "no " must not
+         * be reached by "nonsense". Entries that already end in a space
+         * carry their own boundary.
+         */
+        char after = command[plen];
+        bool self_terminated =
+            (plen > 0 && CISCO_GATE_TABLE[i].prefix[plen - 1] == ' ');
+        if (!self_terminated && after != '\0' &&
+            after != ' ' && after != '\t')
+            continue;
+
+        if (plen > best_len) { best = &CISCO_GATE_TABLE[i]; best_len = plen; }
     }
     /* Fail-closed: anything not explicitly GREEN/YELLOW/RED-listed is RED. */
     return best ? best->tier : VIRP_TIER_RED;

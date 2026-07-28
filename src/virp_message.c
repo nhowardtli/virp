@@ -12,6 +12,7 @@
 #include "virp_context.h"
 #include <string.h>
 #include <ctype.h>
+#include <stdio.h>      /* snprintf — separator-policy reason strings */
 #include <time.h>
 #include <arpa/inet.h>  /* htons, htonl, ntohs, ntohl */
 
@@ -940,6 +941,44 @@ int virp_canonicalize_command(const char *cmd, char *out, size_t out_len)
 
     out[j] = '\0';
     return (int)j;
+}
+
+/* =========================================================================
+ * Command Separator Policy (see virp.h for rationale)
+ * ========================================================================= */
+
+int virp_command_check_separators(const char *cmd, char *why, size_t why_len)
+{
+    if (why && why_len) why[0] = '\0';
+    if (!cmd) return -1;
+
+    const unsigned char *base = (const unsigned char *)cmd;
+    for (const unsigned char *p = base; *p; p++) {
+        char rendered[8];
+        const char *what = NULL;
+
+        if (*p < 0x20 || *p == 0x7F) {
+            /* Control byte — render escaped, never raw. */
+            snprintf(rendered, sizeof(rendered), "\\x%02x", (unsigned)*p);
+            what = rendered;
+        } else if (*p == ';' || *p == '|' || *p == '&' || *p == '`') {
+            rendered[0] = (char)*p;
+            rendered[1] = '\0';
+            what = rendered;
+        } else if (*p == '$' && (*(p + 1) == '(' || *(p + 1) == '{')) {
+            snprintf(rendered, sizeof(rendered), "$%c", (char)*(p + 1));
+            what = rendered;
+        }
+
+        if (what) {
+            if (why && why_len)
+                snprintf(why, why_len,
+                         "illegal separator '%s' at offset %zu",
+                         what, (size_t)(p - base));
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* =========================================================================
