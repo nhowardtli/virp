@@ -318,23 +318,45 @@ static void test_manifest_too_large(void)
     cleanup();
     create_test_key();
 
-    char json[16384];
+    /*
+     * Buffer is heap-allocated and sized from the cap, and every write is
+     * checked for truncation.
+     *
+     * The previous version used a fixed char[16384] and did `off += w`
+     * with w = snprintf(...). snprintf returns the length it WOULD have
+     * written, so once the buffer filled, off ran past sizeof(json):
+     * `json + off` pointed outside the array and `sizeof(json) - off`
+     * underflowed to a huge size_t, so the next write went out of
+     * bounds. That was latent while the cap was 32 (33 assertions fit in
+     * 16 KB) and segfaulted the moment the cap rose to 1024.
+     */
     const char *ph = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    int off = snprintf(json, sizeof(json),
+    size_t cap = 256u + (size_t)(VALIDATOR_MAX_ASSERTIONS + 1) * 128u;
+    char *json = malloc(cap);
+    ASSERT(json != NULL, "alloc");
+
+    size_t off = 0;
+    int w = snprintf(json, cap,
         "{\"session_id\":\"s7\",\"prose_hash\":\"%s\","
         "\"tool_call_refs\":[],\"assertions\":[", ph);
+    ASSERT(w > 0 && (size_t)w < cap, "header fits");
+    off = (size_t)w;
 
     for (int i = 0; i < VALIDATOR_MAX_ASSERTIONS + 1; i++) {
-        int w = snprintf(json + off, sizeof(json) - (size_t)off,
+        w = snprintf(json + off, cap - off,
             "%s{\"device\":\"r%d\",\"claim_type\":\"state_read\",\"evidence_ref\":null}",
             (i == 0) ? "" : ",", i);
-        off += w;
+        ASSERT(w > 0 && (size_t)w < cap - off, "assertion fits");
+        off += (size_t)w;
     }
-    off += snprintf(json + off, sizeof(json) - (size_t)off, "]}");
+    w = snprintf(json + off, cap - off, "]}");
+    ASSERT(w > 0 && (size_t)w < cap - off, "terminator fits");
+    off += (size_t)w;
 
     validator_manifest_t m;
     validator_violation_code_t reason;
-    virp_error_t err = validator_parse_manifest(json, (size_t)off, &m, &reason);
+    virp_error_t err = validator_parse_manifest(json, off, &m, &reason);
+    free(json);
     ASSERT(err != VIRP_OK, "parser should reject");
     ASSERT(reason == VALIDATOR_VIOLATION_MANIFEST_TOO_LARGE, "reason code");
     PASS();
