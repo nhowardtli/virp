@@ -6,6 +6,8 @@ chain.db*
 .env
 *.key
 build/
+# driver-enabled test build tree (make test-drivers)
+build-drivers/
 __pycache__/
 api/__pycache__/
 tests/__pycache__/
