@@ -1528,13 +1528,20 @@ static int recv_exact(int fd, void *buf, size_t len)
 /*
  * Send a framed response: [4-byte big-endian length][payload].
  * Length covers the payload only, not the 4-byte prefix itself.
+ *
+ * MSG_NOSIGNAL on every daemon send: a client that closes before
+ * reading its response would otherwise raise SIGPIPE, whose default
+ * action kills the whole daemon. Both mains also SIG_IGN SIGPIPE; the
+ * per-send flag keeps the guarantee even if a future entry path forgets
+ * (send returns -1/EPIPE instead, which we deliberately ignore — the
+ * peer is gone and the caller closes the fd either way).
  */
 static void send_framed(int fd, const void *buf, size_t len)
 {
     uint32_t net_len = htonl((uint32_t)len);
-    send(fd, &net_len, 4, 0);
+    send(fd, &net_len, 4, MSG_NOSIGNAL);
     if (len > 0)
-        send(fd, buf, len, 0);
+        send(fd, buf, len, MSG_NOSIGNAL);
 }
 
 /*
@@ -1599,7 +1606,10 @@ static void handle_client(onode_state_t *state, int client_fd)
         /* v1 client: first byte is part of JSON (e.g. '{' = 0x7B).
          * Send unframed error so the v1 client can read it. */
         uint32_t err_code = htonl((uint32_t)VIRP_ERR_PROTOCOL_VERSION);
-        send(client_fd, &err_code, 4, 0);
+        /* MSG_NOSIGNAL: this send fires before the client is trusted —
+         * a peer that connects and instantly closes must not SIGPIPE
+         * the daemon. */
+        send(client_fd, &err_code, 4, MSG_NOSIGNAL);
         close(client_fd);
         return;
     }

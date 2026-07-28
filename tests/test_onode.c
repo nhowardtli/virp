@@ -1197,6 +1197,136 @@ TEST(test_concurrent_clients_no_head_of_line)
 }
 
 /* =========================================================================
+ * SIGPIPE regression: peer closes before reading its response
+ *
+ * Pre-fix, every daemon send used flags=0 and neither entry path
+ * ignored SIGPIPE, so an allowlisted client that disconnected before
+ * reading its response killed the whole daemon (default SIGPIPE action
+ * terminates the process). These tests run the server in-process: a
+ * regression re-raises SIGPIPE and takes down this test binary — we
+ * deliberately do NOT ignore SIGPIPE here, so the fix under test is the
+ * daemon's own MSG_NOSIGNAL sends.
+ * ========================================================================= */
+
+/* One v2 framed request in a single send(), then close WITHOUT reading
+ * the response. Retries connect briefly (accept-queue pressure under the
+ * storm test). Returns 0 once the request left the socket. */
+static int fire_and_close_framed(const char *json)
+{
+    int fd = -1;
+    for (int tries = 0; tries < 5 && fd < 0; tries++) {
+        fd = client_connect();
+        if (fd < 0) usleep(1000);
+    }
+    if (fd < 0) return -1;
+
+    uint8_t req[512];
+    size_t json_len = strlen(json);
+    if (5 + json_len > sizeof(req)) { close(fd); return -1; }
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+    memcpy(req, &frame_len, 4);
+    req[4] = VIRP_FRAME_VERSION;
+    memcpy(req + 5, json, json_len);
+    ssize_t n = send(fd, req, 5 + json_len, 0);
+    close(fd);   /* gone before the daemon can respond */
+    return (n == (ssize_t)(5 + json_len)) ? 0 : -1;
+}
+
+/* v1-style client: raw unframed JSON, closed immediately. The daemon's
+ * unframed reject send fires BEFORE the client is trusted — this send
+ * site must also be SIGPIPE-safe. */
+static int fire_and_close_v1(void)
+{
+    int fd = -1;
+    for (int tries = 0; tries < 5 && fd < 0; tries++) {
+        fd = client_connect();
+        if (fd < 0) usleep(1000);
+    }
+    if (fd < 0) return -1;
+
+    const char *json = "{\"action\":\"heartbeat\"}";
+    ssize_t n = send(fd, json, strlen(json), 0);
+    close(fd);   /* daemon's v1-reject hits a dead peer */
+    return (n == (ssize_t)strlen(json)) ? 0 : -1;
+}
+
+/* Daemon must still answer a well-behaved client. */
+static int daemon_still_serves(void)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request("{\"action\": \"heartbeat\"}",
+                               resp, sizeof(resp));
+    if (n <= (ssize_t)VIRP_HEADER_SIZE) return 0;
+    virp_header_t hdr;
+    return virp_validate_message(resp, (size_t)n, &g_state.okey,
+                                 &hdr) == VIRP_OK;
+}
+
+TEST(test_close_before_read_does_not_kill_daemon)
+{
+    ASSERT_EQ(fire_and_close_framed(
+        "{\"action\":\"execute\",\"device\":\"R6\","
+        "\"command\":\"show version\"}"), 0);
+    usleep(150000);   /* let the daemon execute and hit the dead socket */
+    ASSERT_TRUE(daemon_still_serves());
+}
+
+TEST(test_v1_reject_close_before_read_does_not_kill_daemon)
+{
+    ASSERT_EQ(fire_and_close_v1(), 0);
+    usleep(100000);   /* let the unframed reject hit the dead socket */
+    ASSERT_TRUE(daemon_still_serves());
+}
+
+/* 800-call storm: same 16×50 shape as the onode concurrency harness,
+ * but over real sockets, every client closing before reading. Every
+ * third call is a v1-reject client so the pre-trust send site stays
+ * covered under contention. */
+#define SP_WORKERS 16
+#define SP_ITERS   50
+
+typedef struct { int tid; int fired; } sp_arg_t;
+
+static void *sigpipe_storm_thread(void *p)
+{
+    sp_arg_t *arg = (sp_arg_t *)p;
+    for (int i = 0; i < SP_ITERS; i++) {
+        int rc = ((i + arg->tid) % 3 == 0)
+            ? fire_and_close_v1()
+            : fire_and_close_framed(
+                  "{\"action\":\"execute\",\"device\":\"R6\","
+                  "\"command\":\"show version\"}");
+        if (rc == 0) arg->fired++;
+    }
+    return NULL;
+}
+
+TEST(test_close_before_read_800_call_storm)
+{
+    pthread_t th[SP_WORKERS];
+    sp_arg_t  args[SP_WORKERS];
+    memset(args, 0, sizeof(args));
+
+    for (int i = 0; i < SP_WORKERS; i++) {
+        args[i].tid = i;
+        ASSERT_EQ(pthread_create(&th[i], NULL, sigpipe_storm_thread,
+                                 &args[i]), 0);
+    }
+    int fired = 0;
+    for (int i = 0; i < SP_WORKERS; i++) {
+        pthread_join(th[i], NULL);
+        fired += args[i].fired;
+    }
+
+    /* All 800 hostile disconnects must have gone out... */
+    ASSERT_EQ(fired, SP_WORKERS * SP_ITERS);
+
+    /* ...and the daemon must have survived every one of them. */
+    usleep(300000);   /* drain in-flight workers hitting dead sockets */
+    ASSERT_TRUE(daemon_still_serves());
+}
+
+/* =========================================================================
  * Signed error observation tests
  * ========================================================================= */
 
@@ -1980,6 +2110,11 @@ int main(void)
 
     printf("\n[Worker Pool / Concurrency Tests]\n");
     RUN_TEST(test_concurrent_clients_no_head_of_line);
+
+    printf("\n[SIGPIPE Close-Before-Read Tests]\n");
+    RUN_TEST(test_close_before_read_does_not_kill_daemon);
+    RUN_TEST(test_v1_reject_close_before_read_does_not_kill_daemon);
+    RUN_TEST(test_close_before_read_800_call_storm);
 
     printf("\n[Signed Error Observation Tests]\n");
     RUN_TEST(test_driver_error_returns_signed_observation);

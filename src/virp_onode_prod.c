@@ -703,6 +703,10 @@ int main(int argc, char **argv)
     /* Install signal handlers */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    /* A client closing before reading its response must not kill the
+     * daemon: default SIGPIPE terminates the process. Sends also pass
+     * MSG_NOSIGNAL (belt and suspenders). */
+    signal(SIGPIPE, SIG_IGN);
 
     /* Start event loop (blocks) */
     err = onode_start(&g_state);
