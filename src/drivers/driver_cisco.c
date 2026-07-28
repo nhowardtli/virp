@@ -629,6 +629,26 @@ static const cisco_route_t CISCO_GATE_TABLE[] = {
 static const size_t CISCO_GATE_TABLE_SIZE =
     sizeof(CISCO_GATE_TABLE) / sizeof(CISCO_GATE_TABLE[0]);
 
+/*
+ * Test-support accessors — let a test iterate the gate table without
+ * exposing its struct layout (virp_driver_cisco.h cannot be included
+ * standalone, so the table itself stays static). Used by the
+ * table-driven reachability suite: every entry must classify as the
+ * tier it declares, or it is shadowed by a broader/earlier entry and
+ * would never fire in production.
+ */
+size_t cisco_gate_table_count(void)
+{
+    return CISCO_GATE_TABLE_SIZE;
+}
+
+const char *cisco_gate_table_entry(size_t i, virp_trust_tier_t *tier)
+{
+    if (i >= CISCO_GATE_TABLE_SIZE) return NULL;
+    if (tier) *tier = CISCO_GATE_TABLE[i].tier;
+    return CISCO_GATE_TABLE[i].prefix;
+}
+
 virp_trust_tier_t cisco_gate_tier(const char *command)
 {
     if (!command) return VIRP_TIER_RED;              /* fail closed */

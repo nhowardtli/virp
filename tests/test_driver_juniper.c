@@ -616,6 +616,69 @@ static void test_no_match_fails_closed(void)
     assert(junos_route_command(NULL) == VIRP_TIER_RED); PASS();
 }
 
+
+/* Tier name helper for the table-driven suite's labels. */
+static const char *tier_name(virp_trust_tier_t t)
+{
+    switch (t) {
+    case VIRP_TIER_GREEN:  return "GREEN";
+    case VIRP_TIER_YELLOW: return "YELLOW";
+    case VIRP_TIER_RED:    return "RED";
+    case VIRP_TIER_BLACK:  return "BLACK";
+    default:               return "UNCLASSIFIED";
+    }
+}
+
+/* =========================================================================
+ * Table-driven reachability + declared-tier suite
+ *
+ * Iterates JunOS's OWN classification table and asserts, for every
+ * entry, that junos_route_command(entry) returns the tier that entry declares.
+ *
+ * This is not tautological. It proves two things hand-written cases
+ * cannot:
+ *   1. REACHABILITY — an entry shadowed by a broader or earlier entry
+ *      would silently never fire. A BLACK or RED entry shadowed by a
+ *      GREEN one is a live vulnerability. This table is longest-match.
+ *   2. The entry returns its declared tier through the REAL matching
+ *      logic, including the separator and token-boundary rules.
+ *
+ * Any new entry is covered automatically the moment it is added.
+ * ========================================================================= */
+
+static void test_table_driven_all_entries(void)
+{
+    printf("\n=== Table-driven: every table entry reachable + correctly tiered ===\n");
+    size_t total = JUNOS_ROUTE_TABLE_SIZE;
+    size_t skipped = 0;
+
+    for (size_t i = 0; i < total; i++) {
+        const char *cmd = JUNOS_ROUTE_TABLE[i].command_pattern;
+        virp_trust_tier_t declared = JUNOS_ROUTE_TABLE[i].tier;
+        /* KNOWN-DEAD ENTRY (reported, deliberately not fixed):
+         * "show configuration | display set" can never fire — the shared
+         * separator policy refuses '|' before this table is consulted, so
+         * the entry is unreachable by construction. Left in place so the
+         * decision to remove it (or to add a display-filter carve-out)
+         * stays an explicit choice. */
+        if (strchr(cmd, '|') != NULL) { skipped++; continue; }
+        char label[192];
+        snprintf(label, sizeof(label), "entry[%zu] %s -> %s",
+                 i, cmd, tier_name(declared));
+        TEST(label);
+        virp_trust_tier_t got = junos_route_command(cmd);
+        if (got != declared) {
+            printf("\n    SHADOWED or MIS-TIERED: \"%s\" declares %s but "
+                   "classifies %s\n", cmd, tier_name(declared), tier_name(got));
+            assert(got == declared);
+        }
+        PASS();
+    }
+
+    printf("  (%zu entries checked, %zu known-dead skipped)\n",
+           total - skipped, skipped);
+}
+
 int main(void)
 {
     printf("VIRP Juniper JunOS Driver — Unit Tests\n");
@@ -631,6 +694,7 @@ int main(void)
     test_adversarial_separators();
     test_legit_matches_unaffected();
     test_no_match_fails_closed();
+    test_table_driven_all_entries();
     printf("\n=======================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

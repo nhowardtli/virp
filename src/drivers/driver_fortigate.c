@@ -418,6 +418,23 @@ static const fg_command_route_t FG_ROUTE_TABLE[] = {
 static const size_t FG_ROUTE_TABLE_SIZE =
     sizeof(FG_ROUTE_TABLE) / sizeof(FG_ROUTE_TABLE[0]);
 
+/*
+ * Test-support accessors — see the equivalent pair in driver_cisco.c.
+ * Lets the table-driven reachability suite prove every entry is
+ * reachable and returns the tier it declares.
+ */
+size_t fg_route_table_count(void)
+{
+    return FG_ROUTE_TABLE_SIZE;
+}
+
+const char *fg_route_table_entry(size_t i, virp_trust_tier_t *tier)
+{
+    if (i >= FG_ROUTE_TABLE_SIZE) return NULL;
+    if (tier) *tier = FG_ROUTE_TABLE[i].tier;
+    return FG_ROUTE_TABLE[i].command_pattern;
+}
+
 virp_trust_tier_t fg_route_command(const char *command)
 {
     if (!command) return VIRP_TIER_RED;              /* fail closed */

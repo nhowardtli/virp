@@ -11,6 +11,7 @@
 #include "virp.h"
 #include "virp_driver.h"
 #include <stdio.h>
+#include <string.h>
 #include <assert.h>
 
 /* cisco_gate_tier is declared in virp_driver_cisco.h, but that header embeds
@@ -280,6 +281,66 @@ static void test_token_boundary(void)
     assert(cisco_gate_tier("show bootvar") == VIRP_TIER_GREEN); PASS();
 }
 
+extern size_t cisco_gate_table_count(void);
+extern const char *cisco_gate_table_entry(size_t i, virp_trust_tier_t *tier);
+
+/* Tier name helper for the table-driven suite's labels. */
+static const char *tier_name(virp_trust_tier_t t)
+{
+    switch (t) {
+    case VIRP_TIER_GREEN:  return "GREEN";
+    case VIRP_TIER_YELLOW: return "YELLOW";
+    case VIRP_TIER_RED:    return "RED";
+    case VIRP_TIER_BLACK:  return "BLACK";
+    default:               return "UNCLASSIFIED";
+    }
+}
+
+/* =========================================================================
+ * Table-driven reachability + declared-tier suite
+ *
+ * Iterates Cisco IOS/IOS-XE's OWN classification table and asserts, for every
+ * entry, that cisco_gate_tier(entry) returns the tier that entry declares.
+ *
+ * This is not tautological. It proves two things hand-written cases
+ * cannot:
+ *   1. REACHABILITY — an entry shadowed by a broader or earlier entry
+ *      would silently never fire. A BLACK or RED entry shadowed by a
+ *      GREEN one is a live vulnerability. This table is longest-match.
+ *   2. The entry returns its declared tier through the REAL matching
+ *      logic, including the separator and token-boundary rules.
+ *
+ * Any new entry is covered automatically the moment it is added.
+ * ========================================================================= */
+
+static void test_table_driven_all_entries(void)
+{
+    printf("\n=== Table-driven: every table entry reachable + correctly tiered ===\n");
+    size_t total = cisco_gate_table_count();
+    size_t skipped = 0;
+
+    for (size_t i = 0; i < total; i++) {
+        virp_trust_tier_t declared;
+        const char *cmd = cisco_gate_table_entry(i, &declared);
+        assert(cmd != NULL);
+
+        char label[192];
+        snprintf(label, sizeof(label), "entry[%zu] %s -> %s",
+                 i, cmd, tier_name(declared));
+        TEST(label);
+        virp_trust_tier_t got = cisco_gate_tier(cmd);
+        if (got != declared) {
+            printf("\n    SHADOWED or MIS-TIERED: \"%s\" declares %s but "
+                   "classifies %s\n", cmd, tier_name(declared), tier_name(got));
+            assert(got == declared);
+        }
+        PASS();
+    }
+
+    printf("  (%zu entries checked, %zu known-dead skipped)\n",
+           total - skipped, skipped);
+}
+
 int main(void)
 {
     printf("VIRP Cisco IOS/IOS-XE Gate Classifier — Unit Tests\n");
@@ -294,6 +355,7 @@ int main(void)
     test_multicommand_bypass();
     test_separator_fails_closed();
     test_token_boundary();
+    test_table_driven_all_entries();
     printf("\n==================================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
