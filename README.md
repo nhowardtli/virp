@@ -121,28 +121,62 @@ VIRP has been running continuously on production infrastructure since March 2026
 Each item below is tagged with its evidence status:
 **[tested]** implemented and covered by a checked-in test or machine proof;
 **[untested]** implemented but with no automated coverage;
+**[unreproduced measurement]** a one-time observation, not re-derived by
+any check;
 **[aspirational]** intended, not yet built.
 
-- **66 days of continuous operation** at time of this writing *[untested — uptime is observed, not asserted by any check]*
-- **2,024 cryptographically linked chain artifacts** across 81 sessions *[untested — a count from a one-time export, not reproduced by a test]*
-- **35-router BGP topology**: full verification under 60 seconds *[untested — a one-time measurement; no benchmark in the suite]*
-- **FortiGate audit**: 15 findings on real hardware, zero false positives *[untested — a one-time manual audit]*
+- **66 days of continuous operation** at time of this writing *[unreproduced measurement — uptime is observed, not asserted by any check]*
+- **2,024 cryptographically linked chain artifacts** across 81 sessions *[unreproduced measurement — a count from a one-time export]*
+- **35-router BGP topology**: full verification under 60 seconds *[unreproduced measurement — one-time timing; no benchmark in the suite]*
+- **FortiGate audit**: 15 findings on real hardware, zero false positives *[unreproduced measurement — a one-time manual audit]*
 
-**Chain integrity.** A previous version of this section claimed "99.9%
-chain integrity (verified against full export)". That number has been
-removed rather than explained, because it could not be substantiated and
-because the metric is a category error: a hash-linked chain is valid or
-it is not — a 0.1% failure rate in a structure where each entry commits
-to its predecessor means every entry after the first break is
-unverifiable, not that 99.9% of it is good. The one recorded verification
-in this tree, from 2026-04-24, returned `valid:false first_broken:2`
-(snapshot preserved as `chain.db.broken-2026-04-24`). Chain verification
-logic itself is covered by `tests/test_chain.c` (genesis, sequential
-linking, tamper detection, crash recovery) and
-`tests/test_chain_concurrency.c` *[tested]*; what is **not** established
-is any integrity figure for the production chain. Re-establishing that
-needs a fresh `virp chain verify` against the live database, reported as
-pass/fail with the first broken sequence if any.
+**Chain integrity — verified 2026-07-28, read-only.** A previous version
+of this section claimed "99.9% chain integrity (verified against full
+export)". That figure is removed: it could not be substantiated, and the
+metric is a category error for a hash-linked structure, where each entry
+commits to its predecessor. What follows replaces it.
+
+The `valid:false first_broken:2` result recorded on 2026-04-24 was a
+**verifier bug, not chain corruption**. `virp-bridge.py:chain_verify()`
+walks `ORDER BY id ASC` — globally — and compares each row's
+`previous_entry_hash` to the previous row's hash. The chain is
+*per-session*: `virp_chain_verify()` walks `(session_id, sequence)` and
+every session begins at sequence 0 with
+`SHA256("VIRP_CHAIN_GENESIS:" || session_id)`. With two or more sessions
+present, the global walk necessarily breaks at the second session's
+genesis entry. Reproduced exactly on all three databases below.
+
+Verified per-session, read-only, no daemon restart:
+
+| Database | Entries | Sessions | Result |
+|---|---|---|---|
+| Live `/var/lib/virp/chain.db` | 3,009 | 169 | **162/169 sessions fully hash-linked**; 7 broken |
+| Export `chain.db.export-20260614-2156` | 2,465 | 125 | 118/125 valid; same 7 broken |
+| Snapshot `chain.db.broken-2026-04-24` | 1,265 | 38 | 31/38 valid; same 7 broken |
+
+The 7 failures are **writer-convention mismatches, not tamper evidence**.
+Five sessions carry an all-zero `previous_entry_hash` at sequence 0 — a
+second writer (the Python bridge) using zeros for "no predecessor"
+instead of the derived genesis; one carries a third, foreign genesis
+value; one has non-contiguous sequence allocation. Six of the seven break
+at their *first* entry, which is the signature of a genesis convention,
+not of modification. The same 7 break identically across all three
+databases. Entry-count ratios overstate the spread: one long-running
+bridge session (`dashboard-obs`) accounts for 1,065 of the 1,776 entries
+in broken sessions.
+
+**All three approval sessions verify clean** — `approval:R1` (15 entries,
+the 2026-07-23 live-proof session), `approval:SW-3850` (10),
+`approval:R21` (1). The PROPOSAL → APPROVAL → OUTCOME evidence in
+[`docs/LIVE-PROOF-2026-07-23.md`](docs/LIVE-PROOF-2026-07-23.md) holds
+under correct per-session verification.
+
+**Still open:** the bridge's global-walk verifier is unfixed, so the
+operator-facing `chain_verify` API still reports `valid:false` on any
+multi-session database; and the two-writer genesis divergence is
+unresolved. Chain *logic* is covered by `tests/test_chain.c` (genesis,
+sequential linking, tamper detection, crash recovery) and
+`tests/test_chain_concurrency.c` *[tested]*.
 
 Fabrication is prevented by protocol design, assuming the O-Node is uncompromised *[tested — see `docs/VIRP-CLAIMS.md` Appendix A, C5–C8 and C16]*. See [`SECURITY.md`](SECURITY.md) for the full trust boundary analysis, including known open work on TCP-path mutual authentication.
 

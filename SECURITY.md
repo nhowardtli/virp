@@ -26,7 +26,7 @@ evidence backing the corresponding defence:
 
 - HMAC-SHA256 signing bypass or forgery *[tested — `tests/test_virp.c`, `tests/test_obs_v2.c`, ProVerif `proofs/virp_obs_v2.pv`]*
 - Trust tier escalation (e.g., RED command executing as GREEN) *[tested — five driver suites incl. table-driven reachability and adversarial separator injection; see `docs/VIRP-CLAIMS.md` C22–C25]*
-- Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection; production-chain integrity unestablished, see README]*
+- Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection. Production chain verified per-session 2026-07-28: 162/169 sessions hash-linked; the 7 failures are writer-convention mismatches, not tamper evidence. The operator-facing `chain_verify` bridge API still reports a false negative on any multi-session database — see README]*
 - O-Node socket authentication bypass *[tested — `tests/test_onode.c` `test_peer_uid_allowed`, `test_peer_uid_rejected`]*
 - Device credential exposure through the API layer *[untested — no suite covers the API layer's credential handling]*
 - Session handshake state machine violations *[tested — `tests/test_session_negative.c`, `tests/test_session_key.c`]*

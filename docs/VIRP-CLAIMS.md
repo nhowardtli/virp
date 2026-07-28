@@ -391,6 +391,17 @@ establish.
 
 **Two open questions, unresolved.**
 
+0. *(Settled 2026-07-28)* The production chain's integrity question is
+   no longer open. The `valid:false first_broken:2` result was a verifier
+   bug — `virp-bridge.py:chain_verify()` walks globally over a
+   per-session chain. Verified per-session and read-only: 162/169 live
+   sessions fully hash-linked, the 7 failures all writer-convention
+   mismatches (five with an all-zero genesis from a second writer), and
+   all three `approval:*` sessions valid, including `approval:R1` from
+   the 2026-07-23 live proof. Two follow-ups remain: the bridge verifier
+   is unfixed, and the two-writer genesis divergence is unresolved. See
+   the README chain-integrity section for the full table.
+
 1. *Config-dumping reads at YELLOW.* `show full-configuration`
    (FortiGate), `show system ha` (FortiGate) and `show running-config`
    (ASA/Cisco) are classified YELLOW as "config reads", but their output
