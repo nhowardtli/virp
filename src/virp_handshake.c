@@ -56,9 +56,22 @@ virp_error_t virp_handle_hello(virp_context_t *ctx,
     /* reset any stale session */
     virp_session_reset(ctx);
 
+    /*
+     * Clamp both counts to their array bounds before use. version_count
+     * and algorithm_count are uint8_t (up to 255) while versions[] and
+     * algorithms[] hold VIRP_MAX_VERSIONS / VIRP_MAX_ALGORITHMS (8) —
+     * so a struct arriving with a larger count would read past the
+     * array. The daemon's own parser caps these, but this is a library
+     * entry point and must not trust its caller.
+     */
+    int n_versions = hello_in->version_count;
+    if (n_versions > VIRP_MAX_VERSIONS) n_versions = VIRP_MAX_VERSIONS;
+    int n_algorithms = hello_in->algorithm_count;
+    if (n_algorithms > VIRP_MAX_ALGORITHMS) n_algorithms = VIRP_MAX_ALGORITHMS;
+
     /* check version compatibility — we support v2 and v1 */
     uint8_t selected_version = 0;
-    for (int i = 0; i < hello_in->version_count; i++) {
+    for (int i = 0; i < n_versions; i++) {
         if (hello_in->versions[i] == 2) { selected_version = 2; break; }
         if (hello_in->versions[i] == 1) { selected_version = 1; }
     }
@@ -67,7 +80,7 @@ virp_error_t virp_handle_hello(virp_context_t *ctx,
 
     /* check algorithm — we only support HMAC-SHA256 for now */
     int alg_ok = 0;
-    for (int i = 0; i < hello_in->algorithm_count; i++) {
+    for (int i = 0; i < n_algorithms; i++) {
         if (hello_in->algorithms[i] == VIRP_ALG_HMAC_SHA256) {
             alg_ok = 1; break;
         }
@@ -80,16 +93,29 @@ virp_error_t virp_handle_hello(virp_context_t *ctx,
         char nonce_hex[17];
         hs_hex(nonce_hex, sizeof(nonce_hex), hello_in->client_nonce, 8);
 
+        /*
+         * Truncation-safe accumulation. snprintf returns the length it
+         * WOULD have written, so `vpos += snprintf(...)` can push vpos
+         * past the buffer, after which `ver_buf + vpos` is out of bounds
+         * and `sizeof(ver_buf) - vpos` underflows. Check every write and
+         * stop on truncation; snprintf has already NUL-terminated.
+         */
         char ver_buf[64];
-        int vpos = 0;
-        vpos += snprintf(ver_buf + vpos, sizeof(ver_buf) - vpos, "[");
-        for (int i = 0; i < hello_in->version_count; i++) {
-            if (i > 0)
-                vpos += snprintf(ver_buf + vpos, sizeof(ver_buf) - vpos, ",");
-            vpos += snprintf(ver_buf + vpos, sizeof(ver_buf) - vpos,
-                             "%u", hello_in->versions[i]);
+        size_t vpos = 0;
+        int vw = snprintf(ver_buf, sizeof(ver_buf), "[");
+        if (vw > 0 && (size_t)vw < sizeof(ver_buf)) {
+            vpos = (size_t)vw;
+            for (int i = 0; i < n_versions; i++) {
+                vw = snprintf(ver_buf + vpos, sizeof(ver_buf) - vpos,
+                              "%s%u", (i > 0) ? "," : "",
+                              hello_in->versions[i]);
+                if (vw < 0 || (size_t)vw >= sizeof(ver_buf) - vpos)
+                    break;              /* truncated; buffer stays valid */
+                vpos += (size_t)vw;
+            }
+            if (vpos < sizeof(ver_buf) - 1)
+                snprintf(ver_buf + vpos, sizeof(ver_buf) - vpos, "]");
         }
-        snprintf(ver_buf + vpos, sizeof(ver_buf) - vpos, "]");
 
         fprintf(stderr,
                 "[VIRP-HS] SESSION_HELLO received from %s, "

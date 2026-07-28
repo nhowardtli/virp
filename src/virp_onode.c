@@ -853,9 +853,20 @@ static void approval_proposer_id(onode_state_t *state, int obs_version,
         if (state->ctx &&
             virp_session_require_active(state->ctx) == VIRP_OK) {
             int off = snprintf(out, out_len, "session:");
-            for (int i = 0; i < 8 && off + 2 < (int)out_len; i++)
-                off += snprintf(out + off, out_len - off, "%02x",
-                                state->ctx->session.session_id[i]);
+            /* snprintf returns the WOULD-BE length; if the prefix did not
+             * fit, off already exceeds out_len and must not be used as an
+             * offset. */
+            if (off < 0 || (size_t)off >= out_len) {
+                pthread_mutex_unlock(&state->session_mutex);
+                return;
+            }
+            for (int i = 0; i < 8 && off + 2 < (int)out_len; i++) {
+                int hw = snprintf(out + off, out_len - (size_t)off, "%02x",
+                                  state->ctx->session.session_id[i]);
+                if (hw < 0 || (size_t)hw >= out_len - (size_t)off)
+                    break;
+                off += hw;
+            }
             pthread_mutex_unlock(&state->session_mutex);
             return;
         }
@@ -1369,17 +1380,28 @@ static virp_error_t onode_list_devices(onode_state_t *state,
                                        uint8_t *out_buf, size_t out_buf_len,
                                        size_t *out_len)
 {
+    /*
+     * Truncation-safe accumulation. `offset += snprintf(...)` advances by
+     * the WOULD-BE length, so a long row could push offset past
+     * sizeof(listing); `offset` is then passed as the observation payload
+     * length below, which would read past the buffer. The old loop guard
+     * (offset < sizeof - 100) was thinner than a worst-case row: hostname
+     * and host are 64 bytes each, so a row can reach ~152 bytes.
+     */
     char listing[VIRP_OUTPUT_MAX];
-    int offset = 0;
+    size_t offset = 0;
 
-    offset += snprintf(listing + offset, sizeof(listing) - offset,
+    int hw = snprintf(listing, sizeof(listing),
                        "VIRP O-Node Device Inventory (%d devices)\n"
                        "%-16s %-16s %-12s %-8s\n"
                        "-----------------------------------------------------\n",
                        state->device_count,
                        "Hostname", "Host", "Vendor", "NodeID");
+    if (hw < 0 || (size_t)hw >= sizeof(listing))
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+    offset = (size_t)hw;
 
-    for (int i = 0; i < state->device_count && offset < (int)sizeof(listing) - 100; i++) {
+    for (int i = 0; i < state->device_count && offset < sizeof(listing); i++) {
         const char *vendor_str = "unknown";
         switch (state->devices[i].vendor) {
         case VIRP_VENDOR_CISCO_IOS: vendor_str = "cisco_ios"; break;
@@ -1395,12 +1417,15 @@ static virp_error_t onode_list_devices(onode_state_t *state,
         default: break;
         }
 
-        offset += snprintf(listing + offset, sizeof(listing) - offset,
+        int rw = snprintf(listing + offset, sizeof(listing) - offset,
                            "%-16s %-16s %-12s %08x\n",
                            state->devices[i].hostname,
                            state->devices[i].host,
                            vendor_str,
                            state->devices[i].node_id);
+        if (rw < 0 || (size_t)rw >= sizeof(listing) - offset)
+            break;                 /* row truncated — stop, keep offset sane */
+        offset += (size_t)rw;
     }
 
     return virp_build_observation(out_buf, out_buf_len, out_len,
@@ -2216,10 +2241,21 @@ static void handle_client(onode_state_t *state, int client_fd)
         }
 
         /*
-         * Build JSON payload. Up to VALIDATOR_MAX_ASSERTIONS per-
-         * assertion objects plus the envelope — fits in 8KB.
+         * Build JSON payload: up to VALIDATOR_MAX_ASSERTIONS per-assertion
+         * objects plus the envelope.
+         *
+         * Sized from the cap rather than a fixed 8KB. When
+         * VALIDATOR_MAX_ASSERTIONS rose from 32 to 1024, the old 8KB
+         * buffer stopped fitting a full-size manifest (~45 bytes per
+         * assertion, so ~46KB): the guarded loop below would have failed
+         * a maximal turn with BUFFER_TOO_SMALL — safely, but it would
+         * have failed — which is exactly the full-topology case the
+         * raised cap exists to allow.
          */
-        char json_buf[8192];
+        #define VALIDATE_JSON_ENVELOPE 512
+        #define VALIDATE_JSON_PER_ASSERTION 64
+        char json_buf[VALIDATE_JSON_ENVELOPE +
+                      VALIDATOR_MAX_ASSERTIONS * VALIDATE_JSON_PER_ASSERTION];
         int joff = snprintf(json_buf, sizeof(json_buf),
             "{\"decision\":\"%s\","
             "\"turn_violation\":%d,"
@@ -2245,7 +2281,15 @@ static void handle_client(onode_state_t *state, int client_fd)
             }
             joff += jw;
         }
-        joff += snprintf(json_buf + joff, sizeof(json_buf) - (size_t)joff, "]}");
+        {
+            int tw = snprintf(json_buf + joff, sizeof(json_buf) - (size_t)joff,
+                              "]}");
+            if (tw < 0 || (size_t)tw >= sizeof(json_buf) - (size_t)joff) {
+                send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+                goto validate_turn_done;
+            }
+            joff += tw;
+        }
 
         err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
                                       state->node_id, onode_next_seq(state),
