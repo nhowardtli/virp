@@ -117,16 +117,40 @@ virp_trust_tier_t asa_route_command(const char *command)
 {
     if (!command) return VIRP_TIER_YELLOW;
 
+    /*
+     * Layer 3a — a separator-carrying string is not one command, so this
+     * table cannot vouch for it: the prefix match only ever sees the
+     * first command while the driver sends the whole string to the
+     * device. Fail closed to RED here as well as at the daemon boundary,
+     * because asa_route_command is directly callable.
+     */
+    if (virp_command_check_separators(command, NULL, 0) != 0)
+        return VIRP_TIER_RED;
+
     const asa_command_route_t *best = NULL;
     size_t best_len = 0;
 
     for (size_t i = 0; i < ASA_ROUTE_TABLE_SIZE; i++) {
         size_t plen = strlen(ASA_ROUTE_TABLE[i].command_pattern);
-        if (strncasecmp(command, ASA_ROUTE_TABLE[i].command_pattern, plen) == 0) {
-            if (plen > best_len) {
-                best = &ASA_ROUTE_TABLE[i];
-                best_len = plen;
-            }
+        if (strncasecmp(command, ASA_ROUTE_TABLE[i].command_pattern, plen) != 0)
+            continue;
+
+        /*
+         * Layer 3b — the match must END on a token boundary so a listed
+         * prefix can never stand in for a longer word ("reload" must not
+         * cover "reloadable"). Entries that already end in a space carry
+         * their own boundary. Longest valid match still wins.
+         */
+        char after = command[plen];
+        bool self_terminated = (plen > 0 &&
+            ASA_ROUTE_TABLE[i].command_pattern[plen - 1] == ' ');
+        if (!self_terminated && after != '\0' &&
+            after != ' ' && after != '\t')
+            continue;
+
+        if (plen > best_len) {
+            best = &ASA_ROUTE_TABLE[i];
+            best_len = plen;
         }
     }
 

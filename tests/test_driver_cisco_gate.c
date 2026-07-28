@@ -223,6 +223,15 @@ static void test_separator_fails_closed(void)
     TEST("brace expansion: show version${x} -> RED");
     assert(cisco_gate_tier("show version${x}") == VIRP_TIER_RED); PASS();
 
+    TEST("carriage return: show clock\\rreload -> RED");
+    assert(cisco_gate_tier("show clock\rreload") == VIRP_TIER_RED); PASS();
+
+    TEST("double ampersand: show version&&reload -> RED");
+    assert(cisco_gate_tier("show version&&reload") == VIRP_TIER_RED); PASS();
+
+    TEST("leading newline: \\nreload -> RED");
+    assert(cisco_gate_tier("\nreload") == VIRP_TIER_RED); PASS();
+
     TEST("embedded tab: show version\\treload -> RED");
     assert(cisco_gate_tier("show version\treload") == VIRP_TIER_RED); PASS();
 

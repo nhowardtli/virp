@@ -145,16 +145,39 @@ virp_trust_tier_t junos_route_command(const char *command)
 {
     if (!command) return VIRP_TIER_YELLOW;
 
+    /*
+     * Layer 3a — a separator-carrying string is not one command. JunOS
+     * uses BOTH ';' and '\n' as separators, which is what the deleted
+     * batch splitter exploited: the daemon classified such a string once,
+     * on its first token. junos_execute already refuses these; this makes
+     * junos_route_command safe on its own, since it is directly callable.
+     */
+    if (virp_command_check_separators(command, NULL, 0) != 0)
+        return VIRP_TIER_RED;
+
     const junos_command_route_t *best = NULL;
     size_t best_len = 0;
 
     for (size_t i = 0; i < JUNOS_ROUTE_TABLE_SIZE; i++) {
         size_t plen = strlen(JUNOS_ROUTE_TABLE[i].command_pattern);
-        if (strncasecmp(command, JUNOS_ROUTE_TABLE[i].command_pattern, plen) == 0) {
-            if (plen > best_len) {
-                best = &JUNOS_ROUTE_TABLE[i];
-                best_len = plen;
-            }
+        if (strncasecmp(command, JUNOS_ROUTE_TABLE[i].command_pattern, plen) != 0)
+            continue;
+
+        /*
+         * Layer 3b — the match must END on a token boundary. Entries that
+         * already end in a space ("set ") carry their own boundary.
+         * Longest valid match still wins.
+         */
+        char after = command[plen];
+        bool self_terminated = (plen > 0 &&
+            JUNOS_ROUTE_TABLE[i].command_pattern[plen - 1] == ' ');
+        if (!self_terminated && after != '\0' &&
+            after != ' ' && after != '\t')
+            continue;
+
+        if (plen > best_len) {
+            best = &JUNOS_ROUTE_TABLE[i];
+            best_len = plen;
         }
     }
 

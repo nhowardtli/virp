@@ -421,6 +421,14 @@ virp_trust_tier_t fg_route_command(const char *command)
 {
     if (!command) return VIRP_TIER_YELLOW;
 
+    /*
+     * Layer 3a — a separator-carrying string is not one command, so this
+     * table cannot vouch for it. Fail closed to RED here as well as at
+     * the daemon boundary, because fg_route_command is directly callable.
+     */
+    if (virp_command_check_separators(command, NULL, 0) != 0)
+        return VIRP_TIER_RED;
+
     /* Skip leading whitespace so " show system admin" still classifies. */
     while (*command == ' ' || *command == '\t') command++;
 
@@ -429,11 +437,27 @@ virp_trust_tier_t fg_route_command(const char *command)
 
     for (size_t i = 0; i < FG_ROUTE_TABLE_SIZE; i++) {
         size_t plen = strlen(FG_ROUTE_TABLE[i].command_pattern);
-        if (strncasecmp(command, FG_ROUTE_TABLE[i].command_pattern, plen) == 0) {
-            if (plen > best_len) {
-                best = &FG_ROUTE_TABLE[i];
-                best_len = plen;
-            }
+        if (strncasecmp(command, FG_ROUTE_TABLE[i].command_pattern, plen) != 0)
+            continue;
+
+        /*
+         * Layer 3b — the match must END on a token boundary so a listed
+         * prefix cannot stand in for a longer word. This matters most for
+         * the deliberately broad catch-alls here ("show", "config"):
+         * without it "showdown" would inherit "show"'s YELLOW. Entries
+         * ending in a space carry their own boundary; longest valid match
+         * still wins.
+         */
+        char after = command[plen];
+        bool self_terminated = (plen > 0 &&
+            FG_ROUTE_TABLE[i].command_pattern[plen - 1] == ' ');
+        if (!self_terminated && after != '\0' &&
+            after != ' ' && after != '\t')
+            continue;
+
+        if (plen > best_len) {
+            best = &FG_ROUTE_TABLE[i];
+            best_len = plen;
         }
     }
 

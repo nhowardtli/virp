@@ -193,6 +193,90 @@ static void test_ordering_and_boundary(void)
     PASS();
 }
 
+
+/* =========================================================================
+ * Adversarial — separator injection (layer 3)
+ *
+ * The exploit shape: a benign prefix that is a REAL entry in this
+ * driver's own table, followed by a separator and a command that was
+ * never classified. The prefix match only ever sees the first command
+ * while the driver hands the whole string to the device. Every case must
+ * fail closed to RED — no benign tier may be inherited.
+ *
+ * PAN-OS previously accepted '\n' as a valid token boundary, which WAS
+ * this driver's copy of the bypass: the GREEN entry matched and returned
+ * its tier with a whole second command still attached.
+ * ========================================================================= */
+
+static void test_adversarial_separators(void)
+{
+    printf("\n=== Adversarial — separator injection fails closed ===\n");
+
+    TEST("newline: show system info\\nrequest restart system -> RED");
+    assert(pa_route_command("show system info\nrequest restart system") == VIRP_TIER_RED); PASS();
+
+    TEST("carriage return: show system info\\rrequest restart system -> RED");
+    assert(pa_route_command("show system info\rrequest restart system") == VIRP_TIER_RED); PASS();
+
+    TEST("CRLF: show system info\\r\\nrequest restart system -> RED");
+    assert(pa_route_command("show system info\r\nrequest restart system") == VIRP_TIER_RED); PASS();
+
+    TEST("semicolon: show system info;request restart system -> RED");
+    assert(pa_route_command("show system info;request restart system") == VIRP_TIER_RED); PASS();
+
+    TEST("pipe: show system info|request restart system -> RED");
+    assert(pa_route_command("show system info|request restart system") == VIRP_TIER_RED); PASS();
+
+    TEST("ampersand: show system info&request restart system -> RED");
+    assert(pa_route_command("show system info&request restart system") == VIRP_TIER_RED); PASS();
+
+    TEST("double ampersand: show system info&&request restart system -> RED");
+    assert(pa_route_command("show system info&&request restart system") == VIRP_TIER_RED); PASS();
+
+    TEST("backtick: show system info`request restart system` -> RED");
+    assert(pa_route_command("show system info`request restart system`") == VIRP_TIER_RED); PASS();
+
+    TEST("command substitution: show system info$(request restart system) -> RED");
+    assert(pa_route_command("show system info$(request restart system)") == VIRP_TIER_RED); PASS();
+
+    TEST("brace expansion: show system info${x} -> RED");
+    assert(pa_route_command("show system info${x}") == VIRP_TIER_RED); PASS();
+
+    TEST("embedded tab: show system info\\trequest restart system -> RED");
+    assert(pa_route_command("show system info\trequest restart system") == VIRP_TIER_RED); PASS();
+
+    TEST("trailing newline alone: show system info\\n -> RED");
+    assert(pa_route_command("show system info\n") == VIRP_TIER_RED); PASS();
+
+    TEST("leading newline: \\nrequest restart system -> RED");
+    assert(pa_route_command("\nrequest restart system") == VIRP_TIER_RED); PASS();
+}
+
+/* =========================================================================
+ * Legitimate-match regressions (layer 3)
+ *
+ * The separator/boundary rules must not become over-broad. If a future
+ * edit starts rejecting valid PAN-OS commands, these fail loudly here
+ * rather than degrading the fleet quietly.
+ * ========================================================================= */
+
+static void test_legit_matches_unaffected(void)
+{
+    printf("\n=== Legitimate commands still classify ===\n");
+
+    TEST("exact GREEN entry: show system info");
+    assert(pa_route_command("show system info") == VIRP_TIER_GREEN); PASS();
+
+    TEST("GREEN entry: show system resources");
+    assert(pa_route_command("show system resources") == VIRP_TIER_GREEN); PASS();
+
+    TEST("RED credential read: show admins");
+    assert(pa_route_command("show admins") == VIRP_TIER_RED); PASS();
+
+    TEST("YELLOW topology read: show device-group");
+    assert(pa_route_command("show device-group") == VIRP_TIER_YELLOW); PASS();
+}
+
 int main(void)
 {
     printf("VIRP PAN-OS Driver — Unit Tests\n");
@@ -203,6 +287,8 @@ int main(void)
     test_red();
     test_ordering_and_boundary();
 
+    test_adversarial_separators();
+    test_legit_matches_unaffected();
     printf("\n================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

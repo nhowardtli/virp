@@ -397,6 +397,23 @@ endif
 test-cisco: $(TEST_CISCO)
 	./$(TEST_CISCO)
 
+# FortiGate driver tests (BLACK tier + gate classifier). Requires
+# FORTIGATE=1 so driver_fortigate.o is built into libvirp.a.
+TEST_FORTIGATE = $(BUILD_DIR)/test_driver_fortigate_black
+
+$(TEST_FORTIGATE): tests/test_driver_fortigate_black.c $(LIB)
+ifndef FORTIGATE
+	@echo "ERROR: test-fortigate requires FORTIGATE=1 — driver objects are not in libvirp.a."
+	@echo "       Run:  make FORTIGATE=1 test-fortigate"
+	@echo "       Or:   make test-drivers   (builds every driver and runs all driver suites)"
+	@false
+else
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+endif
+
+test-fortigate: $(TEST_FORTIGATE)
+	./$(TEST_FORTIGATE)
+
 # Cisco IOS/IOS-XE gate-classifier tests (build with CISCO=1)
 TEST_CISCO_GATE = $(BUILD_DIR)/test_driver_cisco_gate
 
@@ -504,9 +521,9 @@ DRIVER_BUILD_DIR = build-drivers
 
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-gate, juniper, asa, panos) ==="
-	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 \
-	        test-cisco test-cisco-gate test-juniper test-asa test-panos
+	@echo "=== driver test suites (cisco, cisco-gate, juniper, asa, panos, fortigate) ==="
+	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 \
+	        test-cisco test-cisco-gate test-juniper test-asa test-panos test-fortigate
 
 # Deploy unit-file check — a unit-file regression is invisible to the C
 # battery. Approval mode refuses to start without a chain (see

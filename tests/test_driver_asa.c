@@ -589,6 +589,95 @@ static void test_driver_registration(void)
  * Main
  * ========================================================================= */
 
+
+/* =========================================================================
+ * Adversarial — separator injection (layer 3)
+ *
+ * The exploit shape: a benign prefix that is a REAL entry in this
+ * driver's own table, followed by a separator and a command that was
+ * never classified. The prefix match only ever sees the first command
+ * while the driver hands the whole string to the device. Every case must
+ * fail closed to RED — no benign tier may be inherited.
+ *
+ * NOTE: "reload" is a BLACK entry in this table, so the injected
+ * half is exactly what the gate exists to stop.
+ * ========================================================================= */
+
+static void test_adversarial_separators(void)
+{
+    printf("\n=== Adversarial — separator injection fails closed ===\n");
+
+    TEST("newline: show version\\nreload -> RED");
+    assert(asa_route_command("show version\nreload") == VIRP_TIER_RED); PASS();
+
+    TEST("carriage return: show version\\rreload -> RED");
+    assert(asa_route_command("show version\rreload") == VIRP_TIER_RED); PASS();
+
+    TEST("CRLF: show version\\r\\nreload -> RED");
+    assert(asa_route_command("show version\r\nreload") == VIRP_TIER_RED); PASS();
+
+    TEST("semicolon: show version;reload -> RED");
+    assert(asa_route_command("show version;reload") == VIRP_TIER_RED); PASS();
+
+    TEST("pipe: show version|reload -> RED");
+    assert(asa_route_command("show version|reload") == VIRP_TIER_RED); PASS();
+
+    TEST("ampersand: show version&reload -> RED");
+    assert(asa_route_command("show version&reload") == VIRP_TIER_RED); PASS();
+
+    TEST("double ampersand: show version&&reload -> RED");
+    assert(asa_route_command("show version&&reload") == VIRP_TIER_RED); PASS();
+
+    TEST("backtick: show version`reload` -> RED");
+    assert(asa_route_command("show version`reload`") == VIRP_TIER_RED); PASS();
+
+    TEST("command substitution: show version$(reload) -> RED");
+    assert(asa_route_command("show version$(reload)") == VIRP_TIER_RED); PASS();
+
+    TEST("brace expansion: show version${x} -> RED");
+    assert(asa_route_command("show version${x}") == VIRP_TIER_RED); PASS();
+
+    TEST("embedded tab: show version\\treload -> RED");
+    assert(asa_route_command("show version\treload") == VIRP_TIER_RED); PASS();
+
+    TEST("trailing newline alone: show version\\n -> RED");
+    assert(asa_route_command("show version\n") == VIRP_TIER_RED); PASS();
+
+    TEST("leading newline: \\nreload -> RED");
+    assert(asa_route_command("\nreload") == VIRP_TIER_RED); PASS();
+}
+
+/* =========================================================================
+ * Legitimate-match regressions (layer 3)
+ *
+ * The separator/boundary rules must not become over-broad. If a future
+ * edit starts rejecting valid ASA commands, these fail loudly here
+ * rather than degrading the fleet quietly.
+ * ========================================================================= */
+
+static void test_legit_matches_unaffected(void)
+{
+    printf("\n=== Legitimate commands still classify ===\n");
+
+    TEST("exact GREEN entry: show version");
+    assert(asa_route_command("show version") == VIRP_TIER_GREEN); PASS();
+
+    TEST("GREEN entry with args: show version detail");
+    assert(asa_route_command("show version detail") == VIRP_TIER_GREEN); PASS();
+
+    TEST("longest match: show interface ip brief");
+    assert(asa_route_command("show interface ip brief") == VIRP_TIER_GREEN); PASS();
+
+    TEST("YELLOW config read: show running-config");
+    assert(asa_route_command("show running-config") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("RED credential read: show aaa-server");
+    assert(asa_route_command("show aaa-server") == VIRP_TIER_RED); PASS();
+
+    TEST("BLACK still detected: reload");
+    assert(asa_route_command("reload") == VIRP_TIER_BLACK); PASS();
+}
+
 int main(void)
 {
     printf("VIRP Cisco ASA Driver — Unit Tests\n");
@@ -606,6 +695,8 @@ int main(void)
     test_parse_access_list();
     test_driver_registration();
 
+    test_adversarial_separators();
+    test_legit_matches_unaffected();
     printf("\n===================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

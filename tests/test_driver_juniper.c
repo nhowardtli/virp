@@ -168,8 +168,25 @@ static void test_command_routing(void)
     assert(junos_route_command("show configuration") == VIRP_TIER_YELLOW);
     PASS();
 
-    TEST("show configuration | display set → YELLOW (config-read reconciliation)");
-    assert(junos_route_command("show configuration | display set") == VIRP_TIER_YELLOW);
+    /*
+     * BEHAVIOR CHANGE — was YELLOW, now RED.
+     *
+     * "| display set" is a legitimate, extremely common JunOS display
+     * filter, not a command separator. It is nonetheless refused, because
+     * the separator policy rejects '|' outright: on the linux driver '|'
+     * IS command chaining, and the policy is shared across all drivers by
+     * design so the daemon boundary and the classifiers cannot drift.
+     *
+     * This is not new breakage introduced here — the layer-1 daemon
+     * boundary has refused pipe-bearing commands since b3985e1, so this
+     * command was already unusable through the daemon; layer 3 only makes
+     * the classifier agree. Kept as an explicit assertion rather than
+     * deleted so the cost of the policy stays visible: if a
+     * display-filter carve-out for network CLIs is ever adopted, this is
+     * the test that must change back.
+     */
+    TEST("show configuration | display set → RED (pipe refused by policy)");
+    assert(junos_route_command("show configuration | display set") == VIRP_TIER_RED);
     PASS();
 
     TEST("show configuration protocols → YELLOW (longest match over RED)");
@@ -477,6 +494,92 @@ static void test_batch_tier_prescan(void)
  * Main
  * ========================================================================= */
 
+
+/* =========================================================================
+ * Adversarial — separator injection (layer 3)
+ *
+ * The exploit shape: a benign prefix that is a REAL entry in this
+ * driver's own table, followed by a separator and a command that was
+ * never classified. The prefix match only ever sees the first command
+ * while the driver hands the whole string to the device. Every case must
+ * fail closed to RED — no benign tier may be inherited.
+ *
+ * JunOS uses BOTH ';' and '\n' as separators — this is the classifier
+ * half of the bypass the deleted batch splitter exploited.
+ * ========================================================================= */
+
+static void test_adversarial_separators(void)
+{
+    printf("\n=== Adversarial — separator injection fails closed ===\n");
+
+    TEST("newline: show route\\nrequest system reboot -> RED");
+    assert(junos_route_command("show route\nrequest system reboot") == VIRP_TIER_RED); PASS();
+
+    TEST("carriage return: show route\\rrequest system reboot -> RED");
+    assert(junos_route_command("show route\rrequest system reboot") == VIRP_TIER_RED); PASS();
+
+    TEST("CRLF: show route\\r\\nrequest system reboot -> RED");
+    assert(junos_route_command("show route\r\nrequest system reboot") == VIRP_TIER_RED); PASS();
+
+    TEST("semicolon: show route;request system reboot -> RED");
+    assert(junos_route_command("show route;request system reboot") == VIRP_TIER_RED); PASS();
+
+    TEST("pipe: show route|request system reboot -> RED");
+    assert(junos_route_command("show route|request system reboot") == VIRP_TIER_RED); PASS();
+
+    TEST("ampersand: show route&request system reboot -> RED");
+    assert(junos_route_command("show route&request system reboot") == VIRP_TIER_RED); PASS();
+
+    TEST("double ampersand: show route&&request system reboot -> RED");
+    assert(junos_route_command("show route&&request system reboot") == VIRP_TIER_RED); PASS();
+
+    TEST("backtick: show route`request system reboot` -> RED");
+    assert(junos_route_command("show route`request system reboot`") == VIRP_TIER_RED); PASS();
+
+    TEST("command substitution: show route$(request system reboot) -> RED");
+    assert(junos_route_command("show route$(request system reboot)") == VIRP_TIER_RED); PASS();
+
+    TEST("brace expansion: show route${x} -> RED");
+    assert(junos_route_command("show route${x}") == VIRP_TIER_RED); PASS();
+
+    TEST("embedded tab: show route\\trequest system reboot -> RED");
+    assert(junos_route_command("show route\trequest system reboot") == VIRP_TIER_RED); PASS();
+
+    TEST("trailing newline alone: show route\\n -> RED");
+    assert(junos_route_command("show route\n") == VIRP_TIER_RED); PASS();
+
+    TEST("leading newline: \\nrequest system reboot -> RED");
+    assert(junos_route_command("\nrequest system reboot") == VIRP_TIER_RED); PASS();
+}
+
+/* =========================================================================
+ * Legitimate-match regressions (layer 3)
+ *
+ * The separator/boundary rules must not become over-broad. If a future
+ * edit starts rejecting valid JunOS commands, these fail loudly here
+ * rather than degrading the fleet quietly.
+ * ========================================================================= */
+
+static void test_legit_matches_unaffected(void)
+{
+    printf("\n=== Legitimate commands still classify ===\n");
+
+    TEST("exact GREEN entry: show route");
+    assert(junos_route_command("show route") == VIRP_TIER_GREEN); PASS();
+
+    TEST("GREEN entry with args: show route table inet.0");
+    assert(junos_route_command("show route table inet.0") == VIRP_TIER_GREEN); PASS();
+
+    TEST("YELLOW config read: show configuration");
+    assert(junos_route_command("show configuration") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("RED write via self-terminated \"set \" entry");
+    assert(junos_route_command("set interfaces ge-0/0/0 unit 0") == VIRP_TIER_RED); PASS();
+
+    TEST("BLACK still detected: request system reboot");
+    assert(junos_route_command("request system reboot") == VIRP_TIER_BLACK); PASS();
+}
+
 int main(void)
 {
     printf("VIRP Juniper JunOS Driver — Unit Tests\n");
@@ -489,6 +592,8 @@ int main(void)
     test_multicommand_refused();
     test_batch_tier_prescan();
 
+    test_adversarial_separators();
+    test_legit_matches_unaffected();
     printf("\n=======================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

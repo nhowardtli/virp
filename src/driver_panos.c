@@ -157,14 +157,37 @@ virp_trust_tier_t pa_route_command(const char *command)
 {
     if (!command) return VIRP_TIER_YELLOW;
 
+    /*
+     * Layer 3a — a separator-carrying string is not one command, so this
+     * table cannot vouch for it. Fail closed to RED here as well as at
+     * the daemon boundary, because pa_route_command is directly callable.
+     */
+    if (virp_command_check_separators(command, NULL, 0) != 0)
+        return VIRP_TIER_RED;
+
     /* Skip leading whitespace */
     while (*command == ' ' || *command == '\t') command++;
 
+    /*
+     * First match wins here (NOT longest match) — table order is load-
+     * bearing and documented at the entries. Kept as-is.
+     */
     for (size_t i = 0; i < PA_ROUTE_TABLE_SIZE; i++) {
         size_t plen = strlen(PA_ROUTE_TABLE[i].command_pattern);
         if (strncasecmp(command, PA_ROUTE_TABLE[i].command_pattern, plen) == 0) {
+            /*
+             * Layer 3b — the match must END on a token boundary. '\n' was
+             * previously accepted as a boundary, which WAS this driver's
+             * copy of the multi-command bypass: "show system info\nreload"
+             * matched the GREEN entry and returned its tier. A newline is
+             * a command separator, never a token boundary. Entries ending
+             * in a space carry their own boundary.
+             */
             char next = command[plen];
-            if (next == '\0' || next == ' ' || next == '\t' || next == '\n')
+            bool self_terminated = (plen > 0 &&
+                PA_ROUTE_TABLE[i].command_pattern[plen - 1] == ' ');
+            if (self_terminated ||
+                next == '\0' || next == ' ' || next == '\t')
                 return PA_ROUTE_TABLE[i].tier;
         }
     }
