@@ -106,7 +106,10 @@ static void test_routing_table(void)
         { "/security/user/authenticate",             VIRP_TIER_BLACK  },
         { "/active-response",                        VIRP_TIER_BLACK  },
         { "/manager/restart",                        VIRP_TIER_BLACK  },
-        { "/some/unknown/endpoint",                  VIRP_TIER_GREEN  },
+        /* Fail-closed: an unmapped endpoint is RED, not GREEN. The old
+         * GREEN default was the most permissive tier there is. */
+        { "/some/unknown/endpoint",                  VIRP_TIER_RED    },
+        { "/manager/../../etc/passwd",               VIRP_TIER_RED    },
         { NULL, 0 },
     };
 

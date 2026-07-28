@@ -48,8 +48,16 @@
  *   GREEN  — agent status, health checks (passive monitoring)
  *   YELLOW — alerts, vulnerability, syscheck (security-sensitive data)
  *
- * Prefix-matched, longest match wins. Unmapped defaults to GREEN
- * (Wazuh API user is read-only, role ID 2).
+ * Prefix-matched, longest match wins. FAIL-CLOSED: unmapped endpoints
+ * default to RED.
+ *
+ * This table is NOT currently wired to a route_command hook (see
+ * wazuh_driver below), so gate_classify returns UNCLASSIFIED for this
+ * driver today. The default is fail-closed regardless: whoever wires it
+ * up must not inherit a permissive default. It previously defaulted to
+ * GREEN — the most permissive tier there is — on the rationale that the
+ * API user is read-only, which is a property of the deployed credential,
+ * not of the endpoint being classified.
  * ========================================================================= */
 
 const wz_command_route_t WZ_ROUTE_TABLE[] = {
@@ -90,7 +98,7 @@ const size_t WZ_ROUTE_TABLE_SIZE =
 
 virp_trust_tier_t wz_route_endpoint(const char *endpoint)
 {
-    if (!endpoint) return VIRP_TIER_GREEN;
+    if (!endpoint) return VIRP_TIER_RED;             /* fail closed */
 
     /* Strip query string for matching */
     size_t ep_len = strlen(endpoint);
@@ -112,7 +120,8 @@ virp_trust_tier_t wz_route_endpoint(const char *endpoint)
         }
     }
 
-    return best ? best->tier : VIRP_TIER_GREEN;
+    /* Fail-closed: an unmapped endpoint is RED, not GREEN. */
+    return best ? best->tier : VIRP_TIER_RED;
 }
 
 /* =========================================================================
