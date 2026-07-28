@@ -13,6 +13,7 @@
 #include "driver_panos.h"
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <assert.h>
 
 static int tests_run = 0;
@@ -176,16 +177,14 @@ static void test_ordering_and_boundary(void)
     assert(pa_route_command("show systemfoo") == VIRP_TIER_RED);
     PASS();
 
-    /* KNOWN word-boundary mis-tier: real PAN-OS interface syntax has no
-     * space (ethernet1/1), so it does NOT match "show interface ethernet"
-     * and falls to the YELLOW default. Fail-safe (over-restrictive, not
-     * dangerous); documented here so the behavior is explicit. */
-    /* RELIER on the old YELLOW default — NOT added to the table.
-     * This is a legitimate command that was never listed; it executed
-     * only because the no-match default cleared the gate. Now RED.
-     * Listing it is a deliberate tier decision, not a bug fix. */
-    TEST("show interface ethernet1/1 -> RED (word-boundary fall-through)");
-    assert(pa_route_command("show interface ethernet1/1") == VIRP_TIER_RED);
+    /* RESOLVED: real PAN-OS interface syntax has no space
+     * (ethernet1/1), which used to miss "show interface ethernet" and
+     * fall through. The entry now carries prefix=true, so the unit
+     * attaches over the restricted [A-Za-z0-9._/-] class and the entry's
+     * GREEN applies again. Separator forms are still refused — see
+     * test_prefix_entries_positive_and_negative. */
+    TEST("show interface ethernet1/1 -> GREEN (prefix entry)");
+    assert(pa_route_command("show interface ethernet1/1") == VIRP_TIER_GREEN);
     PASS();
 
     TEST("unmapped command -> RED (fail-closed default)");
@@ -372,6 +371,127 @@ static void test_table_driven_all_entries(void)
            total - skipped, skipped);
 }
 
+
+/* =========================================================================
+ * Prefix-entry lint — FAILS the suite, does not warn
+ *
+ * prefix=true widens the token boundary, so it must never sit on a
+ * GREEN/YELLOW entry that is itself a prefix of a MORE SENSITIVE entry:
+ * that would let the benign entry swallow the sensitive one's commands.
+ * Enforced mechanically over the real table so a future entry cannot
+ * introduce the hazard silently.
+ * ========================================================================= */
+
+static int tier_rank(virp_trust_tier_t t)
+{
+    switch (t) {
+    case VIRP_TIER_GREEN:  return 1;
+    case VIRP_TIER_YELLOW: return 2;
+    case VIRP_TIER_RED:    return 3;
+    case VIRP_TIER_BLACK:  return 4;
+    default:               return 0;
+    }
+}
+
+static void test_prefix_flag_lint(void)
+{
+    printf("\n=== Prefix-entry lint (GREEN/YELLOW prefix of a stricter entry) ===\n");
+
+    size_t flagged = 0;
+    for (size_t i = 0; i < PA_ROUTE_TABLE_SIZE; i++) {
+        if (!PA_ROUTE_TABLE[i].prefix) continue;
+        flagged++;
+
+        const char *pat = PA_ROUTE_TABLE[i].command_pattern;
+        size_t plen = strlen(pat);
+        int rank = tier_rank(PA_ROUTE_TABLE[i].tier);
+
+        char label[192];
+        snprintf(label, sizeof(label),
+                 "prefix entry \"%s\" (%s) shadows nothing stricter", pat,
+                 tier_name(PA_ROUTE_TABLE[i].tier));
+        TEST(label);
+
+        for (size_t j = 0; j < PA_ROUTE_TABLE_SIZE; j++) {
+            if (i == j) continue;
+            /* Does entry j live underneath this prefix? */
+            if (strncasecmp(PA_ROUTE_TABLE[j].command_pattern, pat, plen) != 0)
+                continue;
+            if (tier_rank(PA_ROUTE_TABLE[j].tier) > rank) {
+                printf("\n    LINT FAILURE: prefix entry \"%s\" (%s) would "
+                       "absorb \"%s\" (%s)\n", pat,
+                       tier_name(PA_ROUTE_TABLE[i].tier),
+                       PA_ROUTE_TABLE[j].command_pattern,
+                       tier_name(PA_ROUTE_TABLE[j].tier));
+                assert(0 && "prefix=true on an entry that shadows a stricter one");
+            }
+        }
+        PASS();
+    }
+
+    TEST("exactly the 5 PAN-OS interface entries carry prefix=true");
+    assert(flagged == 5);
+    PASS();
+}
+
+/* =========================================================================
+ * Prefix entries: real interface forms classify again; separators cannot
+ * ride in on the widened boundary.
+ * ========================================================================= */
+
+static void test_prefix_entries_positive_and_negative(void)
+{
+    printf("\n=== Prefix entries — real forms GREEN, separators still refused ===\n");
+
+    TEST("show interface ethernet1/1 -> GREEN");
+    assert(pa_route_command("show interface ethernet1/1") == VIRP_TIER_GREEN); PASS();
+
+    TEST("show interface ethernet1/1.100 -> GREEN (subinterface)");
+    assert(pa_route_command("show interface ethernet1/1.100") == VIRP_TIER_GREEN); PASS();
+
+    TEST("show interface loopback.1 -> GREEN");
+    assert(pa_route_command("show interface loopback.1") == VIRP_TIER_GREEN); PASS();
+
+    TEST("show interface tunnel.1 -> GREEN");
+    assert(pa_route_command("show interface tunnel.1") == VIRP_TIER_GREEN); PASS();
+
+    TEST("show interface vlan.100 -> GREEN");
+    assert(pa_route_command("show interface vlan.100") == VIRP_TIER_GREEN); PASS();
+
+    TEST("show interface aggregate-ethernet1 -> GREEN");
+    assert(pa_route_command("show interface aggregate-ethernet1") == VIRP_TIER_GREEN); PASS();
+
+    TEST("space form still works: show interface ethernet 1/1 -> GREEN");
+    assert(pa_route_command("show interface ethernet 1/1") == VIRP_TIER_GREEN); PASS();
+
+    /* NEGATIVE — a prefix entry must not absorb anything with a separator. */
+    TEST("show interface ethernet1/1;reload -> RED");
+    assert(pa_route_command("show interface ethernet1/1;reload") == VIRP_TIER_RED); PASS();
+
+    TEST("show interface ethernet1/1|reload -> RED");
+    assert(pa_route_command("show interface ethernet1/1|reload") == VIRP_TIER_RED); PASS();
+
+    TEST("show interface ethernet1/1\\nrequest restart system -> RED");
+    assert(pa_route_command("show interface ethernet1/1\nrequest restart system") == VIRP_TIER_RED); PASS();
+
+    TEST("show interface ethernet$(reload) -> RED");
+    assert(pa_route_command("show interface ethernet$(reload)") == VIRP_TIER_RED); PASS();
+
+    TEST("show interface ethernet`reload` -> RED");
+    assert(pa_route_command("show interface ethernet`reload`") == VIRP_TIER_RED); PASS();
+
+    TEST("show interface ethernet&&reload -> RED");
+    assert(pa_route_command("show interface ethernet&&reload") == VIRP_TIER_RED); PASS();
+
+    /* Outside the restricted class: '=' is not an allowed prefix char. */
+    TEST("show interface ethernet=1 -> RED (char outside [A-Za-z0-9._/-])");
+    assert(pa_route_command("show interface ethernet=1") == VIRP_TIER_RED); PASS();
+
+    /* A NON-prefix entry must NOT have gained the widened boundary. */
+    TEST("show systemfoo -> RED (non-prefix entry unaffected)");
+    assert(pa_route_command("show systemfoo") == VIRP_TIER_RED); PASS();
+}
+
 int main(void)
 {
     printf("VIRP PAN-OS Driver — Unit Tests\n");
@@ -386,6 +506,8 @@ int main(void)
     test_legit_matches_unaffected();
     test_no_match_fails_closed();
     test_table_driven_all_entries();
+    test_prefix_flag_lint();
+    test_prefix_entries_positive_and_negative();
     printf("\n================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

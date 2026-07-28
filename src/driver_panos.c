@@ -71,80 +71,80 @@
 
 const pa_command_route_t PA_ROUTE_TABLE[] = {
     /* GREEN TIER — passive read-only monitoring */
-    { "show system info",                   VIRP_TIER_GREEN },
-    { "show system state",                  VIRP_TIER_GREEN },
-    { "show system resources",              VIRP_TIER_GREEN },
-    { "show system environmentals",         VIRP_TIER_GREEN },
-    { "show system software",              VIRP_TIER_GREEN },
-    { "show system disk-space",             VIRP_TIER_GREEN },
-    { "show interface all",                 VIRP_TIER_GREEN },
-    { "show interface ethernet",            VIRP_TIER_GREEN },
-    { "show interface loopback",            VIRP_TIER_GREEN },
-    { "show interface tunnel",              VIRP_TIER_GREEN },
-    { "show interface vlan",                VIRP_TIER_GREEN },
-    { "show interface aggregate-ethernet",  VIRP_TIER_GREEN },
-    { "show session info",                  VIRP_TIER_GREEN },
-    { "show session all",                   VIRP_TIER_GREEN },
-    { "show session id",                    VIRP_TIER_GREEN },
-    { "show session meter",                 VIRP_TIER_GREEN },
-    { "show high-availability state",       VIRP_TIER_GREEN },
-    { "show high-availability all",         VIRP_TIER_GREEN },
-    { "show high-availability",             VIRP_TIER_GREEN },
-    { "show arp all",                       VIRP_TIER_GREEN },
-    { "show arp",                           VIRP_TIER_GREEN },
-    { "show routing route",                 VIRP_TIER_GREEN },
-    { "show routing summary",              VIRP_TIER_GREEN },
-    { "show routing protocol",              VIRP_TIER_GREEN },
-    { "show routing",                       VIRP_TIER_GREEN },
-    { "show clock",                         VIRP_TIER_GREEN },
-    { "show counter global",               VIRP_TIER_GREEN },
-    { "show counter interface",             VIRP_TIER_GREEN },
-    { "show counter",                       VIRP_TIER_GREEN },
-    { "show jobs all",                      VIRP_TIER_GREEN },
-    { "show jobs",                          VIRP_TIER_GREEN },
-    { "show mac all",                       VIRP_TIER_GREEN },
-    { "show neighbor",                      VIRP_TIER_GREEN },
-    { "show ntp",                           VIRP_TIER_GREEN },
-    { "show zone",                          VIRP_TIER_GREEN },
-    { "show vpn ipsec-sa",                  VIRP_TIER_GREEN },
-    { "show vpn ike-sa",                    VIRP_TIER_GREEN },
-    { "show vpn flow",                      VIRP_TIER_GREEN },
-    { "show vpn",                           VIRP_TIER_GREEN },
-    { "show dns-proxy cache",              VIRP_TIER_GREEN },
-    { "show dhcp server",                   VIRP_TIER_GREEN },
-    { "show global-protect-gateway",        VIRP_TIER_GREEN },
-    { "show log system",                    VIRP_TIER_GREEN },
-    { "show log traffic",                   VIRP_TIER_GREEN },
-    { "show log threat",                    VIRP_TIER_GREEN },
-    { "show log",                           VIRP_TIER_GREEN },
+    { "show system info",                   VIRP_TIER_GREEN, false },
+    { "show system state",                  VIRP_TIER_GREEN, false },
+    { "show system resources",              VIRP_TIER_GREEN, false },
+    { "show system environmentals",         VIRP_TIER_GREEN, false },
+    { "show system software",              VIRP_TIER_GREEN, false },
+    { "show system disk-space",             VIRP_TIER_GREEN, false },
+    { "show interface all",                 VIRP_TIER_GREEN, false },
+    { "show interface ethernet",            VIRP_TIER_GREEN, true },
+    { "show interface loopback",            VIRP_TIER_GREEN, true },
+    { "show interface tunnel",              VIRP_TIER_GREEN, true },
+    { "show interface vlan",                VIRP_TIER_GREEN, true },
+    { "show interface aggregate-ethernet",  VIRP_TIER_GREEN, true },
+    { "show session info",                  VIRP_TIER_GREEN, false },
+    { "show session all",                   VIRP_TIER_GREEN, false },
+    { "show session id",                    VIRP_TIER_GREEN, false },
+    { "show session meter",                 VIRP_TIER_GREEN, false },
+    { "show high-availability state",       VIRP_TIER_GREEN, false },
+    { "show high-availability all",         VIRP_TIER_GREEN, false },
+    { "show high-availability",             VIRP_TIER_GREEN, false },
+    { "show arp all",                       VIRP_TIER_GREEN, false },
+    { "show arp",                           VIRP_TIER_GREEN, false },
+    { "show routing route",                 VIRP_TIER_GREEN, false },
+    { "show routing summary",              VIRP_TIER_GREEN, false },
+    { "show routing protocol",              VIRP_TIER_GREEN, false },
+    { "show routing",                       VIRP_TIER_GREEN, false },
+    { "show clock",                         VIRP_TIER_GREEN, false },
+    { "show counter global",               VIRP_TIER_GREEN, false },
+    { "show counter interface",             VIRP_TIER_GREEN, false },
+    { "show counter",                       VIRP_TIER_GREEN, false },
+    { "show jobs all",                      VIRP_TIER_GREEN, false },
+    { "show jobs",                          VIRP_TIER_GREEN, false },
+    { "show mac all",                       VIRP_TIER_GREEN, false },
+    { "show neighbor",                      VIRP_TIER_GREEN, false },
+    { "show ntp",                           VIRP_TIER_GREEN, false },
+    { "show zone",                          VIRP_TIER_GREEN, false },
+    { "show vpn ipsec-sa",                  VIRP_TIER_GREEN, false },
+    { "show vpn ike-sa",                    VIRP_TIER_GREEN, false },
+    { "show vpn flow",                      VIRP_TIER_GREEN, false },
+    { "show vpn",                           VIRP_TIER_GREEN, false },
+    { "show dns-proxy cache",              VIRP_TIER_GREEN, false },
+    { "show dhcp server",                   VIRP_TIER_GREEN, false },
+    { "show global-protect-gateway",        VIRP_TIER_GREEN, false },
+    { "show log system",                    VIRP_TIER_GREEN, false },
+    { "show log traffic",                   VIRP_TIER_GREEN, false },
+    { "show log threat",                    VIRP_TIER_GREEN, false },
+    { "show log",                           VIRP_TIER_GREEN, false },
 
     /* YELLOW TIER — configuration reads, active diagnostics */
-    { "show running security-policy",       VIRP_TIER_YELLOW },
-    { "show running nat-policy",            VIRP_TIER_YELLOW },
-    { "show running qos-policy",            VIRP_TIER_YELLOW },
-    { "show running",                       VIRP_TIER_YELLOW },
-    { "show config",                        VIRP_TIER_YELLOW },
-    { "debug",                              VIRP_TIER_YELLOW },
-    { "test",                               VIRP_TIER_YELLOW },
-    { "ping",                               VIRP_TIER_YELLOW },
-    { "traceroute",                         VIRP_TIER_YELLOW },
-    { "less",                               VIRP_TIER_YELLOW },
-    { "tail",                               VIRP_TIER_YELLOW },
+    { "show running security-policy",       VIRP_TIER_YELLOW, false },
+    { "show running nat-policy",            VIRP_TIER_YELLOW, false },
+    { "show running qos-policy",            VIRP_TIER_YELLOW, false },
+    { "show running",                       VIRP_TIER_YELLOW, false },
+    { "show config",                        VIRP_TIER_YELLOW, false },
+    { "debug",                              VIRP_TIER_YELLOW, false },
+    { "test",                               VIRP_TIER_YELLOW, false },
+    { "ping",                               VIRP_TIER_YELLOW, false },
+    { "traceroute",                         VIRP_TIER_YELLOW, false },
+    { "less",                               VIRP_TIER_YELLOW, false },
+    { "tail",                               VIRP_TIER_YELLOW, false },
     /* Operational/topology reads — NOT credential-exposing; YELLOW to
      * match the config-read precedent. show panorama-status reveals the
      * Panorama mgmt IP + connection state; show device-group reveals
      * group membership / pushed config. (No earlier entry word-boundary-
      * matches these, so placement here is order-safe for first-match.) */
-    { "show device-group",                  VIRP_TIER_YELLOW },
-    { "show panorama-status",               VIRP_TIER_YELLOW },
+    { "show device-group",                  VIRP_TIER_YELLOW, false },
+    { "show panorama-status",               VIRP_TIER_YELLOW, false },
 
     /* RED TIER — credential-exposing reads only */
-    { "show admins",                        VIRP_TIER_RED },
-    { "show user ip-user-mapping",          VIRP_TIER_RED },
-    { "show user group",                    VIRP_TIER_RED },
-    { "show user",                          VIRP_TIER_RED },
-    { "show certificate",                   VIRP_TIER_RED },
-    { "request password-hash",              VIRP_TIER_RED },
+    { "show admins",                        VIRP_TIER_RED, false },
+    { "show user ip-user-mapping",          VIRP_TIER_RED, false },
+    { "show user group",                    VIRP_TIER_RED, false },
+    { "show user",                          VIRP_TIER_RED, false },
+    { "show certificate",                   VIRP_TIER_RED, false },
+    { "request password-hash",              VIRP_TIER_RED, false },
 };
 
 const size_t PA_ROUTE_TABLE_SIZE =
@@ -153,6 +153,17 @@ const size_t PA_ROUTE_TABLE_SIZE =
 /* =========================================================================
  * Command Routing — prefix match against table
  * ========================================================================= */
+
+/*
+ * Characters a prefix entry may absorb without an intervening space:
+ * [A-Za-z0-9._/-]. Deliberately narrow — see pa_command_route_t.prefix.
+ */
+static bool pa_prefix_char_ok(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == '.' || c == '_' || c == '/' || c == '-';
+}
 
 virp_trust_tier_t pa_route_command(const char *command)
 {
@@ -188,7 +199,19 @@ virp_trust_tier_t pa_route_command(const char *command)
             bool self_terminated = (plen > 0 &&
                 PA_ROUTE_TABLE[i].command_pattern[plen - 1] == ' ');
             if (self_terminated ||
-                next == '\0' || next == ' ' || next == '\t')
+                next == '\0' || next == ' ' || next == '\t') {
+                return PA_ROUTE_TABLE[i].tier;
+            }
+            /*
+             * Opt-in prefix entry: the remainder may attach with no
+             * space, but only over a restricted class — alphanumerics
+             * plus '.', '/', '-' and '_'. That covers every PAN-OS
+             * interface unit form ("ethernet1/1.100", "loopback.1",
+             * "ae1") while refusing anything shell- or CLI-meaningful.
+             * Separators are already impossible here: the shared policy
+             * rejects them for the whole string before this point.
+             */
+            if (PA_ROUTE_TABLE[i].prefix && pa_prefix_char_ok(next))
                 return PA_ROUTE_TABLE[i].tier;
         }
     }

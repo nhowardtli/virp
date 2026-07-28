@@ -23,6 +23,28 @@ extern "C" {
 typedef struct {
     const char         *command_pattern;
     virp_trust_tier_t   tier;
+    /*
+     * Opt-in prefix matching. Default false (zero-filled by every
+     * existing brace initializer) means the pattern must end on a token
+     * boundary — end-of-string, space or tab.
+     *
+     * true additionally allows the remainder to attach with NO space,
+     * for PAN-OS entries whose interface unit is suffixed directly onto
+     * the type name ("show interface ethernet" -> "ethernet1/1"). The
+     * remainder is restricted to [A-Za-z0-9._/-]; anything else still
+     * fails the boundary.
+     *
+     * This can never let a prefix entry absorb a second command: the
+     * shared separator policy rejects every separator in the WHOLE
+     * string before this table is consulted, so the remainder is
+     * guaranteed separator-free and can only be arguments to the one
+     * command. The flag widens what counts as a token boundary, not
+     * what counts as a single command.
+     *
+     * A lint in the table-driven test suite REJECTS prefix=true on any
+     * GREEN/YELLOW entry that is a prefix of a more sensitive entry.
+     */
+    bool                prefix;
 } pa_command_route_t;
 
 /* -- PAN-OS-specific error codes (extend virp_error_t range) ------------- */
