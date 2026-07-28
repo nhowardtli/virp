@@ -452,6 +452,19 @@ proofs:
 	@grep -q "RESULT inj-event(accepted(.*)) ==> inj-event(signed(.*)) is true" /tmp/virp-proofs-run.out
 	@echo "  PASS: all 3 ProVerif queries proved"
 
+# Deploy unit-file check — a unit-file regression is invisible to the C
+# battery. Approval mode refuses to start without a chain (see
+# onode_setup_chain_and_approvals in src/virp_onode_prod.c), so the
+# shipped unit MUST pass -c <chain.db> and -C <chain.key>.
+.PHONY: check-deploy-unit
+check-deploy-unit:
+	@echo "=== checking deploy/virp-onode.service for chain flags ==="
+	@grep -Eq '^[[:space:]]*-c[[:space:]]+[^[:space:]]' deploy/virp-onode.service || \
+	    { echo "FAIL: deploy/virp-onode.service is missing '-c <chain.db>' — approval mode will refuse to start"; exit 1; }
+	@grep -Eq '^[[:space:]]*-C[[:space:]]+[^[:space:]]' deploy/virp-onode.service || \
+	    { echo "FAIL: deploy/virp-onode.service is missing '-C <chain.key>' — approval mode will refuse to start"; exit 1; }
+	@echo "  PASS: chain flags present in deploy/virp-onode.service"
+
 # Lint: fail build if sprintf( appears in src/ (use snprintf instead)
 .PHONY: lint-sprintf
 lint-sprintf:
@@ -560,4 +573,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: test test-onode test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit test test-onode test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11

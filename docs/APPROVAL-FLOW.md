@@ -125,6 +125,18 @@ JSON array of:
 An example ships at `docs/approvers.example.json`. Generate entries with
 `virp enroll` (below) — never hand-compute `key_id`.
 
+### Deployment requirement — approval mode needs the chain
+
+Enrolling any usable key in `/etc/virp/approvers.json` turns approval
+mode on at the next daemon start, and approval mode **requires the trust
+chain flags**: the daemon refuses to start (exits non-zero) if
+`-c <chain.db>` / `-C <chain.key>` are absent or chain init fails.
+Without the chain no PROPOSAL → APPROVAL → OUTCOME history is written and
+the L1 consumed-proposal check cannot run. The shipped
+`deploy/virp-onode.service` passes both flags; `make check-deploy-unit`
+(part of `make all-tests`) fails if they are ever removed. Non-approval
+deployments (no registry) may still run chainless, as before.
+
 ## YubiKey PIV enrollment (slot 9c, touch-policy ALWAYS)
 
 Generate the signing key ON the token so the private key never exists off
