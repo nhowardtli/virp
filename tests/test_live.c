@@ -20,6 +20,27 @@ extern void virp_driver_mock_init(void);
 extern void virp_driver_cisco_init(void);
 #endif
 int main(int argc, char **argv) {
+    /*
+     * Live-contact opt-in. This binary opens a real SSH session to
+     * `host`. It SKIPs unless VIRP_LIVE_SSH=1 — the same self-skip shape
+     * as TestInterop_LiveCONode's VIRP_LIVE_INTEROP guard (a2c01ef) and
+     * tests/test_driver_wazuh.c's VIRP_LIVE_WAZUH.
+     *
+     * The default host stays 198.51.100.1 (TEST-NET-3, RFC 5737
+     * documentation range) on purpose: the guard is the control, and a
+     * reserved-range default means even a deliberate run with no
+     * argument cannot reach production. Guard + reserved default is the
+     * pattern; neither replaces the other.
+     */
+    {
+        const char *v = getenv("VIRP_LIVE_SSH");
+        if (!(v && v[0] == '1' && v[1] == '\0')) {
+            printf("[SKIP] virp-live-test opens a REAL SSH session.\n"
+                   "       Set VIRP_LIVE_SSH=1 to enable:\n"
+                   "         make VIRP_LIVE_SSH=1 test-live HOST=<ip>\n");
+            return 0;
+        }
+    }
     const char *host = (argc > 1) ? argv[1] : "198.51.100.1";
     const char *command = (argc > 2) ? argv[2] : "show ip bgp summary";
     printf("\n================================================================\n");

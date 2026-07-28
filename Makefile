@@ -525,6 +525,46 @@ test-drivers:
 	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 \
 	        test-cisco test-cisco-gate test-juniper test-asa test-panos test-fortigate
 
+# Live-contact fence — STRUCTURAL, not a list of known targets.
+#
+# a2c01ef fenced one target (TestInterop_LiveCONode) and the class was
+# assumed covered. It was not: test-wazuh opened an unguarded connection
+# to the production Wazuh manager for months. A hand-maintained list of
+# "the live targets" goes stale exactly that way, so this scans for the
+# PRIMITIVES instead: any tests/ or tools/ source that can originate
+# outbound contact must carry a VIRP_LIVE_* opt-in guard.
+#
+# Detected primitives: a driver connect dispatch (->connect(), a libssh2
+# handshake, a libcurl perform, or a raw AF_INET socket. AF_UNIX is not
+# outbound and is deliberately not matched.
+#
+# The guard is in-source (a getenv that SKIPs unless set), matching
+# tests/test_live.c and tests/test_driver_wazuh.c, so a guarded file is
+# safe to run from any target.
+.PHONY: check-live-fence
+check-live-fence:
+	@echo "=== checking live-contact sources are opt-in guarded ==="
+	@fail=0; \
+	for f in $$(ls tests/*.c tools/*.c 2>/dev/null); do \
+	  if grep -qE '(->connect\(|libssh2_session_handshake\(|curl_easy_perform\(|socket\(AF_INET)' $$f; then \
+	    if grep -q 'VIRP_LIVE_' $$f; then \
+	      echo "    guarded: $$f"; \
+	    else \
+	      echo "FAIL: $$f can originate outbound network contact but has"; \
+	      echo "      no VIRP_LIVE_* opt-in guard."; \
+	      fail=1; \
+	    fi; \
+	  fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then \
+	  echo ""; \
+	  echo "      Add an in-source guard that SKIPs unless the flag is set,"; \
+	  echo "      as tests/test_live.c (VIRP_LIVE_SSH) and"; \
+	  echo "      tests/test_driver_wazuh.c (VIRP_LIVE_WAZUH) do."; \
+	  exit 1; \
+	fi; \
+	echo "  PASS: every live-capable test/tool source is opt-in guarded"
+
 # Deploy unit-file check — a unit-file regression is invisible to the C
 # battery. Approval mode refuses to start without a chain (see
 # onode_setup_chain_and_approvals in src/virp_onode_prod.c), so the
@@ -646,4 +686,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit test test-onode test-drivers test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-live-fence test test-onode test-drivers test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11

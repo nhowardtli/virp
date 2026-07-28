@@ -197,11 +197,26 @@ in with `19c0054`.
 fenced `TestInterop_LiveCONode` behind `VIRP_LIVE_INTEROP=1` and was read
 as having fenced live-device testing generally. It had not: `test-wazuh`
 opened an unguarded connection to the production Wazuh manager
-(`10.0.20.10:55000`), `test-live` opens an unguarded SSH session, and
-`tests/virp_sweep.c` is a fleet-wide SSH sweep with no Makefile target at
-all. `test-wazuh` was brought under an opt-in guard in `0f70b61`;
-**`test-live` and `virp_sweep.c` remain unguarded, and there is no check
-target preventing a new live-capable test from shipping unfenced.**
+(`10.0.20.10:55000`), `test-live` opened an unguarded SSH session, and
+`tests/virp_sweep.c` was a fleet-wide SSH sweep with no Makefile target
+at all — an orphan from the initial commit that CI had never run.
+
+Resolved. `test-wazuh` was guarded in `0f70b61`; `test-live` now
+self-skips unless `VIRP_LIVE_SSH=1` (its default host stays
+`198.51.100.1`, TEST-NET-3 — the guard is the control, the reserved-range
+default is defence in depth); `tests/virp_sweep.c` was deleted, since
+nothing referenced it and no document described it as a supported tool
+(recoverable from `fa245d8`).
+
+The fix that matters is `make check-live-fence`, part of `all-tests`. It
+is **structural, not a list**: it scans every `tests/` and `tools/`
+source for outbound-contact primitives — a driver `->connect(` dispatch,
+`libssh2_session_handshake(`, `curl_easy_perform(`, or a raw
+`socket(AF_INET` — and fails if any file containing one lacks a
+`VIRP_LIVE_*` guard. A hand-maintained list of "the live targets" would
+go stale exactly the way the `a2c01ef` fence did. Verified by injecting
+an unguarded live-capable test (the check failed) and reverting it (the
+check passed).
 
 ## Supported Versions
 
