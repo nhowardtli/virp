@@ -91,17 +91,26 @@ Prompt engineering, output validation, and behavioral guardrails did not fix it.
 
 ## Seven Trust Primitives
 
-| # | Name | What It Does | Status |
-|---|---|---|---|
-| P1 | Verified Observation | Device output HMAC-signed at collection | Production |
-| P2 | Tiered Authorization | Command classification enforced below AI | Production |
-| P3 | Verified Intent | Signed proposals before execution | Implemented |
-| P4 | Verified Outcome | Before/after signed comparison | Implemented |
-| P5 | Baseline Memory | Deviation detection from signed history | Implemented |
-| P6 | Trust Chain | SQLite tamper-evident chain | Implemented |
-| P7 | Trust Federation | Ed25519 cross-tenant verification | Implemented |
+| # | Name | What It Does | Status | Evidence |
+|---|---|---|---|---|
+| P1 | Verified Observation | Device output HMAC-signed at collection | Production | tested |
+| P2 | Tiered Authorization | Command classification enforced below AI | Production | tested — see caveats below |
+| P3 | Verified Intent | Signed proposals before execution | Implemented | tested |
+| P4 | Verified Outcome | Before/after signed comparison | Implemented | tested |
+| P5 | Baseline Memory | Deviation detection from signed history | Implemented | untested — no suite covers deviation detection |
+| P6 | Trust Chain | SQLite tamper-evident chain | Implemented | tested (logic); production-chain integrity unestablished, see below |
+| P7 | Trust Federation | Ed25519 cross-tenant verification | Implemented | tested (crypto only); no multi-tenant deployment exists — federation *operation* is aspirational |
 
 **Production** primitives have accumulated operational history across real deployments. **Implemented** primitives are complete, tested, and exercised in integration runs, but have not yet accumulated equivalent production hours.
+
+> **Gate scope.** The tier gate accepts one command per request. Separator
+> characters (newline, `;`, `|`, `&`, backtick, `$(`, `${`) are rejected
+> fleet-wide, so CLI display filters such as `show run | include bgp` do
+> not work, and multi-line/config-mode payloads are unsupported through
+> the single-command path. The `linux` and `wazuh` drivers have no
+> classifier and execute unclassified under the SHADOW overrides they run
+> with in production. See [`SECURITY.md`](SECURITY.md) §Command Gate —
+> Explicit Scope Limits.
 
 ---
 
@@ -109,13 +118,33 @@ Prompt engineering, output validation, and behavioral guardrails did not fix it.
 
 VIRP has been running continuously on production infrastructure since March 2026.
 
-- **66 days of continuous operation** at time of this writing
-- **2,024 cryptographically linked chain artifacts** across 81 sessions
-- **99.9% chain integrity** (verified against full export)
-- **35-router BGP topology**: full verification under 60 seconds
-- **FortiGate audit**: 15 findings on real hardware, zero false positives
+Each item below is tagged with its evidence status:
+**[tested]** implemented and covered by a checked-in test or machine proof;
+**[untested]** implemented but with no automated coverage;
+**[aspirational]** intended, not yet built.
 
-Fabrication is prevented by protocol design, assuming the O-Node is uncompromised. See [`SECURITY.md`](SECURITY.md) for the full trust boundary analysis, including known open work on TCP-path mutual authentication.
+- **66 days of continuous operation** at time of this writing *[untested — uptime is observed, not asserted by any check]*
+- **2,024 cryptographically linked chain artifacts** across 81 sessions *[untested — a count from a one-time export, not reproduced by a test]*
+- **35-router BGP topology**: full verification under 60 seconds *[untested — a one-time measurement; no benchmark in the suite]*
+- **FortiGate audit**: 15 findings on real hardware, zero false positives *[untested — a one-time manual audit]*
+
+**Chain integrity.** A previous version of this section claimed "99.9%
+chain integrity (verified against full export)". That number has been
+removed rather than explained, because it could not be substantiated and
+because the metric is a category error: a hash-linked chain is valid or
+it is not — a 0.1% failure rate in a structure where each entry commits
+to its predecessor means every entry after the first break is
+unverifiable, not that 99.9% of it is good. The one recorded verification
+in this tree, from 2026-04-24, returned `valid:false first_broken:2`
+(snapshot preserved as `chain.db.broken-2026-04-24`). Chain verification
+logic itself is covered by `tests/test_chain.c` (genesis, sequential
+linking, tamper detection, crash recovery) and
+`tests/test_chain_concurrency.c` *[tested]*; what is **not** established
+is any integrity figure for the production chain. Re-establishing that
+needs a fresh `virp chain verify` against the live database, reported as
+pass/fail with the first broken sequence if any.
+
+Fabrication is prevented by protocol design, assuming the O-Node is uncompromised *[tested — see `docs/VIRP-CLAIMS.md` Appendix A, C5–C8 and C16]*. See [`SECURITY.md`](SECURITY.md) for the full trust boundary analysis, including known open work on TCP-path mutual authentication.
 
 ---
 

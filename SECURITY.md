@@ -18,14 +18,23 @@ We will acknowledge receipt within 48 hours and provide a timeline for remediati
 
 ## Scope
 
-The following are in scope for security reports:
+The following are in scope for security reports. Each is tagged with the
+evidence backing the corresponding defence:
+**[tested]** covered by a checked-in test or machine proof;
+**[untested]** implemented, no automated coverage;
+**[aspirational]** intended, not yet built.
 
-- HMAC-SHA256 signing bypass or forgery
-- Trust tier escalation (e.g., RED command executing as GREEN)
-- Chain database tampering without detection
-- O-Node socket authentication bypass
-- Device credential exposure through the API layer
-- Session handshake state machine violations
+- HMAC-SHA256 signing bypass or forgery *[tested — `tests/test_virp.c`, `tests/test_obs_v2.c`, ProVerif `proofs/virp_obs_v2.pv`]*
+- Trust tier escalation (e.g., RED command executing as GREEN) *[tested — five driver suites incl. table-driven reachability and adversarial separator injection; see `docs/VIRP-CLAIMS.md` C22–C25]*
+- Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection; production-chain integrity unestablished, see README]*
+- O-Node socket authentication bypass *[tested — `tests/test_onode.c` `test_peer_uid_allowed`, `test_peer_uid_rejected`]*
+- Device credential exposure through the API layer *[untested — no suite covers the API layer's credential handling]*
+- Session handshake state machine violations *[tested — `tests/test_session_negative.c`, `tests/test_session_key.c`]*
+
+Two further defences are worth stating explicitly:
+
+- Single-command enforcement / multi-command injection *[tested — suite only, no live device; see the scope limits below]*
+- Fail-closed classification on unrecognized commands *[tested — suite only; all five drivers, both no-match paths]*
 
 ## Out of Scope
 
@@ -101,6 +110,98 @@ to the Unix socket. On this path:
 the dashboard bridge and the socat endpoint, or request-side signing
 at the VIRP message layer — is not yet implemented and is tracked as
 follow-up hardening.
+
+## Command Gate — Explicit Scope Limits
+
+The tier gate accepts **one command per request**. These are deliberate
+limits of that design, not bugs; each is stated so operators do not
+discover them in production.
+
+**Separator characters are rejected fleet-wide.** Control bytes
+(including newline, CR and tab), `;`, `|`, `&`, backtick, `$(` and `${`
+are refused at the daemon boundary before classification, and again in
+every classifier. This is what closes multi-command injection — a
+classifier only ever sees the first command in such a string, while the
+driver sends the whole thing to the device.
+
+The cost is real: **display filters do not work.** `show run | include
+bgp` (IOS), `show configuration | display set` (JunOS) and every other
+pipe-filter idiom is refused, even though `|` on a network CLI is a
+display filter and not command execution. The set is shared across all
+drivers on purpose — on the linux driver `|` *is* command chaining, and a
+per-driver split would let the daemon boundary and the classifiers
+disagree. **Intended future shape:** a per-driver allowlist of pipe
+*verbs* (`include`, `match`, `section`, `display`, `count`, `except`)
+validated after the pipe, so filters are permitted and `| save`, `| tee`
+or a shell pipe remain refused. Not implemented.
+
+**Multi-line and config-mode payloads are unsupported through the
+single-command path.** JunOS config sequences (`configure; set ...;
+commit check; commit`), IOS config blocks and any other payload needing
+several statements in one session cannot be submitted as one string. The
+batch action is the supported route — it classifies and gates each item
+separately. A structured multi-command *proposal* format (an ordered list
+of individually-tiered commands approved as a unit, executed in one
+session) is the intended answer for genuinely session-bound config
+transactions. Not designed yet. Until it exists, session-bound config
+work is out of scope for VIRP.
+
+**linux and wazuh have no classifier.** Neither driver registers a
+`route_command` hook, so `gate_classify` returns UNCLASSIFIED for every
+command they receive. Under ENFORCE that blocks; under the **SHADOW
+overrides both run with in production**, SHADOW logs and proceeds — so
+every linux and wazuh command executes unclassified today. The layer-1
+separator boundary still applies (it is driver-agnostic), which matters
+most for linux, the one driver where `|` and `;` genuinely chain
+commands. Nothing else about their commands is tiered.
+
+**REST-shaped drivers need their own command grammar.** The separator set
+is a CLI grammar. Wazuh's "command" is a URL path, where `&` is a
+legitimate query-string separator and `?`/`/` are structural — so
+applying the CLI set verbatim would refuse ordinary endpoints like
+`/agents?limit=100&offset=0`. A REST driver therefore needs a per-driver
+grammar (path + allowed query parameters) rather than the CLI set. This
+is why `WZ_ROUTE_TABLE` is not wired to a `route_command` hook despite
+now defaulting to RED.
+
+## Corrections to Previously Documented Behavior
+
+Four statements in this repository asserted behavior that no code
+performed. Recorded here because each was load-bearing in a security
+argument at some point.
+
+**Juniper had no BLACK batch pre-scan.** `tests/test_driver_juniper.c`
+described the batch executor as pre-scanning every sub-command for BLACK
+tier before running any. No such pre-scan existed in
+`src/drivers/driver_juniper.c` — the claim lived only in that test file's
+section comment, and the tests underneath it were exercising per-command
+classification, not a batch pre-scan. The batch splitter it described has
+since been deleted (`0a0d75b`).
+
+**The 800-call concurrency suites never exercised a send site.**
+`tests/test_onode_concurrency.c` calls `onode_execute` in-process; it
+never opens a socket, so it could not and did not cover the daemon's
+`send()` paths. The daemon-wide SIGPIPE crash (any client disconnecting
+before reading its response terminated the process, taking down
+verification for the whole fleet) survived every run of that suite and
+was only caught once a real-socket close-before-read test was added in
+`5ba6c94`.
+
+**FortiGate BLACK enforcement was unverified.**
+`tests/test_driver_fortigate_black.c` existed but **no Makefile target
+referenced it**, so it was never built or run. FortiGate's BLACK-tier
+blocking was untested for as long as that file has been in the tree. Wired
+in with `19c0054`.
+
+**The live-contact fence covered one target, not the class.** `a2c01ef`
+fenced `TestInterop_LiveCONode` behind `VIRP_LIVE_INTEROP=1` and was read
+as having fenced live-device testing generally. It had not: `test-wazuh`
+opened an unguarded connection to the production Wazuh manager
+(`10.0.20.10:55000`), `test-live` opens an unguarded SSH session, and
+`tests/virp_sweep.c` is a fleet-wide SSH sweep with no Makefile target at
+all. `test-wazuh` was brought under an opt-in guard in `0f70b61`;
+**`test-live` and `virp_sweep.c` remain unguarded, and there is no check
+target preventing a new live-capable test from shipping unfenced.**
 
 ## Supported Versions
 

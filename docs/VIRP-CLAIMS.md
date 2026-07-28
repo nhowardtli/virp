@@ -374,6 +374,37 @@ exercises the property; every pointer below is a file in this tree.
 | C19 | An approval binds command_hash + device + 300 s TTL, signed by a dedicated Ed25519 key the daemon can verify but never sign with | DEMONSTRATED (live + suite) | `tests/test_approval.c`: `test_e2e_propose_approve_apply`, `test_wrong_key_rejected`, `test_daemon_refuses_secret_key`; live: `docs/LIVE-PROOF-2026-07-23.md` §T5, T8 |
 | C20 | An approved apply executes exactly once; reuse, expiry, hash/device mismatch, and missing approval are rejected with distinct codes (-36…-41), reuse surviving daemon restart | DEMONSTRATED (live + suite) | `tests/test_approval.c`: `test_reused_approval_rejected`, `test_expired_approval_rejected`, `test_hash_mismatch_rejected`, `test_device_mismatch_rejected`, `test_no_approval_plain_block`, `test_reuse_survives_restart`; live: `docs/LIVE-PROOF-2026-07-23.md` §T4–T7 |
 | C21 | PROPOSAL → APPROVAL → OUTCOME are hash-linked on the trust chain | DEMONSTRATED (live + suite) | `tests/test_approval.c`: `test_e2e_propose_approve_apply`, `test_cli_chain_tail_format`; live: `docs/LIVE-PROOF-2026-07-23.md` §T8 |
+| C22 | The gate rejects every known multi-command injection vector, on every driver | DEMONSTRATED (suite only) | Daemon boundary: `tests/test_onode.c` `test_multicommand_newline_is_blocked`, `..._batch`, `test_multicommand_batch_rejects_per_item_not_whole_batch`, `test_separator_policy_rejects_every_class`, and both SHADOW cases. Per-driver classifiers: `test_adversarial_separators` in `tests/test_driver_cisco_gate.c`, `test_driver_asa.c`, `test_driver_panos.c`, `test_driver_juniper.c`, `test_driver_fortigate_black.c` — newline, CR, CRLF, `;`, `\|`, `&`, `&&`, backtick, `$(`, `${`, tab, leading/trailing newline, each built on a real GREEN entry from that driver's own table |
+| C23 | An unrecognized command fails closed (RED) on all five drivers | DEMONSTRATED (suite only) | `test_no_match_fails_closed` in `tests/test_driver_asa.c`, `test_driver_panos.c`, `test_driver_juniper.c`, `test_driver_fortigate_black.c`; Cisco's fail-closed default in `tests/test_driver_cisco_gate.c` `test_fail_closed`. Both no-match paths per driver (NULL early return and table fallback) are covered |
+| C24 | Every classification table entry is reachable and returns the tier it declares | DEMONSTRATED (suite only) | `test_table_driven_all_entries` in all five driver suites, iterating each driver's own table (257 entries). Proves reachability — an entry shadowed by a broader or earlier entry would silently never fire — under both matching disciplines: PAN-OS is first-match (order load-bearing), the other four longest-match |
+| C25 | A prefix-flagged table entry cannot absorb a second command | DEMONSTRATED (suite only) | `tests/test_driver_panos.c`: `test_prefix_entries_positive_and_negative` (separator forms all RED), `test_prefix_flag_lint` (fails the suite if `prefix=true` sits on a GREEN/YELLOW entry that shadows a stricter one) |
+
+**Scope of the live evidence.** C17–C21 carry live results from
+2026-07-23. Those runs submitted **single commands only**, against a
+**single driver** (Cisco IOS). They say nothing about multi-command
+injection, about the no-match default, or about the other four drivers —
+all of which were found defective afterwards and are covered here by
+suite evidence alone. C22–C25 are marked DEMONSTRATED (suite only) for
+that reason: no live device has exercised them. See
+`docs/LIVE-PROOF-2026-07-23.md` §Scope for what that run did and did not
+establish.
+
+**Two open questions, unresolved.**
+
+1. *Config-dumping reads at YELLOW.* `show full-configuration`
+   (FortiGate), `show system ha` (FortiGate) and `show running-config`
+   (ASA/Cisco) are classified YELLOW as "config reads", but their output
+   contains every encrypted secret on the box — PSKs, HA passwords, admin
+   hashes. YELLOW clears the default gate threshold, so these execute
+   without approval. Whether a config dump is a config *read* or a
+   credential read is unsettled; the current tiering treats it as the
+   former.
+2. *Wiring the Wazuh table.* `WZ_ROUTE_TABLE` now fails closed to RED but
+   is attached to no `route_command` hook, so `gate_classify` returns
+   UNCLASSIFIED for that driver. Wiring it would make BLACK endpoints
+   (`/active-response`, `/manager/restart`) auditable immediately and
+   blocking the moment wazuh leaves SHADOW. It also needs a REST-shaped
+   separator grammar first (see the scope limits in `SECURITY.md`).
 
 Statuses above apply to the v2 observation path
 (`virp_verify_observation_v2`, `src/virp_crypto.c`) for C5–C16, and to
