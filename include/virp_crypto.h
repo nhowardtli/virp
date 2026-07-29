@@ -55,6 +55,28 @@ virp_error_t virp_key_init(virp_signing_key_t *sk,
 bool virp_key_owner_ok(uid_t file_owner, uid_t euid);
 
 /*
+ * Durable, symlink-safe small-file write: write to <path>.tmp, fsync it,
+ * rename over <path>, then fsync the PARENT DIRECTORY so the rename
+ * itself survives a crash.
+ *
+ * Symlink safety comes from two properties together:
+ *   - the temp file is created with O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC
+ *     after unlinking any stale temp, so we always own a fresh regular
+ *     file and never write through a planted link;
+ *   - rename(2) REPLACES whatever sits at `path`, including a symlink,
+ *     rather than following it — so a link planted at the destination
+ *     cannot redirect where the bytes land.
+ *
+ * The mode is applied with fchmod after creation, so it holds exactly
+ * regardless of the caller's umask.
+ *
+ * Takes a length rather than a NUL-terminated string: key material is
+ * binary and may contain NUL bytes.
+ */
+virp_error_t virp_write_file_durable(const char *path, mode_t mode,
+                                     const void *buf, size_t len);
+
+/*
  * Initialize a signing key from a file (32 bytes, raw binary).
  * Returns VIRP_OK on success.
  */

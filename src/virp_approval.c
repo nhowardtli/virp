@@ -170,29 +170,19 @@ virp_error_t virp_approval_build_canonical(const char *proposal_id_hex,
     return VIRP_OK;
 }
 
-/* Durable small-file write: temp file, fsync, rename over target. */
+/*
+ * Durable small-file write for NUL-terminated record text.
+ *
+ * Thin shim over virp_write_file_durable(), which owns the symlink-safe
+ * create (O_EXCL|O_NOFOLLOW|O_CLOEXEC after unlinking any stale temp),
+ * the exact-mode fchmod, the short-write loop, and the parent-directory
+ * fsync. Callers here all write text records, so strlen is correct; the
+ * shared helper takes a length because key material is binary.
+ */
 static virp_error_t write_file_durable(const char *path, mode_t mode,
                                        const char *content)
 {
-    char tmp[VIRP_APPROVAL_DIR_MAX + 80];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-
-    int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY, mode);
-    if (fd < 0)
-        return VIRP_ERR_CHAIN_DB;
-    size_t len = strlen(content);
-    ssize_t w = write(fd, content, len);
-    if (w < 0 || (size_t)w != len || fsync(fd) != 0) {
-        close(fd);
-        unlink(tmp);
-        return VIRP_ERR_CHAIN_DB;
-    }
-    close(fd);
-    if (rename(tmp, path) != 0) {
-        unlink(tmp);
-        return VIRP_ERR_CHAIN_DB;
-    }
-    return VIRP_OK;
+    return virp_write_file_durable(path, mode, content, strlen(content));
 }
 
 /* Read a whole record file (bounded). Returns byte count or -1. */

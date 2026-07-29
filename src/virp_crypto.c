@@ -239,6 +239,90 @@ virp_error_t virp_key_generate(virp_signing_key_t *sk,
     return virp_key_init(sk, type, buf);
 }
 
+/* =========================================================================
+ * Durable, symlink-safe small-file write (see virp_crypto.h)
+ * ========================================================================= */
+
+virp_error_t virp_write_file_durable(const char *path, mode_t mode,
+                                     const void *buf, size_t len)
+{
+    if (!path || (!buf && len > 0))
+        return VIRP_ERR_NULL_PTR;
+
+    char tmp[4096];
+    int need = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (need < 0 || (size_t)need >= sizeof(tmp))
+        return VIRP_ERR_INVALID_LENGTH;
+
+    /*
+     * Remove any stale temp first. A crash between create and rename can
+     * leave one behind, and with O_EXCL that would wedge every future
+     * write to this path. Unlinking also clears a symlink planted at the
+     * temp name. ENOENT is the normal case.
+     */
+    if (unlink(tmp) != 0 && errno != ENOENT)
+        return VIRP_ERR_CHAIN_DB;
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                  mode);
+    if (fd < 0)
+        return VIRP_ERR_CHAIN_DB;
+
+    /* Apply the mode exactly: the open() mode is masked by umask. */
+    if (fchmod(fd, mode) != 0) {
+        close(fd);
+        unlink(tmp);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* Write fully — write(2) may return short. */
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, p + off, len - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            unlink(tmp);
+            return VIRP_ERR_CHAIN_DB;
+        }
+        off += (size_t)w;
+    }
+
+    if (fsync(fd) != 0) {
+        close(fd);
+        unlink(tmp);
+        return VIRP_ERR_CHAIN_DB;
+    }
+    close(fd);
+
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    /*
+     * fsync the parent directory. Without this the file contents are
+     * durable but the rename linking them to `path` may not be, so a
+     * crash can leave the old file (or none) in place.
+     */
+    char dirbuf[4096];
+    snprintf(dirbuf, sizeof(dirbuf), "%s", path);
+    char *slash = strrchr(dirbuf, '/');
+    const char *dir = ".";
+    if (slash) {
+        if (slash == dirbuf) dirbuf[1] = '\0';   /* path at filesystem root */
+        else                 *slash    = '\0';
+        dir = dirbuf;
+    }
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd >= 0) {
+        (void)fsync(dfd);      /* best effort: the data is already renamed */
+        close(dfd);
+    }
+    return VIRP_OK;
+}
+
 virp_error_t virp_key_save_file(const virp_signing_key_t *sk,
                                 const char *path)
 {

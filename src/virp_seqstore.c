@@ -17,6 +17,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 static int hexval(char c)
 {
@@ -106,6 +107,29 @@ static virp_error_t seqstore_save(virp_seqstore_t *st)
     if (rename(tmp, st->path) != 0) {
         unlink(tmp);
         return VIRP_ERR_CHAIN_DB;
+    }
+
+    /*
+     * fsync the parent directory. The record bytes were fsynced above,
+     * but without this the rename that links them to st->path may not
+     * survive a crash — leaving the previous file, or none, in place.
+     * Same gap the shared virp_write_file_durable() closes.
+     */
+    {
+        char dirbuf[VIRP_SEQSTORE_PATH_MAX + 8];
+        snprintf(dirbuf, sizeof(dirbuf), "%s", st->path);
+        char *slash = strrchr(dirbuf, '/');
+        const char *dir = ".";
+        if (slash) {
+            if (slash == dirbuf) dirbuf[1] = '\0';
+            else                 *slash    = '\0';
+            dir = dirbuf;
+        }
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0) {
+            (void)fsync(dfd);
+            close(dfd);
+        }
     }
     return VIRP_OK;
 }

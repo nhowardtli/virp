@@ -950,6 +950,146 @@ TEST(test_key_load_ownership_integration)
  * Main — run all tests
  * ========================================================================= */
 
+
+/* =========================================================================
+ * Durable, symlink-safe file write (virp_write_file_durable)
+ *
+ * The WRITE path used to be weaker than the READ path: virp_key_load_file
+ * has used O_NOFOLLOW/O_CLOEXEC plus fstat mode+owner checks for a while,
+ * while the save path opened O_CREAT|O_TRUNC with no O_EXCL and no
+ * O_NOFOLLOW — so a symlink planted at the target redirected where the
+ * bytes landed. That asymmetry was the bug.
+ * ========================================================================= */
+
+#define WFD_DIR   "/tmp/virp-wfd-test"
+#define WFD_TGT   WFD_DIR "/target.bin"
+#define WFD_LINK  WFD_DIR "/decoy.bin"
+
+static void wfd_cleanup(void)
+{
+    unlink(WFD_TGT); unlink(WFD_LINK);
+    unlink(WFD_TGT ".tmp");
+    rmdir(WFD_DIR);
+}
+
+TEST(test_wfd_writes_exact_bytes_and_mode)
+{
+    wfd_cleanup();
+    ASSERT_EQ(mkdir(WFD_DIR, 0700), 0);
+
+    /* Binary payload including an embedded NUL — the reason the helper
+     * takes a length instead of a NUL-terminated string. */
+    const uint8_t payload[8] = { 0xde, 0xad, 0x00, 0xbe, 0xef, 0x00, 0x01, 0x02 };
+    ASSERT_OK(virp_write_file_durable(WFD_TGT, 0600, payload, sizeof(payload)));
+
+    struct stat st;
+    ASSERT_EQ(stat(WFD_TGT, &st), 0);
+    ASSERT_EQ((int)(st.st_mode & 07777), 0600);
+    ASSERT_EQ((int)st.st_size, (int)sizeof(payload));
+    ASSERT_EQ((int)(st.st_mode & (S_IRWXG | S_IRWXO)), 0);
+
+    uint8_t back[8] = {0};
+    int fd = open(WFD_TGT, O_RDONLY);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)read(fd, back, sizeof(back)), (int)sizeof(payload));
+    close(fd);
+    ASSERT_EQ(memcmp(back, payload, sizeof(payload)), 0);
+
+    /* No temp file left behind. */
+    ASSERT_NEQ(stat(WFD_TGT ".tmp", &st), 0);
+    wfd_cleanup();
+}
+
+TEST(test_wfd_symlink_at_target_not_followed)
+{
+    wfd_cleanup();
+    ASSERT_EQ(mkdir(WFD_DIR, 0700), 0);
+
+    /* Decoy the link points at; it must NOT receive the bytes. */
+    int fd = open(WFD_LINK, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)write(fd, "old", 3), 3);
+    close(fd);
+
+    /* Plant the symlink at the write target. */
+    ASSERT_EQ(symlink(WFD_LINK, WFD_TGT), 0);
+
+    const uint8_t secret[4] = { 0x11, 0x22, 0x33, 0x44 };
+    ASSERT_OK(virp_write_file_durable(WFD_TGT, 0600, secret, sizeof(secret)));
+
+    /*
+     * rename(2) REPLACES the symlink rather than following it, so the
+     * target is now a regular file holding our bytes...
+     */
+    struct stat lst;
+    ASSERT_EQ(lstat(WFD_TGT, &lst), 0);
+    ASSERT_EQ((int)S_ISLNK(lst.st_mode), 0);
+    ASSERT_EQ((int)S_ISREG(lst.st_mode), 1);
+    ASSERT_EQ((int)(lst.st_mode & 07777), 0600);
+
+    /* ...and the decoy is untouched: the key did not land at the link
+     * target. This is the assertion the finding is about. */
+    struct stat dst;
+    ASSERT_EQ(stat(WFD_LINK, &dst), 0);
+    ASSERT_EQ((int)dst.st_size, 3);
+    uint8_t decoy[8] = {0};
+    fd = open(WFD_LINK, O_RDONLY);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)read(fd, decoy, sizeof(decoy)), 3);
+    close(fd);
+    ASSERT_EQ(memcmp(decoy, "old", 3), 0);
+    wfd_cleanup();
+}
+
+TEST(test_wfd_symlink_at_temp_path_not_followed)
+{
+    wfd_cleanup();
+    ASSERT_EQ(mkdir(WFD_DIR, 0700), 0);
+
+    /* Plant a symlink at the TEMP name, the other half of the race. */
+    int fd = open(WFD_LINK, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)write(fd, "old", 3), 3);
+    close(fd);
+    ASSERT_EQ(symlink(WFD_LINK, WFD_TGT ".tmp"), 0);
+
+    const uint8_t secret[4] = { 0xaa, 0xbb, 0xcc, 0xdd };
+    ASSERT_OK(virp_write_file_durable(WFD_TGT, 0600, secret, sizeof(secret)));
+
+    /* Decoy still holds its original contents. */
+    uint8_t decoy[8] = {0};
+    fd = open(WFD_LINK, O_RDONLY);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)read(fd, decoy, sizeof(decoy)), 3);
+    close(fd);
+    ASSERT_EQ(memcmp(decoy, "old", 3), 0);
+    wfd_cleanup();
+}
+
+TEST(test_wfd_stale_temp_does_not_wedge_writes)
+{
+    /*
+     * Regression for the O_EXCL adoption: a stale <path>.tmp left by a
+     * crash must not permanently break writes. The helper unlinks it
+     * first, so the write succeeds and self-heals as it did before.
+     */
+    wfd_cleanup();
+    ASSERT_EQ(mkdir(WFD_DIR, 0700), 0);
+
+    int fd = open(WFD_TGT ".tmp", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)write(fd, "stale", 5), 5);
+    close(fd);
+
+    const uint8_t payload[3] = { 1, 2, 3 };
+    ASSERT_OK(virp_write_file_durable(WFD_TGT, 0600, payload, sizeof(payload)));
+
+    struct stat st;
+    ASSERT_EQ(stat(WFD_TGT, &st), 0);
+    ASSERT_EQ((int)st.st_size, 3);
+    wfd_cleanup();
+}
+
 int main(void)
 {
     printf("\n");
@@ -1019,6 +1159,12 @@ int main(void)
     RUN_TEST(test_key_owner_check_predicate);
     RUN_TEST(test_key_load_ownership_integration);
 
+
+    printf("\n[Durable Symlink-Safe File Write]\n");
+    RUN_TEST(test_wfd_writes_exact_bytes_and_mode);
+    RUN_TEST(test_wfd_symlink_at_target_not_followed);
+    RUN_TEST(test_wfd_symlink_at_temp_path_not_followed);
+    RUN_TEST(test_wfd_stale_temp_does_not_wedge_writes);
     printf("\n================================================================\n");
     printf("  Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0)
