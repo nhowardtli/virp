@@ -213,6 +213,21 @@ uint64_t virp_device_id_from_hostname(const char *hostname);
 /* Mock driver for testing — always available */
 void virp_driver_mock_init(void);
 
+/*
+ * Mock driver test hooks. The shared-channel hook makes the mock behave
+ * like a real one-channel-per-session driver: bytes another caller puts
+ * on the channel during an execute() read window are read as part of
+ * that command's output. Used to test serialization of the watchdog's
+ * health_check against in-flight execution.
+ */
+#define MOCK_HEALTH_PROBE_MARKER  "<<<MOCK-HEALTH-PROBE>>>\n"
+void virp_driver_mock_set_shared_channel(bool on);
+/* Count health_check() calls for this hostname only (resets the count).
+ * Other O-Node instances in the same process run their own watchdogs
+ * against their own devices, so an unfiltered count proves nothing. */
+void virp_driver_mock_watch_probes(const char *hostname);
+int  virp_driver_mock_probe_count(void);
+
 /* Real drivers — conditionally compiled */
 #ifdef VIRP_DRIVER_CISCO
 void virp_driver_cisco_init(void);

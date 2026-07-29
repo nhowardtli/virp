@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -34,6 +35,67 @@ void virp_driver_mock_set_connect_fail(bool fail) { mock_connect_fail = fail; }
 static const char *mock_soft_fail_msg = NULL;
 void virp_driver_mock_set_soft_fail(const char *msg) { mock_soft_fail_msg = msg; }
 
+/*
+ * Test hook: simulate a single shared SSH channel per connection.
+ *
+ * A real driver holds one libssh2 channel per session: execute() writes
+ * the command, then reads until the prompt, and ANY bytes another
+ * caller put on that channel meanwhile are read as part of this
+ * command's output — and then signed. When enabled, health_check()
+ * appends MOCK_HEALTH_PROBE_MARKER to the connection's channel buffer
+ * and execute() prepends whatever landed there during its read window
+ * to its own output, so an unserialized watchdog probe is visible in
+ * the observation body. Off by default; no other test is affected.
+ */
+static bool mock_shared_channel = false;
+
+/*
+ * Count of health_check() calls for ONE watched hostname, so a
+ * concurrency test can prove the watchdog actually probed its device
+ * rather than passing because it never ran. Filtered by hostname
+ * because other O-Node instances in the same test process run their
+ * own watchdogs against their own mock devices.
+ *
+ * These hook globals are read by watchdog threads while test threads
+ * write them, so they are guarded. mock_hook_mutex is a leaf lock — no
+ * other lock is ever acquired while it is held.
+ */
+static pthread_mutex_t mock_hook_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int  mock_probe_count = 0;
+static char mock_probe_filter[64] = "";
+
+void virp_driver_mock_set_shared_channel(bool on)
+{
+    pthread_mutex_lock(&mock_hook_mutex);
+    mock_shared_channel = on;
+    pthread_mutex_unlock(&mock_hook_mutex);
+}
+
+static bool mock_shared_channel_on(void)
+{
+    pthread_mutex_lock(&mock_hook_mutex);
+    bool on = mock_shared_channel;
+    pthread_mutex_unlock(&mock_hook_mutex);
+    return on;
+}
+
+void virp_driver_mock_watch_probes(const char *hostname)
+{
+    pthread_mutex_lock(&mock_hook_mutex);
+    snprintf(mock_probe_filter, sizeof(mock_probe_filter), "%s",
+             hostname ? hostname : "");
+    mock_probe_count = 0;
+    pthread_mutex_unlock(&mock_hook_mutex);
+}
+
+int virp_driver_mock_probe_count(void)
+{
+    pthread_mutex_lock(&mock_hook_mutex);
+    int n = mock_probe_count;
+    pthread_mutex_unlock(&mock_hook_mutex);
+    return n;
+}
+
 /* =========================================================================
  * Mock connection — just stores the device info
  * ========================================================================= */
@@ -42,6 +104,8 @@ struct virp_conn {
     virp_device_t   device;
     bool            connected;
     int             cmd_count;
+    /* Simulated shared channel buffer — see mock_shared_channel. */
+    char            chan_buf[256];
 };
 
 /* =========================================================================
@@ -162,6 +226,12 @@ static virp_error_t mock_execute(virp_conn_t *conn,
 
     conn->cmd_count++;
 
+    /* Command written to the channel — the read window opens here, so
+     * anything already buffered from a previous read is drained. */
+    bool shared = mock_shared_channel_on();
+    if (shared)
+        conn->chan_buf[0] = '\0';
+
     /* Optional delay for parallel execution testing */
     if (mock_delay_ms > 0)
         usleep((unsigned)(mock_delay_ms * 1000));
@@ -169,11 +239,15 @@ static virp_error_t mock_execute(virp_conn_t *conn,
     /* Look up simulated response */
     const char *response = mock_find_response(command);
 
+    /* Read the channel: foreign bytes that arrived during the window
+     * come off it first, exactly as a real driver would read them. */
+    const char *chan = shared ? conn->chan_buf : "";
+
     if (response) {
         /* Format like real CLI output: hostname#command\noutput */
         int n = snprintf(result->output, sizeof(result->output),
-                         "%s#%s\n%s",
-                         conn->device.hostname, command, response);
+                         "%s%s#%s\n%s",
+                         chan, conn->device.hostname, command, response);
         result->output_len = (n > 0) ? (size_t)n : 0;
         result->success = true;
         result->exit_code = 0;
@@ -211,6 +285,23 @@ static bool mock_detect(virp_conn_t *conn)
 static virp_error_t mock_health_check(virp_conn_t *conn)
 {
     if (!conn) return VIRP_ERR_NULL_PTR;
+
+    pthread_mutex_lock(&mock_hook_mutex);
+    bool shared = mock_shared_channel;
+    if (mock_probe_filter[0] &&
+        strcmp(conn->device.hostname, mock_probe_filter) == 0)
+        mock_probe_count++;
+    pthread_mutex_unlock(&mock_hook_mutex);
+
+    /* A real health_check writes a keepalive/probe to the channel and
+     * reads the reply. With mock_shared_channel on, those bytes are
+     * left on the same channel execute() reads from. */
+    if (shared) {
+        size_t used = strlen(conn->chan_buf);
+        snprintf(conn->chan_buf + used, sizeof(conn->chan_buf) - used,
+                 "%s", MOCK_HEALTH_PROBE_MARKER);
+    }
+
     return conn->connected ? VIRP_OK : VIRP_ERR_KEY_NOT_LOADED;
 }
 

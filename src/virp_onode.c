@@ -2652,21 +2652,48 @@ static void *watchdog_thread_fn(void *arg)
                 continue;
             }
 
-            /* Case 1: Connection exists — probe with health_check */
+            /* Case 1: Connection exists — probe with health_check.
+             *
+             * LOCK ORDER: exec_mutex[i] → conn_mutex, never the reverse.
+             * The probe drives the same SSH channel as drv->execute, so
+             * it must run under exec_mutex[i] — conn_mutex protects only
+             * the slot pointer, not the channel. An unserialized probe
+             * interleaves with an in-flight command: its bytes land in
+             * that command's SIGNED observation, and concurrent channel
+             * operations on one libssh2 session are a data race.
+             * Acquiring exec_mutex while holding conn_mutex is the
+             * forbidden direction (it would invert against the execute
+             * path, which takes exec_mutex[i] and then conn_mutex inside
+             * get_connection/drop_connection), so release conn_mutex
+             * first and re-validate the slot after the gap.
+             */
             if (conn && drv->health_check) {
+                pthread_mutex_unlock(&state->conn_mutex);
+
+                /* Serialize against any in-flight onode_execute. */
+                pthread_mutex_lock(&state->exec_mutex[i]);
+
+                /* The connection may have been dropped (and freed) by an
+                 * execute-path drop_connection while we waited. */
+                pthread_mutex_lock(&state->conn_mutex);
+                conn = state->connections[i];
+                bool probe_skip = (conn == NULL) || ri->reconnecting;
+                pthread_mutex_unlock(&state->conn_mutex);
+                if (probe_skip) {
+                    pthread_mutex_unlock(&state->exec_mutex[i]);
+                    continue;
+                }
+
                 virp_error_t hc = drv->health_check(conn);
                 if (hc != VIRP_OK) {
                     fprintf(stderr, "[Watchdog] Health check failed: %s — dropping\n",
                             state->devices[i].hostname);
-                    /*
-                     * Null the slot and mark reconnecting under conn_mutex,
-                     * stash the pointer locally, then release conn_mutex
-                     * before taking exec_mutex. This preserves the
-                     * conn_mutex-never-held-with-exec_mutex invariant while
-                     * still serializing disconnect against any in-flight
-                     * onode_execute on the same device.
-                     */
-                    virp_conn_t *stale = conn;
+                    /* Null the slot and arm reconnect under conn_mutex
+                     * (nesting conn under exec is the allowed direction),
+                     * then tear down while still holding exec_mutex[i] so
+                     * no execute can race the free. */
+                    pthread_mutex_lock(&state->conn_mutex);
+                    virp_conn_t *stale = state->connections[i];
                     state->connections[i] = NULL;
                     ri->reconnecting = true;
                     ri->last_attempt = now;
@@ -2674,16 +2701,15 @@ static void *watchdog_thread_fn(void *arg)
                         ri->backoff_sec = ONODE_RECONNECT_BACKOFF_INIT;
                     pthread_mutex_unlock(&state->conn_mutex);
 
-                    /* Wait out any in-flight execute, then tear down. */
-                    pthread_mutex_lock(&state->exec_mutex[i]);
-                    drv->disconnect(stale);
+                    if (stale)
+                        drv->disconnect(stale);
                     pthread_mutex_unlock(&state->exec_mutex[i]);
 
                     pthread_mutex_lock(&state->conn_mutex);
                     ri->reconnecting = false;
                     pthread_mutex_unlock(&state->conn_mutex);
                 } else {
-                    pthread_mutex_unlock(&state->conn_mutex);
+                    pthread_mutex_unlock(&state->exec_mutex[i]);
                 }
                 continue;
             }
@@ -2710,6 +2736,25 @@ static void *watchdog_thread_fn(void *arg)
 done:
     fprintf(stderr, "[Watchdog] Stopped\n");
     return NULL;
+}
+
+/*
+ * Start the watchdog thread against an initialized state. Split out of
+ * onode_start() so tests can exercise watchdog behavior (health-check
+ * probes, reconnects) without binding a socket or entering the accept
+ * loop. onode_destroy() stops and joins the thread.
+ */
+virp_error_t onode_watchdog_start(onode_state_t *state)
+{
+    if (!state)
+        return VIRP_ERR_NULL_PTR;
+    state->watchdog_running = true;
+    if (pthread_create(&state->watchdog_thread, NULL,
+                       watchdog_thread_fn, state) != 0) {
+        state->watchdog_running = false;
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+    return VIRP_OK;
 }
 
 /* =========================================================================
@@ -2988,11 +3033,8 @@ virp_error_t onode_start(onode_state_t *state)
     state->running = true;
 
     /* Start auto-reconnect watchdog thread */
-    state->watchdog_running = true;
-    if (pthread_create(&state->watchdog_thread, NULL, watchdog_thread_fn, state) != 0) {
+    if (onode_watchdog_start(state) != VIRP_OK)
         perror("[O-Node] Failed to start watchdog thread");
-        state->watchdog_running = false;
-    }
 
     /* Event loop */
     while (state->running) {

@@ -2291,6 +2291,143 @@ TEST(test_no_approvers_chain_failure_still_starts)
 }
 
 /* =========================================================================
+ * Watchdog health_check vs. in-flight execute (finding N3)
+ *
+ * The watchdog probes a live connection with drv->health_check(). That
+ * drives the same channel drv->execute() is reading from, so it must be
+ * serialized against execution on the same device by exec_mutex[i]. It
+ * previously ran under conn_mutex only — a different lock — so a probe
+ * could land inside an in-flight command's read window and its bytes
+ * became part of that command's SIGNED observation.
+ *
+ * The mock's shared-channel hook models exactly that: health_check
+ * leaves MOCK_HEALTH_PROBE_MARKER on the channel and execute reads
+ * whatever arrived during its window. Runtime is ~10s: the watchdog's
+ * first steady-state tick is ONODE_WATCHDOG_INTERVAL_SEC after start,
+ * and the execute must still be in flight when it fires.
+ * ========================================================================= */
+
+extern void virp_driver_mock_set_shared_channel(bool on);
+extern void virp_driver_mock_watch_probes(const char *hostname);
+extern int  virp_driver_mock_probe_count(void);
+
+TEST(test_watchdog_health_check_serialized_with_execute)
+{
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0009, NULL,
+                         "/tmp/virp-onode-wdrace.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "R-RACE");
+    snprintf(dev.host, sizeof(dev.host), "10.0.0.97");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0BADF00D;
+    dev.enabled = true;
+    ASSERT_OK(onode_add_device(&tmp, &dev));
+
+    /* Count probes for THIS device only — the suite's served daemon
+     * runs its own watchdog against R6 throughout. */
+    virp_driver_mock_watch_probes("R-RACE");
+    virp_driver_mock_set_shared_channel(true);
+
+    /* Watchdog only — no socket, no accept loop. */
+    ASSERT_OK(onode_watchdog_start(&tmp));
+
+    /* Wait for the watchdog's initial connect pass to establish the
+     * connection, so the steady-state health-check tick is what races
+     * the execute below. */
+    bool connected = false;
+    for (int i = 0; i < 200 && !connected; i++) {
+        pthread_mutex_lock(&tmp.conn_mutex);
+        connected = (tmp.connections[0] != NULL);
+        pthread_mutex_unlock(&tmp.conn_mutex);
+        if (!connected) usleep(25000);
+    }
+    if (!connected) {
+        printf(" [FAIL]\n    watchdog never connected the mock device\n");
+        virp_driver_mock_set_shared_channel(false);
+        tests_run++; tests_failed++;
+        virp_context_destroy(tmp.ctx);
+        onode_destroy(&tmp);
+        return;
+    }
+
+    /*
+     * Run one command whose read window spans the watchdog's first
+     * steady-state tick (the watchdog sleeps ONODE_WATCHDOG_INTERVAL_SEC
+     * before its first probe, so a window of INTERVAL+2 seconds started
+     * now contains that tick).
+     */
+    const int EXEC_MS = (ONODE_WATCHDOG_INTERVAL_SEC + 2) * 1000;
+    virp_driver_mock_set_delay(EXEC_MS);
+
+    /* Must be zero: if the watchdog had already probed before the
+     * command started, the tick we rely on would not be inside the
+     * execute window and a clean body would prove nothing. */
+    int probes_before = virp_driver_mock_probe_count();
+
+    uint8_t obs_buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t obs_len = 0;
+    virp_error_t err = onode_execute(&tmp, "R-RACE", "show version",
+                                     obs_buf, sizeof(obs_buf), &obs_len);
+
+    virp_driver_mock_set_delay(0);
+
+    /*
+     * The probe must actually have fired. With the fix it is blocked on
+     * exec_mutex for the duration of the command and lands just after
+     * onode_execute releases it, so poll rather than sampling once.
+     */
+    int probes = 0;
+    for (int i = 0; i < 200; i++) {
+        probes = virp_driver_mock_probe_count();
+        if (probes > probes_before) break;
+        usleep(25000);
+    }
+
+    virp_driver_mock_set_shared_channel(false);
+    virp_driver_mock_watch_probes(NULL);
+
+    ASSERT_OK(err);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs_buf, obs_len, &tmp.okey, &hdr));
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs_buf + VIRP_HEADER_SIZE,
+                                     obs_len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+
+    if (probes_before != 0 || probes < 1) {
+        printf(" [FAIL]\n    watchdog probe did not fall inside the execute "
+               "window (before=%d after=%d) — test would pass for the "
+               "wrong reason\n", probes_before, probes);
+        tests_run++; tests_failed++;
+        virp_context_destroy(tmp.ctx);
+        onode_destroy(&tmp);
+        return;
+    }
+
+    /* The signed body must be this command's output and nothing else. */
+    ASSERT_TRUE(strstr((const char *)data, "R-RACE#show version") != NULL);
+    ASSERT_TRUE(strstr((const char *)data,
+                       MOCK_HEALTH_PROBE_MARKER) == NULL);
+    /* Not merely uncontaminated — the body must start with this
+     * command's echo, so foreign bytes cannot have led it. */
+    ASSERT_TRUE(strncmp((const char *)data, "R-RACE#show version",
+                        strlen("R-RACE#show version")) == 0);
+
+    virp_context_destroy(tmp.ctx);
+    onode_destroy(&tmp);
+}
+
+/* =========================================================================
  * gate_obs_tier — audit-honesty mapping (Item 1 hardening)
  * ========================================================================= */
 
@@ -2431,6 +2568,9 @@ int main(void)
     RUN_TEST(test_error_obs_connect_failure_is_error_with_true_tier);
     RUN_TEST(test_error_obs_driver_refusal_is_error_not_output);
     RUN_TEST(test_error_obs_gate_block_logs_as_error_not_change);
+
+    printf("\n--- Watchdog / execute serialization (finding N3) ---\n");
+    RUN_TEST(test_watchdog_health_check_serialized_with_execute);
 
     printf("\n[SO_PEERCRED Allowlist Tests]\n");
     RUN_TEST(test_peer_uid_allowed);

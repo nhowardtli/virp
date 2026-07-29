@@ -321,6 +321,15 @@ virp_error_t onode_add_device(onode_state_t *state,
 virp_error_t onode_start(onode_state_t *state);
 
 /*
+ * Start the auto-reconnect watchdog thread on its own. onode_start()
+ * calls this after binding; tests call it directly to exercise the
+ * watchdog (health-check probes against in-flight executes, reconnect
+ * backoff) without binding a socket or entering the accept loop.
+ * onode_destroy() clears watchdog_running and joins the thread.
+ */
+virp_error_t onode_watchdog_start(onode_state_t *state);
+
+/*
  * Signal the O-Node to shut down gracefully.
  * Can be called from a signal handler.
  */
