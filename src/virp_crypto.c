@@ -225,18 +225,39 @@ virp_error_t virp_key_generate(virp_signing_key_t *sk,
     if (!sk)
         return VIRP_ERR_NULL_PTR;
 
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0)
+    /*
+     * Entropy via randombytes_buf(), not a bare read() of /dev/urandom.
+     *
+     * The old path issued a single un-looped read() and compared the
+     * result to VIRP_KEY_SIZE. read(2) is permitted to return short, and
+     * can fail with EINTR; everywhere else this codebase loops (see
+     * recv_exact in virp_onode.c, and the write loop in
+     * virp_write_file_durable). Key generation was the one place that
+     * did not, and it is the path that matters most.
+     *
+     * randombytes_buf() removes the short-read class entirely rather
+     * than handling it: it fills the whole buffer or does not return.
+     * libsodium also owns the fd/getrandom selection and reseeding.
+     * sodium_init() is idempotent and must succeed before use.
+     */
+    if (sodium_init() < 0)
         return VIRP_ERR_KEY_NOT_LOADED;
 
     uint8_t buf[VIRP_KEY_SIZE];
-    ssize_t n = read(fd, buf, VIRP_KEY_SIZE);
-    close(fd);
+    randombytes_buf(buf, sizeof(buf));
 
-    if (n != VIRP_KEY_SIZE)
-        return VIRP_ERR_KEY_NOT_LOADED;
+    virp_error_t err = virp_key_init(sk, type, buf);
 
-    return virp_key_init(sk, type, buf);
+    /*
+     * Wipe the stack copy. virp_key_init has copied the material into
+     * sk->key.key (which is mlocked); leaving a second copy on the stack
+     * to be overwritten by whatever runs next is exactly the exposure
+     * virp_key_destroy() exists to prevent. sodium_memzero is not
+     * elided by the optimiser the way memset can be.
+     */
+    sodium_memzero(buf, sizeof(buf));
+
+    return err;
 }
 
 /* =========================================================================

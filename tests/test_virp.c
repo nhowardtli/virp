@@ -1207,6 +1207,82 @@ TEST(test_key_save_tightens_mode_on_existing_file)
     ks_cleanup();
 }
 
+
+/* =========================================================================
+ * Key generation entropy
+ *
+ * The old path did a single un-looped read() of /dev/urandom and never
+ * wiped the stack buffer. read(2) may return short; every other read in
+ * this codebase loops. Generation now uses randombytes_buf(), which
+ * fills the whole buffer or does not return, and sodium_memzero()s the
+ * stack copy.
+ * ========================================================================= */
+
+TEST(test_key_generate_fills_full_length)
+{
+    virp_signing_key_t sk;
+    memset(&sk, 0, sizeof(sk));
+    ASSERT_OK(virp_key_generate(&sk, VIRP_KEY_TYPE_OKEY));
+
+    ASSERT_TRUE(sk.key.loaded);
+    ASSERT_EQ((int)sk.type, (int)VIRP_KEY_TYPE_OKEY);
+
+    /* Not all-zero: a short or failed fill would leave a zero tail. */
+    int nonzero = 0;
+    for (int i = 0; i < VIRP_KEY_SIZE; i++)
+        if (sk.key.key[i] != 0) nonzero++;
+    ASSERT_TRUE(nonzero > 0);
+
+    /*
+     * A short read would most plausibly leave a run of trailing zeros.
+     * Assert the last quarter of the key is not entirely zero — with
+     * real entropy the chance of that is 256^-8.
+     */
+    int tail_nonzero = 0;
+    for (int i = VIRP_KEY_SIZE - (VIRP_KEY_SIZE / 4); i < VIRP_KEY_SIZE; i++)
+        if (sk.key.key[i] != 0) tail_nonzero++;
+    ASSERT_TRUE(tail_nonzero > 0);
+
+    virp_key_destroy(&sk);
+}
+
+TEST(test_key_generate_two_keys_differ)
+{
+    virp_signing_key_t a, b;
+    ASSERT_OK(virp_key_generate(&a, VIRP_KEY_TYPE_OKEY));
+    ASSERT_OK(virp_key_generate(&b, VIRP_KEY_TYPE_OKEY));
+
+    /* Distinct, and neither is the all-zero key. */
+    ASSERT_NEQ(memcmp(a.key.key, b.key.key, VIRP_KEY_SIZE), 0);
+
+    uint8_t zero[VIRP_KEY_SIZE];
+    memset(zero, 0, sizeof(zero));
+    ASSERT_NEQ(memcmp(a.key.key, zero, VIRP_KEY_SIZE), 0);
+    ASSERT_NEQ(memcmp(b.key.key, zero, VIRP_KEY_SIZE), 0);
+
+    virp_key_destroy(&a);
+    virp_key_destroy(&b);
+}
+
+TEST(test_key_generate_rejects_null)
+{
+    /* The only caller-reachable failure path returns an error rather
+     * than partially initialising anything. */
+    ASSERT_EQ(virp_key_generate(NULL, VIRP_KEY_TYPE_OKEY), VIRP_ERR_NULL_PTR);
+}
+
+TEST(test_key_generate_distinct_across_key_types)
+{
+    virp_signing_key_t o, r;
+    ASSERT_OK(virp_key_generate(&o, VIRP_KEY_TYPE_OKEY));
+    ASSERT_OK(virp_key_generate(&r, VIRP_KEY_TYPE_RKEY));
+    ASSERT_EQ((int)o.type, (int)VIRP_KEY_TYPE_OKEY);
+    ASSERT_EQ((int)r.type, (int)VIRP_KEY_TYPE_RKEY);
+    ASSERT_NEQ(memcmp(o.key.key, r.key.key, VIRP_KEY_SIZE), 0);
+    virp_key_destroy(&o);
+    virp_key_destroy(&r);
+}
+
 int main(void)
 {
     printf("\n");
@@ -1287,6 +1363,12 @@ int main(void)
     RUN_TEST(test_key_save_roundtrip_is_0600_and_intact);
     RUN_TEST(test_key_save_does_not_follow_symlink);
     RUN_TEST(test_key_save_tightens_mode_on_existing_file);
+
+    printf("\n[Key Generation Entropy]\n");
+    RUN_TEST(test_key_generate_fills_full_length);
+    RUN_TEST(test_key_generate_two_keys_differ);
+    RUN_TEST(test_key_generate_rejects_null);
+    RUN_TEST(test_key_generate_distinct_across_key_types);
     printf("\n================================================================\n");
     printf("  Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0)
