@@ -266,6 +266,29 @@ $(TEST_SSH_IO): tests/test_ssh_io.c $(LIB)
 test-ssh-io: $(TEST_SSH_IO)
 	./$(TEST_SSH_IO)
 
+# FortiGate reply scrubbing (finding N1 / 2c)
+TEST_FG_SCRUB = $(BUILD_DIR)/test_driver_fortigate_scrub
+
+# Built with the driver + hostkey objects explicitly, so the suite runs
+# in the default battery even when the library was built without
+# FORTIGATE=1.
+$(BUILD_DIR)/fg_scrub_driver.o: src/drivers/driver_fortigate.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_FORTINET -c $< -o $@
+
+$(BUILD_DIR)/fg_scrub_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_FORTINET -c $< -o $@
+
+$(TEST_FG_SCRUB): tests/test_driver_fortigate_scrub.c \
+                  $(BUILD_DIR)/fg_scrub_driver.o \
+                  $(BUILD_DIR)/fg_scrub_hostkey.o $(LIB)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_FORTINET $< \
+	    $(BUILD_DIR)/fg_scrub_driver.o $(BUILD_DIR)/fg_scrub_hostkey.o \
+	    $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+.PHONY: test-fg-scrub
+test-fg-scrub: $(TEST_FG_SCRUB)
+	./$(TEST_FG_SCRUB)
+
 # Chain and Federation tests
 TEST_CHAIN = $(BUILD_DIR)/test_chain
 TEST_FED   = $(BUILD_DIR)/test_federation
@@ -673,11 +696,12 @@ asan-test:
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined"
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
-	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO)
+	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO) $(TEST_FG_SCRUB)
 	@echo "=== Running tests under ASan+UBSan ==="
 	./$(TEST_BIN) 2>&1
 	./$(TEST_ONODE) 2>&1
 	./$(TEST_SSH_IO) 2>&1
+	./$(TEST_FG_SCRUB) 2>&1
 	@echo "=== ASan+UBSan test run complete ==="
 
 # libFuzzer harness (requires clang)
@@ -756,4 +780,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-drivers test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11

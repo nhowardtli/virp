@@ -43,4 +43,20 @@ virp_trust_tier_t fg_route_command(const char *command);
 #ifdef __cplusplus
 }
 #endif
+
+/*
+ * Reply scrubbing (exposed for tests).
+ *
+ * fg_scrub_reply reduces a raw FortiOS reply to the device's answer:
+ * it drops the command echo, and for a VDOM-wrapped command the
+ * `config vdom` / `edit <vdom>` / `end` echoes around it, plus the
+ * trailing prompt. Returns NULL when the command echo is absent — the
+ * reply cannot then be reduced to a trustworthy body and the caller
+ * reports an error instead of guessing.
+ */
+char *fg_scrub_reply(char *raw, size_t total, const char *command,
+                     bool vdom_wrapped, size_t *out_len);
+char *fg_line_after_containing(char *buf, const char *needle);
+char *fg_find_last_echo_line(char *buf, const char *word);
+
 #endif /* VIRP_DRIVER_FORTIGATE_H */

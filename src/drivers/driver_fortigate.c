@@ -177,6 +177,136 @@ static bool fg_command_needs_vdom(const char *command)
          || strncasecmp(command, "diagnose ",         9) == 0);
 }
 
+/*
+ * FortiGate output scrubbing.
+ *
+ * FortiOS echoes every line it is sent, each preceded by a prompt, so a
+ * VDOM-wrapped command comes back roughly as:
+ *
+ *   FGT # config vdom
+ *   FGT (vdom) # edit <vdom>
+ *   current vf=<vdom>:0
+ *   FGT (<vdom>) # <command>
+ *   <the output we actually want>
+ *   FGT (<vdom>) # end
+ *   FGT #
+ *
+ * The previous scrub dropped only the FIRST line, so `edit <vdom>`, the
+ * command echo and the trailing `end` echo all landed inside the SIGNED
+ * observation body. Locating the boundaries by matching the text we
+ * sent — rather than by counting lines — is what keeps the body to the
+ * device's actual answer.
+ */
+
+/* Start of the line following the first line that contains `needle`. */
+char *fg_line_after_containing(char *buf, const char *needle)
+{
+    char *hit = strstr(buf, needle);
+    if (!hit) return NULL;
+    char *nl = strchr(hit, '\n');
+    return nl ? nl + 1 : NULL;
+}
+
+/*
+ * Start of the last line whose content (after any "prompt # " prefix) is
+ * exactly `word`. Used to find the trailing `end` echo.
+ */
+char *fg_find_last_echo_line(char *buf, const char *word)
+{
+    size_t wlen = strlen(word);
+    char *best = NULL;
+    char *line = buf;
+
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+
+        /* Skip a leading "<prompt> # " if present. */
+        const char *content = line;
+        size_t clen = len;
+        for (size_t i = 0; i + 1 < len; i++) {
+            if (line[i] == '#' && line[i + 1] == ' ') {
+                content = line + i + 2;
+                clen = len - (i + 2);
+            }
+        }
+        while (clen > 0 && (content[clen - 1] == '\r' ||
+                            content[clen - 1] == ' '))
+            clen--;
+
+        if (clen == wlen && strncmp(content, word, wlen) == 0)
+            best = line;
+
+        line = nl ? nl + 1 : NULL;
+    }
+    return best;
+}
+
+
+/*
+ * Pure scrub: given the raw reply, return the device's answer.
+ *
+ * Returns NULL if the command echo is absent — meaning the reply cannot
+ * be reduced to a trustworthy body, which the caller reports as an
+ * error rather than guessing at boundaries. Exposed (non-static) so
+ * tests can drive it with recorded FortiOS transcripts; the SSH path
+ * around it needs a live device.
+ */
+char *fg_scrub_reply(char *raw, size_t total, const char *command,
+                     bool vdom_wrapped, size_t *out_len)
+{
+    if (!raw || !command || !out_len) return NULL;
+    *out_len = 0;
+
+    char *start = fg_line_after_containing(raw, command);
+    if (!start)
+        return NULL;
+
+    char *end = raw + total;
+
+    /*
+     * Cut at the trailing `end` echo that closes the VDOM wrapper. The
+     * LAST such line is the wrapper's: FortiOS config output can itself
+     * contain `end` lines (a `show router ...` block ends with one), and
+     * those precede the wrapper echo.
+     */
+    bool cut_at_wrapper = false;
+    if (vdom_wrapped) {
+        char *end_echo = fg_find_last_echo_line(start, "end");
+        if (end_echo) {
+            end = end_echo;
+            cut_at_wrapper = true;
+        }
+    }
+
+    size_t payload_len;
+    if (cut_at_wrapper) {
+        /*
+         * The wrapper echo line and the final prompt after it are
+         * already outside [start, end). Only trim the line break that
+         * preceded the echo — running the prompt-line walk below here
+         * would delete the last line of real output.
+         */
+        while (end > start && (end[-1] == '\r' || end[-1] == '\n'))
+            end--;
+        payload_len = (size_t)(end - start);
+    } else {
+        /* No wrapper: drop the trailing prompt line itself. */
+        while (end > start && (end[-1] == ' ' || end[-1] == '#' ||
+                               end[-1] == '\r' || end[-1] == '\n'))
+            end--;
+        char *prompt_line = end;
+        while (prompt_line > start && prompt_line[-1] != '\n')
+            prompt_line--;
+        payload_len = (size_t)(prompt_line - start);
+        if (payload_len > 0 && start[payload_len - 1] == '\r')
+            payload_len--;
+    }
+
+    *out_len = payload_len;
+    return start;
+}
+
 static virp_error_t fg_ssh_execute(struct virp_conn *conn,
                                    const char *command,
                                    virp_exec_result_t *result)
@@ -228,7 +358,8 @@ static virp_error_t fg_ssh_execute(struct virp_conn *conn,
     char cmd_buf[4096];
     int cmd_len;
 
-    if (conn->vdom_enabled && fg_command_needs_vdom(command)) {
+    bool vdom_wrapped = (conn->vdom_enabled && fg_command_needs_vdom(command));
+    if (vdom_wrapped) {
         cmd_len = snprintf(cmd_buf, sizeof(cmd_buf),
                            "config vdom\nedit %s\n%s\nend\n",
                            vdom, command);
@@ -250,6 +381,7 @@ static virp_error_t fg_ssh_execute(struct virp_conn *conn,
 
     size_t total = 0;
     int idle_cycles = 0;
+    bool prompt_seen = false;
     libssh2_session_set_blocking(session, 0);
 
     while (total < FG_SSH_BUFFER_SIZE - 1 && idle_cycles < 30) {
@@ -260,8 +392,18 @@ static virp_error_t fg_ssh_execute(struct virp_conn *conn,
             total += n;
             idle_cycles = 0;
 
-            if (total > 3 && raw[total - 1] == ' '
-                          && raw[total - 2] == '#') {
+            /*
+             * Trim trailing padding before testing, rather than
+             * requiring the read to land exactly on "# ". The old test
+             * only fired when a fragment boundary happened to sit on
+             * those two bytes.
+             */
+            size_t t = total;
+            while (t > 0 && (raw[t - 1] == ' ' || raw[t - 1] == '\r' ||
+                             raw[t - 1] == '\n'))
+                t--;
+            if (t > 0 && raw[t - 1] == '#') {
+                prompt_seen = true;
                 break;
             }
         } else if (n == LIBSSH2_ERROR_EAGAIN) {
@@ -275,22 +417,47 @@ static virp_error_t fg_ssh_execute(struct virp_conn *conn,
     libssh2_session_set_blocking(session, 1);
     raw[total] = '\0';
 
-    /* Strip command echo and trailing prompt */
-    char *start = strstr(raw, "\n");
-    if (start) start++;
-    else start = raw;
+    /*
+     * Inspect the read outcome. The loop can also end on a full buffer,
+     * a 3s idle timeout or a transport error; those produce a partial
+     * body, which must never be reported as the device's answer. This
+     * used to set success = true unconditionally.
+     */
+    if (!prompt_seen) {
+        fprintf(stderr, "[FortiGate] Read ended without prompt: device=%s "
+                "bytes=%zu (buffer_full=%s) — reporting as error\n",
+                conn->device.hostname, total,
+                (total >= FG_SSH_BUFFER_SIZE - 1) ? "yes" : "no");
+        free(raw);
+        libssh2_channel_close(channel);
+        libssh2_channel_free(channel);
+        result->success = false;
+        result->output_len = 0;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Incomplete read on %s: no prompt after %zu bytes",
+                 conn->device.hostname, total);
+        return VIRP_ERR_NO_PROMPT;
+    }
 
-    char *end = raw + total;
-    while (end > start && (end[-1] == ' ' || end[-1] == '#'
-                           || end[-1] == '\r' || end[-1] == '\n'))
-        end--;
-    char *prompt_line = end;
-    while (prompt_line > start && prompt_line[-1] != '\n')
-        prompt_line--;
-
-    size_t payload_len = (size_t)(prompt_line - start);
-    if (payload_len > 0 && start[payload_len - 1] == '\r')
-        payload_len--;
+    /* Strip the command echo and, when VDOM-wrapped, the wrapper
+     * echoes around it. */
+    size_t payload_len = 0;
+    char *start = fg_scrub_reply(raw, total, command, vdom_wrapped,
+                                 &payload_len);
+    if (!start) {
+        fprintf(stderr, "[FortiGate] Command echo not found in reply: "
+                "device=%s command='%s' — reporting as error\n",
+                conn->device.hostname, command);
+        free(raw);
+        libssh2_channel_close(channel);
+        libssh2_channel_free(channel);
+        result->success = false;
+        result->output_len = 0;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Malformed reply on %s: command echo missing",
+                 conn->device.hostname);
+        return VIRP_ERR_NO_PROMPT;
+    }
 
     /* Copy into fixed-size result buffer */
     if (payload_len >= VIRP_OUTPUT_MAX)
