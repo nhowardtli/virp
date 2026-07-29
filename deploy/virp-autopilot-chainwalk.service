@@ -1,0 +1,10 @@
+[Unit]
+Description=VIRP Autopilot — daily full chain verification walk + signed summary
+After=virp-onode.service
+Requires=virp-onode.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/virp/autopilot/virp_autopilot.py chainwalk
+NoNewPrivileges=yes
+PrivateTmp=yes

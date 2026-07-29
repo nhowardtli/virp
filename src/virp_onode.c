@@ -1541,6 +1541,71 @@ static int hex_nibble(char c)
     return -1;
 }
 
+/* =========================================================================
+ * Autopilot hard exclusions — non-negotiable device blocklist
+ *
+ * 10.0.10.1 (the edge firewall) and 10.0.10.10 must NEVER appear in a
+ * device config this daemon loads. The check is a startup assertion in
+ * every config loader: a config carrying either address is refused
+ * outright — no skip-and-continue, the daemon does not start.
+ *
+ * Matching is boundary-aware over the raw config text so it catches the
+ * address anywhere (host fields, comments, spare keys) without false-
+ * positives on neighbors: an occurrence counts only when the preceding
+ * character is not [0-9.] and the following character is not a digit,
+ * so "10.0.10.12" and "10.0.10.100" do NOT trip the "10.0.10.1" /
+ * "10.0.10.10" rules.
+ * ========================================================================= */
+
+static const char *const ONODE_BLOCKED_ADDRS[] = {
+    "10.0.10.1",
+    "10.0.10.10",
+};
+
+const char *virp_config_blocked_address(const char *text)
+{
+    if (!text) return NULL;
+
+    for (size_t i = 0;
+         i < sizeof(ONODE_BLOCKED_ADDRS) / sizeof(ONODE_BLOCKED_ADDRS[0]);
+         i++) {
+        const char *addr = ONODE_BLOCKED_ADDRS[i];
+        size_t alen = strlen(addr);
+        for (const char *p = strstr(text, addr); p;
+             p = strstr(p + 1, addr)) {
+            char prev = (p == text) ? '\0' : p[-1];
+            char next = p[alen];
+            bool prev_extends = (prev >= '0' && prev <= '9') || prev == '.';
+            bool next_extends = (next >= '0' && next <= '9');
+            if (!prev_extends && !next_extends)
+                return addr;
+        }
+    }
+    return NULL;
+}
+
+/* File variant for the config loaders: reads up to 1 MiB of the config
+ * and scans it. An unreadable file returns NULL — the loader's own
+ * open/parse error handling covers that case. */
+const char *virp_config_file_blocked(const char *path)
+{
+    if (!path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    static const size_t MAX_CFG = 1024 * 1024;
+    char *buf = malloc(MAX_CFG + 1);
+    if (!buf) { fclose(f); return NULL; }
+
+    size_t n = fread(buf, 1, MAX_CFG, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    const char *blocked = virp_config_blocked_address(buf);
+    free(buf);
+    return blocked;   /* points at a static table entry, or NULL */
+}
+
 /* Decode hex string to bytes. Returns number of bytes written, or -1 on error.
  * Rejects any non-[0-9a-fA-F] character (no whitespace, signs, or 0x prefixes). */
 int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len)

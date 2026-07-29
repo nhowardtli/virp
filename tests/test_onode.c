@@ -2067,6 +2067,94 @@ TEST(test_load_devices_skips_missing_required_fields)
 }
 
 /* =========================================================================
+ * Autopilot hard exclusions — 10.0.10.1 / 10.0.10.10 must never load
+ *
+ * The text scan is boundary-aware: the LibreNMS host 10.0.10.12 and a
+ * hypothetical 10.0.10.100 must NOT trip the assertion, while either
+ * blocked address anywhere in the file (host field, spare key, comment)
+ * must refuse the whole config.
+ * ========================================================================= */
+
+TEST(test_blocked_address_text_scan)
+{
+    /* Hits */
+    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"10.0.10.1\"") != NULL);
+    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"10.0.10.10\"") != NULL);
+    ASSERT_TRUE(virp_config_blocked_address("x 10.0.10.1 y") != NULL);
+    ASSERT_TRUE(virp_config_blocked_address("10.0.10.10") != NULL);
+    /* Non-hits: neighbors that merely share the prefix */
+    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"10.0.10.12\"") == NULL);
+    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"10.0.10.100\"") == NULL);
+    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"110.0.10.1\"") == NULL);
+    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"210.0.10.10\"") == NULL);
+    ASSERT_TRUE(virp_config_blocked_address("") == NULL);
+    ASSERT_TRUE(virp_config_blocked_address(NULL) == NULL);
+}
+
+#define EXCLUSION_CFG "/tmp/virp-onode-exclusion.json"
+
+TEST(test_load_devices_refuses_blocked_address)
+{
+    /* A config that is VALID in every respect except the blocked host:
+     * the refusal must be the exclusion, not a parse error, and it must
+     * refuse the WHOLE config (no skip-and-continue). */
+    FILE *f = fopen(EXCLUSION_CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"ok-device\", \"host\": \"10.0.10.12\", \"vendor\": \"mock\" },\n"
+        "    { \"hostname\": \"edge-fw\", \"host\": \"10.0.10.1\", \"vendor\": \"mock\" }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0004, NULL,
+                         "/tmp/virp-onode-exclusion.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    int loaded = load_devices(&tmp, EXCLUSION_CFG);
+    ASSERT_EQ(loaded, -1);
+    ASSERT_EQ(tmp.device_count, 0);
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(EXCLUSION_CFG);
+}
+
+TEST(test_load_devices_allows_neighbor_addresses)
+{
+    /* The boundary rule: 10.0.10.12 (LibreNMS) and 10.0.10.100 load
+     * fine — only the two exact addresses are excluded. */
+    FILE *f = fopen(EXCLUSION_CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"librenms\", \"host\": \"10.0.10.12\", \"vendor\": \"mock\" },\n"
+        "    { \"hostname\": \"far-host\", \"host\": \"10.0.10.100\", \"vendor\": \"mock\" }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0005, NULL,
+                         "/tmp/virp-onode-exclusion.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    int loaded = load_devices(&tmp, EXCLUSION_CFG);
+    ASSERT_EQ(loaded, 2);
+    ASSERT_EQ(tmp.device_count, 2);
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(EXCLUSION_CFG);
+}
+
+/* =========================================================================
  * hex_decode unit tests
  * ========================================================================= */
 
@@ -2494,6 +2582,11 @@ int main(void)
     printf("[Device Config Parser Robustness (issue #7)]\n");
     RUN_TEST(test_load_devices_wrong_type_does_not_crash);
     RUN_TEST(test_load_devices_skips_missing_required_fields);
+
+    printf("\n[Autopilot hard exclusions (10.0.10.1 / 10.0.10.10)]\n");
+    RUN_TEST(test_blocked_address_text_scan);
+    RUN_TEST(test_load_devices_refuses_blocked_address);
+    RUN_TEST(test_load_devices_allows_neighbor_addresses);
 
     printf("\n[Gate observation-tier honesty (Item 1 hardening)]\n");
     RUN_TEST(test_gate_obs_tier_honesty);

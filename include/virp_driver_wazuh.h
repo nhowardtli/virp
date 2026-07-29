@@ -71,11 +71,19 @@ void              virp_driver_wazuh_init(void);
 const virp_driver_t *virp_driver_wazuh(void);
 
 /*
- * Route an API endpoint to its trust tier.
- * Returns the tier for the best-matching prefix, or VIRP_TIER_GREEN
- * as default (all Wazuh endpoints are read-only in this driver).
+ * Route an API endpoint to its trust tier. EXACT path match (query
+ * string ignored) against the enumerated GREEN read set; everything
+ * else is VIRP_TIER_RED (fail closed). The table carries no YELLOW,
+ * BLACK, or write rows.
  */
 virp_trust_tier_t wz_route_endpoint(const char *endpoint);
+
+/*
+ * route_command hook for the O-Node tier gate: accepts an optional
+ * "GET " prefix, REDs any other method prefix or unrooted path, then
+ * defers to wz_route_endpoint.
+ */
+virp_trust_tier_t wazuh_gate_tier(const char *command);
 
 extern const size_t          WZ_ROUTE_TABLE_SIZE;
 extern const wz_command_route_t WZ_ROUTE_TABLE[];

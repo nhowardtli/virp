@@ -19,6 +19,19 @@ Group=virp
 # state under StateDirectory so systemd creates+chowns it for us.
 StateDirectory=virp
 StateDirectoryMode=0750
+# Device config is RENDERED at start: credentials live only in
+# /etc/virp/autopilot.env (0600 root) and are substituted into the
+# no-secrets template /etc/virp/devices.template.json, landing on the
+# /run tmpfs as 0640 root:virp. The `+` prefix runs the render as root
+# outside the sandbox; the daemon itself only reads the result. The
+# render script never echoes credential values.
+ExecStartPre=+/opt/virp/deploy/render-devices.sh
+
+# Wazuh manager (10.0.20.10) presents a self-signed cert on the lab
+# management VLAN — TLS verification is disabled for that driver ONLY.
+# Replace with VIRP_CA_BUNDLE once the lab CA exists.
+Environment=VIRP_WAZUH_INSECURE=1
+
 # Chain flags (-c/-C) are REQUIRED here: approval mode (enabled whenever
 # /etc/virp/approvers.json enrolls a key) refuses to start without a
 # working trust chain — without it no PROPOSAL/APPROVAL/OUTCOME history
@@ -29,7 +42,7 @@ StateDirectoryMode=0750
 ExecStart=/opt/virp/build/virp-onode-prod \
     -k /etc/virp/keys/onode.key \
     -s /run/virp/onode.sock \
-    -d /var/lib/virp/devices.json \
+    -d /run/virp/devices.json \
     -c /var/lib/virp/chain.db \
     -C /etc/virp/keys/chain.key
 

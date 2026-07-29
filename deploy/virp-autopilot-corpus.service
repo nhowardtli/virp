@@ -1,0 +1,10 @@
+[Unit]
+Description=VIRP Autopilot — nightly adversarial corpus replay against the live gate
+After=virp-onode.service
+Requires=virp-onode.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/virp/autopilot/virp_autopilot.py corpus
+NoNewPrivileges=yes
+PrivateTmp=yes

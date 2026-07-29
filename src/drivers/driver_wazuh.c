@@ -61,39 +61,31 @@
  * ========================================================================= */
 
 const wz_command_route_t WZ_ROUTE_TABLE[] = {
-    /* ── Tier 1: GREEN — Passive monitoring (no approval) ──────── */
-    { "/agents",                    VIRP_TIER_GREEN  },
-    { "/manager/status",            VIRP_TIER_GREEN  },
-    { "/manager/info",              VIRP_TIER_GREEN  },
-    { "/manager/configuration",     VIRP_TIER_GREEN  },
-    { "/manager/logs",              VIRP_TIER_GREEN  },
-    { "/cluster/status",            VIRP_TIER_GREEN  },
-    { "/cluster/nodes",             VIRP_TIER_GREEN  },
-    { "/syscollector",              VIRP_TIER_GREEN  },
-    { "/overview/agents",           VIRP_TIER_GREEN  },
-
-    /* ── Tier 2: YELLOW — Security telemetry (single approval) ── */
-    { "/vulnerability",             VIRP_TIER_YELLOW },
-    { "/syscheck",                  VIRP_TIER_YELLOW },
-    { "/security/users",            VIRP_TIER_YELLOW },
-    { "/security/roles",            VIRP_TIER_YELLOW },
-    { "/security/rules",            VIRP_TIER_YELLOW },
-    { "/security/actions",          VIRP_TIER_YELLOW },
-    { "/rootcheck",                 VIRP_TIER_YELLOW },
-    { "/ciscat",                    VIRP_TIER_YELLOW },
-
-    /* ── BLACK — Destructive (never transmitted) ─────────────── */
-    { "/security/user/authenticate", VIRP_TIER_BLACK },  /* Auth endpoint — internal only */
-    { "/active-response",           VIRP_TIER_BLACK },   /* Can trigger actions on agents */
-    { "/manager/restart",           VIRP_TIER_BLACK },   /* Restarts the manager */
-    { "/agents/restart",            VIRP_TIER_BLACK },   /* Restarts agents */
+    /*
+     * Autopilot GREEN set (2026-07-29) — the exact read-only GETs the
+     * monitoring battery uses, and NOTHING else. No YELLOW rows, no
+     * write endpoints classified at all: everything unlisted is RED by
+     * absence, which under the ENFORCE gate is a signed rejection plus
+     * a filed proposal. The old table carried YELLOW telemetry rows and
+     * BLACK write rows, but it only ever ran in SHADOW and was not even
+     * wired to route_command — it never gated anything. With no BLACK
+     * rows every RED here stays approvable (propose/approve/apply).
+     */
+    { "/agents",                  VIRP_TIER_GREEN },  /* agent list      */
+    { "/agents/summary/status",   VIRP_TIER_GREEN },  /* summary/status  */
+    { "/manager/stats/analysisd", VIRP_TIER_GREEN },  /* alerts summary  */
 };
 
 const size_t WZ_ROUTE_TABLE_SIZE =
     sizeof(WZ_ROUTE_TABLE) / sizeof(WZ_ROUTE_TABLE[0]);
 
 /* =========================================================================
- * Endpoint Routing — prefix match, longest wins
+ * Endpoint Routing — EXACT path match (query string ignored)
+ *
+ * Exact matching closes the recorded prefix-boundary gap: with prefix
+ * matching, "/agents_evil" and "/agents/001/restart" both inherited the
+ * GREEN "/agents" row. A URL path either IS an enumerated read or it is
+ * RED — there is no boundary rule subtle enough to be worth auditing.
  * ========================================================================= */
 
 virp_trust_tier_t wz_route_endpoint(const char *endpoint)
@@ -106,22 +98,33 @@ virp_trust_tier_t wz_route_endpoint(const char *endpoint)
     if (qmark)
         ep_len = (size_t)(qmark - endpoint);
 
-    const wz_command_route_t *best = NULL;
-    size_t best_len = 0;
-
     for (size_t i = 0; i < WZ_ROUTE_TABLE_SIZE; i++) {
         size_t plen = strlen(WZ_ROUTE_TABLE[i].endpoint_pattern);
-        if (plen <= ep_len &&
-            strncmp(endpoint, WZ_ROUTE_TABLE[i].endpoint_pattern, plen) == 0) {
-            if (plen > best_len) {
-                best = &WZ_ROUTE_TABLE[i];
-                best_len = plen;
-            }
-        }
+        if (plen == ep_len &&
+            strncmp(endpoint, WZ_ROUTE_TABLE[i].endpoint_pattern, plen) == 0)
+            return WZ_ROUTE_TABLE[i].tier;
     }
 
     /* Fail-closed: an unmapped endpoint is RED, not GREEN. */
-    return best ? best->tier : VIRP_TIER_RED;
+    return VIRP_TIER_RED;
+}
+
+/*
+ * route_command hook for the tier gate. Accepts an optional "GET "
+ * prefix (the transport is GET-only); any other method prefix — or
+ * anything that is not a rooted path — is RED: write intents are
+ * deliberately unclassified, so they fall to absence.
+ */
+virp_trust_tier_t wazuh_gate_tier(const char *command)
+{
+    if (!command) return VIRP_TIER_RED;
+    while (*command == ' ') command++;
+    if (strncmp(command, "GET ", 4) == 0) {
+        command += 4;
+        while (*command == ' ') command++;
+    }
+    if (command[0] != '/') return VIRP_TIER_RED;
+    return wz_route_endpoint(command);
 }
 
 /* =========================================================================
@@ -402,47 +405,42 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
     struct virp_conn *conn = (struct virp_conn *)base_conn;
     memset(result, 0, sizeof(*result));
 
+    /*
+     * GET-only transport honesty — checked BEFORE the connectivity test
+     * so the refusal is deterministic and offline-testable.
+     *
+     * This driver can only issue GETs. The old code stripped ANY method
+     * prefix and GETted the path, so an approved "POST /agents/restart"
+     * would silently execute something other than what was classified
+     * and approved. A command carrying a non-GET method prefix (or
+     * anything that is not a rooted path) is refused outright as a
+     * soft-failure, which the O-Node wraps as a signed ERROR
+     * observation (executed=no).
+     *
+     * The endpoint path (with query string) goes straight to libcurl's
+     * CURLOPT_URL as a C string — no shell interpretation, no
+     * fork/exec. Characters like & in the query string are URL
+     * parameter separators, not shell operators.
+     */
+    const char *endpoint = command;
+    while (*endpoint == ' ') endpoint++;
+    if (strncmp(endpoint, "GET ", 4) == 0) {
+        endpoint += 4;
+        while (*endpoint == ' ') endpoint++;
+    }
+    if (endpoint[0] != '/') {
+        result->success = false;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Refused: GET-only REST driver cannot honor '%.64s' "
+                 "(non-GET method or unrooted path)", command);
+        return VIRP_OK;
+    }
+
     if (!conn->connected) {
         result->success = false;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Not connected to %s", conn->device.hostname);
         return WZ_ERR_NOT_CONNECTED;
-    }
-
-    /*
-     * Strip HTTP method prefix if present.
-     *
-     * IronClaw (R-Node AI) may send commands like "GET /agents?status=active&limit=20".
-     * The Wazuh driver only needs the endpoint path — the HTTP method is always GET
-     * (all endpoints are read-only). The method prefix would corrupt the URL if
-     * concatenated directly (e.g. "https://host:55000GET /agents?...").
-     *
-     * The endpoint path (with query string) goes straight to libcurl's CURLOPT_URL
-     * as a C string — no shell interpretation, no fork/exec. Characters like & in
-     * the query string are URL parameter separators, not shell operators.
-     */
-    const char *endpoint = command;
-    if (strncmp(command, "GET ",     4) == 0) endpoint = command + 4;
-    else if (strncmp(command, "POST ",    5) == 0) endpoint = command + 5;
-    else if (strncmp(command, "PUT ",     4) == 0) endpoint = command + 4;
-    else if (strncmp(command, "DELETE ",  7) == 0) endpoint = command + 7;
-    else if (strncmp(command, "PATCH ",   6) == 0) endpoint = command + 6;
-
-    /* Ensure endpoint starts with '/' */
-    if (endpoint[0] != '/') {
-        result->success = false;
-        snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Invalid endpoint (must start with /): %.64s", command);
-        return VIRP_OK;
-    }
-
-    /* Check trust tier — refuse BLACK-tier endpoints */
-    virp_trust_tier_t tier = wz_route_endpoint(endpoint);
-    if (tier == VIRP_TIER_BLACK) {
-        result->success = false;
-        snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Endpoint blocked (BLACK tier): %s", endpoint);
-        return VIRP_OK;
     }
 
     /* Step 1: Ensure token is fresh */
@@ -625,6 +623,7 @@ static virp_driver_t wazuh_driver = {
     .disconnect = wazuh_disconnect,
     .detect     = wazuh_detect,
     .health_check = wazuh_health_check,
+    .route_command = wazuh_gate_tier,
 };
 
 const virp_driver_t *virp_driver_wazuh(void)

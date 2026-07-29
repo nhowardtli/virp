@@ -111,6 +111,15 @@ ifdef LINUX
   LIB_OBJS += $(BUILD_DIR)/driver_linux.o
 endif
 
+# Optional LibreNMS driver (requires libcurl — REST API, not SSH)
+ifdef LIBRENMS
+  CFLAGS  += -DVIRP_DRIVER_LIBRENMS $(shell pkg-config --cflags libcurl 2>/dev/null)
+  ifndef WAZUH
+    LDFLAGS += $(shell pkg-config --libs libcurl 2>/dev/null || echo "-lcurl")
+  endif
+  LIB_OBJS += $(BUILD_DIR)/driver_librenms.o
+endif
+
 # SSH host key verification — included when any SSH driver is enabled
 ifneq (,$(or $(CISCO),$(FORTIGATE),$(PANOS),$(ASA),$(JUNIPER),$(LINUX)))
   LIB_OBJS += $(BUILD_DIR)/virp_ssh_hostkey.o
@@ -167,6 +176,9 @@ $(BUILD_DIR)/driver_linux.o: src/drivers/driver_linux.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_wazuh.o: src/drivers/driver_wazuh.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_librenms.o: src/drivers/driver_librenms.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_ssh_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
@@ -343,13 +355,13 @@ $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
 # name works and callers have a single driver-enabled build entry point.
 .PHONY: prod
 prod:
-	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 $(ONODE_PROD)
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 $(ONODE_PROD)
 
 # Full production build — recursive make ensures all ifdef guards evaluate correctly
 # SSH host key verification is strict: unknown keys are rejected.
 .PHONY: prod-full
 prod-full:
-	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 $(ONODE_PROD)
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 $(ONODE_PROD)
 
 # Dev build — all drivers, TOFU enabled by default so lab devices work
 # without pre-populating known_hosts. Do not run dev binaries in production.
@@ -501,6 +513,21 @@ $(TEST_WAZUH): tests/test_driver_wazuh.c $(LIB)
 test-wazuh: $(TEST_WAZUH)
 	./$(TEST_WAZUH)
 
+# LibreNMS driver tests (requires LIBRENMS=1; classifier tests are offline,
+# live tests are fenced the same way the Wazuh suite is)
+TEST_LIBRENMS = $(BUILD_DIR)/test_driver_librenms
+
+$(TEST_LIBRENMS): tests/test_driver_librenms.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-librenms: $(TEST_LIBRENMS)
+	./$(TEST_LIBRENMS)
+
+# Autopilot client unit tests (pure-python: baselines, corpus table,
+# RBAC empty-result handling — no daemon, no devices)
+test-autopilot:
+	python3 tests/test_autopilot.py
+
 # Session negative-path tests
 TEST_SESSION_NEG = $(BUILD_DIR)/test_session_negative
 
@@ -574,9 +601,9 @@ DRIVER_BUILD_DIR = build-drivers
 
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate) ==="
-	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 \
-	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate
+	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms) ==="
+	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 \
+	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.
 #
@@ -796,4 +823,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11

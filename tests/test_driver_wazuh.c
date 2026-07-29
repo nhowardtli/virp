@@ -119,17 +119,28 @@ static void test_routing_table(void)
         const char *endpoint;
         virp_trust_tier_t expected;
     } cases[] = {
-        { "/agents?select=id,name,status,ip",       VIRP_TIER_GREEN  },
+        /* The autopilot GREEN read set — exact paths, query allowed. */
+        { "/agents?select=id,name,status,ip",        VIRP_TIER_GREEN  },
+        { "/agents",                                 VIRP_TIER_GREEN  },
         { "/agents/summary/status",                  VIRP_TIER_GREEN  },
-        { "/manager/status",                         VIRP_TIER_GREEN  },
-        { "/manager/logs/summary",                   VIRP_TIER_GREEN  },
-        { "/vulnerability/001/last_scan",            VIRP_TIER_YELLOW },
-        { "/syscheck/001?limit=100",                 VIRP_TIER_YELLOW },
-        { "/security/user/authenticate",             VIRP_TIER_BLACK  },
-        { "/active-response",                        VIRP_TIER_BLACK  },
-        { "/manager/restart",                        VIRP_TIER_BLACK  },
-        /* Fail-closed: an unmapped endpoint is RED, not GREEN. The old
-         * GREEN default was the most permissive tier there is. */
+        { "/manager/stats/analysisd",                VIRP_TIER_GREEN  },
+        /* No YELLOW rows, no write endpoints classified: everything
+         * unlisted — including every row the old SHADOW-only table
+         * carried — is RED by absence. */
+        { "/manager/status",                         VIRP_TIER_RED    },
+        { "/manager/info",                           VIRP_TIER_RED    },
+        { "/manager/configuration",                  VIRP_TIER_RED    },
+        { "/manager/logs/summary",                   VIRP_TIER_RED    },
+        { "/vulnerability/001/last_scan",            VIRP_TIER_RED    },
+        { "/syscheck/001?limit=100",                 VIRP_TIER_RED    },
+        { "/security/users",                         VIRP_TIER_RED    },
+        { "/security/user/authenticate",             VIRP_TIER_RED    },
+        { "/active-response",                        VIRP_TIER_RED    },
+        { "/manager/restart",                        VIRP_TIER_RED    },
+        { "/agents/restart",                         VIRP_TIER_RED    },
+        /* Exact match kills prefix creep in BOTH directions. */
+        { "/agents/001",                             VIRP_TIER_RED    },
+        { "/agents/summary/status/extra",            VIRP_TIER_RED    },
         { "/some/unknown/endpoint",                  VIRP_TIER_RED    },
         { "/manager/../../etc/passwd",               VIRP_TIER_RED    },
         { NULL, 0 },
@@ -375,13 +386,19 @@ static void test_virp_signing(void)
 }
 
 /* =========================================================================
- * Test: BLACK tier rejection
+ * Test: GET-only transport refusal
+ *
+ * (Replaced the BLACK-tier rejection test: the table carries no BLACK
+ * rows any more — writes are deliberately unclassified and the gate
+ * REDs them by absence. The driver-level invariant that remains is
+ * transport honesty: a non-GET method prefix must be refused, never
+ * silently GETted.)
  * ========================================================================= */
 
-static void test_black_tier_rejection(void)
+static void test_non_get_refusal(void)
 {
-    REQUIRE_LIVE("BLACK tier rejection against the live manager");
-    TEST_START("BLACK tier endpoint rejection");
+    REQUIRE_LIVE("GET-only refusal against the live manager");
+    TEST_START("Non-GET method prefix refusal");
 
     if (!g_conn) {
         TEST_FAIL("No connection (auth test failed)");
@@ -391,27 +408,26 @@ static void test_black_tier_rejection(void)
     const virp_driver_t *drv = virp_driver_lookup(VIRP_VENDOR_WAZUH);
     virp_exec_result_t result;
 
-    /* Try to call the auth endpoint via execute (should be blocked) */
-    virp_error_t err = drv->execute(g_conn, "/security/user/authenticate", &result);
+    virp_error_t err = drv->execute(g_conn, "PUT /agents/restart", &result);
     if (err != VIRP_OK) {
-        TEST_FAIL("execute() should return VIRP_OK even for blocked commands");
+        TEST_FAIL("execute() should return VIRP_OK even for refused commands");
         return;
     }
 
     if (result.success) {
-        TEST_FAIL("BLACK tier endpoint should have been rejected");
+        TEST_FAIL("Non-GET command should have been refused");
         return;
     }
 
-    if (strstr(result.error_msg, "BLACK") == NULL) {
+    if (strstr(result.error_msg, "GET-only") == NULL) {
         char msg[512];
         snprintf(msg, sizeof(msg),
-                 "Error msg should mention BLACK: '%.200s'", result.error_msg);
+                 "Error msg should mention GET-only: '%.200s'", result.error_msg);
         TEST_FAIL(msg);
         return;
     }
 
-    fprintf(stderr, "    Correctly rejected: %s\n", result.error_msg);
+    fprintf(stderr, "    Correctly refused: %s\n", result.error_msg);
     TEST_PASS();
 }
 
@@ -420,28 +436,34 @@ static void test_black_tier_rejection(void)
  * ========================================================================= */
 
 /*
- * KNOWN GAP — recorded here rather than in notes, deliberately skipped.
- *
- * wz_route_endpoint() prefix-matches with plain strncmp and has NO token
- * boundary rule: the layer-3 boundary work covered the five CLI drivers
- * and never reached this REST matcher. So "/agents_evil" prefix-matches
- * the GREEN "/agents" entry and inherits GREEN, exactly the class of bug
- * the boundary rule fixed elsewhere ("show boot" covering "show
- * bootleg").
- *
- * Not fixed here: this driver is wired to no route_command hook, and the
- * fix needs a boundary rule shaped for URL paths ('/' and '?' are
- * structural, not word separators), which is a design decision, not a
- * one-liner. Enable this test with the fix.
+ * Formerly a KNOWN GAP: prefix matching let "/agents_evil" inherit the
+ * GREEN "/agents" row. Fixed by the exact-match rewrite (a URL path
+ * either IS an enumerated read or it is RED), so the gap test is now a
+ * live assertion, plus the gate-hook method rules the fix introduced.
  */
-static void test_known_gap_prefix_boundary(void)
+static void test_prefix_boundary_fixed(void)
 {
-    printf("  [SKIP] Endpoint prefix boundary — KNOWN GAP: "
-           "\"/agents_evil\" matches \"/agents\" and inherits GREEN "
-           "(wz_route_endpoint has no token-boundary rule)\n");
-    if (0) {   /* enable with the fix */
-        assert(wz_route_endpoint("/agents_evil") == VIRP_TIER_RED);
-    }
+    TEST_START("Endpoint boundary + gate-hook method rules");
+
+    assert(wz_route_endpoint("/agents_evil") == VIRP_TIER_RED);
+    assert(wz_route_endpoint("/agents/") == VIRP_TIER_RED);
+
+    /* route_command hook: optional GET prefix OK, any other method or
+     * unrooted string is RED (write intents deliberately unclassified). */
+    assert(wazuh_gate_tier("GET /agents") == VIRP_TIER_GREEN);
+    assert(wazuh_gate_tier("GET /agents/summary/status") == VIRP_TIER_GREEN);
+    assert(wazuh_gate_tier("/manager/stats/analysisd") == VIRP_TIER_GREEN);
+    assert(wazuh_gate_tier("POST /agents") == VIRP_TIER_RED);
+    assert(wazuh_gate_tier("PUT /agents/restart") == VIRP_TIER_RED);
+    assert(wazuh_gate_tier("DELETE /agents/001") == VIRP_TIER_RED);
+    assert(wazuh_gate_tier("agents") == VIRP_TIER_RED);
+    assert(wazuh_gate_tier(NULL) == VIRP_TIER_RED);
+
+    /* The registered driver must actually carry the hook. */
+    const virp_driver_t *drv = virp_driver_lookup(VIRP_VENDOR_WAZUH);
+    assert(drv && drv->route_command == wazuh_gate_tier);
+
+    TEST_PASS();
 }
 
 int main(void)
@@ -463,7 +485,7 @@ int main(void)
     /* Unit tests (no network) */
     test_registration();
     test_routing_table();
-    test_known_gap_prefix_boundary();
+    test_prefix_boundary_fixed();
 
     /* Live tests (need Wazuh Manager) */
     test_live_auth();
@@ -477,7 +499,7 @@ int main(void)
 
     /* VIRP integration */
     test_virp_signing();
-    test_black_tier_rejection();
+    test_non_get_refusal();
 
     /* Disconnect */
     if (g_conn) {

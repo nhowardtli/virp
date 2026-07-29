@@ -1,0 +1,13 @@
+[Unit]
+Description=VIRP Autopilot — 5-minute GREEN monitoring battery
+After=virp-onode.service
+Requires=virp-onode.service
+
+[Service]
+Type=oneshot
+# Root: needs the O-Key (verify), chain.db (read-only enumeration), the
+# onode socket (uid 0 is on socket_allowed_uids), and the alert sink in
+# /var/lib/virp/autopilot. Holds NO device credentials.
+ExecStart=/usr/bin/python3 /opt/virp/autopilot/virp_autopilot.py cycle
+NoNewPrivileges=yes
+PrivateTmp=yes

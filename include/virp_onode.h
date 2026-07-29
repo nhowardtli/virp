@@ -471,6 +471,18 @@ virp_error_t onode_set_allowed_uids(onode_state_t *state,
 int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len);
 
 /*
+ * Autopilot hard exclusions: 10.0.10.1 and 10.0.10.10 must never appear
+ * in a device config. Boundary-aware scan of raw config text (so
+ * 10.0.10.12 / 10.0.10.100 do not false-positive). Returns the blocked
+ * address (static string) on a hit, NULL when clean. The file variant
+ * reads up to 1 MiB of `path`; unreadable files return NULL — the
+ * loader's own error handling covers those. Every config loader MUST
+ * call one of these and refuse to start on a hit.
+ */
+const char *virp_config_blocked_address(const char *text);
+const char *virp_config_file_blocked(const char *path);
+
+/*
  * Fuzz entry point for the internal JSON request parser. Intended for
  * test harnesses — production callers should not use this. Never
  * crashes regardless of input; returns true iff the input parsed into

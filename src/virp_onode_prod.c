@@ -58,6 +58,12 @@ extern void virp_driver_asa_init(void);
 extern void virp_driver_wazuh_init(void);
 #include <curl/curl.h>
 #endif
+#ifdef VIRP_DRIVER_LIBRENMS
+extern void virp_driver_librenms_init(void);
+#ifndef VIRP_DRIVER_WAZUH
+#include <curl/curl.h>
+#endif
+#endif
 #ifdef VIRP_DRIVER_JUNIPER
 extern void virp_driver_juniper_init(void);
 #endif
@@ -106,6 +112,7 @@ static virp_vendor_t vendor_from_string(const char *s)
     if (strcmp(s, "proxmox") == 0)   return VIRP_VENDOR_PROXMOX;
     if (strcmp(s, "cisco_asa") == 0) return VIRP_VENDOR_CISCO_ASA;
     if (strcmp(s, "wazuh") == 0)     return VIRP_VENDOR_WAZUH;
+    if (strcmp(s, "librenms") == 0)  return VIRP_VENDOR_LIBRENMS;
     if (strcmp(s, "mock") == 0)      return VIRP_VENDOR_MOCK;
     return VIRP_VENDOR_UNKNOWN;
 }
@@ -311,6 +318,16 @@ static void load_gate_config(onode_state_t *state, struct json_object *root)
  */
 int load_devices(onode_state_t *state, const char *path)
 {
+    /* Autopilot hard exclusion — non-negotiable: refuse the entire
+     * config if it mentions a blocked address anywhere. */
+    const char *blocked = virp_config_file_blocked(path);
+    if (blocked) {
+        fprintf(stderr, "[O-Node] FATAL: device config %s contains "
+                "hard-excluded address %s — refusing to load\n",
+                path, blocked);
+        return -1;
+    }
+
     struct json_object *root = json_object_from_file(path);
     if (!root) {
         fprintf(stderr, "[O-Node] Failed to parse device config: %s\n", path);
@@ -646,6 +663,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_JUNIPER
     virp_driver_juniper_init();
+#endif
+#ifdef VIRP_DRIVER_LIBRENMS
+    virp_driver_librenms_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 
