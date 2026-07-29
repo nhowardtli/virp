@@ -176,20 +176,39 @@ class TestPolicyInvariants(unittest.TestCase):
             self.assertEqual(must_contain, "illegal separator")
 
     def test_battery_rest_commands_are_in_green_sets(self):
+        # Built from EXPLICIT configs, never from the ambient module-level
+        # BATTERY: on a deployed node /etc/virp/autopilot-node.json exists
+        # and adds peer rows, which made this assertion pass on a build
+        # host and fail on the real nodes. A unit test must not depend on
+        # deployed state.
         wazuh_green = {"/agents", "/agents/summary/status",
                        "/manager/stats/analysisd"}
         librenms_green = {"/api/v0/devices", "/api/v0/alerts"}
-        for device, command, _ in ap.BATTERY:
-            if device == ap.WAZUH_DEV:
-                path = command.replace("GET ", "").split("?")[0]
-                self.assertIn(path, wazuh_green, command)
-            elif device == ap.LIBRENMS_DEV:
-                path = command.replace("GET ", "").split("?")[0]
-                self.assertIn(path, librenms_green, command)
-            else:
-                self.assertTrue(command.startswith('vtysh -c "show '),
-                                "FRR battery must be vtysh show reads: %s"
-                                % command)
+        peer_green = {ap.PEER_CMD_LIVENESS, ap.PEER_CMD_CHAIN_HEAD,
+                      ap.PEER_CMD_PUBLISHED}
+        shapes = [
+            {"node": "virp-lab", "frr_nodes": list(ap.FRR_NODES),
+             "peer_device": "virp-node2-peer"},
+            {"node": "virp-node2", "frr_nodes": [],
+             "peer_device": "virp-lab-peer"},
+            {"node": "solo", "frr_nodes": [], "peer_device": None},
+        ]
+        for cfg in shapes:
+            for device, command, kind in ap.build_battery(cfg):
+                if device == ap.WAZUH_DEV:
+                    path = command.replace("GET ", "").split("?")[0]
+                    self.assertIn(path, wazuh_green, command)
+                elif device == ap.LIBRENMS_DEV:
+                    path = command.replace("GET ", "").split("?")[0]
+                    self.assertIn(path, librenms_green, command)
+                elif device == cfg["peer_device"]:
+                    self.assertIn(command, peer_green,
+                                  "peer probes must be exact GREEN rows: %s"
+                                  % command)
+                else:
+                    self.assertTrue(command.startswith('vtysh -c "show '),
+                                    "FRR battery must be vtysh show reads: %s"
+                                    % command)
 
     def test_no_green_ingestion_endpoint_means_log_only(self):
         # Policy lock: alerts are log-only until an ingestion endpoint is
