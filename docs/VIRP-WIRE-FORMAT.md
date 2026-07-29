@@ -17,7 +17,7 @@ VIRP (Verified Infrastructure Response Protocol) is a two-channel cryptographic 
 
 ## 1. Transport
 
-The O-Node exposes a Unix domain socket (default: `/tmp/virp-onode.sock`).
+The O-Node exposes a Unix domain socket (default: `/run/virp/onode.sock`).
 
 Clients connect, send a request frame, and receive a response frame. One request per connection is the simplest model. The O-Node supports up to 8 concurrent clients (`ONODE_MAX_CLIENTS=8`).
 

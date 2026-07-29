@@ -204,7 +204,7 @@ make test-session-key
 ./build/virp-tool keygen -o /etc/virp/keys/onode.key
 ./build/virp-onode-prod \
   -k /etc/virp/keys/onode.key \
-  -s /tmp/virp-onode.sock \
+  -s /run/virp/onode.sock \
   -d /etc/virp/devices.json \
   -c /var/lib/virp/chain.db
 ```

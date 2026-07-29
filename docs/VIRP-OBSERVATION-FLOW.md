@@ -29,7 +29,7 @@ if (!g_virp_session.session_key_valid)
 The derived session key must exist. No session key, no observations.
 
 Step 3 — Bridge sends JSON request to O-Node over Unix socket
-CT 210 opens a TCP connection to CT 211 port 9999 (the socat bridge), which forwards to /tmp/virp-onode.sock.
+CT 210 opens a TCP connection to CT 211 port 9999 (the socat bridge), which forwards to the O-Node Unix socket (/run/virp/onode.sock by default; the currently deployed socat still points at /tmp/virp-onode.sock — see the deploy note in the commit that moved this default).
 
 ￼
 json

@@ -6,7 +6,7 @@
  * Usage:
  *   virp-onode [options]
  *     -k <okey_path>    Path to O-Key file (generates if absent)
- *     -s <socket_path>  Unix socket path (default: /tmp/virp-onode.sock)
+ *     -s <socket_path>  Unix socket path (default: /run/virp/onode.sock)
  *     -n <node_id_hex>  Node ID in hex (default: 0x00000001)
  *     -m                Use mock driver with test devices
  *     -h                Show help

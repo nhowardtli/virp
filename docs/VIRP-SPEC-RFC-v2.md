@@ -1115,7 +1115,7 @@ Table of Contents
 13.1.  Transport
 
    The O-Node listens on a Unix domain socket (SOCK_STREAM).
-   The default path is /tmp/virp-onode.sock.
+   The default path is /run/virp/onode.sock.
 
 13.2.  Request Format
 

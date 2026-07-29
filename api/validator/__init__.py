@@ -68,7 +68,7 @@ from typing import Optional
 
 
 # Defaults mirror api/server.py so the same env overrides apply.
-VIRP_SOCKET = os.environ.get("VIRP_SOCKET", "/tmp/virp-onode.sock")
+VIRP_SOCKET = os.environ.get("VIRP_SOCKET", "/run/virp/onode.sock")
 VIRP_FRAME_VERSION = 0x02
 ONODE_MAX_REQUEST_SIZE = 24576
 VIRP_HEADER_SIZE = 56

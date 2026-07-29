@@ -35,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 # Configuration
 # ---------------------------------------------------------------------------
 
-VIRP_SOCKET = os.environ.get("VIRP_SOCKET", "/tmp/virp-onode.sock")
+VIRP_SOCKET = os.environ.get("VIRP_SOCKET", "/run/virp/onode.sock")
 VIRP_KEY_PATH = os.environ.get("VIRP_KEY_PATH", "/etc/virp/keys/onode.key")
 # devices.json lives under /var/lib/virp (service-user writable) rather
 # than /etc/virp (root-owned, immutable config). Operators can point

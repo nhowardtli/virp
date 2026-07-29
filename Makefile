@@ -565,6 +565,36 @@ check-live-fence:
 	fi; \
 	echo "  PASS: every live-capable test/tool source is opt-in guarded"
 
+# Socket-path agreement — the daemon's compiled fallback
+# (ONODE_SOCKET_PATH in include/virp_onode.h) and the client's default
+# (ONODE_DEFAULT_SOCKET in src/virp_tool.c) must name the SAME socket, and
+# neither may sit under /tmp.
+#
+# They had drifted: the client defaulted to /tmp/virp-onode.sock while the
+# daemon defaulted to /run/virp/onode.sock, so out of the box the tool did
+# not find the daemon — and /tmp is world-writable and shared, so a
+# pre-created socket or symlink there is a local attack vector that
+# SO_PEERCRED does not defend against (it authenticates the peer, not the
+# path). Two constants in two files cannot be kept in step by review alone.
+.PHONY: check-socket-path
+check-socket-path:
+	@echo "=== checking daemon/client socket-path agreement ==="
+	@d=$$(sed -n 's/^#define[[:space:]]*ONODE_SOCKET_PATH[[:space:]]*"\(.*\)".*/\1/p' include/virp_onode.h); \
+	 c=$$(sed -n 's/^#define[[:space:]]*ONODE_DEFAULT_SOCKET[[:space:]]*"\(.*\)".*/\1/p' src/virp_tool.c); \
+	 if [ -z "$$d" ] || [ -z "$$c" ]; then \
+	   echo "FAIL: could not read one of the defaults (daemon='$$d' client='$$c')"; exit 1; fi; \
+	 if [ "$$d" != "$$c" ]; then \
+	   echo "FAIL: socket-path drift."; \
+	   echo "      daemon ONODE_SOCKET_PATH   = $$d  (include/virp_onode.h)"; \
+	   echo "      client ONODE_DEFAULT_SOCKET = $$c  (src/virp_tool.c)"; \
+	   echo "      They must name the same socket."; exit 1; fi; \
+	 case "$$d" in /tmp/*) \
+	   echo "FAIL: default socket '$$d' is under /tmp — world-writable and"; \
+	   echo "      shared; a pre-created socket or symlink there is a local"; \
+	   echo "      attack vector SO_PEERCRED does not defend against."; exit 1;; \
+	 esac; \
+	 echo "  PASS: daemon and client both default to $$d"
+
 # Deploy unit-file check — a unit-file regression is invisible to the C
 # battery. Approval mode refuses to start without a chain (see
 # onode_setup_chain_and_approvals in src/virp_onode_prod.c), so the
@@ -686,4 +716,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-live-fence test test-onode test-drivers test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-live-fence check-socket-path test test-onode test-drivers test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11

@@ -38,7 +38,12 @@ int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len);
 #define APPROVAL_DEFAULT_DIR  "/var/lib/virp/approvals"
 #define APPROVAL_DEFAULT_KEY  "/etc/virp/keys/approval.key"
 #define APPROVAL_DEFAULT_PUB  "/etc/virp/keys/approval.pub"
-#define ONODE_DEFAULT_SOCKET  "/tmp/virp-onode.sock"
+/* Must match ONODE_SOCKET_PATH in include/virp_onode.h — the daemon's
+ * compiled fallback. They drifted apart (client on /tmp, daemon on
+ * /run/virp), so out of the box the tool did not find the daemon, and
+ * the client default sat on a world-writable path. check-socket-path
+ * in the Makefile now fails if they diverge again. */
+#define ONODE_DEFAULT_SOCKET  "/run/virp/onode.sock"
 
 /* =========================================================================
  * Hex dump utility

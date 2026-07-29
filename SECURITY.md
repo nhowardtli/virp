@@ -67,8 +67,10 @@ VIRP defines two distinct paths that reach the O-Node. Their protections
 are not the same, and a protection that applies to one does not
 automatically apply to the other.
 
-**Local Unix domain socket** — `/run/virp/onode.sock` (prod) or
-`/tmp/virp-onode.sock` (dev). Protected by:
+**Local Unix domain socket** — `/run/virp/onode.sock` for both prod and dev.
+(The client default previously drifted to `/tmp/virp-onode.sock`; /tmp is
+world-writable and shared, so a pre-created socket or symlink there is a
+local attack vector that SO_PEERCRED does not defend against.) Protected by:
 
 - `SO_PEERCRED` peer-UID allowlist (see previous section) — the kernel
   reports the caller's real UID, which is checked against the
