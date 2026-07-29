@@ -389,9 +389,15 @@ def count_full_adjacencies(payload):
 def eval_wazuh_summary(payload):
     """agents/summary/status → (active, total) or ('denied', reason).
 
-    Wazuh RBAC subtlety: a denied read is HTTP 200 with EMPTY data, not
-    a 403 — so 'no data' must be treated as a denial signal, never as
-    'zero agents'."""
+    Wazuh RBAC denial has TWO shapes and neither is a 403 on this
+    endpoint:
+      - endpoint-level denial → a real HTTP 403 (seen on
+        /manager/stats/analysisd for a tightly-scoped credential)
+      - resource-level filtering → HTTP 200 with an EMPTY result. On
+        this endpoint that presents as a present-but-all-zero connection
+        block (total == 0), which must NEVER be read as "the manager has
+        zero agents". virp-node2's credential does exactly this.
+    """
     code, doc = rest_json(payload)
     if doc is None:
         return ("denied", "unparseable body (HTTP %s)" % code)
@@ -399,7 +405,11 @@ def eval_wazuh_summary(payload):
     if not conn:
         return ("denied", "empty connection summary (HTTP %s) — "
                           "RBAC denial presents as empty-result" % code)
-    return (conn.get("active"), conn.get("total"))
+    active, total = conn.get("active"), conn.get("total")
+    if not total:
+        return ("denied", "HTTP %s with total=0 agents — resource-level "
+                          "RBAC filtering, not an agentless manager" % code)
+    return (active, total)
 
 
 def eval_wazuh_affected_items(payload):
@@ -430,11 +440,16 @@ def evaluate_baselines(results):
     """results: {kind: [payloads]} → list of deviation dicts. Pure."""
     deviations = []
 
-    full = sum(count_full_adjacencies(p) for p in results.get("frr_neighbors", []))
-    if full != BASELINES["frr_full_adjacencies"]:
-        deviations.append({"check": "frr_full_adjacencies",
-                           "expected": BASELINES["frr_full_adjacencies"],
-                           "observed": full})
+    # FRR adjacencies are only a baseline for nodes that actually observe
+    # the ring. An agentless node with no FRR devices must not be told it
+    # is missing 8 adjacencies it was never asked to watch.
+    if results.get("frr_neighbors"):
+        full = sum(count_full_adjacencies(p)
+                   for p in results["frr_neighbors"])
+        if full != BASELINES["frr_full_adjacencies"]:
+            deviations.append({"check": "frr_full_adjacencies",
+                               "expected": BASELINES["frr_full_adjacencies"],
+                               "observed": full})
 
     for p in results.get("frr_routes", []):
         if "O" not in p.split("\n", 1)[-1]:
@@ -445,8 +460,11 @@ def evaluate_baselines(results):
     for p in results.get("wazuh_summary", []):
         active, total = eval_wazuh_summary(p)
         if active == "denied":
-            deviations.append({"check": "wazuh_summary_denied",
-                               "expected": "readable summary",
+            # ONE unobservable finding, not a pair of bogus count
+            # deviations: a credential that cannot see agents has not
+            # observed "0 active of 0".
+            deviations.append({"check": "wazuh_unobservable",
+                               "expected": "readable agent summary",
                                "observed": total})
         else:
             # Either direction is reportable — the disconnected agent is
@@ -638,6 +656,9 @@ def publish_summary(results, alerts):
         except Exception:
             return default
 
+    # Publish None — never 0 — when the credential cannot observe agents,
+    # so the peer's comparator reports a missing-value disagreement
+    # instead of a fabricated "0 active vs 5 active".
     active_total = first("wazuh_summary", eval_wazuh_summary, (None, None))
     active, total = active_total if isinstance(active_total, tuple) \
         else (None, None)

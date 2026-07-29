@@ -126,11 +126,39 @@ class TestBaselines(unittest.TestCase):
         r = healthy_results()
         r["wazuh_summary"] = [wazuh_rbac_denied_payload()]
         devs = ap.evaluate_baselines(r)
-        self.assertTrue(any(d["check"] == "wazuh_summary_denied"
+        self.assertTrue(any(d["check"] == "wazuh_unobservable"
                             for d in devs))
         # and it must NOT read as an agent-count change
         self.assertFalse(any(d["check"] == "wazuh_active_agents"
                              for d in devs))
+
+    def test_all_zero_connection_block_is_unobservable_not_zero_agents(self):
+        # virp-node2's real behaviour: HTTP 200, connection block present
+        # but every counter 0 — resource-level RBAC filtering. Must read
+        # as unobservable, never as "0 active of 0 total".
+        r = healthy_results()
+        r["wazuh_summary"] = [wazuh_summary_payload(0, 0)]
+        devs = ap.evaluate_baselines(r)
+        self.assertTrue(any(d["check"] == "wazuh_unobservable"
+                            for d in devs))
+        self.assertFalse(any(d["check"] in ("wazuh_active_agents",
+                                            "wazuh_total_agents")
+                             for d in devs))
+        status, why = ap.eval_wazuh_summary(wazuh_summary_payload(0, 0))
+        self.assertEqual(status, "denied")
+        self.assertIn("RBAC", why)
+
+    def test_agentless_node_not_told_it_lost_adjacencies(self):
+        # An agentless node observes no FRR ring; it must not be alerted
+        # for 8 adjacencies it was never asked to watch.
+        r = healthy_results()
+        del r["frr_neighbors"]
+        del r["frr_routes"]
+        devs = ap.evaluate_baselines(r)
+        self.assertFalse(any(d["check"] == "frr_full_adjacencies"
+                             for d in devs),
+                         "agentless node must not get an FRR deviation")
+        self.assertEqual(devs, [])
 
     def test_librenms_device_count_flags(self):
         # Either direction deviates from the 6-device inventory baseline:
