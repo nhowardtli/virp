@@ -7,10 +7,15 @@ Takes a claim file (JSON) and verifies it against the signed observation corpus.
 Verification pipeline:
   1. Schema validation
   2. Observation lookup
-  3. Signature verification (HMAC-SHA256 via C library)
-  4. Freshness check
-  5. Completeness check
-  6. Extraction verification
+  3. Signature verification (HMAC-SHA256 via C library) — required;
+     entries without raw_message are UNVERIFIABLE, no fallback
+  3b. Decode payload/timestamp/node_id/seq_num from the VERIFIED bytes
+      (C library parse path via virp_bridge.parse_observation)
+  3c. Cross-check unsigned obs_id / node_id / raw_output against the
+      verified bytes — any disagreement is an explicit mismatch failure
+  4. Freshness check (signed timestamp only)
+  5. Completeness check (unsigned collection_status — downgrade only)
+  6. Extraction verification (verified payload only)
   7. Assertion check
 
 Usage:
@@ -194,11 +199,50 @@ def evaluate_assertion(extracted: str, operator: str, expected: str) -> bool:
 
 # ── Core verification ─────────────────────────────────────────────
 
+_HEX_ID_RE = re.compile(r'0[xX][0-9a-fA-F]+$')
+_TRAILING_INT_RE = re.compile(r'^\D*?(\d+)$')
+
+
+def _resolve_numeric_id(value) -> Optional[int]:
+    """
+    Resolve a corpus/evidence identifier to the integer carried in the
+    signed header. Accepts an int, a decimal string, a 0x-hex string,
+    or a label with a trailing integer ("R1" → 1). Returns None when
+    the value cannot be resolved — callers must treat that as a
+    failure, not skip the cross-check.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if _HEX_ID_RE.fullmatch(s):
+            return int(s, 16)
+        if s.isdigit():
+            return int(s)
+        m = _TRAILING_INT_RE.match(s)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def verify_evidence(evidence: dict, corpus: dict, bridge: VIRPBridge,
                     freshness_window: float, now: float) -> tuple:
     """
     Verify a single evidence reference.
     Returns (verdict, details_dict).
+
+    Trust model: obs["raw_message"] (the signed bytes) is the ONLY
+    source of truth. Payload, timestamp, node_id and sequence number
+    are decoded from the verified bytes and the claim is evaluated
+    against those. Unsigned convenience fields (raw_output, obs_id,
+    node_id) must agree with the verified bytes or the evidence is
+    rejected with an explicit mismatch error. There is no fallback for
+    entries without raw_message — they are unverified, full stop.
+    collection_status alone is still read from the unsigned entry (the
+    v1 wire format carries no collection metadata); it can only
+    downgrade a verdict to INCOMPLETE, never upgrade one.
     """
     obs_id = evidence["obs_id"]
     node_id = evidence["node_id"]
@@ -213,39 +257,115 @@ def verify_evidence(evidence: dict, corpus: dict, bridge: VIRPBridge,
             "reason": "Observation not found in corpus",
         }
 
-    # Step 3: Signature verification
+    # Step 3: Signature verification — no raw_message, no verification.
     raw_msg = obs.get("raw_message")
-    if raw_msg:
-        if isinstance(raw_msg, str):
+    if not raw_msg:
+        return Verdict.UNVERIFIABLE, {
+            "obs_id": obs_id,
+            "reason": "No raw_message (signed bytes) in corpus entry — "
+                      "evidence is unverified",
+            "signature": "ABSENT",
+        }
+    if isinstance(raw_msg, str):
+        try:
             raw_msg = bytes.fromhex(raw_msg)
-        sig_valid = bridge.verify_observation(raw_msg)
-    else:
-        sig_valid = obs.get("verified", False)
+        except ValueError:
+            return Verdict.UNVERIFIABLE, {
+                "obs_id": obs_id,
+                "reason": "raw_message is not valid hex",
+                "signature": "INVALID",
+            }
 
-    if not sig_valid:
+    if not bridge.verify_observation(raw_msg):
         return Verdict.UNVERIFIABLE, {
             "obs_id": obs_id,
             "reason": "Signature verification failed",
             "signature": "INVALID",
         }
 
-    # Step 4: Freshness check
-    obs_timestamp = obs.get("timestamp", 0)
-    if isinstance(obs_timestamp, str):
-        # ISO format
-        import datetime
-        dt = datetime.datetime.fromisoformat(obs_timestamp.replace("Z", "+00:00"))
-        obs_timestamp = dt.timestamp()
+    # Step 3b: Decode the verified bytes. Everything evaluated below
+    # comes from here, via the C library's parse path.
+    try:
+        signed = bridge.parse_observation(raw_msg)
+    except ValueError as e:
+        return Verdict.UNVERIFIABLE, {
+            "obs_id": obs_id,
+            "reason": f"Signed message failed to parse: {e}",
+            "signature": "VALID",
+        }
+
+    try:
+        verified_output = signed["payload"].decode("utf-8")
+    except UnicodeDecodeError:
+        verified_output = signed["payload"].decode("latin-1")
+
+    # Step 3c: Cross-check unsigned fields against the verified bytes.
+    # obs_id must match the signed sequence number.
+    claimed_obs_id = _resolve_numeric_id(obs_id)
+    if claimed_obs_id is None:
+        return Verdict.UNVERIFIABLE, {
+            "obs_id": obs_id,
+            "reason": f"obs_id {obs_id!r} cannot be resolved to a numeric "
+                      "sequence number for cross-check against signed bytes",
+            "signature": "VALID",
+            "unresolved": "obs_id",
+        }
+    if claimed_obs_id != signed["seq_num"]:
+        return Verdict.CONTRADICTED, {
+            "obs_id": obs_id,
+            "reason": f"Unsigned obs_id {obs_id!r} disagrees with signed "
+                      f"seq_num {signed['seq_num']}",
+            "signature": "VALID",
+            "mismatch": "obs_id",
+        }
+
+    # node_id (evidence ref and corpus entry) must match the signed node_id.
+    for label, value in (("evidence", node_id), ("corpus", obs.get("node_id"))):
+        if value is None:
+            continue
+        claimed_node = _resolve_numeric_id(value)
+        if claimed_node is None:
+            return Verdict.UNVERIFIABLE, {
+                "obs_id": obs_id,
+                "reason": f"{label} node_id {value!r} cannot be resolved for "
+                          "cross-check against signed bytes",
+                "signature": "VALID",
+                "unresolved": "node_id",
+            }
+        if claimed_node != signed["node_id"]:
+            return Verdict.CONTRADICTED, {
+                "obs_id": obs_id,
+                "reason": f"Unsigned {label} node_id {value!r} disagrees with "
+                          f"signed node_id {signed['node_id']}",
+                "signature": "VALID",
+                "mismatch": "node_id",
+            }
+
+    # Unsigned convenience copies of the output must equal the signed payload.
+    for field in ("raw_output", "payload"):
+        if field in obs and obs[field] != verified_output:
+            return Verdict.CONTRADICTED, {
+                "obs_id": obs_id,
+                "reason": f"Unsigned {field} disagrees with the signed "
+                          "payload — corpus entry is inconsistent with its "
+                          "own signature",
+                "signature": "VALID",
+                "mismatch": field,
+            }
+
+    # Step 4: Freshness check — from the signed timestamp only.
+    obs_timestamp = signed["timestamp_ns"] / 1e9
     age = now - obs_timestamp
     if age > freshness_window:
         return Verdict.STALE, {
             "obs_id": obs_id,
-            "reason": f"Observation age {age:.0f}s exceeds window {freshness_window:.0f}s",
+            "reason": f"Observation age {age:.0f}s exceeds window {freshness_window:.0f}s"
+                      " (signed timestamp)",
             "signature": "VALID",
             "freshness": "EXPIRED",
         }
 
-    # Step 5: Completeness check
+    # Step 5: Completeness check (unsigned metadata — downgrade only)
     collection_status = obs.get("collection_status", "COMPLETE")
     if collection_status != "COMPLETE":
         return Verdict.INCOMPLETE, {
@@ -256,9 +376,8 @@ def verify_evidence(evidence: dict, corpus: dict, bridge: VIRPBridge,
             "complete": "NO",
         }
 
-    # Step 6: Extraction verification
-    raw_output = obs.get("raw_output", obs.get("payload", ""))
-    extracted = extract_value(raw_output, extracted_path)
+    # Step 6: Extraction verification — over the verified payload only.
+    extracted = extract_value(verified_output, extracted_path)
     if extracted is None:
         return Verdict.UNVERIFIABLE, {
             "obs_id": obs_id,

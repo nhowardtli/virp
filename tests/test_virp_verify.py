@@ -14,6 +14,8 @@ Exercises:
   - SCHEMA_ERROR — missing required fields
 """
 
+import hashlib
+import hmac as hmac_mod
 import json
 import os
 import struct
@@ -22,8 +24,10 @@ import tempfile
 import time
 import unittest
 
-# Ensure we can import from the same directory
+# Ensure we can import from the same directory and from api/
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api")))
 
 from virp_bridge import VIRPBridge, VIRP_HEADER_SIZE
 from virp_verify import (
@@ -34,15 +38,45 @@ from virp_verify import (
 KEY_PATH = "/opt/virp/keys/onode.key"
 
 
+def resign_with_timestamp(signed_msg: bytes, ts_ns: int) -> bytes:
+    """Patch timestamp_ns (offset 16) in a signed v1 message and re-sign.
+
+    The HMAC covers bytes [0:24) and [56:end) — everything except the
+    HMAC field itself (see virp_sign in src/virp_crypto.c). Python
+    HMAC-SHA256 parity with the C library is proven by
+    tests/test_hmac_parity.py, so re-signing here with the same O-Key
+    produces a genuinely signed message with a back-dated timestamp —
+    something virp_build_observation cannot do (it always stamps now).
+    """
+    with open(KEY_PATH, "rb") as f:
+        key = f.read()
+    m = bytearray(signed_msg)
+    struct.pack_into("!Q", m, 16, ts_ns)
+    digest = hmac_mod.new(key, bytes(m[:24]) + bytes(m[56:]),
+                          hashlib.sha256).digest()
+    m[24:56] = digest
+    return bytes(m)
+
+
 def make_corpus_entry(bridge, obs_id, node_id, raw_output,
-                      collection_status="COMPLETE", timestamp=None):
-    """Build a signed observation and return a corpus entry dict."""
+                      collection_status="COMPLETE", timestamp=None,
+                      signed_timestamp=None):
+    """Build a signed observation and return a corpus entry dict.
+
+    timestamp sets only the unsigned convenience field; signed_timestamp
+    (seconds) back-dates the timestamp inside the signed bytes via
+    resign_with_timestamp(). The verifier evaluates freshness from the
+    signed bytes, so stale fixtures must set signed_timestamp.
+    """
     output_bytes = raw_output.encode("utf-8") if isinstance(raw_output, str) else raw_output
     signed_msg = bridge.build_signed_observation(
         output_bytes,
         node_id=node_id,
         seq_num=obs_id,
     )
+    if signed_timestamp is not None:
+        signed_msg = resign_with_timestamp(signed_msg, int(signed_timestamp * 1e9))
+        assert bridge.verify_observation(signed_msg), "re-signed fixture must verify"
 
     # Extract timestamp from the signed message header (offset 16, uint64 BE, nanoseconds)
     ts_ns = struct.unpack_from("!Q", signed_msg, 16)[0]
@@ -85,7 +119,8 @@ class TestVIRPVerify(unittest.TestCase):
         cls.obs_stale = make_corpus_entry(
             cls.bridge, obs_id=37808, node_id=2,
             raw_output="interface GigabitEthernet0/0 is up",
-            timestamp=cls.now - 600,  # 600 seconds ago — stale with default window
+            timestamp=cls.now - 600,          # unsigned convenience field
+            signed_timestamp=cls.now - 600,   # stale inside the signed bytes
         )
 
         cls.obs_incomplete = make_corpus_entry(
@@ -354,6 +389,103 @@ class TestVIRPVerify(unittest.TestCase):
 
         result = verify_claim(claim, corpus, self.bridge, freshness_window=300)
         self.assertEqual(result["verdict"], Verdict.UNVERIFIABLE)
+
+    # ── Finding N1: verifier must judge the signed bytes it verified ──
+
+    @staticmethod
+    def _bgp_claim(obs_id=37807, node_id="R1"):
+        return {
+            "claim_id": "n1-001",
+            "claim_type": "bgp.neighbor.state",
+            "assertion": {
+                "subject": "bgp",
+                "predicate": "neighbor[10.0.0.2].state",
+                "operator": "==",
+                "value": "Established",
+            },
+            "evidence": [
+                {
+                    "obs_id": obs_id,
+                    "node_id": node_id,
+                    "extracted_path": "bgp.neighbor[10.0.0.2].state",
+                    "extracted_value": "Established",
+                }
+            ],
+        }
+
+    def test_forged_raw_output_with_genuine_signature_fails(self):
+        """Genuinely signed payload says Idle; unsigned raw_output says
+        Established. The claim asserts Established. Must NOT verify —
+        and the failure must name the raw_output mismatch."""
+        idle_output = self.bgp_output.replace("Established", "Idle")
+        entry = make_corpus_entry(
+            self.bridge, obs_id=37807, node_id=1,
+            raw_output=idle_output, timestamp=self.now - 5,
+        )
+        entry["raw_output"] = self.bgp_output  # attacker's convenience copy
+
+        result = verify_claim(self._bgp_claim(), {37807: entry},
+                              self.bridge, freshness_window=300)
+        self.assertNotEqual(result["verdict"], Verdict.VERIFIED)
+        details = result["evidence_results"][0]["details"]
+        self.assertEqual(details.get("mismatch"), "raw_output")
+
+    def test_plaintext_verified_flag_without_raw_message_fails(self):
+        """{"verified": true} with no raw_message must be UNVERIFIABLE."""
+        entry = {
+            "obs_id": 37807,
+            "node_id": "R1",
+            "verified": True,
+            "raw_output": self.bgp_output,
+            "timestamp": self.now - 5,
+            "collection_status": "COMPLETE",
+        }
+        result = verify_claim(self._bgp_claim(), {37807: entry},
+                              self.bridge, freshness_window=300)
+        self.assertEqual(result["verdict"], Verdict.UNVERIFIABLE)
+
+    def test_obs_id_disagrees_with_signed_seq_num_fails(self):
+        """Corpus entry claims obs_id 37807 but the signed header carries
+        seq_num 55555. Must fail with an obs_id mismatch, not verify."""
+        entry = make_corpus_entry(
+            self.bridge, obs_id=55555, node_id=1,
+            raw_output=self.bgp_output, timestamp=self.now - 5,
+        )
+        entry["obs_id"] = 37807  # relabeled without re-signing
+
+        result = verify_claim(self._bgp_claim(), {37807: entry},
+                              self.bridge, freshness_window=300)
+        self.assertNotEqual(result["verdict"], Verdict.VERIFIED)
+        details = result["evidence_results"][0]["details"]
+        self.assertEqual(details.get("mismatch"), "obs_id")
+
+    def test_node_id_disagrees_with_signed_node_id_fails(self):
+        """Signed header carries node_id 1; entry and evidence say R9.
+        Must fail with a node_id mismatch, not verify."""
+        entry = make_corpus_entry(
+            self.bridge, obs_id=37807, node_id=1,
+            raw_output=self.bgp_output, timestamp=self.now - 5,
+        )
+        entry["node_id"] = "R9"
+
+        result = verify_claim(self._bgp_claim(node_id="R9"), {37807: entry},
+                              self.bridge, freshness_window=300)
+        self.assertNotEqual(result["verdict"], Verdict.VERIFIED)
+        details = result["evidence_results"][0]["details"]
+        self.assertEqual(details.get("mismatch"), "node_id")
+
+    def test_stale_signed_timestamp_fails_freshness(self):
+        """Timestamp inside the verified bytes is 600s old while the
+        unsigned timestamp field claims fresh. Must be STALE."""
+        entry = make_corpus_entry(
+            self.bridge, obs_id=37807, node_id=1,
+            raw_output=self.bgp_output,
+            timestamp=self.now - 5,           # unsigned field lies: fresh
+            signed_timestamp=self.now - 600,  # signed bytes: stale
+        )
+        result = verify_claim(self._bgp_claim(), {37807: entry},
+                              self.bridge, freshness_window=300)
+        self.assertEqual(result["verdict"], Verdict.STALE)
 
 
 if __name__ == "__main__":

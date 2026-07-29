@@ -39,6 +39,9 @@ class KeyType(IntEnum):
     RKEY = 2   # VIRP_KEY_TYPE_RKEY — signs IC messages
     CHAIN = 3  # VIRP_KEY_TYPE_CHAIN
 
+class MsgType(IntEnum):
+    OBSERVATION = 0x01  # VIRP_MSG_OBSERVATION
+
 class ObsType(IntEnum):
     DEVICE_OUTPUT = 0x07  # VIRP_OBS_DEVICE_OUTPUT
 
@@ -85,6 +88,34 @@ class VIRPSigningKey(ctypes.Structure):
         ("key", VIRPKey),
         ("type", ctypes.c_int),
         ("fingerprint", ctypes.c_uint8 * VIRP_HMAC_SIZE),
+    ]
+
+
+class VIRPHeader(ctypes.Structure):
+    """Mirrors virp_header_t (packed, 56 bytes) — host-order after
+    virp_header_deserialize()."""
+    _pack_ = 1
+    _fields_ = [
+        ("version", ctypes.c_uint8),
+        ("type", ctypes.c_uint8),
+        ("length", ctypes.c_uint16),
+        ("node_id", ctypes.c_uint32),
+        ("channel", ctypes.c_uint8),
+        ("tier", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint16),
+        ("seq_num", ctypes.c_uint32),
+        ("timestamp_ns", ctypes.c_uint64),
+        ("hmac", ctypes.c_uint8 * VIRP_HMAC_SIZE),
+    ]
+
+
+class VIRPObservationHdr(ctypes.Structure):
+    """Mirrors virp_observation_t (packed, 4 bytes)."""
+    _pack_ = 1
+    _fields_ = [
+        ("obs_type", ctypes.c_uint8),
+        ("obs_scope", ctypes.c_uint8),
+        ("obs_length", ctypes.c_uint16),
     ]
 
 
@@ -212,6 +243,32 @@ class VIRPBridge:
         ]
         lib.virp_verify.restype = ctypes.c_int
 
+        # ── Message parsing (C parse path — no Python reimplementation) ──
+        # virp_error_t virp_header_deserialize(virp_header_t *hdr,
+        #     const uint8_t *buf, size_t buf_len)
+        lib.virp_header_deserialize.argtypes = [
+            ctypes.POINTER(VIRPHeader),
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+        ]
+        lib.virp_header_deserialize.restype = ctypes.c_int
+
+        # virp_error_t virp_header_validate(const virp_header_t *hdr)
+        lib.virp_header_validate.argtypes = [ctypes.POINTER(VIRPHeader)]
+        lib.virp_header_validate.restype = ctypes.c_int
+
+        # virp_error_t virp_parse_observation(const uint8_t *payload,
+        #     size_t payload_len, virp_observation_t *obs,
+        #     const uint8_t **data, uint16_t *data_len)
+        lib.virp_parse_observation.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+            ctypes.POINTER(VIRPObservationHdr),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.POINTER(ctypes.c_uint16),
+        ]
+        lib.virp_parse_observation.restype = ctypes.c_int
+
         # ── Raw HMAC ──
         # void virp_hmac_sha256(const uint8_t key[32],
         #     const uint8_t *data, size_t data_len, uint8_t out[32])
@@ -317,6 +374,72 @@ class VIRPBridge:
             ctypes.byref(self._signing_key),
         )
         return err == 0
+
+    # ── Message parsing ────────────────────────────────────────────
+
+    def parse_observation(self, msg: bytes) -> dict:
+        """
+        Parse a signed v1 OBSERVATION message via the C library and
+        return its header fields and payload — decoded from the message
+        bytes only.
+
+        Does NOT verify the signature; call verify_observation() first.
+        Raises ValueError on any structural inconsistency: bad header,
+        wrong message type, declared length not matching the actual
+        message size, or an observation length that does not account
+        for every payload byte (virp_parse_observation itself does not
+        bounds-check obs_length, so that is enforced here).
+        """
+        if len(msg) < VIRP_HEADER_SIZE + 4:
+            raise ValueError(f"message too short ({len(msg)} bytes)")
+
+        buf = (ctypes.c_uint8 * len(msg))(*msg)
+        hdr = VIRPHeader()
+        err = self._lib.virp_header_deserialize(
+            ctypes.byref(hdr), buf, ctypes.c_size_t(len(msg)))
+        if err != 0:
+            raise ValueError(f"virp_header_deserialize failed: error {err}")
+
+        err = self._lib.virp_header_validate(ctypes.byref(hdr))
+        if err != 0:
+            raise ValueError(f"virp_header_validate failed: error {err}")
+
+        if hdr.type != MsgType.OBSERVATION:
+            raise ValueError(f"not an OBSERVATION message (type 0x{hdr.type:02x})")
+        if hdr.length != len(msg):
+            raise ValueError(
+                f"declared length {hdr.length} != actual message size {len(msg)}")
+
+        payload_len = len(msg) - VIRP_HEADER_SIZE
+        payload_buf = (ctypes.c_uint8 * payload_len)(*msg[VIRP_HEADER_SIZE:])
+        obs = VIRPObservationHdr()
+        data_ptr = ctypes.POINTER(ctypes.c_uint8)()
+        data_len = ctypes.c_uint16(0)
+        err = self._lib.virp_parse_observation(
+            payload_buf, ctypes.c_size_t(payload_len),
+            ctypes.byref(obs), ctypes.byref(data_ptr), ctypes.byref(data_len))
+        if err != 0:
+            raise ValueError(f"virp_parse_observation failed: error {err}")
+
+        if obs.obs_length != payload_len - 4:
+            raise ValueError(
+                f"observation length {obs.obs_length} does not match "
+                f"payload size {payload_len - 4}")
+
+        payload = bytes(payload_buf[4:4 + obs.obs_length]) if obs.obs_length else b""
+
+        return {
+            "version": hdr.version,
+            "type": hdr.type,
+            "node_id": hdr.node_id,
+            "channel": hdr.channel,
+            "tier": hdr.tier,
+            "seq_num": hdr.seq_num,
+            "timestamp_ns": hdr.timestamp_ns,
+            "obs_type": obs.obs_type,
+            "obs_scope": obs.obs_scope,
+            "payload": payload,
+        }
 
     def __del__(self):
         if hasattr(self, '_signing_key') and self._signing_key is not None:
