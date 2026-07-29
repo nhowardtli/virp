@@ -32,6 +32,10 @@
 
 #include "virp_ssh_io.h"
 
+/* Buffer a driver would give the keepalive read (PAN-OS uses
+ * VIRP_OUTPUT_MAX; the size only needs to exceed the reply). */
+#define VIRP_SSH_KEEPALIVE_TEST_BUF  8192
+
 static int tests_run = 0;
 static int tests_failed = 0;
 
@@ -528,6 +532,102 @@ TEST(test_drain_reports_byte_count)
           "clean channel reported residue");
 }
 
+
+/* =========================================================================
+ * Keepalive window (finding N1 / 2b)
+ *
+ * PAN-OS holds ONE channel for the life of the connection and runs a
+ * background keepalive on it. The keepalive is shaped exactly like a
+ * command — send a newline, read the prompt back — so it runs through
+ * virp_ssh_exec. What matters is that its read window cannot end with
+ * unread bytes still on the channel, because this driver's next read is
+ * a real command whose body gets signed.
+ * ========================================================================= */
+
+TEST(test_keepalive_exchange_leaves_channel_clean)
+{
+    const char *PROMPT = "aiops-svc@pa-850>";
+    virp_ssh_prompt_t pr;
+    memset(&pr, 0, sizeof(pr));
+    snprintf(pr.prompt, sizeof(pr.prompt), "%s", PROMPT);
+    pr.prompt_len = strlen(PROMPT);
+    pr.learned = true;
+
+    /*
+     * A reply bigger than the keepalive's old 1024-byte discard buffer.
+     * PAN-OS emits a banner ahead of the prompt after a reconnect, which
+     * is how the real one overflowed.
+     */
+    char reply[4096];
+    size_t off = 0;
+    off += (size_t)snprintf(reply + off, sizeof(reply) - off, "\r\n");
+    for (int i = 0; i < 40 && off < sizeof(reply) - 128; i++)
+        off += (size_t)snprintf(reply + off, sizeof(reply) - off,
+                                "banner line %02d: system message of the day\n", i);
+    snprintf(reply + off, sizeof(reply) - off, "%s ", PROMPT);
+
+    /* --- new path: exec to the learned prompt --- */
+    mock_pty_t m;
+    mock_init(&m, "", 64);
+    m.reply_on_write = reply;
+    virp_ssh_io_t io = { .ctx = &m, .read = mock_read, .write = mock_write };
+
+    char buf[VIRP_SSH_KEEPALIVE_TEST_BUF];
+    size_t got = 0;
+    virp_error_t rc = virp_ssh_exec(&io, &pr, "", buf, sizeof(buf), &got,
+                                    2000, "pa-850");
+    CHECK(rc == VIRP_OK, "keepalive exchange failed (%d)", (int)rc);
+
+    /* The defining assertion: nothing is left for the next command. */
+    size_t leftover = virp_ssh_drain(&io, "pa-850-after-keepalive");
+    CHECK(leftover == 0,
+          "keepalive left %zu bytes on the channel for the next command",
+          leftover);
+
+    /* --- frozen legacy: 1024-byte quiescent discard --- */
+    mock_pty_t lm;
+    mock_init(&lm, "", 64);
+    lm.reply_on_write = reply;
+    virp_ssh_io_t lio = { .ctx = &lm, .read = mock_read, .write = mock_write };
+    mock_write(&lm, "\n", 1);
+
+    char ldiscard[1024];
+    virp_ssh_read_quiescent(&lio, ldiscard, sizeof(ldiscard), 2000);
+    size_t lleftover = virp_ssh_drain(&lio, "pa-850-legacy");
+    CHECK(lleftover > 0,
+          "legacy keepalive window no longer leaves residue — this case has "
+          "stopped being a regression test");
+}
+
+TEST(test_keepalive_without_prompt_is_error)
+{
+    /*
+     * Device answers the keepalive with something that never terminates.
+     * Reporting OK here would leave an unterminated read on the channel;
+     * the driver needs a distinguishable failure so it can mark the
+     * session stale instead.
+     */
+    const char *PROMPT = "aiops-svc@pa-850>";
+    virp_ssh_prompt_t pr;
+    memset(&pr, 0, sizeof(pr));
+    snprintf(pr.prompt, sizeof(pr.prompt), "%s", PROMPT);
+    pr.prompt_len = strlen(PROMPT);
+    pr.learned = true;
+
+    mock_pty_t m;
+    mock_init(&m, "", 64);
+    m.reply_on_write = "\r\npartial output with no prompt\r\n";
+    virp_ssh_io_t io = { .ctx = &m, .read = mock_read, .write = mock_write };
+
+    char buf[4096];
+    size_t got = 0;
+    virp_error_t rc = virp_ssh_exec(&io, &pr, "", buf, sizeof(buf), &got,
+                                    300, "pa-850");
+    CHECK(rc == VIRP_ERR_NO_PROMPT,
+          "expected VIRP_ERR_NO_PROMPT, got %d", (int)rc);
+    CHECK(got > 0, "expected the partial bytes to be reported, got %zu", got);
+}
+
 /* ========================================================================= */
 
 int main(void)
@@ -543,6 +643,10 @@ int main(void)
     RUN_TEST(test_learn_prompt_confirms_across_two_probes);
     RUN_TEST(test_learn_prompt_refuses_when_unconfirmed);
     RUN_TEST(test_read_refuses_without_learned_prompt);
+
+    printf("\n--- PAN-OS keepalive window (2b) ---\n");
+    RUN_TEST(test_keepalive_exchange_leaves_channel_clean);
+    RUN_TEST(test_keepalive_without_prompt_is_error);
 
     printf("\n--- Scrubbing and drain accounting ---\n");
     RUN_TEST(test_strip_echo_matches_command_text);

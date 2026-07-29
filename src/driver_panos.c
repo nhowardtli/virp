@@ -61,6 +61,7 @@
 #define PA_SSH_READ_BUF_SIZE       32768
 #define PA_SSH_MAX_PROMPT_LEN      128
 #define PA_KEEPALIVE_INTERVAL_SEC  55      /* Keepalive every 55s (PA-850 idles at ~5 min) */
+#define PA_KEEPALIVE_READ_TIMEOUT_MS 5000  /* Prompt must return within 5s */
 
 /* =========================================================================
  * Command Routing Table — maps CLI commands to VIRP trust tiers
@@ -416,21 +417,47 @@ static void *pa_keepalive_thread(void *arg)
             return NULL;
         }
 
-        /* Send newline — PAN-OS echoes back the prompt (no-op command) */
-        if (pa_ssh_write(conn, "\n") == 0) {
-            /* Read the prompt echo back to quiescence so the keepalive
-             * cannot leave its own reply on the channel. (2b hardens
-             * this further.) */
-            char discard[8192];
-            virp_ssh_read_quiescent(&conn->io, discard, sizeof(discard), 5000);
-            fprintf(stderr, "[PAN-OS] Keepalive OK (%s)\n", conn->device.hostname);
-        } else {
+        /*
+         * Keepalive is a bare newline; PAN-OS answers with the prompt.
+         *
+         * It runs through the SAME primitive as a command — drain, send,
+         * read to the LEARNED prompt — for one reason: a quiescent read
+         * is timing-based and can return before the reply lands, and the
+         * old one read into a 1024-byte buffer. Either way the unread
+         * tail stays on the channel, and this driver holds ONE channel
+         * for the life of the connection, so that tail becomes the head
+         * of the next command's read and ends up in its signed body.
+         * Terminating on the prompt consumes exactly this keepalive's
+         * own reply and nothing more, so the window cannot leave residue
+         * behind whatever the device's timing.
+         *
+         * (Interleaving was never the gap: session_mutex, held here and
+         * across the whole of pa_execute, already serialized the two.
+         * The gap was this read window.)
+         */
+        char discard[VIRP_OUTPUT_MAX];
+        size_t got = 0;
+        virp_error_t krc = virp_ssh_exec(&conn->io, &conn->prompt, "",
+                                         discard, sizeof(discard), &got,
+                                         PA_KEEPALIVE_READ_TIMEOUT_MS,
+                                         conn->device.hostname);
+        if (krc != VIRP_OK) {
+            /*
+             * A keepalive that does not get its prompt back is the
+             * definition of a session that can no longer be read
+             * reliably. Marking it stale drops the connection so the
+             * watchdog rebuilds it — the alternative, reporting OK and
+             * leaving an unterminated read on the channel, is exactly
+             * how the contamination started.
+             */
             conn->connected = false;
-            fprintf(stderr, "[PAN-OS] Keepalive write failed, marking stale (%s)\n",
-                    conn->device.hostname);
+            fprintf(stderr, "[PAN-OS] Keepalive: no prompt after %zu bytes "
+                    "(%s) — marking stale\n", got, conn->device.hostname);
             pthread_mutex_unlock(&conn->session_mutex);
             return NULL;
         }
+
+        fprintf(stderr, "[PAN-OS] Keepalive OK (%s)\n", conn->device.hostname);
 
         pthread_mutex_unlock(&conn->session_mutex);
     }
