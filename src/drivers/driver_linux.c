@@ -517,6 +517,47 @@ static bool has_frr_token(const char *canon)
     return false;
 }
 
+/* =========================================================================
+ * Peer-health rows (VIRP node watching another VIRP node)
+ *
+ * EXACT-match only — the whole canonicalized command must equal a row.
+ * No wildcards, no prefixes, no argument charset: a peer probe is a
+ * fixed, enumerated read or it is nothing. This is deliberately
+ * stricter than the vtysh GREEN row (which allows a charset-limited
+ * remainder), because the peer rows run against another node's control
+ * plane, where "close enough" would be an unforced error:
+ *
+ *   systemctl is-active virp-onode    → daemon liveness. Exact match
+ *     means `systemctl stop virp-onode` is NOT reachable through this
+ *     row; it stays RED by absence.
+ *   virp-tool chain tail -n 1 …       → the peer's chain HEAD, which is
+ *     what the comparator cross-references inside its own signed
+ *     observation (see the federation note in the comparator: this is
+ *     an observation OF the peer's report, not verification of the
+ *     peer's signature — VIRP has no asymmetric observation signing).
+ *   cat …/autopilot/published.json    → the peer's last published cycle
+ *     summary (one fixed path). Without this the comparator cannot diff
+ *     what the two nodes independently saw, which is the entire reason
+ *     the second node exists.
+ * ========================================================================= */
+
+static const char *const LINUX_PEER_GREEN_EXACT[] = {
+    "systemctl is-active virp-onode",
+    "/opt/virp/build/virp-tool chain tail -n 1 --db /var/lib/virp/chain.db",
+    "cat /var/lib/virp/autopilot/published.json",
+};
+
+static bool is_peer_green_exact(const char *canon)
+{
+    for (size_t i = 0;
+         i < sizeof(LINUX_PEER_GREEN_EXACT) / sizeof(LINUX_PEER_GREEN_EXACT[0]);
+         i++) {
+        if (strcmp(canon, LINUX_PEER_GREEN_EXACT[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* Mutating tools whose mention of /etc/frr/ is a config write. Reads
  * (cat, less, grep …) stay RED by absence with the generic reason. */
 static bool is_mutating_tool(const char *canon)
@@ -624,6 +665,12 @@ virp_trust_tier_t linux_gate_classify(const char *command, const char **reason)
 
         return VIRP_TIER_RED;   /* unlisted vtysh command — fail closed */
     }
+
+    /* Peer-health reads — exact match, checked before the bare-shell RED
+     * rows so an enumerated peer probe classifies GREEN while every
+     * neighbouring spelling of it stays RED by absence. */
+    if (is_peer_green_exact(canon))
+        return VIRP_TIER_GREEN;
 
     /* Bare shell. Everything is RED; these two rows carry teaching
      * reasons instead of the generic unclassified rejection. */

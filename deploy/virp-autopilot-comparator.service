@@ -1,0 +1,10 @@
+[Unit]
+Description=VIRP Autopilot — cross-node comparator (diffs this node's view against the peer's)
+After=virp-onode.service
+Requires=virp-onode.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/virp/autopilot/virp_autopilot.py comparator
+NoNewPrivileges=yes
+PrivateTmp=yes

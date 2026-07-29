@@ -218,6 +218,153 @@ class TestPolicyInvariants(unittest.TestCase):
                              "query: %s" % cmd)
 
 
+def peer_liveness_payload(state="active"):
+    return "virp-lab-peer$ systemctl is-active virp-onode\n%s" % state
+
+
+def peer_chain_head_payload(session="autopilot:2026-07-29", seq=239,
+                            entry_hash="7626023f1ab8829a"):
+    return ("virp-lab-peer$ /opt/virp/build/virp-tool chain tail -n 1 "
+            "--db /var/lib/virp/chain.db\n"
+            "SESSION SEQ TYPE ARTIFACT_ID ENTRY_HASH PREV_HASH\n"
+            "%s %d observation obs:x:1 %s prevhash" % (session, seq, entry_hash))
+
+
+def summary(node="virp-lab", at=1785360000, devices=6, active=5, total=6):
+    return {"node": node, "published_at": at,
+            "chain_head": {"session": "s", "seq": 1, "entry_hash": "h"},
+            "alerts": 0,
+            "observed": {"librenms_devices": devices, "librenms_alerts": 1,
+                         "wazuh_active": active, "wazuh_total": total,
+                         "frr_full_adjacencies": 8}}
+
+
+class TestPeerEvaluators(unittest.TestCase):
+    def test_liveness(self):
+        self.assertTrue(ap.eval_peer_liveness(peer_liveness_payload("active")))
+        for bad in ("inactive", "failed", "unknown", ""):
+            self.assertFalse(ap.eval_peer_liveness(peer_liveness_payload(bad)),
+                             "%r must not read as live" % bad)
+
+    def test_chain_head_parse(self):
+        head = ap.eval_peer_chain_head(peer_chain_head_payload())
+        self.assertEqual(head, {"session": "autopilot:2026-07-29", "seq": 239,
+                                "entry_hash": "7626023f1ab8829a"})
+
+    def test_chain_head_header_only_is_none(self):
+        p = ("peer$ cmd\nSESSION SEQ TYPE ARTIFACT_ID ENTRY_HASH PREV_HASH\n"
+             "(no chain entries)")
+        self.assertIsNone(ap.eval_peer_chain_head(p))
+
+    def test_peer_deviations_flow_into_baselines(self):
+        r = healthy_results()
+        r["peer_liveness"] = [peer_liveness_payload("inactive")]
+        devs = ap.evaluate_baselines(r)
+        self.assertTrue(any(d["check"] == "peer_daemon_liveness" and
+                            d["observed"] == "inactive" for d in devs))
+
+    def test_peer_rows_match_the_classifier_exact_rows(self):
+        # These strings must be byte-identical to LINUX_PEER_GREEN_EXACT
+        # in src/drivers/driver_linux.c; drift classifies RED and alerts.
+        with open(os.path.join(REPO_ROOT, "src", "drivers",
+                               "driver_linux.c")) as f:
+            src = f.read()
+        for cmd in (ap.PEER_CMD_LIVENESS, ap.PEER_CMD_CHAIN_HEAD,
+                    ap.PEER_CMD_PUBLISHED):
+            self.assertIn('"%s"' % cmd, src.replace('"\n                       "', ''),
+                          "peer command not an exact GREEN row: %s" % cmd)
+
+
+class TestComparator(unittest.TestCase):
+    NOW = 1785360000
+
+    def test_agreement_is_silent(self):
+        self.assertEqual(
+            ap.compare_views(summary(), summary(node="virp-node2"), self.NOW),
+            [])
+
+    def test_librenms_disagreement_flagged(self):
+        f = ap.compare_views(summary(devices=6),
+                             summary(node="virp-node2", devices=5), self.NOW)
+        self.assertTrue(any(x["check"] == "observer_disagreement" and
+                            x["target"] == "librenms_devices" and
+                            x["local"] == 6 and x["peer"] == 5 for x in f))
+
+    def test_wazuh_active_disagreement_flagged(self):
+        f = ap.compare_views(summary(active=5),
+                             summary(node="virp-node2", active=4), self.NOW)
+        self.assertTrue(any(x["check"] == "observer_disagreement" and
+                            x["target"] == "wazuh_active" for x in f))
+
+    def test_missing_value_is_a_disagreement_not_equality(self):
+        theirs = summary(node="virp-node2")
+        theirs["observed"]["wazuh_active"] = None
+        f = ap.compare_views(summary(), theirs, self.NOW)
+        self.assertTrue(any(x["check"] ==
+                            "observer_disagreement_missing_value" and
+                            x["target"] == "wazuh_active" for x in f))
+
+    def test_both_missing_still_disagreement(self):
+        # Two observers that both failed to observe must NOT be reported
+        # as agreeing — silence is not consensus.
+        mine, theirs = summary(), summary(node="virp-node2")
+        mine["observed"]["librenms_devices"] = None
+        theirs["observed"]["librenms_devices"] = None
+        f = ap.compare_views(mine, theirs, self.NOW)
+        self.assertTrue(any(x["target"] == "librenms_devices" for x in f))
+
+    def test_stale_peer_summary_flagged(self):
+        old = summary(node="virp-node2", at=self.NOW - 1000)
+        f = ap.compare_views(summary(), old, self.NOW)
+        self.assertTrue(any(x["check"] == "peer_summary_stale" and
+                            x["peer_age_sec"] == 1000 for x in f))
+
+    def test_fresh_peer_within_limit_not_stale(self):
+        recent = summary(node="virp-node2", at=self.NOW - 60)
+        f = ap.compare_views(summary(), recent, self.NOW)
+        self.assertFalse(any(x["check"] == "peer_summary_stale" for x in f))
+
+    def test_unreadable_peer_summary_flagged(self):
+        f = ap.compare_views(summary(), None, self.NOW)
+        self.assertEqual([x["check"] for x in f], ["peer_summary_unreadable"])
+
+    def test_missing_local_summary_flagged(self):
+        f = ap.compare_views(None, summary(node="virp-node2"), self.NOW)
+        self.assertTrue(any(x["check"] == "local_summary_missing" for x in f))
+
+    def test_compared_keys_are_the_shared_targets(self):
+        self.assertEqual(set(ap.COMPARED_KEYS),
+                         {"librenms_devices", "wazuh_active", "wazuh_total"})
+
+
+class TestNodeConfig(unittest.TestCase):
+    def test_default_config_is_virp_lab_shape(self):
+        cfg = ap.load_node_config("/nonexistent/autopilot-node.json")
+        self.assertEqual(cfg["node"], "virp-lab")
+        self.assertEqual(len(cfg["frr_nodes"]), 4)
+        self.assertIsNone(cfg["peer_device"])
+
+    def test_peerless_battery_has_no_peer_rows(self):
+        b = ap.build_battery({"node": "x", "frr_nodes": [],
+                              "peer_device": None})
+        kinds = {k for _, _, k in b}
+        self.assertNotIn("peer_liveness", kinds)
+        self.assertNotIn("frr_neighbors", kinds)
+        self.assertIn("wazuh_summary", kinds)
+
+    def test_node2_shape_battery(self):
+        b = ap.build_battery({"node": "virp-node2", "frr_nodes": [],
+                              "peer_device": "virp-lab-peer"})
+        kinds = [k for _, _, k in b]
+        self.assertEqual(kinds, ["wazuh_summary", "wazuh_alerts",
+                                 "librenms_devices", "librenms_alerts",
+                                 "peer_liveness", "peer_chain_head"])
+        # Peer probes must be the exact GREEN rows, never improvised.
+        peer_cmds = [c for d, c, k in b if k.startswith("peer_")]
+        self.assertEqual(peer_cmds, [ap.PEER_CMD_LIVENESS,
+                                     ap.PEER_CMD_CHAIN_HEAD])
+
+
 class TestTemplateExclusions(unittest.TestCase):
     """Mirror of the C-side boundary scan (virp_config_blocked_address):
     the shipped device template must never carry 10.0.10.1 / 10.0.10.10,
@@ -239,13 +386,15 @@ class TestTemplateExclusions(unittest.TestCase):
             start = i + 1
 
     def test_template_carries_no_blocked_address(self):
-        text = open(TEMPLATE).read()
+        with open(TEMPLATE) as f:
+            text = f.read()
         for addr in self.BLOCKED:
             self.assertFalse(self.blocked_hit(text, addr),
                              "%s present in devices template" % addr)
 
     def test_template_still_has_librenms_and_placeholders_only(self):
-        text = open(TEMPLATE).read()
+        with open(TEMPLATE) as f:
+            text = f.read()
         self.assertIn("10.0.10.12", text)
         self.assertIn("10.0.20.10", text)
         # Secrets are placeholders, rendered at daemon start — the

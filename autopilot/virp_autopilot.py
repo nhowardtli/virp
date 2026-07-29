@@ -17,6 +17,13 @@ Three modes, each a systemd timer on virp-lab:
   chainwalk  (daily)    Full chain verification walk over every session
                         in chain.db, then appends a SIGNED summary
                         observation (entry count + failure count).
+  comparator (*/10 min) Diffs THIS node's latest published observations
+                        against the PEER node's for the shared targets
+                        (LibreNMS device count, Wazuh active/total,
+                        peer liveness) and alerts on any disagreement.
+                        Disagreement between independent observers is
+                        the finding. See the honest-v1 federation note
+                        above run_comparator().
 
 Alerting: deviations log to the journal (stderr) and to
 /var/lib/virp/autopilot/alerts.jsonl. They would ALSO post as a Wazuh
@@ -119,18 +126,64 @@ FRR_NODES = ["clab-frr-ospf-frr1", "clab-frr-ospf-frr2",
 WAZUH_DEV    = "wazuh-lab"
 LIBRENMS_DEV = "librenms-lab"
 
-# The fixed GREEN battery: (device, command, kind). Every command here
-# must classify GREEN — a rejection is itself an alert.
-BATTERY = (
-    [(n, 'vtysh -c "show ip ospf neighbor"', "frr_neighbors") for n in FRR_NODES] +
-    [(n, 'vtysh -c "show ip route ospf"',    "frr_routes")    for n in FRR_NODES] +
-    [
-        (WAZUH_DEV,    "GET /agents/summary/status",   "wazuh_summary"),
-        (WAZUH_DEV,    "GET /manager/stats/analysisd", "wazuh_alerts"),
-        (LIBRENMS_DEV, "GET /api/v0/devices",          "librenms_devices"),
-        (LIBRENMS_DEV, "GET /api/v0/alerts?state=1",   "librenms_alerts"),
-    ]
-)
+# ── Per-node identity / topology ───────────────────────────────────────
+# /etc/virp/autopilot-node.json lets one client serve both nodes:
+#   {"node": "virp-node2", "frr_nodes": [],
+#    "peer_device": "virp-lab-peer", "peer_node": "virp-lab"}
+# Absent file → virp-lab's historical shape (4 FRR nodes, no peer), so
+# an un-migrated deployment keeps behaving exactly as before.
+NODE_CONFIG_PATH = "/etc/virp/autopilot-node.json"
+
+# Peer probes — EXACTLY the exact-match GREEN rows in driver_linux.c.
+# Any drift here classifies RED and alerts, which is the intended
+# failure mode: the classifier is the authority, not this list.
+PEER_CMD_LIVENESS   = "systemctl is-active virp-onode"
+PEER_CMD_CHAIN_HEAD = ("/opt/virp/build/virp-tool chain tail -n 1 "
+                       "--db /var/lib/virp/chain.db")
+PEER_CMD_PUBLISHED  = "cat /var/lib/virp/autopilot/published.json"
+
+PUBLISHED_FILE = os.path.join(STATE_DIR, "published.json")
+
+# A peer summary older than this is stale — 3 missed 5-minute cycles.
+PEER_STALE_SEC = 900
+
+
+def load_node_config(path=NODE_CONFIG_PATH):
+    cfg = {"node": "virp-lab", "frr_nodes": list(FRR_NODES),
+           "peer_device": None, "peer_node": None}
+    try:
+        with open(path) as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def build_battery(cfg):
+    """The fixed GREEN battery: (device, command, kind). Every command
+    here must classify GREEN — a rejection is itself an alert."""
+    frr = cfg.get("frr_nodes") or []
+    battery = (
+        [(n, 'vtysh -c "show ip ospf neighbor"', "frr_neighbors") for n in frr] +
+        [(n, 'vtysh -c "show ip route ospf"',    "frr_routes")    for n in frr] +
+        [
+            (WAZUH_DEV,    "GET /agents/summary/status",   "wazuh_summary"),
+            (WAZUH_DEV,    "GET /manager/stats/analysisd", "wazuh_alerts"),
+            (LIBRENMS_DEV, "GET /api/v0/devices",          "librenms_devices"),
+            (LIBRENMS_DEV, "GET /api/v0/alerts?state=1",   "librenms_alerts"),
+        ]
+    )
+    peer = cfg.get("peer_device")
+    if peer:
+        battery += [
+            (peer, PEER_CMD_LIVENESS,   "peer_liveness"),
+            (peer, PEER_CMD_CHAIN_HEAD, "peer_chain_head"),
+        ]
+    return battery
+
+
+NODE = load_node_config()
+BATTERY = build_battery(NODE)
 
 # ── Nightly adversarial corpus ─────────────────────────────────────────
 # Mirrors tests/test_driver_linux_gate.c plus REST-gate probes. Expected
@@ -300,6 +353,32 @@ def rest_json(payload):
         return code, None
 
 
+def shell_output(payload):
+    """Linux-driver payloads are 'host$ <command>\\n<output>'. Return the
+    output with the echoed command line removed."""
+    _, _, body = payload.partition("\n")
+    return body.strip()
+
+
+def eval_peer_liveness(payload):
+    """systemctl is-active virp-onode → True iff the peer daemon is
+    active. Anything else (inactive/failed/unknown/empty) is False."""
+    return shell_output(payload) == "active"
+
+
+def eval_peer_chain_head(payload):
+    """Parse `virp chain tail -n 1` into {session, seq, entry_hash}.
+
+    Columns: SESSION SEQ TYPE ARTIFACT_ID ENTRY_HASH PREV_HASH. Returns
+    None if no data row is present."""
+    for line in shell_output(payload).splitlines():
+        parts = line.split()
+        if len(parts) >= 6 and parts[0] != "SESSION" and parts[1].isdigit():
+            return {"session": parts[0], "seq": int(parts[1]),
+                    "entry_hash": parts[4]}
+    return None
+
+
 def count_full_adjacencies(payload):
     """Count OSPF neighbors in Full state in one 'show ip ospf neighbor'
     transcript."""
@@ -402,6 +481,19 @@ def evaluate_baselines(results):
                                "expected": "status ok + count",
                                "observed": "unreadable"})
 
+    # Peer health — only evaluated on nodes that have a peer configured.
+    for p in results.get("peer_liveness", []):
+        if not eval_peer_liveness(p):
+            deviations.append({"check": "peer_daemon_liveness",
+                               "expected": "active",
+                               "observed": shell_output(p) or "(no output)"})
+
+    for p in results.get("peer_chain_head", []):
+        if eval_peer_chain_head(p) is None:
+            deviations.append({"check": "peer_chain_head",
+                               "expected": "one chain entry row",
+                               "observed": "unparseable"})
+
     return deviations
 
 
@@ -450,6 +542,13 @@ def run_cycle():
 
     for dev in evaluate_baselines(results):
         emit_alert("baseline_deviation", dev)
+        alerts += 1
+
+    try:
+        pub = publish_summary(results, alerts)
+        print("  published: %s" % json.dumps(pub["observed"], sort_keys=True))
+    except OSError as e:
+        emit_alert("publish_failed", {"error": str(e)})
         alerts += 1
 
     print("cycle complete: %d observations, %d alerts"
@@ -502,6 +601,74 @@ def run_corpus():
     print("corpus replay complete: %d cases, %d mismatches"
           % (len(CORPUS), alerts))
     return alerts
+
+
+def chain_head(db_path=CHAIN_DB):
+    """Latest chain entry on THIS node, read-only (the daemon owns all
+    writes). Shape matches eval_peer_chain_head() so local and peer
+    heads are directly comparable."""
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        row = con.execute("SELECT session_id, sequence, chain_entry_hash "
+                          "FROM chain_entries ORDER BY id DESC "
+                          "LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    if not row:
+        return None
+    return {"session": row[0], "seq": int(row[1]), "entry_hash": row[2]}
+
+
+def publish_summary(results, alerts):
+    """Write this node's view of the shared targets so the PEER can read
+    it through its one exact-match GREEN row and diff it. 0644 on
+    purpose: the peer's probe account only needs to read it, and it
+    carries no secrets — measured counts and our own chain head only."""
+    def first(kind, fn, default=None):
+        vals = results.get(kind) or []
+        if not vals:
+            return default
+        try:
+            return fn(vals[0])
+        except Exception:
+            return default
+
+    active_total = first("wazuh_summary", eval_wazuh_summary, (None, None))
+    active, total = active_total if isinstance(active_total, tuple) \
+        else (None, None)
+    if active == "denied":
+        active, total = None, None
+
+    summary = {
+        "node": NODE.get("node"),
+        "published_at": int(time.time()),
+        "chain_head": chain_head(),
+        "alerts": alerts,
+        "observed": {
+            "librenms_devices": first("librenms_devices",
+                                      lambda p: eval_librenms_count(p, "devices")),
+            "librenms_alerts": first("librenms_alerts",
+                                     lambda p: eval_librenms_count(p, "alerts")),
+            "wazuh_active": active,
+            "wazuh_total": total,
+            "frr_full_adjacencies": sum(
+                count_full_adjacencies(p)
+                for p in results.get("frr_neighbors", [])) or None,
+        },
+    }
+    tmp = PUBLISHED_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(summary, f, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, PUBLISHED_FILE)
+    os.chmod(PUBLISHED_FILE, 0o644)
+    return summary
 
 
 def chain_sessions(db_path=CHAIN_DB):
@@ -584,13 +751,209 @@ def run_chainwalk():
     return alerts
 
 
+# ── Comparator: two independent observers, diffed ──────────────────────
+#
+# HONEST-v1 NOTE (federation). VIRP signs observations with HMAC-SHA256
+# under each node's own O-Key, and the wire header carries no sig_alg
+# field, so there is NO asymmetric observation signing and a peer's
+# O-Key must never leave the peer. This node therefore CANNOT verify the
+# peer's signature on the peer's own observations. What it can do — and
+# what this comparator does — is read the peer's report through the tier
+# gate and sign, with ITS OWN O-Key, an observation of what the peer
+# reported, cross-referencing both chain heads.
+#
+# The auditable claim is exactly:
+#   "node A observed, and signed, that node B reported head X at time T"
+# NOT:
+#   "node A verified node B's signature."
+# Real cross-node verification needs asymmetric observation signing, a
+# peer public-key registry, and a foreign-entry import path — none of
+# which exist in the repo today (virp_federation.c is an Ed25519
+# keypair library used by the approval flow).
+
+COMPARED_KEYS = ("librenms_devices", "wazuh_active", "wazuh_total")
+
+
+def compare_views(mine, theirs, now, stale_sec=PEER_STALE_SEC):
+    """Pure diff of two published summaries. Returns a list of
+    disagreement dicts. Disagreement between independent observers IS
+    the finding — that is the whole point of the second node."""
+    findings = []
+
+    if theirs is None:
+        findings.append({"check": "peer_summary_unreadable",
+                         "detail": "no parseable peer summary"})
+        return findings
+
+    age = now - int(theirs.get("published_at") or 0)
+    if age > stale_sec:
+        findings.append({"check": "peer_summary_stale",
+                         "peer_age_sec": age, "limit_sec": stale_sec})
+
+    if mine is None:
+        findings.append({"check": "local_summary_missing",
+                         "detail": "this node has published no summary yet"})
+        return findings
+
+    mo = mine.get("observed") or {}
+    to = theirs.get("observed") or {}
+    for key in COMPARED_KEYS:
+        a, b = mo.get(key), to.get(key)
+        if a is None or b is None:
+            # One observer having no value is itself a disagreement about
+            # observability — never silently treated as "equal".
+            findings.append({"check": "observer_disagreement_missing_value",
+                             "target": key,
+                             "local": a, "peer": b})
+        elif a != b:
+            findings.append({"check": "observer_disagreement",
+                             "target": key,
+                             "local": a, "peer": b})
+
+    return findings
+
+
+def run_comparator():
+    alerts = 0
+    peer_dev = NODE.get("peer_device")
+    if not peer_dev:
+        print("no peer_device configured in %s — nothing to compare"
+              % NODE_CONFIG_PATH)
+        return 0
+
+    now = int(time.time())
+    session = "autopilot-comparator:%s" % time.strftime("%Y-%m-%d",
+                                                        time.gmtime())
+
+    # Our own view: a local file read (same host, no device involved).
+    try:
+        with open(PUBLISHED_FILE) as f:
+            mine = json.load(f)
+    except (OSError, ValueError):
+        mine = None
+
+    # The peer's view + liveness + chain head, each through the gate.
+    peer_reads = {}
+    for kind, command in (("peer_liveness", PEER_CMD_LIVENESS),
+                          ("peer_chain_head", PEER_CMD_CHAIN_HEAD),
+                          ("peer_published", PEER_CMD_PUBLISHED)):
+        raw, obs = execute(peer_dev, command)
+        if "error_code" in obs or "parse_error" in obs:
+            emit_alert("comparator_transport",
+                       {"cmd": command, "obs": obs})
+            alerts += 1
+            peer_reads[kind] = None
+            print("  [ALERT] %-16s transport failure: %s" % (kind, obs))
+            continue
+
+        verified = verify_observation(raw)
+        green = obs["tier"] == 0x01 and obs["obs_type"] == OBS_DEVICE_OUTPUT
+        ok = verified and green
+        artifact = chain_append(session, peer_dev, raw) if verified else None
+
+        print("  [%s] %-16s tier=%s obs=0x%02x verified=%s chain=%s"
+              % ("OK" if ok else "ALERT", kind, obs["tier_name"],
+                 obs["obs_type"], "VALID" if verified else "FAILED",
+                 artifact or "-"))
+
+        if not ok:
+            # A peer probe that is refused or unverified means we have NO
+            # trustworthy reading of the peer — an alert in its own right,
+            # distinct from "the peer disagrees with us".
+            emit_alert("comparator_probe_not_green_verified",
+                       {"cmd": command, "tier": obs["tier_name"],
+                        "obs_type": obs["obs_type"], "verified": verified,
+                        "payload_head": obs["payload"][:200]})
+            alerts += 1
+            peer_reads[kind] = None
+            continue
+
+        peer_reads[kind] = obs["payload"]
+
+    # Peer daemon liveness.
+    live_payload = peer_reads.get("peer_liveness")
+    peer_live = eval_peer_liveness(live_payload) if live_payload else False
+    if not peer_live:
+        emit_alert("peer_daemon_not_active",
+                   {"peer": NODE.get("peer_node"),
+                    "observed": shell_output(live_payload) if live_payload
+                                else "(unreachable / refused)"})
+        alerts += 1
+    print("  peer_live=%s" % peer_live)
+
+    # Chain heads, cross-referenced (the honest-v1 federation step).
+    local_head = chain_head()
+    peer_head = (eval_peer_chain_head(peer_reads["peer_chain_head"])
+                 if peer_reads.get("peer_chain_head") else None)
+    print("  local_head=%s" % (json.dumps(local_head) if local_head else "-"))
+    print("  peer_head =%s" % (json.dumps(peer_head) if peer_head else "-"))
+
+    # The view diff.
+    try:
+        theirs = json.loads(peer_reads["peer_published"]
+                            .partition("\n")[2]) \
+            if peer_reads.get("peer_published") else None
+    except (ValueError, AttributeError):
+        theirs = None
+
+    findings = compare_views(mine, theirs, now)
+    for f in findings:
+        emit_alert("comparator_" + f["check"], f)
+        alerts += 1
+    if not findings:
+        print("  views agree on: %s" % ", ".join(COMPARED_KEYS))
+
+    # Sign + chain-register the comparator verdict, carrying BOTH heads.
+    verdict = {
+        "comparator": "cross-node",
+        "node": NODE.get("node"),
+        "peer": NODE.get("peer_node"),
+        "at": now,
+        "peer_live": peer_live,
+        "local_chain_head": local_head,
+        "peer_chain_head": peer_head,
+        "compared": {k: {"local": (mine or {}).get("observed", {}).get(k),
+                         "peer": (theirs or {}).get("observed", {}).get(k)}
+                     for k in COMPARED_KEYS},
+        "disagreements": findings,
+        "verification_note": ("peer report observed and signed under THIS "
+                              "node's O-Key; peer signature not verifiable "
+                              "(no asymmetric observation signing in VIRP)"),
+    }
+    verdict_json = json.dumps(verdict, sort_keys=True)
+    digest = hashlib.sha256(verdict_json.encode()).hexdigest()
+    signed = onode_send({"action": "sign_outcome", "command": digest})
+    sobs = parse_observation(signed)
+    if "error_code" in sobs or sobs.get("obs_type") != OBS_OUTCOME_SIGNED \
+            or not verify_observation(signed):
+        emit_alert("comparator_verdict_signing", {"obs": sobs})
+        alerts += 1
+    else:
+        onode_send({
+            "action": "chain_append",
+            "session_id": session,
+            "artifact_type": "comparator_verdict",
+            "artifact_id": "comparator:%d" % time.time_ns(),
+            "artifact_hash": hashlib.sha256(signed).hexdigest(),
+            "artifact_content": verdict_json,
+        })
+        print("  signed verdict appended (obs sha256 %s...)"
+              % hashlib.sha256(signed).hexdigest()[:16])
+
+    print("comparator complete: %d disagreements, %d alerts"
+          % (len(findings), alerts))
+    return alerts
+
+
 def main():
     ap = argparse.ArgumentParser(description="VIRP autopilot")
-    ap.add_argument("mode", choices=["cycle", "corpus", "chainwalk"])
+    ap.add_argument("mode", choices=["cycle", "corpus", "chainwalk",
+                                     "comparator"])
     args = ap.parse_args()
     os.makedirs(STATE_DIR, exist_ok=True)
     alerts = {"cycle": run_cycle, "corpus": run_corpus,
-              "chainwalk": run_chainwalk}[args.mode]()
+              "chainwalk": run_chainwalk,
+              "comparator": run_comparator}[args.mode]()
     return 1 if alerts else 0
 
 

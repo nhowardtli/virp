@@ -1,0 +1,11 @@
+{
+  "_comment": "virp-node2 device template — AGENTLESS node: daemon + chain + approval registry + script clients only, no bridge/agent/consumer. Rendered to /run/virp/devices.json at daemon start by deploy/render-devices.sh, substituting ${...} from /etc/virp/autopilot.env (root-only, node2's OWN credentials). No FRR devices — node2 does not run containerlab. HARD EXCLUSIONS apply: the daemon refuses to load any config naming a blocked address (see virp_config_blocked_address in virp_onode.c); do not name them here, even in a comment.",
+  "socket_allowed_uids": [0, 1000],
+  "gate_default_mode": "enforce",
+  "gate_max_tier": "yellow",
+  "devices": [
+    { "hostname": "wazuh-lab", "host": "10.0.20.10", "vendor": "wazuh", "port": 55000, "api_port": 55000, "username": "${WAZUH_USER}", "password": "${WAZUH_PASS}", "node_id": "0A00140A" },
+    { "hostname": "librenms-lab", "host": "10.0.10.12", "vendor": "librenms", "port": 80, "api_port": 80, "api_token": "${LIBRENMS_TOKEN}", "node_id": "0A000A0C" },
+    { "hostname": "virp-lab-peer", "host": "10.0.10.211", "vendor": "linux", "port": 22, "username": "${PEER_USER}", "password": "${PEER_PASS}", "node_id": "0A000AD3" }
+  ]
+}
