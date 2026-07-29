@@ -170,6 +170,19 @@ typedef struct virp_driver {
      */
     virp_trust_tier_t (*route_command)(const char *command);
 
+    /*
+     * route_reason — OPTIONAL companion to route_command. For commands
+     * whose classification carries an instructive rejection reason
+     * (e.g. "configuration change — use propose/approve/apply"), return
+     * a pointer to a static string; return NULL for rows that take the
+     * gate's generic rejection message. The gate appends the reason to
+     * the signed ERROR observation payload so a refused caller learns
+     * the escalation path instead of just the tier arithmetic. Same
+     * contract as route_command: read-only, side-effect free, and the
+     * returned pointer must remain valid forever (string literal).
+     */
+    const char *(*route_reason)(const char *command);
+
 } virp_driver_t;
 
 /* =========================================================================

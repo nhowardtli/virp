@@ -1126,6 +1126,18 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                      command, device_name, gate_tier_name(gate_tier),
                      gate_tier_name(state->gate_max_tier));
 
+            /* Classifier-supplied instructive reason (optional hook):
+             * appended before the proposal_id so the rejection payload
+             * teaches the escalation path, not just the tier math. */
+            if (drv->route_reason) {
+                const char *why = drv->route_reason(command);
+                if (why) {
+                    size_t off = strlen(err_msg);
+                    snprintf(err_msg + off, sizeof(err_msg) - off,
+                             " reason: %s", why);
+                }
+            }
+
             /*
              * PROPOSE: file a signed proposal so a human can escalate
              * this exact command via `virp approve`. Best-effort — a

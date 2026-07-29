@@ -22,6 +22,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_driver.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -395,6 +396,265 @@ static virp_error_t linux_health_check(virp_conn_t *conn)
 }
 
 /* =========================================================================
+ * Gate classifier — FRR/vtysh table (linux driver only)
+ *
+ * The linux driver runs raw shell over an SSH exec channel, so the
+ * classifier's first job is refusing anything that is not exactly ONE
+ * command. Guards run before any table row and fail RED:
+ *
+ *   1. virp_command_check_separators() — rejects ; | & ` $( ${ and every
+ *      control byte (so newlines) ANYWHERE, quoted or not. The remaining
+ *      shell-composition bytes (< > ( ) { } \ " outside the vtysh
+ *      argument) are excluded by the anchored form check below: the only
+ *      accepted vtysh shape is exactly `vtysh -c "<arg>"`, so any stray
+ *      byte outside the quotes fails the anchor.
+ *   2. vtysh commands must match that anchor exactly — one -c, one
+ *      double-quoted argument, nothing before or after. Two or more -c
+ *      flags are RED unconditionally (a multi-command sequence is a
+ *      config session, not an observation).
+ *   3. Whitespace runs are collapsed and keywords matched
+ *      case-insensitively, but abbreviations are NOT expanded: FRR's
+ *      parser would accept "sh ip os nei", this table does not — an
+ *      unlisted spelling falls through RED, fail closed.
+ *
+ * Rows (on the vtysh argument):
+ *   GREEN  — show <rest>, rest limited to [a-z0-9 ./-]
+ *   YELLOW — clear ip ospf (interface|neighbor) <rest>, ping/traceroute
+ *   RED    — configure …, clear ip ospf process (instructive reasons via
+ *            linux_gate_reason so the signed rejection teaches the
+ *            propose/approve/apply path)
+ * Bare shell: mutating tools touching /etc/frr/ and `systemctl … frr`
+ * carry instructive RED reasons; everything else is RED by absence.
+ * This table never returns BLACK, so every RED here stays approvable.
+ * ========================================================================= */
+
+#define LINUX_GATE_CANON_MAX 1024
+
+static const char *const REASON_CONFIG =
+    "configuration change — use propose/approve/apply";
+static const char *const REASON_OSPF_PROCESS =
+    "disruptive OSPF process reset — use propose/approve/apply";
+static const char *const REASON_FRR_FILES =
+    "FRR config file change — use propose/approve/apply";
+static const char *const REASON_FRR_SERVICE =
+    "FRR service control — use propose/approve/apply";
+static const char *const REASON_SEPARATOR =
+    "shell metacharacter refused — one plain command per request";
+static const char *const REASON_MULTI_C =
+    "multiple -c flags — a command sequence is not an observation";
+static const char *const REASON_VTYSH_FORM =
+    "malformed vtysh invocation — expected exactly: vtysh -c \"<command>\"";
+
+/* Collapse whitespace runs, trim, lowercase. Returns -1 if too long. */
+static int linux_gate_canon(const char *in, char *out, size_t out_len)
+{
+    size_t j = 0;
+    int last_was_space = 1;              /* eats leading whitespace */
+    for (const char *p = in; *p; p++) {
+        char c = *p;
+        if (c == ' ' || c == '\t') {
+            if (!last_was_space) {
+                if (j + 1 >= out_len) return -1;
+                out[j++] = ' ';
+                last_was_space = 1;
+            }
+            continue;
+        }
+        last_was_space = 0;
+        if (j + 1 >= out_len) return -1;
+        out[j++] = (char)tolower((unsigned char)c);
+    }
+    while (j > 0 && out[j - 1] == ' ') j--;
+    out[j] = '\0';
+    return (int)j;
+}
+
+/* Does `canon` start with the full word `tok`? ("show" matches "show x"
+ * and "show", never "shower" — and never the abbreviation "sh"). */
+static bool tok_prefix(const char *canon, const char *tok)
+{
+    size_t n = strlen(tok);
+    return strncmp(canon, tok, n) == 0 &&
+           (canon[n] == '\0' || canon[n] == ' ');
+}
+
+/* Row charset for GREEN/YELLOW remainders: [a-z0-9 ./-] only. */
+static bool rest_charset_ok(const char *rest)
+{
+    for (const char *p = rest; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
+            *p == ' ' || *p == '.' || *p == '/' || *p == '-')
+            continue;
+        return false;
+    }
+    return true;
+}
+
+/* Skip a matched token and the space after it (if any). */
+static const char *tok_rest(const char *canon, const char *tok)
+{
+    const char *r = canon + strlen(tok);
+    while (*r == ' ') r++;
+    return r;
+}
+
+/* First word of `canon` equals `tok` exactly. */
+static bool first_tok_is(const char *canon, const char *tok)
+{
+    return tok_prefix(canon, tok);
+}
+
+/* Any full word in `canon` starts with "frr" (frr, frr.service, frrouting
+ * would also match — over-matching here only ever REDs, fail closed). */
+static bool has_frr_token(const char *canon)
+{
+    const char *p = canon;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (strncmp(p, "frr", 3) == 0) return true;
+        while (*p && *p != ' ') p++;
+    }
+    return false;
+}
+
+/* Mutating tools whose mention of /etc/frr/ is a config write. Reads
+ * (cat, less, grep …) stay RED by absence with the generic reason. */
+static bool is_mutating_tool(const char *canon)
+{
+    static const char *const TOOLS[] = {
+        "sed", "tee", "cp", "mv", "rm", "chmod", "chown", "truncate",
+        "dd", "ln", "echo", "printf", "install", "touch",
+    };
+    for (size_t i = 0; i < sizeof(TOOLS) / sizeof(TOOLS[0]); i++)
+        if (first_tok_is(canon, TOOLS[i])) return true;
+    return false;
+}
+
+/*
+ * Core classification. `reason` (optional) receives a static string for
+ * rows that carry an instructive rejection reason, NULL otherwise.
+ * Non-static: exercised directly by tests/test_driver_linux_gate.c.
+ */
+virp_trust_tier_t linux_gate_classify(const char *command, const char **reason)
+{
+    if (reason) *reason = NULL;
+    if (!command) return VIRP_TIER_RED;
+
+    /* Guard 1 — separator policy on the RAW string: ; | & ` $( ${ and
+     * control bytes (newlines) are refused everywhere, even inside the
+     * quoted vtysh argument. */
+    if (virp_command_check_separators(command, NULL, 0) != 0) {
+        if (reason) *reason = REASON_SEPARATOR;
+        return VIRP_TIER_RED;
+    }
+
+    char canon[LINUX_GATE_CANON_MAX];
+    if (linux_gate_canon(command, canon, sizeof(canon)) < 0)
+        return VIRP_TIER_RED;
+    if (canon[0] == '\0')
+        return VIRP_TIER_RED;
+
+    if (tok_prefix(canon, "vtysh")) {
+        /* Guard 2 — two or more -c flags: RED always. */
+        int c_flags = 0;
+        for (const char *p = canon; *p; p++) {
+            if (p[0] == '-' && p[1] == 'c' &&
+                (p == canon || p[-1] == ' ') &&
+                (p[2] == '\0' || p[2] == ' '))
+                c_flags++;
+        }
+        if (c_flags >= 2) {
+            if (reason) *reason = REASON_MULTI_C;
+            return VIRP_TIER_RED;
+        }
+
+        /* Guard 2 (cont.) — anchored form: exactly `vtysh -c "<arg>"`.
+         * Anything else (env prefix, missing quotes, trailing bytes,
+         * a second quote inside the argument) is RED. Note an env-var
+         * prefix like `FOO=x vtysh …` never reaches this branch: the
+         * canon then starts with "foo=x", not "vtysh", and falls through
+         * to the bare-shell rows below — RED by absence. */
+        static const char SCAFFOLD[] = "vtysh -c \"";
+        if (strncmp(canon, SCAFFOLD, sizeof(SCAFFOLD) - 1) != 0) {
+            if (reason) *reason = REASON_VTYSH_FORM;
+            return VIRP_TIER_RED;
+        }
+        const char *arg = canon + sizeof(SCAFFOLD) - 1;
+        const char *close = strchr(arg, '"');
+        if (!close || close == arg || close[1] != '\0') {
+            if (reason) *reason = REASON_VTYSH_FORM;
+            return VIRP_TIER_RED;
+        }
+
+        char vcmd[LINUX_GATE_CANON_MAX];
+        size_t vlen = (size_t)(close - arg);
+        if (vlen >= sizeof(vcmd)) return VIRP_TIER_RED;
+        memcpy(vcmd, arg, vlen);
+        vcmd[vlen] = '\0';
+
+        /* RED teaching rows before anything else. */
+        if (tok_prefix(vcmd, "configure")) {
+            if (reason) *reason = REASON_CONFIG;
+            return VIRP_TIER_RED;
+        }
+        if (tok_prefix(vcmd, "clear ip ospf process")) {
+            if (reason) *reason = REASON_OSPF_PROCESS;
+            return VIRP_TIER_RED;
+        }
+
+        /* GREEN — reads. "show" must be the full spelled-out token:
+         * "sh ip os nei" is not expanded and falls through RED. */
+        if (tok_prefix(vcmd, "show") &&
+            rest_charset_ok(tok_rest(vcmd, "show")))
+            return VIRP_TIER_GREEN;
+
+        /* YELLOW — bounded operational actions. */
+        if (tok_prefix(vcmd, "clear ip ospf interface") &&
+            rest_charset_ok(tok_rest(vcmd, "clear ip ospf interface")))
+            return VIRP_TIER_YELLOW;
+        if (tok_prefix(vcmd, "clear ip ospf neighbor") &&
+            rest_charset_ok(tok_rest(vcmd, "clear ip ospf neighbor")))
+            return VIRP_TIER_YELLOW;
+        if (tok_prefix(vcmd, "ping") &&
+            rest_charset_ok(tok_rest(vcmd, "ping")))
+            return VIRP_TIER_YELLOW;
+        if (tok_prefix(vcmd, "traceroute") &&
+            rest_charset_ok(tok_rest(vcmd, "traceroute")))
+            return VIRP_TIER_YELLOW;
+
+        return VIRP_TIER_RED;   /* unlisted vtysh command — fail closed */
+    }
+
+    /* Bare shell. Everything is RED; these two rows carry teaching
+     * reasons instead of the generic unclassified rejection. */
+    if (strstr(canon, "/etc/frr/") && is_mutating_tool(canon)) {
+        if (reason) *reason = REASON_FRR_FILES;
+        return VIRP_TIER_RED;
+    }
+    if (first_tok_is(canon, "systemctl") && has_frr_token(canon)) {
+        if (reason) *reason = REASON_FRR_SERVICE;
+        return VIRP_TIER_RED;
+    }
+
+    return VIRP_TIER_RED;
+}
+
+/* route_command hook — tier only. */
+virp_trust_tier_t linux_gate_tier(const char *command)
+{
+    return linux_gate_classify(command, NULL);
+}
+
+/* route_reason hook — static instructive string, or NULL for rows that
+ * take the daemon's generic rejection message. */
+const char *linux_gate_reason(const char *command)
+{
+    const char *reason = NULL;
+    (void)linux_gate_classify(command, &reason);
+    return reason;
+}
+
+/* =========================================================================
  * Driver Registration
  * ========================================================================= */
 
@@ -406,6 +666,8 @@ static virp_driver_t linux_driver = {
     .disconnect = linux_disconnect,
     .detect     = linux_detect,
     .health_check = linux_health_check,
+    .route_command = linux_gate_tier,
+    .route_reason  = linux_gate_reason,
 };
 
 /* Proxmox is Debian Linux — same driver, different vendor enum */
