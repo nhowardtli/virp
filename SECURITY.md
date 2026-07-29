@@ -22,10 +22,13 @@ The following are in scope for security reports. Each is tagged with the
 evidence backing the corresponding defence:
 **[tested]** covered by a checked-in test or machine proof;
 **[untested]** implemented, no automated coverage;
+**[fixed in branch, undeployed]** fixed and tested on a branch, but not
+merged to `main` and not running in production — the defect still
+applies to the deployed daemon;
 **[aspirational]** intended, not yet built.
 
-- HMAC-SHA256 signing bypass or forgery *[tested — `tests/test_virp.c`, `tests/test_obs_v2.c`, ProVerif `proofs/virp_obs_v2.pv`. Scope caveat: the signature attests the bytes the O-Node read, not that those bytes answer the signed command — see §Observation-Body Integrity]*
-- Observation-body integrity — signed body not corresponding to the command in the signed header *[known defect — three mechanisms identified by static review at `hardening-2026-07-29`, one live occurrence observed 2026-07-29; see §Observation-Body Integrity. No suite covers cross-command body contamination]*
+- HMAC-SHA256 signing bypass or forgery *[tested — `tests/test_virp.c`, `tests/test_obs_v2.c`, ProVerif `proofs/virp_obs_v2.pv`. Scope caveat: the signature attests the bytes the O-Node read; that those bytes answer the signed command is enforced separately by the read path — see §Observation-Body Integrity]*
+- Observation-body integrity — signed body not corresponding to the command in the signed header *[fixed in branch, undeployed — five mechanisms: three from the `hardening-2026-07-29` review, two more from the five-driver read-path audit; all closed on `hardening/review-fixes-2026-07-29` and covered by `tests/test_ssh_io.c` and `tests/test_driver_fortigate_scrub.c`. Production still runs the pre-fix code; the 2026-07-29 pa-850 occurrence was never root-caused. See §Observation-Body Integrity]*
 - Trust tier escalation (e.g., RED command executing as GREEN) *[tested — five driver suites incl. table-driven reachability and adversarial separator injection; see `docs/VIRP-CLAIMS.md` C22–C25]*
 - Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection. Production chain verified per-session 2026-07-28: 162/169 sessions hash-linked; the 7 failures are writer-convention mismatches, not tamper evidence. Narrowed 2026-07-29: the C verifier accepts a truncated tail and a zero-row session, so "hash-linked" establishes internal link consistency, not completeness; the operator-facing `chain_verify` bridge API never checks the keyed `chain_hmac` and still reports a false negative on any multi-session database — see §Verifier Limitations and README]*
 - O-Node socket authentication bypass *[tested — `tests/test_onode.c` `test_peer_uid_allowed`, `test_peer_uid_rejected`]*
@@ -117,63 +120,165 @@ the dashboard bridge and the socat endpoint, or request-side signing
 at the VIRP message layer — is not yet implemented and is tracked as
 follow-up hardening.
 
-## Observation-Body Integrity — Known Limitation
+## Observation-Body Integrity
 
 The HMAC-SHA256 signature on an observation is sound, and the v2 header
-binds command hash, device, session and sequence. What the signature
-does **not** currently guarantee is that the observation *body* is the
-device's response to the command named in the header. On the SSH
-drivers, bytes that did not come from the signed command can enter the
-body before signing — and the O-Node then signs them faithfully. The
-independent static review at tag `hardening-2026-07-29` identified
-three mechanisms:
+binds command hash, device, session and sequence. What the signature by
+itself does not establish is that the observation *body* is the
+device's response to the command named in the header: bytes that did
+not come from the signed command could enter the body before signing,
+and the O-Node would then sign them faithfully.
 
-**Cisco reads stale bytes from cached connections.** `cisco_execute`
-(`src/drivers/driver_cisco.c`) sends its command with no pre-read drain
-of the channel — unlike ASA (`asa_flush_buffer`) and Juniper
-(`junos_flush_buffer`), both of which drain first and say in their own
-comments that prior-command output can still be in the buffer. Cisco's
-`ssh_read_until_prompt` also terminates on any trailing `#` or `>`
-without comparing against `conn->prompt`. Connections are cached and
-reused per device, so leftover bytes from command N can become the head
-of command N+1's read and land inside N+1's signed observation.
-*[untested — no suite covers cross-command body contamination]*
+The independent static review at tag `hardening-2026-07-29` identified
+three mechanisms. A side-by-side audit of all five drivers' read paths
+found two more — PAN-OS shared Cisco's defect and had a keepalive of
+its own, and every driver reported a promptless read as success. All
+are now addressed on branch `hardening/review-fixes-2026-07-29`.
 
-**The watchdog can interleave with an in-flight command.** The watchdog
-calls `drv->health_check(conn)` holding only `conn_mutex`
-(`src/virp_onode.c:2657`), while execute runs holding only
-`exec_mutex`. Nothing serializes the two, so a health-check probe can
-write to the same channel as an in-flight command and its bytes can
-appear in that command's signed body. *[untested]*
+> **Deployment status.** These fixes are committed on that branch and
+> are **not merged to `main` and not deployed** as of 2026-07-29. The
+> running O-Node still has the pre-fix behavior described under "What
+> was wrong" below. Until the branch is deployed, every caveat in the
+> original form of this section still applies to production.
+> *[fixed in branch, undeployed]*
 
-**FortiGate signs its own VDOM scaffolding.** The VDOM wrapper
-(`src/drivers/driver_fortigate.c:231-234`) sends
-`config vdom` / `edit <vdom>` / `end` around the command and only
-partially scrubs their echoes, so wrapper echoes land inside the signed
-observation body. *[untested]*
+### What was wrong
 
-**Observed live, 2026-07-29** *[observed occurrence — one instance, not
-yet reproduced under instrumentation]*: a signed observation for
-`show system resources` on pa-850 carried the output of
-`show system info`. A re-run returned correct output. The device had
-reconnected approximately three minutes earlier. This is a recorded
-production occurrence of the stale-buffer failure class, not a
-hypothesis — note it occurred on the PAN-OS driver, which the static
-findings above do not name, so the class should be assumed to extend
-beyond the drivers listed until each driver's read path is audited.
+**Cisco and PAN-OS read stale bytes from cached connections.** Neither
+drained the channel before sending. Both terminated a read on a
+heuristic — any trailing `#`/`>` (plus an `@` somewhere on the line for
+PAN-OS), never compared against the connection's actual prompt — so
+device output that merely resembled a prompt ended the read early and
+left the true remainder buffered. These drivers hold ONE channel per
+device for the life of the connection, so that remainder became the
+head of the next command's read. ASA and JunOS drained first, but only
+for a fixed 200 ms, and their terminators were unanchored too.
 
-**Consequence for the signed-at-collection claim.** "Signed at the
-point of collection" binds command, device and session to the bytes the
-O-Node *read* — it does not currently guarantee those bytes correspond
-to that command on the SSH drivers. A verifier checking the signature
-gets a true answer to "did the O-Node sign this body for this
-command/device/session?" and no answer to "is this body the device's
-response to that command?" Every statement elsewhere in this repository
-of the form "here is the signed response to command X" carries this
-caveat until the drivers drain before send and prompt-match against
-`conn->prompt`, the watchdog is serialized against execute, and the
-FortiGate wrapper scrub is complete. *[aspirational — none of those
-fixes exist yet]*
+**A promptless read was reported as success.** Every SSH driver
+returned the bytes it had when a read timed out without a prompt, and
+`onode_execute_obs_ex` only retries when `output_len == 0` — so a
+truncated-but-nonempty body was signed as ordinary GREEN device output
+with nothing anywhere marking it short.
+
+**The watchdog could interleave with an in-flight command.** The
+watchdog called `drv->health_check(conn)` holding only `conn_mutex`
+while execute ran holding only `exec_mutex` — different locks on the
+same channel.
+
+**FortiGate signed its own VDOM scaffolding, and never checked its
+read.** The `config vdom` / `edit <vdom>` / `end` wrapper echoes were
+only partially scrubbed (the old scrub dropped the first line only), and
+`result->success` was set unconditionally, so a reply truncated by a
+full buffer, an idle timeout or a transport error was signed as the
+device's answer.
+
+**PAN-OS's keepalive left its own reply on the channel.** A background
+thread wrote a newline every 55 s and drained the reply on a
+timing-based read into a 1024-byte buffer. Anything it did not consume
+stayed on the shared channel for the next command.
+
+### What changed
+
+`src/virp_ssh_io.c` (new) replaces the four per-driver read loops in
+Cisco, ASA, JunOS and PAN-OS. Three rules:
+
+- **The prompt is learned at connect** and confirmed — two bare-newline
+  probes must return the same last line — then used as an *input* to
+  every subsequent read. There is no heuristic fallback: a connection
+  whose prompt cannot be learned is refused outright. JunOS's ordering
+  was inverted for this; it previously cleared the prompt immediately
+  before each read, making the prompt a by-product of the read rather
+  than a check on it. Commands that deliberately move the prompt
+  (`configure` / `rollback` / `exit`, ASA enable transitions) re-learn
+  it explicitly.
+- **Reads terminate only on the learned prompt**, matched exactly at
+  the start of the final line.
+- **Drain-until-quiescent before every send**, bounded by time and
+  bytes. Residue is not silently discarded: every occurrence is logged
+  as `[SSH] Residue drained before send: device=<host> bytes=<n>`, so
+  the rate at which this condition still arises is visible in the
+  field rather than inferred.
+
+A read that ends without the learned prompt now returns
+`VIRP_ERR_NO_PROMPT`, which the drivers propagate as a hard error, so
+the O-Node emits a **typed ERROR observation** carrying the command's
+true tier instead of signing a truncated body as device output.
+Command echoes are stripped by matching the command text rather than by
+deleting the first line positionally.
+
+The watchdog's `health_check` now runs under `exec_mutex[i]`, with the
+lock order stated in the code: `exec_mutex[i]` → `conn_mutex`, never
+the reverse.
+
+PAN-OS's keepalive runs through the same primitive as a command
+(drain → send → read to the learned prompt), so its window cannot leave
+residue whatever the device's timing; a keepalive that does not get its
+prompt back marks the session stale rather than reporting OK.
+
+FortiGate is deliberately **not** on the shared helper — it opens a
+fresh channel per command and never had cross-command carry-over — but
+it now inspects its read outcome and locates the VDOM wrapper
+boundaries by matching the text it sent.
+
+`make check-shared-readpath`, part of `all-tests`, fails the build if
+any of the four SSH drivers reintroduces a private read loop or drops
+the shared include. Four private copies drifting apart is how this
+class of defect arose; the check is structural rather than a
+hand-maintained list, for the same reason `check-live-fence` is.
+
+*[tested — `tests/test_ssh_io.c` (10 cases, four driver profiles
+against a scripted mock PTY), `tests/test_driver_fortigate_scrub.c`
+(4 cases against recorded FortiOS transcripts),
+`test_watchdog_health_check_serialized_with_execute` in
+`tests/test_onode.c`. Each case is differential: the pre-fix algorithm
+is frozen into the test and asserted to get it wrong on byte-identical
+input, so a case that stops being a regression test fails loudly.]*
+
+### What is still not established
+
+**The 2026-07-29 pa-850 occurrence has not been root-caused.** A signed
+observation for `show system resources` carried `show system info`
+output; a re-run returned correct output; the device had reconnected
+about three minutes earlier. Several of the mechanisms above are
+individually consistent with it and all are now closed, but which one
+fired was never isolated under instrumentation, and no test reproduces
+that specific transcript. Treat it as a recorded occurrence of the
+failure class, not as a diagnosed and confirmed-fixed bug.
+*[observed occurrence — one instance, not reproduced]*
+
+**Connect-time reads remain quiescence-based.** Banner, pager-off and
+the ASA enable exchange necessarily run before a prompt exists to
+match. Nothing read on those paths is ever signed — it is discarded or
+pattern-matched for the enable password prompt — but they are the one
+remaining place where a read is bounded by silence rather than by a
+known terminator. *[untested]*
+
+**FortiGate's read-outcome check is not directly exercised.** Its
+`prompt_seen` branch sits around libssh2 calls and needs a live
+channel. The suite covers the failure contract it shares with the
+malformed-reply path (`VIRP_ERR_NO_PROMPT` out of `fg_ssh_execute`),
+not that branch itself. Closing this would mean putting FortiGate
+behind the same transport vtable the other four drivers now use.
+*[aspirational]*
+
+**No live device has exercised any of this.** All evidence is suite
+evidence against mock PTYs and recorded transcripts. Prompt learning is
+fail-closed by design, so the first deployment is also the first test
+of whether every fleet device has a prompt the learner can confirm;
+a device that fails learning will fail to connect rather than fall back.
+*[aspirational — no live run]*
+
+### Consequence for the signed-at-collection claim
+
+"Signed at the point of collection" binds command, device and session
+to the bytes the O-Node read. With the branch deployed, the SSH drivers
+additionally drain before sending, terminate only on a confirmed
+prompt, and refuse to report an unterminated read as output — so
+body-to-command correspondence is enforced by construction rather than
+assumed. Until then, production retains the original caveat: a verifier
+checking the signature gets a true answer to "did the O-Node sign this
+body for this command/device/session?" and no answer to "is this body
+the device's response to that command?"
 
 ## Command Gate — Explicit Scope Limits
 
@@ -230,22 +335,35 @@ now defaulting to RED.
 
 ## Verifier Limitations
 
-Three verifiers ship in this tree. Each currently proves less than its
-name suggests. The gaps below are from the static review at
-`hardening-2026-07-29`; none has automated coverage.
+Three verifiers ship in this tree. The gaps below are from the static
+review at `hardening-2026-07-29`. One is fixed; two are not.
 
-**The Python claim verifier trusts unsigned fields.**
-`api/virp_verify.py:verify_evidence` HMAC-verifies `obs["raw_message"]`
-when it is present — but then evaluates freshness, completeness and the
-asserted value from *unsigned sibling fields* of the corpus entry, not
-from the signed bytes. When `raw_message` is absent it falls back to
-the plaintext `obs["verified"]` boolean — no cryptographic check at
-all. A corpus writer can therefore satisfy the freshness, completeness
-and value checks with unsigned data, or skip signature verification
-entirely by omitting `raw_message` and setting `verified: true`.
-*[untested]*
+**The Python claim verifier trusted unsigned fields. Fixed.**
+`api/virp_verify.py:verify_evidence` HMAC-verified `obs["raw_message"]`
+but then evaluated freshness, completeness and the asserted value from
+*unsigned sibling fields* of the corpus entry, and fell back to a
+plaintext `obs["verified"]` boolean when `raw_message` was absent — so
+a genuinely signed message paired with an arbitrary `raw_output`
+returned VERIFIED, and a `{"verified": true}` entry skipped
+cryptographic checking entirely.
 
-**The bridge chain verifier is unkeyed.** `virp-bridge.py:
+It now decodes payload, timestamp, node_id and sequence number **from
+the verified bytes** (via the C library's own parse path, bound in
+`api/virp_bridge.py:parse_observation`) and evaluates the claim against
+those. Unsigned `raw_output` / `obs_id` / `node_id` that disagree with
+the verified bytes are rejected with a distinct mismatch error rather
+than a generic failure, and the `obs["verified"]` fallback is deleted:
+evidence without a verifiable `raw_message` is unverified, full stop.
+One field is still read unsigned — `collection_status`, because the v1
+wire format carries no collection metadata to read it from; it can
+only downgrade a verdict to INCOMPLETE, never upgrade one.
+*[tested — `tests/test_virp_verify.py`: forged `raw_output` over a
+genuine signature, plaintext `verified:true` with no `raw_message`,
+relabeled `obs_id`, mismatched `node_id`, and a stale timestamp inside
+the signed bytes. Each was confirmed failing against the previous
+code.]*
+
+**The bridge chain verifier is unkeyed. NOT fixed.** `virp-bridge.py:
 chain_verify()` checks only that each row's `previous_entry_hash`
 equals the prior row's stored `chain_entry_hash`. It never verifies
 `chain_hmac` — the keyed value — and never recomputes
@@ -254,7 +372,7 @@ access can produce a chain this verifier reports valid. (Separately, it
 false-negatives on any multi-session database — see README.)
 *[untested]*
 
-**The C chain verifier accepts a truncated tail.**
+**The C chain verifier accepts a truncated tail. NOT fixed.**
 `chain_verify_locked` (`src/virp_chain.c`) does verify per-entry
 `chain_hmac`, entry hash and linkage — but it reports `valid:true`
 whenever the walk ends, without checking that it reached the session's
