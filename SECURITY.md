@@ -24,9 +24,10 @@ evidence backing the corresponding defence:
 **[untested]** implemented, no automated coverage;
 **[aspirational]** intended, not yet built.
 
-- HMAC-SHA256 signing bypass or forgery *[tested — `tests/test_virp.c`, `tests/test_obs_v2.c`, ProVerif `proofs/virp_obs_v2.pv`]*
+- HMAC-SHA256 signing bypass or forgery *[tested — `tests/test_virp.c`, `tests/test_obs_v2.c`, ProVerif `proofs/virp_obs_v2.pv`. Scope caveat: the signature attests the bytes the O-Node read, not that those bytes answer the signed command — see §Observation-Body Integrity]*
+- Observation-body integrity — signed body not corresponding to the command in the signed header *[known defect — three mechanisms identified by static review at `hardening-2026-07-29`, one live occurrence observed 2026-07-29; see §Observation-Body Integrity. No suite covers cross-command body contamination]*
 - Trust tier escalation (e.g., RED command executing as GREEN) *[tested — five driver suites incl. table-driven reachability and adversarial separator injection; see `docs/VIRP-CLAIMS.md` C22–C25]*
-- Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection. Production chain verified per-session 2026-07-28: 162/169 sessions hash-linked; the 7 failures are writer-convention mismatches, not tamper evidence. The operator-facing `chain_verify` bridge API still reports a false negative on any multi-session database — see README]*
+- Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection. Production chain verified per-session 2026-07-28: 162/169 sessions hash-linked; the 7 failures are writer-convention mismatches, not tamper evidence. Narrowed 2026-07-29: the C verifier accepts a truncated tail and a zero-row session, so "hash-linked" establishes internal link consistency, not completeness; the operator-facing `chain_verify` bridge API never checks the keyed `chain_hmac` and still reports a false negative on any multi-session database — see §Verifier Limitations and README]*
 - O-Node socket authentication bypass *[tested — `tests/test_onode.c` `test_peer_uid_allowed`, `test_peer_uid_rejected`]*
 - Device credential exposure through the API layer *[untested — no suite covers the API layer's credential handling]*
 - Session handshake state machine violations *[tested — `tests/test_session_negative.c`, `tests/test_session_key.c`]*
@@ -97,6 +98,9 @@ to the Unix socket. On this path:
   bridge are signed at collection time with the O-Key and are as
   verifiable as on the local path. An attacker who intercepts or
   injects on the TCP path cannot forge observations without the O-Key.
+  (What "signed at collection time" does and does not guarantee about
+  the observation *body* is narrowed in §Observation-Body Integrity —
+  the caveat applies equally on both paths.)
 - The TCP path itself is **not** currently TLS-protected, and the
   session handshake authenticates session establishment via nonce
   exchange but does not cryptographically bind to a TCP endpoint
@@ -112,6 +116,64 @@ to the Unix socket. On this path:
 the dashboard bridge and the socat endpoint, or request-side signing
 at the VIRP message layer — is not yet implemented and is tracked as
 follow-up hardening.
+
+## Observation-Body Integrity — Known Limitation
+
+The HMAC-SHA256 signature on an observation is sound, and the v2 header
+binds command hash, device, session and sequence. What the signature
+does **not** currently guarantee is that the observation *body* is the
+device's response to the command named in the header. On the SSH
+drivers, bytes that did not come from the signed command can enter the
+body before signing — and the O-Node then signs them faithfully. The
+independent static review at tag `hardening-2026-07-29` identified
+three mechanisms:
+
+**Cisco reads stale bytes from cached connections.** `cisco_execute`
+(`src/drivers/driver_cisco.c`) sends its command with no pre-read drain
+of the channel — unlike ASA (`asa_flush_buffer`) and Juniper
+(`junos_flush_buffer`), both of which drain first and say in their own
+comments that prior-command output can still be in the buffer. Cisco's
+`ssh_read_until_prompt` also terminates on any trailing `#` or `>`
+without comparing against `conn->prompt`. Connections are cached and
+reused per device, so leftover bytes from command N can become the head
+of command N+1's read and land inside N+1's signed observation.
+*[untested — no suite covers cross-command body contamination]*
+
+**The watchdog can interleave with an in-flight command.** The watchdog
+calls `drv->health_check(conn)` holding only `conn_mutex`
+(`src/virp_onode.c:2657`), while execute runs holding only
+`exec_mutex`. Nothing serializes the two, so a health-check probe can
+write to the same channel as an in-flight command and its bytes can
+appear in that command's signed body. *[untested]*
+
+**FortiGate signs its own VDOM scaffolding.** The VDOM wrapper
+(`src/drivers/driver_fortigate.c:231-234`) sends
+`config vdom` / `edit <vdom>` / `end` around the command and only
+partially scrubs their echoes, so wrapper echoes land inside the signed
+observation body. *[untested]*
+
+**Observed live, 2026-07-29** *[observed occurrence — one instance, not
+yet reproduced under instrumentation]*: a signed observation for
+`show system resources` on pa-850 carried the output of
+`show system info`. A re-run returned correct output. The device had
+reconnected approximately three minutes earlier. This is a recorded
+production occurrence of the stale-buffer failure class, not a
+hypothesis — note it occurred on the PAN-OS driver, which the static
+findings above do not name, so the class should be assumed to extend
+beyond the drivers listed until each driver's read path is audited.
+
+**Consequence for the signed-at-collection claim.** "Signed at the
+point of collection" binds command, device and session to the bytes the
+O-Node *read* — it does not currently guarantee those bytes correspond
+to that command on the SSH drivers. A verifier checking the signature
+gets a true answer to "did the O-Node sign this body for this
+command/device/session?" and no answer to "is this body the device's
+response to that command?" Every statement elsewhere in this repository
+of the form "here is the signed response to command X" carries this
+caveat until the drivers drain before send and prompt-match against
+`conn->prompt`, the watchdog is serialized against execute, and the
+FortiGate wrapper scrub is complete. *[aspirational — none of those
+fixes exist yet]*
 
 ## Command Gate — Explicit Scope Limits
 
@@ -165,6 +227,42 @@ applying the CLI set verbatim would refuse ordinary endpoints like
 grammar (path + allowed query parameters) rather than the CLI set. This
 is why `WZ_ROUTE_TABLE` is not wired to a `route_command` hook despite
 now defaulting to RED.
+
+## Verifier Limitations
+
+Three verifiers ship in this tree. Each currently proves less than its
+name suggests. The gaps below are from the static review at
+`hardening-2026-07-29`; none has automated coverage.
+
+**The Python claim verifier trusts unsigned fields.**
+`api/virp_verify.py:verify_evidence` HMAC-verifies `obs["raw_message"]`
+when it is present — but then evaluates freshness, completeness and the
+asserted value from *unsigned sibling fields* of the corpus entry, not
+from the signed bytes. When `raw_message` is absent it falls back to
+the plaintext `obs["verified"]` boolean — no cryptographic check at
+all. A corpus writer can therefore satisfy the freshness, completeness
+and value checks with unsigned data, or skip signature verification
+entirely by omitting `raw_message` and setting `verified: true`.
+*[untested]*
+
+**The bridge chain verifier is unkeyed.** `virp-bridge.py:
+chain_verify()` checks only that each row's `previous_entry_hash`
+equals the prior row's stored `chain_entry_hash`. It never verifies
+`chain_hmac` — the keyed value — and never recomputes
+`chain_entry_hash` from row contents. A keyless attacker with DB write
+access can produce a chain this verifier reports valid. (Separately, it
+false-negatives on any multi-session database — see README.)
+*[untested]*
+
+**The C chain verifier accepts a truncated tail.**
+`chain_verify_locked` (`src/virp_chain.c`) does verify per-entry
+`chain_hmac`, entry hash and linkage — but it reports `valid:true`
+whenever the walk ends, without checking that it reached the session's
+recorded tail. Deleting the newest K entries of a session leaves
+`valid:true`; a session with zero rows also verifies valid.
+Consequently the 2026-07-28 "162/169 sessions fully hash-linked"
+result establishes internal link consistency, not completeness — it
+does not rule out deletion of trailing entries. *[untested]*
 
 ## Corrections to Previously Documented Behavior
 

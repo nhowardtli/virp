@@ -379,6 +379,30 @@ exercises the property; every pointer below is a file in this tree.
 | C24 | Every classification table entry is reachable and returns the tier it declares | DEMONSTRATED (suite only) | `test_table_driven_all_entries` in all five driver suites, iterating each driver's own table (257 entries). Proves reachability — an entry shadowed by a broader or earlier entry would silently never fire — under both matching disciplines: PAN-OS is first-match (order load-bearing), the other four longest-match |
 | C25 | A prefix-flagged table entry cannot absorb a second command | DEMONSTRATED (suite only) | `tests/test_driver_panos.c`: `test_prefix_entries_positive_and_negative` (separator forms all RED), `test_prefix_flag_lint` (fails the suite if `prefix=true` sits on a GREEN/YELLOW entry that shadows a stricter one) |
 
+**Body-integrity caveat (added 2026-07-29).** C5–C8 and C16 attest the
+*verification layer*: they bind the signed header — command hash,
+device, session, sequence, timestamp — and reject substitution and
+replay at verify time. None of them attest that the observation *body*
+is the device's response to the header's command. The 2026-07-29 static
+review found three SSH-driver mechanisms by which foreign bytes (stale
+buffered output, concurrent watchdog probes, wrapper echoes) can enter
+the body before signing, and one live occurrence was observed on
+2026-07-29 (a signed `show system resources` observation on pa-850
+carrying `show system info` output). C7 in particular remains
+DEMONSTRATED for what it states — verify-time substitution rejection —
+but should not be read as a body-to-command correspondence guarantee.
+See `SECURITY.md` §Observation-Body Integrity.
+
+**Reference-verifier caveat (added 2026-07-29).** The shipped
+`api/virp_verify.py:verify_evidence` diverges from the §6 procedure: it
+HMAC-verifies `obs["raw_message"]` when present, but takes freshness,
+completeness and the extracted value from unsigned sibling fields of
+the corpus entry, and when `raw_message` is absent it falls back to the
+plaintext `obs["verified"]` boolean with no cryptographic check. Until
+that is fixed, §6's guarantees hold for the specified procedure, not
+for the shipped implementation. See `SECURITY.md` §Verifier
+Limitations.
+
 **Scope of the live evidence.** C17–C21 carry live results from
 2026-07-23. Those runs submitted **single commands only**, against a
 **single driver** (Cisco IOS). They say nothing about multi-command
@@ -398,9 +422,15 @@ establish.
    sessions fully hash-linked, the 7 failures all writer-convention
    mismatches (five with an all-zero genesis from a second writer), and
    all three `approval:*` sessions valid, including `approval:R1` from
-   the 2026-07-23 live proof. Two follow-ups remain: the bridge verifier
-   is unfixed, and the two-writer genesis divergence is unresolved. See
-   the README chain-integrity section for the full table.
+   the 2026-07-23 live proof. Narrowed 2026-07-29: the per-session C
+   verifier accepts a truncated tail (deleting the newest K entries
+   still verifies valid, as does a zero-row session), so "fully
+   hash-linked" establishes internal link consistency, not
+   completeness; and the bridge verifier never checks the keyed
+   `chain_hmac` at all. Follow-ups now: the bridge verifier is unfixed
+   (global walk + no HMAC check), the C verifier's tail-completeness
+   gap, and the two-writer genesis divergence. See the README
+   chain-integrity section and `SECURITY.md` §Verifier Limitations.
 
 1. *Config-dumping reads at YELLOW.* `show full-configuration`
    (FortiGate), `show system ha` (FortiGate) and `show running-config`

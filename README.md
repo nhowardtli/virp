@@ -30,6 +30,16 @@ A dedicated process — the **O-Node** — connects to your network devices, cap
 
 This is not a policy. It is a code path.
 
+> **Scope caveat — body-to-command correspondence.** The signature binds
+> command, device and session to the bytes the O-Node read. It does
+> **not** currently guarantee that those bytes are the device's response
+> to that command on the SSH drivers: stale buffered output, a
+> concurrent watchdog probe, or driver wrapper echoes can enter the body
+> before signing, and one such mismatch was observed live on 2026-07-29
+> (a signed `show system resources` observation carrying
+> `show system info` output). See
+> [`SECURITY.md`](SECURITY.md) §Observation-Body Integrity.
+
 ```
 Agent: "FortiGate policy 2 allows all traffic with no AV/IPS."
 
@@ -93,7 +103,7 @@ Prompt engineering, output validation, and behavioral guardrails did not fix it.
 
 | # | Name | What It Does | Status | Evidence |
 |---|---|---|---|---|
-| P1 | Verified Observation | Device output HMAC-signed at collection | Production | tested |
+| P1 | Verified Observation | Device output HMAC-signed at collection | Production | tested (signature validity); body-to-command correspondence not guaranteed on SSH drivers — one live mismatch observed 2026-07-29, see `SECURITY.md` §Observation-Body Integrity |
 | P2 | Tiered Authorization | Command classification enforced below AI | Production | tested — see caveats below |
 | P3 | Verified Intent | Signed proposals before execution | Implemented | tested |
 | P4 | Verified Outcome | Before/after signed comparison | Implemented | tested |
@@ -171,12 +181,26 @@ the 2026-07-23 live-proof session), `approval:SW-3850` (10),
 [`docs/LIVE-PROOF-2026-07-23.md`](docs/LIVE-PROOF-2026-07-23.md) holds
 under correct per-session verification.
 
+**Narrowed 2026-07-29 (static review):** "fully hash-linked" above
+means internal link consistency, not completeness. The per-session C
+verifier (`chain_verify_locked`) reports `valid:true` when its walk
+ends without checking it reached the session's recorded tail — deleting
+the newest K entries of a session still verifies valid, and a zero-row
+session verifies valid. The 2026-07-28 result therefore does not rule
+out deletion of trailing entries. Additionally, the bridge's
+`chain_verify()` checks only the unkeyed `chain_entry_hash` links and
+never verifies the keyed `chain_hmac`, so a keyless attacker with DB
+write access can produce a chain the operator-facing API reports valid.
+See `SECURITY.md` §Verifier Limitations.
+
 **Still open:** the bridge's global-walk verifier is unfixed, so the
 operator-facing `chain_verify` API still reports `valid:false` on any
-multi-session database; and the two-writer genesis divergence is
-unresolved. Chain *logic* is covered by `tests/test_chain.c` (genesis,
-sequential linking, tamper detection, crash recovery) and
-`tests/test_chain_concurrency.c` *[tested]*.
+multi-session database; the bridge never verifies `chain_hmac`; the C
+verifier accepts a truncated tail; and the two-writer genesis
+divergence is unresolved. Chain *logic* is covered by
+`tests/test_chain.c` (genesis, sequential linking, tamper detection,
+crash recovery) and `tests/test_chain_concurrency.c` *[tested — but no
+test covers tail-truncation or the zero-row case]*.
 
 Fabrication is prevented by protocol design, assuming the O-Node is uncompromised *[tested — see `docs/VIRP-CLAIMS.md` Appendix A, C5–C8 and C16]*. See [`SECURITY.md`](SECURITY.md) for the full trust boundary analysis, including known open work on TCP-path mutual authentication.
 
@@ -235,7 +259,7 @@ No. Fabrication is a structural failure mode: the model generates output in resp
 Because the question is not "did this bytestring get tampered with after we recorded it?" — it is "did this bytestring come from a real device?" Hashing after the AI sees the data lets the AI insert the data. VIRP signs at the point of collection, in a process the AI cannot reach, with a key the AI cannot read.
 
 **How is this different from agent observability or tracing platforms?**
-Observability tools record what the agent claimed to do. VIRP records what was cryptographically verified to have happened. Tracing tells you the agent said it ran `show firewall policy 2`. VIRP tells you the device responded, here is the signed response, here is its position in the tamper-evident chain.
+Observability tools record what the agent claimed to do. VIRP records what was cryptographically verified to have happened. Tracing tells you the agent said it ran `show firewall policy 2`. VIRP tells you the device responded, here is the signed response, here is its position in the tamper-evident chain. (One honest narrowing: "the signed response" means the bytes the O-Node read and signed for that command — on the SSH drivers, body-to-command correspondence is not currently guaranteed; see `SECURITY.md` §Observation-Body Integrity.)
 
 **Is the O-Node a single point of compromise?**
 Yes, and intentionally so. The O-Node is the trust boundary; you harden it the way you would harden a HSM or a credential vault. VIRP's job is to compress the trust surface from "everywhere the AI can reach" down to "one process you can audit." That is a manageable problem. The original is not.
