@@ -1090,6 +1090,123 @@ TEST(test_wfd_stale_temp_does_not_wedge_writes)
     wfd_cleanup();
 }
 
+
+/* =========================================================================
+ * Key save: symmetry with the load path
+ *
+ * virp_key_load_file has long required O_NOFOLLOW plus a regular-file,
+ * mode and owner check. virp_key_save_file opened O_CREAT|O_TRUNC with
+ * neither O_EXCL nor O_NOFOLLOW, so a symlink planted at the key path
+ * redirected the key material to the link target. These pin the save
+ * path to the guarantees the load path already made.
+ * ========================================================================= */
+
+#define KS_DIR   "/tmp/virp-keysave-test"
+#define KS_KEY   KS_DIR "/onode.key"
+#define KS_DECOY KS_DIR "/decoy.key"
+
+static void ks_cleanup(void)
+{
+    unlink(KS_KEY); unlink(KS_DECOY); unlink(KS_KEY ".tmp");
+    rmdir(KS_DIR);
+}
+
+TEST(test_key_save_roundtrip_is_0600_and_intact)
+{
+    ks_cleanup();
+    ASSERT_EQ(mkdir(KS_DIR, 0700), 0);
+
+    virp_signing_key_t sk;
+    ASSERT_OK(virp_key_generate(&sk, VIRP_KEY_TYPE_OKEY));
+    ASSERT_OK(virp_key_save_file(&sk, KS_KEY));
+
+    struct stat st;
+    ASSERT_EQ(stat(KS_KEY, &st), 0);
+    ASSERT_EQ((int)(st.st_mode & 07777), 0600);
+    ASSERT_EQ((int)(st.st_mode & (S_IRWXG | S_IRWXO)), 0);
+    ASSERT_EQ((int)st.st_size, VIRP_KEY_SIZE);
+
+    /* Reads back byte-identical through the hardened load path. */
+    virp_signing_key_t loaded;
+    ASSERT_OK(virp_key_load_file(&loaded, VIRP_KEY_TYPE_OKEY, KS_KEY));
+    ASSERT_EQ(memcmp(loaded.key.key, sk.key.key, VIRP_KEY_SIZE), 0);
+
+    virp_key_destroy(&loaded);
+    virp_key_destroy(&sk);
+    ks_cleanup();
+}
+
+TEST(test_key_save_does_not_follow_symlink)
+{
+    ks_cleanup();
+    ASSERT_EQ(mkdir(KS_DIR, 0700), 0);
+
+    /* Decoy the planted link points at. */
+    int fd = open(KS_DECOY, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)write(fd, "not-a-key", 9), 9);
+    close(fd);
+
+    ASSERT_EQ(symlink(KS_DECOY, KS_KEY), 0);
+
+    virp_signing_key_t sk;
+    ASSERT_OK(virp_key_generate(&sk, VIRP_KEY_TYPE_OKEY));
+    ASSERT_OK(virp_key_save_file(&sk, KS_KEY));
+
+    /* The key path is now a regular 0600 file, not the symlink. */
+    struct stat lst;
+    ASSERT_EQ(lstat(KS_KEY, &lst), 0);
+    ASSERT_EQ((int)S_ISLNK(lst.st_mode), 0);
+    ASSERT_EQ((int)S_ISREG(lst.st_mode), 1);
+    ASSERT_EQ((int)(lst.st_mode & 07777), 0600);
+    ASSERT_EQ((int)lst.st_size, VIRP_KEY_SIZE);
+
+    /* The key did NOT land at the link target — the whole point. */
+    struct stat dst;
+    ASSERT_EQ(stat(KS_DECOY, &dst), 0);
+    ASSERT_EQ((int)dst.st_size, 9);
+    uint8_t decoy[32] = {0};
+    fd = open(KS_DECOY, O_RDONLY);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)read(fd, decoy, sizeof(decoy)), 9);
+    close(fd);
+    ASSERT_EQ(memcmp(decoy, "not-a-key", 9), 0);
+
+    virp_key_destroy(&sk);
+    ks_cleanup();
+}
+
+TEST(test_key_save_tightens_mode_on_existing_file)
+{
+    /*
+     * 0600 used to apply only on create, so saving over a pre-existing
+     * world-readable file left it world-readable. fchmod in the helper
+     * makes the mode hold every time.
+     */
+    ks_cleanup();
+    ASSERT_EQ(mkdir(KS_DIR, 0700), 0);
+
+    int fd = open(KS_KEY, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    ASSERT_TRUE(fd >= 0);
+    close(fd);
+    ASSERT_EQ(chmod(KS_KEY, 0666), 0);
+
+    virp_signing_key_t sk;
+    ASSERT_OK(virp_key_generate(&sk, VIRP_KEY_TYPE_OKEY));
+    ASSERT_OK(virp_key_save_file(&sk, KS_KEY));
+
+    struct stat st;
+    ASSERT_EQ(stat(KS_KEY, &st), 0);
+    ASSERT_EQ((int)(st.st_mode & 07777), 0600);
+
+    /* And it still loads: the load path rejects group/other bits. */
+    virp_signing_key_t loaded;
+    ASSERT_OK(virp_key_load_file(&loaded, VIRP_KEY_TYPE_OKEY, KS_KEY));
+    virp_key_destroy(&loaded);
+    virp_key_destroy(&sk);
+    ks_cleanup();
+}
+
 int main(void)
 {
     printf("\n");
@@ -1165,6 +1282,11 @@ int main(void)
     RUN_TEST(test_wfd_symlink_at_target_not_followed);
     RUN_TEST(test_wfd_symlink_at_temp_path_not_followed);
     RUN_TEST(test_wfd_stale_temp_does_not_wedge_writes);
+
+    printf("\n[Key Save / Load Symmetry]\n");
+    RUN_TEST(test_key_save_roundtrip_is_0600_and_intact);
+    RUN_TEST(test_key_save_does_not_follow_symlink);
+    RUN_TEST(test_key_save_tightens_mode_on_existing_file);
     printf("\n================================================================\n");
     printf("  Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0)

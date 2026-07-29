@@ -331,15 +331,30 @@ virp_error_t virp_key_save_file(const virp_signing_key_t *sk,
     if (!sk->key.loaded)
         return VIRP_ERR_KEY_NOT_LOADED;
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0)
-        return VIRP_ERR_KEY_NOT_LOADED;
-
-    ssize_t n = write(fd, sk->key.key, VIRP_KEY_SIZE);
-    close(fd);
-
-    if (n != VIRP_KEY_SIZE)
-        return VIRP_ERR_KEY_NOT_LOADED;
+    /*
+     * Route through the durable, symlink-safe helper rather than a bare
+     * open. The old path used O_CREAT|O_TRUNC with no O_EXCL and no
+     * O_NOFOLLOW, so a symlink planted at `path` redirected the key to
+     * the link target — and 0600 only applied on create, so writing over
+     * an existing world-readable file left it world-readable. The READ
+     * path (virp_key_load_file) has defended against exactly this with
+     * O_NOFOLLOW/O_CLOEXEC plus fstat mode and owner checks; the write
+     * path being weaker was the bug.
+     *
+     * The helper gives us, on this path: no symlink follow (fresh
+     * O_EXCL|O_NOFOLLOW temp, and rename replaces a planted link at the
+     * destination instead of following it), mode 0600 applied exactly
+     * via fchmod regardless of umask, a full write, fsync of both the
+     * file and its parent directory, and atomic replacement — a reader
+     * never observes a partially written key.
+     *
+     * Owner is the process euid, which is what virp_key_load_file's
+     * virp_key_owner_ok() check expects to see on the way back in.
+     */
+    virp_error_t err = virp_write_file_durable(path, 0600,
+                                               sk->key.key, VIRP_KEY_SIZE);
+    if (err != VIRP_OK)
+        return VIRP_ERR_KEY_NOT_LOADED;   /* preserve the caller contract */
 
     return VIRP_OK;
 }
