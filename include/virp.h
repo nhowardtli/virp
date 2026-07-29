@@ -427,6 +427,11 @@ typedef enum {
     VIRP_ERR_APPROVAL_CONSUMED        = -42,  /* Proposal already has an OUTCOME */
     VIRP_ERR_APPROVAL_KEY_UNENROLLED  = -43,  /* key_id not in the registry */
     VIRP_ERR_APPROVAL_KEY_DISABLED    = -44,  /* enrolled key marked disabled */
+
+    /* Interactive-shell read path (see include/virp_ssh_io.h). A read
+     * that ends without the learned prompt is incomplete by definition
+     * and must never be reported as command output. */
+    VIRP_ERR_NO_PROMPT                = -45,  /* read ended without prompt */
 } virp_error_t;
 
 /* =========================================================================

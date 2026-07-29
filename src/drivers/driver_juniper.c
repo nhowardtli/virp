@@ -24,6 +24,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_driver.h"
+#include "virp_ssh_io.h"
 #include "virp_driver_juniper.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -196,13 +197,41 @@ struct virp_conn {
     int                 sock_fd;
     LIBSSH2_SESSION     *session;
     LIBSSH2_CHANNEL     *channel;
-    char                prompt[JUNOS_MAX_PROMPT_LEN];
-    size_t              prompt_len;
+    virp_ssh_prompt_t   prompt;      /* learned at connect / after mode change */
+    virp_ssh_io_t       io;          /* shared read path transport adapter */
     bool                connected;
     junos_mode_t        current_mode;
     bool                config_error;       /* set/delete failed in config session */
     bool                commit_check_ok;    /* commit check passed for this batch */
 };
+
+/* ── Transport adapter for the shared read path ─────────────────── */
+
+static ssize_t junos_io_read(void *ctx, char *buf, size_t len)
+{
+    virp_conn_t *conn = (virp_conn_t *)ctx;
+    ssize_t n = libssh2_channel_read(conn->channel, buf, len);
+    if (n == LIBSSH2_ERROR_EAGAIN)
+        return VIRP_SSH_IO_EAGAIN;
+    return n;
+}
+
+static ssize_t junos_io_write(void *ctx, const char *buf, size_t len)
+{
+    virp_conn_t *conn = (virp_conn_t *)ctx;
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = libssh2_channel_write(conn->channel, buf + written,
+                                          len - written);
+        if (n > 0)
+            written += (size_t)n;
+        else if (n == LIBSSH2_ERROR_EAGAIN)
+            usleep(10000);
+        else
+            return -1;
+    }
+    return (ssize_t)written;
+}
 
 /* =========================================================================
  * Prompt Parsing — determine JunOS mode from prompt string
@@ -287,87 +316,6 @@ static int tcp_connect(const char *host, uint16_t port)
  * Also handles "{master:0}" prefix lines before the prompt.
  * ========================================================================= */
 
-static ssize_t ssh_read_until_prompt(virp_conn_t *conn,
-                                     char *buf, size_t buf_len,
-                                     int timeout_ms)
-{
-    size_t total = 0;
-    int elapsed = 0;
-    int poll_interval = 50;
-
-    while (total < buf_len - 1 && elapsed < timeout_ms) {
-        ssize_t n = libssh2_channel_read(conn->channel,
-                                          buf + total,
-                                          buf_len - total - 1);
-        if (n > 0) {
-            total += n;
-            buf[total] = '\0';
-
-            /*
-             * JunOS prompt detection.
-             *
-             * JunOS prompt is always on the last line and ends with > # or %
-             * It contains '@' (user@hostname pattern).
-             *
-             * Watch out for "{master:0}" or "[edit]" lines that appear
-             * before the prompt in config mode — scan the actual last line.
-             */
-            if (total >= 1) {
-                /* Find the last non-empty line */
-                char *last_nl = strrchr(buf, '\n');
-                const char *last_line = last_nl ? last_nl + 1 : buf;
-
-                /* Skip if empty (might have trailing newline before prompt) */
-                if (*last_line == '\0' && last_nl && last_nl > buf) {
-                    /* Look one line further back */
-                    char saved = *last_nl;
-                    *last_nl = '\0';
-                    char *prev_nl = strrchr(buf, '\n');
-                    *last_nl = saved;
-                    if (prev_nl)
-                        last_line = prev_nl + 1;
-                    else
-                        last_line = buf;
-                }
-
-                size_t llen = strlen(last_line);
-                /* Strip trailing whitespace for matching */
-                while (llen > 0 && (last_line[llen - 1] == ' ' ||
-                                     last_line[llen - 1] == '\r' ||
-                                     last_line[llen - 1] == '\n'))
-                    llen--;
-
-                if (llen > 0) {
-                    char last = last_line[llen - 1];
-                    if ((last == '>' || last == '#' || last == '%') &&
-                        memchr(last_line, '@', llen) != NULL) {
-                        /* Looks like a JunOS prompt — save it */
-                        if (llen < JUNOS_MAX_PROMPT_LEN) {
-                            if (conn->prompt_len == 0) {
-                                memcpy(conn->prompt, last_line, llen);
-                                conn->prompt[llen] = '\0';
-                                conn->prompt_len = llen;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            elapsed = 0;
-        } else if (n == LIBSSH2_ERROR_EAGAIN) {
-            usleep(poll_interval * 1000);
-            elapsed += poll_interval;
-        } else if (n == 0) {
-            break;
-        } else {
-            break;
-        }
-    }
-
-    buf[total] = '\0';
-    return (ssize_t)total;
-}
-
 /* =========================================================================
  * SSH Write Helper
  * ========================================================================= */
@@ -389,32 +337,6 @@ static int ssh_write(virp_conn_t *conn, const char *data)
             return -1;
     }
     return 0;
-}
-
-/* =========================================================================
- * Buffer Flush — drain any stale output
- *
- * Same pattern as ASA — older JunOS can leave bytes in the buffer
- * between commands, especially after long "show" outputs.
- * ========================================================================= */
-
-static void junos_flush_buffer(virp_conn_t *conn)
-{
-    char drain[4096];
-    int elapsed = 0;
-
-    while (elapsed < JUNOS_FLUSH_TIMEOUT_MS) {
-        ssize_t n = libssh2_channel_read(conn->channel,
-                                          drain, sizeof(drain) - 1);
-        if (n > 0) {
-            elapsed = 0;
-        } else if (n == LIBSSH2_ERROR_EAGAIN) {
-            usleep(50 * 1000);
-            elapsed += 50;
-        } else {
-            break;
-        }
-    }
 }
 
 /* =========================================================================
@@ -483,7 +405,9 @@ static virp_conn_t *junos_connect(const virp_device_t *device)
     memcpy(&conn->device, device, sizeof(*device));
     conn->sock_fd = -1;
     conn->connected = false;
-    conn->prompt_len = 0;
+    conn->io.ctx = conn;
+    conn->io.read = junos_io_read;
+    conn->io.write = junos_io_write;
     conn->current_mode = JUNOS_MODE_UNKNOWN;
     conn->config_error = false;
     conn->commit_check_ok = false;
@@ -658,30 +582,47 @@ static virp_conn_t *junos_connect(const virp_device_t *device)
     /* Set non-blocking mode */
     libssh2_session_set_blocking(conn->session, 0);
 
-    /* Read initial banner/prompt.
-     * JunOS often sends a MOTD banner before the CLI prompt.
-     * The prompt will be the last line: "user@hostname>" */
-    char banner[4096];
-    ssh_read_until_prompt(conn, banner, sizeof(banner), 5000);
-
-    /* Detect initial mode */
-    conn->current_mode = junos_parse_mode(conn->prompt);
+    /*
+     * Connect-time reads precede any known prompt (JunOS sends a MOTD
+     * banner first), so they are quiescence-based and never signed.
+     */
+    char scratch[4096];
+    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
 
     /* Disable paging — JunOS uses "set cli screen-length 0" */
     ssh_write(conn, "set cli screen-length 0\n");
-    char discard[4096];
-    ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
+    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
 
     /* Disable line wrapping — prevents mid-line breaks on wide output */
     ssh_write(conn, "set cli screen-width 0\n");
-    conn->prompt_len = 0;  /* Reset — prompt may have changed */
-    ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
+    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+
+    /*
+     * Learn the prompt AFTER the cli settings, which can change it.
+     * From here the prompt is an input to every read. No fallback:
+     * a connection we cannot learn a prompt for cannot produce a
+     * trustworthy observation.
+     */
+    if (virp_ssh_learn_prompt(&conn->io, device->hostname,
+                              &conn->prompt) != VIRP_OK) {
+        fprintf(stderr, "[JunOS] Prompt learning failed — refusing connection "
+                "to %s (%s:%u)\n", device->hostname, device->host, port);
+        libssh2_channel_close(conn->channel);
+        libssh2_channel_free(conn->channel);
+        libssh2_session_disconnect(conn->session, "prompt learn failed");
+        libssh2_session_free(conn->session);
+        close(conn->sock_fd);
+        OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
+        free(conn);
+        return NULL;
+    }
+    conn->current_mode = junos_parse_mode(conn->prompt.prompt);
 
     conn->connected = true;
 
     fprintf(stderr, "[JunOS] Connected: %s@%s:%u prompt='%s' mode=%d\n",
             device->username, device->host, port,
-            conn->prompt, conn->current_mode);
+            conn->prompt.prompt, conn->current_mode);
 
     return conn;
 }
@@ -715,9 +656,6 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
         return VIRP_OK;
     }
 
-    /* Step 1: Flush stale output */
-    junos_flush_buffer(conn);
-
     /* ── BLACK tier safety: never execute forbidden commands ── */
     virp_trust_tier_t tier = junos_route_command(command);
     if (tier == VIRP_TIER_BLACK) {
@@ -746,6 +684,10 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
     bool is_rollback = (strncasecmp(command, "rollback", 8) == 0);
     bool is_set_delete = (strncasecmp(command, "set ", 4) == 0 ||
                           strncasecmp(command, "delete ", 7) == 0);
+    /* Commands that deliberately move the prompt (op <-> config). */
+    bool is_mode_changing = is_configure || is_rollback ||
+                            (strncasecmp(command, "exit", 4) == 0) ||
+                            (strncasecmp(command, "quit", 4) == 0);
 
     /* Reset config state when entering configure mode */
     if (is_configure) {
@@ -765,8 +707,11 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
         /* Auto-rollback for safety */
         ssh_write(conn, "rollback 0\n");
         char rb_buf[4096];
-        conn->prompt_len = 0;
-        ssh_read_until_prompt(conn, rb_buf, sizeof(rb_buf), 5000);
+        virp_ssh_read_quiescent(&conn->io, rb_buf, sizeof(rb_buf), 5000);
+        /* rollback can change the prompt — re-learn, best effort here
+         * since we are already on an error path. */
+        virp_ssh_learn_prompt(&conn->io, conn->device.hostname, &conn->prompt);
+        conn->current_mode = junos_parse_mode(conn->prompt.prompt);
         conn->config_error = false;
         conn->commit_check_ok = false;
         int written = snprintf(result->output, sizeof(result->output),
@@ -793,6 +738,9 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
         snprintf(cmd_buf, sizeof(cmd_buf), "%s\n", command);
     }
 
+    /* Drain residue from any earlier command before sending. */
+    virp_ssh_drain(&conn->io, conn->device.hostname);
+
     if (ssh_write(conn, cmd_buf) != 0) {
         conn->connected = false;
         result->success = false;
@@ -801,29 +749,76 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
         return VIRP_OK;
     }
 
-    /* Step 3: Read response.
-     * Reset prompt detection — JunOS may change prompt after some commands
-     * (e.g., entering config mode changes > to #). */
-    conn->prompt_len = 0;
-
+    /*
+     * Step 3: Read response.
+     *
+     * Ordering inverted from the original: the learned prompt is an
+     * INPUT to this read. It used to be cleared here and re-derived
+     * from whatever the read happened to end on, which meant the read
+     * could not be checked against anything. Commands that legitimately
+     * change the prompt (configure / exit / rollback) re-learn it
+     * explicitly after the read instead.
+     */
     char raw_output[VIRP_OUTPUT_MAX];
-    ssize_t n = ssh_read_until_prompt(conn, raw_output, sizeof(raw_output),
-                                      JUNOS_READ_TIMEOUT_MS);
+    size_t n = 0;
+    virp_error_t rerr = virp_ssh_read_until_prompt(&conn->io, &conn->prompt,
+                                                   raw_output,
+                                                   sizeof(raw_output), &n,
+                                                   JUNOS_READ_TIMEOUT_MS,
+                                                   conn->device.hostname);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
                                        (end.tv_nsec - start.tv_nsec) / 1000000);
 
-    if (n <= 0) {
-        conn->connected = false;
-        result->success = false;
-        snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Read timeout on %s", conn->device.hostname);
-        return VIRP_OK;
+    if (rerr == VIRP_ERR_NO_PROMPT && is_mode_changing) {
+        /*
+         * A mode-changing command moves the prompt, so the pre-command
+         * prompt legitimately will not reappear. Re-learn and treat the
+         * transition itself as the result — still never a signed body
+         * built from an unterminated read.
+         */
+        if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+                                  &conn->prompt) == VIRP_OK) {
+            conn->current_mode = junos_parse_mode(conn->prompt.prompt);
+            rerr = VIRP_OK;
+        }
     }
 
-    /* Update mode from fresh prompt */
-    conn->current_mode = junos_parse_mode(conn->prompt);
+    if (rerr == VIRP_ERR_NO_PROMPT) {
+        conn->connected = false;
+        result->success = false;
+        result->output_len = 0;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Incomplete read on %s: no prompt after %zu bytes",
+                 conn->device.hostname, n);
+        return VIRP_ERR_NO_PROMPT;
+    }
+    if (rerr != VIRP_OK) {
+        conn->connected = false;
+        result->success = false;
+        result->output_len = 0;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Transport failure on %s: %s",
+                 conn->device.hostname, virp_error_str(rerr));
+        return rerr;
+    }
+
+    /* Re-learn after any deliberate mode change so the next read has a
+     * correct input prompt. */
+    if (is_mode_changing) {
+        if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+                                  &conn->prompt) != VIRP_OK) {
+            conn->connected = false;
+            result->success = false;
+            result->output_len = 0;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Prompt re-learn failed after mode change on %s",
+                     conn->device.hostname);
+            return VIRP_ERR_NO_PROMPT;
+        }
+    }
+    conn->current_mode = junos_parse_mode(conn->prompt.prompt);
 
     /* Step 4: Scrub output — remove echoed command and trailing prompt.
      *
@@ -836,20 +831,7 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
      * Additional wrinkle: in config mode, JunOS may emit
      * "{master:0}" or "[edit]" lines before the prompt.
      */
-    char *output_start = raw_output;
-    char *first_nl = strchr(raw_output, '\n');
-    if (first_nl)
-        output_start = first_nl + 1;
-
-    /* Remove trailing prompt */
-    if (conn->prompt_len > 0) {
-        size_t out_len = strlen(output_start);
-        if (out_len >= conn->prompt_len) {
-            char *possible_prompt = output_start + out_len - conn->prompt_len;
-            if (strncmp(possible_prompt, conn->prompt, conn->prompt_len) == 0)
-                *possible_prompt = '\0';
-        }
-    }
+    char *output_start = virp_ssh_strip_echo(raw_output, command);
 
     /* Also strip {master:0} lines if present at end */
     char *master_tag = strstr(output_start, "\n{master:");
@@ -919,11 +901,13 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
             fprintf(stderr, "[JunOS] Commit check FAILED on %s — "
                     "auto-rollback\n", conn->device.hostname);
             /* Auto-rollback on commit check failure */
-            junos_flush_buffer(conn);
+            virp_ssh_drain(&conn->io, conn->device.hostname);
             ssh_write(conn, "rollback 0\n");
             char rb_buf[4096];
-            conn->prompt_len = 0;
-            ssh_read_until_prompt(conn, rb_buf, sizeof(rb_buf), 5000);
+            virp_ssh_read_quiescent(&conn->io, rb_buf, sizeof(rb_buf), 5000);
+            virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+                                  &conn->prompt);
+            conn->current_mode = junos_parse_mode(conn->prompt.prompt);
         }
     }
 

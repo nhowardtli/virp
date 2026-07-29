@@ -18,6 +18,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_driver.h"
+#include "virp_ssh_io.h"
 #include "virp_driver_asa.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -170,13 +171,41 @@ struct virp_conn {
     int                 sock_fd;
     LIBSSH2_SESSION     *session;
     LIBSSH2_CHANNEL     *channel;
-    char                prompt[ASA_MAX_PROMPT_LEN];
-    size_t              prompt_len;
+    virp_ssh_prompt_t   prompt;      /* learned at connect / after mode change */
+    virp_ssh_io_t       io;          /* shared read path transport adapter */
     bool                connected;
     bool                in_enable;
     asa_mode_t          current_mode;
     asa_context_t       context;
 };
+
+/* ── Transport adapter for the shared read path ─────────────────── */
+
+static ssize_t asa_io_read(void *ctx, char *buf, size_t len)
+{
+    virp_conn_t *conn = (virp_conn_t *)ctx;
+    ssize_t n = libssh2_channel_read(conn->channel, buf, len);
+    if (n == LIBSSH2_ERROR_EAGAIN)
+        return VIRP_SSH_IO_EAGAIN;
+    return n;
+}
+
+static ssize_t asa_io_write(void *ctx, const char *buf, size_t len)
+{
+    virp_conn_t *conn = (virp_conn_t *)ctx;
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = libssh2_channel_write(conn->channel, buf + written,
+                                          len - written);
+        if (n > 0)
+            written += (size_t)n;
+        else if (n == LIBSSH2_ERROR_EAGAIN)
+            usleep(10000);
+        else
+            return -1;
+    }
+    return (ssize_t)written;
+}
 
 /* =========================================================================
  * Prompt Parsing — determine ASA mode from prompt string
@@ -266,66 +295,6 @@ static int tcp_connect(const char *host, uint16_t port)
  * ASA prompts: hostname>, hostname#, hostname(config)#, hostname/ctx>
  * ========================================================================= */
 
-static ssize_t ssh_read_until_prompt(virp_conn_t *conn,
-                                     char *buf, size_t buf_len,
-                                     int timeout_ms)
-{
-    size_t total = 0;
-    int elapsed = 0;
-    int poll_interval = 50;
-
-    while (total < buf_len - 1 && elapsed < timeout_ms) {
-        ssize_t n = libssh2_channel_read(conn->channel,
-                                          buf + total,
-                                          buf_len - total - 1);
-        if (n > 0) {
-            total += n;
-            buf[total] = '\0';
-
-            /*
-             * ASA prompt detection: look for # or > at end of last line.
-             * Must handle (config)# and /context# patterns.
-             */
-            if (total >= 1) {
-                /* Find the last line */
-                char *last_nl = strrchr(buf, '\n');
-                const char *last_line = last_nl ? last_nl + 1 : buf;
-
-                /* Strip trailing spaces */
-                size_t llen = strlen(last_line);
-                while (llen > 0 && last_line[llen - 1] == ' ')
-                    llen--;
-
-                if (llen > 0) {
-                    char last = last_line[llen - 1];
-                    if (last == '#' || last == '>') {
-                        /* Looks like a prompt — save it */
-                        if (llen < ASA_MAX_PROMPT_LEN) {
-                            if (conn->prompt_len == 0) {
-                                memcpy(conn->prompt, last_line, llen);
-                                conn->prompt[llen] = '\0';
-                                conn->prompt_len = llen;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            elapsed = 0;
-        } else if (n == LIBSSH2_ERROR_EAGAIN) {
-            usleep(poll_interval * 1000);
-            elapsed += poll_interval;
-        } else if (n == 0) {
-            break;
-        } else {
-            break;
-        }
-    }
-
-    buf[total] = '\0';
-    return (ssize_t)total;
-}
-
 /* =========================================================================
  * SSH Write Helper
  * ========================================================================= */
@@ -350,32 +319,6 @@ static int ssh_write(virp_conn_t *conn, const char *data)
 }
 
 /* =========================================================================
- * Buffer Flush — drain any stale output from the ASA
- *
- * ASA quirk: output from a previous command can appear in the buffer
- * if the read didn't fully drain. Always flush before sending a command.
- * ========================================================================= */
-
-static void asa_flush_buffer(virp_conn_t *conn)
-{
-    char drain[4096];
-    int elapsed = 0;
-
-    while (elapsed < ASA_FLUSH_TIMEOUT_MS) {
-        ssize_t n = libssh2_channel_read(conn->channel,
-                                          drain, sizeof(drain) - 1);
-        if (n > 0) {
-            elapsed = 0;  /* More data, keep draining */
-        } else if (n == LIBSSH2_ERROR_EAGAIN) {
-            usleep(50 * 1000);
-            elapsed += 50;
-        } else {
-            break;
-        }
-    }
-}
-
-/* =========================================================================
  * Enable Mode — enter or re-enter privileged EXEC
  *
  * Returns true if now in enable mode (prompt ends with #).
@@ -386,48 +329,46 @@ static bool asa_enter_enable(virp_conn_t *conn)
 {
     char buf[4096];
 
-    /* Check current prompt */
-    if (conn->prompt_len > 0 &&
-        conn->prompt[conn->prompt_len - 1] == '#') {
+    /* Already privileged? */
+    if (conn->prompt.learned && conn->prompt.prompt_len > 0 &&
+        conn->prompt.prompt[conn->prompt.prompt_len - 1] == '#') {
         conn->in_enable = true;
         return true;
     }
 
-    /* Send enable */
+    /*
+     * The enable exchange changes the prompt, so it runs on quiescent
+     * reads and the prompt is RE-LEARNED afterwards. Nothing read here
+     * is signed.
+     */
     ssh_write(conn, "enable\n");
-    ssh_read_until_prompt(conn, buf, sizeof(buf), ASA_ENABLE_TIMEOUT_MS);
+    virp_ssh_read_quiescent(&conn->io, buf, sizeof(buf), ASA_ENABLE_TIMEOUT_MS);
 
-    /* If we got a password prompt, send enable password */
     if (strstr(buf, "assword") != NULL) {
         char enable_cmd[256];
         snprintf(enable_cmd, sizeof(enable_cmd), "%s\n",
                  conn->device.enable_password);
         ssh_write(conn, enable_cmd);
-
-        /* Reset prompt — will be re-detected */
-        conn->prompt_len = 0;
-        ssh_read_until_prompt(conn, buf, sizeof(buf), ASA_ENABLE_TIMEOUT_MS);
+        virp_ssh_read_quiescent(&conn->io, buf, sizeof(buf),
+                                ASA_ENABLE_TIMEOUT_MS);
     }
 
-    /* Check if we're now in enable mode */
-    if (conn->prompt_len > 0 &&
-        conn->prompt[conn->prompt_len - 1] == '#') {
-        conn->in_enable = true;
+    /* Pager/width do not persist across an enable transition. */
+    ssh_write(conn, "terminal pager 0\n");
+    virp_ssh_read_quiescent(&conn->io, buf, sizeof(buf), 3000);
+    ssh_write(conn, "terminal width 512\n");
+    virp_ssh_read_quiescent(&conn->io, buf, sizeof(buf), 3000);
 
-        /* Re-apply terminal pager 0 — doesn't persist across enable transitions */
-        ssh_write(conn, "terminal pager 0\n");
-        char discard[4096];
-        ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
-
-        /* Set terminal width to prevent 80-char line wrapping */
-        ssh_write(conn, "terminal width 512\n");
-        ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
-
-        return true;
+    if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+                              &conn->prompt) != VIRP_OK) {
+        conn->in_enable = false;
+        return false;
     }
 
-    conn->in_enable = false;
-    return false;
+    conn->current_mode = asa_parse_mode(conn->prompt.prompt);
+    conn->in_enable = (conn->prompt.prompt_len > 0 &&
+                       conn->prompt.prompt[conn->prompt.prompt_len - 1] == '#');
+    return conn->in_enable;
 }
 
 /* =========================================================================
@@ -439,18 +380,19 @@ static bool asa_enter_enable(virp_conn_t *conn)
 static bool asa_verify_enable(virp_conn_t *conn)
 {
     /*
-     * Send an empty line to get a fresh prompt.
-     * This also detects if we dropped to user mode.
+     * Re-learn rather than re-detect. ASA silently drops out of enable
+     * after some commands, which changes the prompt; the learned prompt
+     * is an input to every read, so a stale one would make every later
+     * read fail. Re-learning IS the check — it sends the probes and
+     * confirms the answer.
      */
-    ssh_write(conn, "\n");
+    if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+                              &conn->prompt) != VIRP_OK) {
+        conn->in_enable = false;
+        return false;
+    }
 
-    /* Reset prompt to re-detect */
-    conn->prompt_len = 0;
-
-    char buf[4096];
-    ssh_read_until_prompt(conn, buf, sizeof(buf), 2000);
-
-    conn->current_mode = asa_parse_mode(conn->prompt);
+    conn->current_mode = asa_parse_mode(conn->prompt.prompt);
 
     if (conn->current_mode == ASA_MODE_ENABLE ||
         conn->current_mode == ASA_MODE_CONFIG ||
@@ -480,7 +422,9 @@ static virp_conn_t *asa_connect(const virp_device_t *device)
     conn->sock_fd = -1;
     conn->connected = false;
     conn->in_enable = false;
-    conn->prompt_len = 0;
+    conn->io.ctx = conn;
+    conn->io.read = asa_io_read;
+    conn->io.write = asa_io_write;
     conn->current_mode = ASA_MODE_UNKNOWN;
     memset(&conn->context, 0, sizeof(conn->context));
 
@@ -606,12 +550,21 @@ static virp_conn_t *asa_connect(const virp_device_t *device)
     /* Set non-blocking mode */
     libssh2_session_set_blocking(conn->session, 0);
 
-    /* Read initial banner/prompt */
-    char banner[4096];
-    ssh_read_until_prompt(conn, banner, sizeof(banner), 5000);
+    /*
+     * Connect-time reads precede any known prompt, so they are
+     * quiescence-based and never signed.
+     */
+    char scratch[4096];
+    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
 
-    /* Detect initial mode */
-    conn->current_mode = asa_parse_mode(conn->prompt);
+    /* Learn the prompt before deciding anything from it. */
+    if (virp_ssh_learn_prompt(&conn->io, device->hostname,
+                              &conn->prompt) != VIRP_OK) {
+        fprintf(stderr, "[ASA] Prompt learning failed — refusing connection "
+                "to %s (%s:%u)\n", device->hostname, device->host, port);
+        goto learn_failed;
+    }
+    conn->current_mode = asa_parse_mode(conn->prompt.prompt);
 
     /* Enter enable mode if needed */
     if (conn->current_mode == ASA_MODE_USER) {
@@ -627,20 +580,40 @@ static virp_conn_t *asa_connect(const virp_device_t *device)
         conn->in_enable = true;
         /* Already in enable — just disable pager and set width */
         ssh_write(conn, "terminal pager 0\n");
-        char discard[4096];
-        ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
+        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
 
         ssh_write(conn, "terminal width 512\n");
-        ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
+        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+
+        /* Those commands can alter the prompt line — re-learn. */
+        if (virp_ssh_learn_prompt(&conn->io, device->hostname,
+                                  &conn->prompt) != VIRP_OK) {
+            fprintf(stderr, "[ASA] Prompt re-learn failed after pager setup "
+                    "on %s\n", device->hostname);
+            goto learn_failed;
+        }
+        conn->current_mode = asa_parse_mode(conn->prompt.prompt);
     }
 
     conn->connected = true;
 
     fprintf(stderr, "[ASA] Connected: %s@%s:%u prompt='%s' enable=%d mode=%d\n",
             device->username, device->host, port,
-            conn->prompt, conn->in_enable, conn->current_mode);
+            conn->prompt.prompt, conn->in_enable, conn->current_mode);
 
     return conn;
+
+learn_failed:
+    libssh2_channel_close(conn->channel);
+    libssh2_channel_free(conn->channel);
+    libssh2_session_disconnect(conn->session, "prompt learn failed");
+    libssh2_session_free(conn->session);
+    close(conn->sock_fd);
+    OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
+    OPENSSL_cleanse(conn->device.enable_password,
+                    sizeof(conn->device.enable_password));
+    free(conn);
+    return NULL;
 }
 
 /* =========================================================================
@@ -686,10 +659,8 @@ static virp_error_t asa_execute(virp_conn_t *conn,
         return VIRP_OK;
     }
 
-    /* Step 1: Flush stale output */
-    asa_flush_buffer(conn);
-
-    /* Step 2: Verify enable mode before every command */
+    /* Step 1: Verify enable mode before every command (re-learns the
+     * prompt, which also drains anything buffered). */
     if (!asa_verify_enable(conn)) {
         fprintf(stderr, "[ASA] Warning: not in enable mode on %s, "
                 "command may fail: %s\n", conn->device.hostname, command);
@@ -698,53 +669,42 @@ static virp_error_t asa_execute(virp_conn_t *conn,
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    /* Step 3: Send command */
-    char cmd_buf[2048];
-    snprintf(cmd_buf, sizeof(cmd_buf), "%s\n", command);
-
-    if (ssh_write(conn, cmd_buf) != 0) {
-        conn->connected = false;
-        result->success = false;
-        snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Failed to send command to %s", conn->device.hostname);
-        return VIRP_OK;
-    }
-
-    /* Step 4: Read response */
+    /* Step 2: shared read path — drain residue, send, read to the
+     * LEARNED prompt (which the helper strips). */
     char raw_output[VIRP_OUTPUT_MAX];
-    ssize_t n = ssh_read_until_prompt(conn, raw_output, sizeof(raw_output),
-                                      ASA_READ_TIMEOUT_MS);
+    size_t n = 0;
+    virp_error_t rerr = virp_ssh_exec(&conn->io, &conn->prompt, command,
+                                      raw_output, sizeof(raw_output), &n,
+                                      ASA_READ_TIMEOUT_MS,
+                                      conn->device.hostname);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
                                        (end.tv_nsec - start.tv_nsec) / 1000000);
 
-    if (n <= 0) {
+    if (rerr == VIRP_ERR_NO_PROMPT) {
+        /* Incomplete read — a hard error so the O-Node emits a typed
+         * ERROR observation rather than signing a truncated body. */
         conn->connected = false;
         result->success = false;
+        result->output_len = 0;
         snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Read timeout on %s", conn->device.hostname);
-        return VIRP_OK;
+                 "Incomplete read on %s: no prompt after %zu bytes",
+                 conn->device.hostname, n);
+        return VIRP_ERR_NO_PROMPT;
+    }
+    if (rerr != VIRP_OK) {
+        conn->connected = false;
+        result->success = false;
+        result->output_len = 0;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Transport failure on %s: %s",
+                 conn->device.hostname, virp_error_str(rerr));
+        return rerr;
     }
 
-    /* Update mode from fresh prompt */
-    conn->current_mode = asa_parse_mode(conn->prompt);
-
-    /* Step 5: Scrub output — remove echoed command and trailing prompt */
-    char *output_start = raw_output;
-    char *first_nl = strchr(raw_output, '\n');
-    if (first_nl)
-        output_start = first_nl + 1;
-
-    /* Remove trailing prompt */
-    if (conn->prompt_len > 0) {
-        size_t out_len = strlen(output_start);
-        if (out_len >= conn->prompt_len) {
-            char *possible_prompt = output_start + out_len - conn->prompt_len;
-            if (strncmp(possible_prompt, conn->prompt, conn->prompt_len) == 0)
-                *possible_prompt = '\0';
-        }
-    }
+    /* Step 3: strip the echo by matching the command text. */
+    char *output_start = virp_ssh_strip_echo(raw_output, command);
 
     /* Strip trailing \r\n */
     size_t clean_len = strlen(output_start);

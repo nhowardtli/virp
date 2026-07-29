@@ -34,6 +34,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_validator.o \
              $(BUILD_DIR)/virp_approval.o \
              $(BUILD_DIR)/virp_approver_registry.o \
+             $(BUILD_DIR)/virp_ssh_io.o \
              $(BUILD_DIR)/cJSON.o
 
 # Optional Cisco driver (requires libssh2)
@@ -171,6 +172,9 @@ $(BUILD_DIR)/driver_wazuh.o: src/drivers/driver_wazuh.c | $(BUILD_DIR)
 $(BUILD_DIR)/virp_ssh_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/virp_ssh_io.o: src/virp_ssh_io.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/cJSON.o: src/third_party/cJSON.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -251,6 +255,16 @@ fuzz: $(FUZZ_BIN)
 
 test-onode: $(TEST_ONODE)
 	./$(TEST_ONODE)
+
+# Shared SSH read path (finding N1 / 2a)
+TEST_SSH_IO = $(BUILD_DIR)/test_ssh_io
+
+$(TEST_SSH_IO): tests/test_ssh_io.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-ssh-io
+test-ssh-io: $(TEST_SSH_IO)
+	./$(TEST_SSH_IO)
 
 # Chain and Federation tests
 TEST_CHAIN = $(BUILD_DIR)/test_chain
@@ -629,15 +643,41 @@ lint-memcmp:
 	@echo "=== memcmp usage in src/ (advisory) ==="
 	@grep -rn 'memcmp' src/ || echo "  (none found)"
 
+# Structural check: no driver may reimplement the read-until-prompt loop.
+# The four SSH drivers share src/virp_ssh_io.c; a private copy is how the
+# four paths diverged in the first place (see SECURITY.md
+# Observation-Body Integrity). Structural, not a hand-maintained list.
+.PHONY: check-shared-readpath
+check-shared-readpath:
+	@echo "=== Checking SSH drivers use the shared read path ==="
+	@fail=0; \
+	for f in src/drivers/driver_cisco.c src/drivers/driver_asa.c \
+	         src/drivers/driver_juniper.c src/driver_panos.c; do \
+	  if grep -qE '^\s*static\s+ssize_t\s+[a-z_]*read_until_prompt' $$f; then \
+	    echo "  FAIL: $$f defines its own read_until_prompt"; fail=1; \
+	  fi; \
+	  if ! grep -q 'virp_ssh_io.h' $$f; then \
+	    echo "  FAIL: $$f does not include virp_ssh_io.h"; fail=1; \
+	  fi; \
+	  if grep -qE 'libssh2_channel_read' $$f | grep -v io_read; then \
+	    :; \
+	  fi; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "  OK: all four SSH drivers use the shared read path"; \
+	else exit 1; fi
+
 # ASan+UBSan test rebuild — runs full test suite under sanitizers
 .PHONY: asan-test
 asan-test:
 	$(MAKE) clean
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined"
+	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
+	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO)
 	@echo "=== Running tests under ASan+UBSan ==="
 	./$(TEST_BIN) 2>&1
 	./$(TEST_ONODE) 2>&1
+	./$(TEST_SSH_IO) 2>&1
 	@echo "=== ASan+UBSan test run complete ==="
 
 # libFuzzer harness (requires clang)
@@ -716,4 +756,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-live-fence check-socket-path test test-onode test-drivers test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-drivers test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11

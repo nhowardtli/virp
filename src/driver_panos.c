@@ -31,6 +31,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_driver.h"
+#include "virp_ssh_io.h"
 #include "driver_panos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -231,8 +232,8 @@ struct virp_conn {
     int                 sock_fd;
     LIBSSH2_SESSION     *session;
     LIBSSH2_CHANNEL     *channel;
-    char                prompt[PA_SSH_MAX_PROMPT_LEN];
-    size_t              prompt_len;
+    virp_ssh_prompt_t   prompt;      /* learned at connect — see virp_ssh_io.h */
+    virp_ssh_io_t       io;          /* shared read path transport adapter */
     bool                connected;
     bool                pager_disabled;
 
@@ -285,95 +286,6 @@ static int pa_tcp_connect(const char *host, uint16_t port)
 }
 
 /* =========================================================================
- * SSH Read Helper — reads until PAN-OS prompt or timeout
- *
- * PAN-OS prompt format:
- *   username@hostname>    (operational mode)
- *   username@hostname#    (configuration mode)
- *
- * We detect the prompt by looking for a line ending in > or # that
- * contains an @ character (the username@hostname pattern).
- * ========================================================================= */
-
-static ssize_t pa_ssh_read_until_prompt(virp_conn_t *conn,
-                                         char *buf, size_t buf_len,
-                                         int timeout_ms)
-{
-    size_t total = 0;
-    int elapsed = 0;
-    int poll_interval = 50;  /* ms */
-
-    while (total < buf_len - 1 && elapsed < timeout_ms) {
-        ssize_t n = libssh2_channel_read(conn->channel,
-                                          buf + total,
-                                          buf_len - total - 1);
-        if (n > 0) {
-            total += n;
-            buf[total] = '\0';
-
-            /*
-             * Check for PAN-OS prompt: username@hostname> or username@hostname#
-             * Look for a line ending in > or # that contains @
-             */
-            if (total >= 2) {
-                char last = buf[total - 1];
-                if (last == '>' || last == '#' || last == ' ') {
-                    /* Handle trailing space after > or # */
-                    size_t check_pos = total - 1;
-                    if (last == ' ' && check_pos > 0) {
-                        last = buf[check_pos - 1];
-                        if (last != '>' && last != '#') {
-                            elapsed = 0;
-                            continue;
-                        }
-                    }
-
-                    /* Extract the last line as potential prompt */
-                    char *last_nl = NULL;
-                    for (ssize_t i = (ssize_t)total - 2; i >= 0; i--) {
-                        if (buf[i] == '\n') {
-                            last_nl = buf + i;
-                            break;
-                        }
-                    }
-                    const char *prompt_start = last_nl ? last_nl + 1 : buf;
-
-                    /* Verify it looks like username@hostname> */
-                    size_t plen = (buf + total) - prompt_start;
-                    if (plen > 2 && plen < PA_SSH_MAX_PROMPT_LEN &&
-                        memchr(prompt_start, '@', plen) != NULL) {
-                        /* Save detected prompt if we don't have one */
-                        if (conn->prompt_len == 0) {
-                            memcpy(conn->prompt, prompt_start, plen);
-                            conn->prompt[plen] = '\0';
-                            conn->prompt_len = plen;
-
-                            /* Trim trailing whitespace from saved prompt */
-                            while (conn->prompt_len > 0 &&
-                                   conn->prompt[conn->prompt_len - 1] == ' ') {
-                                conn->prompt[--conn->prompt_len] = '\0';
-                            }
-                        }
-                        break;  /* Got a prompt, we're done */
-                    }
-                }
-            }
-            elapsed = 0;  /* Reset timeout on data received */
-        } else if (n == LIBSSH2_ERROR_EAGAIN) {
-            usleep(poll_interval * 1000);
-            elapsed += poll_interval;
-        } else if (n == 0) {
-            break;  /* Channel EOF */
-        } else {
-            break;  /* Error */
-        }
-    }
-
-    buf[total] = '\0';
-    return (ssize_t)total;
-}
-
-/* =========================================================================
  * SSH Write Helper
  * ========================================================================= */
 
@@ -394,6 +306,34 @@ static int pa_ssh_write(virp_conn_t *conn, const char *data)
             return -1;
     }
     return 0;
+}
+
+/* ── Transport adapter for the shared read path ─────────────────── */
+
+static ssize_t pa_io_read(void *ctx, char *buf, size_t len)
+{
+    virp_conn_t *conn = (virp_conn_t *)ctx;
+    ssize_t n = libssh2_channel_read(conn->channel, buf, len);
+    if (n == LIBSSH2_ERROR_EAGAIN)
+        return VIRP_SSH_IO_EAGAIN;
+    return n;
+}
+
+static ssize_t pa_io_write(void *ctx, const char *buf, size_t len)
+{
+    virp_conn_t *conn = (virp_conn_t *)ctx;
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = libssh2_channel_write(conn->channel, buf + written,
+                                          len - written);
+        if (n > 0)
+            written += (size_t)n;
+        else if (n == LIBSSH2_ERROR_EAGAIN)
+            usleep(10000);
+        else
+            return -1;
+    }
+    return (ssize_t)written;
 }
 
 /* =========================================================================
@@ -478,8 +418,11 @@ static void *pa_keepalive_thread(void *arg)
 
         /* Send newline — PAN-OS echoes back the prompt (no-op command) */
         if (pa_ssh_write(conn, "\n") == 0) {
-            char discard[1024];
-            pa_ssh_read_until_prompt(conn, discard, sizeof(discard), 5000);
+            /* Read the prompt echo back to quiescence so the keepalive
+             * cannot leave its own reply on the channel. (2b hardens
+             * this further.) */
+            char discard[8192];
+            virp_ssh_read_quiescent(&conn->io, discard, sizeof(discard), 5000);
             fprintf(stderr, "[PAN-OS] Keepalive OK (%s)\n", conn->device.hostname);
         } else {
             conn->connected = false;
@@ -507,7 +450,9 @@ static virp_conn_t *pa_connect(const virp_device_t *device)
     memcpy(&conn->device, device, sizeof(*device));
     conn->sock_fd = -1;
     conn->connected = false;
-    conn->prompt_len = 0;
+    conn->io.ctx = conn;
+    conn->io.read = pa_io_read;
+    conn->io.write = pa_io_write;
     conn->pager_disabled = false;
     conn->keepalive_running = false;
     conn->keepalive_started = false;
@@ -634,16 +579,38 @@ static virp_conn_t *pa_connect(const virp_device_t *device)
      * interval=60 seconds — SSH protocol layer, independent of our application keepalive. */
     libssh2_keepalive_config(conn->session, 1, 60);
 
-    /* Read initial banner/prompt */
-    char banner[4096];
-    pa_ssh_read_until_prompt(conn, banner, sizeof(banner), 5000);
+    /*
+     * Connect-time reads precede any known prompt, so they are
+     * quiescence-based and never signed.
+     */
+    char scratch[4096];
+    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
 
     /* Disable paging — PAN-OS uses 'set cli pager off' */
     if (!conn->pager_disabled) {
         pa_ssh_write(conn, "set cli pager off\n");
-        char discard[4096];
-        pa_ssh_read_until_prompt(conn, discard, sizeof(discard), 3000);
+        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
         conn->pager_disabled = true;
+    }
+
+    /*
+     * Learn the prompt. PAN-OS is the driver where a stale-residue
+     * mismatch was actually observed in production (2026-07-29), so the
+     * strict path matters most here. No fallback: failure fails connect.
+     */
+    if (virp_ssh_learn_prompt(&conn->io, device->hostname,
+                              &conn->prompt) != VIRP_OK) {
+        fprintf(stderr, "[PAN-OS] Prompt learning failed — refusing connection "
+                "to %s (%s:%u)\n", device->hostname, device->host, port);
+        libssh2_channel_close(conn->channel);
+        libssh2_channel_free(conn->channel);
+        libssh2_session_disconnect(conn->session, "prompt learn failed");
+        libssh2_session_free(conn->session);
+        close(conn->sock_fd);
+        pthread_mutex_destroy(&conn->session_mutex);
+        OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
+        free(conn);
+        return NULL;
     }
 
     conn->connected = true;
@@ -666,7 +633,7 @@ static virp_conn_t *pa_connect(const virp_device_t *device)
     }
 
     fprintf(stderr, "[PAN-OS] Connected: %s@%s:%u prompt='%s'\n",
-            device->username, device->host, port, conn->prompt);
+            device->username, device->host, port, conn->prompt.prompt);
 
     return conn;
 }
@@ -730,19 +697,6 @@ static virp_error_t pa_execute(virp_conn_t *conn,
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    /* Send command */
-    char cmd_buf[2048];
-    snprintf(cmd_buf, sizeof(cmd_buf), "%s\n", command);
-
-    if (pa_ssh_write(conn, cmd_buf) != 0) {
-        conn->connected = false;
-        pthread_mutex_unlock(&conn->session_mutex);
-        result->success = false;
-        snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Failed to send command to %s", conn->device.hostname);
-        return VIRP_OK;
-    }
-
     /* Read response — use longer timeout for commit/load/save/request */
     int read_timeout = pa_timeout_for_command(command);
     if (read_timeout > PA_SSH_READ_TIMEOUT_MS) {
@@ -750,21 +704,38 @@ static virp_error_t pa_execute(virp_conn_t *conn,
                 read_timeout / 1000, command);
     }
 
+    /* Shared read path: drain residue, send, read to the LEARNED prompt. */
     char raw_output[VIRP_OUTPUT_MAX];
-    ssize_t n = pa_ssh_read_until_prompt(conn, raw_output, sizeof(raw_output),
-                                          read_timeout);
+    size_t n = 0;
+    virp_error_t rerr = virp_ssh_exec(&conn->io, &conn->prompt, command,
+                                      raw_output, sizeof(raw_output), &n,
+                                      read_timeout, conn->device.hostname);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
                                        (end.tv_nsec - start.tv_nsec) / 1000000);
 
-    if (n <= 0) {
+    if (rerr == VIRP_ERR_NO_PROMPT) {
+        /* Incomplete read — hard error so the O-Node emits a typed
+         * ERROR observation instead of signing a truncated body. */
         conn->connected = false;
         pthread_mutex_unlock(&conn->session_mutex);
         result->success = false;
+        result->output_len = 0;
         snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Read timeout on %s", conn->device.hostname);
-        return VIRP_OK;
+                 "Incomplete read on %s: no prompt after %zu bytes",
+                 conn->device.hostname, n);
+        return VIRP_ERR_NO_PROMPT;
+    }
+    if (rerr != VIRP_OK) {
+        conn->connected = false;
+        pthread_mutex_unlock(&conn->session_mutex);
+        result->success = false;
+        result->output_len = 0;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Transport failure on %s: %s",
+                 conn->device.hostname, virp_error_str(rerr));
+        return rerr;
     }
 
     /*
@@ -777,30 +748,8 @@ static virp_error_t pa_execute(virp_conn_t *conn,
      * (Matches existing VIRP output format)
      */
 
-    /* Find end of echoed command (first \n) */
-    char *output_start = raw_output;
-    char *first_nl = strchr(raw_output, '\n');
-    if (first_nl)
-        output_start = first_nl + 1;
-
-    /* Remove trailing prompt */
-    if (conn->prompt_len > 0) {
-        size_t out_len = strlen(output_start);
-        if (out_len >= conn->prompt_len) {
-            /* Search backwards for the prompt — may have trailing space */
-            char *search = output_start + out_len - conn->prompt_len;
-            while (search > output_start) {
-                if (strncmp(search, conn->prompt, conn->prompt_len) == 0) {
-                    *search = '\0';
-                    break;
-                }
-                search--;
-                /* Don't search too far back */
-                if ((size_t)(output_start + out_len - search) > conn->prompt_len + 4)
-                    break;
-            }
-        }
-    }
+    /* Strip the echoed command by matching its text, not by position. */
+    char *output_start = virp_ssh_strip_echo(raw_output, command);
 
     /* Strip trailing \r\n */
     size_t clean_len = strlen(output_start);

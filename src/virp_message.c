@@ -990,6 +990,7 @@ const char *virp_error_str(virp_error_t err)
     switch (err) {
     case VIRP_OK:                    return "OK";
     case VIRP_ERR_NULL_PTR:          return "NULL pointer";
+    case VIRP_ERR_NO_PROMPT:         return "Read ended without device prompt (output incomplete)";
     case VIRP_ERR_BUFFER_TOO_SMALL:  return "Buffer too small";
     case VIRP_ERR_INVALID_VERSION:   return "Invalid version";
     case VIRP_ERR_INVALID_TYPE:      return "Invalid message type";
