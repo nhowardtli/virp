@@ -153,9 +153,22 @@ class TestPolicyInvariants(unittest.TestCase):
                                  "YELLOW-executing command in live corpus: %s"
                                  % command)
 
-    def test_corpus_rejected_cases_stay_rejected_shape(self):
+    def test_corpus_expectation_kinds_are_known(self):
         kinds = {e for _, _, e, _ in ap.CORPUS}
-        self.assertEqual(kinds, {"rejected", "green"})
+        self.assertEqual(kinds, {"separator", "rejected", "green"})
+
+    def test_separator_cases_assert_the_outer_layer(self):
+        # A separator-carrying command is refused at the request
+        # boundary (UNCLASSIFIED + "illegal separator"), before
+        # classification. The corpus must assert that specific layer so
+        # a regression demoting it to a weaker one is caught.
+        seps = [(c, m) for _, c, e, m in ap.CORPUS if e == "separator"]
+        self.assertTrue(seps)
+        for command, must_contain in seps:
+            self.assertTrue(any(ch in command for ch in ";|&`"),
+                            "separator case must carry a separator: %s"
+                            % command)
+            self.assertEqual(must_contain, "illegal separator")
 
     def test_battery_rest_commands_are_in_green_sets(self):
         wazuh_green = {"/agents", "/agents/summary/status",

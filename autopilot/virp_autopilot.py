@@ -104,8 +104,16 @@ BATTERY = (
 # ── Nightly adversarial corpus ─────────────────────────────────────────
 # Mirrors tests/test_driver_linux_gate.c plus REST-gate probes. Expected
 # outcome is asserted against the LIVE gate:
-#   "rejected" → signed ERROR observation, tier RED, nothing executed
-#   "green"    → DEVICE_OUTPUT observation, tier GREEN, executed
+#   "separator" → signed ERROR, tier UNCLASSIFIED, refused by the
+#                 daemon's request-boundary separator policy BEFORE
+#                 device lookup or classification (virp_onode.c). This
+#                 is the OUTER layer of a two-layer defense; the
+#                 classifier's own guard is the inner one (unit-tested).
+#                 Asserting the layer precisely means a regression that
+#                 demotes this to a weaker layer still fails here.
+#   "rejected"  → signed ERROR observation, tier RED, gate-blocked,
+#                 nothing executed
+#   "green"     → DEVICE_OUTPUT observation, tier GREEN, executed
 #
 # YELLOW rows (clear ip ospf neighbor/interface, ping, traceroute) are
 # DELIBERATELY absent: a live replay would execute them on the devices
@@ -117,7 +125,7 @@ BATTERY = (
 # the real gate, not a bug.
 CORPUS = [
     # FRR guards
-    ("clab-frr-ospf-frr1", 'vtysh -c "show ip ospf neighbor"; rm -rf /etc/frr', "rejected", None),
+    ("clab-frr-ospf-frr1", 'vtysh -c "show ip ospf neighbor"; rm -rf /etc/frr', "separator", "illegal separator"),
     ("clab-frr-ospf-frr1", 'vtysh -c "show ip ospf neighbor" -c "configure terminal"', "rejected", None),
     ("clab-frr-ospf-frr1", 'FRR_PAGER=cat vtysh -c "show running-config"', "rejected", None),
     ("clab-frr-ospf-frr1", 'vtysh -c "sh ip os nei"', "rejected", None),
@@ -430,7 +438,14 @@ def run_corpus():
             continue
 
         verified = verify_observation(raw)
-        if expect == "rejected":
+        if expect == "separator":
+            # Outer layer: refused at the request boundary, so the
+            # command was never classified — UNCLASSIFIED is the honest
+            # tier here, not a classification failure.
+            ok = (verified and obs["obs_type"] == OBS_ERROR and
+                  obs["tier"] == 0x00 and
+                  "illegal separator" in obs["payload"])
+        elif expect == "rejected":
             ok = (verified and obs["obs_type"] == OBS_ERROR and
                   obs["tier"] == 0x03 and
                   "tier gate blocked" in obs["payload"])
