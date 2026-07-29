@@ -604,8 +604,24 @@ static virp_error_t wazuh_health_check(virp_conn_t *base_conn)
 
     if (!conn->connected) return WZ_ERR_NOT_CONNECTED;
 
+    /*
+     * Health probe MUST be an endpoint from the GREEN read set.
+     *
+     * This used to probe /manager/status, which is (a) not in the
+     * enumerated GREEN set and (b) not readable by a properly
+     * least-privileged API credential: virp-lab's account happens to be
+     * allowed it, but virp-node2's tighter account gets HTTP 403
+     * (error 4000), so the watchdog health-checked, failed, dropped the
+     * connection and reconnected in a loop — churn caused entirely by
+     * the daemon probing outside its own policy. /agents/summary/status
+     * is GREEN, is what the battery already reads, and works for both.
+     *
+     * Note both Wazuh denial shapes exist and differ: endpoint-level
+     * permission denial is a real 403, while resource-level RBAC
+     * filtering is HTTP 200 with an empty affected_items set.
+     */
     virp_exec_result_t result;
-    virp_error_t err = wazuh_execute(base_conn, WZ_EP_MANAGER_STATUS, &result);
+    virp_error_t err = wazuh_execute(base_conn, WZ_EP_AGENT_SUMMARY, &result);
     if (err != VIRP_OK) return err;
 
     return result.success ? VIRP_OK : WZ_ERR_API_ERROR;

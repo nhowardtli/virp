@@ -246,11 +246,14 @@ static virp_conn_t *librenms_connect(const virp_device_t *device)
 
     fprintf(stderr, "[LibreNMS] Connecting to %s\n", conn->base_url);
 
-    /* Validate the token with an internal probe (driver-internal, not
-     * a gated command — same category as the Wazuh auth POST). */
+    /* Validate the token with an internal probe. The probe path is
+     * deliberately one of the GREEN read rows (/api/v0/devices), not
+     * /api/v0/system: the daemon must never touch an endpoint its own
+     * classifier calls RED, and a least-privileged token may not be
+     * granted anything outside the enumerated set. */
     char probe[1024];
     long http_code = 0;
-    virp_error_t err = ln_get(conn, LN_API_PREFIX "/system",
+    virp_error_t err = ln_get(conn, LN_API_PREFIX "/devices",
                               probe, sizeof(probe), &http_code);
     if (err != VIRP_OK || http_code != 200) {
         fprintf(stderr, "[LibreNMS] Token probe failed on %s: HTTP %ld\n",
@@ -396,9 +399,10 @@ static virp_error_t librenms_health_check(virp_conn_t *base_conn)
 
     if (!conn->connected) return LN_ERR_NOT_CONNECTED;
 
+    /* Health probe stays inside the GREEN read set — see connect(). */
     char probe[1024];
     long http_code = 0;
-    virp_error_t err = ln_get(conn, LN_API_PREFIX "/system",
+    virp_error_t err = ln_get(conn, LN_API_PREFIX "/devices",
                               probe, sizeof(probe), &http_code);
     if (err != VIRP_OK) return err;
     return http_code == 200 ? VIRP_OK : LN_ERR_AUTH_FAILED;

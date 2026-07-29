@@ -463,6 +463,15 @@ static void test_prefix_boundary_fixed(void)
     const virp_driver_t *drv = virp_driver_lookup(VIRP_VENDOR_WAZUH);
     assert(drv && drv->route_command == wazuh_gate_tier);
 
+    /*
+     * The health probe must sit INSIDE the GREEN set. It used to be
+     * /manager/status, which is RED here and returns HTTP 403 on a
+     * properly least-privileged credential (virp-node2's account),
+     * causing an endless health-fail → drop → reconnect churn.
+     */
+    assert(wz_route_endpoint(WZ_EP_AGENT_SUMMARY) == VIRP_TIER_GREEN);
+    assert(wz_route_endpoint(WZ_EP_MANAGER_STATUS) == VIRP_TIER_RED);
+
     TEST_PASS();
 }
 

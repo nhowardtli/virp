@@ -119,6 +119,44 @@ static void test_gate_hook_methods(void)
     PASS();
 }
 
+/*
+ * The daemon must never touch an endpoint its OWN classifier calls RED.
+ * Both drivers previously probed outside their GREEN set on connect and
+ * health_check (/api/v0/system here, /manager/status in Wazuh), which on
+ * a least-privileged credential produced an endless
+ * health-check-fail → drop → reconnect churn. These assertions pin the
+ * probe paths inside the GREEN set.
+ */
+static void test_internal_probes_are_green(void)
+{
+    printf("\n=== Internal probe paths stay inside the GREEN set ===\n");
+
+    TEST("connect/health probe path is GREEN");
+    assert(ln_route_path("/api/v0/devices") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("the old probe path is RED (must not be probed)");
+    assert(ln_route_path("/api/v0/system") == VIRP_TIER_RED);
+    PASS();
+
+    TEST("driver source probes /devices, never /system");
+    {
+        FILE *f = fopen("src/drivers/driver_librenms.c", "r");
+        if (!f) {
+            printf("SKIP (run from repo root)\n");
+            tests_passed++;
+        } else {
+            char buf[262144];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            buf[n] = '\0';
+            assert(strstr(buf, "LN_API_PREFIX \"/system\"") == NULL);
+            assert(strstr(buf, "ln_get(conn, LN_API_PREFIX \"/devices\"") != NULL);
+            PASS();
+        }
+    }
+}
+
 int main(void)
 {
     printf("=== LibreNMS Driver Tests (offline) ===\n");
@@ -127,6 +165,7 @@ int main(void)
     test_green_rows();
     test_red_by_absence();
     test_gate_hook_methods();
+    test_internal_probes_are_green();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

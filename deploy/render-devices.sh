@@ -42,13 +42,29 @@ import json, os, sys
 template_path, out_path = sys.argv[1], sys.argv[2]
 text = open(template_path).read()
 
-for var in ("WAZUH_USER", "WAZUH_PASS", "LIBRENMS_TOKEN"):
+# Only substitute placeholders the template actually uses, so a node
+# without a peer (or without one of the API devices) does not need every
+# variable defined. A placeholder left unsubstituted is FATAL: the daemon
+# would otherwise authenticate as the literal "${PEER_USER}" and log an
+# auth failure that reads like a bad credential rather than a bad render.
+for var in ("WAZUH_USER", "WAZUH_PASS", "LIBRENMS_TOKEN",
+            "PEER_USER", "PEER_PASS"):
+    placeholder = "${%s}" % var
+    if placeholder not in text:
+        continue
     val = os.environ.get(var)
     if not val:
         print("[render-devices] FATAL: %s not set in autopilot.env" % var,
               file=sys.stderr)
         sys.exit(1)
-    text = text.replace("${%s}" % var, json.dumps(val)[1:-1])
+    text = text.replace(placeholder, json.dumps(val)[1:-1])
+
+import re as _re
+leftover = sorted(set(_re.findall(r"\$\{([A-Z_]+)\}", text)))
+if leftover:
+    print("[render-devices] FATAL: unsubstituted placeholders: %s"
+          % ", ".join(leftover), file=sys.stderr)
+    sys.exit(1)
 
 json.loads(text)   # must render to valid JSON — fail before the daemon does
 
