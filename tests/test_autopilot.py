@@ -64,7 +64,7 @@ def healthy_results():
                           "O>* 10.10.23.0/30 [110/20] via ..."] * 4,
         "wazuh_summary": [wazuh_summary_payload(5, 6)],
         "wazuh_alerts":  [wazuh_items_payload(1)],
-        "librenms_devices": [librenms_payload("devices", 5)],
+        "librenms_devices": [librenms_payload("devices", 6)],
         "librenms_alerts":  [librenms_payload("alerts", 1)],
     }
 
@@ -133,11 +133,16 @@ class TestBaselines(unittest.TestCase):
                              for d in devs))
 
     def test_librenms_device_count_flags(self):
-        r = healthy_results()
-        r["librenms_devices"] = [librenms_payload("devices", 6)]
-        devs = ap.evaluate_baselines(r)
-        self.assertTrue(any(d["check"] == "librenms_devices" and
-                            d["observed"] == 6 for d in devs))
+        # Either direction deviates from the 6-device inventory baseline:
+        # 5 would be the old availability-filtered figure (proxmox01
+        # down), 7 would be a genuinely new device.
+        for observed in (5, 7):
+            r = healthy_results()
+            r["librenms_devices"] = [librenms_payload("devices", observed)]
+            devs = ap.evaluate_baselines(r)
+            self.assertTrue(any(d["check"] == "librenms_devices" and
+                                d["observed"] == observed for d in devs),
+                            "count=%d must deviate" % observed)
 
 
 class TestPolicyInvariants(unittest.TestCase):
@@ -196,7 +201,21 @@ class TestPolicyInvariants(unittest.TestCase):
         self.assertEqual(ap.BASELINES["frr_full_adjacencies"], 8)
         self.assertEqual(ap.BASELINES["wazuh_active"], 5)
         self.assertEqual(ap.BASELINES["wazuh_total"], 6)
-        self.assertEqual(ap.BASELINES["librenms_devices"], 5)
+        self.assertEqual(ap.BASELINES["librenms_devices"], 6)
+
+    def test_device_baseline_is_measured_by_the_query_the_loop_issues(self):
+        # The rule the librenms 5-vs-6 incident bought us: the device
+        # baseline describes UNFILTERED inventory, so the battery must
+        # issue exactly that query. A filtered variant (?type=up etc.)
+        # answers a different question and would silently split the
+        # baseline from the measurement again.
+        device_cmds = [c for d, c, kind in ap.BATTERY
+                       if kind == "librenms_devices"]
+        self.assertEqual(device_cmds, ["GET /api/v0/devices"])
+        for cmd in device_cmds:
+            self.assertNotIn("?", cmd,
+                             "inventory baseline must not use a filtered "
+                             "query: %s" % cmd)
 
 
 class TestTemplateExclusions(unittest.TestCase):

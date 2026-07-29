@@ -70,17 +70,48 @@ OBS_ERROR          = 0x0F
 WAZUH_GREEN_INGESTION_ENDPOINT = None
 
 # ── Baselines (agreed 2026-07-29) ──────────────────────────────────────
+#
+# RULE: every baseline here MUST be measured with the EXACT API query the
+# battery below issues — same path, same query string. A baseline taken
+# with a different query form is not a baseline for this loop, it is a
+# number about a different question, and the mismatch surfaces as a
+# permanent false deviation that trains people to ignore the alert.
+#
+# This rule was written the hard way. librenms_devices was originally 5,
+# measured with a filtered query, while the loop counts unfiltered
+# inventory (/api/v0/devices) and sees 6 — flagging every cycle for a
+# fleet that had not changed. Measured 2026-07-29 through this daemon:
+#
+#   /api/v0/devices               → 6   (what the loop uses: inventory)
+#   /api/v0/devices?type=all      → 6   (identical to unfiltered)
+#   /api/v0/devices?type=up       → 5   ← where the 5 came from
+#   /api/v0/devices?type=down     → 1   (proxmox01)
+#
+# So the 5 was an AVAILABILITY figure, not an inventory figure, and the
+# single device accounting for the gap is **proxmox01**, which LibreNMS
+# currently reports as down (all six devices predate 2026-07-29; nothing
+# was added). Note also that ?type=network and ?type=server both return
+# 6 here — LibreNMS does not filter on those values the way the name
+# suggests, which is exactly why the query string must be copied
+# verbatim from the battery rather than reasoned about.
+#
+# Baselines:
 # - 8 Full OSPF adjacencies across the 4-node ring
 # - Wazuh: 5 active agents of 6 total. The 1 disconnected agent is
 #   currently UNEXPLAINED; flag if the active count changes in EITHER
 #   direction (a "recovery" to 6 is as reportable as a drop to 4).
-# - LibreNMS: 5 devices.
+# - LibreNMS: 6 devices in inventory, per /api/v0/devices unfiltered.
+#   This tracks INVENTORY only. Availability is deliberately not
+#   baselined here yet: proxmox01 being down means an availability
+#   baseline of 6-up would alert immediately, and 5-up would bake a
+#   current outage into the definition of healthy. Decide the intent
+#   before adding it.
 
 BASELINES = {
     "frr_full_adjacencies": 8,
     "wazuh_active": 5,
     "wazuh_total": 6,
-    "librenms_devices": 5,
+    "librenms_devices": 6,
 }
 
 FRR_NODES = ["clab-frr-ospf-frr1", "clab-frr-ospf-frr2",
