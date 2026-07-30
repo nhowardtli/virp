@@ -1,0 +1,13 @@
+# virp report dependencies.
+#
+# reportlab is the only non-stdlib requirement. It is pure Python (its
+# optional C accelerator is not required and is not used here), so it
+# installs on a locked-down offline node from a wheel with no compiler and
+# no system packages:
+#
+#   pip install --no-index --find-links /path/to/wheels -r requirements.txt
+#
+# Distro packages work equally well, e.g. apt install python3-reportlab.
+#
+# The tool makes no network calls at runtime.
+reportlab>=3.6

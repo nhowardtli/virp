@@ -528,6 +528,18 @@ test-librenms: $(TEST_LIBRENMS)
 test-autopilot:
 	python3 tests/test_autopilot.py
 
+# virp report — consumer-side chain PDF generator. Synthetic-chain tests run
+# anywhere; the live-chain tests self-skip when /var/lib/virp/chain.db is
+# absent, so this target is safe on a build host. Requires reportlab
+# (report/requirements.txt); pure python, no system packages.
+test-virp-report:
+	@python3 -c "import reportlab" 2>/dev/null || { \
+	  echo "test-virp-report: reportlab is not installed."; \
+	  echo "  install it with: pip install -r report/requirements.txt"; \
+	  echo "  (or the distro package, e.g. apt install python3-reportlab)"; \
+	  exit 1; }
+	python3 tests/test_virp_report.py
+
 # Session negative-path tests
 TEST_SESSION_NEG = $(BUILD_DIR)/test_session_negative
 
@@ -823,4 +835,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
