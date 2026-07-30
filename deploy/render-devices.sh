@@ -47,7 +47,14 @@ text = open(template_path).read()
 # variable defined. A placeholder left unsubstituted is FATAL: the daemon
 # would otherwise authenticate as the literal "${PEER_USER}" and log an
 # auth failure that reads like a bad credential rather than a bad render.
-for var in ("WAZUH_USER", "WAZUH_PASS", "LIBRENMS_TOKEN",
+# VIRP_UID resolves the daemon's own uid so socket_allowed_uids can be
+# expressed portably in the tracked template instead of hardcoding a number
+# that differs per host. The loader accepts uids as strings.
+if "${VIRP_UID}" in text:
+    import pwd
+    os.environ.setdefault("VIRP_UID", str(pwd.getpwnam("virp").pw_uid))
+
+for var in ("VIRP_UID", "WAZUH_USER", "WAZUH_PASS", "LIBRENMS_TOKEN",
             "PEER_USER", "PEER_PASS"):
     placeholder = "${%s}" % var
     if placeholder not in text:

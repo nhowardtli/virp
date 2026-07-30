@@ -1,8 +1,8 @@
 {
   "_comment": "virp-lab device template. Rendered to /run/virp/devices.json at daemon start by deploy/render-devices.sh, which substitutes ${...} placeholders from /etc/virp/autopilot.env (root-only). The template itself carries NO credentials for the API devices. HARD EXCLUSIONS apply: the daemon refuses to load any config containing a blocked address (see virp_config_blocked_address in virp_onode.c) \u2014 do not name them here, even in a comment, or the render output will be refused at startup.",
-  "_socket_allowlist_policy": "Autopilot runs as the dedicated virp-ops account (uid 985), NOT root: socket_allowed_uids deliberately EXCLUDES uid 0. See DEPLOYED.md \"socket allowlist policy\". virp-ops has no shell and no sudo; it is granted exactly socket access, group virp (traverse /var/lib/virp, read chain.db) and group virp-keyread (read the O-Key, which HMAC verification structurally requires). 1000 is the interactive operator.",
+  "_socket_allowlist_policy": "DELIBERATE (2026-07-30): uid 0 is EXCLUDED. The allowlist is the daemon's own uid (rendered from ${VIRP_UID}) plus 1000, the interactive operator \u2014 the same policy CT 211 has always run. The autopilot runs as User=virp, i.e. the daemon's own service account (nologin, no sudo, cannot read /etc/virp/autopilot.env). A SEPARATE unprivileged uid was tried and rejected: verifying an observation requires the O-Key because VIRP signs with symmetric HMAC, and virp_key_load_file REFUSES a key with group read (\"insecure mode 0640\"), so a second account could only verify by weakening key hygiene or duplicating the key on disk. Verifier and signer cannot be separated until the daemon exposes a verify action; see DEPLOYED.md \"socket allowlist policy\".",
   "socket_allowed_uids": [
-    985,
+    "${VIRP_UID}",
     1000
   ],
   "gate_default_mode": "enforce",

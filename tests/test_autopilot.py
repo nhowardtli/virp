@@ -452,10 +452,10 @@ class TestTemplateExclusions(unittest.TestCase):
     def test_socket_allowlist_excludes_root(self):
         """Deliberate policy (2026-07-30): the daemon socket allowlist
         EXCLUDES uid 0 on every node. CT 211 always did; the colo nodes
-        used to include it because the autopilot ran as root. They now run
-        as the dedicated virp-ops account (985). Pinned here because the
-        drift was silent — two nodes disagreed on a security policy and
-        nothing failed."""
+        included it because the autopilot ran as root. The allowlist is now
+        the daemon's own uid (rendered from ${VIRP_UID}) plus 1000, the
+        interactive operator. Pinned here because the drift was silent —
+        two nodes disagreed on a security policy and nothing failed."""
         for name in ("devices.template.json", "devices.node2.template.json"):
             path = os.path.join(REPO_ROOT, "deploy", name)
             with open(path) as f:
@@ -463,11 +463,19 @@ class TestTemplateExclusions(unittest.TestCase):
             uids = cfg.get("socket_allowed_uids")
             self.assertIsNotNone(uids, "%s: allowlist must be explicit" % name)
             self.assertNotIn(0, uids, "%s: uid 0 must not be allowed" % name)
-            self.assertIn(985, uids, "%s: virp-ops (985) must be allowed" % name)
+            self.assertNotIn("0", uids, "%s: uid 0 must not be allowed" % name)
+            self.assertIn("${VIRP_UID}", uids,
+                          "%s: allowlist should resolve the daemon uid, not "
+                          "hardcode a per-host number" % name)
             self.assertIn("_socket_allowlist_policy", cfg,
                           "%s: the policy must be documented in place" % name)
 
     def test_autopilot_units_do_not_run_as_root(self):
+        """The units must name a User. Running as the daemon's own account
+        is deliberate: verification needs the O-Key, VIRP signs with
+        symmetric HMAC, and virp_key_load_file refuses a group-readable key
+        — so a separate uid could only verify by weakening key hygiene or
+        duplicating the signing key. Documented in the units themselves."""
         deploy = os.path.join(REPO_ROOT, "deploy")
         units = [u for u in os.listdir(deploy)
                  if u.startswith("virp-autopilot") and u.endswith(".service")]
@@ -475,10 +483,11 @@ class TestTemplateExclusions(unittest.TestCase):
         for u in units:
             with open(os.path.join(deploy, u)) as f:
                 text = f.read()
-            self.assertIn("User=virp-ops", text,
-                          "%s must run as virp-ops, not root" % u)
-            self.assertIn("SupplementaryGroups=virp virp-keyread", text,
-                          "%s needs chain.db + O-Key read groups" % u)
+            self.assertIn("User=virp\n", text,
+                          "%s must run as virp, not root" % u)
+            self.assertNotIn("User=root", text, "%s must not run as root" % u)
+            self.assertIn("insecure mode", text,
+                          "%s must record WHY a separate uid was rejected" % u)
 
     def test_scan_boundary_semantics(self):
         self.assertTrue(self.blocked_hit('"host": "10.0.10.1"', "10.0.10.1"))
