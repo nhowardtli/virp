@@ -10,7 +10,11 @@ Run: make test-autopilot   (or python3 tests/test_autopilot.py)
 
 import json
 import os
+import shutil
+import sqlite3
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "autopilot"))
