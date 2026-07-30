@@ -54,8 +54,18 @@ if "${VIRP_UID}" in text:
     import pwd
     os.environ.setdefault("VIRP_UID", str(pwd.getpwnam("virp").pw_uid))
 
-for var in ("VIRP_UID", "WAZUH_USER", "WAZUH_PASS", "LIBRENMS_TOKEN",
-            "PEER_USER", "PEER_PASS"):
+# VIRP_BACKUP_UID is the config-backup runbook's dedicated identity
+# (virp-lab only — the node2 template does not name it). Resolved the
+# same way as VIRP_UID; if the template names it, the user MUST exist,
+# so a missing account fails the render (and the daemon start) loudly
+# instead of silently shipping an allowlist that rejects the runbook.
+if "${VIRP_BACKUP_UID}" in text:
+    import pwd
+    os.environ.setdefault("VIRP_BACKUP_UID",
+                          str(pwd.getpwnam("virp-backup").pw_uid))
+
+for var in ("VIRP_UID", "VIRP_BACKUP_UID", "WAZUH_USER", "WAZUH_PASS",
+            "LIBRENMS_TOKEN", "PEER_USER", "PEER_PASS"):
     placeholder = "${%s}" % var
     if placeholder not in text:
         continue

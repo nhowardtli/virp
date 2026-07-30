@@ -541,6 +541,9 @@ test-librenms: $(TEST_LIBRENMS)
 test-autopilot:
 	python3 tests/test_autopilot.py
 
+test-config-backup:
+	python3 tests/test_config_backup.py
+
 # virp report — consumer-side chain PDF generator. Synthetic-chain tests run
 # anywhere; the live-chain tests self-skip when /var/lib/virp/chain.db is
 # absent, so this target is safe on a build host. Requires reportlab
@@ -854,4 +857,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11

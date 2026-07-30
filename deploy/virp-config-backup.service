@@ -1,0 +1,35 @@
+[Unit]
+Description=VIRP config backup + drift runbook (governed, no-AI)
+Documentation=file:/opt/virp/docs/RUNBOOK-CONFIG-BACKUP.md
+After=virp-onode.service
+Requires=virp-onode.service
+
+[Service]
+Type=oneshot
+# DEDICATED least-privilege identity. Deliberately NOT `virp` (the
+# daemon user, which owns the O-Key and chain key) and NOT root (the
+# socket allowlist excludes uid 0 anyway). `virp-backup` is a member of
+# no key or credential group; it can reach exactly two things: the gate
+# socket (via the ACL granted below) and /var/lib/virp/config-backups.
+# The script additionally REFUSES to start if it can read the O-Key,
+# chain key, approver secret key, or either credential store — the
+# sandbox here is defence in depth, not the only wall.
+User=virp-backup
+Group=virp-backup
+UMask=0077
+# Socket ACL + backup-dir provisioning happen in virp-onode's
+# ExecStartPost (deploy/virp-onode-runbook.dropin.conf): the grants
+# must track socket creation, and this unit's sandbox deliberately
+# cannot reach /var/lib/virp to grant itself anything.
+ExecStart=/usr/bin/python3 /opt/virp/autopilot/virp_config_backup.py run
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/virp/config-backups /run/virp
+# Belt over braces: even if file modes regressed, this unit cannot see
+# key material, credential stores, the approvals store, or the chain db.
+InaccessiblePaths=-/etc/virp/keys -/etc/virp/autopilot.env -/var/lib/virp/approvals -/var/lib/virp/.virp -/var/lib/virp/autopilot -/var/lib/virp/chain.db -/var/lib/virp/chain.db-wal -/var/lib/virp/chain.db-shm
+
+[Install]
+WantedBy=multi-user.target
