@@ -64,7 +64,18 @@ if "${VIRP_BACKUP_UID}" in text:
     os.environ.setdefault("VIRP_BACKUP_UID",
                           str(pwd.getpwnam("virp-backup").pw_uid))
 
-for var in ("VIRP_UID", "VIRP_BACKUP_UID", "WAZUH_USER", "WAZUH_PASS",
+# VIRP_EVIDENCE_UID is the compliance-evidence collector's dedicated
+# identity (virp-lab only). Resolved exactly like VIRP_BACKUP_UID: if the
+# template names it the user MUST exist, so a missing account fails the
+# render (and the daemon start) loudly instead of silently shipping an
+# allowlist that rejects the collector.
+if "${VIRP_EVIDENCE_UID}" in text:
+    import pwd
+    os.environ.setdefault("VIRP_EVIDENCE_UID",
+                          str(pwd.getpwnam("virp-evidence").pw_uid))
+
+for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
+            "WAZUH_USER", "WAZUH_PASS",
             "LIBRENMS_TOKEN", "PEER_USER", "PEER_PASS"):
     placeholder = "${%s}" % var
     if placeholder not in text:

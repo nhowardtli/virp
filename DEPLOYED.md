@@ -289,3 +289,61 @@ drift cycle on frr2 (seq 18–19, proposal 8756273c…, left to expire,
 device untouched), virp-backup cannot approve (-43 not enrolled).
 Requires the `acl` package (setfacl) — installed 2026-07-30.
 Docs: docs/RUNBOOK-CONFIG-BACKUP.md.
+
+## Compliance-evidence collector (2026-07-30, branch runbook/evidence-collector-2026-07-30)
+
+Daily governed no-AI READ-ONLY automation: virp-evidence.timer → runs as
+`virp-evidence` (uid 995), a dedicated identity in no key/credential
+group and deliberately SEPARATE from `virp-backup` (each automation owns
+its own identity and evidence tree). Socket reach via ACL (virp-onode
+ExecStartPost drop-in
+/etc/systemd/system/virp-onode.service.d/51-evidence.conf) + allowlist
+entry ${VIRP_EVIDENCE_UID} in the template. Same refusal check as
+virp-backup: refuses to start if it can read onode.key / chain.key /
+approval.key / autopilot.env / rendered devices.json, or runs as
+root / virp / virp-backup.
+
+Per FRR node, per item: one GREEN `vtysh -c "show ..."` read → signed
+observation chain-registered (obs:<device>:<ns>) + an evidence record
+chain-registered (evidence:<device>:<item>:<ns>, schema
+evidence_item/1) carrying item, device, ts, the exact command, the
+control ref, the honest caveats, collection status, and the path +
+sha256 of both data files. Item set (deploy/evidence-items.json) and
+control mapping (deploy/controls.json, PLACEHOLDER ids) are DATA in
+/etc/virp — editing them never touches code. Unmapped items are
+collected, flagged and reported, never dropped.
+
+Read-only structurally: because the item list is operator-editable, the
+collector re-derives driver_linux.c's GREEN row locally and refuses to
+submit anything that is not exactly `vtysh -c "show <rest>"` with rest
+in [a-z0-9 ./-]; validation happens at load, so a bad edit fails the
+run rather than being found mid-collection. Non-GREEN returned tiers
+alert and are never stored as evidence.
+
+Report: report/virp-evidence-report renders BY CONTROL, reusing
+report/verify.py + chain_read.py so every hash/link/signature is
+recomputed at render time. Runs as a KEY HOLDER — the deliberate split
+from the keyless collector.
+
+Proven live 2026-07-30: full cycle over frr1–4 × 5 items = 20 results,
+0 alerts, exit 0; chain session `evidence:2026-07-30` seq 0–39 (20
+observations + 20 evidence records); report re-verified all 40 entries
+PASS (entry hash, links, chain HMAC, artifact binding) and all 20
+observation HMACs PASS, 5 controls, 1 declared evidence gap.
+
+Honest gaps recorded, not papered over:
+  - time_sync (AU-8) is UNEVIDENCED: FRR has no NTP subsystem — `show
+    ntp status`, `show ntp associations`, `show clock` are all unknown
+    commands (verified live on frr1). Needs a host-level collector that
+    does not exist yet.
+  - access_accounts / management_services cannot see host OS accounts,
+    SSH keys, PAM, or listening ports — no GREEN vtysh row reaches them.
+  - /var/lib/virp/chain.db is 0644, so virp-evidence could read it
+    outside its unit; the unit masks it via InaccessiblePaths, and the
+    chain holds no key material. Identical to virp-backup's position.
+  - FRR answers unknown commands on stdout and exits 0, so the gate
+    signs them. The collector detects the `%` diagnostic and flags
+    collection_status=device_rejected_command rather than letting
+    "% Unknown command" render as a satisfied control.
+
+Docs: docs/RUNBOOK-EVIDENCE.md.
