@@ -62,6 +62,26 @@ CHAIN_DB     = "/var/lib/virp/chain.db"
 STATE_DIR    = "/var/lib/virp/autopilot"
 ALERTS_FILE  = os.path.join(STATE_DIR, "alerts.jsonl")
 
+# Shared read-only chain access (report/chain_read.py). It prefers a plain
+# mode=ro open and falls back to a snapshot copy when the WAL needs recovery
+# and no writer is around to do it — the "attempt to write a readonly
+# database" case this loop hits whenever a daemon is stopped.
+#
+# The snapshot path needs a writable temp dir and read access to the -wal
+# and -shm sidecars. Both hold under the deployed units: PrivateTmp=yes
+# gives each run its own /tmp, and the sidecars are group-readable by
+# `virp`, which virp-ops has.
+#
+# Imported defensively on purpose: this is a monitoring loop, and a missing
+# sibling directory must never be the reason it stops running. Without the
+# helper the local reads fall back to exactly their previous behaviour.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "report"))
+try:
+    import chain_read
+except ImportError:                                  # pragma: no cover
+    chain_read = None
+
 HEADER_FMT = "!BBHIBBHIQ"        # 24 bytes, then 32-byte HMAC
 HEADER_LEN = 24
 HMAC_LEN   = 32
@@ -621,22 +641,62 @@ def run_corpus():
     return alerts
 
 
+def open_chain_ro(db_path):
+    """Open a chain database for reading without disturbing its writer.
+
+    Uses the shared helper when present so a stopped daemon does not make
+    the chain unreadable: a plain mode=ro open fails once the WAL needs
+    recovery, and the helper falls back to a snapshot copy. Returns a
+    context manager exposing .conn, or None if the chain cannot be read.
+    """
+    if chain_read is not None:
+        try:
+            return chain_read.open_chain(db_path)
+        except chain_read.ChainReadError:
+            return None
+
+    # Legacy path — identical to the behaviour before the helper existed.
+    # The probe query matters: sqlite3.connect() is lazy, so a URI that
+    # cannot really be read connects without error and only fails on first
+    # use.
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+        con.execute("SELECT 1 FROM chain_entries LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return None
+
+    class _PlainReader:
+        conn = con
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            con.close()
+            return False
+
+    return _PlainReader()
+
+
 def chain_head(db_path=CHAIN_DB):
     """Latest chain entry on THIS node, read-only (the daemon owns all
     writes). Shape matches eval_peer_chain_head() so local and peer
-    heads are directly comparable."""
-    try:
-        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
-    except sqlite3.Error:
+    heads are directly comparable.
+
+    This is the head THIS node publishes for its peer to read, so failing
+    to read it is not a local-only problem: it reaches the peer as a
+    missing value, and the comparator counts a one-sided missing value as
+    a disagreement."""
+    reader = open_chain_ro(db_path)
+    if reader is None:
         return None
     try:
-        row = con.execute("SELECT session_id, sequence, chain_entry_hash "
-                          "FROM chain_entries ORDER BY id DESC "
-                          "LIMIT 1").fetchone()
+        with reader:
+            row = reader.conn.execute(
+                "SELECT session_id, sequence, chain_entry_hash "
+                "FROM chain_entries ORDER BY id DESC LIMIT 1").fetchone()
     except sqlite3.Error:
         return None
-    finally:
-        con.close()
     if not row:
         return None
     return {"session": row[0], "seq": int(row[1]), "entry_hash": row[2]}
@@ -696,13 +756,18 @@ def chain_sessions(db_path=CHAIN_DB):
     """Read-only enumeration of sessions + max sequence. The daemon owns
     all chain WRITES; a read-only sqlite open for enumeration keeps the
     single-writer invariant intact."""
-    con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
-    try:
-        rows = con.execute("SELECT session_id, MAX(sequence) "
-                           "FROM chain_entries GROUP BY session_id").fetchall()
-        return [(sid, int(mx)) for sid, mx in rows]
-    finally:
-        con.close()
+    reader = open_chain_ro(db_path)
+    if reader is None:
+        # Raise rather than return []: an empty list renders as a chainwalk
+        # that checked 0 sessions and found 0 failures, i.e. an unreadable
+        # chain would report itself clean. Fail the unit loudly instead.
+        raise sqlite3.OperationalError(
+            "cannot open chain database read-only: %s" % db_path)
+    with reader:
+        rows = reader.conn.execute(
+            "SELECT session_id, MAX(sequence) "
+            "FROM chain_entries GROUP BY session_id").fetchall()
+    return [(sid, int(mx)) for sid, mx in rows]
 
 
 def run_chainwalk():

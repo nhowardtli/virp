@@ -10,7 +10,11 @@ Run: make test-autopilot   (or python3 tests/test_autopilot.py)
 
 import json
 import os
+import shutil
+import sqlite3
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "autopilot"))
@@ -485,6 +489,92 @@ class TestTemplateExclusions(unittest.TestCase):
         self.assertTrue(self.blocked_hit('"host": "10.0.10.10"', "10.0.10.10"))
         self.assertFalse(self.blocked_hit('"host": "10.0.10.12"', "10.0.10.1"))
         self.assertFalse(self.blocked_hit('"host": "10.0.10.100"', "10.0.10.10"))
+
+
+class TestLocalChainReads(unittest.TestCase):
+    """The local chain reads go through the shared read-only helper, so a
+    stopped daemon does not make this node's own head unreadable — and
+    therefore invisible to its peer, which counts a one-sided missing value
+    as a disagreement."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="autopilot-chain-")
+
+    def tearDown(self):
+        os.chmod(self.tmp, 0o755)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _dirty_wal_chain(self, name="chain.db", rows=24):
+        """A chain whose writer died leaving an un-checkpointed WAL, with no
+        -shm. A clean close would checkpoint the WAL away and leave nothing
+        to recover, so the writer is SIGKILLed."""
+        db = os.path.join(self.tmp, name)
+        writer = (
+            "import sqlite3, os, signal\n"
+            "c = sqlite3.connect(%r)\n"
+            "c.execute('PRAGMA journal_mode=wal')\n"
+            "c.execute('CREATE TABLE chain_entries (id INTEGER PRIMARY KEY "
+            "AUTOINCREMENT, session_id TEXT, sequence INTEGER, "
+            "chain_entry_hash TEXT)')\n"
+            "c.execute(\"INSERT INTO chain_entries(session_id,sequence,"
+            "chain_entry_hash) VALUES ('boot',0,'a')\")\n"
+            "c.commit()\n"
+            "c.execute('PRAGMA wal_checkpoint(FULL)')\n"
+            "c.executemany('INSERT INTO chain_entries(session_id,sequence,"
+            "chain_entry_hash) VALUES (?,?,?)',\n"
+            "  [('autopilot:x', i, 'h%%d' %% i) for i in range(1, %d)])\n"
+            "c.commit()\n"
+            "os.kill(os.getpid(), signal.SIGKILL)\n" % (db, rows + 1))
+        subprocess.run([sys.executable, "-c", writer], capture_output=True)
+        shm = db + "-shm"
+        if os.path.exists(shm):
+            os.remove(shm)
+        return db
+
+    def test_head_readable_when_a_plain_ro_open_would_fail(self):
+        if ap.chain_read is None:
+            self.skipTest("chain_read helper not importable")
+        db = self._dirty_wal_chain()
+        os.chmod(self.tmp, 0o555)
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the directory mode; mode=ro succeeds")
+
+        # The inline open this loop used before cannot read it at all.
+        with self.assertRaises(sqlite3.Error):
+            con = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+            con.execute("SELECT 1 FROM chain_entries LIMIT 1").fetchone()
+
+        head = ap.chain_head(db)
+        self.assertIsNotNone(head, "the helper must recover the WAL")
+        self.assertEqual(head["seq"], 24,
+                         "the head must come from the un-checkpointed WAL")
+
+    def test_head_is_none_when_the_chain_is_absent(self):
+        self.assertIsNone(ap.chain_head(os.path.join(self.tmp, "nope.db")))
+
+    def test_sessions_raises_rather_than_reporting_a_clean_empty_walk(self):
+        """An unreadable chain must not render as a chainwalk that checked
+        zero sessions and found zero failures."""
+        with self.assertRaises(sqlite3.Error):
+            ap.chain_sessions(os.path.join(self.tmp, "nope.db"))
+
+    def test_sessions_enumerates_a_readable_chain(self):
+        db = self._dirty_wal_chain()
+        sessions = dict(ap.chain_sessions(db))
+        self.assertEqual(sessions.get("autopilot:x"), 24)
+        self.assertIn("boot", sessions)
+
+    def test_local_head_shape_matches_the_peer_head_parser(self):
+        """Local and peer heads are compared field by field, so their shapes
+        must not drift apart."""
+        db = self._dirty_wal_chain()
+        local = ap.chain_head(db)
+        peer = ap.eval_peer_chain_head(
+            "SESSION SEQ TYPE ARTIFACT_ID ENTRY_HASH PREV_HASH\n"
+            "autopilot:x 24 observation obs:d:1 h24 h23\n")
+        self.assertIsNotNone(local)
+        self.assertIsNotNone(peer)
+        self.assertEqual(set(local), set(peer))
 
 
 if __name__ == "__main__":
