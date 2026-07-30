@@ -449,6 +449,37 @@ class TestTemplateExclusions(unittest.TestCase):
         for ph in ("${WAZUH_USER}", "${WAZUH_PASS}", "${LIBRENMS_TOKEN}"):
             self.assertIn(ph, text)
 
+    def test_socket_allowlist_excludes_root(self):
+        """Deliberate policy (2026-07-30): the daemon socket allowlist
+        EXCLUDES uid 0 on every node. CT 211 always did; the colo nodes
+        used to include it because the autopilot ran as root. They now run
+        as the dedicated virp-ops account (985). Pinned here because the
+        drift was silent — two nodes disagreed on a security policy and
+        nothing failed."""
+        for name in ("devices.template.json", "devices.node2.template.json"):
+            path = os.path.join(REPO_ROOT, "deploy", name)
+            with open(path) as f:
+                cfg = json.load(f)
+            uids = cfg.get("socket_allowed_uids")
+            self.assertIsNotNone(uids, "%s: allowlist must be explicit" % name)
+            self.assertNotIn(0, uids, "%s: uid 0 must not be allowed" % name)
+            self.assertIn(985, uids, "%s: virp-ops (985) must be allowed" % name)
+            self.assertIn("_socket_allowlist_policy", cfg,
+                          "%s: the policy must be documented in place" % name)
+
+    def test_autopilot_units_do_not_run_as_root(self):
+        deploy = os.path.join(REPO_ROOT, "deploy")
+        units = [u for u in os.listdir(deploy)
+                 if u.startswith("virp-autopilot") and u.endswith(".service")]
+        self.assertTrue(units, "no autopilot units found")
+        for u in units:
+            with open(os.path.join(deploy, u)) as f:
+                text = f.read()
+            self.assertIn("User=virp-ops", text,
+                          "%s must run as virp-ops, not root" % u)
+            self.assertIn("SupplementaryGroups=virp virp-keyread", text,
+                          "%s needs chain.db + O-Key read groups" % u)
+
     def test_scan_boundary_semantics(self):
         self.assertTrue(self.blocked_hit('"host": "10.0.10.1"', "10.0.10.1"))
         self.assertTrue(self.blocked_hit('"host": "10.0.10.10"', "10.0.10.10"))

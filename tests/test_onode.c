@@ -34,6 +34,8 @@
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sqlite3.h>
+#include <openssl/evp.h>
 
 /* =========================================================================
  * Test infrastructure
@@ -2155,6 +2157,154 @@ TEST(test_load_devices_allows_neighbor_addresses)
 }
 
 /* =========================================================================
+ * Gate-reason RETENTION (2026-07-30)
+ *
+ * A gate_rejection entry used to store sha256(reason) and NO body, so an
+ * evidence report could prove a block happened and commit to its reason
+ * but could not show the reason from the chain alone — the text lived
+ * only in the daemon journal. The daemon now stores a structured reason
+ * body (schema gate_rejection/1) under the same artifact_id the entry
+ * names, still committed to by artifact_hash.
+ *
+ * This test blocks a command against a chain-enabled state, then reads
+ * the chain BACK and asserts:
+ *   - a gate_rejection entry exists,
+ *   - its body is present in the artifact store,
+ *   - sha256(body) equals the entry's committed artifact_hash,
+ *   - the body carries the command, tiers and human-readable message.
+ * The readback goes through SQLite directly because the chain exposes a
+ * store API but no body-read API — a reader is exactly what an evidence
+ * report is, so the test reads the way a report does.
+ * ========================================================================= */
+
+/* Declared again here: the shared extern below sits further down the
+ * file, after this test. */
+extern virp_error_t onode_setup_chain_and_approvals(onode_state_t *state,
+                                                    uint32_t node_id,
+                                                    const char *chain_db_path,
+                                                    const char *chain_key_path,
+                                                    const char *approval_dir,
+                                                    const char *approvers_path);
+
+#define GR_CHAIN_DB  "/tmp/virp-onode-test-grchain.db"
+#define GR_CHAIN_KEY "/tmp/virp-onode-test-grchain.key"
+
+static void gr_cleanup(void)
+{
+    unlink(GR_CHAIN_DB);
+    unlink(GR_CHAIN_DB "-wal");
+    unlink(GR_CHAIN_DB "-shm");
+    unlink(GR_CHAIN_KEY);
+}
+
+/* sha256 hex of a NUL-terminated string, mirroring gate_sha256_hex(). */
+static void gr_sha256_hex(const char *s, char out[65])
+{
+    unsigned char md[32];
+    unsigned int mdlen = 0;
+    EVP_Digest(s, strlen(s), md, &mdlen, EVP_sha256(), NULL);
+    for (int i = 0; i < 32; i++)
+        snprintf(out + i * 2, 3, "%02x", md[i]);
+}
+
+TEST(test_gate_rejection_reason_body_is_retained_and_matches_commitment)
+{
+    gr_cleanup();
+
+    virp_signing_key_t ck;
+    ASSERT_OK(virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN));
+    ASSERT_OK(virp_key_save_file(&ck, GR_CHAIN_KEY));
+    virp_key_destroy(&ck);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0007, NULL,
+                         "/tmp/virp-onode-grchain.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+    /* ENFORCE at YELLOW: an unclassified command is blocked and the
+     * rejection is persisted (the branch is dormant under SHADOW). */
+    tmp.gate_default_mode = GATE_MODE_ENFORCE;
+    tmp.gate_max_tier = VIRP_TIER_YELLOW;
+
+    /* Chain enabled, approval mode OFF: the paths must be non-NULL, but
+     * a registry that does not exist enrolls zero keys and leaves the
+     * flow disabled (fail safe), so no proposal is filed and the
+     * rejection-persistence path is what is under test. */
+    ASSERT_OK(onode_setup_chain_and_approvals(&tmp, 0xDEAD0007,
+                                              GR_CHAIN_DB, GR_CHAIN_KEY,
+                                              "/tmp/virp-onode-test-grapprovals",
+                                              "/tmp/virp-onode-test-no-registry"));
+    ASSERT_EQ((int)tmp.chain_enabled, 1);
+    ASSERT_EQ((int)tmp.approvers_loaded, 0);
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "R-REASON");
+    snprintf(dev.host, sizeof(dev.host), "10.0.0.97");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0BADF00D;
+    dev.enabled = true;
+    ASSERT_OK(onode_add_device(&tmp, &dev));
+
+    const char *blocked = "frobnicate the flux capacitor";
+    uint8_t obs_buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t obs_len = 0;
+    ASSERT_OK(onode_execute(&tmp, "R-REASON", blocked,
+                            obs_buf, sizeof(obs_buf), &obs_len));
+
+    /* The response is a signed ERROR observation — nothing executed. */
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs_buf, obs_len, &tmp.okey, &hdr));
+
+    onode_destroy(&tmp);            /* flush + close the chain */
+    virp_context_destroy(tmp.ctx);
+
+    /* ── read the chain back the way an evidence report does ── */
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(GR_CHAIN_DB, &db), SQLITE_OK);
+
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT e.artifact_id, e.artifact_hash, a.artifact_content "
+        "FROM chain_entries e "
+        "LEFT JOIN artifacts a ON a.artifact_id = e.artifact_id "
+        "WHERE e.artifact_type = 'gate_rejection' "
+        "ORDER BY e.id DESC LIMIT 1", -1, &st, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+
+    const char *aid  = (const char *)sqlite3_column_text(st, 0);
+    const char *ahash = (const char *)sqlite3_column_text(st, 1);
+    const char *abody = (const char *)sqlite3_column_text(st, 2);
+
+    ASSERT_TRUE(aid != NULL && strncmp(aid, "gatereject-", 11) == 0);
+    ASSERT_TRUE(ahash != NULL && strlen(ahash) == 64);
+
+    /* The body must be PRESENT — this is the whole point. */
+    ASSERT_TRUE(abody != NULL);
+    ASSERT_TRUE(abody[0] != '\0');
+
+    /* …and it must hash to the entry's commitment. */
+    char recomputed[65];
+    gr_sha256_hex(abody, recomputed);
+    ASSERT_EQ(strcmp(recomputed, ahash), 0);
+
+    /* …and it must actually carry the reason, not just be non-empty. */
+    ASSERT_TRUE(strstr(abody, "\"schema\":\"gate_rejection/1\"") != NULL);
+    ASSERT_TRUE(strstr(abody, blocked) != NULL);
+    ASSERT_TRUE(strstr(abody, "\"device\":\"R-REASON\"") != NULL);
+    ASSERT_TRUE(strstr(abody, "\"classified_tier\":\"UNCLASSIFIED\"") != NULL);
+    ASSERT_TRUE(strstr(abody, "\"gate_max_tier\":\"YELLOW\"") != NULL);
+    ASSERT_TRUE(strstr(abody, "tier gate blocked") != NULL);
+    /* executed=no is literal: an ERROR observation means it never ran. */
+    ASSERT_TRUE(strstr(abody, "\"executed\":false") != NULL);
+
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    gr_cleanup();
+}
+
+/* =========================================================================
  * hex_decode unit tests
  * ========================================================================= */
 
@@ -2587,6 +2737,9 @@ int main(void)
     RUN_TEST(test_blocked_address_text_scan);
     RUN_TEST(test_load_devices_refuses_blocked_address);
     RUN_TEST(test_load_devices_allows_neighbor_addresses);
+
+    printf("\n[Gate-reason retention (chain body recoverable)]\n");
+    RUN_TEST(test_gate_rejection_reason_body_is_retained_and_matches_commitment);
 
     printf("\n[Gate observation-tier honesty (Item 1 hardening)]\n");
     RUN_TEST(test_gate_obs_tier_honesty);

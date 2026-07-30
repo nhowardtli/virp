@@ -344,6 +344,80 @@ static void test_peer_health_rows(void)
     PASS();
 }
 
+/*
+ * INVARIANT: this table never returns BLACK.
+ *
+ * The approved-apply path in virp_onode.c refuses BLACK outright
+ * (aerr = VIRP_ERR_TIER_VIOLATION) before any approval is verified, so a
+ * BLACK row here would make its commands permanently unapprovable — the
+ * propose→approve→apply escalation this driver's teaching reasons point
+ * operators at would dead-end for exactly the commands most likely to
+ * need it. Every refusal must stay RED, which is blocked-but-approvable.
+ *
+ * Asserted over the whole corpus this suite exercises plus the BLACK-
+ * bait commands most likely to tempt a future contributor into adding a
+ * BLACK row.
+ */
+static void test_never_returns_black(void)
+{
+    printf("\n=== INVARIANT — the table never returns BLACK ===\n");
+
+    static const char *const corpus[] = {
+        /* GREEN + YELLOW rows */
+        "vtysh -c \"show ip ospf neighbor\"",
+        "vtysh -c \"show running-config\"",
+        "vtysh -c \"clear ip ospf neighbor\"",
+        "vtysh -c \"clear ip ospf interface eth1\"",
+        "vtysh -c \"ping 10.10.12.2\"",
+        "vtysh -c \"traceroute 4.4.4.4\"",
+        /* teaching-RED rows */
+        "vtysh -c \"configure terminal\"",
+        "vtysh -c \"clear ip ospf process\"",
+        "sed -i s/1/2/ /etc/frr/frr.conf",
+        "systemctl restart frr",
+        /* guards */
+        "vtysh -c \"show ip ospf neighbor\"; rm -rf /etc/frr",
+        "vtysh -c \"show x\" -c \"configure terminal\"",
+        "FRR_PAGER=cat vtysh -c \"show running-config\"",
+        /* peer rows + their neighbours */
+        "systemctl is-active virp-onode",
+        "systemctl stop virp-onode",
+        "cat /var/lib/virp/autopilot/published.json",
+        "cat /etc/virp/keys/onode.key",
+        /* BLACK bait — destructive things a contributor might reach for */
+        "rm -rf /",
+        "dd if=/dev/zero of=/dev/sda",
+        "mkfs.ext4 /dev/sda1",
+        "shutdown -h now",
+        "reboot",
+        "systemctl stop frr",
+        "vtysh -c \"write erase\"",
+        "chmod -R 777 /etc",
+        "userdel -r nhoward",
+        ":(){ :|:& };:",
+        "",
+    };
+
+    TEST("no command in the corpus classifies BLACK");
+    for (size_t i = 0; i < sizeof(corpus) / sizeof(corpus[0]); i++) {
+        virp_trust_tier_t t = linux_gate_tier(corpus[i]);
+        assert(t != VIRP_TIER_BLACK);
+        /* and the tier must be one the wire can carry */
+        assert(t == VIRP_TIER_GREEN || t == VIRP_TIER_YELLOW ||
+               t == VIRP_TIER_RED);
+    }
+    assert(linux_gate_tier(NULL) != VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("every blocked command stays RED (approvable), never BLACK");
+    for (size_t i = 0; i < sizeof(corpus) / sizeof(corpus[0]); i++) {
+        virp_trust_tier_t t = linux_gate_tier(corpus[i]);
+        if (gate_blocks_at_yellow(t))
+            assert(t == VIRP_TIER_RED);
+    }
+    PASS();
+}
+
 static void test_gate_decisions(void)
 {
     printf("\n=== Gate-level decisions at threshold YELLOW ===\n");
@@ -378,6 +452,7 @@ int main(void)
     test_red_teaching_rows();
     test_red_by_absence();
     test_peer_health_rows();
+    test_never_returns_black();
     test_gate_decisions();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);

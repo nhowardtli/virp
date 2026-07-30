@@ -21,6 +21,9 @@
 #include "virp_federation.h"
 #include "cJSON.h"
 #include <arpa/inet.h>
+#include <openssl/evp.h>
+#include <stdbool.h>
+#include <time.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -44,6 +47,12 @@ int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len);
  * the client default sat on a world-writable path. check-socket-path
  * in the Makefile now fails if they diverge again. */
 #define ONODE_DEFAULT_SOCKET  "/run/virp/onode.sock"
+/* Default O-Key for client-side verification. Readable only by the daemon
+ * user in a least-privilege deployment, so verification SKIPS (loudly)
+ * rather than failing when the operator cannot read it. Override with
+ * --okey. HMAC is symmetric: whoever can verify can also forge, so this
+ * path is deliberately not world-readable. */
+#define OKEY_DEFAULT_PATH     "/etc/virp/keys/onode.key"
 
 /* =========================================================================
  * Hex dump utility
@@ -633,10 +642,21 @@ static int onode_framed_roundtrip(const char *sock_path,
  * codes included). Returns 0 for an executed observation, 2 for a
  * signed rejection (OBS_ERROR), 1 for anything unparseable.
  *
- * The message is printed unverified — verify via the bridge or
- * `virp-tool inspect` with the O-Key if needed.
+ * VERIFICATION (2026-07-30): when an O-Key is available the response
+ * HMAC is verified here, so the operator CLI is no longer the weakest
+ * verifier in the fleet. It previously printed the message unverified
+ * and told the reader to go run `virp-tool inspect` separately — which
+ * means the one client a human drives by hand was the one that did not
+ * check the signature, while the autopilot did. A verification FAILURE
+ * is fatal to the exit status: an unverified observation is not
+ * evidence.
+ *
+ * Note the structural caveat: HMAC is symmetric, so a client that can
+ * verify can also forge. Verifying here narrows accident, not
+ * authority — see the socket-allowlist note in DEPLOYED.md.
  */
-static int print_execute_response(const uint8_t *resp, uint32_t resp_len)
+static int print_execute_response(const uint8_t *resp, uint32_t resp_len,
+                                  const char *okey_path)
 {
     if (resp_len == 4) {
         int32_t code = (int32_t)ntohl(*(const uint32_t *)resp);
@@ -662,12 +682,42 @@ static int print_execute_response(const uint8_t *resp, uint32_t resp_len)
     }
 
     int is_rejection = (obs.obs_type == VIRP_OBS_ERROR);
+
+    /* Verify the O-Key HMAC over the whole message before printing any
+     * of it as fact. Absent/unreadable key → say so plainly rather than
+     * implying the bytes were checked. */
+    int verify_failed = 0;
+    const char *verdict;
+    virp_signing_key_t okey;
+    if (!okey_path) {
+        verdict = "SKIPPED (no --okey given and default not readable)";
+    } else if (virp_key_load_file(&okey, VIRP_KEY_TYPE_OKEY,
+                                  okey_path) != VIRP_OK) {
+        verdict = "SKIPPED (O-Key not readable)";
+    } else {
+        virp_error_t verr = virp_verify(NULL, resp, resp_len, &okey);
+        virp_key_destroy(&okey);
+        if (verr == VIRP_OK) {
+            verdict = "VALID";
+        } else {
+            verdict = "*** INVALID — DO NOT TRUST THIS OUTPUT ***";
+            verify_failed = 1;
+        }
+    }
+
     printf("trust_tier=%s (0x%02x)  seq=%u  obs_type=0x%02x (%s)\n",
            tool_tier_name(hdr.tier), hdr.tier, hdr.seq_num, obs.obs_type,
            is_rejection ? "ERROR — signed rejection, nothing executed"
                         : "signed observation");
+    printf("signature=%s\n", verdict);
     printf("gate_decision=%s\n", is_rejection ? "blocked" : "allowed");
     printf("payload:\n%.*s\n", (int)data_len, (const char *)data);
+
+    if (verify_failed) {
+        fprintf(stderr, "Error: observation signature did not verify against "
+                        "%s — the payload above is NOT evidence.\n", okey_path);
+        return 1;
+    }
 
     /* Surface a filed proposal_id on its own line for easy capture. */
     if (is_rejection) {
@@ -723,9 +773,98 @@ static int client_obs_payload(const char *sock, const char *req_json,
     return 0;
 }
 
+/*
+ * Chain-register a verified observation, the same way the bridge-style
+ * capture client does: artifact_hash = sha256(raw observation bytes),
+ * body = "base64:<b64>" so the stored body decodes to exactly the bytes
+ * the hash commits to. Returns 0 on success.
+ *
+ * Deliberately NOT automatic: registering writes to the audit chain, so
+ * the operator asks for it with --chain-register. An unverified
+ * observation is never registered (the caller checks first).
+ */
+static int chain_register_observation(const char *sock_path,
+                                      const char *device,
+                                      const uint8_t *resp, uint32_t resp_len)
+{
+    unsigned char md[32];
+    unsigned int mdlen = 0;
+    EVP_Digest(resp, resp_len, md, &mdlen, EVP_sha256(), NULL);
+    char hash_hex[65];
+    for (int i = 0; i < 32; i++)
+        snprintf(hash_hex + i * 2, 3, "%02x", md[i]);
+
+    /* base64 the raw message. 4/3 expansion + NUL + slack. */
+    size_t b64_max = ((size_t)resp_len + 2) / 3 * 4 + 1;
+    char *b64 = malloc(b64_max);
+    if (!b64) {
+        fprintf(stderr, "chain-register: out of memory\n");
+        return 1;
+    }
+    int b64_len = EVP_EncodeBlock((unsigned char *)b64, resp, (int)resp_len);
+    if (b64_len <= 0) {
+        free(b64);
+        fprintf(stderr, "chain-register: base64 encode failed\n");
+        return 1;
+    }
+
+    /* Request JSON. The daemon's artifact_content field is 8192 bytes and
+     * silently truncates, which would store a body that no longer hashes
+     * to the commitment — refuse rather than write an unverifiable entry. */
+    size_t body_len = strlen("base64:") + (size_t)b64_len;
+    if (body_len >= 8192) {
+        free(b64);
+        fprintf(stderr, "chain-register: observation is %u bytes; its base64 "
+                "body (%zu) exceeds the daemon's 8192-byte artifact limit and "
+                "would be stored truncated (unverifiable). Not registered.\n",
+                resp_len, body_len);
+        return 1;
+    }
+
+    size_t json_max = body_len + 512;
+    char *json = malloc(json_max);
+    if (!json) {
+        free(b64);
+        fprintf(stderr, "chain-register: out of memory\n");
+        return 1;
+    }
+    int jl = snprintf(json, json_max,
+                      "{\"action\":\"chain_append\","
+                      "\"session_id\":\"virp-cli:%s\","
+                      "\"artifact_type\":\"observation\","
+                      "\"artifact_id\":\"obs:%s:%llu\","
+                      "\"artifact_hash\":\"%s\","
+                      "\"artifact_content\":\"base64:%s\"}",
+                      device, device,
+                      (unsigned long long)time(NULL), hash_hex, b64);
+    free(b64);
+    if (jl < 0 || (size_t)jl >= json_max) {
+        free(json);
+        fprintf(stderr, "chain-register: request too large\n");
+        return 1;
+    }
+
+    static uint8_t cresp[VIRP_MAX_MESSAGE_SIZE];
+    uint32_t cresp_len = 0;
+    int rc = onode_framed_roundtrip(sock_path, json, (size_t)jl,
+                                    cresp, sizeof(cresp), &cresp_len);
+    free(json);
+    if (rc != 0)
+        return 1;
+    if (cresp_len == 4) {
+        int32_t code = (int32_t)ntohl(*(const uint32_t *)cresp);
+        fprintf(stderr, "chain-register: O-Node error %d (%s)\n", code,
+                virp_error_str((virp_error_t)code));
+        return 1;
+    }
+    printf("chain_registered=yes  artifact_hash=%s\n", hash_hex);
+    return 0;
+}
+
 /* Build + submit an execute request; proposal_id may be NULL. */
 static int submit_execute(const char *sock_path, const char *device,
-                          const char *command, const char *proposal_id)
+                          const char *command, const char *proposal_id,
+                          const char *okey_path, bool chain_register)
 {
     char esc_cmd[2200];
     json_escape(command, esc_cmd, sizeof(esc_cmd));
@@ -752,7 +891,17 @@ static int submit_execute(const char *sock_path, const char *device,
     if (onode_framed_roundtrip(sock_path, json, (size_t)jl,
                                resp, sizeof(resp), &resp_len) != 0)
         return 1;
-    return print_execute_response(resp, resp_len);
+    int rc = print_execute_response(resp, resp_len, okey_path);
+
+    /* Register ONLY a response that verified (rc 0 = verified observation,
+     * 2 = verified signed rejection). rc 1 means unparseable or a failed
+     * signature — never write that to the audit chain. */
+    if (chain_register && (rc == 0 || rc == 2)) {
+        if (chain_register_observation(sock_path, device, resp, resp_len) != 0
+            && rc == 0)
+            rc = 1;
+    }
+    return rc;
 }
 
 /* =========================================================================
@@ -764,21 +913,37 @@ static int cmd_exec(int argc, char **argv)
     if (argc < 2) {
         fprintf(stderr,
             "Usage: virp exec <device> \"<command>\" [--socket PATH]\n"
+            "                 [--okey PATH] [--no-verify] [--chain-register]\n"
             "Submits through the normal framed socket and tier gate (a\n"
-            "client, not a bypass) and prints the signed response.\n");
+            "client, not a bypass), VERIFIES the signed response against\n"
+            "the O-Key, and prints it.\n"
+            "  --okey PATH       O-Key for verification (default %s)\n"
+            "  --no-verify       print without verifying (not evidence)\n"
+            "  --chain-register  register the verified observation in the\n"
+            "                    trust chain, like the bridge client does\n",
+            OKEY_DEFAULT_PATH);
         return 1;
     }
     const char *device = argv[0];
     const char *command = argv[1];
     const char *sock_path = ONODE_DEFAULT_SOCKET;
+    const char *okey_path = OKEY_DEFAULT_PATH;
+    bool chain_register = false;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
             sock_path = argv[++i];
+        else if (strcmp(argv[i], "--okey") == 0 && i + 1 < argc)
+            okey_path = argv[++i];
+        else if (strcmp(argv[i], "--no-verify") == 0)
+            okey_path = NULL;
+        else if (strcmp(argv[i], "--chain-register") == 0)
+            chain_register = true;
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
 
     printf("device=%s command=\"%s\"\n", device, command);
-    return submit_execute(sock_path, device, command, NULL);
+    return submit_execute(sock_path, device, command, NULL,
+                          okey_path, chain_register);
 }
 
 /* =========================================================================
@@ -795,9 +960,14 @@ static int cmd_apply(int argc, char **argv)
     const char *proposal_id = argv[0];
     const char *dir = APPROVAL_DEFAULT_DIR;
     const char *sock_path = ONODE_DEFAULT_SOCKET;
+    const char *okey_path = OKEY_DEFAULT_PATH;
+    bool chain_register = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dir") == 0 && i + 1 < argc) dir = argv[++i];
         else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) sock_path = argv[++i];
+        else if (strcmp(argv[i], "--okey") == 0 && i + 1 < argc) okey_path = argv[++i];
+        else if (strcmp(argv[i], "--no-verify") == 0) okey_path = NULL;
+        else if (strcmp(argv[i], "--chain-register") == 0) chain_register = true;
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
 
@@ -813,7 +983,7 @@ static int cmd_apply(int argc, char **argv)
     printf("device=%s command=\"%s\" proposal_id=%s\n",
            prop.device, prop.command, prop.proposal_id);
     return submit_execute(sock_path, prop.device, prop.command,
-                          prop.proposal_id);
+                          prop.proposal_id, okey_path, chain_register);
 }
 
 /* =========================================================================

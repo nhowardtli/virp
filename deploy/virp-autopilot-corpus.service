@@ -5,6 +5,17 @@ Requires=virp-onode.service
 
 [Service]
 Type=oneshot
+# Runs as the dedicated virp-ops account, NOT root: the daemon's
+# socket_allowed_uids deliberately excludes uid 0 (see DEPLOYED.md,
+# "socket allowlist policy"). virp-ops has no shell and no sudo, and is
+# granted exactly three things: socket access, group `virp` (traverse
+# /var/lib/virp and read chain.db) and group `virp-keyread` (read the
+# O-Key). The key read is unavoidable: VIRP observations are HMAC-signed,
+# so verifying one requires the same key that signs one — this narrows
+# which account holds that power, it does not remove it.
+User=virp-ops
+Group=virp-ops
+SupplementaryGroups=virp virp-keyread
 ExecStart=/usr/bin/python3 /opt/virp/autopilot/virp_autopilot.py corpus
 NoNewPrivileges=yes
 PrivateTmp=yes

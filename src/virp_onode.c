@@ -1070,6 +1070,18 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
              * stays unapprovable, and an unconfigured approval store
              * verifies nothing (fail closed).
              */
+            /*
+             * BLACK is unapprovable BY DESIGN and this check runs before
+             * any signature work, so a classifier that returns BLACK
+             * makes its commands permanently un-escalatable: the
+             * propose→approve→apply path dead-ends for exactly the
+             * commands most likely to need a human. Driver tables are
+             * therefore expected to top out at RED (blocked, but
+             * approvable). The linux/FRR table is pinned to that by
+             * test_never_returns_black() in
+             * tests/test_driver_linux_gate.c; any new table should carry
+             * the same invariant test.
+             */
             virp_error_t aerr;
             if (gate_tier == VIRP_TIER_BLACK)
                 aerr = VIRP_ERR_TIER_VIOLATION;
@@ -1183,26 +1195,123 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
              * chain_append handler; a dedicated chain mutex shared by both
              * paths is the proper hardening before high-concurrency enforce. */
             if (state->chain_enabled) {
-                char artifact_hash[65];
-                gate_sha256_hex(err_msg, strlen(err_msg), artifact_hash);
-                char artifact_id[64];
-                snprintf(artifact_id, sizeof(artifact_id),
-                         "gatereject-%.16s", artifact_hash);
+                /*
+                 * Reason RETENTION. The entry commits to sha256(body) as
+                 * before, but the body is now STORED, so the reason is
+                 * recoverable from the chain alone instead of only from
+                 * the daemon journal. Before this, an evidence report
+                 * could prove a block happened and commit to its reason
+                 * but could not show the reason.
+                 *
+                 * Body is a structured object (schema gate_rejection/1):
+                 * device, driver, command, classified tier, gate max
+                 * tier, the classifier's matched rule when it supplied
+                 * one, and the exact human-readable message — the same
+                 * text the signed ERROR observation carries as its
+                 * payload, so the chain body and the O-Key-signed
+                 * observation agree by construction.
+                 *
+                 * Binding: the body is committed to by artifact_hash,
+                 * which is itself covered by the entry's chain HMAC. The
+                 * body is HMAC-bound through the entry, not directly
+                 * O-Key-signed; the O-Key-signed copy of the same text
+                 * is the ERROR observation returned to the caller.
+                 *
+                 * RETENTION SENSITIVITY (reviewed 2026-07-30): a
+                 * classification reason is metadata — tiers, rule names,
+                 * device and driver names — and carries no credential.
+                 * The one field that can carry caller-supplied content is
+                 * `command`, and a blocked write attempt can legitimately
+                 * contain a secret the caller typed (e.g. an attempted
+                 * "username x secret y"). That text is NOT newly exposed
+                 * by this change: it already goes to the journal, is
+                 * already the payload of the signed ERROR observation
+                 * returned to the caller, and was already hashed into
+                 * this entry. What does change is durability and reach —
+                 * chain.db is permanent where the journal rotates, and it
+                 * is group-readable under /var/lib/virp (0750 virp:virp),
+                 * so group `virp` members can read attempted command
+                 * text. Retained deliberately: an audit record of a
+                 * refused command that omits the command is not an audit
+                 * record. If a deployment cannot accept that, scrub at
+                 * the caller — never here, where scrubbing would break
+                 * the observation/chain agreement above.
+                 */
                 char session_id[96];
                 snprintf(session_id, sizeof(session_id),
                          "gate-enforce:%s", device_name);
+
+                const char *matched = drv->route_reason
+                                    ? drv->route_reason(command) : NULL;
+
+                /* cJSON does the escaping: command text is arbitrary and
+                 * must never be pasted into JSON by hand. */
+                char *body = NULL;
+                cJSON *o = cJSON_CreateObject();
+                if (o) {
+                    cJSON_AddStringToObject(o, "schema", "gate_rejection/1");
+                    cJSON_AddStringToObject(o, "device", device_name);
+                    cJSON_AddStringToObject(o, "driver", drv->name);
+                    cJSON_AddStringToObject(o, "command", command);
+                    cJSON_AddStringToObject(o, "classified_tier",
+                                            gate_tier_name(gate_tier));
+                    cJSON_AddStringToObject(o, "gate_max_tier",
+                                            gate_tier_name(state->gate_max_tier));
+                    if (matched)
+                        cJSON_AddStringToObject(o, "matched_rule", matched);
+                    else
+                        cJSON_AddNullToObject(o, "matched_rule");
+                    cJSON_AddStringToObject(o, "message", err_msg);
+                    cJSON_AddBoolToObject(o, "executed", false);
+                    body = cJSON_PrintUnformatted(o);
+                    cJSON_Delete(o);
+                }
+
+                /* Commit to the body actually stored. If the body could
+                 * not be built, fall back to the historical
+                 * commit-to-message behaviour rather than losing the
+                 * entry — a rejection must always be recorded. */
+                char artifact_hash[65];
+                const char *commit_src = body ? body : err_msg;
+                gate_sha256_hex(commit_src, strlen(commit_src), artifact_hash);
+                char artifact_id[64];
+                snprintf(artifact_id, sizeof(artifact_id),
+                         "gatereject-%.16s", artifact_hash);
+
                 virp_chain_entry_t ce;
                 virp_error_t cerr = virp_chain_append(&state->chain, session_id,
                                                       "gate_rejection",
                                                       artifact_id, artifact_hash,
                                                       &ce);
-                if (cerr == VIRP_OK)
+                if (cerr == VIRP_OK) {
+                    /* Store the body under the same id the entry names.
+                     * Best-effort like the append itself: a storage
+                     * failure must not alter the rejection, but it is
+                     * logged so a chain with unrecoverable reasons is
+                     * visible rather than silent. */
+                    if (body) {
+                        virp_error_t serr = virp_chain_artifact_store(
+                                &state->chain, artifact_id, "gate_rejection",
+                                body, artifact_hash, session_id);
+                        if (serr != VIRP_OK)
+                            fprintf(stderr, "[GATE] rejection reason body "
+                                    "store failed: %s (entry %s retains only "
+                                    "the commitment)\n",
+                                    virp_error_str(serr), artifact_id);
+                    } else {
+                        fprintf(stderr, "[GATE] rejection reason body could "
+                                "not be built; entry %s retains only the "
+                                "commitment\n", artifact_id);
+                    }
                     fprintf(stderr, "[GATE] rejection persisted: session=%s "
                             "seq=%lld hash=%.16s\n", session_id,
                             (long long)ce.sequence, ce.chain_entry_hash);
-                else
+                } else {
                     fprintf(stderr, "[GATE] rejection chain_append failed: %s\n",
                             virp_error_str(cerr));
+                }
+
+                if (body) free(body);
             }
 
             log_error_obs(device_name, gate_tier, err_msg);

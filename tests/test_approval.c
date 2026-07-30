@@ -798,7 +798,7 @@ static void test_cli_exec_green_executes(void)
     TEST("CLI: virp exec GREEN read executes");
     char out[8192], cmd[512];
     snprintf(cmd, sizeof(cmd),
-             CLI_BIN " exec R-APP \"show version\" --socket %s",
+             CLI_BIN " exec R-APP \"show version\" --socket %s --no-verify",
              g.socket_path);
     int rc = run_cli(cmd, out, sizeof(out));
     ASSERT(rc == 0, "exit code should be 0 (executed)");
@@ -808,12 +808,72 @@ static void test_cli_exec_green_executes(void)
     PASS();
 }
 
+/*
+ * The operator CLI must VERIFY, not just print (2026-07-30). `virp exec`
+ * used to print the response unverified and tell the reader to run
+ * `virp-tool inspect` separately, which made the one client a human
+ * drives by hand the weakest verifier in the fleet while the autopilot
+ * verified everything. Asserted both ways: the harness O-Key verifies,
+ * and an unrelated key is a hard failure — a bad signature must never
+ * exit 0 with the payload printed as fact.
+ */
+static void test_cli_exec_verifies_signature(void)
+{
+    TEST("CLI: virp exec verifies the observation signature");
+    char out[8192], cmd[768];
+
+    /* The harness signs with the in-memory g.okey; write it out so the
+     * CLI can verify against the same key the daemon used. */
+    const char *good = "/tmp/virp-approval-test-okey.bin";
+    const char *bad  = "/tmp/virp-approval-test-okey-wrong.bin";
+    ASSERT(virp_key_save_file(&g.okey, good) == VIRP_OK, "save harness okey");
+
+    virp_signing_key_t other;
+    ASSERT(virp_key_generate(&other, VIRP_KEY_TYPE_OKEY) == VIRP_OK,
+           "generate unrelated okey");
+    ASSERT(virp_key_save_file(&other, bad) == VIRP_OK, "save unrelated okey");
+    virp_key_destroy(&other);
+
+    /* Correct key: executes AND reports the signature as valid. */
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " exec R-APP \"show version\" --socket %s --okey %s",
+             g.socket_path, good);
+    int rc = run_cli(cmd, out, sizeof(out));
+    ASSERT(rc == 0, "correct key: exit 0");
+    ASSERT(strstr(out, "signature=VALID") != NULL,
+           "correct key: signature must be reported VALID");
+
+    /* Wrong key: must FAIL, and must say the payload is not evidence. */
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " exec R-APP \"show version\" --socket %s --okey %s",
+             g.socket_path, bad);
+    rc = run_cli(cmd, out, sizeof(out));
+    ASSERT(rc == 1, "wrong key: must exit non-zero, not 0");
+    ASSERT(strstr(out, "INVALID") != NULL,
+           "wrong key: must announce INVALID");
+    ASSERT(strstr(out, "NOT evidence") != NULL,
+           "wrong key: must refuse to present the payload as evidence");
+
+    /* Explicit opt-out still works and says so rather than implying a check. */
+    snprintf(cmd, sizeof(cmd),
+             CLI_BIN " exec R-APP \"show version\" --socket %s --no-verify",
+             g.socket_path);
+    rc = run_cli(cmd, out, sizeof(out));
+    ASSERT(rc == 0, "--no-verify: exit 0");
+    ASSERT(strstr(out, "signature=SKIPPED") != NULL,
+           "--no-verify must report SKIPPED, never VALID");
+
+    unlink(good);
+    unlink(bad);
+    PASS();
+}
+
 static void test_cli_exec_red_rejected_with_proposal(void)
 {
     TEST("CLI: virp exec RED returns rejection + proposal_id");
     char out[8192], cmd[512];
     snprintf(cmd, sizeof(cmd),
-             CLI_BIN " exec R-APP \"reload\" --socket %s", g.socket_path);
+             CLI_BIN " exec R-APP \"reload\" --socket %s --no-verify", g.socket_path);
     int rc = run_cli(cmd, out, sizeof(out));
     ASSERT(rc == 2, "exit code should be 2 (signed rejection)");
     ASSERT(strstr(out, "trust_tier=RED") != NULL, "tier resolution missing");
@@ -877,7 +937,7 @@ static void test_cli_approve_apply_e2e(void)
      * ("reload" is RED for the mock classifier; "configure" is YELLOW.) */
     char out[8192], cmd[1024];
     snprintf(cmd, sizeof(cmd),
-             CLI_BIN " exec R-APP \"reload\" --socket %s", g.socket_path);
+             CLI_BIN " exec R-APP \"reload\" --socket %s --no-verify", g.socket_path);
     ASSERT(run_cli(cmd, out, sizeof(out)) == 2, "exec must be a rejection");
     const char *p = strstr(out, "\nproposal_id=");
     ASSERT(p != NULL, "no proposal_id");
@@ -894,7 +954,7 @@ static void test_cli_approve_apply_e2e(void)
 
     /* 3. Apply via the CLI — the command executes. */
     snprintf(cmd, sizeof(cmd),
-             CLI_BIN " apply %s --dir %s --socket %s", pid, DIR, g.socket_path);
+             CLI_BIN " apply %s --dir %s --socket %s --no-verify", pid, DIR, g.socket_path);
     int rc = run_cli(cmd, out, sizeof(out));
     ASSERT(rc == 0, "apply should execute (exit 0)");
     ASSERT(strstr(out, "R-APP#reload") != NULL, "command did not execute");
@@ -932,7 +992,7 @@ static void test_cli_keygen_key_loads(void)
 
     /* File a proposal so the challenge succeeds. */
     snprintf(cmd, sizeof(cmd),
-             CLI_BIN " exec R-APP \"reload\" --socket %s", g.socket_path);
+             CLI_BIN " exec R-APP \"reload\" --socket %s --no-verify", g.socket_path);
     ASSERT(run_cli(cmd, out, sizeof(out)) == 2, "exec block");
     const char *p = strstr(out, "\nproposal_id=");
     ASSERT(p != NULL, "no proposal_id");
@@ -962,7 +1022,7 @@ static void test_cli_approve_key_diagnostics(void)
     /* Need a live proposal so the loader is reached (it runs post-challenge). */
     char out[8192], cmd[1024];
     snprintf(cmd, sizeof(cmd),
-             CLI_BIN " exec R-APP \"reload\" --socket %s", g.socket_path);
+             CLI_BIN " exec R-APP \"reload\" --socket %s --no-verify", g.socket_path);
     ASSERT(run_cli(cmd, out, sizeof(out)) == 2, "exec block");
     const char *p = strstr(out, "\nproposal_id=");
     ASSERT(p != NULL, "no proposal_id");
@@ -1067,6 +1127,7 @@ int main(void)
     pthread_create(&srv, NULL, serve_thread, &g);
     usleep(200000);
     test_cli_exec_green_executes();
+    test_cli_exec_verifies_signature();
     test_cli_exec_red_rejected_with_proposal();
     test_cli_approve_apply_e2e();
     test_cli_keygen_key_loads();

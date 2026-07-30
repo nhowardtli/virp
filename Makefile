@@ -383,9 +383,22 @@ $(TEST_INTEROP): tests/test_interop_c.c $(LIB)
 # live-daemon test is NOT run here — it is fenced behind
 # VIRP_LIVE_INTEROP=1 (see live-interop below) so the default battery
 # never touches a live device.
+# SKIPS with a warning when the Go toolchain is absent rather than failing
+# the whole battery. Three separate environments (CT 211, virp-lab and
+# virp-node2 on first build) hit `go: not found` here and reported a red
+# battery for a missing optional toolchain, which trains people to read
+# `all-tests` failures as noise. The C reference implementation is fully
+# covered without Go; what is lost is the C↔Go wire-parity check, so the
+# skip says so loudly instead of passing quietly.
 test-interop: $(TEST_INTEROP)
-	cd $(GO_DIR) && VIRP_INTEROP_BIN=$(abspath $(TEST_INTEROP)) \
-		go test ./virp/ -run TestInterop -v -count=1
+	@if command -v go >/dev/null 2>&1; then \
+	  cd $(GO_DIR) && VIRP_INTEROP_BIN=$(abspath $(TEST_INTEROP)) \
+	    go test ./virp/ -run TestInterop -v -count=1; \
+	else \
+	  echo "  *** SKIPPING test-interop: no Go toolchain on PATH."; \
+	  echo "      install it with: apt install golang-go"; \
+	  echo "  *** C<->Go wire parity is NOT covered in this run."; \
+	fi
 
 # Opt-in ONLY: drives the deployed daemon and REAL devices
 # (FORTIGATE-200G, SW-3850). Known stale — needs the framed-protocol
@@ -527,6 +540,24 @@ test-librenms: $(TEST_LIBRENMS)
 # RBAC empty-result handling — no daemon, no devices)
 test-autopilot:
 	python3 tests/test_autopilot.py
+
+# virp report — consumer-side chain PDF generator. Synthetic-chain tests run
+# anywhere; the live-chain tests self-skip when /var/lib/virp/chain.db is
+# absent, so this target is safe on a build host. Requires reportlab
+# (report/requirements.txt); pure python, no system packages.
+#
+# SKIPS with a warning when reportlab is absent rather than failing the
+# battery — same policy as test-interop below. A missing optional tool is a
+# gap in coverage to report, not a broken tree.
+test-virp-report:
+	@if python3 -c "import reportlab" 2>/dev/null; then \
+	  python3 tests/test_virp_report.py; \
+	else \
+	  echo "  *** SKIPPING test-virp-report: reportlab is not installed."; \
+	  echo "      install it with: pip install -r report/requirements.txt"; \
+	  echo "      (or the distro package, e.g. apt install python3-reportlab)"; \
+	  echo "  *** The chain report generator is NOT covered in this run."; \
+	fi
 
 # Session negative-path tests
 TEST_SESSION_NEG = $(BUILD_DIR)/test_session_negative
@@ -823,4 +854,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11

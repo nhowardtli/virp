@@ -1,0 +1,12 @@
+#!/bin/sh
+# virp-report — thin launcher for the consumer-side chain PDF generator.
+#
+# The `virp` CLI is a compiled C binary (src/virp_tool.c); the report
+# generator is Python because it renders PDFs with reportlab. Rather than
+# rebuild and replace a deployed binary just to add a subcommand, the tool
+# ships as this launcher. `virp report ...` in the docs means:
+#
+#     virp-report --db <path> --out <file.pdf> [--session ID] [--since TS] [--until TS]
+#
+# Symlink it onto PATH if you want it alongside `virp`.
+exec python3 "$(dirname "$(readlink -f "$0")")/virp_report.py" "$@"
