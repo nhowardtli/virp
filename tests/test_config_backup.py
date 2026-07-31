@@ -476,9 +476,37 @@ class TestDeployPolicy(unittest.TestCase):
         sh = self.read("deploy", "render-devices.sh")
         tmpl = self.read("deploy", "devices.template.json")
         for var in ("PBS_HOST", "PBS_TOKENID", "PBS_TOKEN",
-                    "PBS_FINGERPRINT", "PBS_DATASTORES"):
+                    "PBS_FINGERPRINT", "PBS_DATASTORES", "PBS_SERVERNAME"):
             self.assertIn("${%s}" % var, tmpl)
             self.assertIn('"%s"' % var, sh)
+
+    def test_pbs_device_carries_a_tls_servername(self):
+        """Hostname verification must have something true to check.
+
+        Pinning does NOT subsume hostname verification: libcurl performs
+        the name check separately from the certificate-verify callback, so
+        a correct pin still failed live with "no alternative certificate
+        subject name matches target host name '<ip>'". The fix is
+        tls_servername + CURLOPT_RESOLVE, NOT lowering VERIFYHOST — so the
+        field has to stay present in the template.
+        """
+        cfg = json.loads(self.read("deploy", "devices.template.json"))
+        pbs = [d for d in cfg["devices"] if d.get("vendor") == "pbs"][0]
+        self.assertEqual(pbs["tls_servername"], "${PBS_SERVERNAME}")
+
+    def test_pbs_driver_never_lowers_tls_verification(self):
+        """The driver must not reach for the easy workaround.
+
+        Guards the exact regression the live probe caught: setting
+        VERIFYHOST/VERIFYPEER to 0 makes the pin "work" against an IP by
+        turning off the check that was complaining.
+        """
+        src = self.read("src", "drivers", "driver_pbs.c")
+        self.assertNotIn("CURLOPT_SSL_VERIFYHOST, 0", src)
+        self.assertNotIn("CURLOPT_SSL_VERIFYPEER, 0", src)
+        self.assertIn("CURLOPT_SSL_VERIFYHOST, 2L", src)
+        self.assertIn("CURLOPT_SSL_VERIFYPEER, 1L", src)
+        self.assertIn("CURLOPT_RESOLVE", src)
 
     def test_no_unit_executes_from_a_source_worktree(self):
         """Deployment must be an act, not a side effect of a restart.

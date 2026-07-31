@@ -521,17 +521,28 @@ int pbs_parse_fingerprint(const char *text,
 }
 
 /*
- * OpenSSL certificate verification, replaced wholesale by an exact
- * leaf-certificate pin.
+ * CHAIN verification, replaced wholesale by an exact leaf-certificate
+ * pin. Read the next paragraph carefully — an earlier version of this
+ * comment got it wrong and the error survived until it was caught
+ * against a live server.
  *
- * Honest statement of what this does: it does NOT build or validate a
- * chain, and it does NOT check the hostname. It checks that the peer
- * presented exactly the certificate the operator recorded. For a single
- * pinned host that is strictly stronger than chain+hostname validation —
- * a mis-issued cert for the right hostname from any trusted CA fails
- * here — and it is why a self-signed PBS certificate needs no CA bundle
- * and no exception. The cost is that certificate rotation on the PBS
- * side is a config change here; that is recorded in the runbook.
+ * What this callback replaces: chain building and trust-anchor
+ * validation. It checks that the peer presented exactly the certificate
+ * the operator recorded. For a single pinned host that is stronger than
+ * chain validation — a mis-issued certificate for the right name from
+ * any trusted CA fails here — and it is why a self-signed PBS
+ * certificate needs no CA bundle and no exception.
+ *
+ * What this callback does NOT replace: HOSTNAME verification. libcurl
+ * performs the name check itself, separately from this hook, so with
+ * CURLOPT_SSL_VERIFYHOST=2 a correct pin still fails when the connect
+ * address is not covered by the certificate's subject/SAN. That is not
+ * a bug to route around by lowering VERIFYHOST — it is why the device
+ * carries tls_servername, so the driver can connect to an IP while
+ * validating the name the certificate actually bears (see pbs_request).
+ *
+ * The cost of pinning is that certificate rotation on the PBS side is a
+ * config change here; that is recorded in the runbook.
  */
 static int pbs_cert_verify_cb(X509_STORE_CTX *ctx, void *arg)
 {
@@ -605,6 +616,16 @@ struct virp_conn {
     virp_device_t  device;
     CURL          *curl;
     char           base_url[512];
+    /*
+     * When the device names a tls_servername, base_url is built from
+     * that name and this holds the CURLOPT_RESOLVE entry pinning it to
+     * the configured address ("name:port:addr"). Hostname verification
+     * then validates the certificate's real name while the connection
+     * still goes to the address the operator configured — no DNS
+     * dependency, and no lowering of VERIFYHOST.
+     */
+    char           resolve_entry[640];
+    bool           use_resolve;
     unsigned char  pin[PBS_FINGERPRINT_BYTES];
     char           datastores[PBS_MAX_DATASTORES][PBS_VALUE_MAX];
     size_t         datastore_count;
@@ -710,6 +731,12 @@ static virp_error_t pbs_request(struct virp_conn *conn, pbs_method_t method,
     headers = curl_slist_append(headers, auth_hdr);
     headers = curl_slist_append(headers, "Accept: application/json");
 
+    /* Name-to-address override, so hostname verification validates the
+     * certificate's actual name without a DNS dependency. */
+    struct curl_slist *resolve = NULL;
+    if (conn->use_resolve)
+        resolve = curl_slist_append(resolve, conn->resolve_entry);
+
     pbs_response_t resp = { .buf = out, .buf_size = out_len, .offset = 0 };
     out[0] = '\0';
 
@@ -731,10 +758,13 @@ static virp_error_t pbs_request(struct virp_conn *conn, pbs_method_t method,
     curl_easy_setopt(conn->curl, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(conn->curl, CURLOPT_SSL_CTX_FUNCTION, pbs_ssl_ctx_cb);
     curl_easy_setopt(conn->curl, CURLOPT_SSL_CTX_DATA, conn->pin);
+    if (resolve)
+        curl_easy_setopt(conn->curl, CURLOPT_RESOLVE, resolve);
 
     CURLcode rc = curl_easy_perform(conn->curl);
 
     curl_slist_free_all(headers);
+    if (resolve) curl_slist_free_all(resolve);
     OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
 
     if (rc != CURLE_OK) {
@@ -793,8 +823,26 @@ static virp_conn_t *pbs_connect(const virp_device_t *device)
 
     uint16_t port = device->api_port ? device->api_port :
                     (device->port ? device->port : PBS_DEFAULT_PORT);
-    snprintf(conn->base_url, sizeof(conn->base_url), "https://%s:%u",
-             device->host, port);   /* PBS is TLS-only; no http fallback */
+
+    /*
+     * PBS is TLS-only; no http fallback. When the operator supplied the
+     * certificate's name, address the request to THAT name and pin the
+     * name to the configured address with CURLOPT_RESOLVE — hostname
+     * verification then has something true to check, instead of being
+     * turned off because an IP is not in the certificate's SAN.
+     */
+    if (device->tls_servername[0] != '\0') {
+        snprintf(conn->base_url, sizeof(conn->base_url), "https://%.255s:%u",
+                 device->tls_servername, port);
+        snprintf(conn->resolve_entry, sizeof(conn->resolve_entry),
+                 "%.255s:%u:%.255s", device->tls_servername, port,
+                 device->host);
+        conn->use_resolve = true;
+    } else {
+        snprintf(conn->base_url, sizeof(conn->base_url), "https://%.255s:%u",
+                 device->host, port);
+        conn->use_resolve = false;
+    }
 
     conn->curl = curl_easy_init();
     if (!conn->curl) {
@@ -805,8 +853,12 @@ static virp_conn_t *pbs_connect(const virp_device_t *device)
         return NULL;
     }
 
-    fprintf(stderr, "[PBS] Connecting to %s (pinned cert, %zu datastore%s "
-                    "allowlisted)\n", conn->base_url, conn->datastore_count,
+    fprintf(stderr, "[PBS] Connecting to %s%s%s (pinned cert, hostname "
+                    "verification on, %zu datastore%s allowlisted)\n",
+            conn->base_url,
+            conn->use_resolve ? " via " : "",
+            conn->use_resolve ? device->host : "",
+            conn->datastore_count,
             conn->datastore_count == 1 ? "" : "s");
 
     /*

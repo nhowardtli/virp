@@ -162,13 +162,48 @@ mechanically — it fails if the driver ever disables curl verification,
 reads *any* environment variable, drops the verify callback, or starts
 following redirects.
 
-Be honest about what the pin does and does not do. It does **not** build a
-chain and does **not** check the hostname; it checks that the peer
-presented exactly the recorded certificate. For a single pinned host that
-is *stronger* than chain+hostname validation — a mis-issued certificate for
-the right hostname from any trusted CA fails — and it is why a self-signed
-PBS certificate needs no CA bundle and no exception. The cost is that
+Be honest about what the pin does and does not do. It replaces **chain
+building and trust-anchor validation**: it checks that the peer presented
+exactly the recorded certificate. For a single pinned host that is
+*stronger* than chain validation — a mis-issued certificate for the right
+name from any trusted CA fails — and it is why a self-signed PBS
+certificate needs no CA bundle and no exception. The cost is that
 certificate rotation becomes a config change. That is the intended trade.
+
+**The pin does NOT replace hostname verification, and assuming it did was
+a real bug.** The first version of this driver set
+`CURLOPT_SSL_VERIFYHOST=2` and reasoned that, since the certificate-verify
+callback overrides OpenSSL's chain verification, the name check went with
+it. It does not: libcurl performs hostname verification *itself*,
+separately from that hook. Against the live server a **correct** pin
+therefore failed with
+
+```
+CURLcode=60  SSL: no alternative certificate subject name
+             matches target host name '10.0.20.199'
+```
+
+even though the callback ran and matched. The PBS self-signed certificate
+carries `DNS:localhost, DNS:pbs, DNS:pbs.thirdlevelit.local` and
+`IP:127.0.0.1` — not the management IP the daemon connects to.
+
+The wrong fix is lowering `VERIFYHOST`. The fix is to give hostname
+verification something true to check: the device carries
+**`tls_servername`**, and when set the driver addresses the request to
+that name while pinning the name to the configured address with
+`CURLOPT_RESOLVE`. Both checks stay on, there is no DNS dependency, and
+nothing is disabled:
+
+```
+[PBS] Connecting to https://pbs.thirdlevelit.local:8007 via 10.0.20.199
+      (pinned cert, hostname verification on, 1 datastore allowlisted)
+```
+
+The general lesson for the next driver: **verify the TLS posture against a
+real server before deploy.** Every unit test passed while this was broken,
+because no unit test opens a socket — by design. A live probe in both
+directions (correct pin connects, wrong pin refuses) is the only thing
+that catches it.
 
 Contrast `driver_wazuh.c`, which carries `VIRP_WAZUH_INSECURE=1` for the
 lab manager's self-signed cert. That is pre-existing and documented, and it
@@ -201,6 +236,7 @@ PBS_HOST=10.0.x.y                       # PBS management address
 PBS_TOKENID='virp-ro@pbs!virp'          # API token id, user@realm!tokenid
 PBS_TOKEN=xxxxxxxx-xxxx-...             # the token SECRET
 PBS_FINGERPRINT=AB:CD:...:EF            # SHA-256 of the PBS leaf cert
+PBS_SERVERNAME=pbs.example.local        # name on the cert (see below)
 PBS_DATASTORES=vault,vault-01           # comma-separated allowlist
 ```
 
@@ -216,6 +252,7 @@ PBS_DATASTORES=vault,vault-01           # comma-separated allowlist
   "username": "${PBS_TOKENID}",
   "api_token": "${PBS_TOKEN}",
   "tls_fingerprint": "${PBS_FINGERPRINT}",
+  "tls_servername": "${PBS_SERVERNAME}",
   "datastore_allow": "${PBS_DATASTORES}"
 }
 ```
@@ -229,6 +266,13 @@ Field notes:
 - **`datastore_allow`** is exact-match, comma-separated. Malformed entries
   are dropped with a warning rather than silently widening the list; an
   empty list refuses `backup.snapshots.list` outright.
+- **`tls_servername`** is the name the certificate is issued for, when
+  that differs from `host`. Required whenever `host` is an IP the
+  certificate's SAN does not cover — the normal case for a self-signed PBS
+  certificate. Read it off the cert:
+  `openssl s_client -connect <ip>:8007 | openssl x509 -noout -ext subjectAltName`.
+  Empty means "use `host` unchanged", which is correct only when `host` is
+  itself covered by the certificate.
 - **`username` holds the token id, not a login.** The auth header is
   `Authorization: PBSAPIToken=<username>:<api_token>`.
 - The host must not collide with the daemon's hard-exclusion list

@@ -108,6 +108,23 @@ typedef struct {
      */
     char            tls_fingerprint[128];
     char            datastore_allow[256];
+    /*
+     * tls_servername: the name the server's certificate is issued for,
+     * when that differs from `host`.
+     *
+     * Needed because certificate pinning does NOT subsume hostname
+     * verification in libcurl. curl performs the name check separately
+     * from the certificate-verify callback, so a correct pin still fails
+     * with "no alternative certificate subject name matches target host
+     * name" when `host` is an IP the certificate does not cover — which
+     * is the normal case for a self-signed PBS certificate.
+     *
+     * When set, the driver connects to `host` but presents/validates
+     * this name (SNI + CURLOPT_RESOLVE). Hostname verification stays ON
+     * and genuinely passes, rather than being switched off to work
+     * around the mismatch. Empty = use `host` unchanged.
+     */
+    char            tls_servername[256];
 } virp_device_t;
 
 /* =========================================================================

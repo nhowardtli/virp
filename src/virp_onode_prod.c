@@ -461,6 +461,8 @@ int load_devices(onode_state_t *state, const char *path)
                         sizeof(device.tls_fingerprint));
         json_get_string(dev_obj, "datastore_allow", device.datastore_allow,
                         sizeof(device.datastore_allow));
+        json_get_string(dev_obj, "tls_servername", device.tls_servername,
+                        sizeof(device.tls_servername));
 
         if (device.hostname[0] == '\0' || device.host[0] == '\0') {
             fprintf(stderr, "[O-Node] Skipping device %d: missing hostname/host\n", i);

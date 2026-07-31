@@ -84,7 +84,7 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             # will then refuse — the operator should learn about it at
             # deploy time, not from a connect failure.
             "PBS_HOST", "PBS_TOKENID", "PBS_TOKEN",
-            "PBS_FINGERPRINT", "PBS_DATASTORES"):
+            "PBS_FINGERPRINT", "PBS_DATASTORES", "PBS_SERVERNAME"):
     placeholder = "${%s}" % var
     if placeholder not in text:
         continue

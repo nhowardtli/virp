@@ -75,6 +75,7 @@
       "username": "${PBS_TOKENID}",
       "api_token": "${PBS_TOKEN}",
       "tls_fingerprint": "${PBS_FINGERPRINT}",
+      "tls_servername": "${PBS_SERVERNAME}",
       "datastore_allow": "${PBS_DATASTORES}"
     }
   ]
