@@ -120,6 +120,21 @@ ifdef LIBRENMS
   LIB_OBJS += $(BUILD_DIR)/driver_librenms.o
 endif
 
+# Optional Proxmox Backup Server driver — typed operations over REST.
+# Needs libcurl like the other REST drivers, plus -lssl: the certificate
+# pin is implemented with an OpenSSL verify callback (SSL_CTX_*), which
+# the bare -lcrypto in the base LDFLAGS does not provide.
+ifdef PBS
+  CFLAGS  += -DVIRP_DRIVER_PBS $(shell pkg-config --cflags libcurl 2>/dev/null)
+  ifndef WAZUH
+    ifndef LIBRENMS
+      LDFLAGS += $(shell pkg-config --libs libcurl 2>/dev/null || echo "-lcurl")
+    endif
+  endif
+  LDFLAGS += -lssl
+  LIB_OBJS += $(BUILD_DIR)/driver_pbs.o
+endif
+
 # SSH host key verification — included when any SSH driver is enabled
 ifneq (,$(or $(CISCO),$(FORTIGATE),$(PANOS),$(ASA),$(JUNIPER),$(LINUX)))
   LIB_OBJS += $(BUILD_DIR)/virp_ssh_hostkey.o
@@ -179,6 +194,9 @@ $(BUILD_DIR)/driver_wazuh.o: src/drivers/driver_wazuh.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_librenms.o: src/drivers/driver_librenms.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_pbs.o: src/drivers/driver_pbs.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_ssh_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
@@ -355,13 +373,13 @@ $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
 # name works and callers have a single driver-enabled build entry point.
 .PHONY: prod
 prod:
-	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 $(ONODE_PROD)
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 PBS=1 $(ONODE_PROD)
 
 # Full production build — recursive make ensures all ifdef guards evaluate correctly
 # SSH host key verification is strict: unknown keys are rejected.
 .PHONY: prod-full
 prod-full:
-	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 $(ONODE_PROD)
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 PBS=1 $(ONODE_PROD)
 
 # Dev build — all drivers, TOFU enabled by default so lab devices work
 # without pre-populating known_hosts. Do not run dev binaries in production.
@@ -536,6 +554,18 @@ $(TEST_LIBRENMS): tests/test_driver_librenms.c $(LIB)
 test-librenms: $(TEST_LIBRENMS)
 	./$(TEST_LIBRENMS)
 
+# PBS typed-operation driver tests (requires PBS=1). Entirely offline:
+# the grammar parser, op table, URL derivation, fingerprint parsing and
+# device precheck are all pure functions, so this suite never originates
+# outbound contact and needs no live fence.
+TEST_PBS = $(BUILD_DIR)/test_driver_pbs
+
+$(TEST_PBS): tests/test_driver_pbs.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-pbs: $(TEST_PBS)
+	./$(TEST_PBS)
+
 # Autopilot client unit tests (pure-python: baselines, corpus table,
 # RBAC empty-result handling — no daemon, no devices)
 test-autopilot:
@@ -644,9 +674,9 @@ DRIVER_BUILD_DIR = build-drivers
 
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms) ==="
-	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 \
-	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms
+	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs) ==="
+	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 \
+	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms test-pbs
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.
 #

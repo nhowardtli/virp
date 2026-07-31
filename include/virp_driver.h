@@ -38,6 +38,7 @@ typedef enum {
     VIRP_VENDOR_WAZUH       = 9,
     VIRP_VENDOR_CISCO_IOSXE = 10,  /* Cisco IOS-XE (Catalyst/ISR-XE); shares the cisco driver + gate core */
     VIRP_VENDOR_LIBRENMS    = 11,  /* LibreNMS REST API (token auth) */
+    VIRP_VENDOR_PBS         = 12,  /* Proxmox Backup Server (typed ops, pinned TLS) */
     VIRP_VENDOR_MOCK        = 99,   /* Testing only */
 } virp_vendor_t;
 
@@ -90,6 +91,23 @@ typedef struct {
     char            vdom[64];           /* VDOM name (default "root") */
     bool            verify_tls;         /* Verify TLS cert on REST calls */
     bool            ssh_legacy;         /* Force legacy SSH ciphers (group14-sha1, ssh-rsa, aes256-cbc) */
+    /*
+     * Vendor-optional (PBS) — zero-initialized for other vendors.
+     *
+     * tls_fingerprint: SHA-256 fingerprint of the server's leaf
+     * certificate, colon-separated or bare hex. For the PBS driver this
+     * is the server's identity and is MANDATORY: pbs_connect() refuses
+     * without it, and that driver has no insecure/skip-verify mode to
+     * fall back to. Not a `verify_tls`-style boolean on purpose — a
+     * boolean can be set to false, a fingerprint can only be right.
+     *
+     * datastore_allow: comma-separated datastore names accepted for
+     * op=backup.snapshots.list. The typed-op grammar constrains the
+     * SHAPE of a parameter; this constrains its VALUE to what the
+     * operator enumerated for this device.
+     */
+    char            tls_fingerprint[128];
+    char            datastore_allow[256];
 } virp_device_t;
 
 /* =========================================================================
