@@ -259,6 +259,38 @@ A new typed-op driver is not done until it has:
 - **Method impossibility:** assert the predicate rejects every value but
   GET, and that every table row is GET.
 
+## 9a. Source layout (decision on record, 2026-07-31)
+
+**Driver sources live in `src/drivers/`.** `driver_pbs.c` was placed there
+because that is where nine of the ten existing drivers already live — it
+is neither a new convention nor an accident, it is the existing majority.
+`src/driver_panos.c` is the lone outlier and is left where it is; moving
+it is a rename with no functional payoff and real churn against a driver
+nobody was touching tonight.
+
+Guards were audited against both locations at the time of this decision:
+
+| guard | how it scans | covers both? |
+|---|---|---|
+| `lint-sprintf`, `lint-rand`, `lint-memcmp` | `grep -rn … src/` (recursive) | yes |
+| `check-pbs-pin` | explicit path to the PBS sources | n/a (PBS only) |
+| `check-shared-readpath` | explicit four-file list, already naming both `src/drivers/*.c` and `src/driver_panos.c` | yes |
+| driver object rules | one explicit rule per source file | yes |
+| `asan-drivers` | test targets → `$(LIB)` → `LIB_OBJS` | location-independent |
+
+Two caveats worth knowing rather than rediscovering:
+
+- `check-shared-readpath` is a **hand-maintained list**, not a glob. It
+  covers both layouts today, but a new SSH driver in either location would
+  be silently unguarded. Same staleness class as the deploy-unit list that
+  missed six autopilot units on 2026-07-31 — worth converting to a glob
+  over `src/drivers/driver_*.c src/driver_*.c` when someone next touches
+  an SSH driver.
+- A new driver still needs an explicit `$(BUILD_DIR)/driver_X.o` rule.
+  There is no pattern rule, so a driver added without one fails to link
+  rather than being silently omitted — a fine failure mode, just not an
+  automatic one.
+
 ## 10. Checklist for the next REST driver
 
 - [ ] Command is a typed-op encoding, not a path or a CLI
