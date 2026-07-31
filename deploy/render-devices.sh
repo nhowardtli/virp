@@ -76,7 +76,15 @@ if "${VIRP_EVIDENCE_UID}" in text:
 
 for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             "WAZUH_USER", "WAZUH_PASS",
-            "LIBRENMS_TOKEN", "PEER_USER", "PEER_PASS"):
+            "LIBRENMS_TOKEN", "PEER_USER", "PEER_PASS",
+            # PBS: the token SECRET is the only true credential here, but
+            # the token id, host, certificate fingerprint and datastore
+            # allowlist are required the same way. A missing FINGERPRINT
+            # must fail the render rather than render a device the driver
+            # will then refuse — the operator should learn about it at
+            # deploy time, not from a connect failure.
+            "PBS_HOST", "PBS_TOKENID", "PBS_TOKEN",
+            "PBS_FINGERPRINT", "PBS_DATASTORES"):
     placeholder = "${%s}" % var
     if placeholder not in text:
         continue

@@ -62,6 +62,20 @@
       "api_port": 80,
       "api_token": "${LIBRENMS_TOKEN}",
       "node_id": "0A000A0C"
+    },
+    {
+      "_comment": "Proxmox Backup Server — typed-operation driver. The command a caller submits is NOT an API path: it is a canonical typed operation, `pbs op=<operation.id> [key=value ...]`, and the driver derives method and URL from a static table. See docs/DRIVER-TYPED-OPS.md.",
+      "_tls_note": "tls_fingerprint is the SHA-256 fingerprint of the PBS leaf certificate and is MANDATORY: the driver refuses to connect without it and the daemon refuses to LOAD this device without it. There is deliberately no verify_tls boolean here and no insecure mode in the driver — a boolean has a value meaning 'do not check', a fingerprint does not. Rotating the PBS certificate is therefore a config change here; that is the intended cost.",
+      "_datastore_note": "datastore_allow is the exact set of datastore names accepted for op=backup.snapshots.list. The grammar constrains the SHAPE of the store parameter; this constrains its VALUE. The gate hook receives no device context, so this check lives in the driver — see the shape-vs-value split in tests/test_driver_pbs_gate.c.",
+      "hostname": "pbs-lab",
+      "host": "${PBS_HOST}",
+      "vendor": "pbs",
+      "port": 8007,
+      "api_port": 8007,
+      "username": "${PBS_TOKENID}",
+      "api_token": "${PBS_TOKEN}",
+      "tls_fingerprint": "${PBS_FINGERPRINT}",
+      "datastore_allow": "${PBS_DATASTORES}"
     }
   ]
 }

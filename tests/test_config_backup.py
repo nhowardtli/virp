@@ -409,8 +409,19 @@ class TestDeployPolicy(unittest.TestCase):
         # grant lives on the daemon unit's ExecStartPost drop-in.
         self.assertNotIn("config-backup-access.sh", unit)
         dropin = self.read("deploy", "virp-onode-runbook.dropin.conf")
-        self.assertIn("ExecStartPost=+/opt/virp/deploy/config-backup-access.sh",
-                      dropin)
+        self.assertIn(
+            "ExecStartPost=+/usr/local/lib/virp/config-backup-access.sh",
+            dropin)
+        # The grant script must be an INSTALLED artifact, never a file in a
+        # source worktree (2026-07-31). This drop-in previously executed
+        # /opt/virp/deploy/config-backup-access.sh — a path inside a live
+        # git checkout — so editing the tree changed what ran on the next
+        # daemon restart. Asserted as an invariant rather than as a second
+        # literal so it keeps holding if the install prefix ever moves.
+        for exec_line in [ln for ln in dropin.splitlines()
+                          if ln.startswith("Exec")]:
+            for worktree in ("/opt/virp", "/root/", "/home/", "/build/"):
+                self.assertNotIn(worktree, exec_line)
 
     def test_timer_is_hourly(self):
         self.assertIn("OnCalendar=hourly",
@@ -430,6 +441,67 @@ class TestDeployPolicy(unittest.TestCase):
         sh = self.read("deploy", "render-devices.sh")
         self.assertIn('pwd.getpwnam("virp-backup")', sh)
         self.assertIn("VIRP_BACKUP_UID", sh)
+
+    def test_pbs_device_pins_its_certificate(self):
+        """The PBS entry must carry tls_fingerprint and no verify_tls knob.
+
+        The PBS driver has no insecure mode; a template entry that omitted
+        the pin would be refused at load, so catching it here turns a
+        failed daemon start into a failed test.
+        """
+        cfg = json.loads(self.read("deploy", "devices.template.json"))
+        pbs = [d for d in cfg["devices"] if d.get("vendor") == "pbs"]
+        self.assertEqual(len(pbs), 1, "expected exactly one PBS device")
+        entry = pbs[0]
+        self.assertEqual(entry["tls_fingerprint"], "${PBS_FINGERPRINT}")
+        self.assertEqual(entry["api_token"], "${PBS_TOKEN}")
+        self.assertEqual(entry["username"], "${PBS_TOKENID}")
+        self.assertIn("datastore_allow", entry)
+        # A boolean has a value meaning "do not check"; a fingerprint does
+        # not. verify_tls must never appear on a PBS device.
+        self.assertNotIn("verify_tls", entry)
+        # No secret may be baked into the tracked template.
+        for key in ("api_token", "tls_fingerprint", "username"):
+            self.assertTrue(entry[key].startswith("${"),
+                            f"{key} must be a render placeholder")
+
+    def test_render_script_requires_every_pbs_placeholder(self):
+        """A missing PBS value must fail the render, not the connect.
+
+        render-devices.sh treats an unsubstituted placeholder as fatal, so
+        every PBS placeholder used by the template has to be in its
+        required-variable list — otherwise a missing fingerprint would
+        surface as a puzzling auth failure hours later.
+        """
+        sh = self.read("deploy", "render-devices.sh")
+        tmpl = self.read("deploy", "devices.template.json")
+        for var in ("PBS_HOST", "PBS_TOKENID", "PBS_TOKEN",
+                    "PBS_FINGERPRINT", "PBS_DATASTORES"):
+            self.assertIn("${%s}" % var, tmpl)
+            self.assertIn('"%s"' % var, sh)
+
+    def test_no_unit_executes_from_a_source_worktree(self):
+        """Deployment must be an act, not a side effect of a restart.
+
+        Every Exec* line in every shipped unit has to name an installed
+        artifact. Until 2026-07-31 the daemon unit ran
+        /opt/virp/build/virp-onode-prod and /opt/virp/deploy/*.sh, so any
+        `make` in the checkout armed the next restart to ship it.
+        """
+        units = ("virp-onode.service",
+                 "virp-onode-runbook.dropin.conf",
+                 "virp-onode-evidence.dropin.conf",
+                 "virp-config-backup.service",
+                 "virp-evidence.service")
+        for unit in units:
+            text = self.read("deploy", unit)
+            for line in text.splitlines():
+                if not line.startswith("Exec"):
+                    continue
+                for worktree in ("/opt/virp", "/root/", "/home/", "/build/"):
+                    self.assertNotIn(
+                        worktree, line,
+                        f"{unit}: {line!r} executes from a source worktree")
 
     def test_access_script_grants_traversal_not_read(self):
         sh = self.read("deploy", "config-backup-access.sh")

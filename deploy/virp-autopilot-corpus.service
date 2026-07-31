@@ -19,6 +19,6 @@ Type=oneshot
 # only when the daemon exposes a verify action.
 User=virp
 Group=virp
-ExecStart=/usr/bin/python3 /opt/virp/autopilot/virp_autopilot.py corpus
+ExecStart=/usr/bin/python3 /usr/local/lib/virp/autopilot/virp_autopilot.py corpus
 NoNewPrivileges=yes
 PrivateTmp=yes

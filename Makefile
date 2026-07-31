@@ -556,7 +556,7 @@ test-librenms: $(TEST_LIBRENMS)
 
 # PBS typed-operation driver tests (requires PBS=1). Entirely offline:
 # the grammar parser, op table, URL derivation, fingerprint parsing and
-# device precheck are all pure functions, so this suite never originates
+# gate classifier are all pure functions, so this suite never originates
 # outbound contact and needs no live fence.
 TEST_PBS = $(BUILD_DIR)/test_driver_pbs
 
@@ -761,6 +761,110 @@ check-socket-path:
 # battery. Approval mode refuses to start without a chain (see
 # onode_setup_chain_and_approvals in src/virp_onode_prod.c), so the
 # shipped unit MUST pass -c <chain.db> and -C <chain.key>.
+# =========================================================================
+# Deployment
+#
+# The installed artifacts live OUTSIDE any source worktree. This is the
+# whole point: with ExecStart pointing into a git checkout, `make` in
+# that checkout was a deployment, and Restart=always meant the next
+# restart shipped it. Now a restart re-runs exactly what install-prod
+# last put here, and installing is a deliberate act that refuses on a
+# dirty tree.
+# =========================================================================
+VIRP_INSTALL_DIR ?= /usr/local/lib/virp
+VIRP_INSTALL_BIN  = $(VIRP_INSTALL_DIR)/virp-onode-prod
+
+# Scripts the unit executes. These are as load-bearing as the binary —
+# an edit to render-devices.sh in a worktree would change daemon
+# behaviour on the next restart just as surely as a rebuilt binary.
+VIRP_INSTALL_SCRIPTS = deploy/render-devices.sh \
+                       deploy/config-backup-access.sh \
+                       deploy/evidence-access.sh
+
+# The timer-driven automations (autopilot cycle/comparator/chainwalk/
+# corpus, config-backup, evidence) run these Python modules. They had the
+# SAME defect as the daemon binary and it was missed at first: their units
+# executed /opt/virp/autopilot/*.py, so an edit in the checkout changed
+# what the next hourly timer ran. autopilot/ is self-contained — each
+# entry point does sys.path.insert(0, dirname(__file__)) and imports only
+# virp_autopilot — so installing the directory wholesale is sufficient.
+VIRP_INSTALL_PY_DIR = $(VIRP_INSTALL_DIR)/autopilot
+VIRP_INSTALL_PY     = autopilot/virp_autopilot.py \
+                      autopilot/virp_config_backup.py \
+                      autopilot/virp_evidence.py
+
+.PHONY: install-prod
+install-prod: prod
+	@test -f $(ONODE_PROD) || { echo "FAIL: $(ONODE_PROD) was not built"; exit 1; }
+	@st=$$(git status --porcelain 2>/dev/null); \
+	 if [ -n "$$st" ]; then \
+	     echo "FAIL: refusing to install from a dirty tree — what gets deployed"; \
+	     echo "      must be exactly what a commit hash names:"; \
+	     echo "$$st"; \
+	     exit 1; \
+	 fi
+	@echo "=== installing to $(VIRP_INSTALL_DIR) (outside any worktree) ==="
+	install -d -m 0755 $(VIRP_INSTALL_DIR)
+	install -m 0755 $(ONODE_PROD) $(VIRP_INSTALL_BIN)
+	install -m 0755 $(VIRP_INSTALL_SCRIPTS) $(VIRP_INSTALL_DIR)/
+	install -d -m 0755 $(VIRP_INSTALL_PY_DIR)
+	install -m 0644 $(VIRP_INSTALL_PY) $(VIRP_INSTALL_PY_DIR)/
+	@echo
+	@$(MAKE) --no-print-directory deploy-record
+
+# The DEPLOYED.md stanza, generated rather than hand-written so it cannot
+# drift from what is actually installed. Refuses on a dirty tree for the
+# same reason install-prod does.
+.PHONY: deploy-record
+deploy-record:
+	@test -f $(VIRP_INSTALL_BIN) || \
+	    { echo "FAIL: $(VIRP_INSTALL_BIN) is not installed"; exit 1; }
+	@st=$$(git status --porcelain 2>/dev/null); \
+	 if [ -n "$$st" ]; then echo "FAIL: tree is dirty:"; echo "$$st"; exit 1; fi
+	@echo "- **Commit**: \`$$(git rev-parse HEAD)\`"
+	@echo "- **Branch**: \`$$(git rev-parse --abbrev-ref HEAD)\`"
+	@echo "- **Tree at install**: clean (\`git status --porcelain\` empty)"
+	@echo "- **Installed binary**: \`$(VIRP_INSTALL_BIN)\`"
+	@echo "- **sha256**: \`$$(sha256sum $(VIRP_INSTALL_BIN) | awk '{print $$1}')\`"
+	@for s in $(VIRP_INSTALL_SCRIPTS); do \
+	    b=$$(basename $$s); \
+	    echo "- **sha256** \`$(VIRP_INSTALL_DIR)/$$b\`: \`$$(sha256sum $(VIRP_INSTALL_DIR)/$$b | awk '{print $$1}')\`"; \
+	 done
+	@for s in $(VIRP_INSTALL_PY); do \
+	    b=$$(basename $$s); \
+	    echo "- **sha256** \`$(VIRP_INSTALL_PY_DIR)/$$b\`: \`$$(sha256sum $(VIRP_INSTALL_PY_DIR)/$$b | awk '{print $$1}')\`"; \
+	 done
+
+# Lint: the PBS driver must have NO way to weaken its certificate pin.
+#
+# Scoped deliberately to the PBS sources. driver_wazuh.c does carry a
+# VIRP_WAZUH_INSECURE escape hatch for the lab manager's self-signed cert;
+# that is pre-existing, documented in the unit file, and out of scope
+# here — it is not silently blessed by this target's narrower reach.
+#
+# The word "insecure" is NOT banned: this driver's comments say, at
+# length, that it has no insecure mode, and a lint that forbade saying so
+# would be a lint against documentation. What is banned is the machinery
+# an escape hatch would need.
+.PHONY: check-pbs-pin
+check-pbs-pin:
+	@echo "=== checking the PBS driver has no TLS escape hatch ==="
+	@if grep -nE 'CURLOPT_SSL_VERIFY(PEER|HOST)[[:space:]]*,[[:space:]]*0L?' \
+	        src/drivers/driver_pbs.c; then \
+	    echo "FAIL: PBS driver disables curl TLS verification"; exit 1; fi
+	@if grep -n 'getenv' src/drivers/driver_pbs.c include/virp_driver_pbs.h; then \
+	    echo "FAIL: the PBS driver reads an environment variable — no env var"; \
+	    echo "      may exist that could weaken or bypass the certificate pin"; \
+	    exit 1; fi
+	@grep -q 'CURLOPT_SSL_VERIFYPEER, 1L' src/drivers/driver_pbs.c || \
+	    { echo "FAIL: PBS driver does not enable CURLOPT_SSL_VERIFYPEER"; exit 1; }
+	@grep -q 'SSL_CTX_set_cert_verify_callback' src/drivers/driver_pbs.c || \
+	    { echo "FAIL: PBS driver has no pin verification callback"; exit 1; }
+	@grep -q 'CURLOPT_FOLLOWLOCATION, 0L' src/drivers/driver_pbs.c || \
+	    { echo "FAIL: PBS driver may follow redirects — a redirect is a URL"; \
+	      echo "      the operation table did not derive"; exit 1; }
+	@echo "  PASS: pin is mandatory, no env var, no redirect following"
+
 .PHONY: check-deploy-unit
 check-deploy-unit:
 	@echo "=== checking deploy/virp-onode.service for chain flags ==="
@@ -769,6 +873,39 @@ check-deploy-unit:
 	@grep -Eq '^[[:space:]]*-C[[:space:]]+[^[:space:]]' deploy/virp-onode.service || \
 	    { echo "FAIL: deploy/virp-onode.service is missing '-C <chain.key>' — approval mode will refuse to start"; exit 1; }
 	@echo "  PASS: chain flags present in deploy/virp-onode.service"
+	@echo "=== checking no unit executes a path inside a source worktree ==="
+	@units=$$(ls deploy/*.service deploy/*.dropin.conf 2>/dev/null); \
+	 bad=0; \
+	 for u in $$units; do \
+	     [ -f "$$u" ] || continue; \
+	     if grep -E '^Exec(Start|StartPre|StartPost|Stop|Reload)=' "$$u" | \
+	        grep -Eq '(/opt/virp|/root/|/home/|/build/|virp-dev)'; then \
+	         echo "FAIL: $$u executes a path inside a source worktree —"; \
+	         echo "      a restart would then deploy whatever the tree happens to hold."; \
+	         grep -nE '^Exec(Start|StartPre|StartPost|Stop|Reload)=' "$$u" | \
+	             grep -E '(/opt/virp|/root/|/home/|/build/|virp-dev)'; \
+	         bad=1; \
+	     fi; \
+	 done; \
+	 [ $$bad -eq 0 ] || exit 1
+	@echo "  PASS: every Exec* path is an installed artifact"
+	@echo "=== checking no unit rebuilds anything at start ==="
+	@units=$$(ls deploy/*.service deploy/*.dropin.conf 2>/dev/null); \
+	 bad=0; \
+	 for u in $$units; do \
+	     [ -f "$$u" ] || continue; \
+	     if grep -E '^Exec[A-Za-z]*=' "$$u" | \
+	        grep -Eq '(^|[^a-zA-Z])(make|gcc|cc|cargo|go build)([^a-zA-Z]|$$)'; then \
+	         echo "FAIL: $$u builds at unit start — the CT 211 hazard."; \
+	         bad=1; \
+	     fi; \
+	 done; \
+	 [ $$bad -eq 0 ] || exit 1
+	@echo "  PASS: no unit rebuilds from source at start"
+	@echo "=== checking ExecStart matches the documented install path ==="
+	@grep -Eq '^ExecStart=$(VIRP_INSTALL_BIN)([[:space:]]|\\\\|$$)' deploy/virp-onode.service || \
+	    { echo "FAIL: ExecStart is not $(VIRP_INSTALL_BIN)"; exit 1; }
+	@echo "  PASS: ExecStart=$(VIRP_INSTALL_BIN)"
 
 # Lint: fail build if sprintf( appears in src/ (use snprintf instead)
 .PHONY: lint-sprintf
@@ -905,4 +1042,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11

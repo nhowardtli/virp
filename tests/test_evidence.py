@@ -1040,8 +1040,15 @@ class TestDeployPolicy(unittest.TestCase):
         # grant lives on the daemon unit's ExecStartPost drop-in.
         self.assertNotIn("evidence-access.sh", unit)
         dropin = self.read("deploy", "virp-onode-evidence.dropin.conf")
-        self.assertIn("ExecStartPost=+/opt/virp/deploy/evidence-access.sh",
+        self.assertIn("ExecStartPost=+/usr/local/lib/virp/evidence-access.sh",
                       dropin)
+        # The grant script must be an INSTALLED artifact, never a file in a
+        # source worktree (2026-07-31) — see the matching assertion in
+        # tests/test_config_backup.py for why.
+        for exec_line in [ln for ln in dropin.splitlines()
+                          if ln.startswith("Exec")]:
+            for worktree in ("/opt/virp", "/root/", "/home/", "/build/"):
+                self.assertNotIn(worktree, exec_line)
 
     def test_timer_defaults_daily_and_documents_the_override(self):
         timer = self.read("deploy", "virp-evidence.timer")

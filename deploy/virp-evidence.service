@@ -22,7 +22,7 @@ UMask=0077
 # ExecStartPost (deploy/virp-onode-evidence.dropin.conf): the grants must
 # track socket creation, and this unit's sandbox deliberately cannot
 # reach /var/lib/virp to grant itself anything.
-ExecStart=/usr/bin/python3 /opt/virp/autopilot/virp_evidence.py run
+ExecStart=/usr/bin/python3 /usr/local/lib/virp/autopilot/virp_evidence.py run
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
