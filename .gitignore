@@ -17,3 +17,4 @@ on
 on.dump*
 devices-r35.json
 implementations/go/virp-onode-go
+build-asan-drivers/
