@@ -828,6 +828,24 @@ static int chain_register_observation(const char *sock_path,
         fprintf(stderr, "chain-register: out of memory\n");
         return 1;
     }
+    /*
+     * NANOSECOND artifact id. This was time(NULL) — seconds — and that
+     * collided: `artifacts` has UNIQUE(artifact_id), so two observations
+     * for one device inside the same second share an id and only the
+     * first content row survives. The chain entry for the second read
+     * then references an artifact_hash whose stored content is a
+     * DIFFERENT observation, i.e. an entry that cannot be verified
+     * against its own artifact. Caught live on 2026-07-31 running four
+     * PBS reads back to back (~200 ms apart).
+     *
+     * autopilot/virp_autopilot.py has always used time.time_ns(); this
+     * is the CLI path catching up, so the two agree.
+     */
+    struct timespec now_ts;
+    clock_gettime(CLOCK_REALTIME, &now_ts);
+    unsigned long long now_ns = (unsigned long long)now_ts.tv_sec * 1000000000ULL
+                              + (unsigned long long)now_ts.tv_nsec;
+
     int jl = snprintf(json, json_max,
                       "{\"action\":\"chain_append\","
                       "\"session_id\":\"virp-cli:%s\","
@@ -835,8 +853,7 @@ static int chain_register_observation(const char *sock_path,
                       "\"artifact_id\":\"obs:%s:%llu\","
                       "\"artifact_hash\":\"%s\","
                       "\"artifact_content\":\"base64:%s\"}",
-                      device, device,
-                      (unsigned long long)time(NULL), hash_hex, b64);
+                      device, device, now_ns, hash_hex, b64);
     free(b64);
     if (jl < 0 || (size_t)jl >= json_max) {
         free(json);
