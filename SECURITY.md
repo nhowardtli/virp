@@ -315,14 +315,24 @@ session) is the intended answer for genuinely session-bound config
 transactions. Not designed yet. Until it exists, session-bound config
 work is out of scope for VIRP.
 
-**linux and wazuh have no classifier.** Neither driver registers a
+**wazuh has no classifier.** The Wazuh driver registers no
 `route_command` hook, so `gate_classify` returns UNCLASSIFIED for every
-command they receive. Under ENFORCE that blocks; under the **SHADOW
-overrides both run with in production**, SHADOW logs and proceeds — so
-every linux and wazuh command executes unclassified today. The layer-1
-separator boundary still applies (it is driver-agnostic), which matters
-most for linux, the one driver where `|` and `;` genuinely chain
-commands. Nothing else about their commands is tiered.
+command it receives. Under ENFORCE that blocks; under a SHADOW override
+it logs and proceeds. The layer-1 separator boundary still applies (it is
+driver-agnostic). Nothing else about its commands is tiered.
+
+> **Corrected 2026-07-31.** This paragraph previously read "linux and
+> wazuh have no classifier" and stated that every linux command executes
+> unclassified under a SHADOW override. That has been false since
+> `b5aab66` (2026-07-29), which added the linux driver's FRR/vtysh
+> classifier and `route_reason` hook; the `linux=shadow` override was
+> removed the same day and the deployed node has run
+> `gate_default_mode=enforce` for the linux driver since. The claim was
+> left standing in this document for two days. Recorded rather than
+> silently edited, because a stale *reassurance* in a security document
+> is worse than a stale fact — a reader who acted on it would have
+> believed the fleet was less protected than it was, and the same rot in
+> the other direction is the dangerous case.
 
 **REST-shaped drivers need their own command grammar.** The separator set
 is a CLI grammar. Wazuh's "command" is a URL path, where `&` is a
@@ -332,6 +342,66 @@ applying the CLI set verbatim would refuse ordinary endpoints like
 grammar (path + allowed query parameters) rather than the CLI set. This
 is why `WZ_ROUTE_TABLE` is not wired to a `route_command` hook despite
 now defaulting to RED.
+
+**The PBS driver answers that paragraph differently, and better.** Rather
+than giving a REST driver a grammar for *paths*, `driver_pbs.c` removes
+the path from the command entirely: the command is a canonical typed
+operation (`pbs op=<id> [k=v ...]`), and method and URL are derived inside
+the driver from a static table. There is no vendor syntax left to parse,
+so the CLI separator set applies unchanged and every structural URL byte
+(`/ ? # % : @`) is simply outside the value charset. This is the pattern
+future REST drivers must follow — see `docs/DRIVER-TYPED-OPS.md`.
+
+## PBS Observations — Explicit Scope Limits
+
+The PBS driver is the first non-network domain through the gate. What its
+signed observations do and do not establish:
+
+**A signed `backup.verify.tasks` observation proves that PBS *reported*
+those verification results at that time. It does not prove that any backup
+is restorable, and it does not prove that PBS itself is uncompromised.**
+
+Spelled out, because this is the claim most likely to be over-read by
+someone holding a chain entry that says "verify: OK":
+
+- **It is PBS's word, signed.** VIRP attests that the O-Node read these
+  bytes from the pinned host at that moment and that they have not been
+  altered since. The *truthfulness* of the content is PBS's, not VIRP's. A
+  compromised or buggy PBS that reports successful verifications produces
+  observations that are perfectly valid and completely wrong.
+- **A verify task result is not a restore test.** PBS verification reads
+  chunks and checks digests. It does not exercise the restore path, the
+  target hypervisor, or whether the restored guest boots. No observation
+  in this driver — none, at any tier — evidences recoverability. Only an
+  actual restore does, and VIRP does not perform one.
+- **`backup.datastore.usage` is capacity, not retention correctness.** It
+  says how full a datastore is, not whether the right things are in it,
+  nor whether retention pruning removed something that was needed.
+- **`backup.snapshots.list` is an inventory of what PBS believes it holds.**
+  Absence of a snapshot is evidence; presence is a claim about metadata.
+- **Scope is the four enumerated reads on the allowlisted datastores.** No
+  write operation exists at any tier. Nothing in this driver can start,
+  stop, prune, or repair anything, so an operator reading a PBS chain must
+  not infer that VIRP would have *acted* on a bad result.
+
+**What the certificate pin does and does not cover.** The pin is an exact
+SHA-256 match on the leaf certificate. It does not build a chain and does
+not verify the hostname; it verifies that the peer is the recorded
+certificate. For a single pinned host that is stronger than chain plus
+hostname validation — a mis-issued certificate for the right name from any
+trusted CA fails — but it means certificate rotation on the PBS side
+breaks collection until `tls_fingerprint` is updated in `devices.json`.
+That is a deliberate trade, and the failure mode is refusal, not silent
+fallback: the driver has no insecure mode, enforced by
+`make check-pbs-pin`.
+
+**The gate sees shape, not values.** `route_command(const char *)` receives
+no device context, so the classifier cannot consult the per-device
+datastore allowlist. A well-formed request naming a non-allowlisted
+datastore classifies GREEN and is then refused by the driver before any
+request is issued. Fail-closed still holds, and the refusal is still
+pre-network — but a reader of gate decisions alone should not conclude
+that GREEN meant the datastore was permitted.
 
 ## Verifier Limitations
 
