@@ -125,6 +125,7 @@ FRR_NODES = ["clab-frr-ospf-frr1", "clab-frr-ospf-frr2",
              "clab-frr-ospf-frr3", "clab-frr-ospf-frr4"]
 WAZUH_DEV    = "wazuh-lab"
 LIBRENMS_DEV = "librenms-lab"
+PBS_DEV      = "pbs-lab"
 
 # ── Per-node identity / topology ───────────────────────────────────────
 # /etc/virp/autopilot-node.json lets one client serve both nodes:
@@ -173,6 +174,27 @@ def build_battery(cfg):
             (LIBRENMS_DEV, "GET /api/v0/alerts?state=1",   "librenms_alerts"),
         ]
     )
+    # PBS typed operations. The command is a canonical typed op, not a
+    # path — see docs/DRIVER-TYPED-OPS.md. The datastore name comes from
+    # node config rather than a literal, because it is also constrained
+    # by the per-device allowlist in devices.json and the two must agree.
+    # Gated on config exactly like peer_device: a node without a PBS
+    # device must not probe one. node2 has no PBS entry in its devices
+    # template, and an ungated row there would alert every cycle.
+    pbs_dev = cfg.get("pbs_device")
+    if pbs_dev:
+        battery += [
+            (pbs_dev, "pbs op=backup.version.read",    "pbs_version"),
+            (pbs_dev, "pbs op=backup.datastore.usage", "pbs_datastore_usage"),
+            (pbs_dev, "pbs op=backup.verify.tasks",    "pbs_verify_tasks"),
+        ]
+        pbs_store = cfg.get("pbs_datastore")
+        if pbs_store:
+            battery += [
+                (pbs_dev, "pbs op=backup.snapshots.list store=%s" % pbs_store,
+                 "pbs_snapshots"),
+            ]
+
     peer = cfg.get("peer_device")
     if peer:
         battery += [
@@ -226,6 +248,47 @@ CORPUS = [
     (WAZUH_DEV,    "GET /agents/summary/status", "green", None),
     (LIBRENMS_DEV, "GET /api/v0/system", "rejected", None),
     (LIBRENMS_DEV, "GET /api/v0/devices", "green", None),
+    # ── PBS typed operations: one row per REFUSAL CLASS ────────────────
+    # The unit suites cover these offline; these rows assert the same
+    # refusals survive all the way to the live gate, with their teaching
+    # reasons intact. Ordered as in the grammar doc.
+    #   unknown op / no write op exists at any tier
+    (PBS_DEV, "pbs op=backup.verify.run", "rejected", "RED by absence"),
+    (PBS_DEV, "pbs op=backup.snapshots.delete store=colo-backups", "rejected",
+     "RED by absence"),
+    #   prefix creep, both directions
+    (PBS_DEV, "pbs op=backup.version.readX", "rejected", "unknown operation id"),
+    (PBS_DEV, "pbs op=backup.version.rea", "rejected", "unknown operation id"),
+    #   separator policy — refused at the daemon boundary, before the driver
+    (PBS_DEV, "pbs op=backup.version.read; rm -rf /", "separator",
+     "illegal separator"),
+    (PBS_DEV, "pbs op=backup.version.read | cat /etc/shadow", "separator",
+     "illegal separator"),
+    #   value charset: path traversal, query smuggling, URL fragment
+    (PBS_DEV, "pbs op=backup.snapshots.list store=../../etc/passwd",
+     "rejected", "illegal byte"),
+    (PBS_DEV, "pbs op=backup.snapshots.list store=colo-backups?typefilter=all",
+     "rejected", "illegal byte"),
+    (PBS_DEV, "pbs op=backup.snapshots.list store=colo-backups#frag",
+     "rejected", "illegal byte"),
+    #   canonical-form violations
+    (PBS_DEV, "pbs op=backup.snapshots.list store=a store=b", "rejected",
+     "duplicate parameter"),
+    (PBS_DEV, "pbs op=backup.snapshots.list abc=1 store=colo-backups",
+     "rejected", "ascending key order"),
+    (PBS_DEV, "pbs op=backup.version.read store=colo-backups", "rejected",
+     "not declared for this operation"),
+    (PBS_DEV, "pbs op=backup.snapshots.list", "rejected",
+     "required parameter missing"),
+    (PBS_DEV, "pbs op=BACKUP.VERSION.READ", "rejected", None),
+    (PBS_DEV, "pbs  op=backup.version.read", "rejected", None),
+    (PBS_DEV, "pbs op=backup.verify.tasks typefilter=all", "rejected",
+     "not declared for this operation"),
+    #   op-in-param smuggling
+    (PBS_DEV, "pbs op=backup.version.read op=backup.verify.run", "rejected",
+     "duplicate parameter"),
+    #   GREEN control — the cheapest of the four, harmless to replay
+    (PBS_DEV, "pbs op=backup.version.read", "green", None),
 ]
 
 # ── O-Node socket client ───────────────────────────────────────────────

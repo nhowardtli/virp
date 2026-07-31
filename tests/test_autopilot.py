@@ -214,9 +214,12 @@ class TestPolicyInvariants(unittest.TestCase):
         librenms_green = {"/api/v0/devices", "/api/v0/alerts"}
         peer_green = {ap.PEER_CMD_LIVENESS, ap.PEER_CMD_CHAIN_HEAD,
                       ap.PEER_CMD_PUBLISHED}
+        pbs_green_ops = {"backup.version.read", "backup.datastore.usage",
+                         "backup.snapshots.list", "backup.verify.tasks"}
         shapes = [
             {"node": "virp-lab", "frr_nodes": list(ap.FRR_NODES),
-             "peer_device": "virp-node2-peer"},
+             "peer_device": "virp-node2-peer",
+             "pbs_device": ap.PBS_DEV, "pbs_datastore": "colo-backups"},
             {"node": "virp-node2", "frr_nodes": [],
              "peer_device": "virp-lab-peer"},
             {"node": "solo", "frr_nodes": [], "peer_device": None},
@@ -233,6 +236,14 @@ class TestPolicyInvariants(unittest.TestCase):
                     self.assertIn(command, peer_green,
                                   "peer probes must be exact GREEN rows: %s"
                                   % command)
+                elif device == cfg.get("pbs_device"):
+                    # PBS commands are canonical typed operations, not
+                    # paths: `pbs op=<id> [k=v ...]`. Assert the op id is
+                    # one of the four v1 rows rather than pattern-matching
+                    # a URL, which is the whole point of the encoding.
+                    self.assertTrue(command.startswith("pbs op="), command)
+                    op = command.split("op=", 1)[1].split(" ")[0]
+                    self.assertIn(op, pbs_green_ops, command)
                 else:
                     self.assertTrue(command.startswith('vtysh -c "show '),
                                     "FRR battery must be vtysh show reads: %s"
@@ -398,6 +409,52 @@ class TestNodeConfig(unittest.TestCase):
         self.assertNotIn("peer_liveness", kinds)
         self.assertNotIn("frr_neighbors", kinds)
         self.assertIn("wazuh_summary", kinds)
+
+    def test_pbs_rows_are_config_gated(self):
+        """A node without a PBS device must not probe one.
+
+        node2's devices template has no PBS entry, so an ungated row
+        would alert every cycle. Same gating as peer_device.
+        """
+        no_pbs = ap.build_battery({"node": "virp-node2", "frr_nodes": [],
+                                   "peer_device": None})
+        self.assertEqual([k for _, _, k in no_pbs if k.startswith("pbs_")], [])
+
+        with_pbs = ap.build_battery({"node": "virp-lab", "frr_nodes": [],
+                                     "peer_device": None,
+                                     "pbs_device": ap.PBS_DEV,
+                                     "pbs_datastore": "colo-backups"})
+        self.assertEqual([k for _, _, k in with_pbs if k.startswith("pbs_")],
+                         ["pbs_version", "pbs_datastore_usage",
+                          "pbs_verify_tasks", "pbs_snapshots"])
+
+        # No datastore configured -> the snapshots row is omitted rather
+        # than improvised with a guessed store name.
+        no_store = ap.build_battery({"node": "virp-lab", "frr_nodes": [],
+                                     "peer_device": None,
+                                     "pbs_device": ap.PBS_DEV})
+        self.assertNotIn("pbs_snapshots", [k for _, _, k in no_store])
+
+    def test_pbs_corpus_covers_every_refusal_class(self):
+        """Each PBS refusal class must be replayed against the LIVE gate."""
+        pbs_rows = [r for r in ap.CORPUS if r[0] == ap.PBS_DEV]
+        cmds = [c for _, c, _, _ in pbs_rows]
+        # unknown op / no write op at any tier
+        self.assertIn("pbs op=backup.verify.run", cmds)
+        # separator policy (refused at the daemon boundary)
+        self.assertTrue(any(e == "separator" for _, _, e, _ in pbs_rows))
+        # value charset: traversal, query smuggling, fragment
+        self.assertTrue(any("../.." in c for c in cmds))
+        self.assertTrue(any("?" in c for c in cmds))
+        self.assertTrue(any("#" in c for c in cmds))
+        # canonical form: duplicate, unsorted, undeclared, missing, case
+        self.assertTrue(any("store=a store=b" in c for c in cmds))
+        self.assertTrue(any("abc=1 store=" in c for c in cmds))
+        self.assertIn("pbs op=backup.version.read store=colo-backups", cmds)
+        self.assertIn("pbs op=backup.snapshots.list", cmds)
+        self.assertIn("pbs op=BACKUP.VERSION.READ", cmds)
+        # and exactly one GREEN control
+        self.assertEqual(sum(1 for _, _, e, _ in pbs_rows if e == "green"), 1)
 
     def test_node2_shape_battery(self):
         b = ap.build_battery({"node": "virp-node2", "frr_nodes": [],
