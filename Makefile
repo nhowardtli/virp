@@ -15,7 +15,12 @@ CFLAGS += -I./include -I./src/third_party $(CFLAGS_EXTRA)
 # header change forces every dependent object to recompile — this is what
 # prevents the stale-object / struct-ABI-mismatch class of bug.
 CFLAGS += -MMD -MP
-LDFLAGS = -lcrypto -lpthread -lsqlite3 -lsodium
+# LDFLAGS_EXTRA mirrors CFLAGS_EXTRA above. Use it — never override
+# LDFLAGS on the command line: a command-line assignment beats the `+=`
+# in the driver ifdef blocks below, so the driver libraries (-lcurl,
+# -lssl, -lssh2) silently vanish and the link fails on every driver
+# symbol at once.
+LDFLAGS = -lcrypto -lpthread -lsqlite3 -lsodium $(LDFLAGS_EXTRA)
 
 BUILD_DIR = build
 
@@ -965,6 +970,25 @@ asan-test:
 	./$(TEST_SSH_IO) 2>&1
 	./$(TEST_FG_SCRUB) 2>&1
 	@echo "=== ASan+UBSan test run complete ==="
+
+# Driver suites under ASan+UBSan. Separate from asan-test because the
+# driver objects need their -D guards, which are evaluated at Makefile
+# parse time and so require a recursive $(MAKE) with the flags set.
+#
+# The PBS suites are the reason this exists: the typed-op parser is a
+# hand-written byte-level state machine over attacker-supplied input,
+# which is precisely the shape that needs a sanitizer rather than a
+# passing assertion count.
+.PHONY: asan-drivers
+asan-drivers:
+	rm -rf build-asan-drivers
+	$(MAKE) BUILD_DIR=build-asan-drivers CC=gcc \
+	        CFLAGS_EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+	        LDFLAGS_EXTRA="-fsanitize=address,undefined" \
+	        CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 \
+	        LIBRENMS=1 PBS=1 \
+	        test-pbs test-pbs-gate test-linux-gate test-cisco-gate
+	@echo "=== ASan+UBSan driver run complete ==="
 
 # libFuzzer harness (requires clang)
 FUZZ_LIBFUZZER = $(BUILD_DIR)/fuzz_libfuzzer
