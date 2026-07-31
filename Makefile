@@ -566,6 +566,14 @@ $(TEST_PBS): tests/test_driver_pbs.c $(LIB)
 test-pbs: $(TEST_PBS)
 	./$(TEST_PBS)
 
+TEST_PBS_GATE = $(BUILD_DIR)/test_driver_pbs_gate
+
+$(TEST_PBS_GATE): tests/test_driver_pbs_gate.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-pbs-gate: $(TEST_PBS_GATE)
+	./$(TEST_PBS_GATE)
+
 # Autopilot client unit tests (pure-python: baselines, corpus table,
 # RBAC empty-result handling — no daemon, no devices)
 test-autopilot:
@@ -674,9 +682,10 @@ DRIVER_BUILD_DIR = build-drivers
 
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs) ==="
+	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate) ==="
 	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 \
-	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms test-pbs
+	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms \
+	        test-pbs test-pbs-gate
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.
 #
