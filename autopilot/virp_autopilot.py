@@ -256,8 +256,14 @@ CORPUS = [
     (PBS_DEV, "pbs op=backup.verify.run", "rejected", "RED by absence"),
     (PBS_DEV, "pbs op=backup.snapshots.delete store=colo-backups", "rejected",
      "RED by absence"),
-    #   prefix creep, both directions
-    (PBS_DEV, "pbs op=backup.version.readX", "rejected", "unknown operation id"),
+    #   prefix creep, both directions. NOTE the two reasons differ and
+    #   that distinction is deliberate: an UPPERCASE suffix fails the op-id
+    #   CHARSET check (lowercase only) before the table is ever consulted,
+    #   while a lowercase suffix is well-formed and fails the TABLE lookup.
+    #   Asserting the precise reason keeps the two layers distinguishable —
+    #   the live replay caught this expectation being wrong on 2026-07-31.
+    (PBS_DEV, "pbs op=backup.version.readX", "rejected", "illegal byte"),
+    (PBS_DEV, "pbs op=backup.version.readx", "rejected", "unknown operation id"),
     (PBS_DEV, "pbs op=backup.version.rea", "rejected", "unknown operation id"),
     #   separator policy — refused at the daemon boundary, before the driver
     (PBS_DEV, "pbs op=backup.version.read; rm -rf /", "separator",
