@@ -347,3 +347,142 @@ Honest gaps recorded, not papered over:
     "% Unknown command" render as a satisfied control.
 
 Docs: docs/RUNBOOK-EVIDENCE.md.
+
+## Update 2026-07-31 — PBS typed-operation driver + deploy-path fix
+
+First non-network domain through the gate, and the reference implementation of
+typed operations (`docs/DRIVER-TYPED-OPS.md`).
+
+- **Commit**: `aafd61064f069027feeb7901b7cdb641c34eb8ed`
+  (branch `feature/driver-pbs-typed-2026-07-31`)
+- **Tree at install**: clean — `make install-prod` REFUSES a dirty tree, so
+  what is deployed is exactly what a commit hash names.
+- **Installed binary**: `/usr/local/lib/virp/virp-onode-prod`
+  sha256 `ce0bb73a918d14c3d532cdbb101f4efdf69a8ba45ee5c9262b1bb4b1f6af9374`
+- Installed scripts (sha256):
+  - `render-devices.sh` `dd67a55b96fce325505ec738e3f9ba6adc07064fd13247dded59eca57a1b5f0e`
+  - `config-backup-access.sh` `358aa3aa978a0f220636c444336141f65d62f57136653f0e020fd370219fe022`
+  - `evidence-access.sh` `bcf299794a84b63b0b14b3e9c98dab2009912b8d2fa180493f33834e28a67219`
+  - `autopilot/virp_autopilot.py` `d465d377565d704cff5db466cabbe9047f4a0532ae7b687aab1467d19afa1e34`
+  - `autopilot/virp_config_backup.py` `6dfc726d5ee0fa9b2b34a16ba31584be5ba5668d2a6277101aeffa3ef183c7b1`
+  - `autopilot/virp_evidence.py` `f6deaf33eb1e020d523c9bc90658ec9fc952e585029da4ebfa8729453572528c`
+
+**Snapshots confirmed by operator: VM 211 `pre-pbs-2026-07-31`, VM 212
+(virp-node2) `pre-pbs-2026-07-31`, 2026-07-31.** Taken before the deploy; the
+deploy was gated on this attestation because this session has no pve1 access
+by design (same exclusion as the autopilot).
+
+### Deployment is now an act, not a side effect of a restart
+
+Every path the units executed used to live inside the live `/opt/virp`
+checkout — the binary (`/opt/virp/build/virp-onode-prod`), all three deploy
+scripts, and the autopilot Python. Any `make` or file edit in the worktree
+armed the next restart, and `Restart=always` meant a crash or reboot shipped
+it. It had already drifted: the installed binary was built from `75b135f`
+while the worktree was twelve commits ahead at `9444ff0` (benign only by luck
+— no `.c`/`.h` file differed).
+
+Everything now runs from `/usr/local/lib/virp`, outside any worktree.
+`make check-deploy-unit` fails if any shipped unit executes a path under
+`/opt/virp`, `/root`, `/home` or a `build/` directory, if any `Exec*` line
+invokes make/gcc/cc, or if `ExecStart` is not the documented install path. It
+globs `deploy/*.service` and `deploy/*.dropin.conf` rather than a
+hand-maintained list — the list-based first attempt missed six autopilot
+units, which is how the wider fix was found.
+
+Verified live after deploy: a full `make` inside `/opt/virp` left the running
+daemon untouched (same PID, same start time, same binary sha256).
+
+### PBS device
+
+`pbs-lab` = 10.0.20.199:8007, vendor `pbs`, token `virp-ro@pbs!virp`,
+datastore allowlist `colo-backups`. PBS 3.4 (release 8).
+
+TLS identity is PINNED to the leaf certificate's SHA-256 fingerprint
+(`0E:5A:25:…:F1:E7`), mandatory: the driver refuses to connect without one and
+the daemon refuses to LOAD the device without one. There is no insecure mode —
+`make check-pbs-pin` fails the build if the driver disables curl verification,
+reads any environment variable, drops the verify callback, or follows
+redirects.
+
+**Pinning does not subsume hostname verification.** libcurl performs the name
+check separately from the certificate-verify callback, so a *correct* pin
+failed live with `CURLcode=60 … no alternative certificate subject name
+matches target host name '10.0.20.199'` — the PBS self-signed certificate
+covers `localhost`, `pbs`, `pbs.thirdlevelit.local`, not the management IP.
+The fix is `tls_servername` + `CURLOPT_RESOLVE`, so hostname verification
+stays ON and genuinely passes, NOT a lowered `VERIFYHOST`. Certificate
+rotation on the PBS side is therefore a config change here.
+
+PBS-side ACL required BOTH grants, because token privilege separation makes
+effective rights the intersection of user and token ACLs:
+
+    proxmox-backup-manager acl update /datastore/colo-backups DatastoreAudit --auth-id 'virp-ro@pbs!virp'
+    proxmox-backup-manager acl update /datastore/colo-backups DatastoreAudit --auth-id 'virp-ro@pbs'
+
+### Live verification (2026-07-31)
+
+- `make clean && make all-tests`: **exit 0 on virp-lab AND virp-node2**.
+  New suites: `test-pbs` 88/88, `test-pbs-gate` 74/74. Both clean under
+  ASan+UBSan (`make asan-drivers`).
+- Devices: **7/7 loaded** (was 6/6); all six pre-existing connects unchanged;
+  `[Watchdog] Connected: pbs-lab` added. 12 drivers registered.
+- Autopilot cycle: the four PBS reads all `[OK] tier=GREEN verified=VALID`.
+  Alert profile per cycle is UNCHANGED from before the deploy (5 alerts, all
+  pre-existing: the peer device is absent from `devices.json`, and
+  `wazuh_active` is 4 vs a baseline of 5). No new alert kinds; zero PBS alerts.
+- Adversarial corpus: **33 cases, 0 mismatches**, including one row per PBS
+  refusal class replayed against the LIVE gate.
+- Hard exclusions still FATAL: a config naming `10.0.10.1` makes the daemon
+  exit 1 with `contains hard-excluded address … refusing to load`; the real
+  config still loads 7/7.
+- Token grep sweep: **0 hits** in the journal, `chain.db`, `/usr/local/lib/virp`,
+  `/opt/virp`, `/root/virp-dev`, `/etc/virp/devices.template.json`,
+  `/var/lib/virp`, `/home/nhoward`, `/tmp`. The only copy is
+  `/run/virp/devices.json` (0640 root:virp, tmpfs) — by design, the render target.
+
+### Chain-registered proofs
+
+Session `virp-cli:pbs-lab`, all `signature=VALID`:
+
+| seq | artifact_id | artifact sha256 (head) | what |
+|---|---|---|---|
+| 3 | `obs:pbs-lab:1785539354086878860` | `91934e649ea109b1` | GREEN `backup.version.read` → HTTP 200 |
+| 4 | `obs:pbs-lab:1785539354289969384` | `3242b06585040d26` | GREEN `backup.verify.tasks` → HTTP 200 |
+| 5 | `obs:pbs-lab:1785539354323436161` | `d2569bee5ca72db2` | **RED** `backup.verify.run` → `obs_type=0x0f`, gate blocked, nothing executed |
+
+The RED proof's payload carries the teaching reason in full ("unknown operation
+id — the PBS operation table is closed and RED by absence; no write operation
+exists at any tier in v1…") and files a proposal, so the refusal stays
+approvable through propose/approve/apply.
+
+### OPEN: two of the four reads cannot be chain-registered
+
+`backup.datastore.usage` (27,841 bytes) and `backup.snapshots.list` exceed the
+daemon's **8192-byte artifact limit**. The client REFUSES to register them
+rather than store a truncated, unverifiable artifact, and says so loudly:
+
+    chain-register: observation is 27841 bytes; its base64 body (37131)
+    exceeds the daemon's 8192-byte artifact limit and would be stored
+    truncated (unverifiable). Not registered.
+
+That refusal is correct — but it means two of the four v1 PBS operations
+produce signed, verified GREEN observations that are NOT in the chain. In the
+autopilot cycle they show `chain=-` and do NOT alert, which is quiet. The
+evidence collector's pattern (store the artifact out of band, chain-register
+its path + sha256) is the likely answer. Not designed yet.
+
+### Superseded chain entries (recorded, not rewritten)
+
+`virp-cli:pbs-lab` seq 0 and seq 1 share `artifact_id obs:pbs-lab:1785538992`.
+`virp-tool` built CLI artifact ids from `time(NULL)` — SECONDS — while
+`artifacts` has `UNIQUE(artifact_id)`, so two observations for one device
+inside the same second collided and only one content row survived. seq 0
+records `artifact_hash 5f109f05…` while the stored content under that id is
+seq 1's observation (`1b5550cb…`): an entry that can never be verified against
+its own artifact. Found by running four PBS reads ~200 ms apart.
+
+Fixed in `74f0550` (nanosecond ids, matching what `virp_autopilot.py` always
+did). The two bad entries are LEFT IN PLACE — the chain is append-only and
+rewriting it to hide a defect would be worse than the defect. Proofs above are
+the post-fix entries (seq 3–5).
