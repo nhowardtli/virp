@@ -279,6 +279,53 @@ Field notes:
   (`ONODE_BLOCKED_ADDRS` in `src/virp_onode.c`); a config naming a blocked
   address is refused and the daemon does not start.
 
+## 8b. Observation size vs. the chain artifact limit — OPEN
+
+REST bodies are large, and that collides with the chain's artifact limit
+in a way CLI-shaped drivers never hit.
+
+The daemon caps a chain artifact at **8192 bytes**. Two of the four v1 PBS
+operations exceed it comfortably:
+
+| operation | observation size | chain-registered? |
+|---|---|---|
+| `backup.version.read` | ~200 B | yes |
+| `backup.verify.tasks` | ~400 B | yes |
+| `backup.datastore.usage` | **27,841 B** | **no** |
+| `backup.snapshots.list` | **>8 KB** | **no** |
+
+The client REFUSES to register an oversized observation rather than store
+it truncated:
+
+```
+chain-register: observation is 27841 bytes; its base64 body (37131)
+exceeds the daemon's 8192-byte artifact limit and would be stored
+truncated (unverifiable). Not registered.
+```
+
+**That refusal is correct and must not be "fixed" by truncating.** A
+truncated artifact is an artifact whose hash cannot be recomputed from
+the stored bytes — evidence that looks like evidence and isn't. Refusing
+is the right failure.
+
+But the consequence is real and currently unaddressed: two of the four
+operations produce **signed, signature-VALID, GREEN observations that are
+not in the chain at all**. In an autopilot cycle they report `chain=-`
+and do not alert, which is quieter than it should be.
+
+**The intended pattern** — already proven by the compliance-evidence
+collector (`docs/RUNBOOK-EVIDENCE.md`) — is to store the artifact **out of
+band** and chain-register a small record carrying the artifact's **path
+and sha256** instead of its bytes. The chain then commits to the content
+without holding it, and verification recomputes the hash from the stored
+file.
+
+**Status: OPEN.** Not designed for the driver path yet. Until it is, a
+typed-op driver whose responses can exceed 8 KB should expect partial
+chain coverage, and should say so where an operator will see it rather
+than leaving a bare `chain=-`. New REST drivers must size their
+observations against this limit *before* claiming chain coverage.
+
 ## 9. Testing obligations
 
 A new typed-op driver is not done until it has:
