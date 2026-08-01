@@ -134,8 +134,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.DEPS }} python3
       - name: Build shared library
         run: make shared && make all
-      - name: Run Python suites
+      # These two load build/libvirp.so directly and need nothing else.
+      - name: C/Python parity and bridge verification
         run: |
           python3 tests/test_hmac_parity.py
-          python3 tests/test_parse_message_bounds.py
           python3 tests/test_bridge_verify.py
+      # test_parse_message_bounds imports api/server.py, which pulls in
+      # FastAPI. Install it explicitly rather than letting the suite be
+      # skipped silently.
+      - name: Install API dependencies
+        run: python3 -m pip install --quiet fastapi
+      - name: API message-bounds suite
+        run: python3 tests/test_parse_message_bounds.py
