@@ -19,13 +19,32 @@ Group=virp
 # state under StateDirectory so systemd creates+chowns it for us.
 StateDirectory=virp
 StateDirectoryMode=0750
+# ---------------------------------------------------------------------
+# EVERY PATH THIS UNIT EXECUTES IS AN INSTALLED ARTIFACT UNDER
+# /usr/local/lib/virp — NEVER A FILE IN A SOURCE WORKTREE.
+#
+# This unit previously ran /opt/virp/build/virp-onode-prod and
+# /opt/virp/deploy/*.sh, i.e. files inside a live git checkout. That made
+# DEPLOYMENT AN ACCIDENT WAITING FOR A RESTART: any `make` in /opt/virp
+# rewrote the binary in place, any edit to a deploy script changed daemon
+# behaviour, and with Restart=always the next crash, reboot or
+# `systemctl restart` silently shipped whatever happened to be there. The
+# worktree had in fact already drifted 12 commits ahead of the running
+# binary before anyone noticed.
+#
+# Deploying is now a deliberate act — `make install-prod`, which refuses
+# on a dirty tree — and a restart ships exactly what was last installed.
+# `make check-deploy-unit` fails if any Exec* line points back into a
+# source tree, so this cannot regress quietly.
+# ---------------------------------------------------------------------
+
 # Device config is RENDERED at start: credentials live only in
 # /etc/virp/autopilot.env (0600 root) and are substituted into the
 # no-secrets template /etc/virp/devices.template.json, landing on the
 # /run tmpfs as 0640 root:virp. The `+` prefix runs the render as root
 # outside the sandbox; the daemon itself only reads the result. The
 # render script never echoes credential values.
-ExecStartPre=+/opt/virp/deploy/render-devices.sh
+ExecStartPre=+/usr/local/lib/virp/render-devices.sh
 
 # Wazuh manager (10.0.20.10) presents a self-signed cert on the lab
 # management VLAN — TLS verification is disabled for that driver ONLY.
@@ -39,7 +58,7 @@ Environment=VIRP_WAZUH_INSECURE=1
 #   head -c 32 /dev/urandom > /etc/virp/keys/chain.key
 #   chown virp:virp /etc/virp/keys/chain.key && chmod 0600 /etc/virp/keys/chain.key
 # `make check-deploy-unit` fails if these flags are removed.
-ExecStart=/opt/virp/build/virp-onode-prod \
+ExecStart=/usr/local/lib/virp/virp-onode-prod \
     -k /etc/virp/keys/onode.key \
     -s /run/virp/onode.sock \
     -d /run/virp/devices.json \

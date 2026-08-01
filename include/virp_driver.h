@@ -38,6 +38,7 @@ typedef enum {
     VIRP_VENDOR_WAZUH       = 9,
     VIRP_VENDOR_CISCO_IOSXE = 10,  /* Cisco IOS-XE (Catalyst/ISR-XE); shares the cisco driver + gate core */
     VIRP_VENDOR_LIBRENMS    = 11,  /* LibreNMS REST API (token auth) */
+    VIRP_VENDOR_PBS         = 12,  /* Proxmox Backup Server (typed ops, pinned TLS) */
     VIRP_VENDOR_MOCK        = 99,   /* Testing only */
 } virp_vendor_t;
 
@@ -90,6 +91,40 @@ typedef struct {
     char            vdom[64];           /* VDOM name (default "root") */
     bool            verify_tls;         /* Verify TLS cert on REST calls */
     bool            ssh_legacy;         /* Force legacy SSH ciphers (group14-sha1, ssh-rsa, aes256-cbc) */
+    /*
+     * Vendor-optional (PBS) — zero-initialized for other vendors.
+     *
+     * tls_fingerprint: SHA-256 fingerprint of the server's leaf
+     * certificate, colon-separated or bare hex. For the PBS driver this
+     * is the server's identity and is MANDATORY: pbs_connect() refuses
+     * without it, and that driver has no insecure/skip-verify mode to
+     * fall back to. Not a `verify_tls`-style boolean on purpose — a
+     * boolean can be set to false, a fingerprint can only be right.
+     *
+     * datastore_allow: comma-separated datastore names accepted for
+     * op=backup.snapshots.list. The typed-op grammar constrains the
+     * SHAPE of a parameter; this constrains its VALUE to what the
+     * operator enumerated for this device.
+     */
+    char            tls_fingerprint[128];
+    char            datastore_allow[256];
+    /*
+     * tls_servername: the name the server's certificate is issued for,
+     * when that differs from `host`.
+     *
+     * Needed because certificate pinning does NOT subsume hostname
+     * verification in libcurl. curl performs the name check separately
+     * from the certificate-verify callback, so a correct pin still fails
+     * with "no alternative certificate subject name matches target host
+     * name" when `host` is an IP the certificate does not cover — which
+     * is the normal case for a self-signed PBS certificate.
+     *
+     * When set, the driver connects to `host` but presents/validates
+     * this name (SNI + CURLOPT_RESOLVE). Hostname verification stays ON
+     * and genuinely passes, rather than being switched off to work
+     * around the mismatch. Empty = use `host` unchanged.
+     */
+    char            tls_servername[256];
 } virp_device_t;
 
 /* =========================================================================
@@ -183,6 +218,27 @@ typedef struct virp_driver {
      * returned pointer must remain valid forever (string literal).
      */
     const char *(*route_reason)(const char *command);
+
+    /*
+     * typed_profile — OPTIONAL. Non-NULL declares that this driver's
+     * commands are a TYPED-OPERATION PROFILE (see
+     * docs/DRIVER-TYPED-OPS.md), not a CLI string, and selects the
+     * exact-octet command hash instead of the generic canonicalizing
+     * one.
+     *
+     * Why this is a driver DECLARATION and not a property sniffed from
+     * the command text: sniffing would make the hash algorithm depend on
+     * attacker-influenced bytes, so a crafted command could choose which
+     * hash it is bound under. The driver owns the answer, statically.
+     *
+     * The value is the profile identifier bound into the hash; change it
+     * only alongside a protocol version bump, because it changes every
+     * command hash this driver produces.
+     *
+     * Drivers whose commands ARE CLI strings leave this NULL (designated
+     * initializers zero-fill it) and keep the historic behaviour.
+     */
+    const char *typed_profile;
 
 } virp_driver_t;
 

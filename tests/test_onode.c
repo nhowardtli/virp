@@ -619,6 +619,7 @@ TEST(test_execute_v2_session_bound_roundtrip)
     uint32_t payload_len = 0;
     virp_error_t err = virp_verify_observation_v2(
         g_state.ctx, r6_id, "show ip route",
+        NULL,
         resp, (size_t)n, 0, &store, &hdr, &payload, &payload_len);
     ASSERT_OK(err);
     ASSERT_EQ(hdr.version, VIRP_VERSION_2);
@@ -631,6 +632,7 @@ TEST(test_execute_v2_session_bound_roundtrip)
     /* 5 — REPLAY: the identical bytes must be rejected */
     err = virp_verify_observation_v2(
         g_state.ctx, r6_id, "show ip route",
+        NULL,
         resp, (size_t)n, 0, &store, NULL, NULL, NULL);
     ASSERT_EQ(err, VIRP_ERR_REPLAY_DETECTED);
 
@@ -640,12 +642,14 @@ TEST(test_execute_v2_session_bound_roundtrip)
     ASSERT_OK(virp_seqstore_init(&store2, NULL));
     err = virp_verify_observation_v2(
         g_state.ctx, r6_id, "show running-config",
+        NULL,
         resp, (size_t)n, 0, &store2, NULL, NULL, NULL);
     ASSERT_EQ(err, VIRP_ERR_CONTEXT_MISMATCH);
 
     /* 7 — DEVICE SUBSTITUTION: same bytes, wrong expected device */
     err = virp_verify_observation_v2(
         g_state.ctx, virp_device_id_from_hostname("R7"), "show ip route",
+        NULL,
         resp, (size_t)n, 0, &store2, NULL, NULL, NULL);
     ASSERT_EQ(err, VIRP_ERR_CONTEXT_MISMATCH);
 
@@ -1027,11 +1031,13 @@ TEST(test_batch_execute_v2_honors_obs_version)
 
     ASSERT_OK(virp_verify_observation_v2(g_state.ctx,
         virp_device_id_from_hostname("R5"), "show version",
+        NULL,
         resp[0], resp_len[0], 0, &store, &hdr, NULL, NULL));
     ASSERT_EQ(hdr.version, VIRP_VERSION_2);
 
     ASSERT_OK(virp_verify_observation_v2(g_state.ctx,
         virp_device_id_from_hostname("R6"), "show ip route",
+        NULL,
         resp[1], resp_len[1], 0, &store, &hdr, NULL, NULL));
     ASSERT_EQ(hdr.version, VIRP_VERSION_2);
 
@@ -2682,6 +2688,135 @@ TEST(test_gate_obs_tier_honesty)
 }
 
 /* =========================================================================
+ * Audit §4.1 — sign_intent / sign_outcome must not be a signing oracle
+ *
+ * Both handlers exist to witness a digest the caller already computed,
+ * and both documented a "64 hex chars" contract that nothing enforced.
+ * req.command is char[1024], so a caller could obtain an
+ * O-Key-authenticated GREEN observation over up to 1023 bytes of its own
+ * text — i.e. forge something that reads as an observation. That defeats
+ * the protocol's central claim, so these tests drive the REAL handlers
+ * over the socket rather than only unit-testing the predicate.
+ *
+ * A rejection is a framed 4-byte error code; an acceptance is a full
+ * signed observation. The two are trivially distinguishable by length,
+ * and the tests assert the specific error code as well.
+ * ========================================================================= */
+
+extern bool onode_is_sha256_hex(const char *s);
+
+/* Build {"action": "<act>", "command": "<payload>"} and send it. */
+static ssize_t sign_request(const char *action, const char *payload,
+                            uint8_t *resp, size_t resp_cap)
+{
+    char json[1400];
+    snprintf(json, sizeof(json),
+             "{\"action\": \"%s\", \"command\": \"%s\"}", action, payload);
+    return client_request(json, resp, resp_cap);
+}
+
+/* Decode a framed 4-byte error payload. */
+static int32_t resp_error_code(const uint8_t *resp)
+{
+    uint32_t net;
+    memcpy(&net, resp, 4);
+    return (int32_t)ntohl(net);
+}
+
+TEST(test_sign_intent_predicate)
+{
+    char valid[65];
+    memset(valid, 'a', 64); valid[64] = '\0';
+
+    ASSERT_TRUE(onode_is_sha256_hex(valid));
+    ASSERT_TRUE(onode_is_sha256_hex(
+        "0123456789abcdefABCDEF0123456789abcdefABCDEF0123456789abcdef0123"));
+
+    ASSERT_TRUE(!onode_is_sha256_hex(NULL));
+    ASSERT_TRUE(!onode_is_sha256_hex(""));
+    /* 63 and 65 chars — length must be exact, not a minimum. */
+    char short_hex[64]; memset(short_hex, 'a', 63); short_hex[63] = '\0';
+    ASSERT_TRUE(!onode_is_sha256_hex(short_hex));
+    char long_hex[66]; memset(long_hex, 'a', 65); long_hex[65] = '\0';
+    ASSERT_TRUE(!onode_is_sha256_hex(long_hex));
+    /* Right length, wrong alphabet — including a trailing non-hex byte,
+     * which a strspn-without-length check would happily accept. */
+    char sneaky[65]; memset(sneaky, 'a', 64); sneaky[63] = 'z'; sneaky[64] = '\0';
+    ASSERT_TRUE(!onode_is_sha256_hex(sneaky));
+    ASSERT_TRUE(!onode_is_sha256_hex(
+        "not-a-digest-but-exactly-sixty-four-characters-long-padded!!!!!!!"));
+}
+
+TEST(test_sign_intent_rejects_oversized)
+{
+    /* The oracle in its clearest form: attacker-authored prose. */
+    char payload[600];
+    memset(payload, 'A', sizeof(payload) - 1);
+    payload[sizeof(payload) - 1] = '\0';
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = sign_request("sign_intent", payload, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);                                  /* error, not an observation */
+    ASSERT_EQ(resp_error_code(resp), VIRP_ERR_INVALID_LENGTH);
+}
+
+TEST(test_sign_intent_rejects_non_hex)
+{
+    /* Exactly 64 chars so only the alphabet check can catch it. */
+    const char *payload =
+        "The quick brown fox jumps over the lazy dog and then some more!!";
+    ASSERT_EQ((int)strlen(payload), 64);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = sign_request("sign_intent", payload, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(resp_error_code(resp), VIRP_ERR_INVALID_LENGTH);
+}
+
+TEST(test_sign_intent_accepts_valid_digest)
+{
+    const char *digest =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = sign_request("sign_intent", digest, resp, sizeof(resp));
+
+    /* Still a real, valid, signed observation — the fix must not break
+     * the legitimate path. */
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(resp, (size_t)n, &g_state.okey, &hdr));
+}
+
+TEST(test_sign_outcome_rejects_oversized)
+{
+    char payload[600];
+    memset(payload, 'B', sizeof(payload) - 1);
+    payload[sizeof(payload) - 1] = '\0';
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = sign_request("sign_outcome", payload, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(resp_error_code(resp), VIRP_ERR_INVALID_LENGTH);
+}
+
+TEST(test_sign_outcome_accepts_valid_digest)
+{
+    const char *digest =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = sign_request("sign_outcome", digest, resp, sizeof(resp));
+
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(resp, (size_t)n, &g_state.okey, &hdr));
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -2821,6 +2956,14 @@ int main(void)
     printf("\n[SO_PEERCRED Allowlist Tests]\n");
     RUN_TEST(test_peer_uid_allowed);
     RUN_TEST(test_peer_uid_rejected);
+
+    printf("\n  -- Audit §4.1: sign_intent/sign_outcome signing oracle --\n");
+    RUN_TEST(test_sign_intent_predicate);
+    RUN_TEST(test_sign_intent_rejects_oversized);
+    RUN_TEST(test_sign_intent_rejects_non_hex);
+    RUN_TEST(test_sign_intent_accepts_valid_digest);
+    RUN_TEST(test_sign_outcome_rejects_oversized);
+    RUN_TEST(test_sign_outcome_accepts_valid_digest);
 
     /* Shutdown */
     onode_shutdown(&g_state);

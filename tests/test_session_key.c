@@ -152,6 +152,7 @@ static void test_sign_without_derivation_fails(void)
         ctx,
         0x01, 0x02, VIRP_TIER_GREEN, 1,
         "show ip route",
+        NULL,
         payload, sizeof(payload) - 1,
         &hdr, sig);
     assert(err == VIRP_ERR_SESSION_INVALID);

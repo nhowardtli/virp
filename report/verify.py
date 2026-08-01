@@ -490,17 +490,27 @@ def verify_entry(entry, artifact_content, okey, chain_key, expected_prev):
     return v
 
 
-def verify_chain(entries, artifacts, okey=None, chain_key=None):
+def verify_chain(entries, artifacts, okey=None, chain_key=None,
+                 heads=None, selection_complete=False):
     """Verify a list of chain entries (dicts) in session/sequence order.
 
     `artifacts` maps artifact_id -> artifact_content (or is missing the key).
+
+    `heads` maps session_id -> head row dict (last_sequence,
+    last_entry_hash, head_hmac) from the chain_heads table, or is None when
+    the table was absent (pre-2026-08-01 database) or not loaded. The head
+    record is the SIGNED commitment to chain length: without it, link
+    continuity proves only that the rows present are consistent, not that
+    the tail was retained — deleting the last K entries of a session leaves
+    every per-entry check passing.
 
     Link continuity is evaluated per session. Where the selected range does
     not start at sequence 0, the first entry of that session has no in-range
     predecessor and its link is UNCHECKED rather than assumed good — a
     filtered report must not claim continuity it did not observe.
 
-    Returns (verifications, summary dict).
+    Returns (verifications, summary dict). summary["heads"] holds the
+    per-session head verdicts and their tally.
     """
     by_session = {}
     for e in entries:
@@ -533,8 +543,139 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None):
             prev_hash = e["chain_entry_hash"]
             prev_seq = e["sequence"]
 
+    head_results = verify_heads(by_session, heads, chain_key,
+                                selection_complete)
+
     summary = summarize(verifications)
+    summary["heads"] = head_results
     return verifications, summary
+
+
+# Canonical form for the head HMAC — must match src/virp_chain.c
+# head_canonical() BYTE FOR BYTE (alphabetical keys, compact separators,
+# no escaping, version-tagged), for the same reason canonical_json above
+# reproduces the C producer exactly.
+def head_canonical(session_id, last_sequence, last_entry_hash):
+    return ('{"last_entry_hash":"%s",'
+            '"last_sequence":%d,'
+            '"session_id":"%s",'
+            '"v":"VIRP-CHAIN-HEAD-v1"}'
+            % (last_entry_hash, last_sequence, session_id))
+
+
+def verify_heads(by_session, heads, chain_key, selection_complete=False):
+    """Check each selected session against its signed head record.
+
+    Verdicts per session:
+
+      FAIL       head missing while the table exists (tail-plus-head
+                 deletion is exactly the attack the record exists to catch);
+                 or visible entries extend BEYOND the head (a head can never
+                 lag — it commits in the same transaction as every append);
+                 or the head names the visible final entry but the hash or
+                 HMAC does not match.
+      UNCHECKED  the selection ends before the head's committed tail AND
+                 selection_complete is False (a time-filtered report
+                 legitimately excludes the tail; the unselected remainder is
+                 simply not verified HERE — with selection_complete=True the
+                 same condition is a FAIL: truncation); or the structural
+                 checks pass but no chain key was provided to authenticate
+                 the head itself.
+      UNVERIFIABLE  heads is None: pre-2026-08-01 database or export
+                 without a chain_heads table. Chain LENGTH is then not
+                 authenticated by anything — the honest structural verdict.
+      PASS       head authenticated, and the selection's final entry is
+                 exactly the one the head commits to.
+
+    Returns {"per_session": {sid: (verdict, detail)}, "tally": {...}}.
+    """
+    per_session = {}
+    for sid in sorted(by_session):
+        rows = sorted(by_session[sid], key=lambda r: r["sequence"])
+        max_seq = rows[-1]["sequence"]
+        max_hash = rows[-1]["chain_entry_hash"]
+
+        if heads is None:
+            per_session[sid] = (
+                UNVERIFIABLE,
+                "no chain_heads table (pre-2026-08-01 database): chain "
+                "length is not authenticated; tail deletion would be "
+                "undetectable")
+            continue
+
+        head = heads.get(sid)
+        if head is None:
+            per_session[sid] = (
+                FAIL,
+                "no head record for a session with entries; chain length "
+                "cannot be authenticated (consistent with tail+head "
+                "deletion)")
+            continue
+
+        h_seq = int(head["last_sequence"])
+        h_hash = head["last_entry_hash"]
+        h_mac = head["head_hmac"]
+
+        if max_seq > h_seq:
+            per_session[sid] = (
+                FAIL,
+                "entries visible beyond the head (head=%d, visible=%d); "
+                "the head updates transactionally with every append and "
+                "can never lag" % (h_seq, max_seq))
+            continue
+
+        if max_seq < h_seq:
+            # Whether this is damning depends on what the caller selected.
+            # selection_complete=True asserts the caller loaded the WHOLE
+            # session, so an entry the head commits to but the selection
+            # lacks is a truncation. With a time-filtered selection the
+            # missing tail may simply be outside the window — UNCHECKED,
+            # because a filtered report must not cry wolf about a healthy
+            # chain (same principle as the link-continuity UNCHECKED).
+            if selection_complete:
+                per_session[sid] = (
+                    FAIL,
+                    "chain truncated: head commits to sequence %d but the "
+                    "session ends at %d" % (h_seq, max_seq))
+            else:
+                per_session[sid] = (
+                    UNCHECKED,
+                    "selection ends at %d; head commits to %d — the tail "
+                    "beyond this selection is not verified here (rerun "
+                    "unfiltered to verify the whole session)"
+                    % (max_seq, h_seq))
+            continue
+
+        # max_seq == h_seq: the head names our final entry
+        if max_hash != h_hash:
+            per_session[sid] = (
+                FAIL,
+                "head last_entry_hash %s does not match final entry %s"
+                % (h_hash[:16], max_hash[:16]))
+            continue
+
+        if chain_key is None:
+            per_session[sid] = (
+                UNCHECKED,
+                "head structurally consistent but unauthenticated: no "
+                "chain key available to verify head_hmac")
+            continue
+
+        canonical = head_canonical(sid, h_seq, h_hash)
+        mac = hmac.new(chain_key, canonical.encode(),
+                       hashlib.sha256).hexdigest()
+        if hmac.compare_digest(mac, h_mac):
+            per_session[sid] = (PASS, None)
+        else:
+            per_session[sid] = (
+                FAIL,
+                "head_hmac mismatch: recomputed %s, stored %s"
+                % (mac[:16], h_mac[:16]))
+
+    tally = {PASS: 0, FAIL: 0, UNCHECKED: 0, UNVERIFIABLE: 0}
+    for verdict, _ in per_session.values():
+        tally[verdict] += 1
+    return {"per_session": per_session, "tally": tally}
 
 
 def _tally(verifications, attr):

@@ -111,6 +111,7 @@ virp_error_t virp_approval_propose(const char *dir,
                                    const char *device,
                                    uint32_t device_node_id,
                                    const char *command,
+                                   const char *typed_profile,
                                    const char *proposer,
                                    const char *tier_name,
                                    virp_proposal_rec_t *out);
@@ -217,6 +218,7 @@ virp_error_t virp_approval_verify_consume(const char *dir,
                                           const char *device,
                                           uint32_t device_node_id,
                                           const char *command,
+                                          const char *typed_profile,
                                           uint64_t now_ns,
                                           virp_approval_rec_t *out);
 

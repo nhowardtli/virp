@@ -54,8 +54,44 @@ if "${VIRP_UID}" in text:
     import pwd
     os.environ.setdefault("VIRP_UID", str(pwd.getpwnam("virp").pw_uid))
 
-for var in ("VIRP_UID", "WAZUH_USER", "WAZUH_PASS", "LIBRENMS_TOKEN",
-            "PEER_USER", "PEER_PASS"):
+# VIRP_BACKUP_UID is the config-backup runbook's dedicated identity
+# (virp-lab only — the node2 template does not name it). Resolved the
+# same way as VIRP_UID; if the template names it, the user MUST exist,
+# so a missing account fails the render (and the daemon start) loudly
+# instead of silently shipping an allowlist that rejects the runbook.
+if "${VIRP_BACKUP_UID}" in text:
+    import pwd
+    os.environ.setdefault("VIRP_BACKUP_UID",
+                          str(pwd.getpwnam("virp-backup").pw_uid))
+
+# VIRP_EVIDENCE_UID is the compliance-evidence collector's dedicated
+# identity (virp-lab only). Resolved exactly like VIRP_BACKUP_UID: if the
+# template names it the user MUST exist, so a missing account fails the
+# render (and the daemon start) loudly instead of silently shipping an
+# allowlist that rejects the collector.
+if "${VIRP_EVIDENCE_UID}" in text:
+    import pwd
+    os.environ.setdefault("VIRP_EVIDENCE_UID",
+                          str(pwd.getpwnam("virp-evidence").pw_uid))
+
+for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
+            "WAZUH_USER", "WAZUH_PASS",
+            "LIBRENMS_TOKEN", "PEER_USER", "PEER_PASS",
+            # PBS: the token SECRET is the only true credential here, but
+            # the token id, host, certificate fingerprint and datastore
+            # allowlist are required the same way. A missing FINGERPRINT
+            # must fail the render rather than render a device the driver
+            # will then refuse — the operator should learn about it at
+            # deploy time, not from a connect failure.
+            "PBS_HOST", "PBS_TOKENID", "PBS_TOKEN",
+            "PBS_FINGERPRINT", "PBS_DATASTORES", "PBS_SERVERNAME",
+            # cat3850-lab (10.0.10.2): the physical switch authenticates
+            # with a password and the driver has no key-auth path, so the
+            # credential must reach the rendered devices.json. It is NOT
+            # inlined in the tracked template, which is world-readable
+            # (0644) — unlike the throwaway "frrlab" lab passwords above
+            # it, this is a real operator account on physical hardware.
+            "SWITCH_PASS"):
     placeholder = "${%s}" % var
     if placeholder not in text:
         continue

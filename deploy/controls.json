@@ -1,0 +1,34 @@
+{
+  "_comment": "PLACEHOLDER CONTROL MAPPING — NOT A COMPLIANCE ASSERTION. Every control_id and control_description in this file is a placeholder shipped so the evidence collector and its report have something to organise by. They are NOT claims that these reads satisfy any real control in any real framework. Before this is used for anything that matters, the client's own compliance owner MUST replace `framework`, every `control_id` and every `control_description` with their actual framework references. The report prints the framework name on every page, so a report generated against this file is visibly stamped PLACEHOLDER throughout.",
+  "_editing": "This file is DATA. Re-mapping an item, adding a framework reference, or splitting one item across several controls is a config edit and must NEVER require a code change. Installed at /etc/virp/controls.json; the collector falls back to this tracked copy and records which path it used, and that file's sha256, in every result it writes, so a report always names the mapping it was produced from.",
+  "_unmapped": "An item with no entry here is still COLLECTED, still signed, still chain-registered, and appears in the report under an explicit UNMAPPED heading. Evidence is never dropped for want of a mapping — a missing mapping is an operator to-do, not a reason to lose the read.",
+  "schema": "virp_evidence_controls/1",
+  "framework": "PLACEHOLDER",
+  "controls": {
+    "access_accounts": {
+      "control_id": "AC-1",
+      "control_description": "PLACEHOLDER — Account management: identify and document the accounts and access lines permitted on the device.",
+      "framework": "PLACEHOLDER"
+    },
+    "logging_config": {
+      "control_id": "AU-1",
+      "control_description": "PLACEHOLDER — Audit logging: the device is configured to generate audit records and send them to a defined target.",
+      "framework": "PLACEHOLDER"
+    },
+    "time_sync": {
+      "control_id": "AU-8",
+      "control_description": "PLACEHOLDER — Time stamps: audit records carry timestamps from an authoritative, synchronised time source.",
+      "framework": "PLACEHOLDER"
+    },
+    "running_config_baseline": {
+      "control_id": "CM-2",
+      "control_description": "PLACEHOLDER — Baseline configuration: a current, documented baseline configuration of the device is maintained.",
+      "framework": "PLACEHOLDER"
+    },
+    "management_services": {
+      "control_id": "CM-7",
+      "control_description": "PLACEHOLDER — Least functionality: only required management services and protocols are enabled on the device.",
+      "framework": "PLACEHOLDER"
+    }
+  }
+}

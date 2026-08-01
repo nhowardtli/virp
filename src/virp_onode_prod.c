@@ -67,6 +67,12 @@ extern void virp_driver_librenms_init(void);
 #ifdef VIRP_DRIVER_JUNIPER
 extern void virp_driver_juniper_init(void);
 #endif
+#ifdef VIRP_DRIVER_PBS
+extern void virp_driver_pbs_init(void);
+#if !defined(VIRP_DRIVER_WAZUH) && !defined(VIRP_DRIVER_LIBRENMS)
+#include <curl/curl.h>
+#endif
+#endif
 
 static void signal_handler(int sig)
 {
@@ -113,6 +119,7 @@ static virp_vendor_t vendor_from_string(const char *s)
     if (strcmp(s, "cisco_asa") == 0) return VIRP_VENDOR_CISCO_ASA;
     if (strcmp(s, "wazuh") == 0)     return VIRP_VENDOR_WAZUH;
     if (strcmp(s, "librenms") == 0)  return VIRP_VENDOR_LIBRENMS;
+    if (strcmp(s, "pbs") == 0)       return VIRP_VENDOR_PBS;
     if (strcmp(s, "mock") == 0)      return VIRP_VENDOR_MOCK;
     return VIRP_VENDOR_UNKNOWN;
 }
@@ -445,6 +452,18 @@ int load_devices(onode_state_t *state, const char *path)
         if (json_get_bool(dev_obj, "ssh_legacy", &bool_val))
             device.ssh_legacy = bool_val;
 
+        /* PBS-specific fields (ignored for other vendors).
+         *
+         * tls_fingerprint is the PBS driver's server identity. It is
+         * deliberately NOT a verify_tls-style boolean: a boolean has a
+         * value that means "don't check", and a fingerprint does not. */
+        json_get_string(dev_obj, "tls_fingerprint", device.tls_fingerprint,
+                        sizeof(device.tls_fingerprint));
+        json_get_string(dev_obj, "datastore_allow", device.datastore_allow,
+                        sizeof(device.datastore_allow));
+        json_get_string(dev_obj, "tls_servername", device.tls_servername,
+                        sizeof(device.tls_servername));
+
         if (device.hostname[0] == '\0' || device.host[0] == '\0') {
             fprintf(stderr, "[O-Node] Skipping device %d: missing hostname/host\n", i);
             continue;
@@ -452,6 +471,22 @@ int load_devices(onode_state_t *state, const char *path)
 
         if (device.vendor == VIRP_VENDOR_UNKNOWN) {
             fprintf(stderr, "[O-Node] Skipping %s: unknown vendor\n",
+                    device.hostname);
+            continue;
+        }
+
+        /*
+         * A PBS device without a certificate pin is a configuration
+         * error, not a device to load and let fail at connect time. The
+         * driver would refuse it anyway; refusing HERE makes the
+         * misconfiguration visible at start rather than at first use,
+         * and keeps "loaded" meaning "usable".
+         */
+        if (device.vendor == VIRP_VENDOR_PBS &&
+            device.tls_fingerprint[0] == '\0') {
+            fprintf(stderr, "[O-Node] Skipping %s: PBS device has no "
+                            "tls_fingerprint — the PBS driver pins the "
+                            "server certificate and has no insecure mode\n",
                     device.hostname);
             continue;
         }
@@ -666,6 +701,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_LIBRENMS
     virp_driver_librenms_init();
+#endif
+#ifdef VIRP_DRIVER_PBS
+    virp_driver_pbs_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 

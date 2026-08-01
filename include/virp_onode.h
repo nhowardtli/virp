@@ -104,6 +104,7 @@ typedef enum {
     ONODE_ACTION_VALIDATE_TURN = 13, /* Response-validator: evaluate AI turn manifest */
     ONODE_ACTION_APPROVAL_CHALLENGE = 14, /* Return canonical bytes to sign for a proposal */
     ONODE_ACTION_APPROVAL_SUBMIT    = 15, /* Submit a signature; daemon appends APPROVAL */
+    ONODE_ACTION_CHAIN_VERIFY_SESSION = 16, /* Verify whole session vs signed head */
     ONODE_ACTION_SESSION_HELLO = 20, /* Client SESSION_HELLO handshake */
     ONODE_ACTION_SESSION_BIND  = 21, /* Client SESSION_BIND confirmation */
     ONODE_ACTION_SESSION_CLOSE = 22, /* Either peer closes session */

@@ -562,7 +562,6 @@ static const fg_command_route_t FG_ROUTE_TABLE[] = {
 
     /* ── YELLOW — config reads, backups, active diagnostics ────── */
     { "show full-configuration",    VIRP_TIER_YELLOW },  /* backup path — keep <= YELLOW */
-    { "execute backup",             VIRP_TIER_YELLOW },  /* alternate backup path */
     { "diagnose",                   VIRP_TIER_YELLOW },  /* active diagnostics */
     { "execute ping",               VIRP_TIER_YELLOW },
     { "execute traceroute",         VIRP_TIER_YELLOW },
@@ -597,6 +596,29 @@ static const fg_command_route_t FG_ROUTE_TABLE[] = {
     { "show webfilter",             VIRP_TIER_YELLOW },
 
     /* ── RED — credential/admin reads + config-mode changes ────── */
+    /*
+     * `execute backup` is RED, not YELLOW (audit §4.3, 2026-08-01).
+     *
+     * It reads like a sibling of "show full-configuration" — both dump
+     * the config — but they are not siblings. `show` returns the config
+     * THROUGH the O-Node, which signs and chains what it saw.
+     * `execute backup config ftp <file> <server> <user> <pass>` makes the
+     * DEVICE open its own connection to a caller-supplied host and push
+     * the whole config there: admin password hashes, VPN PSKs, API
+     * tokens. None of it is observed, signed, or chained — the O-Node
+     * sees only "command accepted".
+     *
+     * That is untraced egress to an attacker-chosen destination, and at
+     * the shipped gate_max_tier=yellow it ran with no approval at all.
+     * RED rather than BLACK on purpose: backup-to-external is a
+     * legitimate operator action, so it stays possible behind human
+     * approval instead of being forbidden outright. Anything that makes
+     * the device talk to a caller-named host belongs at RED at minimum.
+     *
+     * Pinned by test_execute_backup_is_gated() in
+     * tests/test_driver_fortigate_black.c.
+     */
+    { "execute backup",             VIRP_TIER_RED    },  /* off-channel config egress */
     { "show system admin",          VIRP_TIER_RED    },  /* admin accounts, pw hashes, tokens */
     { "get system admin",           VIRP_TIER_RED    },
     { "show system api-user",       VIRP_TIER_RED    },  /* API credentials */

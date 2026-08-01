@@ -15,7 +15,12 @@ CFLAGS += -I./include -I./src/third_party $(CFLAGS_EXTRA)
 # header change forces every dependent object to recompile — this is what
 # prevents the stale-object / struct-ABI-mismatch class of bug.
 CFLAGS += -MMD -MP
-LDFLAGS = -lcrypto -lpthread -lsqlite3 -lsodium
+# LDFLAGS_EXTRA mirrors CFLAGS_EXTRA above. Use it — never override
+# LDFLAGS on the command line: a command-line assignment beats the `+=`
+# in the driver ifdef blocks below, so the driver libraries (-lcurl,
+# -lssl, -lssh2) silently vanish and the link fails on every driver
+# symbol at once.
+LDFLAGS = -lcrypto -lpthread -lsqlite3 -lsodium $(LDFLAGS_EXTRA)
 
 BUILD_DIR = build
 
@@ -120,6 +125,21 @@ ifdef LIBRENMS
   LIB_OBJS += $(BUILD_DIR)/driver_librenms.o
 endif
 
+# Optional Proxmox Backup Server driver — typed operations over REST.
+# Needs libcurl like the other REST drivers, plus -lssl: the certificate
+# pin is implemented with an OpenSSL verify callback (SSL_CTX_*), which
+# the bare -lcrypto in the base LDFLAGS does not provide.
+ifdef PBS
+  CFLAGS  += -DVIRP_DRIVER_PBS $(shell pkg-config --cflags libcurl 2>/dev/null)
+  ifndef WAZUH
+    ifndef LIBRENMS
+      LDFLAGS += $(shell pkg-config --libs libcurl 2>/dev/null || echo "-lcurl")
+    endif
+  endif
+  LDFLAGS += -lssl
+  LIB_OBJS += $(BUILD_DIR)/driver_pbs.o
+endif
+
 # SSH host key verification — included when any SSH driver is enabled
 ifneq (,$(or $(CISCO),$(FORTIGATE),$(PANOS),$(ASA),$(JUNIPER),$(LINUX)))
   LIB_OBJS += $(BUILD_DIR)/virp_ssh_hostkey.o
@@ -179,6 +199,9 @@ $(BUILD_DIR)/driver_wazuh.o: src/drivers/driver_wazuh.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_librenms.o: src/drivers/driver_librenms.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_pbs.o: src/drivers/driver_pbs.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_ssh_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
@@ -355,13 +378,13 @@ $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
 # name works and callers have a single driver-enabled build entry point.
 .PHONY: prod
 prod:
-	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 $(ONODE_PROD)
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 PBS=1 $(ONODE_PROD)
 
 # Full production build — recursive make ensures all ifdef guards evaluate correctly
 # SSH host key verification is strict: unknown keys are rejected.
 .PHONY: prod-full
 prod-full:
-	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 $(ONODE_PROD)
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 PBS=1 $(ONODE_PROD)
 
 # Dev build — all drivers, TOFU enabled by default so lab devices work
 # without pre-populating known_hosts. Do not run dev binaries in production.
@@ -536,10 +559,71 @@ $(TEST_LIBRENMS): tests/test_driver_librenms.c $(LIB)
 test-librenms: $(TEST_LIBRENMS)
 	./$(TEST_LIBRENMS)
 
+# PBS typed-operation driver tests (requires PBS=1). Entirely offline:
+# the grammar parser, op table, URL derivation, fingerprint parsing and
+# gate classifier are all pure functions, so this suite never originates
+# outbound contact and needs no live fence.
+TEST_PBS = $(BUILD_DIR)/test_driver_pbs
+
+$(TEST_PBS): tests/test_driver_pbs.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-pbs: $(TEST_PBS)
+	./$(TEST_PBS)
+
+# Typed-operation command hashing (FIX 1). Offline and pure.
+TEST_TYPED_HASH = $(BUILD_DIR)/test_typed_op_hash
+
+$(TEST_TYPED_HASH): tests/test_typed_op_hash.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-typed-hash: $(TEST_TYPED_HASH)
+	./$(TEST_TYPED_HASH)
+
+# Ingress encoded-NUL rejection (FIX 2). Offline — drives the real
+# parse_request() through its fuzz wrapper, no socket.
+TEST_INGRESS_NUL = $(BUILD_DIR)/test_ingress_nul
+
+$(TEST_INGRESS_NUL): tests/test_ingress_nul.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-ingress-nul: $(TEST_INGRESS_NUL)
+	./$(TEST_INGRESS_NUL)
+
+# PBS oversized-response fail-closed boundaries. Offline: drives the real
+# write callback and formatter directly, no socket.
+TEST_PBS_TRUNC = $(BUILD_DIR)/test_pbs_truncation
+
+$(TEST_PBS_TRUNC): tests/test_pbs_truncation.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-pbs-trunc: $(TEST_PBS_TRUNC)
+	./$(TEST_PBS_TRUNC)
+
+TEST_PBS_GATE = $(BUILD_DIR)/test_driver_pbs_gate
+
+$(TEST_PBS_GATE): tests/test_driver_pbs_gate.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-pbs-gate: $(TEST_PBS_GATE)
+	./$(TEST_PBS_GATE)
+
 # Autopilot client unit tests (pure-python: baselines, corpus table,
 # RBAC empty-result handling — no daemon, no devices)
 test-autopilot:
 	python3 tests/test_autopilot.py
+
+test-config-backup:
+	python3 tests/test_config_backup.py
+
+# Compliance-evidence collector + its control-mapped report. Pure python
+# against fakes: no daemon, no devices, no chain database. The report
+# tests need reportlab and SKIP with a warning without it (same policy as
+# test-virp-report) rather than failing the battery — the collector tests
+# always run.
+.PHONY: test-evidence
+test-evidence:
+	python3 tests/test_evidence.py
 
 # virp report — consumer-side chain PDF generator. Synthetic-chain tests run
 # anywhere; the live-chain tests self-skip when /var/lib/virp/chain.db is
@@ -632,9 +716,10 @@ DRIVER_BUILD_DIR = build-drivers
 
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms) ==="
-	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 \
-	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms
+	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, typed-hash, ingress-nul, pbs-trunc) ==="
+	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 \
+	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms \
+	        test-pbs test-pbs-gate test-typed-hash test-ingress-nul test-pbs-trunc
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.
 #
@@ -710,6 +795,110 @@ check-socket-path:
 # battery. Approval mode refuses to start without a chain (see
 # onode_setup_chain_and_approvals in src/virp_onode_prod.c), so the
 # shipped unit MUST pass -c <chain.db> and -C <chain.key>.
+# =========================================================================
+# Deployment
+#
+# The installed artifacts live OUTSIDE any source worktree. This is the
+# whole point: with ExecStart pointing into a git checkout, `make` in
+# that checkout was a deployment, and Restart=always meant the next
+# restart shipped it. Now a restart re-runs exactly what install-prod
+# last put here, and installing is a deliberate act that refuses on a
+# dirty tree.
+# =========================================================================
+VIRP_INSTALL_DIR ?= /usr/local/lib/virp
+VIRP_INSTALL_BIN  = $(VIRP_INSTALL_DIR)/virp-onode-prod
+
+# Scripts the unit executes. These are as load-bearing as the binary —
+# an edit to render-devices.sh in a worktree would change daemon
+# behaviour on the next restart just as surely as a rebuilt binary.
+VIRP_INSTALL_SCRIPTS = deploy/render-devices.sh \
+                       deploy/config-backup-access.sh \
+                       deploy/evidence-access.sh
+
+# The timer-driven automations (autopilot cycle/comparator/chainwalk/
+# corpus, config-backup, evidence) run these Python modules. They had the
+# SAME defect as the daemon binary and it was missed at first: their units
+# executed /opt/virp/autopilot/*.py, so an edit in the checkout changed
+# what the next hourly timer ran. autopilot/ is self-contained — each
+# entry point does sys.path.insert(0, dirname(__file__)) and imports only
+# virp_autopilot — so installing the directory wholesale is sufficient.
+VIRP_INSTALL_PY_DIR = $(VIRP_INSTALL_DIR)/autopilot
+VIRP_INSTALL_PY     = autopilot/virp_autopilot.py \
+                      autopilot/virp_config_backup.py \
+                      autopilot/virp_evidence.py
+
+.PHONY: install-prod
+install-prod: prod
+	@test -f $(ONODE_PROD) || { echo "FAIL: $(ONODE_PROD) was not built"; exit 1; }
+	@st=$$(git status --porcelain 2>/dev/null); \
+	 if [ -n "$$st" ]; then \
+	     echo "FAIL: refusing to install from a dirty tree — what gets deployed"; \
+	     echo "      must be exactly what a commit hash names:"; \
+	     echo "$$st"; \
+	     exit 1; \
+	 fi
+	@echo "=== installing to $(VIRP_INSTALL_DIR) (outside any worktree) ==="
+	install -d -m 0755 $(VIRP_INSTALL_DIR)
+	install -m 0755 $(ONODE_PROD) $(VIRP_INSTALL_BIN)
+	install -m 0755 $(VIRP_INSTALL_SCRIPTS) $(VIRP_INSTALL_DIR)/
+	install -d -m 0755 $(VIRP_INSTALL_PY_DIR)
+	install -m 0644 $(VIRP_INSTALL_PY) $(VIRP_INSTALL_PY_DIR)/
+	@echo
+	@$(MAKE) --no-print-directory deploy-record
+
+# The DEPLOYED.md stanza, generated rather than hand-written so it cannot
+# drift from what is actually installed. Refuses on a dirty tree for the
+# same reason install-prod does.
+.PHONY: deploy-record
+deploy-record:
+	@test -f $(VIRP_INSTALL_BIN) || \
+	    { echo "FAIL: $(VIRP_INSTALL_BIN) is not installed"; exit 1; }
+	@st=$$(git status --porcelain 2>/dev/null); \
+	 if [ -n "$$st" ]; then echo "FAIL: tree is dirty:"; echo "$$st"; exit 1; fi
+	@echo "- **Commit**: \`$$(git rev-parse HEAD)\`"
+	@echo "- **Branch**: \`$$(git rev-parse --abbrev-ref HEAD)\`"
+	@echo "- **Tree at install**: clean (\`git status --porcelain\` empty)"
+	@echo "- **Installed binary**: \`$(VIRP_INSTALL_BIN)\`"
+	@echo "- **sha256**: \`$$(sha256sum $(VIRP_INSTALL_BIN) | awk '{print $$1}')\`"
+	@for s in $(VIRP_INSTALL_SCRIPTS); do \
+	    b=$$(basename $$s); \
+	    echo "- **sha256** \`$(VIRP_INSTALL_DIR)/$$b\`: \`$$(sha256sum $(VIRP_INSTALL_DIR)/$$b | awk '{print $$1}')\`"; \
+	 done
+	@for s in $(VIRP_INSTALL_PY); do \
+	    b=$$(basename $$s); \
+	    echo "- **sha256** \`$(VIRP_INSTALL_PY_DIR)/$$b\`: \`$$(sha256sum $(VIRP_INSTALL_PY_DIR)/$$b | awk '{print $$1}')\`"; \
+	 done
+
+# Lint: the PBS driver must have NO way to weaken its certificate pin.
+#
+# Scoped deliberately to the PBS sources. driver_wazuh.c does carry a
+# VIRP_WAZUH_INSECURE escape hatch for the lab manager's self-signed cert;
+# that is pre-existing, documented in the unit file, and out of scope
+# here — it is not silently blessed by this target's narrower reach.
+#
+# The word "insecure" is NOT banned: this driver's comments say, at
+# length, that it has no insecure mode, and a lint that forbade saying so
+# would be a lint against documentation. What is banned is the machinery
+# an escape hatch would need.
+.PHONY: check-pbs-pin
+check-pbs-pin:
+	@echo "=== checking the PBS driver has no TLS escape hatch ==="
+	@if grep -nE 'CURLOPT_SSL_VERIFY(PEER|HOST)[[:space:]]*,[[:space:]]*0L?' \
+	        src/drivers/driver_pbs.c; then \
+	    echo "FAIL: PBS driver disables curl TLS verification"; exit 1; fi
+	@if grep -n 'getenv' src/drivers/driver_pbs.c include/virp_driver_pbs.h; then \
+	    echo "FAIL: the PBS driver reads an environment variable — no env var"; \
+	    echo "      may exist that could weaken or bypass the certificate pin"; \
+	    exit 1; fi
+	@grep -q 'CURLOPT_SSL_VERIFYPEER, 1L' src/drivers/driver_pbs.c || \
+	    { echo "FAIL: PBS driver does not enable CURLOPT_SSL_VERIFYPEER"; exit 1; }
+	@grep -q 'SSL_CTX_set_cert_verify_callback' src/drivers/driver_pbs.c || \
+	    { echo "FAIL: PBS driver has no pin verification callback"; exit 1; }
+	@grep -q 'CURLOPT_FOLLOWLOCATION, 0L' src/drivers/driver_pbs.c || \
+	    { echo "FAIL: PBS driver may follow redirects — a redirect is a URL"; \
+	      echo "      the operation table did not derive"; exit 1; }
+	@echo "  PASS: pin is mandatory, no env var, no redirect following"
+
 .PHONY: check-deploy-unit
 check-deploy-unit:
 	@echo "=== checking deploy/virp-onode.service for chain flags ==="
@@ -718,6 +907,39 @@ check-deploy-unit:
 	@grep -Eq '^[[:space:]]*-C[[:space:]]+[^[:space:]]' deploy/virp-onode.service || \
 	    { echo "FAIL: deploy/virp-onode.service is missing '-C <chain.key>' — approval mode will refuse to start"; exit 1; }
 	@echo "  PASS: chain flags present in deploy/virp-onode.service"
+	@echo "=== checking no unit executes a path inside a source worktree ==="
+	@units=$$(ls deploy/*.service deploy/*.dropin.conf 2>/dev/null); \
+	 bad=0; \
+	 for u in $$units; do \
+	     [ -f "$$u" ] || continue; \
+	     if grep -E '^Exec(Start|StartPre|StartPost|Stop|Reload)=' "$$u" | \
+	        grep -Eq '(/opt/virp|/root/|/home/|/build/|virp-dev)'; then \
+	         echo "FAIL: $$u executes a path inside a source worktree —"; \
+	         echo "      a restart would then deploy whatever the tree happens to hold."; \
+	         grep -nE '^Exec(Start|StartPre|StartPost|Stop|Reload)=' "$$u" | \
+	             grep -E '(/opt/virp|/root/|/home/|/build/|virp-dev)'; \
+	         bad=1; \
+	     fi; \
+	 done; \
+	 [ $$bad -eq 0 ] || exit 1
+	@echo "  PASS: every Exec* path is an installed artifact"
+	@echo "=== checking no unit rebuilds anything at start ==="
+	@units=$$(ls deploy/*.service deploy/*.dropin.conf 2>/dev/null); \
+	 bad=0; \
+	 for u in $$units; do \
+	     [ -f "$$u" ] || continue; \
+	     if grep -E '^Exec[A-Za-z]*=' "$$u" | \
+	        grep -Eq '(^|[^a-zA-Z])(make|gcc|cc|cargo|go build)([^a-zA-Z]|$$)'; then \
+	         echo "FAIL: $$u builds at unit start — the CT 211 hazard."; \
+	         bad=1; \
+	     fi; \
+	 done; \
+	 [ $$bad -eq 0 ] || exit 1
+	@echo "  PASS: no unit rebuilds from source at start"
+	@echo "=== checking ExecStart matches the documented install path ==="
+	@grep -Eq '^ExecStart=$(VIRP_INSTALL_BIN)([[:space:]]|\\\\|$$)' deploy/virp-onode.service || \
+	    { echo "FAIL: ExecStart is not $(VIRP_INSTALL_BIN)"; exit 1; }
+	@echo "  PASS: ExecStart=$(VIRP_INSTALL_BIN)"
 
 # Lint: fail build if sprintf( appears in src/ (use snprintf instead)
 .PHONY: lint-sprintf
@@ -770,13 +992,34 @@ asan-test:
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined"
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
-	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO) $(TEST_FG_SCRUB)
+	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO) $(TEST_FG_SCRUB) $(TEST_CHAIN)
 	@echo "=== Running tests under ASan+UBSan ==="
 	./$(TEST_BIN) 2>&1
 	./$(TEST_ONODE) 2>&1
 	./$(TEST_SSH_IO) 2>&1
 	./$(TEST_FG_SCRUB) 2>&1
+	./$(TEST_CHAIN) 2>&1
 	@echo "=== ASan+UBSan test run complete ==="
+
+# Driver suites under ASan+UBSan. Separate from asan-test because the
+# driver objects need their -D guards, which are evaluated at Makefile
+# parse time and so require a recursive $(MAKE) with the flags set.
+#
+# The PBS suites are the reason this exists: the typed-op parser is a
+# hand-written byte-level state machine over attacker-supplied input,
+# which is precisely the shape that needs a sanitizer rather than a
+# passing assertion count.
+.PHONY: asan-drivers
+asan-drivers:
+	rm -rf build-asan-drivers
+	$(MAKE) BUILD_DIR=build-asan-drivers CC=gcc \
+	        CFLAGS_EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+	        LDFLAGS_EXTRA="-fsanitize=address,undefined" \
+	        CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 \
+	        LIBRENMS=1 PBS=1 \
+	        test-pbs test-pbs-gate test-typed-hash test-ingress-nul \
+	        test-pbs-trunc test-linux-gate test-cisco-gate
+	@echo "=== ASan+UBSan driver run complete ==="
 
 # libFuzzer harness (requires clang)
 FUZZ_LIBFUZZER = $(BUILD_DIR)/fuzz_libfuzzer
@@ -854,4 +1097,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11

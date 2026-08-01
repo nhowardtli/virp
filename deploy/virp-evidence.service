@@ -1,0 +1,37 @@
+[Unit]
+Description=VIRP compliance evidence collector (governed, no-AI, read-only)
+Documentation=file:/opt/virp/docs/RUNBOOK-EVIDENCE.md
+After=virp-onode.service
+Requires=virp-onode.service
+
+[Service]
+Type=oneshot
+# DEDICATED least-privilege identity, distinct from BOTH the daemon user
+# `virp` (which owns the O-Key and chain key) and `virp-backup` (the
+# config-backup runbook's identity). Each automation gets its own account
+# so one runbook's reach is never another's. `virp-evidence` is a member
+# of no key or credential group; it can reach exactly two things: the
+# gate socket (via the ACL granted below) and /var/lib/virp/evidence.
+# The script additionally REFUSES to start if it can read the O-Key,
+# chain key, approver secret key, or either credential store — the
+# sandbox here is defence in depth, not the only wall.
+User=virp-evidence
+Group=virp-evidence
+UMask=0077
+# Socket ACL + evidence-dir provisioning happen in virp-onode's
+# ExecStartPost (deploy/virp-onode-evidence.dropin.conf): the grants must
+# track socket creation, and this unit's sandbox deliberately cannot
+# reach /var/lib/virp to grant itself anything.
+ExecStart=/usr/bin/python3 /usr/local/lib/virp/autopilot/virp_evidence.py run
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/virp/evidence /run/virp
+# Belt over braces: even if file modes regressed, this unit cannot see
+# key material, credential stores, the approvals store, the chain db, or
+# the OTHER runbook's evidence tree.
+InaccessiblePaths=-/etc/virp/keys -/etc/virp/autopilot.env -/var/lib/virp/approvals -/var/lib/virp/.virp -/var/lib/virp/autopilot -/var/lib/virp/config-backups -/var/lib/virp/chain.db -/var/lib/virp/chain.db-wal -/var/lib/virp/chain.db-shm
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=Scheduled VIRP compliance evidence collection
+
+# CADENCE IS CONFIGURABLE. Daily is the default because evidence
+# collection is a periodic attestation, not a monitoring loop — the
+# autopilot already watches the devices every 5 minutes. Override
+# without editing this tracked file:
+#
+#   systemctl edit virp-evidence.timer
+#   -----------------------------------
+#   [Timer]
+#   OnCalendar=                 # clear the default first
+#   OnCalendar=weekly           # or: hourly, Mon *-*-* 02:00:00, ...
+#
+# The empty assignment matters: OnCalendar= is a list, so without
+# clearing it a drop-in ADDS a schedule rather than replacing one.
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -428,8 +428,10 @@ establish.
    hash-linked" establishes internal link consistency, not
    completeness; and the bridge verifier never checks the keyed
    `chain_hmac` at all. Follow-ups now: the bridge verifier is unfixed
-   (global walk + no HMAC check), the C verifier's tail-completeness
-   gap, and the two-writer genesis divergence. See the README
+   (global walk + no HMAC check; consumer-side repo) and the
+   two-writer genesis divergence. The C verifier's tail-completeness
+   gap is FIXED 2026-08-01 (range completeness + signed per-session
+   head record; see SECURITY.md §Verifier Limitations). See the README
    chain-integrity section and `SECURITY.md` §Verifier Limitations.
 
 1. *Config-dumping reads at YELLOW.* `show full-configuration`

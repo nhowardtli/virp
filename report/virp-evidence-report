@@ -1,0 +1,15 @@
+#!/bin/sh
+# virp-evidence-report — thin launcher for the control-mapped evidence PDF.
+#
+# Same shape as ./virp-report (see that file): the `virp` CLI is a compiled
+# C binary and this generator is Python because it renders PDFs with
+# reportlab, so the tool ships as a launcher rather than a new subcommand
+# on a deployed binary.
+#
+#     virp-evidence-report --db <path> --out <file.pdf>
+#                          [--session evidence:YYYY-MM-DD]
+#
+# Runs as a KEY HOLDER: it needs the O-Key and chain key to re-verify what
+# the least-privilege collector could only store. Symlink it onto PATH if
+# you want it alongside `virp`.
+exec python3 "$(dirname "$(readlink -f "$0")")/virp_evidence_report.py" "$@"

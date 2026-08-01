@@ -22,6 +22,6 @@ Group=virp
 # Needs the O-Key (verify), chain.db (read-only enumeration), the onode
 # socket, and the alert sink in /var/lib/virp/autopilot. Holds NO device
 # credentials.
-ExecStart=/usr/bin/python3 /opt/virp/autopilot/virp_autopilot.py cycle
+ExecStart=/usr/bin/python3 /usr/local/lib/virp/autopilot/virp_autopilot.py cycle
 NoNewPrivileges=yes
 PrivateTmp=yes
