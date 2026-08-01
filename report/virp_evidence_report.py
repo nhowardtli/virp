@@ -746,8 +746,10 @@ def main(argv=None):
             print("virp-evidence-report: session %r has no entries" % session,
                   file=sys.stderr)
             return 1
+        heads = vr.load_heads(reader)
         verifications, summary = verify.verify_chain(
-            entries, artifacts, okey=okey, chain_key=chain_key)
+            entries, artifacts, okey=okey, chain_key=chain_key,
+            heads=heads, selection_complete=True)
 
         controls, unmapped, stats, unparsable = build_model(verifications)
 

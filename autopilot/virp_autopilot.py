@@ -781,8 +781,13 @@ def run_chainwalk():
     sessions = chain_sessions()
 
     for sid, max_seq in sessions:
-        raw = onode_send({"action": "chain_verify", "session_id": sid,
-                          "from_sequence": 0, "to_sequence": max_seq})
+        # chain_verify_session: the daemon derives the range from the
+        # SIGNED head record, not from a caller-supplied to_sequence.
+        # The old form derived max_seq from the same database being
+        # audited, so a truncated DB shrank the asserted range along
+        # with the evidence and the walk could not see the loss.
+        raw = onode_send({"action": "chain_verify_session",
+                          "session_id": sid})
         obs = parse_observation(raw)
         if "error_code" in obs or obs.get("obs_type") != OBS_CHAIN_VERIFY:
             emit_alert("chainwalk_transport", {"session": sid, "obs": obs})
@@ -795,11 +800,23 @@ def run_chainwalk():
         except ValueError:
             vr = {}
         valid = bool(vr.get("valid")) and verified
+        # Cross-check: the head's committed length must reach at least as
+        # far as the entries this walker can SEE. head < visible max means
+        # the head lagged or was replaced — alert either way. (head >
+        # visible is not checkable from here; the daemon's completeness
+        # rule already caught missing entries.)
+        head_to = vr.get("to_sequence")
+        if valid and head_to is not None and int(head_to) < max_seq:
+            valid = False
+            vr["local_note"] = ("head commits to %s but %s entries "
+                                "visible locally" % (head_to, max_seq))
         total_entries += int(vr.get("entries_checked", 0))
-        print("  [%s] session=%s entries=%s first_broken=%s verified=%s"
+        print("  [%s] session=%s entries=%s first_broken=%s verified=%s%s"
               % ("OK" if valid else "ALERT", sid,
                  vr.get("entries_checked"), vr.get("first_broken"),
-                 "VALID" if verified else "FAILED"))
+                 "VALID" if verified else "FAILED",
+                 (" detail=%r" % vr["error_detail"])
+                 if vr.get("error_detail") else ""))
         if not valid:
             failures += 1
             emit_alert("chain_verification_failure",

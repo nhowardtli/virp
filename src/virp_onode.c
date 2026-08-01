@@ -294,6 +294,8 @@ static bool parse_request(const char *json, onode_request_t *req)
         req->action = ONODE_ACTION_CHAIN_APPEND;
     else if (strcmp(action_str, "chain_verify") == 0)
         req->action = ONODE_ACTION_CHAIN_VERIFY;
+    else if (strcmp(action_str, "chain_verify_session") == 0)
+        req->action = ONODE_ACTION_CHAIN_VERIFY_SESSION;
     else if (strcmp(action_str, "intent_store") == 0)
         req->action = ONODE_ACTION_INTENT_STORE;
     else if (strcmp(action_str, "intent_get") == 0)
@@ -2223,6 +2225,62 @@ static void handle_client(onode_state_t *state, int client_fd)
                 "\"to_sequence\":%lld,"
                 "\"valid\":%s}",
                 (long long)vresult.entries_checked,
+                (long long)vresult.first_broken,
+                (long long)vresult.from_sequence,
+                (long long)vresult.to_sequence,
+                vresult.valid ? "true" : "false");
+            err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
+                                          state->node_id, onode_next_seq(state),
+                                          VIRP_OBS_CHAIN_VERIFY, VIRP_SCOPE_LOCAL,
+                                          (const uint8_t *)json_buf, (uint16_t)jlen,
+                                          &state->okey);
+            if (err == VIRP_OK && resp_len > 0) {
+                send_framed(client_fd, resp_buf, resp_len);
+                onode_inc_observations(state);
+            } else {
+                send_framed_error(client_fd, err);
+            }
+        }
+        break;
+
+    case ONODE_ACTION_CHAIN_VERIFY_SESSION:
+        /* Whole-session verification against the signed head record.
+         * Unlike CHAIN_VERIFY, the caller supplies NO range — the range
+         * comes from the authenticated head, so a caller cannot be fooled
+         * by deriving max sequence from the same (possibly truncated)
+         * database it is auditing. Same response obs type as CHAIN_VERIFY
+         * so existing consumers parse it unchanged; adds error_detail
+         * because the failure mode (truncated vs missing head vs forged
+         * head) is the point of the check. */
+        if (!state->chain_enabled) {
+            send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
+            break;
+        }
+        if (req.session_id[0] == '\0') {
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
+            break;
+        }
+        {
+            virp_chain_verify_result_t vresult;
+            err = virp_chain_verify_session(&state->chain, req.session_id,
+                                            &vresult);
+            if (err != VIRP_OK) {
+                send_framed_error(client_fd, err);
+                break;
+            }
+            /* error_detail is daemon-generated prose (fixed format strings,
+             * numbers, session ids validated at ingress) — no quotes or
+             * control bytes reach it, so direct embedding is safe. */
+            char json_buf[1024];
+            int jlen = snprintf(json_buf, sizeof(json_buf),
+                "{\"entries_checked\":%lld,"
+                "\"error_detail\":\"%s\","
+                "\"first_broken\":%lld,"
+                "\"from_sequence\":%lld,"
+                "\"to_sequence\":%lld,"
+                "\"valid\":%s}",
+                (long long)vresult.entries_checked,
+                vresult.error_detail,
                 (long long)vresult.first_broken,
                 (long long)vresult.from_sequence,
                 (long long)vresult.to_sequence,

@@ -382,6 +382,286 @@ static void test_unique_constraint(void)
 }
 
 /* =========================================================================
+ * Helpers for the completeness / head-record tests
+ * ========================================================================= */
+
+static void append_n(virp_chain_state_t *state, const char *sid, int n)
+{
+    for (int i = 0; i < n; i++) {
+        virp_chain_entry_t e;
+        char id[32], hash[65];
+        snprintf(id, sizeof(id), "art-%03d", i);
+        snprintf(hash, sizeof(hash), "%064d", i);
+        virp_chain_append(state, sid, "observation", id, hash, &e);
+    }
+}
+
+/* =========================================================================
+ * Test: Tail truncation detected by range verify (review finding N4)
+ *
+ * REGRESSION SEMANTICS: before 2026-08-01, deleting the last K entries of
+ * a session ended the row walk early and chain_verify returned valid=true
+ * with entries_checked short of the range. This test FAILS against that
+ * code on the !result.valid assertion.
+ * ========================================================================= */
+
+static void test_verify_tail_truncation(void)
+{
+    TEST("Range verify rejects truncated tail");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-trunc", 5);
+
+    /* Delete the last two entries — the tail-truncation attack */
+    sqlite3_exec(state.db,
+        "DELETE FROM chain_entries "
+        "WHERE session_id = 'session-trunc' AND sequence >= 3;",
+        NULL, NULL, NULL);
+
+    virp_chain_verify_result_t result;
+    virp_error_t err = virp_chain_verify(&state, "session-trunc",
+                                          0, 4, &result);
+    ASSERT(err == VIRP_OK, "verify call failed");
+    ASSERT(!result.valid, "truncated chain must NOT verify valid");
+    ASSERT(result.entries_checked == 3, "should have checked 3 entries");
+    ASSERT(result.first_broken == 3,
+           "first missing sequence should be reported");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Test: Zero-row range is invalid (previously verified vacuously valid)
+ * ========================================================================= */
+
+static void test_verify_zero_rows(void)
+{
+    TEST("Range verify rejects zero-row session");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    virp_chain_verify_result_t result;
+    virp_error_t err = virp_chain_verify(&state, "session-none",
+                                          0, 0, &result);
+    ASSERT(err == VIRP_OK, "verify call failed");
+    ASSERT(!result.valid, "nonexistent session must NOT verify valid");
+    ASSERT(result.entries_checked == 0, "zero entries checked");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Test: Inverted range is invalid
+ * ========================================================================= */
+
+static void test_verify_inverted_range(void)
+{
+    TEST("Range verify rejects inverted range");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-inv", 3);
+
+    virp_chain_verify_result_t result;
+    virp_error_t err = virp_chain_verify(&state, "session-inv",
+                                          2, 0, &result);
+    ASSERT(err == VIRP_OK, "verify call failed");
+    ASSERT(!result.valid, "inverted range must NOT verify valid");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Test: Session verify (head record) — happy path
+ * ========================================================================= */
+
+static void test_verify_session_valid(void)
+{
+    TEST("Session verify passes against signed head");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-head", 7);
+
+    virp_chain_verify_result_t result;
+    virp_error_t err = virp_chain_verify_session(&state, "session-head",
+                                                 &result);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(result.valid, "intact session should verify");
+    ASSERT(result.entries_checked == 7, "should check all 7 entries");
+    ASSERT(result.to_sequence == 6, "head should commit to sequence 6");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Test: Session verify detects tail deletion even with head intact
+ * ========================================================================= */
+
+static void test_verify_session_tail_deleted(void)
+{
+    TEST("Session verify detects deleted tail");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-cut", 6);
+
+    sqlite3_exec(state.db,
+        "DELETE FROM chain_entries "
+        "WHERE session_id = 'session-cut' AND sequence >= 4;",
+        NULL, NULL, NULL);
+
+    virp_chain_verify_result_t result;
+    virp_error_t err = virp_chain_verify_session(&state, "session-cut",
+                                                 &result);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(!result.valid, "cut session must NOT verify");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Test: Session verify detects head deletion (entries without head)
+ * ========================================================================= */
+
+static void test_verify_session_head_deleted(void)
+{
+    TEST("Session verify detects deleted head record");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-nohead", 4);
+
+    /* Attacker deletes tail AND the head row to hide the truncation */
+    sqlite3_exec(state.db,
+        "DELETE FROM chain_entries "
+        "WHERE session_id = 'session-nohead' AND sequence >= 2;"
+        "DELETE FROM chain_heads WHERE session_id = 'session-nohead';",
+        NULL, NULL, NULL);
+
+    virp_chain_verify_result_t result;
+    virp_error_t err = virp_chain_verify_session(&state, "session-nohead",
+                                                 &result);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(!result.valid,
+           "session with entries but no head must NOT verify");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Test: Session verify detects a forged (keyless) head rewrite
+ *
+ * An attacker with DB write access but no K_chain truncates the chain and
+ * rewrites the head row to point at the new tail. Without the key they
+ * cannot produce a valid head_hmac, so the head fails authentication.
+ * ========================================================================= */
+
+static void test_verify_session_forged_head(void)
+{
+    TEST("Session verify detects keyless head forgery");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-forge", 5);
+
+    /* Capture entry 2's real hash so the forged head is internally
+     * consistent with the truncated chain — the strongest keyless forgery */
+    sqlite3_stmt *st = NULL;
+    char hash2[65] = {0};
+    sqlite3_prepare_v2(state.db,
+        "SELECT chain_entry_hash FROM chain_entries "
+        "WHERE session_id='session-forge' AND sequence=2", -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW)
+        snprintf(hash2, sizeof(hash2), "%s",
+                 (const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+        "DELETE FROM chain_entries "
+        "WHERE session_id='session-forge' AND sequence >= 3;"
+        "UPDATE chain_heads SET last_sequence=2, last_entry_hash='%s' "
+        "WHERE session_id='session-forge';", hash2);
+    sqlite3_exec(state.db, sql, NULL, NULL, NULL);
+
+    virp_chain_verify_result_t result;
+    virp_error_t err = virp_chain_verify_session(&state, "session-forge",
+                                                 &result);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(!result.valid, "forged head must NOT verify");
+    ASSERT(strstr(result.error_detail, "HMAC") != NULL,
+           "failure should be the head HMAC check");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Test: Head backfill on init for pre-upgrade databases
+ * ========================================================================= */
+
+static void test_head_backfill(void)
+{
+    TEST("Head backfill on init (trust-on-upgrade)");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-legacy", 4);
+
+    /* Simulate a pre-chain_heads database: drop the head rows */
+    sqlite3_exec(state.db, "DELETE FROM chain_heads;", NULL, NULL, NULL);
+    virp_chain_destroy(&state);
+
+    /* Re-init: backfill should mint a head from the existing entries */
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    virp_chain_verify_result_t result;
+    virp_error_t err = virp_chain_verify_session(&state, "session-legacy",
+                                                 &result);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(result.valid, "backfilled session should verify");
+    ASSERT(result.entries_checked == 4, "should check all 4 entries");
+
+    /* And appends after backfill keep extending the head */
+    virp_chain_entry_t e;
+    virp_chain_append(&state, "session-legacy", "observation", "art-post",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &e);
+    err = virp_chain_verify_session(&state, "session-legacy", &result);
+    ASSERT(err == VIRP_OK, "verify_session call failed post-append");
+    ASSERT(result.valid && result.entries_checked == 5,
+           "head should track the post-backfill append");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -398,6 +678,14 @@ int main(void)
     test_key_type();
     test_session_independence();
     test_unique_constraint();
+    test_verify_tail_truncation();
+    test_verify_zero_rows();
+    test_verify_inverted_range();
+    test_verify_session_valid();
+    test_verify_session_tail_deleted();
+    test_verify_session_head_deleted();
+    test_verify_session_forged_head();
+    test_head_backfill();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

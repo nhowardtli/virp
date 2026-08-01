@@ -43,10 +43,20 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                                         const char *session_id,
                                         int64_t from_sequence,
                                         int64_t to_sequence,
-                                        virp_chain_verify_result_t *result);
+                                        virp_chain_verify_result_t *result,
+                                        char out_last_hash[65]);
 static virp_error_t chain_get_last_locked(virp_chain_state_t *state,
                                           const char *session_id,
                                           virp_chain_entry_t *entry);
+static void head_hmac_hex(virp_chain_state_t *state,
+                          const char *session_id,
+                          int64_t last_sequence,
+                          const char *last_entry_hash,
+                          char out_hex[65]);
+static virp_error_t head_upsert_locked(virp_chain_state_t *state,
+                                       const char *session_id,
+                                       int64_t last_sequence,
+                                       const char *last_entry_hash);
 static virp_error_t chain_intent_store_locked(virp_chain_state_t *state,
                                               virp_intent_entry_t *entry);
 static virp_error_t chain_intent_get_locked(virp_chain_state_t *state,
@@ -86,7 +96,95 @@ virp_error_t virp_chain_verify(virp_chain_state_t *state,
     if (!state) return VIRP_ERR_NULL_PTR;
     pthread_mutex_lock(&state->lock);
     virp_error_t rc = chain_verify_locked(state, session_id, from_sequence,
-                                          to_sequence, result);
+                                          to_sequence, result, NULL);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
+                                       const char *session_id,
+                                       virp_chain_verify_result_t *result)
+{
+    if (!state || !session_id || !result)
+        return VIRP_ERR_NULL_PTR;
+
+    memset(result, 0, sizeof(*result));
+    result->first_broken = -1;
+
+    /* Load the head record */
+    int64_t head_seq = -1;
+    char head_hash[65] = {0};
+    char head_mac[65]  = {0};
+
+    sqlite3_reset(state->stmt_head_get);
+    sqlite3_bind_text(state->stmt_head_get, 1, session_id, -1,
+                      SQLITE_TRANSIENT);
+    int have_head = 0;
+    if (sqlite3_step(state->stmt_head_get) == SQLITE_ROW) {
+        have_head = 1;
+        head_seq = sqlite3_column_int64(state->stmt_head_get, 0);
+        snprintf(head_hash, sizeof(head_hash), "%s",
+                 (const char *)sqlite3_column_text(state->stmt_head_get, 1));
+        snprintf(head_mac, sizeof(head_mac), "%s",
+                 (const char *)sqlite3_column_text(state->stmt_head_get, 2));
+    }
+    sqlite3_reset(state->stmt_head_get);
+
+    if (!have_head) {
+        /* Distinguish "session with entries but no head" (tail-length
+         * cannot be authenticated — the deletion-of-head attack) from
+         * "session unknown entirely". Both are invalid; the detail
+         * differs so an operator knows which case they are in. */
+        virp_chain_entry_t probe;
+        virp_error_t prc = chain_get_last_locked(state, session_id, &probe);
+        result->valid = false;
+        if (prc == VIRP_OK) {
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "Head record missing for session with entries; "
+                     "chain length cannot be authenticated");
+        } else {
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "No entries and no head record for session");
+        }
+        return VIRP_OK;
+    }
+
+    /* Authenticate the head itself before trusting its length claim */
+    char expect_mac[65];
+    head_hmac_hex(state, session_id, head_seq, head_hash, expect_mac);
+    if (strcmp(expect_mac, head_mac) != 0) {
+        result->valid = false;
+        result->to_sequence = head_seq;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "Head record HMAC mismatch");
+        return VIRP_OK;
+    }
+
+    /* Walk the full range the head commits to; completeness enforced */
+    char last_hash[65] = {0};
+    virp_error_t rc = chain_verify_locked(state, session_id, 0, head_seq,
+                                          result, last_hash);
+    if (rc != VIRP_OK || !result->valid)
+        return rc;
+
+    /* The final verified entry must be the one the head commits to */
+    if (strcmp(last_hash, head_hash) != 0) {
+        result->valid = false;
+        result->first_broken = head_seq;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "Head record does not match final verified entry "
+                 "at sequence %lld", (long long)head_seq);
+    }
+    return VIRP_OK;
+}
+
+virp_error_t virp_chain_verify_session(virp_chain_state_t *state,
+                                       const char *session_id,
+                                       virp_chain_verify_result_t *result)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_verify_session_locked(state, session_id, result);
     pthread_mutex_unlock(&state->lock);
     return rc;
 }
@@ -214,6 +312,17 @@ static const char *SCHEMA_SQL =
     ");"
     "CREATE INDEX IF NOT EXISTS idx_chain_session_seq "
     "  ON chain_entries(session_id, sequence);"
+    /* Signed per-session head: authenticates chain LENGTH, not just links.
+     * Updated in the same transaction as every append. A DB writer without
+     * K_chain can neither forge a head for a truncated chain nor delete it
+     * undetected (entries-without-head fails virp_chain_verify_session). */
+    "CREATE TABLE IF NOT EXISTS chain_heads ("
+    "  session_id TEXT PRIMARY KEY,"
+    "  last_sequence INTEGER NOT NULL,"
+    "  last_entry_hash TEXT NOT NULL,"
+    "  head_hmac TEXT NOT NULL,"
+    "  updated_at_ns INTEGER NOT NULL"
+    ");"
     "CREATE TABLE IF NOT EXISTS intents ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  intent_id TEXT NOT NULL UNIQUE,"
@@ -277,6 +386,15 @@ static const char *SQL_INSERT_MILESTONE =
     "(session_id, sequence, entries_covered, cumulative_hash, "
     " chain_hmac, created_at_ns) "
     "VALUES (?,?,?,?,?,?)";
+
+static const char *SQL_HEAD_UPSERT =
+    "INSERT OR REPLACE INTO chain_heads "
+    "(session_id, last_sequence, last_entry_hash, head_hmac, updated_at_ns) "
+    "VALUES (?,?,?,?,?)";
+
+static const char *SQL_HEAD_GET =
+    "SELECT last_sequence, last_entry_hash, head_hmac "
+    "FROM chain_heads WHERE session_id = ?";
 
 /* Intent store SQL */
 static const char *SQL_INTENT_INSERT =
@@ -413,6 +531,68 @@ static void read_entry_from_stmt(sqlite3_stmt *stmt, virp_chain_entry_t *e)
 }
 
 /* =========================================================================
+ * Head record — signed commitment to chain length
+ * ========================================================================= */
+
+/*
+ * Canonical form for the head HMAC. Alphabetical keys, compact separators,
+ * matching the milestone convention. The "v" field version-tags the
+ * construction so a future format change cannot be confused with this one.
+ */
+static int head_canonical(const char *session_id,
+                          int64_t last_sequence,
+                          const char *last_entry_hash,
+                          char *out, size_t out_size)
+{
+    return snprintf(out, out_size,
+        "{\"last_entry_hash\":\"%s\","
+        "\"last_sequence\":%lld,"
+        "\"session_id\":\"%s\","
+        "\"v\":\"VIRP-CHAIN-HEAD-v1\"}",
+        last_entry_hash,
+        (long long)last_sequence,
+        session_id);
+}
+
+static void head_hmac_hex(virp_chain_state_t *state,
+                          const char *session_id,
+                          int64_t last_sequence,
+                          const char *last_entry_hash,
+                          char out_hex[65])
+{
+    char canonical[512];
+    int n = head_canonical(session_id, last_sequence, last_entry_hash,
+                           canonical, sizeof(canonical));
+    hmac_sha256_hex(state->chain_key.key.key, canonical, (size_t)n, out_hex);
+}
+
+/*
+ * Write/replace the head row for a session. Caller must already be inside
+ * a transaction (append path) or hold the chain lock (backfill).
+ */
+static virp_error_t head_upsert_locked(virp_chain_state_t *state,
+                                       const char *session_id,
+                                       int64_t last_sequence,
+                                       const char *last_entry_hash)
+{
+    char hmac_hex[65];
+    head_hmac_hex(state, session_id, last_sequence, last_entry_hash,
+                  hmac_hex);
+
+    sqlite3_reset(state->stmt_head_upsert);
+    sqlite3_bind_text(state->stmt_head_upsert, 1, session_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(state->stmt_head_upsert, 2, last_sequence);
+    sqlite3_bind_text(state->stmt_head_upsert, 3, last_entry_hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(state->stmt_head_upsert, 4, hmac_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(state->stmt_head_upsert, 5, (int64_t)get_wall_ns());
+
+    int rc = sqlite3_step(state->stmt_head_upsert);
+    sqlite3_reset(state->stmt_head_upsert);
+
+    return (rc == SQLITE_DONE) ? VIRP_OK : VIRP_ERR_CHAIN_DB;
+}
+
+/* =========================================================================
  * Milestone
  * ========================================================================= */
 
@@ -511,7 +691,11 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
         sqlite3_prepare_v2(state->db, SQL_GET_RANGE, -1,
                            &state->stmt_get_range, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(state->db, SQL_INSERT_MILESTONE, -1,
-                           &state->stmt_insert_milestone, NULL) != SQLITE_OK) {
+                           &state->stmt_insert_milestone, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(state->db, SQL_HEAD_UPSERT, -1,
+                           &state->stmt_head_upsert, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(state->db, SQL_HEAD_GET, -1,
+                           &state->stmt_head_get, NULL) != SQLITE_OK) {
         fprintf(stderr, "[Chain] Failed to prepare statements: %s\n",
                 sqlite3_errmsg(state->db));
         sqlite3_close(state->db);
@@ -538,6 +722,57 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
                 sqlite3_errmsg(state->db));
         sqlite3_close(state->db);
         return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* Backfill head records for sessions created before chain_heads
+     * existed. Only sessions LACKING a head get one — an existing head is
+     * never overwritten here, because a head that disagrees with the
+     * entries is a tampering signal virp_chain_verify_session must report,
+     * not repair. TRUST-ON-UPGRADE: a backfilled head blesses whatever
+     * length the database has at upgrade time; only appends after this
+     * point extend the authenticated length. A backfill failure is logged
+     * and left alone — the affected session then fails
+     * virp_chain_verify_session (no head), which is the fail-closed
+     * outcome, rather than blocking daemon startup. */
+    {
+        sqlite3_stmt *bf = NULL, *hh = NULL;
+        const char *sql_bf =
+            "SELECT ce.session_id, MAX(ce.sequence) "
+            "FROM chain_entries ce "
+            "LEFT JOIN chain_heads ch ON ch.session_id = ce.session_id "
+            "WHERE ch.session_id IS NULL "
+            "GROUP BY ce.session_id";
+        const char *sql_hh =
+            "SELECT chain_entry_hash FROM chain_entries "
+            "WHERE session_id = ? AND sequence = ?";
+        if (sqlite3_prepare_v2(state->db, sql_bf, -1, &bf, NULL) == SQLITE_OK &&
+            sqlite3_prepare_v2(state->db, sql_hh, -1, &hh, NULL) == SQLITE_OK) {
+            while (sqlite3_step(bf) == SQLITE_ROW) {
+                const char *sid = (const char *)sqlite3_column_text(bf, 0);
+                int64_t last = sqlite3_column_int64(bf, 1);
+                sqlite3_reset(hh);
+                sqlite3_bind_text(hh, 1, sid, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(hh, 2, last);
+                if (sqlite3_step(hh) == SQLITE_ROW) {
+                    const char *hash =
+                        (const char *)sqlite3_column_text(hh, 0);
+                    if (head_upsert_locked(state, sid, last, hash)
+                            == VIRP_OK) {
+                        fprintf(stderr,
+                            "[Chain] Head backfill: session=%s "
+                            "last_seq=%lld (trust-on-upgrade)\n",
+                            sid, (long long)last);
+                    } else {
+                        fprintf(stderr,
+                            "[Chain] Head backfill FAILED: session=%s "
+                            "— session will not verify until resolved\n",
+                            sid);
+                    }
+                }
+            }
+        }
+        if (bf) sqlite3_finalize(bf);
+        if (hh) sqlite3_finalize(hh);
     }
 
     fprintf(stderr, "[Chain] Initialized: db=%s node=%u org=%s\n",
@@ -645,6 +880,15 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
         return VIRP_ERR_CHAIN_DB;
     }
 
+    /* Update the signed head record in the SAME transaction, so entry and
+     * head commit or roll back together — the head can never lag or lead
+     * the entries it authenticates. Fail closed: no head, no append. */
+    if (head_upsert_locked(state, session_id, next_seq,
+                           entry->chain_entry_hash) != VIRP_OK) {
+        sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
     /* COMMIT — sequence is now permanent */
     rc = sqlite3_exec(state->db, "COMMIT;", NULL, NULL, NULL);
     if (rc != SQLITE_OK) {
@@ -669,7 +913,8 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                                const char *session_id,
                                int64_t from_sequence,
                                int64_t to_sequence,
-                               virp_chain_verify_result_t *result)
+                               virp_chain_verify_result_t *result,
+                               char out_last_hash[65])
 {
     if (!state || !session_id || !result)
         return VIRP_ERR_NULL_PTR;
@@ -679,6 +924,17 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
     result->to_sequence = to_sequence;
     result->first_broken = -1;
     result->valid = true;
+
+    /* The caller asserts this range exists; an inverted or negative range
+     * can assert nothing, and before 2026-08-01 verified vacuously valid
+     * with zero entries checked. */
+    if (from_sequence < 0 || to_sequence < from_sequence) {
+        result->valid = false;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "Invalid verify range %lld..%lld",
+                 (long long)from_sequence, (long long)to_sequence);
+        return VIRP_OK;
+    }
 
     /* Determine expected previous hash for from_sequence */
     char expected_prev[65];
@@ -781,6 +1037,37 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
     }
 
     sqlite3_reset(state->stmt_get_range);
+
+    /* COMPLETENESS: every sequence in [from, to] must have been verified.
+     * Middle deletions are caught by the sequence-gap check above, but a
+     * range whose TAIL is missing just ends the row walk early — before
+     * 2026-08-01 that returned valid=true, so deleting the last K entries
+     * of a session was undetectable (review finding N4). Nothing here
+     * commits to overall chain length; that is virp_chain_verify_session's
+     * job via the signed head record. This check only makes the verifier
+     * honest about the range the CALLER claimed. */
+    if (result->valid) {
+        int64_t expected_count = to_sequence - from_sequence + 1;
+        if (result->entries_checked != expected_count) {
+            result->valid = false;
+            result->first_broken = from_sequence + result->entries_checked;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "Chain truncated: expected %lld entries "
+                     "(%lld..%lld), found %lld",
+                     (long long)expected_count,
+                     (long long)from_sequence,
+                     (long long)to_sequence,
+                     (long long)result->entries_checked);
+        }
+    }
+
+    if (result->valid && out_last_hash) {
+        /* expected_prev holds the hash of the last verified entry;
+         * entries_checked >= 1 is guaranteed here by the completeness
+         * check (expected_count >= 1 for any valid range). */
+        snprintf(out_last_hash, 65, "%s", expected_prev);
+    }
+
     return VIRP_OK;
 }
 
@@ -824,6 +1111,10 @@ void virp_chain_destroy(virp_chain_state_t *state)
         sqlite3_finalize(state->stmt_get_range);
     if (state->stmt_insert_milestone)
         sqlite3_finalize(state->stmt_insert_milestone);
+    if (state->stmt_head_upsert)
+        sqlite3_finalize(state->stmt_head_upsert);
+    if (state->stmt_head_get)
+        sqlite3_finalize(state->stmt_head_get);
     if (state->stmt_intent_insert)
         sqlite3_finalize(state->stmt_intent_insert);
     if (state->stmt_intent_get)

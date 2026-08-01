@@ -27,6 +27,7 @@ import argparse
 import datetime
 import json
 import os
+import sqlite3
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -148,6 +149,20 @@ def load_evidence(reader, session=None, since_ns=None, until_ns=None):
                  for r in reader.conn.execute(
                      "SELECT artifact_id, artifact_content FROM artifacts")}
     return entries, artifacts
+
+
+def load_heads(reader):
+    """Load the signed per-session head records, or None when the database
+    predates the chain_heads table (2026-08-01). None vs {} matters:
+    None means chain length is structurally unverifiable (legacy DB);
+    an empty/partial dict means the table exists and a missing session
+    row is a tampering signal."""
+    try:
+        return {r["session_id"]: dict(r) for r in reader.conn.execute(
+            "SELECT session_id, last_sequence, last_entry_hash, head_hmac "
+            "FROM chain_heads")}
+    except sqlite3.OperationalError:
+        return None
 
 
 def load_node_identity(path):
@@ -1075,8 +1090,10 @@ def main(argv=None):
             "SELECT count(*) FROM chain_entries").fetchone()[0]
         entries, artifacts = load_evidence(
             reader, args.session, since_ns, until_ns)
+        heads = load_heads(reader)
         verifications, summary = verify.verify_chain(
-            entries, artifacts, okey=okey, chain_key=chain_key)
+            entries, artifacts, okey=okey, chain_key=chain_key,
+            heads=heads, selection_complete=since_ns is None and until_ns is None)
 
         identity = load_node_identity(args.node_identity)
         ctx = {

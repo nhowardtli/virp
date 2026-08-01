@@ -73,6 +73,9 @@ typedef struct {
     sqlite3_stmt       *stmt_get_last;
     sqlite3_stmt       *stmt_get_range;
     sqlite3_stmt       *stmt_insert_milestone;
+    /* Signed per-session head record (chain_heads table) */
+    sqlite3_stmt       *stmt_head_upsert;
+    sqlite3_stmt       *stmt_head_get;
     /* Intent store prepared statements */
     sqlite3_stmt       *stmt_intent_insert;
     sqlite3_stmt       *stmt_intent_get;
@@ -127,12 +130,48 @@ virp_error_t virp_chain_append(virp_chain_state_t *state,
 /*
  * Verify chain integrity for a sequence range within a session.
  * Re-hashes each entry and verifies HMAC + previous_entry_hash linkage.
+ *
+ * COMPLETENESS: the caller asserts that entries from_sequence..to_sequence
+ * exist. The verifier requires every sequence in that range to be present
+ * and valid — a range that ends early (tail truncation), returns zero rows,
+ * or is inverted (to < from) yields result->valid == false. Before
+ * 2026-08-01 this function verified only the rows the query returned, so
+ * deleting the last K entries of a session still verified as valid.
  */
 virp_error_t virp_chain_verify(virp_chain_state_t *state,
                                const char *session_id,
                                int64_t from_sequence,
                                int64_t to_sequence,
                                virp_chain_verify_result_t *result);
+
+/*
+ * Verify an ENTIRE session against its signed head record.
+ *
+ * Every append updates, in the same transaction, a per-session head row
+ * (chain_heads: last_sequence, last_entry_hash) authenticated by
+ * HMAC-SHA256(K_chain). This function:
+ *
+ *   1. loads the head record and verifies its HMAC;
+ *   2. walks sequences 0..head.last_sequence with the completeness rule
+ *      above;
+ *   3. requires the final verified entry's chain_entry_hash to equal
+ *      head.last_entry_hash.
+ *
+ * This is the call that makes "the whole session verifies" meaningful: a
+ * database writer WITHOUT K_chain cannot delete the chain tail undetected,
+ * because they can neither forge a head record for the shortened chain nor
+ * remove it (a session with entries but no head record fails verification).
+ *
+ * TRUST BOUNDARY: a holder of K_chain can still rewrite history wholesale,
+ * including the head. This authenticates chain length against the same
+ * adversary the per-entry HMAC targets — DB write access without the key —
+ * and no stronger one. External anchoring remains future work.
+ *
+ * result->to_sequence is set to the head's last_sequence.
+ */
+virp_error_t virp_chain_verify_session(virp_chain_state_t *state,
+                                       const char *session_id,
+                                       virp_chain_verify_result_t *result);
 
 /*
  * Get the last chain entry for a session.
