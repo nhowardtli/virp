@@ -592,3 +592,102 @@ change the git-based reinstall above is the correct, narrower rollback.
 - Registry version-binding, classify-before-connect + disposition split, and
   table-only transport for the connect/health probes remain undesigned, each
   with a TODO at its site.
+
+## Key hygiene — the ct211 credential, 2026-08-01
+
+Recorded here because the artifacts live outside this repo (`~/.ssh` and the
+containerlab lab directories), so the repo is the only durable record.
+
+### What was found
+
+Two distinct ed25519 keys both labelled `claude-code@ct211`, from the retired
+CT 211 build host:
+
+| fingerprint | private half | where it was trusted |
+|---|---|---|
+| `SHA256:rA3gTRbK…` | **UNLOCATED** | `nhoward@` on virp-lab AND node2 |
+| `SHA256:jVrtKaNz…` | `~/.ssh/virp-lab` on virp-lab | nowhere (inert) |
+
+The dangerous one is `rA3gTRbK…`: it granted `nhoward` on both hosts and its
+private half has never been located. On virp-lab it sat in `authorized_keys`
+with NO comment, which is why it read as "an unknown key" until node2's copy —
+which carries the `claude-code@ct211` comment — identified it.
+
+node2's `authorized_keys` also held four unparseable lines: three bare base64
+key bodies with no `ssh-ed25519` type prefix, and one 32-hex string
+`<REDACTED-32-HEX>`. All inert to sshd, evidence of a botched
+append.
+
+### What was removed
+
+- virp-lab `~/.ssh/authorized_keys` — `rA3gTRbK…` removed (operator).
+- node2 `~/.ssh/authorized_keys` — `rA3gTRbK…` plus the four malformed lines
+  removed (operator, 01:48). 7 raw lines to 2. Backup
+  `authorized_keys.bak-2026-08-01`.
+- virp-lab containerlab files — BOTH ct211 entries removed:
+  `frr-ospf-lab/clab-frr-ospf/authorized_keys` and
+  `frr-spine-leaf-lab/clab-frr-clos/authorized_keys`, each 3 keys to 1
+  (the laptop key). Backups `.bak-2026-08-01`, 0600.
+
+Verified by fingerprint AND by raw grep at every step — a malformed copy of a
+key body does not parse under `ssh-keygen -lf` but still sits in the file, so
+fingerprint-only checking would have missed exactly the lines that were there.
+Access proven on both hops after each change; FRR devices reconnect 4/4
+(they authenticate by password, not key).
+
+### Where the containerlab files come from — the removal is only half durable
+
+The clab `authorized_keys` files are NOT declared in either topology (the only
+`binds` are `daemons` and `frr.conf`). **containerlab 0.77.0 generates them**,
+harvesting the invoking user's SSH material. The old contents map exactly onto
+the sources at generation time:
+
+    jVrtKaNz…  <- ~/.ssh/virp-lab.pub          (a .pub file in ~/.ssh)
+    85OdOtNl…  <- ~/.ssh/authorized_keys        (laptop)
+    rA3gTRbK…  <- ~/.ssh/authorized_keys        (as it was then)
+
+Corroborated by timeline (lab file written 2026-07-29 18:17:52, four minutes
+after virp-lab.pub appeared at 18:13:08; claude-code-virp-lab.pub did not
+exist until 07-31 21:04 and is correctly absent) and by the absence of any
+ssh-agent (`SSH_AUTH_SOCK` unset).
+
+Consequence, split:
+
+- **`rA3gTRbK…` will NOT return.** Its only source was `~/.ssh/authorized_keys`,
+  now cleaned. A `clab deploy` regenerates without it.
+- **`jVrtKaNz…` WILL return on the next `clab deploy`**, because
+  `~/.ssh/virp-lab.pub` still exists and clab re-harvests it.
+
+Deleting the clab file is therefore treating the symptom. The durable fix is
+to remove the seed — `~/.ssh/virp-lab{,.pub}`, an orphaned keypair trusted
+nowhere — which has NOT been done pending an operator decision.
+
+### OPEN — do not treat as resolved
+
+1. **`rA3gTRbK…`'s private half is still unlocated.** It is now trusted
+   nowhere reachable on this pair, but nobody has established where it lives
+   or whether anything outside these two hosts trusts it. "Removed from the
+   hosts we can see" is not "revoked".
+2. **IDENTIFIED, AND IT IS A LIVE CREDENTIAL.** The 32-hex string in node2's
+   `authorized_keys` was assumed to be an approver `key_id` because it has
+   that shape. It is not. It is the **LibreNMS API token** — the exact value
+   of `LIBRENMS_TOKEN` in `/etc/virp/autopilot.env`.
+
+   It is deliberately NOT reproduced in this file. It was caught by the
+   pre-push secret sweep while this very section was being committed toward a
+   PUBLIC repository; the commit was discarded and the object store gc'd
+   before any push. That is the second time the "compare against the remote,
+   sweep for secret VALUES" gate has earned itself.
+
+   Exposure: it sat in `node2:~/.ssh/authorized_keys` (0600 nhoward:nhoward)
+   from an unknown date until 01:48 on 2026-08-01, and now sits in
+   `node2:~/.ssh/authorized_keys.bak-2026-08-01` with the same mode. Readable
+   by `nhoward` and by root on node2. It never reached this repo.
+
+   **The token should be rotated in LibreNMS and `autopilot.env` updated**, on
+   the standard principle that a credential found outside its store is
+   compromised regardless of who is believed to have read it. Until then the
+   backup file is a plaintext copy of a live credential in a world where the
+   store is supposed to be `autopilot.env` alone.
+3. **`~/.ssh/virp-lab.pub` re-seeds `jVrtKaNz…` into clab files** on every lab
+   deploy.
