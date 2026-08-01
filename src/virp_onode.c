@@ -1945,6 +1945,35 @@ static void send_framed_error(int fd, virp_error_t err)
 }
 
 /*
+ * Is this exactly a SHA-256 digest in hex — 64 chars, hex only?
+ *
+ * sign_intent and sign_outcome exist to witness a digest the CALLER
+ * already computed. Their contract has always been "64 hex chars", but
+ * it lived only in a comment: the handlers checked that req.command was
+ * non-empty and then HMAC'd whatever was there with the O-Key.
+ * req.command is char[1024], so that was a signing oracle — a caller
+ * could obtain an O-Key-authenticated, GREEN-tier observation over up
+ * to 1023 bytes of its own choosing, which is precisely the "text that
+ * looks like an observation vs. an actual observation" distinction the
+ * protocol exists to make unforgeable.
+ *
+ * Enforcing the digest shape removes the attacker's choice of content:
+ * a 64-hex string is a commitment to a preimage, not a message. Note
+ * this deliberately does NOT try to prove the digest corresponds to any
+ * real intent — the O-Node cannot know that. It only guarantees the
+ * signed bytes carry no attacker-authored text.
+ *
+ * Non-static so tests/test_onode.c can assert the predicate directly in
+ * addition to driving both handlers over the socket.
+ */
+bool onode_is_sha256_hex(const char *s)
+{
+    if (!s) return false;
+    return strlen(s) == 64 &&
+           strspn(s, "0123456789abcdefABCDEF") == 64;
+}
+
+/*
  * SO_PEERCRED accept-path gate.
  *
  * Checks the connected peer's UID against state->socket_allowed_uids.
@@ -2107,6 +2136,19 @@ static void handle_client(onode_state_t *state, int client_fd)
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
+        /*
+         * ENFORCE the 64-hex contract before signing (audit §4.1).
+         * Documented since the handler was written, checked only from
+         * here on: without it this is a signing oracle over up to 1023
+         * caller-chosen bytes.
+         */
+        if (!onode_is_sha256_hex(req.command)) {
+            fprintf(stderr, "[O-Node] sign_intent rejected: command is not "
+                            "a 64-char SHA-256 hex digest (len=%zu)\n",
+                    strlen(req.command));
+            send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+            break;
+        }
         /* req.command contains SHA256 hex of intent JSON (64 chars) */
         err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
                                       state->node_id, onode_next_seq(state),
@@ -2125,6 +2167,14 @@ static void handle_client(onode_state_t *state, int client_fd)
     case ONODE_ACTION_SIGN_OUTCOME:
         if (req.command[0] == '\0') {
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
+            break;
+        }
+        /* Same oracle, same enforcement — see SIGN_INTENT above (§4.1). */
+        if (!onode_is_sha256_hex(req.command)) {
+            fprintf(stderr, "[O-Node] sign_outcome rejected: command is not "
+                            "a 64-char SHA-256 hex digest (len=%zu)\n",
+                    strlen(req.command));
+            send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
             break;
         }
         /* req.command contains SHA256 hex of outcome JSON (64 chars) */
