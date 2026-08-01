@@ -59,11 +59,15 @@ VIRP:
 
 ## Reproducible Demo
 
-Two commands, no hardware, no credentials, no network access:
+Clone, install the build dependencies, run. No hardware, no credentials, no
+network access (Debian/Ubuntu):
 
 ```bash
 git clone https://github.com/nhowardtli/virp
-cd virp && docker compose -f demo/docker-compose.yml run --rm demo
+cd virp
+sudo apt install -y build-essential libssl-dev libsodium-dev \
+     libsqlite3-dev libssh2-1-dev libcurl4-openssl-dev libjson-c-dev
+./demo/run.sh
 ```
 
 The demo runs the reference collector against a deterministic **simulated
@@ -73,9 +77,11 @@ RED operation is blocked and a proposal is filed; an Ed25519 approval signed
 outside the collector executes the change once; approval reuse, expiry, and
 absence are refused with typed errors; an unknown operation fails closed;
 and every chain session verifies from its own genesis. On an independent
-verifier machine it ran 9/9 from a fresh clone in 15 seconds. The target is
-simulated, so the demo establishes protocol behavior, not device truth.
-Details and a native (non-Docker) path: [`demo/README.md`](demo/README.md).
+verifier machine with the dependencies already installed, it ran 9/9 from a
+fresh clone in 15 seconds; a first run that also installs dependencies and
+compiles takes about two minutes. The target is simulated, so the demo
+establishes protocol behavior, not device truth. Containerized alternative
+and details: [`demo/README.md`](demo/README.md).
 
 ---
 

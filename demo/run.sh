@@ -112,7 +112,7 @@ if [[ $DO_BUILD -eq 1 ]]; then
         echo "Build failed. Install dependencies first:" >&2
         echo "  sudo apt install -y build-essential libssl-dev libsodium-dev \\" >&2
         echo "       libsqlite3-dev libssh2-1-dev libcurl4-openssl-dev libjson-c-dev" >&2
-        echo "Or use the container: docker compose -f demo/docker-compose.yml run --rm demo" >&2
+        echo "Alternative, if your Docker ships the compose plugin: docker compose -f demo/docker-compose.yml run --rm demo" >&2
         exit 1
     fi
 fi

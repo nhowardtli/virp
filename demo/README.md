@@ -3,19 +3,30 @@
 A deterministic, self-contained demonstration of nine VIRP security behaviors.
 No router, hypervisor, credentials, or network access required.
 
+Recommended path (Debian/Ubuntu):
+
 ```bash
 git clone https://github.com/nhowardtli/virp
 cd virp
-docker compose -f demo/docker-compose.yml run --rm demo
-```
-
-Or natively, if you have the build dependencies:
-
-```bash
 sudo apt install -y build-essential libssl-dev libsodium-dev \
      libsqlite3-dev libssh2-1-dev libcurl4-openssl-dev libjson-c-dev
 ./demo/run.sh
 ```
+
+A first run, including the dependency install and compile, takes about two
+minutes. The demo needs no network access and no credentials.
+
+## Alternative: containerized run
+
+On modern Docker the compose plugin is invoked as `docker compose` (with a
+space), but not all apt-packaged Docker builds ship the plugin:
+
+```bash
+docker compose -f demo/docker-compose.yml run --rm demo
+```
+
+If `docker compose` errors ("unknown command", "unknown shorthand flag"), use
+the native path above — it is the reliable one.
 
 ## What it demonstrates
 
