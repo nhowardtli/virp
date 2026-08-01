@@ -193,14 +193,24 @@ never verifies the keyed `chain_hmac`, so a keyless attacker with DB
 write access can produce a chain the operator-facing API reports valid.
 See `SECURITY.md` §Verifier Limitations.
 
-**Still open:** the bridge's global-walk verifier is unfixed, so the
+**Fixed 2026-08-01 (this tree, undeployed):** the C verifier's
+tail-truncation and zero-row acceptance. Range verification now
+enforces completeness, and a signed per-session head record
+(`chain_heads`, HMAC'd with K_chain, updated transactionally with
+every append) authenticates chain LENGTH — `virp_chain_verify_session`
+/ daemon action `chain_verify_session` detect tail deletion, head
+deletion, and keyless head forgery. See `SECURITY.md` §Verifier
+Limitations for the mechanism and its trust boundary (a K_chain holder
+can still rewrite history; external anchoring remains future work).
+
+**Still open:** the bridge's global-walk verifier (`virp-bridge.py`,
+consumer side, not in this repository) is unfixed, so that
 operator-facing `chain_verify` API still reports `valid:false` on any
-multi-session database; the bridge never verifies `chain_hmac`; the C
-verifier accepts a truncated tail; and the two-writer genesis
-divergence is unresolved. Chain *logic* is covered by
-`tests/test_chain.c` (genesis, sequential linking, tamper detection,
-crash recovery) and `tests/test_chain_concurrency.c` *[tested — but no
-test covers tail-truncation or the zero-row case]*.
+multi-session database and never verifies `chain_hmac`; and the
+two-writer genesis divergence is unresolved. Chain *logic* is covered
+by `tests/test_chain.c` (genesis, sequential linking, tamper
+detection, crash recovery, tail-truncation, zero-row, head-record
+attacks, backfill) and `tests/test_chain_concurrency.c` *[tested]*.
 
 Fabrication is prevented by protocol design, assuming the O-Node is uncompromised *[tested — see `docs/VIRP-CLAIMS.md` Appendix A, C5–C8 and C16]*. See [`SECURITY.md`](SECURITY.md) for the full trust boundary analysis, including known open work on TCP-path mutual authentication.
 

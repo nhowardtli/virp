@@ -30,7 +30,7 @@ applies to the deployed daemon;
 - HMAC-SHA256 signing bypass or forgery *[tested — `tests/test_virp.c`, `tests/test_obs_v2.c`, ProVerif `proofs/virp_obs_v2.pv`. Scope caveat: the signature attests the bytes the O-Node read; that those bytes answer the signed command is enforced separately by the read path — see §Observation-Body Integrity]*
 - Observation-body integrity — signed body not corresponding to the command in the signed header *[fixed in branch, undeployed — five mechanisms: three from the `hardening-2026-07-29` review, two more from the five-driver read-path audit; all closed on `hardening/review-fixes-2026-07-29` and covered by `tests/test_ssh_io.c` and `tests/test_driver_fortigate_scrub.c`. Production still runs the pre-fix code; the 2026-07-29 pa-850 occurrence was never root-caused. See §Observation-Body Integrity]*
 - Trust tier escalation (e.g., RED command executing as GREEN) *[tested — five driver suites incl. table-driven reachability and adversarial separator injection; see `docs/VIRP-CLAIMS.md` C22–C25]*
-- Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection. Production chain verified per-session 2026-07-28: 162/169 sessions hash-linked; the 7 failures are writer-convention mismatches, not tamper evidence. Narrowed 2026-07-29: the C verifier accepts a truncated tail and a zero-row session, so "hash-linked" establishes internal link consistency, not completeness; the operator-facing `chain_verify` bridge API never checks the keyed `chain_hmac` and still reports a false negative on any multi-session database — see §Verifier Limitations and README]*
+- Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection. Production chain verified per-session 2026-07-28: 162/169 sessions hash-linked; the 7 failures are writer-convention mismatches, not tamper evidence. Narrowed 2026-07-29: "hash-linked" as measured then establishes internal link consistency, not completeness. Fixed 2026-08-01 in this tree (undeployed): range completeness + signed per-session head record close the truncated-tail/zero-row acceptance — see §Verifier Limitations. Still open: the operator-facing `chain_verify` bridge API (consumer-side repo) never checks the keyed `chain_hmac` and reports a false negative on any multi-session database]*
 - O-Node socket authentication bypass *[tested — `tests/test_onode.c` `test_peer_uid_allowed`, `test_peer_uid_rejected`]*
 - Device credential exposure through the API layer *[untested — no suite covers the API layer's credential handling]*
 - Session handshake state machine violations *[tested — `tests/test_session_negative.c`, `tests/test_session_key.c`]*
@@ -442,15 +442,47 @@ access can produce a chain this verifier reports valid. (Separately, it
 false-negatives on any multi-session database — see README.)
 *[untested]*
 
-**The C chain verifier accepts a truncated tail. NOT fixed.**
-`chain_verify_locked` (`src/virp_chain.c`) does verify per-entry
-`chain_hmac`, entry hash and linkage — but it reports `valid:true`
-whenever the walk ends, without checking that it reached the session's
-recorded tail. Deleting the newest K entries of a session leaves
-`valid:true`; a session with zero rows also verifies valid.
+**The C chain verifier accepts a truncated tail. FIXED 2026-08-01
+(this tree; not yet deployed to the running O-Node).** Two mechanisms:
+
+1. *Range completeness.* `chain_verify_locked` now requires every
+   sequence in the caller's requested range to be present and valid —
+   a range whose tail is missing, a zero-row session, and an inverted
+   range all return `valid:false` with a distinct `error_detail` and
+   `first_broken` set to the first missing sequence. *[tested —
+   `tests/test_chain.c` tail-truncation, zero-row and inverted-range
+   cases, each verified to FAIL against the pre-fix behavior]*
+
+2. *Signed head record.* Every append now updates, in the same
+   transaction, a per-session `chain_heads` row (`last_sequence`,
+   `last_entry_hash`) authenticated by HMAC-SHA256(K_chain) over a
+   versioned canonical (`VIRP-CHAIN-HEAD-v1`). The new
+   `virp_chain_verify_session()` (daemon action
+   `chain_verify_session`) authenticates the head, walks
+   `0..head.last_sequence` under the completeness rule, and requires
+   the final verified entry to match the head's commitment. A DB
+   writer WITHOUT K_chain can therefore no longer delete the chain
+   tail undetected: they can neither forge a head for the shortened
+   chain nor delete it (entries-without-head fails verification).
+   *[tested — deleted-tail, deleted-head, keyless-forged-head and
+   backfill cases in `tests/test_chain.c`; Python/C head-canonical
+   byte-parity verified against a C-produced database]*
+
 Consequently the 2026-07-28 "162/169 sessions fully hash-linked"
-result establishes internal link consistency, not completeness — it
-does not rule out deletion of trailing entries. *[untested]*
+result still establishes only internal link consistency AS MEASURED
+THEN; re-running the walk via `chain_verify_session` after deploy is
+what upgrades that claim to completeness.
+
+Scope limits, stated plainly: a holder of K_chain can still rewrite
+history wholesale, head included — the head authenticates chain length
+against the same adversary the per-entry HMAC targets (DB write access
+without the key) and no stronger one; external anchoring remains
+future work. Pre-existing sessions receive a backfilled head at first
+daemon start after upgrade (TRUST-ON-UPGRADE: the backfill blesses
+whatever length the database has at that moment; only appends after it
+extend the authenticated length). The autopilot chainwalk now uses
+`chain_verify_session`, removing the circularity where it derived the
+expected range from the same database it was auditing.
 
 ## Corrections to Previously Documented Behavior
 
