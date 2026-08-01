@@ -74,6 +74,7 @@ static size_t build_obs(virp_context_t *ctx, uint64_t seq,
     size_t out_len = 0;
     virp_error_t err = virp_build_observation_v2(
         ctx, TEST_NODE_ID, TEST_DEVICE_ID, VIRP_TIER_GREEN, seq, command,
+        NULL,   /* CLI command: historic canonicalizing hash */
         payload, sizeof(payload) - 1, buf, buf_len, &out_len);
     assert(err == VIRP_OK);
     return out_len;
@@ -153,7 +154,7 @@ static void test_verify_accepts_valid_observation(void)
     virp_obs_header_v2_t hdr;
     const uint8_t *payload;
     uint32_t payload_len;
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show ip route",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show ip route", NULL,
                                       msg, n, 0, &store,
                                       &hdr, &payload, &payload_len) == VIRP_OK);
     assert(payload_len == strlen("interface Gi0/1 is up"));
@@ -162,7 +163,7 @@ static void test_verify_accepts_valid_observation(void)
     /* command canonicalization: extra whitespace must not break the
      * binding — same canonical form, same hash */
     size_t n2 = build_obs(ctx, 2, "show   ip   route", msg, sizeof(msg));
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "  show ip route ",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "  show ip route ", NULL,
                                       msg, n2, 0, &store,
                                       NULL, NULL, NULL) == VIRP_OK);
 
@@ -186,12 +187,12 @@ static void test_replay_same_sequence_rejected(void)
     virp_seqstore_t store;
     assert(virp_seqstore_init(&store, NULL) == VIRP_OK);
 
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, 0, &store,
                                       NULL, NULL, NULL) == VIRP_OK);
 
     /* Capture-and-replay: byte-identical message, same sequence */
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, 0, &store,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_REPLAY_DETECTED);
@@ -217,10 +218,10 @@ static void test_non_monotonic_sequence_rejected(void)
 
     /* seq 5 accepted; a validly-signed but older seq 4 must then be
      * rejected — high-water, not set-membership */
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg5, n5, 0, &store,
                                       NULL, NULL, NULL) == VIRP_OK);
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg4, n4, 0, &store,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_REPLAY_DETECTED);
@@ -244,7 +245,7 @@ static void test_replay_rejected_across_store_restart(void)
 
     virp_seqstore_t store;
     assert(virp_seqstore_init(&store, SEQSTORE_FILE) == VIRP_OK);
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, 0, &store,
                                       NULL, NULL, NULL) == VIRP_OK);
     virp_seqstore_destroy(&store);
@@ -253,7 +254,7 @@ static void test_replay_rejected_across_store_restart(void)
      * The replayed capture must STILL be rejected. */
     virp_seqstore_t store2;
     assert(virp_seqstore_init(&store2, SEQSTORE_FILE) == VIRP_OK);
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, 0, &store2,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_REPLAY_DETECTED);
@@ -285,7 +286,7 @@ static void test_stale_observation_rejected(void)
 
     /* Just inside the window: accepted */
     uint64_t now_ok = hdr.timestamp_ns + VIRP_OBS_V2_FRESHNESS_WINDOW_NS - 1;
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, now_ok, &store,
                                       NULL, NULL, NULL) == VIRP_OK);
 
@@ -293,14 +294,14 @@ static void test_stale_observation_rejected(void)
     virp_seqstore_t store2;
     assert(virp_seqstore_init(&store2, NULL) == VIRP_OK);
     uint64_t now_late = hdr.timestamp_ns + VIRP_OBS_V2_FRESHNESS_WINDOW_NS + 1;
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, now_late, &store2,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_STALE_OBSERVATION);
 
     /* Timestamp far in the verifier's FUTURE is equally invalid */
     uint64_t now_early = hdr.timestamp_ns - VIRP_OBS_V2_FRESHNESS_WINDOW_NS - 1;
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, now_early, &store2,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_STALE_OBSERVATION);
@@ -313,7 +314,7 @@ static void test_stale_observation_rejected(void)
     uint8_t be[8];
     for (int i = 0; i < 8; i++) be[i] = (uint8_t)(fake_ts >> (56 - 8 * i));
     memcpy(tampered + 12, be, 8);
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       tampered, n, now_late, &store2,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_HMAC_FAILED);
@@ -342,7 +343,7 @@ static void test_command_substitution_rejected(void)
 
     /* ...but the requester asked for command A. Reject. */
     assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID,
-                                      "show running-config",
+                                      "show running-config", NULL,
                                       msg, n, 0, &store,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_CONTEXT_MISMATCH);
@@ -366,7 +367,7 @@ static void test_device_substitution_rejected(void)
     virp_seqstore_t store;
     assert(virp_seqstore_init(&store, NULL) == VIRP_OK);
 
-    assert(virp_verify_observation_v2(ctx, OTHER_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, OTHER_DEVICE_ID, "show version", NULL,
                                       msg, n, 0, &store,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_CONTEXT_MISMATCH);
@@ -397,7 +398,7 @@ static void test_cross_session_replay_rejected(void)
 
     virp_seqstore_t store;
     assert(virp_seqstore_init(&store, NULL) == VIRP_OK);
-    assert(virp_verify_observation_v2(s2, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(s2, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, 0, &store,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_HMAC_FAILED);
@@ -412,7 +413,7 @@ static void test_cross_session_replay_rejected(void)
     uint8_t saved_sid[16];
     memcpy(saved_sid, s1->session.session_id, 16);
     s1->session.session_id[0] ^= 0xFF;
-    assert(virp_verify_observation_v2(s1, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(s1, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, 0, &store,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_SESSION_INVALID);
@@ -443,7 +444,7 @@ static void test_master_key_signature_rejected(void)
 
     virp_seqstore_t store;
     assert(virp_seqstore_init(&store, NULL) == VIRP_OK);
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, 0, &store,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_HMAC_FAILED);
@@ -467,7 +468,7 @@ static void test_payload_tamper_rejected(void)
 
     virp_seqstore_t store;
     assert(virp_seqstore_init(&store, NULL) == VIRP_OK);
-    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, 0, &store,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_HMAC_FAILED);
@@ -493,7 +494,7 @@ static void test_verify_requires_active_session(void)
 
     virp_seqstore_t store;
     assert(virp_seqstore_init(&store, NULL) == VIRP_OK);
-    assert(virp_verify_observation_v2(cold, TEST_DEVICE_ID, "show version",
+    assert(virp_verify_observation_v2(cold, TEST_DEVICE_ID, "show version", NULL,
                                       msg, n, 0, &store,
                                       NULL, NULL, NULL) ==
            VIRP_ERR_SESSION_INVALID);

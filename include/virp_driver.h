@@ -219,6 +219,27 @@ typedef struct virp_driver {
      */
     const char *(*route_reason)(const char *command);
 
+    /*
+     * typed_profile — OPTIONAL. Non-NULL declares that this driver's
+     * commands are a TYPED-OPERATION PROFILE (see
+     * docs/DRIVER-TYPED-OPS.md), not a CLI string, and selects the
+     * exact-octet command hash instead of the generic canonicalizing
+     * one.
+     *
+     * Why this is a driver DECLARATION and not a property sniffed from
+     * the command text: sniffing would make the hash algorithm depend on
+     * attacker-influenced bytes, so a crafted command could choose which
+     * hash it is bound under. The driver owns the answer, statically.
+     *
+     * The value is the profile identifier bound into the hash; change it
+     * only alongside a protocol version bump, because it changes every
+     * command hash this driver produces.
+     *
+     * Drivers whose commands ARE CLI strings leave this NULL (designated
+     * initializers zero-fill it) and keep the historic behaviour.
+     */
+    const char *typed_profile;
+
 } virp_driver_t;
 
 /* =========================================================================

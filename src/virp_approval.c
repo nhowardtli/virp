@@ -71,10 +71,35 @@ static void sha256_hex(const void *data, size_t len, char out[65])
         snprintf(out + i * 2, 3, "%02x", md[i]);
 }
 
-/* command_hash = SHA-256 hex of the canonicalized command — the same
- * derivation the v2 observation header uses. */
-static virp_error_t command_hash_hex(const char *command, char out[65])
+/*
+ * command_hash = SHA-256 hex, the same derivation the v2 observation
+ * header uses — including the typed-operation split.
+ *
+ * typed_profile NULL -> canonicalize, then hash (historic CLI path).
+ * typed_profile set  -> exact validated octets via virp_typed_op_hash().
+ *
+ * The split matters most HERE. An approval record binds an approver's
+ * signature to a command hash; if two different command spellings hash
+ * alike, an approval issued for one authorizes the other. The typed
+ * parser refuses whitespace variants, but the canonicalizer collapses
+ * them, so without this split `pbs  op=X` (refused) and `pbs op=X`
+ * (approved) share a hash. Latent only while no typed profile has an
+ * approvable non-GREEN row.
+ */
+static virp_error_t command_hash_hex(const char *command,
+                                     const char *typed_profile,
+                                     char out[65])
 {
+    if (typed_profile) {
+        uint8_t md[32];
+        virp_error_t e = virp_typed_op_hash(typed_profile, command,
+                                            strlen(command), md);
+        if (e != VIRP_OK) return e;
+        for (int i = 0; i < 32; i++)
+            snprintf(out + i * 2, 3, "%02x", md[i]);
+        return VIRP_OK;
+    }
+
     char canon[512];
     if (virp_canonicalize_command(command, canon, sizeof(canon)) < 0)
         return VIRP_ERR_INVALID_LENGTH;
@@ -307,6 +332,7 @@ virp_error_t virp_approval_propose(const char *dir,
                                    const char *device,
                                    uint32_t device_node_id,
                                    const char *command,
+                                   const char *typed_profile,
                                    const char *proposer,
                                    const char *tier_name,
                                    virp_proposal_rec_t *out)
@@ -330,7 +356,7 @@ virp_error_t virp_approval_propose(const char *dir,
     snprintf(out->device, sizeof(out->device), "%s", device);
     out->device_node_id = device_node_id;
     snprintf(out->command, sizeof(out->command), "%s", command);
-    err = command_hash_hex(command, out->command_hash);
+    err = command_hash_hex(command, typed_profile, out->command_hash);
     if (err != VIRP_OK) return err;
     snprintf(out->proposer, sizeof(out->proposer), "%s",
              proposer && proposer[0] ? proposer : "unauthenticated-v1");
@@ -814,6 +840,7 @@ virp_error_t virp_approval_verify_consume(const char *dir,
                                           const char *device,
                                           uint32_t device_node_id,
                                           const char *command,
+                                          const char *typed_profile,
                                           uint64_t now_ns,
                                           virp_approval_rec_t *out)
 {
@@ -883,7 +910,7 @@ virp_error_t virp_approval_verify_consume(const char *dir,
 
     /* 3. Command binding. */
     char cmd_hash[65];
-    if (command_hash_hex(command, cmd_hash) != VIRP_OK ||
+    if (command_hash_hex(command, typed_profile, cmd_hash) != VIRP_OK ||
         strcmp(cmd_hash, out->command_hash) != 0)
         return VIRP_ERR_APPROVAL_HASH_MISMATCH;
 

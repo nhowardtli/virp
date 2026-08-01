@@ -28,6 +28,7 @@
 #include <sodium.h>              /* sodium_mlock */
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
+#include <openssl/evp.h>
 
 /* =========================================================================
  * Internal: compute SHA-256 fingerprint of a key
@@ -548,8 +549,90 @@ virp_error_t virp_verify(virp_context_t *ctx,
  * previously had to stay byte-identical or signer and verifier would
  * disagree on every command.
  */
-static virp_error_t command_hash(const char *command, uint8_t out[32])
+/*
+ * TYPED-OPERATION command hash — exact validated octets, never
+ * canonicalized.
+ *
+ *   SHA-256( "VIRP-TYPED-OP\0"
+ *            || u32be profile_id_len || profile_id
+ *            || u32be command_len    || command_octets )
+ *
+ * WHY THIS EXISTS. The generic hash below runs the command through
+ * virp_canonicalize_command(), which collapses runs of whitespace. A
+ * typed-operation parser REFUSES whitespace variants — `pbs  op=X` is
+ * RED, `pbs op=X` is GREEN — but both canonicalize to the same bytes and
+ * so hash identically. Anywhere a command hash is the binding between an
+ * approved object and an executed one (approval records, v2 observation
+ * headers), that collision lets a refused spelling stand in for an
+ * approved one. It is latent while no typed profile has an approvable
+ * non-GREEN row, and it becomes an approval-substitution hole the moment
+ * one exists.
+ *
+ * The domain-separation prefix and the length-prefixed fields are what
+ * keep this from colliding with the generic hash or with a different
+ * profile: no concatenation of (profile, command) can be reinterpreted
+ * as a different (profile, command) pair.
+ *
+ * PROTOCOL-VISIBLE: a typed-profile driver's command hashes change value
+ * under this scheme. Note for draft-06.
+ */
+virp_error_t virp_typed_op_hash(const char *profile,
+                                const char *command, size_t command_len,
+                                uint8_t out[32])
 {
+    if (!profile || !command || !out) return VIRP_ERR_NULL_PTR;
+
+    size_t plen = strlen(profile);
+    if (plen == 0 || plen > 64) return VIRP_ERR_INVALID_LENGTH;
+    if (command_len == 0 || command_len > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_INVALID_LENGTH;
+
+    static const char DOMAIN[] = "VIRP-TYPED-OP";   /* NUL included below */
+
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    if (!md) return VIRP_ERR_CRYPTO;
+
+    virp_error_t rc = VIRP_ERR_CRYPTO;
+    uint8_t be[4];
+    unsigned int outlen = 0;
+
+    if (EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1) goto done;
+    /* sizeof(DOMAIN) includes the terminating NUL — that NUL is part of
+     * the domain separator, deliberately. */
+    if (EVP_DigestUpdate(md, DOMAIN, sizeof(DOMAIN)) != 1) goto done;
+
+    be[0] = (uint8_t)(plen >> 24); be[1] = (uint8_t)(plen >> 16);
+    be[2] = (uint8_t)(plen >> 8);  be[3] = (uint8_t)plen;
+    if (EVP_DigestUpdate(md, be, 4) != 1)         goto done;
+    if (EVP_DigestUpdate(md, profile, plen) != 1) goto done;
+
+    be[0] = (uint8_t)(command_len >> 24); be[1] = (uint8_t)(command_len >> 16);
+    be[2] = (uint8_t)(command_len >> 8);  be[3] = (uint8_t)command_len;
+    if (EVP_DigestUpdate(md, be, 4) != 1)                goto done;
+    if (EVP_DigestUpdate(md, command, command_len) != 1) goto done;
+
+    if (EVP_DigestFinal_ex(md, out, &outlen) != 1) goto done;
+    if (outlen != 32) goto done;
+    rc = VIRP_OK;
+
+done:
+    EVP_MD_CTX_free(md);
+    return rc;
+}
+
+/*
+ * `typed_profile` NULL  -> historic CLI behaviour (canonicalize, hash).
+ * `typed_profile` set   -> exact-octet typed-op hash; the canonicalizer
+ *                          is NOT called on this path at all.
+ */
+static virp_error_t command_hash(const char *command,
+                                 const char *typed_profile,
+                                 uint8_t out[32])
+{
+    if (typed_profile)
+        return virp_typed_op_hash(typed_profile, command,
+                                  strlen(command), out);
+
     char canon[512];
     int canon_len = virp_canonicalize_command(command, canon, sizeof(canon));
     if (canon_len < 0)
@@ -565,6 +648,7 @@ virp_error_t virp_sign_observation_v2(
     uint8_t        tier,
     uint64_t       seq_num,
     const char    *command,
+    const char    *typed_profile,
     const uint8_t *payload,   size_t payload_len,
     virp_obs_header_v2_t *hdr_out,
     uint8_t        sig_out[32])
@@ -613,7 +697,8 @@ virp_error_t virp_sign_observation_v2(
     memcpy(hdr.session_id, ctx->session.session_id, 16);
 
     /* canonicalize command and hash it */
-    virp_error_t cherr = command_hash(command, hdr.command_hash);
+    virp_error_t cherr = command_hash(command, typed_profile,
+                                     hdr.command_hash);
     if (cherr != VIRP_OK) return cherr;
 
     /*
@@ -646,6 +731,7 @@ virp_error_t virp_build_observation_v2(
     uint64_t node_id, uint64_t device_id,
     uint8_t tier, uint64_t seq_num,
     const char *command,
+    const char *typed_profile,
     const uint8_t *payload, size_t payload_len,
     uint8_t *out_buf, size_t out_buf_len, size_t *out_len)
 {
@@ -667,6 +753,7 @@ virp_error_t virp_build_observation_v2(
     uint8_t sig[VIRP_OBS_V2_SIG_SIZE];
     virp_error_t err = virp_sign_observation_v2(ctx, node_id, device_id,
                                                 tier, seq_num, command,
+                                                typed_profile,
                                                 payload, payload_len,
                                                 &hdr, sig);
     if (err != VIRP_OK) return err;
@@ -685,6 +772,7 @@ virp_error_t virp_verify_observation_v2(
     virp_context_t *ctx,
     uint64_t expected_device_id,
     const char *expected_command,
+    const char *expected_typed_profile,
     const uint8_t *msg, size_t msg_len,
     uint64_t now_ns,
     virp_seqstore_t *seq_store,
@@ -748,7 +836,8 @@ virp_error_t virp_verify_observation_v2(
     /* Check 5 — command binding */
     {
         uint8_t expected_hash[32];
-        err = command_hash(expected_command, expected_hash);
+        err = command_hash(expected_command, expected_typed_profile,
+                           expected_hash);
         if (err != VIRP_OK) return err;
         if (!virp_consttime_eq(hdr.command_hash, expected_hash, 32))
             return VIRP_ERR_CONTEXT_MISMATCH;

@@ -80,6 +80,14 @@ static const char REASON_NO_TOKENID[] =
 static const char REASON_NO_FINGERPRINT[] =
     "no tls_fingerprint configured for this PBS device — the PBS driver "
     "pins the server certificate and has no insecure mode to fall back to";
+static const char REASON_DOT_SEGMENT[] =
+    "\".\" and \"..\" are refused as parameter values — a dot segment in a "
+    "derived path is removed by the HTTP client before transmission, so the "
+    "recorded path would not be the transmitted path";
+static const char REASON_NO_TIER[] =
+    "operation table row declares no trust tier — refusing to classify it "
+    "rather than defaulting to GREEN; every row must state its tier "
+    "explicitly (see pbs_op_table_validate)";
 static const char REASON_BAD_FINGERPRINT[] =
     "tls_fingerprint is not a SHA-256 fingerprint — expected 32 bytes of "
     "hex, colon-separated or bare";
@@ -113,6 +121,8 @@ static const pbs_op_t PBS_OPS[] = {
         .path   = "/api2/json/version",
         .query  = NULL,
         .params = PBS_PARAMS_NONE,
+        .tier   = VIRP_TIER_GREEN,   /* explicit: a read of static
+                                      * version/status data */
     },
     {
         .id     = "backup.datastore.usage",
@@ -120,6 +130,8 @@ static const pbs_op_t PBS_OPS[] = {
         .path   = "/api2/json/status/datastore-usage",
         .query  = NULL,
         .params = PBS_PARAMS_NONE,
+        .tier   = VIRP_TIER_GREEN,   /* explicit: a read of static
+                                      * version/status data */
     },
     {
         .id     = "backup.snapshots.list",
@@ -127,6 +139,8 @@ static const pbs_op_t PBS_OPS[] = {
         .path   = "/api2/json/admin/datastore/{store}/snapshots",
         .query  = NULL,
         .params = PBS_PARAMS_STORE,
+        .tier   = VIRP_TIER_GREEN,   /* explicit: a read of static
+                                      * version/status data */
     },
     {
         /* The verify typefilter is part of the OPERATION, not a caller
@@ -139,10 +153,58 @@ static const pbs_op_t PBS_OPS[] = {
         .path   = "/api2/json/nodes/localhost/tasks",
         .query  = "typefilter=verify",
         .params = PBS_PARAMS_NONE,
+        .tier   = VIRP_TIER_GREEN,   /* explicit: a read of static
+                                      * version/status data */
     },
 };
 
 #define PBS_OPS_COUNT (sizeof(PBS_OPS) / sizeof(PBS_OPS[0]))
+
+/*
+ * Operation-table invariants, checked at driver init.
+ *
+ * The point is that a row added WITHOUT an explicit tier must not reach
+ * production. A designated initializer leaves .tier == 0 ==
+ * VIRP_TIER_UNCLASSIFIED, which the classifier already fails closed on;
+ * this makes it loud at startup instead of quietly unclassified, and it
+ * also pins the "GET only" and "no BLACK rows" invariants.
+ */
+int pbs_op_table_validate(void)
+{
+    int bad = 0;
+    for (size_t i = 0; i < PBS_OPS_COUNT; i++) {
+        const pbs_op_t *op = &PBS_OPS[i];
+        if (!op->id || !op->path || !op->params) {
+            fprintf(stderr, "[PBS] op table row %zu is malformed\n", i);
+            bad = 1; continue;
+        }
+        if (op->tier == VIRP_TIER_UNCLASSIFIED) {
+            fprintf(stderr, "[PBS] op table row '%s' declares no tier — "
+                            "every row must state one explicitly\n", op->id);
+            bad = 1;
+        }
+        if (op->tier == VIRP_TIER_BLACK) {
+            fprintf(stderr, "[PBS] op table row '%s' is BLACK — this table "
+                            "carries no BLACK rows so every refusal stays "
+                            "approvable\n", op->id);
+            bad = 1;
+        }
+        /* (b) A dot segment in a STATIC template is the same divergence
+         * as one in a value, just authored rather than submitted. */
+        if (strstr(op->path, "/./") || strstr(op->path, "/../") ||
+            strstr(op->path, "/.") == op->path + strlen(op->path) - 2) {
+            fprintf(stderr, "[PBS] op table row '%s' has a dot segment in "
+                            "its path template\n", op->id);
+            bad = 1;
+        }
+        if (!pbs_method_is_allowed((int)op->method)) {
+            fprintf(stderr, "[PBS] op table row '%s' declares a non-GET "
+                            "method\n", op->id);
+            bad = 1;
+        }
+    }
+    return bad ? -1 : 0;
+}
 
 const pbs_op_t *pbs_op_lookup(const char *id)
 {
@@ -176,6 +238,25 @@ static bool pbs_is_value_char(char c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+}
+
+/*
+ * A path-segment value may never be "." or "..".
+ *
+ * The value charset admits '.', so `store=.` and `store=..` parse
+ * cleanly and get RECORDED as /api2/json/admin/datastore/./snapshots.
+ * libcurl then removes dot segments before transmitting unless
+ * CURLOPT_PATH_AS_IS is set — so the observation says one path and the
+ * wire carries another, which is precisely the recorded-vs-transmitted
+ * divergence this driver exists to eliminate.
+ *
+ * PATH_AS_IS is set in pbs_request(), but this check stays regardless:
+ * an intermediary or the origin server may normalize no matter what the
+ * client does, so the only durable fix is never to emit a dot segment.
+ */
+static bool pbs_is_dot_segment(const char *v)
+{
+    return v && (strcmp(v, ".") == 0 || strcmp(v, "..") == 0);
 }
 
 /* An op id is dotted-lowercase: no leading/trailing dot, no empty
@@ -338,6 +419,12 @@ int pbs_parse_command(const char *command, pbs_request_t *out,
 
         if (n == 0) {                        /* empty value */
             if (reason) *reason = REASON_GRAMMAR;
+            return -1;
+        }
+
+        /* Dot segments never reach a derived path. */
+        if (pbs_is_dot_segment(value)) {
+            if (reason) *reason = REASON_DOT_SEGMENT;
             return -1;
         }
 
@@ -635,37 +722,110 @@ struct virp_conn {
 /* Split the comma-separated devices.json allowlist. Entries that do not
  * satisfy the value charset are dropped loudly rather than silently:
  * a typo in the allowlist must not widen it. */
-static size_t pbs_parse_datastores(const char *csv,
-                                   char (*out)[PBS_VALUE_MAX],
-                                   const char *hostname)
+/*
+ * Parse the comma-separated devices.json allowlist. ATOMIC: returns -1
+ * and loads NOTHING on any malformed, duplicate, over-limit, dot-segment
+ * or charset-invalid entry. On success returns the entry count.
+ *
+ * The previous version trimmed internal whitespace and warn-and-continued
+ * past bad entries. Both were wrong in the same direction — they made a
+ * typo mean something rather than fail:
+ *
+ *   - deleting internal spaces turned ". ." into "..", manufacturing a
+ *     dot segment out of an entry that contained none;
+ *   - skipping a bad entry silently narrowed the allowlist, so a
+ *     mistyped datastore name became "that store is not permitted"
+ *     instead of "your config is wrong".
+ *
+ * An allowlist is a security control; a partially-loaded one is not a
+ * weaker version of the intended control, it is a DIFFERENT control that
+ * nobody reviewed. Refusing the device is the honest failure.
+ */
+int pbs_parse_datastores(const char *csv,
+                                char (*out)[PBS_VALUE_MAX],
+                                const char *hostname,
+                                const char **reason)
 {
-    size_t count = 0;
-    if (!csv || !*csv) return 0;
+    const char *who = hostname ? hostname : "?";
+    if (reason) *reason = NULL;
+    if (!csv || !*csv) return 0;          /* absent list is not an error */
 
+    size_t count = 0;
     const char *p = csv;
-    while (*p && count < PBS_MAX_DATASTORES) {
-        while (*p == ',' || *p == ' ') p++;
-        if (!*p) break;
+
+    while (*p) {
+        /* one field: up to the next comma, inclusive of any spaces */
+        const char *start = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        if (*p == ',') p++;
+
+        /* trim ONLY surrounding whitespace */
+        while (start < end && (*start == ' ' || *start == '\t')) start++;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+
+        size_t n = (size_t)(end - start);
+        if (n == 0) {
+            fprintf(stderr, "[PBS] %s: empty datastore allowlist entry — "
+                            "refusing to load the device\n", who);
+            if (reason) *reason = "empty datastore_allow entry";
+            return -1;
+        }
+        if (n + 1 > PBS_VALUE_MAX) {
+            fprintf(stderr, "[PBS] %s: datastore allowlist entry too long — "
+                            "refusing to load the device\n", who);
+            if (reason) *reason = "datastore_allow entry too long";
+            return -1;
+        }
+        if (count >= PBS_MAX_DATASTORES) {
+            fprintf(stderr, "[PBS] %s: datastore allowlist exceeds %d "
+                            "entries — refusing to load the device rather "
+                            "than truncating a security control\n",
+                    who, PBS_MAX_DATASTORES);
+            if (reason) *reason = "datastore_allow over limit";
+            return -1;
+        }
 
         char name[PBS_VALUE_MAX];
-        size_t n = 0;
-        bool ok = true;
-        while (*p && *p != ',') {
-            if (*p == ' ') { p++; continue; }
-            if (n + 1 >= sizeof(name) || !pbs_is_value_char(*p)) ok = false;
-            if (ok) name[n++] = *p;
-            p++;
-        }
+        memcpy(name, start, n);
         name[n] = '\0';
 
-        if (!ok || n == 0) {
-            fprintf(stderr, "[PBS] %s: ignoring malformed datastore "
-                            "allowlist entry\n", hostname ? hostname : "?");
-            continue;
+        /* internal whitespace is a REFUSAL, never silently joined */
+        for (size_t i = 0; i < n; i++) {
+            if (name[i] == ' ' || name[i] == '\t') {
+                fprintf(stderr, "[PBS] %s: datastore allowlist entry '%s' "
+                                "contains internal whitespace — refusing to "
+                                "load the device\n", who, name);
+                if (reason) *reason = "datastore_allow entry has internal whitespace";
+                return -1;
+            }
+            if (!pbs_is_value_char(name[i])) {
+                fprintf(stderr, "[PBS] %s: datastore allowlist entry '%s' "
+                                "has an illegal byte — refusing to load the "
+                                "device\n", who, name);
+                if (reason) *reason = "datastore_allow entry has an illegal byte";
+                return -1;
+            }
+        }
+        if (pbs_is_dot_segment(name)) {
+            fprintf(stderr, "[PBS] %s: datastore allowlist entry '%s' is a "
+                            "dot segment — refusing to load the device\n",
+                    who, name);
+            if (reason) *reason = "datastore_allow entry is a dot segment";
+            return -1;
+        }
+        for (size_t i = 0; i < count; i++) {
+            if (strcmp(out[i], name) == 0) {
+                fprintf(stderr, "[PBS] %s: duplicate datastore allowlist "
+                                "entry '%s' — refusing to load the device\n",
+                        who, name);
+                if (reason) *reason = "duplicate datastore_allow entry";
+                return -1;
+            }
         }
         memcpy(out[count++], name, sizeof(name));
     }
-    return count;
+    return (int)count;
 }
 
 /* =========================================================================
@@ -752,6 +912,29 @@ static virp_error_t pbs_request(struct virp_conn *conn, pbs_method_t method,
     curl_easy_setopt(conn->curl, CURLOPT_FOLLOWLOCATION, 0L);   /* no redirects:
                                      a redirect is a URL we did not derive */
 
+    /*
+     * Transmit the derived path EXACTLY as recorded. Without this libcurl
+     * squashes /./ and /../ before sending, so the observation and the
+     * wire could disagree. The return IS checked: an old or reduced
+     * libcurl that does not know this option would silently keep
+     * normalizing, and a silently-normalizing transport is the failure
+     * this whole fix is about.
+     *
+     * Dot segments are ALSO refused at parse time and at table
+     * validation — belt and braces, because an intermediary or the origin
+     * may normalize regardless of what this client asks for.
+     */
+    CURLcode pai = curl_easy_setopt(conn->curl, CURLOPT_PATH_AS_IS, 1L);
+    if (pai != CURLE_OK) {
+        fprintf(stderr, "[PBS] CURLOPT_PATH_AS_IS unsupported (%s) — "
+                        "refusing: the transmitted path could differ from "
+                        "the recorded one\n", curl_easy_strerror(pai));
+        curl_slist_free_all(headers);
+        if (resolve) curl_slist_free_all(resolve);
+        OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
+        return PBS_ERR_CURL_PERFORM;
+    }
+
     /* Pinned identity. VERIFYPEER stays on so the callback runs at all;
      * the callback is the actual check. */
     curl_easy_setopt(conn->curl, CURLOPT_SSL_VERIFYPEER, 1L);
@@ -794,6 +977,11 @@ static virp_error_t pbs_request(struct virp_conn *conn, pbs_method_t method,
  * Driver: connect
  * ========================================================================= */
 
+/* TODO(scope: deliberate session): the connect and health probes issue
+ * "/api2/json/version" as a literal rather than going through the op
+ * table. It is the same string a GREEN row derives, but a literal can
+ * drift from the table it is supposed to mirror. Route both probes
+ * through table-only transport. See "out of scope" list, 2026-08-01. */
 static virp_conn_t *pbs_connect(const virp_device_t *device)
 {
     if (!device) return NULL;
@@ -817,9 +1005,20 @@ static virp_conn_t *pbs_connect(const virp_device_t *device)
     OPENSSL_cleanse(pin, sizeof(pin));
     conn->connected = false;
 
-    conn->datastore_count = pbs_parse_datastores(device->datastore_allow,
-                                                 conn->datastores,
-                                                 device->hostname);
+    const char *ds_reason = NULL;
+    int ds_n = pbs_parse_datastores(device->datastore_allow,
+                                    conn->datastores, device->hostname,
+                                    &ds_reason);
+    if (ds_n < 0) {
+        fprintf(stderr, "[PBS] %s: refusing to connect — %s\n",
+                device->hostname, ds_reason ? ds_reason : "bad datastore_allow");
+        OPENSSL_cleanse(conn->device.api_token,
+                        sizeof(conn->device.api_token));
+        OPENSSL_cleanse(conn->pin, sizeof(conn->pin));
+        free(conn);
+        return NULL;
+    }
+    conn->datastore_count = (size_t)ds_n;
 
     uint16_t port = device->api_port ? device->api_port :
                     (device->port ? device->port : PBS_DEFAULT_PORT);
@@ -898,6 +1097,12 @@ static virp_conn_t *pbs_connect(const virp_device_t *device)
  * not of the moment.
  * ========================================================================= */
 
+/* TODO(scope: deliberate session): the daemon connects BEFORE it
+ * classifies, so an unclassifiable command still costs a connection, and
+ * a transport failure is not distinguished from a refusal in the
+ * caller-visible disposition (VIRP_EXEC_REFUSED vs _TRANSPORT_FAILURE).
+ * Reorder to classify-before-connect and split the disposition.
+ * See "out of scope" list, 2026-08-01. */
 static virp_error_t pbs_execute(virp_conn_t *base_conn, const char *command,
                                 virp_exec_result_t *result)
 {
@@ -1069,10 +1274,19 @@ virp_trust_tier_t pbs_gate_classify(const char *command, const char **reason)
         return VIRP_TIER_RED;
     }
 
-    /* Parsed, in-table, all parameters declared and present. Every v1
-     * row is GREEN; when a non-GREEN row is ever added this becomes a
-     * per-row tier lookup and the tests below must gain a case. */
-    return VIRP_TIER_GREEN;
+    /*
+     * Return the row's DECLARED tier. There is deliberately no
+     * "parsed successfully => GREEN" fallback: that fallback is how a
+     * future sensitive or stateful GET becomes GREEN without anyone
+     * making a gate decision about it. A row with no explicit tier holds
+     * VIRP_TIER_UNCLASSIFIED (0), which fails closed here and is
+     * rejected outright by pbs_op_table_validate() at init.
+     */
+    if (req.op->tier == VIRP_TIER_UNCLASSIFIED) {
+        if (reason) *reason = REASON_NO_TIER;
+        return VIRP_TIER_RED;
+    }
+    return req.op->tier;
 }
 
 virp_trust_tier_t pbs_gate_tier(const char *command)
@@ -1101,9 +1315,28 @@ static virp_driver_t pbs_driver = {
     .health_check  = pbs_health_check,
     .route_command = pbs_gate_tier,
     .route_reason  = pbs_gate_reason,
+    /*
+     * Typed-operation profile. Selects the exact-octet command hash
+     * (virp_typed_op_hash) instead of the canonicalizing one, so a
+     * spelling this parser REFUSES cannot share a hash with one it
+     * accepts. Bump alongside a protocol version change only — the value
+     * is bound into every command hash this driver produces.
+     */
+    .typed_profile = "pbs/1",
 };
 
 void virp_driver_pbs_init(void)
 {
+    /*
+     * Fail loudly rather than register a table with an unclassified row.
+     * Registering anyway would leave the row failing closed at the gate,
+     * which is safe but silent — and silence is how a missing tier
+     * survives to the next reader.
+     */
+    if (pbs_op_table_validate() != 0) {
+        fprintf(stderr, "[PBS] FATAL: operation table failed validation — "
+                        "driver NOT registered\n");
+        return;
+    }
     virp_driver_register(&pbs_driver);
 }

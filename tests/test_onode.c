@@ -619,6 +619,7 @@ TEST(test_execute_v2_session_bound_roundtrip)
     uint32_t payload_len = 0;
     virp_error_t err = virp_verify_observation_v2(
         g_state.ctx, r6_id, "show ip route",
+        NULL,
         resp, (size_t)n, 0, &store, &hdr, &payload, &payload_len);
     ASSERT_OK(err);
     ASSERT_EQ(hdr.version, VIRP_VERSION_2);
@@ -631,6 +632,7 @@ TEST(test_execute_v2_session_bound_roundtrip)
     /* 5 — REPLAY: the identical bytes must be rejected */
     err = virp_verify_observation_v2(
         g_state.ctx, r6_id, "show ip route",
+        NULL,
         resp, (size_t)n, 0, &store, NULL, NULL, NULL);
     ASSERT_EQ(err, VIRP_ERR_REPLAY_DETECTED);
 
@@ -640,12 +642,14 @@ TEST(test_execute_v2_session_bound_roundtrip)
     ASSERT_OK(virp_seqstore_init(&store2, NULL));
     err = virp_verify_observation_v2(
         g_state.ctx, r6_id, "show running-config",
+        NULL,
         resp, (size_t)n, 0, &store2, NULL, NULL, NULL);
     ASSERT_EQ(err, VIRP_ERR_CONTEXT_MISMATCH);
 
     /* 7 — DEVICE SUBSTITUTION: same bytes, wrong expected device */
     err = virp_verify_observation_v2(
         g_state.ctx, virp_device_id_from_hostname("R7"), "show ip route",
+        NULL,
         resp, (size_t)n, 0, &store2, NULL, NULL, NULL);
     ASSERT_EQ(err, VIRP_ERR_CONTEXT_MISMATCH);
 
@@ -1027,11 +1031,13 @@ TEST(test_batch_execute_v2_honors_obs_version)
 
     ASSERT_OK(virp_verify_observation_v2(g_state.ctx,
         virp_device_id_from_hostname("R5"), "show version",
+        NULL,
         resp[0], resp_len[0], 0, &store, &hdr, NULL, NULL));
     ASSERT_EQ(hdr.version, VIRP_VERSION_2);
 
     ASSERT_OK(virp_verify_observation_v2(g_state.ctx,
         virp_device_id_from_hostname("R6"), "show ip route",
+        NULL,
         resp[1], resp_len[1], 0, &store, &hdr, NULL, NULL));
     ASSERT_EQ(hdr.version, VIRP_VERSION_2);
 

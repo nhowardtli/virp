@@ -197,9 +197,26 @@ virp_error_t virp_sign_observation_v2(
     uint64_t node_id, uint64_t device_id,
     uint8_t tier, uint64_t seq_num,
     const char *command,
+    const char *typed_profile,
     const uint8_t *payload, size_t payload_len,
     virp_obs_header_v2_t *hdr_out,
     uint8_t sig_out[32]);
+
+/*
+ * Exact-octet command hash for TYPED-OPERATION profiles.
+ *
+ *   SHA-256("VIRP-TYPED-OP\0" || u32be len(profile) || profile
+ *                              || u32be len(command) || command)
+ *
+ * Used instead of the canonicalizing hash whenever a driver declares a
+ * typed_profile. The canonicalizer collapses whitespace, so commands a
+ * typed parser REFUSES hash identically to ones it accepts; binding an
+ * approval or an observation to that hash is then ambiguous. See
+ * docs/DRIVER-TYPED-OPS.md.
+ */
+virp_error_t virp_typed_op_hash(const char *profile,
+                                const char *command, size_t command_len,
+                                uint8_t out[32]);
 
 /*
  * Build a complete v2 observation wire message:
@@ -212,6 +229,7 @@ virp_error_t virp_build_observation_v2(
     uint64_t node_id, uint64_t device_id,
     uint8_t tier, uint64_t seq_num,
     const char *command,
+    const char *typed_profile,
     const uint8_t *payload, size_t payload_len,
     uint8_t *out_buf, size_t out_buf_len, size_t *out_len);
 
@@ -253,6 +271,7 @@ virp_error_t virp_verify_observation_v2(
     virp_context_t *ctx,
     uint64_t expected_device_id,
     const char *expected_command,
+    const char *expected_typed_profile,
     const uint8_t *msg, size_t msg_len,
     uint64_t now_ns,
     virp_seqstore_t *seq_store,
