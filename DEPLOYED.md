@@ -521,3 +521,74 @@ one credential in the tree — the FRR lab container password in
 **For future pushes:** compare against the REMOTE ref (`origin/main`), never
 a local base commit. A local base can be arbitrarily far ahead of what was
 ever published, which is exactly what happened here.
+
+## Update 2026-08-01 — canonicalization hardening (FIX 1–4)
+
+Four divergences between the object that gets classified/hashed/recorded and
+the object submitted/transmitted, from a fresh-context external review of the
+typed-op branch.
+
+- **Commit**: `cc2133512dffe31ec5124297852fe510f7708bd9`
+  (branch `feature/pbs-canon-hardening-2026-08-01`)
+- **Tree at install**: clean
+- **Installed binary**: `/usr/local/lib/virp/virp-onode-prod`
+  sha256 `db5ae063ec01810266eb1b84a9f752f55ff367fd6a3bf18cb786e791f2f4ba90`
+  (previous: `ce0bb73a…`)
+- **Deployed**: 2026-08-01 03:04:39 UTC
+
+### PROTOCOL-VISIBLE: typed-profile command hashes changed value
+
+FIX 1 replaces the canonicalizing command hash with an exact-octet one for
+any driver declaring a `typed_profile` (`"pbs/1"`). Every PBS command hash
+therefore has a different value after this deploy. Noted for draft-06.
+
+Checked before deploying: **no signed approval existed for `pbs-lab`**, so
+nothing in force was invalidated. 120 gate-rejection *proposals* do exist for
+PBS commands, carrying old-derivation hashes; those are now UNAPPROVABLE —
+`virp_approval_verify_consume` recomputes under the new derivation and
+returns `VIRP_ERR_APPROVAL_HASH_MISMATCH`. That is fail-closed and correct: a
+stale proposal cannot be approved into an execution. Deploying this while no
+approvable non-GREEN PBS row exists is precisely why it was safe now and
+would not have been later.
+
+### Verification (2026-08-01)
+
+- `make clean && make all-tests`: **exit 0 on virp-lab AND virp-node2** at
+  `cc21335`. New suites `test-typed-hash` 19/19, `test-ingress-nul` 17/17;
+  `test-pbs` 88 to 107. All clean under ASan+UBSan.
+- Connect counts **unchanged**: 12 drivers, 7/7 devices, 7 driver connects,
+  7 watchdog connects — identical to the pre-deploy baseline.
+- Autopilot cycle: 18 observations, 5 alerts — the same five pre-existing
+  ones (peer device absent from devices.json; `wazuh_active` 4 vs baseline 5).
+  No new alert kinds.
+- Adversarial corpus: **33 cases, 0 mismatches**.
+- FIX 2 proven live over the raw socket, not just in unit tests: a clean
+  request returns an observation (223 B) while an encoded-NUL smuggle, a
+  MALFORMED three-digit unicode escape, and a batch-item smuggle each return
+  the 4-byte framed error. Clean batch control returns an observation (231 B).
+- FIX 3 proven live: `store=.` and `store=..` classify RED, gate-blocked,
+  nothing executed, teaching reason intact.
+- FIX 4 proven live: all four v1 ops still classify GREEN via their declared
+  `.tier`, signatures VALID.
+
+### Rollback (code-only change — no snapshot needed)
+
+    cd /opt/virp && sudo git checkout -B feature/driver-pbs-typed-2026-07-31 8e554d7 \
+      && sudo make install-prod && sudo systemctl restart virp-onode
+
+The 2026-07-31 pve1 snapshots (`pre-pbs-2026-07-31`, VM 211 and VM 212) still
+exist, but rolling back to them would also undo the PBS deploy. For this
+change the git-based reinstall above is the correct, narrower rollback.
+
+### Still open after this deploy
+
+- No on-wire test asserts the exact request line, so `CURLOPT_PATH_AS_IS` is
+  proven only by the setopt return check and by dot segments being refused
+  three layers earlier. A local HTTP listener test is the only thing that
+  would close it. TODO at the site.
+- The typed-op interface is still `(const char *)`; FIX 2 closes the live
+  divergence at the ingress boundary but does not make the interface
+  length-aware. TODO at the site.
+- Registry version-binding, classify-before-connect + disposition split, and
+  table-only transport for the connect/health probes remain undesigned, each
+  with a TODO at its site.
