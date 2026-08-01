@@ -780,3 +780,61 @@ bytes the current `/api2/json/version` response has ~11x headroom, but if it
 ever grew past 1 KB, connect would refuse rather than silently truncate.
 Correct, and better than the alternative, but it is a new way for connect to
 fail.
+
+## Incident 2026-08-01 — daemon down 05:19–07:09 UTC (malformed autopilot.env)
+
+**Duration:** 1h 50m. **Successful starts in the window: 0** — this was a
+full outage, not flapping. 1265 restart attempts.
+
+**Cause.** During the LibreNMS token rotation, line 5 of
+`/etc/virp/autopilot.env` ended up holding TWO 32-character tokens
+separated by a space:
+
+    LIBRENMS_TOKEN=<tokenA> <tokenB>
+
+`sh` parses `VAR=value word` as "run `word` with `VAR=value` in its
+environment", so `LIBRENMS_TOKEN` was set only for that one (failed)
+command and was EMPTY afterwards. Every start logged
+
+    /etc/virp/autopilot.env: line 5: <tokenB>: command not found
+    [render-devices] FATAL: LIBRENMS_TOKEN not set in autopilot.env
+
+and `render-devices.sh` refused to render, so `ExecStartPre` failed and
+the daemon never started. `Restart=always` retried every 5s for 110
+minutes.
+
+**The fail-closed design worked exactly as intended.** The render refused
+to produce a devices.json rather than emit one with an empty credential,
+and the daemon refused to run without it. The alternative — starting with
+a blank LibreNMS token — would have meant a running daemon quietly
+failing every LibreNMS read, which is far worse than a loud stop. This
+incident is evidence FOR the loud-failure choice recorded on 2026-07-31,
+not against it.
+
+**What it cost anyway:** 110 minutes with no observations collected from
+any of the 7 devices, and no chain entries written in that window. Any
+audit of 05:19–07:09 will show a gap; the gap is explained here.
+
+**Recovery.** Repairing line 5 to a single `LIBRENMS_TOKEN=<value>` was
+sufficient; the next scheduled restart (07:09:46) rendered cleanly and
+came up 7/7 devices, 7 driver + 7 watchdog connects, all four PBS ops
+reachable. No code change, no redeploy.
+
+**Detection gap — the honest part.** Nothing alerted. The autopilot could
+not alert because the autopilot runs against the daemon that was down.
+The outage was found incidentally, ~110 minutes in, because an unrelated
+command sourced autopilot.env and printed the shell error. Nothing in the
+system watches "is virp-onode actually up", and the one component that
+would notice is the one that dies with it.
+
+FOLLOW-UP (queued, not done): an external liveness check that does not
+depend on the daemon — a systemd `OnFailure=` unit on virp-onode, or a
+node2-side probe of the peer, either of which would have caught this in
+minutes rather than hours.
+
+**Second-order finding.** The token rotation that triggered this was also
+incomplete: new tokens were created but the compromised one
+(`b6bfb7a2…`, the value found in node2's `authorized_keys`) was left
+live for a further ~2 hours and only revoked at the end of the session,
+confirmed HTTP 401. At one point four tokens were valid simultaneously.
+A rotation is not complete until the old credential is verified dead.
