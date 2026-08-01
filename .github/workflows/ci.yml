@@ -10,7 +10,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # ci/** is included so the workflow can be proven on its own branch
+    # before it is merged to main.
+    branches: [main, 'ci/**']
   pull_request:
   workflow_dispatch:
 
