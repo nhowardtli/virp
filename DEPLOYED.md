@@ -486,3 +486,38 @@ Fixed in `74f0550` (nanosecond ids, matching what `virp_autopilot.py` always
 did). The two bad entries are LEFT IN PLACE — the chain is append-only and
 rewriting it to hide a defect would be worse than the defect. Proofs above are
 the post-fix entries (seq 3–5).
+
+## Disclosure decision — 2026-08-01
+
+`github.com/nhowardtli/virp` is a **PUBLIC** repository, and
+`feature/driver-pbs-typed-2026-07-31` was pushed to it on 2026-08-01
+(remote `efb7eb5`).
+
+That push published this file and `docs/RUNBOOK-{EVIDENCE,CONFIG-BACKUP}.md`
+for the first time — none of them were tracked on `main` (`75b135f`). The
+pre-push sweep checked "is this already published?" against `9444ff0`, the
+branch's LOCAL base, which had never been on the remote; the correct
+reference was `main`. The conclusion drawn from it ("consistent with existing
+repo conventions") was therefore wrong, and the wider disclosure was not
+identified until after the push.
+
+**Operator reviewed and ACCEPTED the disclosure on 2026-08-01.** Recorded so
+it is a decision rather than an oversight, and so nobody re-opens it.
+
+What is public as a result:
+  - 9 RFC1918 addresses, incl. 10.0.10.1 (edge firewall) and 10.0.20.10
+    (Wazuh manager), both of which are also the daemon's hard exclusions
+  - the internal FQDN `pbs.thirdlevelit.local`
+  - service account names: `virp-ro`, `virp-ro2`, `virp-backup`,
+    `virp-evidence`, `virp-ro@pbs!virp`
+  - approver key_id `a88c58a6…`, chain artifact ids, installed-binary sha256s
+  - the security-posture narrative: which drivers carry no classifier, that
+    `VIRP_WAZUH_INSECURE=1` is live on the deployed unit, and the open items
+
+What is NOT public: no passwords, API tokens, or private key material. The
+one credential in the tree — the FRR lab container password in
+`deploy/devices.template.json` — was already on `main` before this branch.
+
+**For future pushes:** compare against the REMOTE ref (`origin/main`), never
+a local base commit. A local base can be arbitrarily far ahead of what was
+ever published, which is exactly what happened here.
