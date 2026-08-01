@@ -84,7 +84,14 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             # will then refuse — the operator should learn about it at
             # deploy time, not from a connect failure.
             "PBS_HOST", "PBS_TOKENID", "PBS_TOKEN",
-            "PBS_FINGERPRINT", "PBS_DATASTORES", "PBS_SERVERNAME"):
+            "PBS_FINGERPRINT", "PBS_DATASTORES", "PBS_SERVERNAME",
+            # cat3850-lab (10.0.10.2): the physical switch authenticates
+            # with a password and the driver has no key-auth path, so the
+            # credential must reach the rendered devices.json. It is NOT
+            # inlined in the tracked template, which is world-readable
+            # (0644) — unlike the throwaway "frrlab" lab passwords above
+            # it, this is a real operator account on physical hardware.
+            "SWITCH_PASS"):
     placeholder = "${%s}" % var
     if placeholder not in text:
         continue
