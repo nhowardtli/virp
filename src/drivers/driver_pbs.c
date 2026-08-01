@@ -924,6 +924,11 @@ static virp_error_t pbs_request(struct virp_conn *conn, pbs_method_t method,
      * validation — belt and braces, because an intermediary or the origin
      * may normalize regardless of what this client asks for.
      */
+    /* TODO(scope: deliberate session): no on-wire test asserts the exact
+     * request line. A local HTTP listener check is the only thing that
+     * proves PATH_AS_IS end to end — this is the class where unit tests
+     * of the string builder passed while the wire differed (cf. the
+     * hostname-verification bug, 2026-07-31). */
     CURLcode pai = curl_easy_setopt(conn->curl, CURLOPT_PATH_AS_IS, 1L);
     if (pai != CURLE_OK) {
         fprintf(stderr, "[PBS] CURLOPT_PATH_AS_IS unsupported (%s) — "

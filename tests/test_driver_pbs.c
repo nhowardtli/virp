@@ -727,6 +727,178 @@ static void test_differential_harness(void)
     PASS();
 }
 
+/* =========================================================================
+ * FIX 3 — dot segments never reach a derived path
+ * ========================================================================= */
+
+static void test_dot_segments(void)
+{
+    printf("\n=== Dot segments — recorded path must equal transmitted ===\n");
+
+    TEST("store=. refused");
+    refuse_diff("pbs op=backup.snapshots.list store=.");
+    PASS();
+
+    TEST("store=.. refused");
+    refuse_diff("pbs op=backup.snapshots.list store=..");
+    PASS();
+
+    TEST("a value merely CONTAINING dots is still fine");
+    {
+        pbs_request_t req;
+        assert(pbs_parse_command("pbs op=backup.snapshots.list store=a.b",
+                                 &req, NULL) == 0);
+        assert(pbs_parse_command("pbs op=backup.snapshots.list store=...",
+                                 &req, NULL) == 0);  /* not "." or ".." */
+    }
+    PASS();
+
+    TEST("every static path template is free of dot segments");
+    assert(pbs_op_table_validate() == 0);
+    PASS();
+}
+
+/* =========================================================================
+ * FIX 3 — the datastore allowlist loads atomically
+ * ========================================================================= */
+
+static void test_allowlist_atomic(void)
+{
+    printf("\n=== Datastore allowlist — atomic, strict ===\n");
+
+    char out[PBS_MAX_DATASTORES][PBS_VALUE_MAX];
+    const char *why = NULL;
+
+    TEST("a clean list loads");
+    assert(pbs_parse_datastores("colo-backups,vault-01", out, "t", &why) == 2);
+    assert(strcmp(out[0], "colo-backups") == 0);
+    assert(strcmp(out[1], "vault-01") == 0);
+    PASS();
+
+    TEST("surrounding whitespace is trimmed");
+    assert(pbs_parse_datastores("  colo-backups , vault-01  ", out, "t", &why) == 2);
+    assert(strcmp(out[0], "colo-backups") == 0);
+    PASS();
+
+    TEST("INTERNAL whitespace is REFUSED, never joined");
+    /* the old parser deleted internal spaces, so ". ." became ".." — a
+     * dot segment manufactured out of an entry that had none. */
+    assert(pbs_parse_datastores("colo backups", out, "t", &why) == -1);
+    assert(why != NULL);
+    PASS();
+
+    TEST("`. .` does not become `..`");
+    assert(pbs_parse_datastores(". .", out, "t", &why) == -1);
+    PASS();
+
+    TEST("a dot-segment entry is refused");
+    assert(pbs_parse_datastores("colo-backups,.", out, "t", &why) == -1);
+    assert(pbs_parse_datastores("..", out, "t", &why) == -1);
+    PASS();
+
+    TEST("a duplicate entry refuses the whole list");
+    assert(pbs_parse_datastores("a,b,a", out, "t", &why) == -1);
+    PASS();
+
+    TEST("an illegal byte refuses the whole list");
+    assert(pbs_parse_datastores("colo-backups,../etc", out, "t", &why) == -1);
+    assert(pbs_parse_datastores("a,b/c", out, "t", &why) == -1);
+    PASS();
+
+    TEST("an empty entry refuses the whole list");
+    assert(pbs_parse_datastores("a,,b", out, "t", &why) == -1);
+    PASS();
+
+    TEST("over-limit refuses as a WHOLE, never truncates");
+    {
+        char big[1024]; size_t o = 0;
+        for (int i = 0; i < PBS_MAX_DATASTORES + 3; i++)
+            o += (size_t)snprintf(big + o, sizeof(big) - o,
+                                  "%sds%d", i ? "," : "", i);
+        assert(pbs_parse_datastores(big, out, "t", &why) == -1);
+    }
+    PASS();
+
+    TEST("a rejected list loads NOTHING (atomicity)");
+    {
+        memset(out, 0, sizeof(out));
+        assert(pbs_parse_datastores("good,bad entry,alsogood", out, "t", &why) == -1);
+        /* nothing usable was committed for the caller to act on */
+        assert(why != NULL);
+    }
+    PASS();
+
+    TEST("an absent list is not an error (0 entries)");
+    assert(pbs_parse_datastores("", out, "t", &why) == 0);
+    assert(pbs_parse_datastores(NULL, out, "t", &why) == 0);
+    PASS();
+}
+
+/* =========================================================================
+ * FIX 4 — every table row declares its tier
+ * ========================================================================= */
+
+static void test_explicit_tier(void)
+{
+    printf("\n=== Explicit tier per row — no default-GREEN ===\n");
+
+    TEST("the shipped table validates");
+    assert(pbs_op_table_validate() == 0);
+    PASS();
+
+    TEST("every v1 row declares GREEN explicitly");
+    {
+        static const char *const IDS[] = {
+            "backup.version.read", "backup.datastore.usage",
+            "backup.snapshots.list", "backup.verify.tasks" };
+        for (size_t i = 0; i < sizeof(IDS)/sizeof(IDS[0]); i++) {
+            const pbs_op_t *op = pbs_op_lookup(IDS[i]);
+            assert(op != NULL);
+            assert(op->tier == VIRP_TIER_GREEN);
+        }
+    }
+    PASS();
+
+    TEST("a row with NO tier holds UNCLASSIFIED (fails closed)");
+    {
+        /* Exactly what a designated initializer produces when the author
+         * forgets .tier — the case the validator exists to catch. */
+        static const char *const NOPARAMS[] = { NULL };
+        pbs_op_t forgot = {
+            .id = "synthetic.forgot.tier",
+            .method = PBS_METHOD_GET,
+            .path = "/api2/json/version",
+            .query = NULL,
+            .params = NOPARAMS,
+        };
+        assert(forgot.tier == VIRP_TIER_UNCLASSIFIED);
+        assert(forgot.tier != VIRP_TIER_GREEN);
+    }
+    PASS();
+
+    TEST("a synthetic non-GREEN row reports its TRUE tier");
+    {
+        static const char *const NOPARAMS[] = { NULL };
+        pbs_op_t yellow = {
+            .id = "synthetic.yellow", .method = PBS_METHOD_GET,
+            .path = "/api2/json/version", .query = NULL,
+            .params = NOPARAMS, .tier = VIRP_TIER_YELLOW,
+        };
+        pbs_op_t red = {
+            .id = "synthetic.red", .method = PBS_METHOD_GET,
+            .path = "/api2/json/version", .query = NULL,
+            .params = NOPARAMS, .tier = VIRP_TIER_RED,
+        };
+        /* The classifier returns req.op->tier verbatim, so a row's tier
+         * IS its classification — no GREEN fallback in between. */
+        assert(yellow.tier == VIRP_TIER_YELLOW);
+        assert(red.tier    == VIRP_TIER_RED);
+        assert(yellow.tier != VIRP_TIER_GREEN);
+        assert(red.tier    != VIRP_TIER_GREEN);
+    }
+    PASS();
+}
+
 int main(void)
 {
     printf("=== PBS typed-operation driver tests ===\n");
@@ -741,6 +913,9 @@ int main(void)
     test_fingerprint();
     test_device_precheck();
     test_differential_harness();
+    test_dot_segments();
+    test_allowlist_atomic();
+    test_explicit_tier();
 
     printf("\n=== %d/%d passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

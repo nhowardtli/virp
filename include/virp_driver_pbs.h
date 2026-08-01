@@ -126,7 +126,40 @@ typedef struct {
     const char        *path;        /* may contain the "{store}" token  */
     const char        *query;       /* static query string, or NULL     */
     const char *const *params;      /* NULL-terminated allowed keys     */
+    /*
+     * MANDATORY, NEVER DEFAULTED. The tier this operation classifies as.
+     *
+     * The classifier returns THIS value; it does not assume that
+     * "parsed successfully" means GREEN. A row added without an explicit
+     * tier gets 0 == VIRP_TIER_UNCLASSIFIED from the designated
+     * initializer, which fails closed at the gate AND is rejected at
+     * driver init by pbs_op_table_validate() — so the failure is loud at
+     * startup rather than a silent GREEN.
+     *
+     * This is the reference-pattern hazard, not a PBS-specific one: the
+     * dangerous version of this driver is the one where someone adds a
+     * stateful or sensitive GET and it inherits GREEN because nothing
+     * made them state a tier.
+     */
+    virp_trust_tier_t  tier;
 } pbs_op_t;
+
+/*
+ * Validate the operation table at init. Returns 0 when every row
+ * declares a usable tier and method, -1 otherwise (after printing which
+ * row is at fault). Exposed for the unit tests.
+ */
+int pbs_op_table_validate(void);
+
+/*
+ * Parse the comma-separated datastore allowlist. ATOMIC: returns the
+ * entry count, or -1 loading nothing if ANY entry is malformed,
+ * duplicated, over-limit, a dot segment, or carries internal whitespace.
+ * A partially-loaded allowlist is a different security control than the
+ * one the operator wrote, so the device is refused instead.
+ */
+int pbs_parse_datastores(const char *csv, char (*out)[PBS_VALUE_MAX],
+                         const char *hostname, const char **reason);
 
 /* ── Parsed request ───────────────────────────────────────────────────
  * The whole result of parsing: which op, and its validated parameters.
