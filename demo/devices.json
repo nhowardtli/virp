@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "DEMO TARGET CONFIGURATION — NOT A REAL DEVICE.",
+    "",
+    "demo-r1 uses the built-in 'mock' driver (src/drivers/driver_mock.c), a",
+    "deterministic simulated target that returns canned, realistic-looking",
+    "output. No router, no credentials, and no network access are involved.",
+    "The mock driver's classifier (mock_route_command) tiers commands as:",
+    "  'show ...'                  -> GREEN",
+    "  'configure|clear|write|copy' -> YELLOW",
+    "  'reload|erase ...'          -> RED",
+    "  anything else               -> UNCLASSIFIED (blocked, fail closed)",
+    "",
+    "gate_max_tier is 'yellow' (the default), so GREEN and YELLOW execute",
+    "while RED and UNCLASSIFIED are blocked. gate_default_mode is 'enforce',",
+    "so blocks are real refusals rather than shadow-mode logging."
+  ],
+  "gate_max_tier": "yellow",
+  "gate_default_mode": "enforce",
+  "devices": [
+    {
+      "hostname": "demo-r1",
+      "host": "127.0.0.1",
+      "port": 22,
+      "_note": "No credentials: the mock driver never connects to anything.",
+      "vendor": "mock",
+      "node_id": "0DE00001"
+    }
+  ]
+}

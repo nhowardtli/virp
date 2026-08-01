@@ -1,0 +1,16 @@
+# VIRP demo — one command, no hardware.
+#
+#   docker compose -f demo/docker-compose.yml run --rm demo
+#
+# The evidence bundle is written to ./demo/output on the host.
+# The demo target is simulated (mock driver); no real device is contacted.
+
+services:
+  demo:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
+    volumes:
+      - ./output:/virp/demo/output
+    # No ports, no network access to anything outside the container.
+    network_mode: none
