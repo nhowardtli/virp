@@ -200,7 +200,20 @@ def independent_counts(db_path):
     recomputes hashes inline, so agreement with the report is corroboration
     rather than the same code agreeing with itself.
     """
-    conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    # mode=ro still needs a WRITABLE DIRECTORY on a WAL database, because
+    # SQLite must create the -wal/-shm sidecars to attach. Against the live
+    # /var/lib/virp/chain.db (0750 virp:virp, WAL) a non-virp reader gets
+    # "attempt to write a readonly database" — and only intermittently,
+    # depending on whether the daemon happens to be holding the sidecars
+    # open. That made this suite non-deterministic. immutable=1 reads the
+    # main file without touching the directory. Kept deliberately naive and
+    # self-contained: this helper must not import report/chain_read.py, or
+    # its agreement with the report stops being corroboration.
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+        conn.execute("SELECT count(*) FROM chain_entries").fetchone()
+    except sqlite3.OperationalError:
+        conn = sqlite3.connect("file:%s?immutable=1" % db_path, uri=True)
     conn.row_factory = sqlite3.Row
     rows = list(conn.execute(
         "SELECT * FROM chain_entries ORDER BY session_id, sequence"))
