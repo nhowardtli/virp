@@ -317,28 +317,83 @@ claim_refusal "unrecognized command blocked by default" "$REC/08-unknown.txt" \
 
 step 9 "The evidence chain verifies"
 "$TOOL" chain tail -n 25 --db "$RUN_DIR/chain.db" > "$REC/09-chain.txt" 2>&1
-if python3 - "$REC/09-chain.txt" <<'PY'
-import re, sys
-rows = []
-for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
-    hexes = re.findall(r'\b[0-9a-f]{16,}\b', line)
-    if len(hexes) >= 2:
-        rows.append((hexes[-2], hexes[-1]))
-if len(rows) < 2:
-    print("fewer than two chain rows parsed", file=sys.stderr)
-    sys.exit(1)
-for i, ((h_prev, _), (_, p_cur)) in enumerate(zip(rows, rows[1:])):
-    if h_prev != p_cur:
-        print(f"link broken at row {i+1}: {h_prev} != {p_cur}", file=sys.stderr)
-        sys.exit(1)
-print(f"{len(rows)} entries, all links intact")
-sys.exit(0)
+if python3 - "$RUN_DIR/chain.db" > "$REC/09-verify.txt" 2>&1 <<'PY'
+"""Verify chain linkage PER SESSION, then witness this run's own evidence.
+
+The chain is not one global list. Each session_id is its own hash-linked
+sequence: the entry at sequence 0 carries previous_entry_hash =
+sha256("VIRP_CHAIN_GENESIS:" + session_id), and each later entry commits to
+the previous entry OF THE SAME SESSION.
+
+Walking every row in rowid order instead, as an earlier version of this
+harness did, breaks the moment a second session appears: the first entry of
+session B looks like a broken link because its previous hash is B's genesis,
+not A's last hash. That global-walk mistake is a real defect that has shipped
+in a consumer-side bridge verifier, so this walker is written the correct way
+deliberately, and this comment exists so the next person copying it does the
+same. Per-session linkage is the property; row order is an artifact.
+"""
+import hashlib, sqlite3, sys
+from collections import defaultdict
+
+GENESIS_PREFIX = "VIRP_CHAIN_GENESIS:"
+
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+rows = db.execute(
+    "SELECT session_id, sequence, chain_entry_hash, previous_entry_hash,"
+    "       artifact_type"
+    "  FROM chain_entries ORDER BY session_id, sequence"
+).fetchall()
+if not rows:
+    sys.exit("no chain entries")
+
+sessions = defaultdict(list)
+for sid, seq, entry, prev, atype in rows:
+    sessions[sid].append((seq, entry, prev, atype))
+
+failures = []
+for sid, entries in sorted(sessions.items()):
+    entries.sort(key=lambda e: e[0])
+    expected = hashlib.sha256((GENESIS_PREFIX + sid).encode()).hexdigest()
+    for seq, entry, prev, _ in entries:
+        if prev != expected:
+            failures.append(
+                f"{sid} seq={seq}: previous_entry_hash {prev[:16]} "
+                f"!= expected {expected[:16]}")
+            break
+        expected = entry
+    else:
+        types = ",".join(t for _, _, _, t in entries)
+        print(f"OK  {sid}: {len(entries)} entries linked from genesis [{types}]")
+
+for f in failures:
+    print(f"BAD {f}")
+
+# The demo just generated a propose -> approve -> apply cycle. Step 9 should
+# witness that evidence, not merely count links.
+triple = {}
+for sid, entries in sessions.items():
+    if sid.startswith("approval:"):
+        for _, _, _, atype in entries:
+            triple[atype.lower()] = True
+missing = [t for t in ("proposal", "approval", "outcome") if t not in triple]
+if missing:
+    failures.append("approval session missing artifact types: "
+                    + ", ".join(missing)
+                    + f" (saw: {', '.join(sorted(triple)) or 'nothing'})")
+    print("BAD " + failures[-1])
+else:
+    print("OK  approval session carries the proposal -> approval -> outcome triple")
+
+sys.exit(1 if failures else 0)
 PY
 then
-    ok "chain links verified (each entry commits to the previous)"
+    cat "$REC/09-verify.txt" | sed 's/^/      /'
+    ok "every session links from its own genesis; approval triple present"
 else
-    bad "chain links verified (each entry commits to the previous)" \
-        "see $REC/09-chain.txt"
+    cat "$REC/09-verify.txt" | sed 's/^/      /'
+    bad "every session links from its own genesis; approval triple present" \
+        "see $REC/09-verify.txt"
 fi
 
 # ------------------------------------------------------------------ summary --
