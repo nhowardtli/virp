@@ -24,13 +24,15 @@ evidence backing the corresponding defence:
 **[untested]** implemented, no automated coverage;
 **[fixed in branch, undeployed]** fixed and tested on a branch, but not
 merged to `main` and not running in production — the defect still
-applies to the deployed daemon;
+applies to the deployed daemon (as of 2026-08-01 **no in-scope item
+carries this tag**; every fix listed below is merged and deployed);
+**[open]** confirmed present in the deployed code, not yet fixed;
 **[aspirational]** intended, not yet built.
 
 - HMAC-SHA256 signing bypass or forgery *[tested — `tests/test_virp.c`, `tests/test_obs_v2.c`, ProVerif `proofs/virp_obs_v2.pv`. Scope caveat: the signature attests the bytes the O-Node read; that those bytes answer the signed command is enforced separately by the read path — see §Observation-Body Integrity]*
-- Observation-body integrity — signed body not corresponding to the command in the signed header *[fixed in branch, undeployed — five mechanisms: three from the `hardening-2026-07-29` review, two more from the five-driver read-path audit; all closed on `hardening/review-fixes-2026-07-29` and covered by `tests/test_ssh_io.c` and `tests/test_driver_fortigate_scrub.c`. Production still runs the pre-fix code; the 2026-07-29 pa-850 occurrence was never root-caused. See §Observation-Body Integrity]*
+- Observation-body integrity — signed body not corresponding to the command in the signed header *[tested — five mechanisms: three from the `hardening-2026-07-29` review, two more from the five-driver read-path audit; all closed on `hardening/review-fixes-2026-07-29`, merged to `main`, and running in production since the 2026-08-01 deploy. Covered by `tests/test_ssh_io.c` and `tests/test_driver_fortigate_scrub.c`. The 2026-07-29 pa-850 occurrence was never root-caused. See §Observation-Body Integrity]*
 - Trust tier escalation (e.g., RED command executing as GREEN) *[tested — five driver suites incl. table-driven reachability and adversarial separator injection; see `docs/VIRP-CLAIMS.md` C22–C25]*
-- Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection. Production chain verified per-session 2026-07-28: 162/169 sessions hash-linked; the 7 failures are writer-convention mismatches, not tamper evidence. Narrowed 2026-07-29: "hash-linked" as measured then establishes internal link consistency, not completeness. Fixed 2026-08-01 in this tree (undeployed): range completeness + signed per-session head record close the truncated-tail/zero-row acceptance — see §Verifier Limitations. Still open: the operator-facing `chain_verify` bridge API (consumer-side repo) never checks the keyed `chain_hmac` and reports a false negative on any multi-session database]*
+- Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection. Production chain verified per-session 2026-07-28: 162/169 sessions hash-linked; the 7 failures are writer-convention mismatches, not tamper evidence. Narrowed 2026-07-29: "hash-linked" as measured then establishes internal link consistency, not completeness. Fixed, merged to `main`, and deployed 2026-08-01 (running commit `b6e9602c`): range completeness + signed per-session head record close the truncated-tail/zero-row acceptance — see §Verifier Limitations. Still open: the operator-facing `chain_verify` bridge API (consumer-side repo) never checks the keyed `chain_hmac` and reports a false negative on any multi-session database]*
 - O-Node socket authentication bypass *[tested — `tests/test_onode.c` `test_peer_uid_allowed`, `test_peer_uid_rejected`]*
 - Device credential exposure through the API layer *[untested — no suite covers the API layer's credential handling]*
 - Session handshake state machine violations *[tested — `tests/test_session_negative.c`, `tests/test_session_key.c`]*
@@ -135,12 +137,22 @@ found two more — PAN-OS shared Cisco's defect and had a keepalive of
 its own, and every driver reported a promptless read as success. All
 are now addressed on branch `hardening/review-fixes-2026-07-29`.
 
-> **Deployment status.** These fixes are committed on that branch and
-> are **not merged to `main` and not deployed** as of 2026-07-29. The
-> running O-Node still has the pre-fix behavior described under "What
-> was wrong" below. Until the branch is deployed, every caveat in the
-> original form of this section still applies to production.
-> *[fixed in branch, undeployed]*
+> **Deployment status (updated 2026-08-01).** These fixes are **merged
+> to `main` and deployed**. They were already present in the binary
+> installed 2026-08-01 01:10 (`cc213351`) and remain in the current
+> running commit `b6e9602c`. The caveats under "What was wrong" below
+> describe the *pre-fix* behaviour and no longer apply to production;
+> they are kept as the record of what was wrong and why.
+> *[tested]*
+>
+> This block previously read "not merged to `main` and not deployed as
+> of 2026-07-29" and stayed that way after both had happened. The
+> 2026-08-01 external code audit read it, took `main` to be pre-hardening,
+> and re-reported findings that were already closed. A status line that
+> is not maintained is not a conservative default — it misdirects review
+> effort in whichever direction it happens to be wrong. Every claim in
+> this file is expected to resolve against the tree and the running
+> deployment on the date it carries.
 
 ### What was wrong
 
@@ -442,8 +454,11 @@ access can produce a chain this verifier reports valid. (Separately, it
 false-negatives on any multi-session database — see README.)
 *[untested]*
 
-**The C chain verifier accepts a truncated tail. FIXED 2026-08-01
-(this tree; not yet deployed to the running O-Node).** Two mechanisms:
+**The C chain verifier accepts a truncated tail. FIXED 2026-08-01,
+merged to `main` and deployed (running commit `b6e9602c`).** On first
+start under the fix the daemon backfilled a signed head for every
+pre-existing session — 33 sessions on virp-lab, 0 failures — under the
+trust-on-upgrade rule described in mechanism 2. Two mechanisms:
 
 1. *Range completeness.* `chain_verify_locked` now requires every
    sequence in the caller's requested range to be present and valid —
@@ -483,6 +498,96 @@ whatever length the database has at that moment; only appends after it
 extend the authenticated length). The autopilot chainwalk now uses
 `chain_verify_session`, removing the circularity where it derived the
 expected range from the same database it was auditing.
+
+## External Code Audit — 2026-08-01
+
+An external static audit was run against `main`. Because `main` was
+behind the fix branches and this file misdescribed that (see §Deployment
+status above), two of its six HIGH findings were already closed and it
+could not see them. The other four were real. Every finding below was
+re-confirmed against this tree before being acted on — line numbers in
+the audit referred to a different tree and did not all transfer.
+
+**Fixed, merged and deployed 2026-08-01 (running commit `b6e9602c`):**
+
+- **§4.1 — `sign_intent`/`sign_outcome` were a signing oracle.** Both
+  handlers checked only that `req.command` was non-empty and then
+  HMAC'd it with the O-Key. `req.command` is `char[1024]`, so any
+  caller reaching the socket could obtain an O-Key-authenticated,
+  GREEN-tier observation over up to 1023 bytes of its own text — text
+  that looks like an observation, which is the exact distinction this
+  protocol exists to make unforgeable. The documented "64 hex chars"
+  contract is now enforced before signing. Separately, `api/server.py`
+  never read `obs_type`, so an `INTENT_SIGNED` (0x08) observation was
+  reported identically to device output with `verified: true`; the
+  parser now surfaces `obs_type` and the execute path fails closed on
+  anything that is not `DEVICE_OUTPUT` or a signed `ERROR`. *[tested —
+  `tests/test_onode.c` drives both handlers over the socket;
+  `tests/test_obs_type_not_device_output.py` forces `verified=true` to
+  prove a verified 0x08 is still not device output. Both verified to
+  fail against the pre-fix code]*
+- **§4.3 — FortiGate `execute backup` was YELLOW.** At the shipped
+  `gate_max_tier: yellow` it executed with no approval, and
+  `execute backup config ftp <file> <server> <user> <pass>` makes the
+  device push its whole config — admin password hashes, VPN PSKs, API
+  tokens — to a caller-supplied host over a channel the O-Node never
+  sees, signs or chains. Now RED, so it requires approval rather than
+  being forbidden outright. *[tested —
+  `tests/test_driver_fortigate_black.c`]*
+- **§4.4 — chain digests and MACs were compared with `strcmp`.** Three
+  sites, two of them against `K_chain`-derived values. `strcmp` returns
+  at the first differing byte, which turns forging a `chain_hmac` from a
+  2^256 search into a byte-at-a-time walk against a verifier that will
+  re-run on demand. All three now use a constant-time comparison.
+  *[tested — `tests/test_chain.c`]*
+- **§4.5** is the chain-completeness work; see §Verifier Limitations.
+
+**Confirmed and still open.** These are real in the deployed code:
+
+- **§4.2 — an abbreviated BLACK command is downgraded to RED.** BLACK
+  matching is a literal full-token prefix compare with no abbreviation
+  expansion, so an abbreviated form falls through to RED, gets a
+  proposal filed, and becomes *approvable*; at `gate_max_tier: red` it
+  would need no approval. The driver-level backstop uses the same
+  matcher, so both layers miss the same input. The code fact is
+  confirmed; whether a given device accepts a given abbreviation is not
+  provable from this tree. *[open]*
+- **§4.6 — the approval signature does not cover the device name.** The
+  Ed25519 signature is over a 72-byte canonical of magic, proposal id,
+  command hash, `device_node_id`, timestamp and TTL. The `device`
+  hostname string, `approver_key_id`, `operator` and `session_id` are
+  outside it, and verification compares the *unsigned* `device` string.
+  The only signed device binding is `device_node_id`, which is
+  degenerate: on virp-lab 5 of 7 devices load `node_id == 0` and so
+  share an identical binding. Comments in `src/virp_approval.c` claim
+  the signature "covers the whole body"; it does not. *[open]*
+- **§4.7 — SHADOW mode does not honour BLACK.** Both blocking branches
+  are gated on `mode == GATE_MODE_ENFORCE`, so under SHADOW a BLACK
+  verdict is logged and execution proceeds. Latent rather than live:
+  the shipped config is `gate_default_mode: enforce`. *[open]*
+- **§4.8 — the `proxmox` driver has no classifier.** `proxmox_driver`
+  in `src/drivers/driver_linux.c` reuses every linux hook but omits
+  `.route_command`, six lines below the `linux_driver` struct that sets
+  it. Every command on a proxmox device therefore classifies
+  UNCLASSIFIED. Under the shipped `gate_default_mode: enforce` that
+  fails closed — UNCLASSIFIED is block-worthy, so such a device can run
+  nothing rather than run something unreviewed — which makes this a
+  functionality gap rather than an exposure *unless* it is combined with
+  §4.7, where SHADOW would let the same UNCLASSIFIED command execute. No
+  proxmox device is present in the deployed config. *[open]*
+- **Not in the audit, found while confirming it:** `src/driver_panos.c`
+  has no driver-level BLACK list at all, so PAN-OS has no second layer
+  behind the gate the way Cisco and FortiGate do. The broad
+  single-row YELLOW entries — FortiOS `diagnose`, PAN-OS `debug`,
+  `test`, `less`, `tail` — hide sub-verbs with mutation or off-channel
+  semantics, the same shape as §4.3. *[open]*
+- **§4.5, residual.** The range walk still exits on any non-`ROW`
+  return, so `SQLITE_BUSY`/`ERROR`/`CORRUPT`/`IOERR` mid-walk is not
+  distinguished from clean exhaustion. The completeness check makes
+  this fail closed — an error-truncated walk reports fewer entries than
+  the range demands — so it is a diagnostic defect, not an integrity
+  one: the operator is told "chain truncated" when the real cause was a
+  database error. *[open, non-security]*
 
 ## Corrections to Previously Documented Behavior
 
