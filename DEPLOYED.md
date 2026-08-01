@@ -691,3 +691,92 @@ nowhere — which has NOT been done pending an operator decision.
    store is supposed to be `autopilot.env` alone.
 3. **`~/.ssh/virp-lab.pub` re-seeds `jVrtKaNz…` into clab files** on every lab
    deploy.
+
+## Update 2026-08-01 — oversized-response fail-closed fix deployed
+
+Closes an attestation-integrity bug: oversized HTTP responses were silently
+truncated and then signed as if verbatim.
+
+- **Commit**: `ebe6678d02eaa879df72961ccbe863083a4bfd01`
+  (branch `fix/pbs-truncation-failclosed-2026-08-01`)
+- **Tree at install**: clean
+- **Installed binary**: `/usr/local/lib/virp/virp-onode-prod`
+  sha256 `fb728199bf1587890856e98e3390a73fbaf1b43255a17821c3459de082c27b56`
+  (previous `db5ae063…`)
+- **Deployed**: 2026-08-01 04:45:32 UTC, PID 421334 (was 403188)
+- **DEPLOYED BUT UNMERGED** — the branch sits on top of
+  `feature/pbs-canon-hardening-2026-08-01`; no merge to main has happened.
+
+### What was wrong
+
+`pbs_write_cb` copied only what fit its fixed buffer and returned the FULL
+incoming byte count to libcurl, so libcurl believed the whole body had been
+consumed and the driver received no overflow signal. `pbs_execute` then set
+`output_len` from snprintf's would-have-written value, unclamped, and could
+mark the operation successful on HTTP status alone. The daemon's length clamp
+prevented an out-of-bounds read but signed the truncated observation anyway,
+with no truncation marker. A valid signature over incomplete evidence.
+
+Now fails closed at BOTH truncation points (capture buffer and observation
+formatter), returning a signed typed ERROR carrying "response exceeded
+evidence limit" instead of a truncated success. `output_len` is the bytes
+actually stored, and on the failure path the payload buffer is wiped and
+`output_len` set to 0 — which is what makes the daemon emit a signed ERROR
+rather than signing partial bytes as DEVICE_OUTPUT.
+
+### Verified live post-deploy
+
+- Connect/health probe against the real PBS: **clean**. `/api2/json/version`
+  is 92 bytes against the 1024-byte probe buffer (~11x headroom), so the
+  probe's new fail-closed behaviour does not affect normal connect.
+- Connect counts **unchanged**: 12 drivers, 7/7 devices, 7 driver + 7
+  watchdog connects.
+- Three real GREEN ops end-to-end, all `signature=VALID`, `tier=GREEN`,
+  `gate_decision=allowed`, HTTP 200:
+  `backup.version.read`, `backup.datastore.usage` (27,841 B — the largest
+  real response, exercising the capture path well inside limits),
+  `backup.snapshots.list store=colo-backups` (19,622 B).
+- Chain linkage verified: every `virp-cli:pbs-lab` entry's
+  `previous_entry_hash` equals its predecessor's `chain_entry_hash`.
+- The separate 8192-byte artifact limit behaves EXACTLY as before —
+  `backup.datastore.usage` (27,841 B) and `backup.snapshots.list` (19,622 B)
+  still sign and still report `chain=-`, refused by the artifact limit with
+  the same message, NOT by the new evidence-limit path. This fix did not
+  touch that path.
+- Zero "evidence buffer" refusals in the journal: nothing overflowed, which
+  is expected — no real response comes close to the limits.
+- Autopilot cycle: 18 observations, 5 alerts (the same five pre-existing).
+  Adversarial corpus: 33 cases, 0 mismatches.
+
+### NOT proven live — pending a TLS listener fixture
+
+The oversized path itself was **not** exercised against a real server.
+Forcing a >65 KB response requires a TLS listener presenting the pinned PBS
+certificate, whose private key lives on the PBS host. The largest real
+response available is 27,841 bytes, comfortably inside both buffers. The
+oversized path is covered by 26 unit tests (both buffer boundaries at
+just-below / exactly-at / just-above, plus the execute-level contract), and
+deployment was accepted on that evidence.
+
+**One fixture closes two gaps.** The same TLS listener would also close the
+`CURLOPT_PATH_AS_IS` on-wire test, which today is proven only by the checked
+setopt return and by dot segments being refused three layers earlier. Build
+the listener once:
+
+  - oversized-response live proof (this fix)
+  - PATH_AS_IS exact-request-line assertion (FIX 3, 2026-07-31)
+
+### Rollback
+
+    cd /opt/virp && sudo git checkout -B feature/pbs-canon-hardening-2026-08-01 cc21335 \
+      && sudo make install-prod && sudo systemctl restart virp-onode
+
+Restores binary sha256 `db5ae063ec01810266eb1b84a9f752f55ff367fd6a3bf18cb786e791f2f4ba90`.
+
+### Behaviour change worth knowing
+
+The connect and health probes use 1 KB buffers and now fail closed too. At 92
+bytes the current `/api2/json/version` response has ~11x headroom, but if it
+ever grew past 1 KB, connect would refuse rather than silently truncate.
+Correct, and better than the alternative, but it is a new way for connect to
+fail.
