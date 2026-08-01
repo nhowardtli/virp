@@ -89,6 +89,7 @@ extern "C" {
 #define PBS_ERR_PIN_MISMATCH    ((virp_error_t)(-225))
 #define PBS_ERR_GRAMMAR         ((virp_error_t)(-226))
 #define PBS_ERR_METHOD          ((virp_error_t)(-227))
+#define PBS_ERR_RESPONSE_TOO_LARGE ((virp_error_t)(-228))
 
 /* ── Tunables ─────────────────────────────────────────────────────── */
 #define PBS_API_TIMEOUT_SEC     30
@@ -160,6 +161,54 @@ int pbs_op_table_validate(void);
  */
 int pbs_parse_datastores(const char *csv, char (*out)[PBS_VALUE_MAX],
                          const char *hostname, const char **reason);
+
+/* ── Response capture ─────────────────────────────────────────────────
+ * `overflowed` is the whole point. The curl write callback used to copy
+ * only what fit and then return the FULL incoming byte count to libcurl,
+ * so libcurl believed the entire body had been consumed and the driver
+ * received no signal at all. The clipped body was then formatted, marked
+ * successful on HTTP status alone, and SIGNED — a valid signature over
+ * incomplete evidence, described in the payload as recorded verbatim.
+ *
+ * That is the precise failure VIRP exists to prevent, so capture now
+ * fails CLOSED: any overflow aborts the transfer and the operation
+ * becomes a signed typed ERROR instead of a truncated observation.
+ * ------------------------------------------------------------------- */
+typedef struct {
+    char   *buf;
+    size_t  buf_size;
+    size_t  offset;      /* bytes actually stored                        */
+    size_t  total;       /* bytes libcurl offered, including discarded   */
+    bool    overflowed;  /* body did not fit — evidence is incomplete    */
+} pbs_response_t;
+
+/*
+ * The curl write callback, exposed so the boundary cases can be driven
+ * directly in unit tests without a socket. Returns the number of bytes
+ * accepted; returning less than offered aborts the transfer, which is
+ * how overflow stops the download instead of silently discarding.
+ */
+size_t pbs_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata);
+
+/*
+ * Format the observation payload. Returns 0 on success with *stored set
+ * to the number of bytes ACTUALLY written (never snprintf's
+ * would-have-written value), or -1 if the payload did not fit — which is
+ * a second truncation point and also fails closed.
+ */
+int pbs_format_observation(char *out, size_t out_len,
+                           const char *hostname, const char *command,
+                           const char *path, long http_code,
+                           const char *body, size_t *stored);
+
+/*
+ * Shape a result as a fail-closed "evidence limit" refusal. output_len
+ * is set to 0, which is what makes the daemon emit a signed typed ERROR
+ * instead of signing partial bytes as DEVICE_OUTPUT. Exposed so that
+ * contract is asserted by a test rather than by reading the daemon.
+ */
+void pbs_result_evidence_limit(virp_exec_result_t *result,
+                               const char *hostname, const char *detail);
 
 /* ── Parsed request ───────────────────────────────────────────────────
  * The whole result of parsing: which op, and its validated parameters.

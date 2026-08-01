@@ -832,28 +832,91 @@ int pbs_parse_datastores(const char *csv,
  * Transport — GET, and only GET
  * ========================================================================= */
 
-typedef struct {
-    char   *buf;
-    size_t  buf_size;
-    size_t  offset;
-} pbs_response_t;
-
-static size_t pbs_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
+/*
+ * Write callback — FAILS CLOSED on overflow.
+ *
+ * The previous version copied only what fit and then returned
+ * `size * nmemb` regardless, telling libcurl the whole body had been
+ * consumed. libcurl was satisfied, the driver learned nothing, and the
+ * clipped body went on to be signed as if verbatim.
+ *
+ * Now: if the incoming chunk does not fit, mark the response overflowed
+ * and return a short count, which libcurl treats as CURLE_WRITE_ERROR
+ * and ABORTS the transfer.
+ *
+ * Aborting was chosen over drain-and-discard for two reasons. It stops
+ * pulling bytes that are only going to be thrown away — an oversized or
+ * hostile body cannot make the daemon read it to the end — and it keeps
+ * the callback a single branch with no second "still draining" state to
+ * get wrong. The cost is that `total` undercounts the true body size, so
+ * the error message says "at least N bytes" rather than claiming an
+ * exact size it never measured.
+ */
+size_t pbs_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
     pbs_response_t *resp = (pbs_response_t *)userdata;
     size_t bytes = size * nmemb;
+
+    if (!resp || !resp->buf || resp->buf_size == 0) return 0;
+
+    resp->total += bytes;
     size_t avail = resp->buf_size - resp->offset - 1;   /* reserve NUL */
 
-    if (bytes > avail)
-        bytes = avail;
-
-    if (bytes > 0) {
-        memcpy(resp->buf + resp->offset, ptr, bytes);
-        resp->offset += bytes;
+    if (bytes > avail) {
+        /*
+         * Keep what fits for the diagnostic only. It is NEVER signed:
+         * pbs_execute zeroes the output and reports output_len 0 on this
+         * path, which is what makes the daemon emit a signed ERROR
+         * rather than a DEVICE_OUTPUT observation over partial bytes.
+         */
+        if (avail > 0) {
+            memcpy(resp->buf + resp->offset, ptr, avail);
+            resp->offset += avail;
+        }
         resp->buf[resp->offset] = '\0';
+        resp->overflowed = true;
+        return 0;                    /* short count -> abort the transfer */
     }
 
-    return size * nmemb;   /* report full consumption to curl */
+    memcpy(resp->buf + resp->offset, ptr, bytes);
+    resp->offset += bytes;
+    resp->buf[resp->offset] = '\0';
+    return bytes;                    /* honest count */
+}
+
+/*
+ * Format the observation payload, reporting the length ACTUALLY stored.
+ *
+ * snprintf returns what it WOULD have written. Storing that as
+ * output_len overstates the payload whenever the format truncates, which
+ * is the second truncation point in this path: the body can fit the curl
+ * buffer and still not fit here once the header line is prepended. The
+ * daemon clamps the length later to avoid an out-of-bounds read, but a
+ * clamp is not a substitute for not lying about the length.
+ */
+int pbs_format_observation(char *out, size_t out_len,
+                           const char *hostname, const char *command,
+                           const char *path, long http_code,
+                           const char *body, size_t *stored)
+{
+    if (stored) *stored = 0;
+    if (!out || out_len == 0) return -1;
+
+    int written = snprintf(out, out_len, "%s>%s [GET %s] [HTTP %ld]\n%s",
+                           hostname ? hostname : "?",
+                           command ? command : "?",
+                           path ? path : "?",
+                           http_code, body ? body : "");
+    if (written < 0) { out[0] = '\0'; return -1; }
+
+    if ((size_t)written >= out_len) {
+        /* Truncated by the formatter — same class as a truncated body. */
+        out[0] = '\0';
+        return -1;
+    }
+
+    if (stored) *stored = (size_t)written;
+    return 0;
 }
 
 /*
@@ -897,7 +960,8 @@ static virp_error_t pbs_request(struct virp_conn *conn, pbs_method_t method,
     if (conn->use_resolve)
         resolve = curl_slist_append(resolve, conn->resolve_entry);
 
-    pbs_response_t resp = { .buf = out, .buf_size = out_len, .offset = 0 };
+    pbs_response_t resp = { .buf = out, .buf_size = out_len, .offset = 0,
+                            .total = 0, .overflowed = false };
     out[0] = '\0';
 
     curl_easy_reset(conn->curl);
@@ -954,6 +1018,21 @@ static virp_error_t pbs_request(struct virp_conn *conn, pbs_method_t method,
     curl_slist_free_all(headers);
     if (resolve) curl_slist_free_all(resolve);
     OPENSSL_cleanse(auth_hdr, sizeof(auth_hdr));
+
+    /*
+     * Overflow is checked BEFORE the generic curl-error branch, because
+     * aborting the transfer is exactly what produces CURLE_WRITE_ERROR
+     * here. Reporting it as a generic transport failure would lose the
+     * one fact that matters: the response was real, we simply could not
+     * capture all of it, so nothing about it may be signed as complete.
+     */
+    if (resp.overflowed) {
+        fprintf(stderr, "[PBS] %s: response exceeds the evidence buffer "
+                        "(at least %zu bytes, limit %zu) — refusing to "
+                        "record a truncated observation\n",
+                conn->device.hostname, resp.total, out_len - 1);
+        return PBS_ERR_RESPONSE_TOO_LARGE;
+    }
 
     if (rc != CURLE_OK) {
         /* Report the class, not the raw string, for TLS failures: a
@@ -1108,6 +1187,31 @@ static virp_conn_t *pbs_connect(const virp_device_t *device)
  * caller-visible disposition (VIRP_EXEC_REFUSED vs _TRANSPORT_FAILURE).
  * Reorder to classify-before-connect and split the disposition.
  * See "out of scope" list, 2026-08-01. */
+/*
+ * The fail-closed result shape, in one place.
+ *
+ * output_len MUST be 0. The daemon emits a signed typed ERROR only when
+ * (!success && output_len == 0 && error_msg[0]); with a non-zero length
+ * it takes the DEVICE_OUTPUT path instead and signs whatever bytes are
+ * in the buffer — which on this path is a TRUNCATED body, i.e. exactly
+ * the thing being refused. Getting this wrong turns the fix into the
+ * bug, so it is a single function with a single test.
+ */
+void pbs_result_evidence_limit(virp_exec_result_t *result,
+                               const char *hostname, const char *detail)
+{
+    if (!result) return;
+    memset(result->output, 0, sizeof(result->output));
+    result->output_len = 0;
+    result->success    = false;
+    result->exit_code  = 1;
+    snprintf(result->error_msg, sizeof(result->error_msg),
+             "response exceeded evidence limit on %.64s — %s; no complete "
+             "observation exists to sign, so nothing was recorded",
+             hostname ? hostname : "?",
+             detail ? detail : "capture incomplete");
+}
+
 static virp_error_t pbs_execute(virp_conn_t *base_conn, const char *command,
                                 virp_exec_result_t *result)
 {
@@ -1163,6 +1267,19 @@ static virp_error_t pbs_execute(virp_conn_t *base_conn, const char *command,
     result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
                                       (end.tv_nsec - start.tv_nsec) / 1000000);
 
+    /*
+     * FAIL CLOSED. output_len MUST be 0 here: the daemon emits a signed
+     * ERROR observation only when (!success && output_len == 0 &&
+     * error_msg[0]). Leaving partial bytes with a non-zero length would
+     * send this down the DEVICE_OUTPUT path instead — signing the very
+     * truncation this branch exists to refuse.
+     */
+    if (err == PBS_ERR_RESPONSE_TOO_LARGE) {
+        pbs_result_evidence_limit(result, conn->device.hostname,
+                                  "the body did not fit the capture buffer");
+        return VIRP_OK;      /* signed typed ERROR, not a transport failure */
+    }
+
     if (err == PBS_ERR_PIN_MISMATCH) {
         result->success = false;
         result->exit_code = 1;
@@ -1186,11 +1303,18 @@ static virp_error_t pbs_execute(virp_conn_t *base_conn, const char *command,
      * path next to the op is what lets a later reader confirm the
      * derivation without re-running the driver.
      */
-    int written = snprintf(result->output, sizeof(result->output),
-                           "%s>%s [GET %s] [HTTP %ld]\n%s",
-                           conn->device.hostname, command, path,
-                           http_code, api_response);
-    result->output_len = (written > 0) ? (size_t)written : 0;
+    size_t stored = 0;
+    if (pbs_format_observation(result->output, sizeof(result->output),
+                               conn->device.hostname, command, path,
+                               http_code, api_response, &stored) != 0) {
+        /* Second truncation point: the body fit the capture buffer but
+         * the formatted payload does not fit the observation buffer.
+         * Same rule — refuse rather than sign a clipped payload. */
+        pbs_result_evidence_limit(result, conn->device.hostname,
+                                  "the formatted observation did not fit");
+        return VIRP_OK;
+    }
+    result->output_len = stored;   /* bytes STORED, never would-have-written */
 
     if (http_code == 401 || http_code == 403) {
         result->success = false;

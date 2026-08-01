@@ -590,6 +590,16 @@ $(TEST_INGRESS_NUL): tests/test_ingress_nul.c $(LIB)
 test-ingress-nul: $(TEST_INGRESS_NUL)
 	./$(TEST_INGRESS_NUL)
 
+# PBS oversized-response fail-closed boundaries. Offline: drives the real
+# write callback and formatter directly, no socket.
+TEST_PBS_TRUNC = $(BUILD_DIR)/test_pbs_truncation
+
+$(TEST_PBS_TRUNC): tests/test_pbs_truncation.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-pbs-trunc: $(TEST_PBS_TRUNC)
+	./$(TEST_PBS_TRUNC)
+
 TEST_PBS_GATE = $(BUILD_DIR)/test_driver_pbs_gate
 
 $(TEST_PBS_GATE): tests/test_driver_pbs_gate.c $(LIB)
@@ -706,10 +716,10 @@ DRIVER_BUILD_DIR = build-drivers
 
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, typed-hash, ingress-nul) ==="
+	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, typed-hash, ingress-nul, pbs-trunc) ==="
 	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 \
 	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms \
-	        test-pbs test-pbs-gate test-typed-hash test-ingress-nul
+	        test-pbs test-pbs-gate test-typed-hash test-ingress-nul test-pbs-trunc
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.
 #
@@ -1007,7 +1017,7 @@ asan-drivers:
 	        CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 \
 	        LIBRENMS=1 PBS=1 \
 	        test-pbs test-pbs-gate test-typed-hash test-ingress-nul \
-	        test-linux-gate test-cisco-gate
+	        test-pbs-trunc test-linux-gate test-cisco-gate
 	@echo "=== ASan+UBSan driver run complete ==="
 
 # libFuzzer harness (requires clang)
