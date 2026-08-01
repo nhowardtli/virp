@@ -7,13 +7,12 @@
 # No router, hypervisor, credentials, or network access are required.
 #
 # THE TARGET IS SIMULATED. This demonstrates protocol behavior, not that any
-# real device was reached. See ../virp/security.html for what VIRP does and
-# does not establish.
+# real device was reached. See https://thirdlevel.ai/virp/security.html for
+# what VIRP does and does not establish.
 #
 # Usage:
 #   ./demo/run.sh                 # build if needed, then run
 #   ./demo/run.sh --no-build      # use existing ./build artifacts
-#   ./demo/run.sh --keep          # keep the output directory contents
 #
 # Copyright (c) 2026 Third Level IT LLC — Apache 2.0
 
@@ -26,6 +25,7 @@ DEMO_DIR="$REPO_ROOT/demo"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="$DEMO_DIR/output/session-$STAMP"
 RUN_DIR="$OUT_DIR/run"
+REC="$OUT_DIR/records"
 LOG="$OUT_DIR/onode.log"
 SOCKET="$RUN_DIR/onode.sock"
 DEVICE="demo-r1"
@@ -34,8 +34,7 @@ DO_BUILD=1
 for arg in "$@"; do
     case "$arg" in
         --no-build) DO_BUILD=0 ;;
-        --keep)     ;;  # accepted for symmetry; output is always kept
-        -h|--help)  sed -n '3,20p' "$0"; exit 0 ;;
+        -h|--help)  sed -n '3,17p' "$0"; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -59,23 +58,43 @@ ok() {
 bad() {
     FAIL=$((FAIL + 1)); RESULTS+=("FAIL  $1")
     printf '      %s %s\n' "$(c_red 'NOT OBSERVED')" "$1"
+    [[ -n "${2:-}" ]] && printf '        %s\n' "$(c_dim "$2")"
+    return 0
 }
 
-# assert_contains <file> <needle> <description>
-assert_contains() {
-    if grep -qF -- "$2" "$1"; then ok "$3"; else
-        bad "$3"
-        printf '        %s\n' "$(c_dim "expected to find: $2")"
-        printf '        %s\n' "$(c_dim "in: $1")"
-    fi
+# Every positive claim runs through here. It must be evidenced by a string
+# only success produces, AND the record must carry no error marker. An
+# assertion a failure message can satisfy is a broken assertion: a demo that
+# greens a failed step is worse than a demo that fails.
+#
+#   claim <description> <record-file> <required-regex> [additional-file ...]
+claim() {
+    local desc="$1" file="$2" needle="$3"; shift 3
+    local files=("$file" "$@") f
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        if grep -qiE '^Error:|Unknown option:|cannot load|No such file|not found' "$f"; then
+            bad "$desc" "error text in $(basename "$f"): $(grep -ioE '^Error:.*|Unknown option:.*|.*cannot load.*' "$f" | head -1 | cut -c1-90)"
+            return 0
+        fi
+    done
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        if grep -qiE -- "$needle" "$f"; then ok "$desc"; return 0; fi
+    done
+    bad "$desc" "expected /$needle/ in $(basename "$file")"
 }
 
-# assert_not_contains <file> <needle> <description>
-assert_not_contains() {
-    if grep -qF -- "$2" "$1"; then
-        bad "$3"
-        printf '        %s\n' "$(c_dim "unexpectedly found: $2")"
-    else ok "$3"; fi
+# A step whose success IS a refusal (blocks, reuse rejection). The regex must
+# match that specific refusal, never a generic failure.
+claim_refusal() {
+    local desc="$1" file="$2" needle="$3"; shift 3
+    local files=("$file" "$@") f
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        if grep -qiE -- "$needle" "$f"; then ok "$desc"; return 0; fi
+    done
+    bad "$desc" "expected /$needle/ in $(basename "$file")"
 }
 
 cleanup() {
@@ -88,7 +107,7 @@ trap cleanup EXIT
 
 # -------------------------------------------------------------------- build --
 if [[ $DO_BUILD -eq 1 ]]; then
-    echo "Building the reference implementation (make prod, make all)..."
+    echo "Building the reference implementation (make all, make prod)..."
     if ! make -s all >/dev/null 2>&1 || ! make -s prod >/dev/null 2>&1; then
         echo "Build failed. Install dependencies first:" >&2
         echo "  sudo apt install -y build-essential libssl-dev libsodium-dev \\" >&2
@@ -107,29 +126,48 @@ for bin in "$TOOL" "$ONODE"; do
     fi
 done
 
-mkdir -p "$RUN_DIR/approvals" "$OUT_DIR/records"
+mkdir -p "$RUN_DIR/approvals" "$REC"
 
 # --------------------------------------------------------------------- keys --
-echo "Generating disposable demo keys in $RUN_DIR ..."
-"$TOOL" keygen okey     "$RUN_DIR/onode.key"     >/dev/null 2>&1
-"$TOOL" keygen approval "$RUN_DIR/approval"      >/dev/null 2>&1
+# Every key here is disposable and lives only under this session directory.
+# Nothing reads or writes /etc/virp or /var/lib/virp.
+echo "Generating disposable demo keys..."
+OKEY="$RUN_DIR/onode.key"
+"$TOOL" keygen okey     "$OKEY"             >"$REC/00-keygen-okey.txt"     2>&1
+"$TOOL" keygen approval "$RUN_DIR/approval" >"$REC/00-keygen-approval.txt" 2>&1
 head -c 32 /dev/urandom > "$RUN_DIR/chain.key"
 chmod 600 "$RUN_DIR"/*.key 2>/dev/null
 
-if [[ ! -s "$RUN_DIR/onode.key" ]]; then
-    echo "Key generation failed; see $RUN_DIR" >&2; exit 1
+if [[ ! -s "$OKEY" || ! -s "$RUN_DIR/approval.pub" ]]; then
+    echo "Key generation failed. See $REC/00-keygen-*.txt" >&2
+    cat "$REC"/00-keygen-*.txt >&2
+    exit 1
 fi
+
+# The daemon verifies approvals against an ENROLLED approver registry
+# (approvers.json), not a bare public key file. `virp enroll` prints one
+# registry entry; the registry is a JSON array of such entries.
+echo "Enrolling the demo approver..."
+REGISTRY="$RUN_DIR/approvers.json"
+ENTRY="$("$TOOL" enroll --key "$RUN_DIR/approval.pub" --operator "demo-approver" 2>"$REC/00-enroll.err")"
+if [[ -z "$ENTRY" ]]; then
+    echo "Approver enrollment failed:" >&2; cat "$REC/00-enroll.err" >&2; exit 1
+fi
+printf '[\n  %s\n]\n' "$ENTRY" > "$REGISTRY"
+cp "$REGISTRY" "$REC/00-approvers.json"
+python3 -c "import json; json.load(open('$REGISTRY'))" 2>/dev/null \
+    || { echo "Generated registry is not valid JSON: $REGISTRY" >&2; exit 1; }
 
 # ------------------------------------------------------------------- daemon --
 echo "Starting the O-Node against the simulated demo target..."
 "$ONODE" \
-    -k "$RUN_DIR/onode.key" \
+    -k "$OKEY" \
     -s "$SOCKET" \
     -d "$DEMO_DIR/devices.json" \
     -c "$RUN_DIR/chain.db" \
     -C "$RUN_DIR/chain.key" \
     -a "$RUN_DIR/approvals" \
-    -A "$RUN_DIR/approval.pub" \
+    -A "$REGISTRY" \
     > "$LOG" 2>&1 &
 ONODE_PID=$!
 
@@ -142,6 +180,16 @@ if [[ ! -S "$SOCKET" ]]; then
     echo "O-Node did not start. Log:" >&2; cat "$LOG" >&2; exit 1
 fi
 
+# If the approval flow did not come up, steps 4-7 cannot be demonstrated.
+# Abort rather than report a partial pass against a flow that never started.
+if grep -q 'Approval flow disabled' "$LOG"; then
+    echo >&2
+    echo "FATAL: the O-Node started with the approval flow DISABLED:" >&2
+    grep 'Approval flow disabled' "$LOG" >&2
+    echo "Registry used: $REGISTRY" >&2
+    exit 1
+fi
+
 printf '\n%s\n' "VIRP DEMO — nine security behaviors against a simulated target"
 printf '%s\n' "$(c_dim "target: $DEVICE (mock driver, deterministic; NOT a real device)")"
 printf '%s\n' "$(c_dim "output: $OUT_DIR")"
@@ -149,95 +197,127 @@ printf '%s\n' "$(c_dim "output: $OUT_DIR")"
 # ---------------------------------------------------------------- behaviors --
 
 step 1 "A GREEN operation executes"
-"$TOOL" exec "$DEVICE" "show version" --socket "$SOCKET" > "$OUT_DIR/records/01-green.txt" 2>&1
-assert_contains "$OUT_DIR/records/01-green.txt" "GREEN" "GREEN read classified and executed"
+"$TOOL" exec "$DEVICE" "show version" --socket "$SOCKET" --okey "$OKEY" \
+    > "$REC/01-green.txt" 2>&1
+claim "GREEN read classified and executed" "$REC/01-green.txt" 'GREEN'
 
 step 2 "Its record verifies"
-assert_contains "$OUT_DIR/records/01-green.txt" "VALID" "observation authentication tag verified"
+# The exec client verifies the returned observation against the O-Key it is
+# given (--okey). Without that flag it prints signature=SKIPPED, which is not
+# a verification result and must never be accepted as one.
+if grep -qiE 'SKIPPED' "$REC/01-green.txt"; then
+    bad "observation authentication tag verified" \
+        "client reported SKIPPED: it was not given the O-Key"
+else
+    claim "observation authentication tag verified" "$REC/01-green.txt" \
+        'signature=VALID|authentication=VALID|VALID'
+fi
 
 step 3 "Modifying the record causes verification failure"
-# Build a standalone observation with the demo O-Key, verify it, corrupt one
-# byte of the payload, and verify again. Same key, same verifier, one bit of
-# difference in the material.
-"$TOOL" build observation "$RUN_DIR/onode.key" 0DE00001 1 \
+"$TOOL" build observation "$OKEY" 0DE00001 1 \
         "interface GigabitEthernet0/1 is up" \
-        "$OUT_DIR/records/03-observation.bin" > "$OUT_DIR/records/03-build.txt" 2>&1
-"$TOOL" inspect "$OUT_DIR/records/03-observation.bin" "$RUN_DIR/onode.key" okey \
-        > "$OUT_DIR/records/03-verify-intact.txt" 2>&1
-cp "$OUT_DIR/records/03-observation.bin" "$OUT_DIR/records/03-observation-tampered.bin"
-# Flip the final payload byte (the trailing authentication tag is not touched;
-# the point is that the authenticated material no longer matches the tag).
-SIZE=$(stat -c%s "$OUT_DIR/records/03-observation-tampered.bin")
-printf '\x00' | dd of="$OUT_DIR/records/03-observation-tampered.bin" \
+        "$REC/03-observation.bin" > "$REC/03-build.txt" 2>&1
+"$TOOL" inspect "$REC/03-observation.bin" "$OKEY" okey \
+        > "$REC/03-verify-intact.txt" 2>&1
+INTACT_RC=$?
+cp "$REC/03-observation.bin" "$REC/03-observation-tampered.bin"
+SIZE=$(stat -c%s "$REC/03-observation-tampered.bin")
+printf '\x00' | dd of="$REC/03-observation-tampered.bin" \
         bs=1 seek=$(( SIZE - 40 )) count=1 conv=notrunc status=none
-"$TOOL" inspect "$OUT_DIR/records/03-observation-tampered.bin" "$RUN_DIR/onode.key" okey \
-        > "$OUT_DIR/records/03-verify-tampered.txt" 2>&1
+"$TOOL" inspect "$REC/03-observation-tampered.bin" "$OKEY" okey \
+        > "$REC/03-verify-tampered.txt" 2>&1
 TAMPER_RC=$?
-if [[ $TAMPER_RC -ne 0 ]] || grep -qiE 'invalid|fail|mismatch' "$OUT_DIR/records/03-verify-tampered.txt"; then
-    ok "modified record rejected by the verifier"
+# Both halves must hold: intact verifies AND tampered is rejected. A verifier
+# that rejected everything would otherwise "pass" this step.
+if [[ $INTACT_RC -eq 0 ]] && { [[ $TAMPER_RC -ne 0 ]] || \
+        grep -qiE 'invalid|fail|mismatch' "$REC/03-verify-tampered.txt"; }; then
+    ok "intact record verifies; modified record is rejected"
 else
-    bad "modified record rejected by the verifier"
+    bad "intact record verifies; modified record is rejected" \
+        "intact_rc=$INTACT_RC tampered_rc=$TAMPER_RC"
 fi
 
 step 4 "A RED operation is blocked"
-"$TOOL" exec "$DEVICE" "reload" --socket "$SOCKET" > "$OUT_DIR/records/04-red-blocked.txt" 2>&1
-assert_contains "$OUT_DIR/records/04-red-blocked.txt" "proposal" "RED command blocked; proposal filed"
-PROPOSAL_ID=$(grep -oE '[0-9a-f]{32}' "$OUT_DIR/records/04-red-blocked.txt" "$LOG" 2>/dev/null | head -1 | sed 's/.*://')
+"$TOOL" exec "$DEVICE" "reload" --socket "$SOCKET" --okey "$OKEY" \
+    > "$REC/04-red-blocked.txt" 2>&1
+claim_refusal "RED command blocked by the tier gate" "$REC/04-red-blocked.txt" \
+    'tier gate blocked|tier=RED|blocked'
+
+# Capture the proposal id ONLY from a line that names a proposal. A bare
+# 32-hex scrape also matches session ids, command hashes, and key ids: the
+# previous harness captured one of those and then reported success against
+# the resulting load error.
+PROPOSAL_ID=""
+for src in "$REC/04-red-blocked.txt" "$LOG"; do
+    [[ -f "$src" ]] || continue
+    PROPOSAL_ID=$(grep -oiE 'proposal(_id)?[=: ]+[0-9a-f]{32}' "$src" \
+                  | grep -oE '[0-9a-f]{32}' | head -1)
+    [[ -n "$PROPOSAL_ID" ]] && break
+done
+if [[ -n "$PROPOSAL_ID" ]]; then
+    printf '      %s\n' "$(c_dim "proposal_id=$PROPOSAL_ID")"
+    echo "$PROPOSAL_ID" > "$REC/04-proposal-id.txt"
+else
+    printf '      %s\n' "$(c_dim 'no proposal id found; steps 5-7 will report NOT OBSERVED')"
+fi
 
 step 5 "An Ed25519 approval is created"
-if [[ -n "${PROPOSAL_ID:-}" ]]; then
+if [[ -n "$PROPOSAL_ID" ]]; then
+    # approve talks to the daemon (challenge -> sign -> submit) and signs with
+    # the approver secret key. This subcommand has no --dir option.
     "$TOOL" approve "$PROPOSAL_ID" \
-        --dir "$RUN_DIR/approvals" \
+        --socket "$SOCKET" \
         --key "$RUN_DIR/approval.key" \
-        --pub "$RUN_DIR/approval.pub" \
-        > "$OUT_DIR/records/05-approve.txt" 2>&1
-    if [[ -f "$RUN_DIR/approvals/$PROPOSAL_ID.approval" ]] || \
-       ls "$RUN_DIR/approvals" 2>/dev/null | grep -q "$PROPOSAL_ID"; then
+        > "$REC/05-approve.txt" 2>&1
+    if grep -qE "\[APPROVAL\] submitted: proposal=$PROPOSAL_ID" "$LOG"; then
         ok "approval signed with a key the collector does not hold"
     else
-        bad "approval signed with a key the collector does not hold"
+        claim "approval signed with a key the collector does not hold" \
+            "$REC/05-approve.txt" 'approved|submitted|key_id'
     fi
 else
-    bad "approval signed with a key the collector does not hold (no proposal id captured)"
+    bad "approval signed with a key the collector does not hold" "no proposal id"
 fi
 
 step 6 "The exact approved operation executes"
-if [[ -n "${PROPOSAL_ID:-}" ]]; then
-    "$TOOL" apply "$PROPOSAL_ID" --dir "$RUN_DIR/approvals" --socket "$SOCKET" \
-        > "$OUT_DIR/records/06-apply.txt" 2>&1
-    assert_not_contains "$OUT_DIR/records/06-apply.txt" "approval_not_found" \
-        "approved command executed under its approval"
+if [[ -n "$PROPOSAL_ID" ]]; then
+    "$TOOL" apply "$PROPOSAL_ID" --dir "$RUN_DIR/approvals" \
+        --socket "$SOCKET" --okey "$OKEY" \
+        > "$REC/06-apply.txt" 2>&1
+    # Positive evidence only: the daemon must log that it VERIFIED the approval
+    # for THIS proposal. Absence of an error is not evidence anything ran.
+    if grep -qE "approval verified: proposal=$PROPOSAL_ID" "$LOG"; then
+        ok "approved command executed under its verified approval"
+    else
+        bad "approved command executed under its verified approval" \
+            "daemon never logged 'approval verified: proposal=$PROPOSAL_ID'"
+    fi
 else
-    bad "approved command executed under its approval (no proposal id captured)"
+    bad "approved command executed under its verified approval" "no proposal id"
 fi
 
 step 7 "Reusing the approval fails"
-if [[ -n "${PROPOSAL_ID:-}" ]]; then
-    "$TOOL" apply "$PROPOSAL_ID" --dir "$RUN_DIR/approvals" --socket "$SOCKET" \
-        > "$OUT_DIR/records/07-reuse.txt" 2>&1
-    if grep -qiE 'reuse|reused|-37|consumed' "$OUT_DIR/records/07-reuse.txt" "$LOG"; then
-        ok "single-use approval refused on reuse"
-    else
-        bad "single-use approval refused on reuse"
-    fi
+if [[ -n "$PROPOSAL_ID" ]]; then
+    "$TOOL" apply "$PROPOSAL_ID" --dir "$RUN_DIR/approvals" \
+        --socket "$SOCKET" --okey "$OKEY" \
+        > "$REC/07-reuse.txt" 2>&1
+    # Must be the specific single-use refusal, not any failure: a proposal that
+    # was never approved also fails, for a different and uninteresting reason.
+    claim_refusal "single-use approval refused on reuse" \
+        "$REC/07-reuse.txt" 'reused|approval_reused|-37|already consumed|consumed' "$LOG"
 else
-    bad "single-use approval refused on reuse (no proposal id captured)"
+    bad "single-use approval refused on reuse" "no proposal id"
 fi
 
 step 8 "An unknown operation fails closed"
-"$TOOL" exec "$DEVICE" "frobnicate the widget" --socket "$SOCKET" \
-    > "$OUT_DIR/records/08-unknown.txt" 2>&1
-if grep -qiE 'UNCLASSIFIED|blocked|tier gate' "$OUT_DIR/records/08-unknown.txt" "$LOG"; then
-    ok "unrecognized command blocked by default"
-else
-    bad "unrecognized command blocked by default"
-fi
+"$TOOL" exec "$DEVICE" "frobnicate the widget" --socket "$SOCKET" --okey "$OKEY" \
+    > "$REC/08-unknown.txt" 2>&1
+claim_refusal "unrecognized command blocked by default" "$REC/08-unknown.txt" \
+    'UNCLASSIFIED|tier gate blocked|blocked' "$LOG"
 
 step 9 "The evidence chain verifies"
-"$TOOL" chain tail -n 20 --db "$RUN_DIR/chain.db" > "$OUT_DIR/records/09-chain.txt" 2>&1
-# Each entry's PREV_HASH must equal the previous entry's HASH. Parse the two
-# hash columns and walk the links.
-if python3 - "$OUT_DIR/records/09-chain.txt" <<'PY'
+"$TOOL" chain tail -n 25 --db "$RUN_DIR/chain.db" > "$REC/09-chain.txt" 2>&1
+if python3 - "$REC/09-chain.txt" <<'PY'
 import re, sys
 rows = []
 for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
@@ -245,16 +325,20 @@ for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
     if len(hexes) >= 2:
         rows.append((hexes[-2], hexes[-1]))
 if len(rows) < 2:
+    print("fewer than two chain rows parsed", file=sys.stderr)
     sys.exit(1)
-for (h_prev, _), (_, p_cur) in zip(rows, rows[1:]):
+for i, ((h_prev, _), (_, p_cur)) in enumerate(zip(rows, rows[1:])):
     if h_prev != p_cur:
+        print(f"link broken at row {i+1}: {h_prev} != {p_cur}", file=sys.stderr)
         sys.exit(1)
+print(f"{len(rows)} entries, all links intact")
 sys.exit(0)
 PY
 then
     ok "chain links verified (each entry commits to the previous)"
 else
-    bad "chain links verified (each entry commits to the previous)"
+    bad "chain links verified (each entry commits to the previous)" \
+        "see $REC/09-chain.txt"
 fi
 
 # ------------------------------------------------------------------ summary --
@@ -265,6 +349,7 @@ cp "$DEMO_DIR/devices.json" "$OUT_DIR/devices.json" 2>/dev/null
     echo "VIRP demo bundle"
     echo "generated: $STAMP"
     echo "commit:    $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "tool:      $("$TOOL" version 2>/dev/null | head -1)"
     echo "target:    simulated (mock driver). NOT a real device."
     echo "behaviors: $PASS observed, $FAIL not observed"
     echo
@@ -279,7 +364,7 @@ else
 fi
 printf '%s/9 security behaviors observed\n' "$PASS"
 printf 'Evidence bundle: %s\n' "$OUT_DIR"
-printf 'Chain replay:    %s chain tail --db %s\n' "./build/virp-tool" "$RUN_DIR/chain.db"
+printf 'Chain replay:    ./build/virp-tool chain tail --db %s\n' "$RUN_DIR/chain.db"
 printf 'Daemon log:      %s\n' "$LOG"
 printf '%s\n' "$(c_dim 'The target was simulated. This shows protocol behavior, not that')"
 printf '%s\n' "$(c_dim 'any real device was reached or told the truth.')"
