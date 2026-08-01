@@ -121,6 +121,28 @@ VIRP_VERSION = 0x01
 VIRP_FRAME_VERSION = 0x02
 ONODE_MAX_REQUEST_SIZE = 24576
 VIRP_TYPE_OBSERVATION = 0x01
+
+# Observation sub-types (virp.h VIRP_OBS_*). The sub-header's first byte.
+#
+# Audit §4.1: this parser used to read obs_length at offset 2 and never
+# look at obs_type at offset 0, so an INTENT_SIGNED/OUTCOME_SIGNED
+# observation — which carries a caller-supplied digest, not anything the
+# O-Node saw on a device — came back indistinguishable from real device
+# output, and `verified: True`. Anything representing a value as
+# authenticated DEVICE OUTPUT must check this.
+VIRP_OBS_DEVICE_OUTPUT = 0x07
+VIRP_OBS_INTENT_SIGNED = 0x08
+VIRP_OBS_OUTCOME_SIGNED = 0x09
+
+OBS_TYPE_NAMES = {
+    0x01: "PREFIX_REACHABLE", 0x02: "LINK_STATE", 0x03: "PEER_STATE",
+    0x04: "FORWARDING_STATE", 0x05: "RESOURCE_STATE", 0x06: "SECURITY_STATE",
+    0x07: "DEVICE_OUTPUT", 0x08: "INTENT_SIGNED", 0x09: "OUTCOME_SIGNED",
+    0x0A: "CHAIN_ENTRY", 0x0B: "CHAIN_VERIFY", 0x0C: "INTENT_STORED",
+    0x0D: "INTENT_FETCHED", 0x0E: "INTENT_EXECUTED", 0x0F: "ERROR",
+    0x10: "VALIDATION_DECISION", 0x11: "APPROVAL_CHALLENGE",
+    0x12: "APPROVAL_RESULT",
+}
 VIRP_TYPE_HELLO = 0x02
 VIRP_TYPE_PROPOSAL = 0x10
 VIRP_TYPE_APPROVAL = 0x11
@@ -276,7 +298,45 @@ def _parse_error(reason: str) -> dict:
         "timestamp_iso": now_iso,
         "node_id": 0,
         "channel": "UNKNOWN",
+        # Present so the reject path has the same shape as success and no
+        # consumer KeyErrors — and so an unparseable frame is never
+        # mistaken for device output (audit §4.1).
+        "obs_type": None,
+        "obs_type_name": None,
+        "is_device_output": False,
     }
+
+
+#
+# The `execute` action produces exactly two observation sub-types:
+# DEVICE_OUTPUT (0x07) on success, and ERROR (0x0F) for every driver
+# failure, gate block and refusal — see the VIRP_OBS_* call sites in
+# src/virp_onode.c. Anything else arriving on this path did not come from
+# running a command on a device.
+#
+# This matters because sign_intent/sign_outcome produce genuinely
+# HMAC-valid observations (0x08/0x09) whose body is a caller-supplied
+# string. Before §4.1 those were shaped identically to device output
+# here, so a client that could reach the socket could have its own text
+# rendered by the REST surface as verified output from a device.
+# Fail closed on anything outside the allowlist rather than trusting
+# `verified` alone.
+#
+_EXECUTE_OBS_ALLOWED = frozenset({VIRP_OBS_DEVICE_OUTPUT, 0x0F})
+
+
+def _require_execute_observation(obs: dict) -> dict:
+    """Reject an observation that the execute path could not have produced."""
+    if obs.get("parse_error"):
+        return obs  # already a hard reject; keep the original reason
+    obs_type = obs.get("obs_type")
+    if obs_type not in _EXECUTE_OBS_ALLOWED:
+        name = OBS_TYPE_NAMES.get(obs_type, "UNKNOWN")
+        raise ConnectionError(
+            "refusing to report obs_type 0x{:02x} ({}) as device output — "
+            "the execute action emits only DEVICE_OUTPUT or ERROR".format(
+                obs_type if obs_type is not None else 0, name))
+    return obs
 
 
 def parse_virp_message(msg: bytes) -> dict:
@@ -353,14 +413,29 @@ def parse_virp_message(msg: bytes) -> dict:
 
     # For OBSERVATION messages, parse sub-header to extract the data
     obs_text = ""
+    obs_type = None
     if msg_type == VIRP_TYPE_OBSERVATION and len(payload) >= 4:
         # Observation sub-header: obs_type(1) + obs_scope(1) + obs_length(2 BE)
+        #
+        # obs_type is read here, not skipped (audit §4.1). Without it an
+        # INTENT_SIGNED (0x08) frame — whose body is a digest the CALLER
+        # chose, never anything observed on a device — was reported with
+        # the same shape and the same `verified: True` as real device
+        # output. The HMAC is genuine either way; what it authenticates
+        # is not. Callers must branch on obs_type, not on `verified`.
+        obs_type = payload[0]
         obs_length = struct.unpack_from("!H", payload, 2)[0]
         obs_text = payload[4:4 + obs_length].decode("utf-8", errors="replace")
     elif len(payload) > 0:
         obs_text = payload.decode("utf-8", errors="replace")
 
     return {
+        "obs_type": obs_type,
+        "obs_type_name": OBS_TYPE_NAMES.get(obs_type, "UNKNOWN")
+                         if obs_type is not None else None,
+        # The single question a consumer should ask before rendering this
+        # as something a device said.
+        "is_device_output": obs_type == VIRP_OBS_DEVICE_OUTPUT,
         "version": version,
         "type": type_names.get(msg_type, f"UNKNOWN(0x{msg_type:02x})"),
         "channel": "OBSERVATION" if channel == VIRP_CHANNEL_OC else f"INTENT({channel})",
@@ -441,7 +516,7 @@ def onode_execute(device: str, command: str, timeout: float = 30.0) -> dict:
             err_code = struct.unpack("!I", msg)[0]
             raise ConnectionError(f"onode error code: {err_code}")
 
-        return parse_virp_message(msg)
+        return _require_execute_observation(parse_virp_message(msg))
 
     except FileNotFoundError:
         raise ConnectionError(f"virp-onode socket not found at {VIRP_SOCKET}")
