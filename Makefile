@@ -571,6 +571,25 @@ $(TEST_PBS): tests/test_driver_pbs.c $(LIB)
 test-pbs: $(TEST_PBS)
 	./$(TEST_PBS)
 
+# Typed-operation command hashing (FIX 1). Offline and pure.
+TEST_TYPED_HASH = $(BUILD_DIR)/test_typed_op_hash
+
+$(TEST_TYPED_HASH): tests/test_typed_op_hash.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-typed-hash: $(TEST_TYPED_HASH)
+	./$(TEST_TYPED_HASH)
+
+# Ingress encoded-NUL rejection (FIX 2). Offline — drives the real
+# parse_request() through its fuzz wrapper, no socket.
+TEST_INGRESS_NUL = $(BUILD_DIR)/test_ingress_nul
+
+$(TEST_INGRESS_NUL): tests/test_ingress_nul.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-ingress-nul: $(TEST_INGRESS_NUL)
+	./$(TEST_INGRESS_NUL)
+
 TEST_PBS_GATE = $(BUILD_DIR)/test_driver_pbs_gate
 
 $(TEST_PBS_GATE): tests/test_driver_pbs_gate.c $(LIB)
@@ -687,10 +706,10 @@ DRIVER_BUILD_DIR = build-drivers
 
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate) ==="
+	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, typed-hash, ingress-nul) ==="
 	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 \
 	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms \
-	        test-pbs test-pbs-gate
+	        test-pbs test-pbs-gate test-typed-hash test-ingress-nul
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.
 #
@@ -987,7 +1006,8 @@ asan-drivers:
 	        LDFLAGS_EXTRA="-fsanitize=address,undefined" \
 	        CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 \
 	        LIBRENMS=1 PBS=1 \
-	        test-pbs test-pbs-gate test-linux-gate test-cisco-gate
+	        test-pbs test-pbs-gate test-typed-hash test-ingress-nul \
+	        test-linux-gate test-cisco-gate
 	@echo "=== ASan+UBSan driver run complete ==="
 
 # libFuzzer harness (requires clang)

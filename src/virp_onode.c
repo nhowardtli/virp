@@ -110,6 +110,30 @@ static bool json_extract_string_cjson(cJSON *root, const char *key,
 }
 
 /*
+ * The typed-operation profile a device's driver declares, or NULL.
+ *
+ * Single resolver so the three places that bind a command to a hash —
+ * the v2 observation header, the approval proposal, and the approval
+ * verify/consume — cannot disagree about which hash a command is under.
+ * If they disagreed, an approval issued under one derivation would fail
+ * (or worse, succeed) against a command hashed under the other.
+ *
+ * The profile is a static driver DECLARATION; the command text is never
+ * inspected to decide.
+ */
+/* TODO(scope: deliberate session): bind the driver/registry VERSION into
+ * approvals and observations alongside the profile id, so an approval
+ * cannot survive a table change that alters what an op id means.
+ * See "out of scope" list, 2026-08-01. */
+static const char *onode_typed_profile(onode_state_t *state, int dev_idx)
+{
+    if (!state || dev_idx < 0) return NULL;
+    const virp_driver_t *drv =
+        virp_driver_lookup(state->devices[dev_idx].vendor);
+    return drv ? drv->typed_profile : NULL;
+}
+
+/*
  * Extract a signed-integer-valued key. Accepts cJSON numbers only.
  * Returns false (leaving *out untouched) if absent or non-numeric.
  */
@@ -142,11 +166,96 @@ static bool json_extract_u64_bounded(cJSON *root, const char *key,
     return true;
 }
 
+/*
+ * Reject a request whose JSON encodes an embedded NUL.
+ *
+ * THE DIVERGENCE. cJSON decodes \u0000 to a real zero byte and keeps
+ * parsing (cJSON.c parse_string), so item->valuestring holds a string
+ * whose C length stops at that byte while the JSON value continues past
+ * it. Every extractor here copies with snprintf("%s"), which also stops
+ * at the NUL. So
+ *
+ *     "pbs op=backup.version.read\u0000 op=backup.verify.run"
+ *
+ * arrives as ONE JSON value, is copied as `pbs op=backup.version.read`,
+ * and the rest is discarded without a word — a submitted command and an
+ * executed command that are not the same object. Classification,
+ * hashing and the chain all see the truncated form.
+ *
+ * This is the fourth parser-length divergence found in this codebase, so
+ * the check lives at the INGRESS BOUNDARY and covers every key of every
+ * request, not just the driver that happened to expose it.
+ *
+ * The scan is deliberately syntactic and conservative: it looks for a
+ * \u0000 escape in the raw request text, counting preceding backslashes
+ * so an escaped backslash (\\u0000, a literal six-character string) is
+ * not mistaken for one. It rejects the WHOLE request rather than
+ * sanitizing a field, because a request that tries to smuggle a NUL is
+ * not a request with one bad field.
+ *
+ * REJECT, never truncate — the same rule the separator policy follows.
+ */
+/* TODO(scope: deliberate session): migrate the typed-op interface to
+ * (const uint8_t *, size_t) end to end. This NUL rejection closes the
+ * live divergence at the boundary; it does not make the interface
+ * length-aware, so a future caller that bypasses this ingress still
+ * hands a bare const char* to the parser. See FIX 2, 2026-08-01. */
+static bool json_has_nul_escape(const char *json)
+{
+    if (!json) return false;
+    for (const char *p = json; *p; p++) {
+        if (*p != 'u' || p == json) continue;
+
+        /* count the run of backslashes immediately before this 'u' */
+        size_t bs = 0;
+        const char *q = p - 1;
+        while (q >= json && *q == '\\') { bs++; if (q == json) break; q--; }
+        if ((bs % 2) == 0) continue;          /* not an escape introducer */
+
+        /*
+         * A \u escape MUST be followed by exactly four hex digits.
+         * Anything else is malformed JSON — and cJSON does not reject it,
+         * it feeds the partial digits to parse_hex4 and writes the
+         * result. `\u000 ` therefore decodes to codepoint 0, i.e. a real
+         * NUL, and the value silently truncates there. Found by the
+         * near-miss case in tests/test_ingress_nul.c, which was written
+         * expecting cJSON to refuse it.
+         *
+         * So: refuse a malformed \u escape outright, and refuse a
+         * well-formed one that encodes U+0000.
+         */
+        const char *h = p + 1;
+        int digits = 0, value = 0;
+        for (; digits < 4; digits++) {
+            char c = h[digits];
+            int v;
+            if      (c >= '0' && c <= '9') v = c - '0';
+            else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+            else break;
+            value = (value << 4) | v;
+        }
+        if (digits < 4) return true;          /* malformed -> refuse */
+        if (value == 0) return true;          /* U+0000     -> refuse */
+    }
+    return false;
+}
+
 static bool parse_request(const char *json, onode_request_t *req)
 {
     if (!json || !req) return false;
 
     memset(req, 0, sizeof(*req));
+
+    /* Length divergence: refuse a request carrying an encoded NUL before
+     * anything copies a field out of it. */
+    if (json_has_nul_escape(json)) {
+        fprintf(stderr, "[O-Node] request contains an encoded NUL "
+                        "(\\u0000) — refusing the whole request; a value "
+                        "that continues past a NUL is not the value that "
+                        "would be executed\n");
+        return false;
+    }
 
     /*
      * Structural validation: cJSON_Parse rejects malformed JSON. We
@@ -1093,7 +1202,9 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                                     proposal_id,
                                                     device_name,
                                                     state->devices[dev_idx].node_id,
-                                                    command, 0, &apr);
+                                                    command,
+                                                    onode_typed_profile(state, dev_idx),
+                                                    0, &apr);
             if (aerr == VIRP_OK) {
                 approved = true;
                 const virp_approver_t *ent = virp_approver_registry_find_any(
@@ -1167,7 +1278,9 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                         state->chain_enabled ? &state->chain : NULL,
                         proposer, device_name,
                         state->devices[dev_idx].node_id,
-                        command, proposer, gate_tier_name(gate_tier),
+                        command,
+                        onode_typed_profile(state, dev_idx),
+                        proposer, gate_tier_name(gate_tier),
                         &prop);
                 if (perr == VIRP_OK) {
                     size_t off = strlen(err_msg);
@@ -1442,10 +1555,22 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                       VIRP_OBS_V2_HEADER_SIZE -
                                       VIRP_OBS_V2_SIG_SIZE);
             uint64_t seq = ++state->ctx->session.last_seq;
+            /*
+             * The command hash binds the approved object to the executed
+             * one. For a TYPED-OPERATION driver that binding must be over
+             * the exact validated octets, not the whitespace-collapsed
+             * canonical form — otherwise a spelling the typed parser
+             * REFUSES hashes identically to one it accepts. The profile
+             * is a static driver declaration; nothing here inspects the
+             * command text to decide. NULL = historic CLI hashing.
+             */
+            const char *typed_profile = onode_typed_profile(state, dev_idx);
+
             err = virp_build_observation_v2(state->ctx,
                                      (uint64_t)state->devices[dev_idx].node_id,
                                      state->devices[dev_idx].device_id,
                                      gate_obs_tier(gate_tier), seq, command,
+                                     typed_profile,
                                      obs_data, data_len,
                                      out_buf, out_buf_len, out_len);
         }
@@ -1593,6 +1718,13 @@ static int parse_batch_commands(const char *json,
                                  batch_thread_arg_t *args,
                                  int max_cmds)
 {
+    /* Same ingress rule as the single path — the batch array is exactly
+     * where a smuggled NUL would be cheapest to hide. */
+    if (json_has_nul_escape(json)) {
+        fprintf(stderr, "[O-Node] batch contains an encoded NUL "
+                        "(\\u0000) — refusing the whole batch\n");
+        return 0;
+    }
     cJSON *root = cJSON_Parse(json);
     if (!root) return 0;
     if (!cJSON_IsObject(root)) {
