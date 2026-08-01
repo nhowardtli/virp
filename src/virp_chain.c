@@ -53,6 +53,8 @@ static void head_hmac_hex(virp_chain_state_t *state,
                           int64_t last_sequence,
                           const char *last_entry_hash,
                           char out_hex[65]);
+/* Constant-time hex digest/MAC comparison — see definition for why (§4.4). */
+static bool hexdigest_eq(const char *a, const char *b);
 static virp_error_t head_upsert_locked(virp_chain_state_t *state,
                                        const char *session_id,
                                        int64_t last_sequence,
@@ -152,7 +154,7 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
     /* Authenticate the head itself before trusting its length claim */
     char expect_mac[65];
     head_hmac_hex(state, session_id, head_seq, head_hash, expect_mac);
-    if (strcmp(expect_mac, head_mac) != 0) {
+    if (!hexdigest_eq(expect_mac, head_mac)) {
         result->valid = false;
         result->to_sequence = head_seq;
         snprintf(result->error_detail, sizeof(result->error_detail),
@@ -423,6 +425,42 @@ static const char *SQL_ARTIFACT_INSERT =
 /* =========================================================================
  * Helpers
  * ========================================================================= */
+
+/*
+ * Constant-time equality for the hex digest/MAC fields (audit §4.4).
+ *
+ * These comparisons decide whether a chain entry is authentic, and two of
+ * the three are against a value derived from K_chain. strcmp() returns at
+ * the first differing byte, so the time it takes reveals how long a
+ * common prefix the attacker guessed. That turns forging a chain_hmac
+ * from a 2^256 search into a byte-at-a-time one against an oracle that
+ * will happily re-verify — no key required. The chain is the audit trail
+ * the whole product rests on, so this is the one comparison that must not
+ * leak.
+ *
+ * Compared as hex rather than decoded to 32 raw bytes: hex is a bijection
+ * of the digest, so a constant-time comparison over the encoding leaks
+ * exactly what a constant-time comparison over the bytes would — nothing
+ * beyond equal/not-equal — while avoiding a decode step with its own
+ * failure paths on values read back from SQLite.
+ *
+ * The length check is not a timing leak: these fields are always 64 hex
+ * chars, so the length is public. It is load-bearing for memory safety —
+ * virp_consttime_eq() reads every byte it is given, and a short or
+ * corrupt value read out of the database must not send it past the NUL
+ * into the uninitialized tail of a stack-allocated entry.
+ *
+ * Behaviour is otherwise identical to the strcmp() it replaces: both
+ * operands are lowercase hex from sha256_hex()/hmac_sha256_hex(), so the
+ * case sensitivity strcmp() had is preserved.
+ */
+static bool hexdigest_eq(const char *a, const char *b)
+{
+    if (!a || !b) return false;
+    size_t alen = strlen(a);
+    if (alen != strlen(b)) return false;
+    return virp_consttime_eq(a, b, alen) == 1;
+}
 
 static void sha256_hex(const char *data, size_t len, char out[65])
 {
@@ -1006,7 +1044,7 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
         char computed_hash[65];
         sha256_hex(canonical, (size_t)clen, computed_hash);
 
-        if (strcmp(computed_hash, e.chain_entry_hash) != 0) {
+        if (!hexdigest_eq(computed_hash, e.chain_entry_hash)) {
             result->valid = false;
             result->first_broken = e.sequence;
             snprintf(result->error_detail, sizeof(result->error_detail),
@@ -1020,7 +1058,7 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
         hmac_sha256_hex(state->chain_key.key.key,
                         canonical, (size_t)clen, computed_hmac);
 
-        if (strcmp(computed_hmac, e.chain_hmac) != 0) {
+        if (!hexdigest_eq(computed_hmac, e.chain_hmac)) {
             result->valid = false;
             result->first_broken = e.sequence;
             snprintf(result->error_detail, sizeof(result->error_detail),

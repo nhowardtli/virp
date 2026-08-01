@@ -662,6 +662,64 @@ static void test_head_backfill(void)
 }
 
 /* =========================================================================
+ * Test: malformed MAC/hash fields still fail closed (audit §4.4)
+ *
+ * The constant-time comparison that replaced strcmp() reads every byte it
+ * is given, so it takes an explicit length check first. Getting that guard
+ * backwards would be a serious bug in the safe direction-looking change:
+ * a truncated or empty chain_hmac must never compare equal. strcmp() got
+ * this right for free by stopping at the NUL, so the replacement has to
+ * be shown to get it right deliberately.
+ *
+ * A timing assertion would be flaky and is deliberately not attempted —
+ * constant-timeness is argued from the implementation (virp_consttime_eq
+ * evaluates all bytes). What is testable, and tested here, is that the
+ * new length guard cannot be tricked into accepting a short value.
+ * ========================================================================= */
+
+static void test_malformed_mac_fails_closed(void)
+{
+    TEST("Truncated / empty chain_hmac fails closed");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    for (int i = 0; i < 5; i++) {
+        virp_chain_entry_t e;
+        char id[32], hash[65];
+        snprintf(id, sizeof(id), "art-%03d", i);
+        snprintf(hash, sizeof(hash), "%064d", i);
+        virp_chain_append(&state, "session-shortmac", "observation",
+                          id, hash, &e);
+    }
+
+    /* Truncate the MAC to a prefix of the real one. A length-blind
+     * comparison could treat this as a match on the bytes present. */
+    sqlite3_exec(state.db,
+        "UPDATE chain_entries SET chain_hmac = substr(chain_hmac, 1, 8) "
+        "WHERE session_id = 'session-shortmac' AND sequence = 2;",
+        NULL, NULL, NULL);
+
+    virp_chain_verify_result_t result;
+    virp_chain_verify(&state, "session-shortmac", 0, 4, &result);
+    ASSERT(!result.valid, "truncated chain_hmac must not verify");
+    ASSERT(result.first_broken == 2, "should break at the truncated entry");
+
+    /* Empty string — strlen 0 on one side only. */
+    sqlite3_exec(state.db,
+        "UPDATE chain_entries SET chain_hmac = '' "
+        "WHERE session_id = 'session-shortmac' AND sequence = 3;",
+        NULL, NULL, NULL);
+    virp_chain_verify(&state, "session-shortmac", 0, 4, &result);
+    ASSERT(!result.valid, "empty chain_hmac must not verify");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -686,6 +744,7 @@ int main(void)
     test_verify_session_head_deleted();
     test_verify_session_forged_head();
     test_head_backfill();
+    test_malformed_mac_fails_closed();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);
