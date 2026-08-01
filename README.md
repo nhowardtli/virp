@@ -2,15 +2,15 @@
   <img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg">
   <img alt="C11" src="https://img.shields.io/badge/C-11-00599C?logo=c&logoColor=white">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white">
-  <img alt="IETF Draft" src="https://img.shields.io/badge/IETF-draft--howard--virp--05-orange">
-  <img alt="Status" src="https://img.shields.io/badge/Status-Production-success">
+  <img alt="IETF Draft" src="https://img.shields.io/badge/IETF-draft--howard--virp--06-orange">
+  <img alt="Status" src="https://img.shields.io/badge/Status-Research_Prototype-orange">
 </p>
 
 > **VIRP does not let AI speak first. Reality speaks first, inside a bound session.**
 
 # VIRP — Verified Infrastructure Response Protocol
 
-**Cryptographic trust primitives for AI agents operating on real infrastructure.**
+**Authenticated evidence for infrastructure automation.**
 
 When an AI agent tells you your firewall policy is misconfigured, can you prove it actually checked?
 
@@ -18,15 +18,15 @@ When it says a BGP session is established, did it read that from a real device �
 
 When it claims a config change succeeded, where is the evidence?
 
-**VIRP makes every agent claim verifiable. Not with prompts. Not with guardrails. With cryptography.**
+**VIRP authenticates operation records under an explicit collector trust model — not with prompts, not with guardrails, with cryptography. It does not establish that a device is honest or that every AI statement is true.**
 
 ---
 
 ## What VIRP Does
 
-VIRP is an open protocol that signs every device observation at the point of collection, before the AI ever sees it.
+VIRP is an open protocol that authenticates every device observation at the point of collection, before the AI ever sees it.
 
-A dedicated process — the **O-Node** — connects to your network devices, captures raw output, and signs it with HMAC-SHA256. The AI agent receives pre-signed data. It can reason about what the device returned. It cannot forge it, modify it, or fabricate it — because it never holds the signing key.
+A dedicated process — the **O-Node** — connects to your network devices, captures raw output, and authenticates it with an HMAC-SHA256 tag. The AI agent receives pre-authenticated data. It can reason about what the device returned. It cannot forge it, modify it, or fabricate it — because it never holds the authentication key.
 
 This is not a policy. It is a code path.
 
@@ -54,6 +54,28 @@ VIRP:
 
   Verify it yourself.
 ```
+
+---
+
+## Reproducible Demo
+
+Two commands, no hardware, no credentials, no network access:
+
+```bash
+git clone https://github.com/nhowardtli/virp
+cd virp && docker compose -f demo/docker-compose.yml run --rm demo
+```
+
+The demo runs the reference collector against a deterministic **simulated
+target** and asserts nine security behaviors end to end: a GREEN operation
+executes and its record verifies; a tampered record fails verification; a
+RED operation is blocked and a proposal is filed; an Ed25519 approval signed
+outside the collector executes the change once; approval reuse, expiry, and
+absence are refused with typed errors; an unknown operation fails closed;
+and every chain session verifies from its own genesis. On an independent
+verifier machine it ran 9/9 from a fresh clone in 15 seconds. The target is
+simulated, so the demo establishes protocol behavior, not device truth.
+Details and a native (non-Docker) path: [`demo/README.md`](demo/README.md).
 
 ---
 
@@ -101,15 +123,23 @@ Prompt engineering, output validation, and behavioral guardrails did not fix it.
 
 ## Seven Trust Primitives
 
+Names and numbering follow §5 of `draft-howard-virp-06`, which is authoritative.
+
 | # | Name | What It Does | Status | Evidence |
 |---|---|---|---|---|
-| P1 | Verified Observation | Device output HMAC-signed at collection | Production | tested (signature validity); body-to-command correspondence not guaranteed on SSH drivers — one live mismatch observed 2026-07-29, see `SECURITY.md` §Observation-Body Integrity |
-| P2 | Tiered Authorization | Command classification enforced below AI | Production | tested — see caveats below |
-| P3 | Verified Intent | Signed proposals before execution | Implemented | tested |
-| P4 | Verified Outcome | Before/after signed comparison | Implemented | tested |
-| P5 | Baseline Memory | Deviation detection from signed history | Implemented | untested — no suite covers deviation detection |
-| P6 | Trust Chain | SQLite tamper-evident chain | Implemented | tested (logic); production-chain integrity unestablished, see below |
-| P7 | Trust Federation | Ed25519 cross-tenant verification | Implemented | tested (crypto only); no multi-tenant deployment exists — federation *operation* is aspirational |
+| P1 | Observation Integrity | Device output HMAC-authenticated at collection | Production | tested (authentication-tag validity); body-to-command correspondence not guaranteed on SSH drivers — one live mismatch observed 2026-07-29, see `SECURITY.md` §Observation-Body Integrity |
+| P2 | Two-Channel Separation | Observation (read) and Intent (write) channels separated, bound to distinct key roles | Implemented | tested — a message authenticated with the other channel's key is refused |
+| P3 | Intent Gating | Command classification enforced below the AI; signed proposals before execution | Production | tested — see gate-scope caveats below |
+| P4 | Outcome Verification | Before/after authenticated comparison | Implemented | tested |
+| P5 | Baseline Memory | Deviation detection from authenticated history | Implemented | untested — no suite covers deviation detection |
+| P6 | Multi-Vendor Normalization | Normalized observation schema across vendor drivers | Implemented | per-driver unit tests; no published cross-vendor live transcript |
+| P7 | Agent Containment | Requesting process treated as an untrusted principal; containment enforced externally | Specified | the three-layer cage above is the enforcement design; not yet fully demonstrated |
+
+Two supporting mechanisms underpin the primitives without being primitives
+themselves: the SQLite tamper-evident **trust chain** (logic tested;
+production-chain integrity unestablished, see below) and per-node Ed25519
+**federation keys** (crypto tested; no multi-tenant deployment exists —
+federation *operation* is aspirational).
 
 **Production** primitives have accumulated operational history across real deployments. **Implemented** primitives are complete, tested, and exercised in integration runs, but have not yet accumulated equivalent production hours.
 
@@ -286,7 +316,7 @@ Yes. VIRP is a protocol and a reference implementation. IronClaw is one consumer
 
 ## Protocol Specification
 
-- **IETF Draft:** `draft-howard-virp-05` (drafts -01 through -05 submitted)
+- **IETF Draft:** `draft-howard-virp-06` (revisions -00 through -06 submitted)
 - **Formal verification:** (1) injective agreement (every accepted v2
   observation corresponds to exactly one signing) and key secrecy
   (master O-Key and derived session keys) are machine-verified in
@@ -299,9 +329,9 @@ Yes. VIRP is a protocol and a reference implementation. IronClaw is one consumer
   including persistence across verifier restart. (3) Timestamp
   freshness is test-verified only (`test_stale_observation_rejected`),
   not modeled. There is no Tamarin model — that is future work. The
-  proofs cover the v2 observation path only; `draft-howard-virp-05`
-  §16.1 still cites the older, broader claim and needs the same
-  correction in its next revision.
+  proofs cover the v2 observation path only; `draft-howard-virp-06`
+  §16.1 scopes its evidence claim to match (the -05 text carried the
+  older, broader claim).
 - **License:** Apache 2.0
 
 ---
