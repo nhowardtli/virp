@@ -229,8 +229,9 @@ never verifies the keyed `chain_hmac`, so a keyless attacker with DB
 write access can produce a chain the operator-facing API reports valid.
 See `SECURITY.md` §Verifier Limitations.
 
-**Fixed 2026-08-01 (this tree, undeployed):** the C verifier's
-tail-truncation and zero-row acceptance. Range verification now
+**Fixed 2026-08-01, merged to `main` and deployed (running commit
+`b6e9602c`):** the C verifier's tail-truncation and zero-row
+acceptance. Range verification now
 enforces completeness, and a signed per-session head record
 (`chain_heads`, HMAC'd with K_chain, updated transactionally with
 every append) authenticates chain LENGTH — `virp_chain_verify_session`
