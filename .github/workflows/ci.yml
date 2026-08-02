@@ -64,14 +64,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.DEPS }}
+      # asan-test and asan-drivers are the Makefile's canonical sanitizer
+      # targets (core + onode + ssh-io + fg-scrub + chain, and the driver
+      # suites with their -D guards). Use them rather than hand-rolling
+      # CFLAGS here, so CI and local runs sanitize the same way.
       - name: Build and test under ASan + UBSan
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
-          make clean
-          make CFLAGS_EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer" all
-          make CFLAGS_EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer" all-tests
+          make asan-test
+          make asan-drivers
 
   valgrind:
     name: Valgrind (core test binary)
@@ -146,3 +149,18 @@ jobs:
         run: python3 -m pip install --quiet fastapi
       - name: API message-bounds suite
         run: python3 tests/test_parse_message_bounds.py
+      # The complete Python suite under pytest — api/ auth/devices/key
+      # tests plus tests/. tests/test_virp_verify.py drives the C bridge
+      # against a signing key at /opt/virp/keys/onode.key (the fixed dev
+      # path), so generate a throwaway key there; virp_key_load_file
+      # refuses keys that are not 0600 and owner-readable only.
+      - name: Install Python suite dependencies
+        run: python3 -m pip install --quiet pytest httpx pyyaml reportlab
+      - name: Generate throwaway bridge key
+        run: |
+          sudo mkdir -p /opt/virp/keys
+          sudo ./build/virp-tool keygen okey /opt/virp/keys/onode.key
+          sudo chown "$(id -u):$(id -g)" /opt/virp/keys/onode.key
+          sudo chmod 600 /opt/virp/keys/onode.key
+      - name: Complete Python suite (pytest)
+        run: python3 -m pytest -q
