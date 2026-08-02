@@ -1,0 +1,166 @@
+# VIRP continuous integration.
+#
+# Every job here runs something real and fails loudly. Nothing in this file
+# exists to produce a green badge: if a job cannot genuinely check what its
+# name claims, it does not belong here.
+#
+# Copyright (c) 2026 Third Level IT LLC — Apache 2.0
+
+name: CI
+
+on:
+  push:
+    # ci/** is included so the workflow can be proven on its own branch
+    # before it is merged to main.
+    branches: [main, 'ci/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DEPS: >-
+    build-essential libssl-dev libsodium-dev libsqlite3-dev
+    libssh2-1-dev libcurl4-openssl-dev libjson-c-dev
+
+jobs:
+  build-and-test:
+    name: Build and full test battery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.DEPS }}
+      # CFLAGS already carry -Wall -Wextra -Werror -pedantic -std=c11, so a
+      # warning is a build failure without any extra flag here.
+      - name: Build (warnings are errors)
+        run: make all && make prod
+      - name: Static checks and lints
+        run: |
+          make check-deploy-unit
+          make check-live-fence
+          make check-socket-path
+          make check-shared-readpath
+          make lint-sprintf
+          make lint-rand
+          make lint-memcmp
+      - name: Full test battery
+        run: make all-tests
+      - name: Demo (nine security behaviors, simulated target)
+        run: ./demo/run.sh --no-build
+      - name: Upload demo evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-evidence-bundle
+          path: demo/output/
+          retention-days: 30
+
+  sanitizers:
+    name: AddressSanitizer and UndefinedBehaviorSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.DEPS }}
+      # asan-test and asan-drivers are the Makefile's canonical sanitizer
+      # targets (core + onode + ssh-io + fg-scrub + chain, and the driver
+      # suites with their -D guards). Use them rather than hand-rolling
+      # CFLAGS here, so CI and local runs sanitize the same way.
+      - name: Build and test under ASan + UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          make asan-test
+          make asan-drivers
+
+  valgrind:
+    name: Valgrind (core test binary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.DEPS }} valgrind
+      - name: Build
+        run: make all
+      - name: Run under Valgrind
+        run: |
+          valgrind --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite \
+                   ./build/test_virp
+
+  fuzz-smoke:
+    name: Fuzz smoke (parser and wire format)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.DEPS }}
+      # A short, bounded run on every push. This is a regression gate, not a
+      # fuzzing campaign: it catches crashes reachable in seconds, and says so.
+      - name: Build fuzz harness
+        run: make fuzz
+      - name: Short bounded run
+        run: timeout 120 ./build/fuzz_virp || test $? -eq 124
+
+  static-analysis:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+    continue-on-error: true   # advisory until the findings backlog is worked
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.DEPS }} clang-tidy
+      - name: Analyze
+        run: |
+          clang-tidy src/*.c src/drivers/*.c -- -Iinclude -std=c11 \
+            2>&1 | tee clang-tidy.log
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-report
+          path: clang-tidy.log
+          retention-days: 30
+
+  python-suites:
+    name: Python parity and bridge suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.DEPS }} python3
+      - name: Build shared library
+        run: make shared && make all
+      # These two load build/libvirp.so directly and need nothing else.
+      - name: C/Python parity and bridge verification
+        run: |
+          python3 tests/test_hmac_parity.py
+          python3 tests/test_bridge_verify.py
+      # test_parse_message_bounds imports api/server.py, which pulls in
+      # FastAPI. Install it explicitly rather than letting the suite be
+      # skipped silently.
+      - name: Install API dependencies
+        run: python3 -m pip install --quiet fastapi
+      - name: API message-bounds suite
+        run: python3 tests/test_parse_message_bounds.py
+      # The complete Python suite under pytest — api/ auth/devices/key
+      # tests plus tests/. tests/test_virp_verify.py drives the C bridge
+      # against a signing key at /opt/virp/keys/onode.key (the fixed dev
+      # path), so generate a throwaway key there; virp_key_load_file
+      # refuses keys that are not 0600 and owner-readable only.
+      - name: Install Python suite dependencies
+        run: python3 -m pip install --quiet pytest httpx pyyaml reportlab
+      - name: Generate throwaway bridge key
+        run: |
+          sudo mkdir -p /opt/virp/keys
+          sudo ./build/virp-tool keygen okey /opt/virp/keys/onode.key
+          sudo chown "$(id -u):$(id -g)" /opt/virp/keys/onode.key
+          sudo chmod 600 /opt/virp/keys/onode.key
+      - name: Complete Python suite (pytest)
+        run: python3 -m pytest -q

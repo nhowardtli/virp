@@ -945,7 +945,9 @@ check-deploy-unit:
 .PHONY: lint-sprintf
 lint-sprintf:
 	@echo "=== checking for banned sprintf in src/ ==="
-	@if grep -rn 'sprintf(' src/; then echo "FAIL: sprintf found — use snprintf"; exit 1; fi
+	@if grep -rn 'sprintf(' src/ --include='*.c' --include='*.h' \
+	     | grep -v '^src/third_party/' | grep -v 'snprintf('; then \
+	     echo "FAIL: sprintf found — use snprintf"; exit 1; fi
 	@echo "  PASS: no sprintf found"
 
 # Lint: fail build if rand( or srand( appears in src/ outside driver_mock.c
