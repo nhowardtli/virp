@@ -1919,31 +1919,73 @@ static int recv_exact(int fd, void *buf, size_t len)
 }
 
 /*
- * Send a framed response: [4-byte big-endian length][payload].
- * Length covers the payload only, not the 4-byte prefix itself.
+ * Send exactly `len` bytes to fd — symmetric counterpart to recv_exact().
+ *
+ * SOCK_STREAM permits partial writes even on Unix domain sockets (most
+ * visibly when a signal lands mid-send), and a partially written 4-byte
+ * length prefix permanently desynchronizes framing for the connection.
+ * So: loop until every byte is out, retry on EINTR.
+ *
+ * EAGAIN/EWOULDBLOCK is fatal by design. Client fds here are blocking
+ * (only SO_RCVTIMEO is set), so EAGAIN can only appear if someone later
+ * configures SO_SNDTIMEO — and a frame cannot be resumed after a
+ * mid-frame timeout. On a hypothetical non-blocking fd, retrying
+ * without poll() would spin. Either way the framing on this connection
+ * is unrecoverable: return -1 and let the caller treat it as dead.
  *
  * MSG_NOSIGNAL on every daemon send: a client that closes before
  * reading its response would otherwise raise SIGPIPE, whose default
  * action kills the whole daemon. Both mains also SIG_IGN SIGPIPE; the
- * per-send flag keeps the guarantee even if a future entry path forgets
- * (send returns -1/EPIPE instead, which we deliberately ignore — the
- * peer is gone and the caller closes the fd either way).
+ * per-send flag keeps the guarantee even if a future entry path
+ * forgets (send returns -1/EPIPE instead and we report failure — the
+ * peer is gone and the caller closes the fd).
+ *
+ * Returns 0 on success, -1 on failure. On failure the connection must
+ * be closed, never written to again: any bytes already sent are a torn
+ * frame. Non-static so tests/test_onode.c can drive it directly over a
+ * socketpair.
  */
-static void send_framed(int fd, const void *buf, size_t len)
+int send_all(int fd, const void *buf, size_t len)
 {
-    uint32_t net_len = htonl((uint32_t)len);
-    send(fd, &net_len, 4, MSG_NOSIGNAL);
-    if (len > 0)
-        send(fd, buf, len, MSG_NOSIGNAL);
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, (const uint8_t *)buf + sent, len - sent,
+                         MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR)
+                continue;   /* signal interrupted — retry */
+            return -1;      /* EAGAIN, EPIPE, 0-byte write: dead */
+        }
+        sent += (size_t)n;
+    }
+    return 0;
 }
 
 /*
- * Send a framed 4-byte error code.
+ * Send a framed response: [4-byte big-endian length][payload].
+ * Length covers the payload only, not the 4-byte prefix itself.
+ *
+ * Returns 0 on success, -1 on failure. On failure the connection is
+ * dead (see send_all) — callers must not attempt further sends on it;
+ * every handle_client path closes the fd before returning.
  */
-static void send_framed_error(int fd, virp_error_t err)
+static int send_framed(int fd, const void *buf, size_t len)
+{
+    uint32_t net_len = htonl((uint32_t)len);
+    if (send_all(fd, &net_len, 4) < 0)
+        return -1;
+    if (len > 0 && send_all(fd, buf, len) < 0)
+        return -1;
+    return 0;
+}
+
+/*
+ * Send a framed 4-byte error code. Same failure contract as send_framed.
+ */
+static int send_framed_error(int fd, virp_error_t err)
 {
     uint32_t err_code = htonl((uint32_t)err);
-    send_framed(fd, &err_code, 4);
+    return send_framed(fd, &err_code, 4);
 }
 
 /*
@@ -2028,10 +2070,11 @@ static void handle_client(onode_state_t *state, int client_fd)
         /* v1 client: first byte is part of JSON (e.g. '{' = 0x7B).
          * Send unframed error so the v1 client can read it. */
         uint32_t err_code = htonl((uint32_t)VIRP_ERR_PROTOCOL_VERSION);
-        /* MSG_NOSIGNAL: this send fires before the client is trusted —
-         * a peer that connects and instantly closes must not SIGPIPE
-         * the daemon. */
-        send(client_fd, &err_code, 4, MSG_NOSIGNAL);
+        /* send_all carries MSG_NOSIGNAL: this send fires before the
+         * client is trusted — a peer that connects and instantly closes
+         * must not SIGPIPE the daemon. Failure needs no handling beyond
+         * the close below; the courtesy error just didn't arrive. */
+        (void)send_all(client_fd, &err_code, 4);
         close(client_fd);
         return;
     }
@@ -2159,8 +2202,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                       (uint16_t)strlen(req.command),
                                       &state->okey);
         if (err == VIRP_OK && resp_len > 0) {
-            send_framed(client_fd, resp_buf, resp_len);
-            onode_inc_observations(state);
+            if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -2187,8 +2230,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                       (uint16_t)strlen(req.command),
                                       &state->okey);
         if (err == VIRP_OK && resp_len > 0) {
-            send_framed(client_fd, resp_buf, resp_len);
-            onode_inc_observations(state);
+            if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -2241,8 +2284,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2285,8 +2328,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2341,8 +2384,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2411,8 +2454,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2473,8 +2516,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2512,8 +2555,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2723,8 +2766,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                       (const uint8_t *)json_buf, (uint16_t)joff,
                                       &state->okey);
         if (err == VIRP_OK && resp_len > 0) {
-            send_framed(client_fd, resp_buf, resp_len);
-            onode_inc_observations(state);
+            if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -2741,8 +2784,8 @@ static void handle_client(onode_state_t *state, int client_fd)
         err = onode_approval_challenge(state, req.proposal_id,
                                        resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0) {
-            send_framed(client_fd, resp_buf, resp_len);
-            onode_inc_observations(state);
+            if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -2758,8 +2801,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                     req.signature,
                                     resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0) {
-            send_framed(client_fd, resp_buf, resp_len);
-            onode_inc_observations(state);
+            if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
