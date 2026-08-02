@@ -51,7 +51,7 @@ def server(tmp_path, monkeypatch):
         del sys.modules["server"]
     server = importlib.import_module("server")
 
-    monkeypatch.setattr(server, "_HAVE_REGISTRY", False)
+    monkeypatch.setattr(server, "_USE_REGISTRY", False)
 
     return server
 
