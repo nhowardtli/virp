@@ -589,6 +589,56 @@ the audit referred to a different tree and did not all transfer.
   one: the operator is told "chain truncated" when the real cause was a
   database error. *[open, non-security]*
 
+## External Review — 2026-08-02
+
+An external review (fresh reviewer, full Python suite run) reported one
+regression and two C lifecycle defects. All three were reproduced
+against this tree before being acted on.
+
+**Fixed on `fix/review-2026-08-02`:**
+
+- **Device-source selection was gated on import success, silently
+  ignoring `VIRP_DEVICES`.** `api/server.py` selected between the
+  `devices.yaml` registry and the operator's JSON file based on whether
+  `device_registry` happened to be importable, so a `sys.path` accident
+  (or a missing optional dependency) decided whether an explicit
+  `VIRP_DEVICES` was honored. In the test suite this made
+  `test_auth_noop_when_token_unset` order-dependent — green alone, red
+  after `tests/test_validator_e2e.py` put the repo root on `sys.path`.
+  Selection is now explicit with one documented precedence rule: a set
+  `VIRP_DEVICES` always wins and the YAML registry is not consulted at
+  all; module availability never determines configuration semantics
+  (README → "Device registry configuration"). *[tested —
+  `api/test_devices.py::test_virp_devices_env_bypasses_yaml_registry`
+  imports the registry successfully, booby-traps every accessor, and
+  proves the YAML path is never consulted; verified to fail against
+  the pre-fix code]*
+- **`send_framed()` ignored `send()` return values.** SOCK_STREAM
+  permits partial writes even on Unix domain sockets, and a partially
+  written 4-byte length prefix permanently desynchronizes framing for
+  that connection. `send_all()` now exists as the symmetric counterpart
+  to `recv_exact()` — complete-or-fail, EINTR retried, EAGAIN fatal by
+  design — and every framed send routes through it; on failure the
+  connection is treated as dead, never written mid-frame again.
+  *[tested — `tests/test_onode.c` drives `send_all` over a socketpair
+  with a shrunken send buffer while bombarding the sender with
+  SIGUSR1 (no `SA_RESTART`), and proves a dead peer surfaces as an
+  error, not SIGPIPE]*
+- **Shutdown destroyed state a live worker could still hold.** The
+  drain waited up to ~30s on an advisory counter, warned, and then ran
+  `onode_destroy()` anyway — freeing mutexes, connections, chain state
+  and key state under any worker that had not exited. (The counter was
+  also incremented after `pthread_create`, so a fast worker produced a
+  phantom count of 1 — the "drain timeout" noise every `test-onode` run
+  printed.) The drain is now a real barrier: worker client sockets are
+  `shutdown()` first so blocked workers unblock, then shutdown waits on
+  a condition variable for the live count to reach zero. The 30s bound
+  remains only as a last resort, and if it fires the daemon logs loudly
+  and *leaks* shared state instead of freeing it under live threads.
+  *[tested — `tests/test_onode.c` 71/71 and
+  `tests/test_onode_concurrency.c` clean; `make asan-test` (ASan+UBSan)
+  clean across core/onode/ssh-io/fg-scrub/chain]*
+
 ## Corrections to Previously Documented Behavior
 
 Four statements in this repository asserted behavior that no code
