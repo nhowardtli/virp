@@ -302,18 +302,28 @@ class TestIdentity(unittest.TestCase):
 
     def test_main_refuses_and_exits_three(self):
         """A refusal must exit 3 and must NOT write into the evidence
-        tree — a root-owned dropping would break the real identity."""
+        tree — a root-owned dropping would break the real identity.
+
+        SECRET_PATHS points at a key this process CAN read, so the
+        refusal fires on any machine, not just ones where the ambient
+        user happens to be root or in a forbidden group. EVIDENCE_ROOT
+        is redirected into the tmp dir so the no-write assertion is
+        real: if the refusal ever regressed, run() would write here —
+        not into /var/lib/virp — and the listdir below would catch it.
+        """
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         with tempfile.NamedTemporaryFile() as key:
             key.write(b"x" * 32)
             key.flush()
-            orig = ev.SECRET_PATHS
+            orig = (ev.SECRET_PATHS, ev.EVIDENCE_ROOT, ev.ALERTS_FILE)
             ev.SECRET_PATHS = (key.name,)
+            ev.EVIDENCE_ROOT = tmp.name
+            ev.ALERTS_FILE = os.path.join(tmp.name, "alerts.jsonl")
             try:
                 rc = ev.main(["run"])
             finally:
-                ev.SECRET_PATHS = orig
+                ev.SECRET_PATHS, ev.EVIDENCE_ROOT, ev.ALERTS_FILE = orig
         self.assertEqual(rc, 3)
         self.assertEqual(os.listdir(tmp.name), [])
 
