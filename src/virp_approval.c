@@ -377,12 +377,14 @@ virp_error_t virp_approval_propose(const char *dir,
                  out->proposal_id);
         char chain_session[96];
         snprintf(chain_session, sizeof(chain_session), "approval:%s", device);
+        /* Entry + body in one transaction: a filed proposal always has
+         * its body recoverable from the chain, and a body-store failure
+         * fails the filing typed instead of stranding a commitment. */
         virp_chain_entry_t ce;
-        err = virp_chain_append(chain, chain_session, "proposal",
-                                artifact_id, artifact_hash, &ce);
+        err = virp_chain_append_with_artifact(chain, chain_session,
+                                              "proposal", artifact_id,
+                                              artifact_hash, body, &ce);
         if (err != VIRP_OK) return err;
-        virp_chain_artifact_store(chain, artifact_id, "proposal",
-                                  body, artifact_hash, chain_session);
         snprintf(out->chain_entry_hash, sizeof(out->chain_entry_hash), "%s",
                  ce.chain_entry_hash);
     }
@@ -728,12 +730,13 @@ virp_error_t virp_approval_submit(const char *dir,
         char chain_session[96];
         snprintf(chain_session, sizeof(chain_session), "approval:%s",
                  out->device);
+        /* Entry + body in one transaction — same rationale as the
+         * proposal filing above. */
         virp_chain_entry_t ce;
-        err = virp_chain_append(chain, chain_session, "approval",
-                                artifact_id, artifact_hash, &ce);
+        err = virp_chain_append_with_artifact(chain, chain_session,
+                                              "approval", artifact_id,
+                                              artifact_hash, content, &ce);
         if (err != VIRP_OK) { pthread_mutex_unlock(&submit_mu); return err; }
-        virp_chain_artifact_store(chain, artifact_id, "approval",
-                                  content, artifact_hash, chain_session);
         snprintf(out->chain_entry_hash, sizeof(out->chain_entry_hash), "%s",
                  ce.chain_entry_hash);
     }
