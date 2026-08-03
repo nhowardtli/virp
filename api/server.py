@@ -578,7 +578,21 @@ def _batch_execute_chunk(chunk: list[dict], timeout: float) -> list[dict]:
                     "error": f"onode error code: {err_code}",
                 })
             else:
-                obs = parse_virp_message(msg)
+                # Same sub-type gate as the single-command path (§4.1):
+                # a batch item whose observation the execute action could
+                # not have produced (e.g. a genuinely HMAC-valid
+                # INTENT_SIGNED carrying caller-chosen text) must never be
+                # reported as device output. Per-item, not per-request:
+                # one forged item becomes an error result and must not
+                # discard its siblings' legitimate output.
+                try:
+                    obs = _require_execute_observation(parse_virp_message(msg))
+                except ConnectionError as e:
+                    results.append({
+                        "device": device, "command": command,
+                        "error": str(e),
+                    })
+                    continue
                 obs["device"] = device
                 obs["command"] = command
                 results.append(obs)
