@@ -65,6 +65,19 @@
 #define ONODE_LISTEN_BACKLOG    128
 #endif
 
+/*
+ * Shutdown drain hard timeout. The drain barrier normally completes as
+ * soon as the last worker exits (client sockets are shutdown() first so
+ * nothing stays blocked on client I/O; SSH I/O has its own 10-15s
+ * timeouts). This bound only exists as a last resort for a genuinely
+ * wedged worker — comfortably inside systemd's 90s stop window — and
+ * hitting it means shared state is leaked, not freed (see
+ * onode_destroy()).
+ */
+#ifndef ONODE_DRAIN_TIMEOUT_SEC
+#define ONODE_DRAIN_TIMEOUT_SEC 30
+#endif
+
 /* Auto-reconnect configuration */
 #define ONODE_WATCHDOG_INTERVAL_SEC  5   /* How often the watchdog checks */
 #define ONODE_RECONNECT_BACKOFF_INIT 5   /* Initial backoff: 5 seconds */
@@ -269,14 +282,27 @@ typedef struct {
     /*
      * Worker pool. Each accepted connection is handled on a detached
      * pthread; `worker_sem` is a counting semaphore initialized to
-     * ONODE_MAX_WORKERS that caps concurrency. `workers_live` is an
-     * advisory counter (under state_mutex) used only for heartbeat
-     * logging and for the shutdown drain loop.
+     * ONODE_MAX_WORKERS that caps concurrency.
+     *
+     * Shutdown barrier (all under state_mutex): `workers_live` counts
+     * live workers; `workers_cv` is broadcast when the count reaches
+     * zero so the drain in onode_start() can wait instead of polling.
+     * `worker_fds[slot]` holds a dup() of each live worker's client fd
+     * so the drain can shutdown(SHUT_RDWR) the underlying socket and
+     * unblock workers stuck in client I/O. The dup is owned by the
+     * worker and closed only after its slot is cleared, so the drain
+     * can never shutdown() a recycled fd number.
+     * `drain_failed` is set when the drain's hard timeout expires with
+     * workers still live; onode_destroy() then leaks shared state
+     * instead of freeing it under live threads.
      */
     sem_t               worker_sem;
     bool                worker_sem_inited;
+    pthread_cond_t      workers_cv;
+    int                 worker_fds[ONODE_MAX_WORKERS];
     uint32_t            workers_live;
     uint32_t            workers_rejected;   /* saturated-pool rejections */
+    bool                drain_failed;       /* drain timed out; leak, don't free */
 
     /* Runtime */
     bool                running;

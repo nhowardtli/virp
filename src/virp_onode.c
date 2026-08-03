@@ -1919,31 +1919,73 @@ static int recv_exact(int fd, void *buf, size_t len)
 }
 
 /*
- * Send a framed response: [4-byte big-endian length][payload].
- * Length covers the payload only, not the 4-byte prefix itself.
+ * Send exactly `len` bytes to fd — symmetric counterpart to recv_exact().
+ *
+ * SOCK_STREAM permits partial writes even on Unix domain sockets (most
+ * visibly when a signal lands mid-send), and a partially written 4-byte
+ * length prefix permanently desynchronizes framing for the connection.
+ * So: loop until every byte is out, retry on EINTR.
+ *
+ * EAGAIN/EWOULDBLOCK is fatal by design. Client fds here are blocking
+ * (only SO_RCVTIMEO is set), so EAGAIN can only appear if someone later
+ * configures SO_SNDTIMEO — and a frame cannot be resumed after a
+ * mid-frame timeout. On a hypothetical non-blocking fd, retrying
+ * without poll() would spin. Either way the framing on this connection
+ * is unrecoverable: return -1 and let the caller treat it as dead.
  *
  * MSG_NOSIGNAL on every daemon send: a client that closes before
  * reading its response would otherwise raise SIGPIPE, whose default
  * action kills the whole daemon. Both mains also SIG_IGN SIGPIPE; the
- * per-send flag keeps the guarantee even if a future entry path forgets
- * (send returns -1/EPIPE instead, which we deliberately ignore — the
- * peer is gone and the caller closes the fd either way).
+ * per-send flag keeps the guarantee even if a future entry path
+ * forgets (send returns -1/EPIPE instead and we report failure — the
+ * peer is gone and the caller closes the fd).
+ *
+ * Returns 0 on success, -1 on failure. On failure the connection must
+ * be closed, never written to again: any bytes already sent are a torn
+ * frame. Non-static so tests/test_onode.c can drive it directly over a
+ * socketpair.
  */
-static void send_framed(int fd, const void *buf, size_t len)
+int send_all(int fd, const void *buf, size_t len)
 {
-    uint32_t net_len = htonl((uint32_t)len);
-    send(fd, &net_len, 4, MSG_NOSIGNAL);
-    if (len > 0)
-        send(fd, buf, len, MSG_NOSIGNAL);
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, (const uint8_t *)buf + sent, len - sent,
+                         MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR)
+                continue;   /* signal interrupted — retry */
+            return -1;      /* EAGAIN, EPIPE, 0-byte write: dead */
+        }
+        sent += (size_t)n;
+    }
+    return 0;
 }
 
 /*
- * Send a framed 4-byte error code.
+ * Send a framed response: [4-byte big-endian length][payload].
+ * Length covers the payload only, not the 4-byte prefix itself.
+ *
+ * Returns 0 on success, -1 on failure. On failure the connection is
+ * dead (see send_all) — callers must not attempt further sends on it;
+ * every handle_client path closes the fd before returning.
  */
-static void send_framed_error(int fd, virp_error_t err)
+static int send_framed(int fd, const void *buf, size_t len)
+{
+    uint32_t net_len = htonl((uint32_t)len);
+    if (send_all(fd, &net_len, 4) < 0)
+        return -1;
+    if (len > 0 && send_all(fd, buf, len) < 0)
+        return -1;
+    return 0;
+}
+
+/*
+ * Send a framed 4-byte error code. Same failure contract as send_framed.
+ */
+static int send_framed_error(int fd, virp_error_t err)
 {
     uint32_t err_code = htonl((uint32_t)err);
-    send_framed(fd, &err_code, 4);
+    return send_framed(fd, &err_code, 4);
 }
 
 /*
@@ -2028,10 +2070,11 @@ static void handle_client(onode_state_t *state, int client_fd)
         /* v1 client: first byte is part of JSON (e.g. '{' = 0x7B).
          * Send unframed error so the v1 client can read it. */
         uint32_t err_code = htonl((uint32_t)VIRP_ERR_PROTOCOL_VERSION);
-        /* MSG_NOSIGNAL: this send fires before the client is trusted —
-         * a peer that connects and instantly closes must not SIGPIPE
-         * the daemon. */
-        send(client_fd, &err_code, 4, MSG_NOSIGNAL);
+        /* send_all carries MSG_NOSIGNAL: this send fires before the
+         * client is trusted — a peer that connects and instantly closes
+         * must not SIGPIPE the daemon. Failure needs no handling beyond
+         * the close below; the courtesy error just didn't arrive. */
+        (void)send_all(client_fd, &err_code, 4);
         close(client_fd);
         return;
     }
@@ -2159,8 +2202,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                       (uint16_t)strlen(req.command),
                                       &state->okey);
         if (err == VIRP_OK && resp_len > 0) {
-            send_framed(client_fd, resp_buf, resp_len);
-            onode_inc_observations(state);
+            if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -2187,8 +2230,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                       (uint16_t)strlen(req.command),
                                       &state->okey);
         if (err == VIRP_OK && resp_len > 0) {
-            send_framed(client_fd, resp_buf, resp_len);
-            onode_inc_observations(state);
+            if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -2241,8 +2284,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2285,8 +2328,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2341,8 +2384,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2411,8 +2454,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2473,8 +2516,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2512,8 +2555,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
-                send_framed(client_fd, resp_buf, resp_len);
-                onode_inc_observations(state);
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
             } else {
                 send_framed_error(client_fd, err);
             }
@@ -2723,8 +2766,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                       (const uint8_t *)json_buf, (uint16_t)joff,
                                       &state->okey);
         if (err == VIRP_OK && resp_len > 0) {
-            send_framed(client_fd, resp_buf, resp_len);
-            onode_inc_observations(state);
+            if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -2741,8 +2784,8 @@ static void handle_client(onode_state_t *state, int client_fd)
         err = onode_approval_challenge(state, req.proposal_id,
                                        resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0) {
-            send_framed(client_fd, resp_buf, resp_len);
-            onode_inc_observations(state);
+            if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -2758,8 +2801,8 @@ static void handle_client(onode_state_t *state, int client_fd)
                                     req.signature,
                                     resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0) {
-            send_framed(client_fd, resp_buf, resp_len);
-            onode_inc_observations(state);
+            if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                onode_inc_observations(state);
         } else {
             send_framed_error(client_fd, err);
         }
@@ -3197,6 +3240,7 @@ virp_error_t onode_watchdog_start(onode_state_t *state)
 typedef struct {
     onode_state_t *state;
     int            client_fd;
+    int            slot;        /* index into state->worker_fds, -1 if none */
 } worker_arg_t;
 
 /*
@@ -3224,15 +3268,26 @@ static void *connection_worker(void *raw_arg)
     worker_arg_t *arg = (worker_arg_t *)raw_arg;
     onode_state_t *state = arg->state;
     int fd = arg->client_fd;
+    int slot = arg->slot;
     free(arg);
 
     /* handle_client() closes the fd on every return path. */
     handle_client(state, fd);
 
-    /* Release the worker slot and update the live counter. */
+    /* Clear the drain-registration slot (closing our dup of the client
+     * fd), release the worker slot, and update the live counter. The
+     * broadcast is the shutdown barrier: onode_start()'s drain waits on
+     * workers_cv for the count to reach zero before onode_destroy()
+     * may tear down state this thread was using. */
     pthread_mutex_lock(&state->state_mutex);
+    if (slot >= 0 && state->worker_fds[slot] >= 0) {
+        close(state->worker_fds[slot]);
+        state->worker_fds[slot] = -1;
+    }
     if (state->workers_live > 0)
         state->workers_live--;
+    if (state->workers_live == 0)
+        pthread_cond_broadcast(&state->workers_cv);
     pthread_mutex_unlock(&state->state_mutex);
     sem_post(&state->worker_sem);
 
@@ -3291,6 +3346,18 @@ virp_error_t onode_init(onode_state_t *state,
     }
     state->workers_live = 0;
     state->workers_rejected = 0;
+    state->drain_failed = false;
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++)
+        state->worker_fds[i] = -1;
+    /* Monotonic clock for the drain barrier's timedwait — a wall-clock
+     * jump during shutdown must not stretch or collapse the timeout. */
+    {
+        pthread_condattr_t cvattr;
+        pthread_condattr_init(&cvattr);
+        pthread_condattr_setclock(&cvattr, CLOCK_MONOTONIC);
+        pthread_cond_init(&state->workers_cv, &cvattr);
+        pthread_condattr_destroy(&cvattr);
+    }
 
     /* Socket path */
     if (socket_path)
@@ -3546,6 +3613,35 @@ virp_error_t onode_start(onode_state_t *state)
             arg->state = state;
             arg->client_fd = client_fd;
 
+            /* Register a dup() of the client fd so the shutdown drain
+             * can shutdown(SHUT_RDWR) the socket and unblock this
+             * worker if it is mid-recv/send at drain time. The dup is
+             * closed by the worker after it clears the slot, so the fd
+             * number cannot be recycled while a drain might target it.
+             * A failed dup just means this worker can't be unblocked
+             * early — the drain timeout still bounds it.
+             *
+             * workers_live is incremented BEFORE pthread_create: the
+             * worker's exit-side decrement must never be able to run
+             * before the increment, or the drain barrier would wait a
+             * full timeout on a phantom worker. */
+            arg->slot = -1;
+            int reg_fd = dup(client_fd);
+            pthread_mutex_lock(&state->state_mutex);
+            if (reg_fd >= 0) {
+                for (int s = 0; s < ONODE_MAX_WORKERS; s++) {
+                    if (state->worker_fds[s] < 0) {
+                        state->worker_fds[s] = reg_fd;
+                        arg->slot = s;
+                        break;
+                    }
+                }
+                if (arg->slot < 0)  /* can't happen: sem caps live workers */
+                    close(reg_fd);
+            }
+            state->workers_live++;
+            pthread_mutex_unlock(&state->state_mutex);
+
             pthread_attr_t attr;
             pthread_attr_init(&attr);
             pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -3554,7 +3650,17 @@ virp_error_t onode_start(onode_state_t *state)
             int rc = pthread_create(&tid, &attr, connection_worker, arg);
             pthread_attr_destroy(&attr);
             if (rc != 0) {
-                /* Thread creation failed: undo semaphore + free arg. */
+                /* Thread creation failed: undo counter, slot, sem, arg. */
+                pthread_mutex_lock(&state->state_mutex);
+                if (arg->slot >= 0 && state->worker_fds[arg->slot] >= 0) {
+                    close(state->worker_fds[arg->slot]);
+                    state->worker_fds[arg->slot] = -1;
+                }
+                if (state->workers_live > 0)
+                    state->workers_live--;
+                if (state->workers_live == 0)
+                    pthread_cond_broadcast(&state->workers_cv);
+                pthread_mutex_unlock(&state->state_mutex);
                 sem_post(&state->worker_sem);
                 free(arg);
                 fprintf(stderr, "[O-Node] pthread_create failed: %s\n",
@@ -3562,42 +3668,50 @@ virp_error_t onode_start(onode_state_t *state)
                 close(client_fd);
                 continue;
             }
-
-            pthread_mutex_lock(&state->state_mutex);
-            state->workers_live++;
-            pthread_mutex_unlock(&state->state_mutex);
         }
     }
 
     fprintf(stderr, "[O-Node] Shutting down...\n");
 
     /*
-     * Drain the worker pool. Workers are detached (no pthread_join), so we
-     * wait on the counter they maintain under state_mutex. This lets each
-     * in-flight request finish its execute AND its chain (audit) write
-     * before teardown, so a restart cannot truncate a durable record.
+     * Drain the worker pool — a real barrier, not timeout-and-hope.
      *
-     * Bounded to ~30s — comfortably longer than the worst-case in-flight
-     * request (SSH read timeout ~10-15s + a fast SQLite chain append) yet
-     * well inside systemd's 90s stop timeout, so a genuinely wedged worker
-     * still can't push us past the deadline into a SIGKILL. If it does time
-     * out we warn (audit visibility) rather than block forever.
+     * 1. shutdown(SHUT_RDWR) every live worker's client socket (via the
+     *    registered dups) so a worker blocked in recv/send on its
+     *    client unblocks immediately. SSH I/O has its own 10-15s
+     *    timeouts, so nothing in handle_client blocks unboundedly.
+     * 2. Wait on workers_cv for workers_live to reach zero. Each
+     *    in-flight request still finishes its execute AND its chain
+     *    (audit) write before teardown, so a restart cannot truncate a
+     *    durable record.
+     * 3. ONODE_DRAIN_TIMEOUT_SEC is the last resort for a genuinely
+     *    wedged worker — comfortably inside systemd's 90s stop window.
+     *    If it fires, mark drain_failed: onode_destroy() must then LEAK
+     *    the shared state (mutexes, connections, chain, keys) rather
+     *    than free it under a live thread.
      */
-    for (int waited = 0; waited < 300; waited++) {   /* 300 * 100ms = 30s */
-        pthread_mutex_lock(&state->state_mutex);
-        uint32_t live = state->workers_live;
-        pthread_mutex_unlock(&state->state_mutex);
-        if (live == 0) break;
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000L };  /* 100ms */
-        nanosleep(&ts, NULL);
-    }
     pthread_mutex_lock(&state->state_mutex);
+    for (int s = 0; s < ONODE_MAX_WORKERS; s++) {
+        if (state->worker_fds[s] >= 0)
+            shutdown(state->worker_fds[s], SHUT_RDWR);
+    }
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += ONODE_DRAIN_TIMEOUT_SEC;
+    int wrc = 0;
+    while (state->workers_live > 0 && wrc != ETIMEDOUT)
+        wrc = pthread_cond_timedwait(&state->workers_cv,
+                                     &state->state_mutex, &deadline);
     uint32_t live_final = state->workers_live;
     pthread_mutex_unlock(&state->state_mutex);
     if (live_final > 0) {
+        state->drain_failed = true;
         fprintf(stderr,
-                "[O-Node] drain timeout — %u worker(s) still live\n",
-                live_final);
+                "[O-Node] DRAIN TIMEOUT after %ds — %u worker(s) still "
+                "live. Shared state (mutexes, connections, chain, keys) "
+                "will be LEAKED, not destroyed, to avoid freeing it "
+                "under a live thread.\n",
+                ONODE_DRAIN_TIMEOUT_SEC, live_final);
     }
 
     return VIRP_OK;
@@ -3618,6 +3732,34 @@ void onode_destroy(onode_state_t *state)
     state->watchdog_running = false;
     if (state->watchdog_thread)
         pthread_join(state->watchdog_thread, NULL);
+
+    /*
+     * Shutdown barrier check. onode_start()'s drain waits on workers_cv
+     * for workers_live to reach zero; only if its hard timeout fired
+     * can workers still be live here. A live worker may be inside
+     * handle_client holding exec_mutex, signing with okey, or writing
+     * the chain — destroying any of that under it is use-after-destroy.
+     * In that case leak everything except the listen socket: the
+     * process is exiting, the OS reclaims memory, and a leak cannot
+     * corrupt the chain db the way freeing under a live writer can.
+     */
+    pthread_mutex_lock(&state->state_mutex);
+    uint32_t live = state->workers_live;
+    pthread_mutex_unlock(&state->state_mutex);
+    if (state->drain_failed || live > 0) {
+        fprintf(stderr,
+                "[O-Node] REFUSING TEARDOWN — %u worker(s) still live "
+                "after drain timeout. Leaking mutexes, connections, "
+                "chain state, and key state; listen socket closed so a "
+                "restart can bind. THIS IS A BUG IN A WORKER: it should "
+                "never outlive the drain.\n",
+                live);
+        if (state->listen_fd >= 0) {
+            close(state->listen_fd);
+            unlink(state->socket_path);
+        }
+        return;
+    }
 
     /*
      * Close all device connections. The listen socket has already been
@@ -3657,7 +3799,8 @@ void onode_destroy(onode_state_t *state)
                         sizeof(state->devices[i].api_token));
     }
 
-    /* Destroy mutexes and worker semaphore */
+    /* Destroy mutexes, drain condvar, and worker semaphore */
+    pthread_cond_destroy(&state->workers_cv);
     pthread_mutex_destroy(&state->state_mutex);
     pthread_mutex_destroy(&state->conn_mutex);
     pthread_mutex_destroy(&state->session_mutex);

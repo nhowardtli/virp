@@ -282,6 +282,21 @@ make test-session-key
 
 Systemd unit file: [`deploy/virp-onode.service`](deploy/virp-onode.service)
 
+### Device registry configuration
+
+The HTTP API (`api/server.py`) resolves its device list from exactly one
+source, chosen by this precedence rule:
+
+1. **`VIRP_DEVICES` set** — the JSON file it names is the device registry,
+   honored exactly as given. The YAML registry is not consulted at all.
+2. **`VIRP_DEVICES` unset** — the canonical `devices.yaml` registry (via
+   `device_registry.py`), when that module is importable.
+3. **Neither** — the legacy default JSON at `/var/lib/virp/devices.json`.
+
+Whether `device_registry.py` happens to be importable never overrides an
+explicit `VIRP_DEVICES`: module availability is an implementation detail,
+not configuration.
+
 ---
 
 ## What's In The Box

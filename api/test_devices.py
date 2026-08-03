@@ -44,7 +44,7 @@ def server(tmp_path, monkeypatch):
     if "server" in sys.modules:
         del sys.modules["server"]
     server = importlib.import_module("server")
-    monkeypatch.setattr(server, "_HAVE_REGISTRY", False)
+    monkeypatch.setattr(server, "_USE_REGISTRY", False)
     return server
 
 
@@ -248,3 +248,51 @@ def test_delete_actually_removes(client, server):
     assert r.status_code == 200
     raw = json.loads(Path(os.environ["VIRP_DEVICES"]).read_text())
     assert "R1" not in raw
+
+
+# ---- VIRP_DEVICES precedence over the YAML registry ------------------------
+
+def test_virp_devices_env_bypasses_yaml_registry(tmp_path, monkeypatch):
+    """An explicit VIRP_DEVICES JSON path must win over devices.yaml.
+
+    Regression test for the 2026-08-02 review finding: server.py used
+    import success (_HAVE_REGISTRY) as the source selector, so whether
+    an earlier test happened to put the repo root on sys.path silently
+    decided whether VIRP_DEVICES was honored. Here device_registry IS
+    importable, and the YAML registry is booby-trapped — any
+    consultation of it fails the test.
+    """
+    pytest.importorskip("yaml")
+
+    devices_path = tmp_path / "devices.json"
+    devices_path.write_text(json.dumps(
+        {"R-env": {"host": "10.9.9.9", "driver": "cisco"}}))
+    monkeypatch.setenv("VIRP_DEVICES", str(devices_path))
+    monkeypatch.setenv("VIRP_WEB_DIR", str(tmp_path / "no-web"))
+    monkeypatch.delenv("VIRP_ALLOWED_ORIGINS", raising=False)
+
+    # Ensure device_registry is importable so import success cannot be
+    # what routes us to the JSON file.
+    repo_root = Path(__file__).resolve().parent.parent
+    monkeypatch.syspath_prepend(str(repo_root))
+    api_dir = Path(__file__).parent
+    if str(api_dir) not in sys.path:
+        sys.path.insert(0, str(api_dir))
+    if "server" in sys.modules:
+        del sys.modules["server"]
+    server = importlib.import_module("server")
+
+    assert server._HAVE_REGISTRY, "precondition: device_registry importable"
+    assert not server._USE_REGISTRY, (
+        "VIRP_DEVICES is set, so the YAML registry must not be selected")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            "devices.yaml registry consulted despite VIRP_DEVICES being set")
+
+    for fn in ("load_devices", "get_enabled_devices", "get_device"):
+        monkeypatch.setattr(server._dr, fn, _boom)
+
+    assert server.load_devices() == {
+        "R-env": {"host": "10.9.9.9", "driver": "cisco"},
+    }

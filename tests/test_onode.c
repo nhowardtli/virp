@@ -24,6 +24,7 @@
 #include "virp_message.h"
 #include "virp_onode.h"
 #include "virp_driver.h"
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1380,6 +1381,106 @@ TEST(test_v1_unframed_client_rejected)
     ASSERT_TRUE(more <= 0);  /* EOF */
 
     close(fd);
+}
+
+/* =========================================================================
+ * send_all unit tests (socketpair, no daemon needed)
+ *
+ * send_all is the send-side counterpart of recv_exact: it must deliver
+ * every byte across partial writes and EINTR, and report a dead peer
+ * as -1 instead of raising SIGPIPE. Exercised directly over a
+ * socketpair; a reader thread drains slowly through a shrunken send
+ * buffer while bombarding the sender with SIGUSR1 (installed WITHOUT
+ * SA_RESTART) so send() actually observes interruptions mid-frame.
+ * ========================================================================= */
+
+extern int send_all(int fd, const void *buf, size_t len);
+
+#define SENDALL_TOTAL (256 * 1024)
+
+typedef struct {
+    int        fd;
+    size_t     got;
+    int        pattern_ok;
+    pthread_t  sender;
+    volatile int bombard;
+} sendall_reader_arg_t;
+
+static void sendall_sigusr1_handler(int sig) { (void)sig; }
+
+static void *sendall_reader_thread(void *argp)
+{
+    sendall_reader_arg_t *a = argp;
+    uint8_t chunk[3000];
+    a->pattern_ok = 1;
+    while (a->got < SENDALL_TOTAL) {
+        if (a->bombard)
+            pthread_kill(a->sender, SIGUSR1);
+        ssize_t n = recv(a->fd, chunk, sizeof(chunk), 0);
+        if (n <= 0)
+            break;
+        for (ssize_t i = 0; i < n; i++)
+            if (chunk[i] != (uint8_t)((a->got + (size_t)i) & 0xFF))
+                a->pattern_ok = 0;
+        a->got += (size_t)n;
+        usleep(1000);   /* drain slowly — keep the send buffer full */
+    }
+    return NULL;
+}
+
+TEST(test_send_all_survives_partial_writes_and_eintr)
+{
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+    int sndbuf = 4096;   /* kernel clamps to its minimum; small is enough */
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    struct sigaction sa, old_sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sendall_sigusr1_handler;   /* no SA_RESTART on purpose */
+    sigaction(SIGUSR1, &sa, &old_sa);
+
+    uint8_t *buf = malloc(SENDALL_TOTAL);
+    ASSERT_TRUE(buf != NULL);
+    for (size_t i = 0; i < SENDALL_TOTAL; i++)
+        buf[i] = (uint8_t)(i & 0xFF);
+
+    sendall_reader_arg_t arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.fd = sv[1];
+    arg.sender = pthread_self();
+    arg.bombard = 1;
+    pthread_t reader;
+    pthread_create(&reader, NULL, sendall_reader_thread, &arg);
+
+    int rc = send_all(sv[0], buf, SENDALL_TOTAL);
+
+    arg.bombard = 0;
+    pthread_join(reader, NULL);
+    sigaction(SIGUSR1, &old_sa, NULL);
+    free(buf);
+    close(sv[0]);
+    close(sv[1]);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ((int)arg.got, SENDALL_TOTAL);
+    ASSERT_TRUE(arg.pattern_ok);
+}
+
+TEST(test_send_all_reports_dead_peer)
+{
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    close(sv[1]);   /* peer gone before we send a byte */
+
+    uint8_t junk[512];
+    memset(junk, 0xAB, sizeof(junk));
+
+    /* MSG_NOSIGNAL inside send_all: EPIPE must surface as -1, not as
+     * SIGPIPE killing this test binary. */
+    ASSERT_EQ(send_all(sv[0], junk, sizeof(junk)), -1);
+    close(sv[0]);
 }
 
 /* =========================================================================
@@ -2935,6 +3036,8 @@ int main(void)
     RUN_TEST(test_v1_unframed_client_rejected);
     RUN_TEST(test_framed_request_split_across_three_sends);
     RUN_TEST(test_framed_oversize_length_rejected);
+    RUN_TEST(test_send_all_survives_partial_writes_and_eintr);
+    RUN_TEST(test_send_all_reports_dead_peer);
 
     printf("\n[Worker Pool / Concurrency Tests]\n");
     RUN_TEST(test_concurrent_clients_no_head_of_line);

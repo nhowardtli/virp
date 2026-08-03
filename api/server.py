@@ -40,7 +40,8 @@ VIRP_KEY_PATH = os.environ.get("VIRP_KEY_PATH", "/etc/virp/keys/onode.key")
 # devices.json lives under /var/lib/virp (service-user writable) rather
 # than /etc/virp (root-owned, immutable config). Operators can point
 # VIRP_DEVICES elsewhere; see deploy/virp-onode.service for the
-# systemd StateDirectory convention.
+# systemd StateDirectory convention. Setting VIRP_DEVICES also selects
+# the JSON file as the device source outright — see _USE_REGISTRY below.
 DEVICES_PATH = os.environ.get("VIRP_DEVICES", "/var/lib/virp/devices.json")
 WEB_DIR = os.environ.get("VIRP_WEB_DIR", "/opt/virp-appliance/web")
 API_TOKEN = os.environ.get("VIRP_API_TOKEN", "")  # Optional bearer token
@@ -95,12 +96,25 @@ VIRP_ALLOWED_ORIGINS = [
     if o.strip()
 ]
 
-# Single source of truth — device registry
+# Device registry import — records only whether the module is importable.
 try:
     import device_registry as _dr
     _HAVE_REGISTRY = True
 except ImportError:
     _HAVE_REGISTRY = False
+
+# Device-source selection. Precedence (documented in README → "Device
+# registry configuration"):
+#   1. VIRP_DEVICES set   → the JSON file it names is the registry,
+#      honored exactly. The YAML registry is NOT consulted.
+#   2. VIRP_DEVICES unset → the canonical devices.yaml registry via
+#      device_registry, when that module is importable.
+#   3. Otherwise          → the legacy default JSON path (DEVICES_PATH).
+# Whether device_registry happens to be importable (a sys.path accident
+# in tests, a missing optional dependency in a deploy) must never
+# override an operator's explicit VIRP_DEVICES: module availability is
+# an implementation detail, not configuration.
+_USE_REGISTRY = _HAVE_REGISTRY and "VIRP_DEVICES" not in os.environ
 
 # VIRP protocol constants
 VIRP_HEADER_SIZE = 56
@@ -634,11 +648,12 @@ _VENDOR_TO_DRIVER = {
 def load_devices() -> dict:
     """Load device registry.
 
-    Uses the canonical devices.yaml via device_registry if available,
-    falling back to the legacy devices.json for backward compat.
+    Uses the canonical devices.yaml via device_registry unless the
+    operator selected an explicit JSON file with VIRP_DEVICES (see
+    _USE_REGISTRY above), falling back to the legacy devices.json.
     Returns dict keyed by hostname with host/driver fields.
     """
-    if _HAVE_REGISTRY:
+    if _USE_REGISTRY:
         result = {}
         for name, d in _dr.get_enabled_devices().items():
             vendor = d.get("vendor", "")
@@ -947,14 +962,14 @@ async def list_devices():
             "driver": config.get("driver", "unknown"),
             "virp_supported": config.get("driver") in ("cisco", "fortigate", "panos", "cisco_asa"),
         }
-        # Include richer metadata from device_registry when available
-        if _HAVE_REGISTRY:
+        # Include richer metadata when the YAML registry is the source
+        if _USE_REGISTRY:
             entry["platform"] = config.get("platform", "")
             entry["type"] = config.get("type", "")
             entry["trust_tier"] = config.get("trust_tier", "YELLOW")
             entry["tags"] = config.get("tags", [])
         result.append(entry)
-    return {"devices": result, "total": len(result), "source": "devices.yaml" if _HAVE_REGISTRY else "devices.json"}
+    return {"devices": result, "total": len(result), "source": "devices.yaml" if _USE_REGISTRY else "devices.json"}
 
 
 @app.post("/api/observe", dependencies=[Depends(check_auth)])
@@ -1158,7 +1173,7 @@ async def add_device(req: DeviceAddRequest, request: Request):
     The canonical source is /root/virp/devices.yaml — edit that file
     for permanent additions.
     """
-    if _HAVE_REGISTRY and _dr.get_device(req.name):
+    if _USE_REGISTRY and _dr.get_device(req.name):
         raise HTTPException(
             status_code=409,
             detail=f"Device '{req.name}' already exists in devices.yaml. "
@@ -1189,7 +1204,7 @@ async def add_device(req: DeviceAddRequest, request: Request):
 async def remove_device(name: str, request: Request):
     """Remove a device from the registry. Same locking + atomic-write
     guarantees as add_device."""
-    if _HAVE_REGISTRY and _dr.get_device(name):
+    if _USE_REGISTRY and _dr.get_device(name):
         raise HTTPException(
             status_code=409,
             detail=f"Device '{name}' is defined in devices.yaml. "

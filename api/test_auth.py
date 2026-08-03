@@ -80,7 +80,7 @@ def server(tmp_path, monkeypatch):
 
     # Force the legacy devices.json path so tests don't conflict with the
     # real devices.yaml registry that ships alongside the source tree.
-    monkeypatch.setattr(server, "_HAVE_REGISTRY", False)
+    monkeypatch.setattr(server, "_USE_REGISTRY", False)
 
     return server
 
