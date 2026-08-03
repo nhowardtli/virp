@@ -370,6 +370,37 @@ ONODE_PROD = $(BUILD_DIR)/virp-onode-prod
 $(ONODE_PROD): src/virp_onode_prod.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -ljson-c -o $@
 
+# ---------------------------------------------------------------------------
+# LAB-ONLY fault-injection daemon (adversarial test program, test #2).
+#
+# Builds build-fi/virp-onode-prod with -DVIRP_FAULT_INJECT so the VIRP_FI()
+# crash points in virp_onode.c / virp_approval.c compile in. Without that
+# define every call site expands to ((void)0) and emits no symbol, so the
+# production binary is unaffected by their presence in the source.
+#
+# ISOLATION, deliberate and load-bearing:
+#   - Objects go to BUILD_DIR=build-fi, NOT build/. An FI-instrumented .o must
+#     never end up in build/libvirp.a where a later `make prod` could link it.
+#     build/virp (the client these tests depend on) is likewise untouched.
+#   - -DVIRP_FAULT_INJECT is passed via the existing CFLAGS_EXTRA hook so the
+#     Makefile's own CFLAGS (includes, warnings, -MMD) are preserved rather
+#     than overridden.
+#
+# NOT a dependency of `all`, `prod`, or `install`. Must never be installed as
+# $(VIRP_INSTALL_BIN) or named in the systemd unit: it exists to be SIGKILLed
+# mid-operation, and must only run in the foreground against an ISOLATED
+# socket, chain DB and approval spool. Full contract in
+# include/virp_fault_inject.h.
+# ---------------------------------------------------------------------------
+.PHONY: onode-fi
+onode-fi:
+	$(MAKE) BUILD_DIR=build-fi CFLAGS_EXTRA=-DVIRP_FAULT_INJECT \
+	        LINUX=1 build-fi/virp-onode-prod
+	@echo ""
+	@echo "built build-fi/virp-onode-prod  — LAB ONLY"
+	@echo "  never 'make install' this, never point the systemd unit at it,"
+	@echo "  and only run it against an isolated socket/chain/spool."
+
 # 'make prod' builds the prod O-Node with all production drivers enabled,
 # including PAN-OS. Uses recursive $(MAKE) because the driver guards are
 # `ifdef PANOS` / `ifdef CISCO` / etc., which are evaluated at Makefile

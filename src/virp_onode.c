@@ -17,6 +17,7 @@
 #define _GNU_SOURCE   /* struct ucred (SO_PEERCRED) */
 
 #include "virp_onode.h"
+#include "virp_fault_inject.h"   /* lab-only; compiles away without -DVIRP_FAULT_INJECT */
 #include "virp_message.h"
 #include "virp_handshake.h"
 #include "virp_transcript.h"
@@ -776,6 +777,7 @@ static void approval_emit_outcome(onode_state_t *state,
                                           "outcome", artifact_id,
                                           artifact_hash, &ce);
     if (cerr == VIRP_OK) {
+        VIRP_FI("mid_outcome");
         virp_chain_artifact_store(&state->chain, artifact_id, "outcome",
                                   content, artifact_hash, chain_session);
         fprintf(stderr, "[GATE] outcome persisted: proposal=%s seq=%lld "
@@ -1442,7 +1444,9 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     }
 
     virp_exec_result_t result;
+    VIRP_FI("pre_exec");
     virp_error_t err = drv->execute(conn, command, &result);
+    VIRP_FI("post_exec");
     if (err != VIRP_OK) {
         drop_connection(state, dev_idx);
         pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -1590,6 +1594,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
 
     /* Approved apply reached execution: link PROPOSAL + APPROVAL to the
      * outcome, whatever the device reported. */
+    VIRP_FI("pre_outcome");
     if (approved)
         approval_emit_outcome(state, proposal_id, &apr,
                               device_name, result.success);

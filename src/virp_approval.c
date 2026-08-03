@@ -15,6 +15,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_approval.h"
+#include "virp_fault_inject.h"   /* lab-only; compiles away without -DVIRP_FAULT_INJECT */
 #include "virp_crypto.h"
 
 #include <errno.h>
@@ -930,5 +931,10 @@ virp_error_t virp_approval_verify_consume(const char *dir,
         return VIRP_ERR_APPROVAL_EXPIRED;
 
     /* 6. Single-use consume (durable; persist failure fails closed). */
-    return consume_once(dir, proposal_id);
+    VIRP_FI("pre_consume");
+    {
+        virp_error_t _c = consume_once(dir, proposal_id);
+        if (_c == VIRP_OK) VIRP_FI("post_consume");
+        return _c;
+    }
 }
