@@ -1,6 +1,52 @@
 # VIRP Deployment Record — virp-lab
 
 - **Role**: production reference instance
+
+## Current live state (verified 2026-08-03 01:28 UTC)
+
+**This block is authoritative for what is running right now.** Everything below
+it is a chronological, append-only log: each section describes the state at the
+time it was written and is deliberately *not* corrected in place. Where a fact
+below disagrees with this block, this block wins. A copy of this file without
+this block is stale — check the commit before relying on it.
+
+- **Commit**: `b6e9602c9d5939c80d83af0dccfbef44858cec6a` (short `b6e9602c`)
+- **Branch**: `deploy/audit-fixes-2026-08-01`
+- **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
+  socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
+  — binary sha256 `db8f3fabbfc6cc8ee838a5f38ed972f710ed8e098b7c0f91f463379d889d5154`
+- **Client**: `/opt/virp/build/virp` — `virp version` reports `virp-tool b6e9602c`,
+  binary sha256 `56d215702cfe2a558d8f5d1bd642c0488a8e0df9a1e7e149d3deb9ce15c57e50`
+- **Gate**: `default=ENFORCE max_tier=YELLOW overrides=0` — pure ENFORCE.
+  There is **no per-driver SHADOW override for any driver**, `linux` included.
+  The FRR/vtysh classifier is **live**: `vtysh -c "show ..."` reads classify as
+  GREEN and are allowed on their own tier, not waved through by a shadow mode.
+  Journal evidence: `[GATE] mode=ENFORCE device=clab-frr-ospf-frr1 driver=linux
+  tier=GREEN threshold=YELLOW decision=allow`.
+- **Devices**: 7/7 loaded from `/run/virp/devices.json`
+  (rendered at daemon start; sha256 of the rendered file
+  `af448c352e0077e6fe28cdfe9ef9e39fc0752ee2329c265788842493c9fd146c`):
+  clab-frr-ospf-frr1..frr4 (linux/FRR), wazuh-lab, librenms-lab, pbs-lab.
+- **Socket allowlist**: uids 999 (`virp`), 1000 (`nhoward`), 997
+  (`virp-backup`), 995 (`virp-evidence`). **uid 0 is deliberately excluded** —
+  a client running as root is rejected with
+  `peer uid=0 not in socket_allowed_uids`.
+
+### What this corrects
+The 2026-07-29 deploy-time header (retained verbatim below) named commit
+`0c9c7338` on branch `hardening/review-fixes-2026-07-29`, and the "Devices"
+section stated a per-driver `linux=SHADOW` gate override held open "until the
+FRR classification table is built". Both statements were true when written and
+are now stale on two counts:
+
+1. The shadow override was removed later the same day — see
+   "Update 2026-07-29 — FRR/vtysh gate classifier, pure ENFORCE" — and the
+   classifier it was waiting on has been live ever since.
+2. The deployed commit has advanced through the update log below and is now
+   `b6e9602c`, not `0c9c7338`.
+
+## Deploy-time record (2026-07-29, historical)
+
 - **Deployed**: 2026-07-29
 - **Commit**: `0c9c73383d22c1909baf8f13b570176cfa9778c3`
 - **Branch**: `hardening/review-fixes-2026-07-29` (HEAD; contains all of main @ 6eaacfc, branch not merged at deploy time)
@@ -14,7 +60,11 @@ All keys generated fresh on this host — no key material copied from any other 
 - Approver keypair: /etc/virp/keys/approval.{key,pub} (Ed25519; secret key never readable by the daemon)
 - Approver registry: /etc/virp/approvers.json
 
-## Devices
+## Devices (as of 2026-07-29 — SUPERSEDED, see "Current live state")
+> Stale on both counts: the device set has since grown to 7 (wazuh-lab,
+> librenms-lab, pbs-lab were added) and the `linux=SHADOW` override was removed
+> on 2026-07-29. Retained unedited as the record of what was true that day.
+
 clab-frr-ospf-frr1..frr4 (containerlab FRR OSPF lab, 172.20.20.2–.5), linux driver.
 Gate: default ENFORCE, max tier YELLOW; per-driver override linux=SHADOW until the
 FRR classification table is built (linux driver has no route_command classifier yet).
