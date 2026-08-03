@@ -772,20 +772,22 @@ static void approval_emit_outcome(onode_state_t *state,
     char chain_session[96];
     snprintf(chain_session, sizeof(chain_session), "approval:%s", device_name);
 
+    /* Entry and body commit in one transaction; the mid_outcome fault
+     * point lives inside virp_chain_append_with_artifact() now, between
+     * the two inserts, where dying must lose both records instead of
+     * stranding a body-less entry. */
     virp_chain_entry_t ce;
-    virp_error_t cerr = virp_chain_append(&state->chain, chain_session,
-                                          "outcome", artifact_id,
-                                          artifact_hash, &ce);
+    virp_error_t cerr = virp_chain_append_with_artifact(&state->chain,
+                                          chain_session, "outcome",
+                                          artifact_id, artifact_hash,
+                                          content, &ce);
     if (cerr == VIRP_OK) {
-        VIRP_FI("mid_outcome");
-        virp_chain_artifact_store(&state->chain, artifact_id, "outcome",
-                                  content, artifact_hash, chain_session);
         fprintf(stderr, "[GATE] outcome persisted: proposal=%s seq=%lld "
                 "hash=%.16s success=%s\n", proposal_id,
                 (long long)ce.sequence, ce.chain_entry_hash,
                 success ? "true" : "false");
     } else {
-        fprintf(stderr, "[GATE] outcome chain_append failed: %s\n",
+        fprintf(stderr, "[GATE] outcome chain append+store failed: %s\n",
                 virp_error_str(cerr));
     }
 }
@@ -1395,37 +1397,29 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                 snprintf(artifact_id, sizeof(artifact_id),
                          "gatereject-%.16s", artifact_hash);
 
+                /* Entry and body are one transaction now: a stored
+                 * rejection always has its reason recoverable, and a
+                 * body-store failure fails the whole append (logged
+                 * below) instead of stranding a commitment. The
+                 * body==NULL fallback keeps the historical entry-only
+                 * append — a rejection must always be recorded even
+                 * when its body could not be built. */
                 virp_chain_entry_t ce;
-                virp_error_t cerr = virp_chain_append(&state->chain, session_id,
-                                                      "gate_rejection",
-                                                      artifact_id, artifact_hash,
-                                                      &ce);
+                virp_error_t cerr = virp_chain_append_with_artifact(
+                                        &state->chain, session_id,
+                                        "gate_rejection", artifact_id,
+                                        artifact_hash, body, &ce);
                 if (cerr == VIRP_OK) {
-                    /* Store the body under the same id the entry names.
-                     * Best-effort like the append itself: a storage
-                     * failure must not alter the rejection, but it is
-                     * logged so a chain with unrecoverable reasons is
-                     * visible rather than silent. */
-                    if (body) {
-                        virp_error_t serr = virp_chain_artifact_store(
-                                &state->chain, artifact_id, "gate_rejection",
-                                body, artifact_hash, session_id);
-                        if (serr != VIRP_OK)
-                            fprintf(stderr, "[GATE] rejection reason body "
-                                    "store failed: %s (entry %s retains only "
-                                    "the commitment)\n",
-                                    virp_error_str(serr), artifact_id);
-                    } else {
+                    if (!body)
                         fprintf(stderr, "[GATE] rejection reason body could "
                                 "not be built; entry %s retains only the "
                                 "commitment\n", artifact_id);
-                    }
                     fprintf(stderr, "[GATE] rejection persisted: session=%s "
                             "seq=%lld hash=%.16s\n", session_id,
                             (long long)ce.sequence, ce.chain_entry_hash);
                 } else {
-                    fprintf(stderr, "[GATE] rejection chain_append failed: %s\n",
-                            virp_error_str(cerr));
+                    fprintf(stderr, "[GATE] rejection chain append+store "
+                            "failed: %s\n", virp_error_str(cerr));
                 }
 
                 if (body) free(body);
@@ -2210,20 +2204,22 @@ static void handle_client(onode_state_t *state, int client_fd)
             break;
         }
         {
+            /* Entry and (optional) raw content commit in one transaction.
+             * A content-store failure now fails the whole request with a
+             * typed error instead of acking an entry whose committed body
+             * was silently dropped. Content-less appends remain valid:
+             * commitment-only is a caller choice, not a failure mode. */
             virp_chain_entry_t chain_entry;
-            err = virp_chain_append(&state->chain, req.session_id,
+            err = virp_chain_append_with_artifact(&state->chain,
+                                     req.session_id,
                                      req.artifact_type, req.artifact_id,
-                                     req.artifact_hash, &chain_entry);
+                                     req.artifact_hash,
+                                     req.artifact_content[0] != '\0'
+                                         ? req.artifact_content : NULL,
+                                     &chain_entry);
             if (err != VIRP_OK) {
                 send_framed_error(client_fd, err);
                 break;
-            }
-            /* Store raw artifact content if provided */
-            if (req.artifact_content[0] != '\0') {
-                virp_chain_artifact_store(&state->chain,
-                    req.artifact_id, req.artifact_type,
-                    req.artifact_content, req.artifact_hash,
-                    req.session_id);
             }
             /* JSON-encode the chain entry as observation payload */
             char json_buf[2048];

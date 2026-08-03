@@ -720,6 +720,101 @@ static void test_malformed_mac_fails_closed(void)
 }
 
 /* =========================================================================
+ * Test: append_with_artifact — entry and body are one transaction
+ *
+ * Adversarial test #2 (`mid_outcome`) showed the old split calls could
+ * leave a chain entry committing to a body that was never stored (crash
+ * between the calls, or a snapshot taken between them; production carries
+ * 20 such entries). These tests pin the combined API's contract: both
+ * records or neither.
+ * ========================================================================= */
+
+static void test_append_with_artifact_stores_both(void)
+{
+    TEST("append_with_artifact stores entry AND body");
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init failed");
+
+    const char *body = "{\"kind\":\"outcome\",\"success\":true}";
+    char hash[65];
+    unsigned char d[32];
+    SHA256((const unsigned char *)body, strlen(body), d);
+    for (int i = 0; i < 32; i++) snprintf(hash + i * 2, 3, "%02x", d[i]);
+
+    virp_chain_entry_t e;
+    err = virp_chain_append_with_artifact(&state, "session-atomic",
+                                          "outcome", "outcome:atomic-1",
+                                          hash, body, &e);
+    ASSERT(err == VIRP_OK, "combined append failed");
+
+    /* The body must be retrievable under the id the entry names, with
+     * the hash the entry commits to. */
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(state.db,
+        "SELECT artifact_content, artifact_hash FROM artifacts "
+        "WHERE artifact_id = 'outcome:atomic-1'", -1, &st, NULL);
+    ASSERT(rc == SQLITE_OK, "prepare failed");
+    ASSERT(sqlite3_step(st) == SQLITE_ROW, "artifact body missing");
+    ASSERT(strcmp((const char *)sqlite3_column_text(st, 0), body) == 0,
+           "stored body differs");
+    ASSERT(strcmp((const char *)sqlite3_column_text(st, 1), hash) == 0,
+           "stored hash differs");
+    sqlite3_finalize(st);
+
+    virp_chain_verify_result_t result;
+    err = virp_chain_verify_session(&state, "session-atomic", &result);
+    ASSERT(err == VIRP_OK && result.valid, "session must verify");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+static void test_append_with_artifact_rolls_back_together(void)
+{
+    TEST("append_with_artifact body failure rolls back entry");
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init failed");
+
+    /* Seed one good combined append so there is a head to protect. */
+    virp_chain_entry_t e;
+    err = virp_chain_append_with_artifact(&state, "session-rollback",
+                                          "outcome", "outcome:rb-0",
+                                          "aa11", "seed body", &e);
+    ASSERT(err == VIRP_OK, "seed append failed");
+
+    /* Force the body store to fail: drop the artifacts table out from
+     * under the prepared statement. The append must then fail AS A WHOLE
+     * — no entry, no head advance — never commit an entry whose body
+     * cannot exist. */
+    sqlite3_exec(state.db, "DROP TABLE artifacts;", NULL, NULL, NULL);
+
+    err = virp_chain_append_with_artifact(&state, "session-rollback",
+                                          "outcome", "outcome:rb-1",
+                                          "bb22", "doomed body", &e);
+    ASSERT(err == VIRP_ERR_CHAIN_DB, "append must fail typed");
+
+    virp_chain_entry_t last;
+    err = virp_chain_get_last(&state, "session-rollback", &last);
+    ASSERT(err == VIRP_OK, "get_last failed");
+    ASSERT(last.sequence == 0, "failed append must not advance the chain");
+    ASSERT(strcmp(last.artifact_id, "outcome:rb-0") == 0,
+           "last entry must be the seed, not the failed append");
+
+    virp_chain_verify_result_t result;
+    err = virp_chain_verify_session(&state, "session-rollback", &result);
+    ASSERT(err == VIRP_OK && result.valid,
+           "session must still verify after rolled-back append");
+    ASSERT(result.to_sequence == 0, "head must not have advanced");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -745,6 +840,8 @@ int main(void)
     test_verify_session_forged_head();
     test_head_backfill();
     test_malformed_mac_fails_closed();
+    test_append_with_artifact_stores_both();
+    test_append_with_artifact_rolls_back_together();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

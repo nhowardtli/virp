@@ -128,6 +128,31 @@ virp_error_t virp_chain_append(virp_chain_state_t *state,
                                virp_chain_entry_t *entry);
 
 /*
+ * Append a chain entry AND store the artifact body it commits to, in one
+ * SQLite transaction. Either both are durable or neither is: a crash (or
+ * a snapshot of the database) can never capture an entry whose committed
+ * body is absent, and a failed body store fails the whole append with
+ * VIRP_ERR_CHAIN_DB instead of being silently dropped.
+ *
+ * artifact_content may be NULL or empty, in which case this behaves
+ * exactly like virp_chain_append() — an entry-only append (commitment
+ * without retained body) remains a deliberate, caller-chosen state, not
+ * something a crash can manufacture.
+ *
+ * Every call site that pairs virp_chain_append() with
+ * virp_chain_artifact_store() for the same artifact must use this
+ * instead; the split calls are only for bodies stored without a chain
+ * entry of their own (e.g. the intent store).
+ */
+virp_error_t virp_chain_append_with_artifact(virp_chain_state_t *state,
+                                             const char *session_id,
+                                             const char *artifact_type,
+                                             const char *artifact_id,
+                                             const char *artifact_hash,
+                                             const char *artifact_content,
+                                             virp_chain_entry_t *entry);
+
+/*
  * Verify chain integrity for a sequence range within a session.
  * Re-hashes each entry and verifies HMAC + previous_entry_hash linkage.
  *

@@ -14,6 +14,7 @@
 #define _POSIX_C_SOURCE 199309L  /* clock_gettime */
 
 #include "virp_chain.h"
+#include "virp_fault_inject.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,7 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
                                         const char *artifact_type,
                                         const char *artifact_id,
                                         const char *artifact_hash,
+                                        const char *artifact_content,
                                         virp_chain_entry_t *entry);
 static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                                         const char *session_id,
@@ -84,7 +86,25 @@ virp_error_t virp_chain_append(virp_chain_state_t *state,
     if (!state) return VIRP_ERR_NULL_PTR;
     pthread_mutex_lock(&state->lock);
     virp_error_t rc = chain_append_locked(state, session_id, artifact_type,
-                                          artifact_id, artifact_hash, entry);
+                                          artifact_id, artifact_hash, NULL,
+                                          entry);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+virp_error_t virp_chain_append_with_artifact(virp_chain_state_t *state,
+                                             const char *session_id,
+                                             const char *artifact_type,
+                                             const char *artifact_id,
+                                             const char *artifact_hash,
+                                             const char *artifact_content,
+                                             virp_chain_entry_t *entry)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_append_locked(state, session_id, artifact_type,
+                                          artifact_id, artifact_hash,
+                                          artifact_content, entry);
     pthread_mutex_unlock(&state->lock);
     return rc;
 }
@@ -828,6 +848,7 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
                                const char *artifact_type,
                                const char *artifact_id,
                                const char *artifact_hash,
+                               const char *artifact_content,
                                virp_chain_entry_t *entry)
 {
     if (!state || !session_id || !artifact_type ||
@@ -925,6 +946,27 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
                            entry->chain_entry_hash) != VIRP_OK) {
         sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
         return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* Store the artifact body in the SAME transaction as the entry that
+     * commits to its hash. Before this the body was written by a separate
+     * autocommit statement after COMMIT, so a crash between the two — or a
+     * snapshot taken between them — yielded a chain entry committing to a
+     * body that does not exist (adversarial test #2, `mid_outcome`; 20
+     * such entries in production). Now entry, head and body land or roll
+     * back together: a store failure fails the whole append, typed, and
+     * can never leave a dangling commitment. The FI point keeps its name
+     * and its meaning — "between entry insert and body store" — but the
+     * boundary is now inside the transaction, so dying here must lose
+     * both records, not one. */
+    if (artifact_content && artifact_content[0] != '\0') {
+        VIRP_FI("mid_outcome");
+        if (chain_artifact_store_locked(state, artifact_id, artifact_type,
+                                        artifact_content, artifact_hash,
+                                        session_id) != VIRP_OK) {
+            sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+            return VIRP_ERR_CHAIN_DB;
+        }
     }
 
     /* COMMIT — sequence is now permanent */
