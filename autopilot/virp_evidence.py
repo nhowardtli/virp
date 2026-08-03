@@ -166,10 +166,15 @@ def assert_green_form(command):
 # ── Identity check ─────────────────────────────────────────────────────
 
 
-def identity_problems(secret_paths=SECRET_PATHS, euid=None, gids=None):
+def identity_problems(secret_paths=None, euid=None, gids=None):
     """Return the list of reasons this process must NOT run. Empty list
     means the least-privilege contract holds. Pure-ish (paths and ids
-    injectable) so tests can exercise every refusal."""
+    injectable) so tests can exercise every refusal. Defaults resolve at
+    call time from the module globals — an import-time default here
+    would make a test's rebinding of SECRET_PATHS invisible to main()'s
+    bare identity_problems() call."""
+    if secret_paths is None:
+        secret_paths = SECRET_PATHS
     problems = []
     euid = os.geteuid() if euid is None else euid
     if euid == 0:
@@ -561,10 +566,16 @@ def collect_item(device, item, session_id, controls, provenance,
 # ── Run ────────────────────────────────────────────────────────────────
 
 
-def run(root=EVIDENCE_ROOT, send=onode_send, alerts_file=ALERTS_FILE,
+def run(root=None, send=onode_send, alerts_file=None,
         items_paths=ITEMS_PATHS, controls_paths=CONTROLS_PATHS,
         devices=None, now=None):
-    """One full collection cycle: every item on every device."""
+    """One full collection cycle: every item on every device. root and
+    alerts_file resolve at call time (see identity_problems) so tests
+    can point the whole evidence tree somewhere disposable."""
+    if root is None:
+        root = EVIDENCE_ROOT
+    if alerts_file is None:
+        alerts_file = ALERTS_FILE
     now = now if now is not None else time.time()
     run_ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
     session_id = "evidence:%s" % time.strftime("%Y-%m-%d", time.gmtime(now))
