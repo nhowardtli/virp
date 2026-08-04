@@ -362,6 +362,15 @@ static const char *SCHEMA_SQL =
     "  created_at_ns INTEGER NOT NULL"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_intents_id ON intents(intent_id);"
+    /* Artifact bodies are keyed by (artifact_id, artifact_hash), NOT by
+     * artifact_id alone. Production audit 2026-08-03: two distinct
+     * observations minted the same second-resolution id in one second;
+     * under UNIQUE(artifact_id) + OR REPLACE the second body silently
+     * displaced the first, losing its evidence bytes forever while both
+     * chain entries stayed valid. The chain entry commits to
+     * artifact_hash, so (id, hash) is the identity readers must join on
+     * — a colliding id then stores both bodies side by side, and an
+     * identical (id, hash) re-store is a no-op. */
     "CREATE TABLE IF NOT EXISTS artifacts ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  artifact_id TEXT NOT NULL,"
@@ -370,7 +379,7 @@ static const char *SCHEMA_SQL =
     "  artifact_hash TEXT NOT NULL,"
     "  session_id TEXT NOT NULL,"
     "  created_at_ns INTEGER NOT NULL,"
-    "  UNIQUE(artifact_id)"
+    "  UNIQUE(artifact_id, artifact_hash)"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_artifacts_id ON artifacts(artifact_id);";
 
@@ -436,11 +445,15 @@ static const char *SQL_INTENT_EXECUTE =
     "UPDATE intents SET commands_executed = commands_executed + 1 "
     "WHERE intent_id = ? AND commands_executed < max_commands";
 
+/* DO NOTHING, never REPLACE: an identical (id, hash) re-store is
+ * idempotent; distinct evidence under a colliding id lands as its own
+ * row via the two-column key above. Nothing can displace stored bytes. */
 static const char *SQL_ARTIFACT_INSERT =
-    "INSERT OR REPLACE INTO artifacts "
+    "INSERT INTO artifacts "
     "(artifact_id, artifact_type, artifact_content, artifact_hash, "
     " session_id, created_at_ns) "
-    "VALUES (?,?,?,?,?,?)";
+    "VALUES (?,?,?,?,?,?) "
+    "ON CONFLICT(artifact_id, artifact_hash) DO NOTHING";
 
 /* =========================================================================
  * Helpers
@@ -739,6 +752,72 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
         sqlite3_free(errmsg);
         sqlite3_close(state->db);
         return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* MIGRATION (2026-08-04): rebuild a legacy artifacts table keyed
+     * UNIQUE(artifact_id) to the two-column key above. CREATE IF NOT
+     * EXISTS leaves an existing table untouched, so every database
+     * created before this change still carries the constraint that let
+     * one observation's body displace another's. The rebuild is one
+     * transaction, preserves every stored row, and must run BEFORE the
+     * statements are prepared — SQL_ARTIFACT_INSERT names the
+     * (artifact_id, artifact_hash) conflict target, which fails to
+     * prepare against the legacy table. Fail closed: no migrated
+     * artifacts table, no chain. Detection keys on the table's stored
+     * CREATE text: the legacy shape says "UNIQUE(artifact_id)" and the
+     * current shape "UNIQUE(artifact_id, artifact_hash)", so the comma
+     * distinguishes them. */
+    {
+        int legacy = 0;
+        sqlite3_stmt *ck = NULL;
+        if (sqlite3_prepare_v2(state->db,
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='artifacts'",
+                -1, &ck, NULL) == SQLITE_OK) {
+            if (sqlite3_step(ck) == SQLITE_ROW) {
+                const char *sql = (const char *)sqlite3_column_text(ck, 0);
+                if (sql && strstr(sql, "UNIQUE(artifact_id)") &&
+                    !strstr(sql, "UNIQUE(artifact_id,"))
+                    legacy = 1;
+            }
+            sqlite3_finalize(ck);
+        }
+        if (legacy) {
+            rc = sqlite3_exec(state->db,
+                "BEGIN IMMEDIATE;"
+                "ALTER TABLE artifacts RENAME TO artifacts_legacy_uid;"
+                "CREATE TABLE artifacts ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  artifact_id TEXT NOT NULL,"
+                "  artifact_type TEXT NOT NULL,"
+                "  artifact_content TEXT NOT NULL,"
+                "  artifact_hash TEXT NOT NULL,"
+                "  session_id TEXT NOT NULL,"
+                "  created_at_ns INTEGER NOT NULL,"
+                "  UNIQUE(artifact_id, artifact_hash)"
+                ");"
+                "INSERT INTO artifacts "
+                "  (artifact_id, artifact_type, artifact_content,"
+                "   artifact_hash, session_id, created_at_ns)"
+                "  SELECT artifact_id, artifact_type, artifact_content,"
+                "         artifact_hash, session_id, created_at_ns"
+                "  FROM artifacts_legacy_uid;"
+                "DROP TABLE artifacts_legacy_uid;"
+                "CREATE INDEX IF NOT EXISTS idx_artifacts_id "
+                "  ON artifacts(artifact_id);"
+                "COMMIT;", NULL, NULL, &errmsg);
+            if (rc != SQLITE_OK) {
+                fprintf(stderr, "[Chain] artifacts migration FAILED: %s\n",
+                        errmsg ? errmsg : "unknown");
+                sqlite3_free(errmsg);
+                sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+                sqlite3_close(state->db);
+                return VIRP_ERR_CHAIN_DB;
+            }
+            fprintf(stderr, "[Chain] artifacts migrated: "
+                    "UNIQUE(artifact_id) -> "
+                    "UNIQUE(artifact_id, artifact_hash)\n");
+        }
     }
 
     /* Prepare statements */

@@ -815,6 +815,198 @@ static void test_append_with_artifact_rolls_back_together(void)
 }
 
 /* =========================================================================
+ * Test: artifact id collisions must never displace evidence
+ *
+ * Production audit 2026-08-03: on Jul 31 two distinct observations in the
+ * same second both received the second-resolution id
+ * obs:pbs-lab:1785538992. Both chain entries committed their own correct
+ * hashes, but artifacts was UNIQUE(artifact_id) and the store kept only
+ * the second body — the first observation's evidence bytes are
+ * permanently lost, silently. These tests replay that exact collision
+ * and pin the required behavior: distinct evidence never displaces
+ * distinct evidence, and a colliding id never loses an append.
+ * ========================================================================= */
+
+static void sha256_hex_of(const char *s, char out[65])
+{
+    unsigned char d[32];
+    SHA256((const unsigned char *)s, strlen(s), d);
+    for (int i = 0; i < 32; i++) snprintf(out + i * 2, 3, "%02x", d[i]);
+}
+
+static int artifact_body_count(virp_chain_state_t *state, const char *id)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT COUNT(*) FROM artifacts WHERE artifact_id = ?",
+            -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return n;
+}
+
+static int artifact_body_matches(virp_chain_state_t *state, const char *id,
+                                 const char *hash, const char *want_body)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT artifact_content FROM artifacts "
+            "WHERE artifact_id = ? AND artifact_hash = ?",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, hash, -1, SQLITE_TRANSIENT);
+    int ok = 0;
+    if (sqlite3_step(st) == SQLITE_ROW)
+        ok = strcmp((const char *)sqlite3_column_text(st, 0), want_body) == 0;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static void test_colliding_id_keeps_both_bodies(void)
+{
+    TEST("id collision: distinct evidence keeps BOTH bodies");
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init failed");
+
+    /* Tonight's exact shape: same second-resolution id, same session,
+     * two different observation bodies. */
+    const char *id = "obs:pbs-lab:1785538992";
+    const char *body_a = "{\"obs\":\"first distinct observation\"}";
+    const char *body_b = "{\"obs\":\"second distinct observation\"}";
+    char hash_a[65], hash_b[65];
+    sha256_hex_of(body_a, hash_a);
+    sha256_hex_of(body_b, hash_b);
+
+    virp_chain_entry_t e0, e1;
+    err = virp_chain_append_with_artifact(&state, "session-collide",
+                                          "observation", id, hash_a,
+                                          body_a, &e0);
+    ASSERT(err == VIRP_OK, "first append failed");
+    err = virp_chain_append_with_artifact(&state, "session-collide",
+                                          "observation", id, hash_b,
+                                          body_b, &e1);
+    ASSERT(err == VIRP_OK,
+           "colliding id must never lose an append");
+
+    ASSERT(artifact_body_count(&state, id) == 2,
+           "both bodies must be stored (evidence displaced!)");
+    ASSERT(artifact_body_matches(&state, id, hash_a, body_a),
+           "first body must be retrievable by (id, hash)");
+    ASSERT(artifact_body_matches(&state, id, hash_b, body_b),
+           "second body must be retrievable by (id, hash)");
+
+    virp_chain_verify_result_t result;
+    err = virp_chain_verify_session(&state, "session-collide", &result);
+    ASSERT(err == VIRP_OK && result.valid, "session must verify");
+    ASSERT(result.entries_checked == 2, "both entries must verify");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+static void test_colliding_id_identical_content_idempotent(void)
+{
+    TEST("id collision: identical evidence is idempotent");
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init failed");
+
+    const char *id = "obs:pbs-lab:idempotent";
+    const char *body = "{\"obs\":\"same bytes both times\"}";
+    char hash[65];
+    sha256_hex_of(body, hash);
+
+    virp_chain_entry_t e0, e1;
+    err = virp_chain_append_with_artifact(&state, "session-idem",
+                                          "observation", id, hash,
+                                          body, &e0);
+    ASSERT(err == VIRP_OK, "first append failed");
+    err = virp_chain_append_with_artifact(&state, "session-idem",
+                                          "observation", id, hash,
+                                          body, &e1);
+    ASSERT(err == VIRP_OK, "identical re-store must not fail the append");
+
+    ASSERT(artifact_body_count(&state, id) == 1,
+           "identical evidence stores once");
+    ASSERT(artifact_body_matches(&state, id, hash, body),
+           "body must be retrievable");
+
+    virp_chain_verify_result_t result;
+    err = virp_chain_verify_session(&state, "session-idem", &result);
+    ASSERT(err == VIRP_OK && result.valid, "session must verify");
+    ASSERT(result.entries_checked == 2,
+           "both chain entries exist even though the body stored once");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+static void test_artifacts_schema_migration(void)
+{
+    TEST("legacy UNIQUE(artifact_id) DB migrates on init");
+
+    /* Build a database with the PRE-fix artifacts schema and one legacy
+     * row, exactly what an existing deployment's chain.db looks like. */
+    static const char *MIG_DB = "/tmp/virp_test_chain_migrate.db";
+    unlink(MIG_DB);
+    unlink("/tmp/virp_test_chain_migrate.db-wal");
+    unlink("/tmp/virp_test_chain_migrate.db-shm");
+
+    sqlite3 *raw = NULL;
+    ASSERT(sqlite3_open(MIG_DB, &raw) == SQLITE_OK, "raw open failed");
+    ASSERT(sqlite3_exec(raw,
+        "CREATE TABLE artifacts ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  artifact_id TEXT NOT NULL,"
+        "  artifact_type TEXT NOT NULL,"
+        "  artifact_content TEXT NOT NULL,"
+        "  artifact_hash TEXT NOT NULL,"
+        "  session_id TEXT NOT NULL,"
+        "  created_at_ns INTEGER NOT NULL,"
+        "  UNIQUE(artifact_id)"
+        ");"
+        "INSERT INTO artifacts (artifact_id, artifact_type,"
+        " artifact_content, artifact_hash, session_id, created_at_ns)"
+        " VALUES ('obs:legacy:1', 'observation', 'legacy body',"
+        " 'aa', 'legacy-sess', 1);",
+        NULL, NULL, NULL) == SQLITE_OK, "legacy schema setup failed");
+    sqlite3_close(raw);
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, MIG_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init on legacy DB failed");
+
+    /* Legacy row survived the rebuild... */
+    ASSERT(artifact_body_matches(&state, "obs:legacy:1", "aa",
+                                 "legacy body"),
+           "legacy row lost in migration");
+
+    /* ...and the collision class is closed on the migrated DB. */
+    const char *body_b = "post-migration distinct body";
+    char hash_b[65];
+    sha256_hex_of(body_b, hash_b);
+    virp_chain_entry_t e;
+    err = virp_chain_append_with_artifact(&state, "legacy-sess",
+                                          "observation", "obs:legacy:1",
+                                          hash_b, body_b, &e);
+    ASSERT(err == VIRP_OK, "post-migration colliding append failed");
+    ASSERT(artifact_body_count(&state, "obs:legacy:1") == 2,
+           "post-migration collision must keep both bodies");
+
+    virp_chain_destroy(&state);
+    unlink(MIG_DB);
+    unlink("/tmp/virp_test_chain_migrate.db-wal");
+    unlink("/tmp/virp_test_chain_migrate.db-shm");
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -842,6 +1034,9 @@ int main(void)
     test_malformed_mac_fails_closed();
     test_append_with_artifact_stores_both();
     test_append_with_artifact_rolls_back_together();
+    test_colliding_id_keeps_both_bodies();
+    test_colliding_id_identical_content_idempotent();
+    test_artifacts_schema_migration();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);
