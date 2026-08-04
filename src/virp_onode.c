@@ -3404,6 +3404,39 @@ virp_error_t onode_add_device(onode_state_t *state,
         state->devices[state->device_count].device_id =
             virp_device_id_from_hostname(device->hostname);
 
+    /* Identity uniqueness, same choke point (checked AFTER derivation so
+     * an explicit device_id colliding with another device's derived one
+     * is caught too). hostname routes requests, node_id routes wire
+     * messages and binds approvals, device_id binds v2 observations —
+     * a duplicate in any of them makes one device's evidence readable
+     * as another's. Fail closed, naming both devices. */
+    {
+        const virp_device_t *nd = &state->devices[state->device_count];
+        for (int i = 0; i < state->device_count; i++) {
+            const virp_device_t *ed = &state->devices[i];
+            const char *field = NULL;
+            if (strcmp(ed->hostname, nd->hostname) == 0)
+                field = "hostname";
+            else if (nd->node_id != 0 && ed->node_id == nd->node_id)
+                field = "node_id";   /* 0 = absent: never routed, and
+                                        approval binding pairs it with
+                                        the (unique) hostname */
+            else if (ed->device_id == nd->device_id)
+                field = "device_id";
+            if (field) {
+                fprintf(stderr, "[O-Node] FATAL: duplicate %s — device "
+                        "'%s' (node_id=0x%08x device_id=0x%016llx) "
+                        "collides with already-loaded '%s' (node_id=0x%08x "
+                        "device_id=0x%016llx)\n", field,
+                        nd->hostname, nd->node_id,
+                        (unsigned long long)nd->device_id,
+                        ed->hostname, ed->node_id,
+                        (unsigned long long)ed->device_id);
+                return VIRP_ERR_DUPLICATE_DEVICE;
+            }
+        }
+    }
+
     state->connections[state->device_count] = NULL;
     state->device_count++;
 

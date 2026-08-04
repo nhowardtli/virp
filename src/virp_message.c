@@ -1070,6 +1070,7 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_APPROVAL_CONSUMED:        return "Proposal already has an outcome";
     case VIRP_ERR_APPROVAL_KEY_UNENROLLED:  return "Approver key_id not enrolled";
     case VIRP_ERR_APPROVAL_KEY_DISABLED:    return "Approver key disabled";
+    case VIRP_ERR_DUPLICATE_DEVICE:  return "Duplicate device identity (hostname/node_id/device_id)";
     default:                         return "Unknown error";
     }
 }

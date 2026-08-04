@@ -2276,6 +2276,120 @@ TEST(test_load_devices_skips_missing_required_fields)
 }
 
 /* =========================================================================
+ * Duplicate device identities — hostname, node_id, and device_id are
+ * each an authorization-binding key (request routing, approval device
+ * binding, v2 observation identity). A collision in any of them lets
+ * one device's evidence read as another's, so onode_add_device refuses
+ * them and both loaders refuse the whole config, fail closed.
+ * ========================================================================= */
+
+static void dup_dev(virp_device_t *d, const char *hostname,
+                    uint32_t node_id, uint64_t device_id)
+{
+    memset(d, 0, sizeof(*d));
+    snprintf(d->hostname, sizeof(d->hostname), "%s", hostname);
+    snprintf(d->host, sizeof(d->host), "10.9.9.9");
+    d->port = 22;
+    d->vendor = VIRP_VENDOR_MOCK;
+    d->node_id = node_id;
+    d->device_id = device_id;
+    d->enabled = true;
+}
+
+TEST(test_add_device_rejects_duplicate_identities)
+{
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0004, NULL,
+                         "/tmp/virp-onode-dup.sock"));
+
+    virp_device_t d;
+    dup_dev(&d, "R-DUP1", 0xD0000001, 0);   /* device_id derived */
+    ASSERT_OK(onode_add_device(&tmp, &d));
+
+    /* Duplicate hostname (everything else differs). */
+    dup_dev(&d, "R-DUP1", 0xD0000002, 0);
+    ASSERT_EQ(onode_add_device(&tmp, &d), VIRP_ERR_DUPLICATE_DEVICE);
+
+    /* Duplicate node_id (hostname differs). */
+    dup_dev(&d, "R-DUP2", 0xD0000001, 0);
+    ASSERT_EQ(onode_add_device(&tmp, &d), VIRP_ERR_DUPLICATE_DEVICE);
+
+    /* Duplicate device_id: explicit id colliding with the first
+     * device's DERIVED id — the post-derivation check. */
+    dup_dev(&d, "R-DUP3", 0xD0000003,
+            virp_device_id_from_hostname("R-DUP1"));
+    ASSERT_EQ(onode_add_device(&tmp, &d), VIRP_ERR_DUPLICATE_DEVICE);
+
+    /* A rejected device must not occupy a slot. */
+    ASSERT_EQ(tmp.device_count, 1);
+
+    /* Fully unique device still loads. */
+    dup_dev(&d, "R-DUP4", 0xD0000004, 0);
+    ASSERT_OK(onode_add_device(&tmp, &d));
+    ASSERT_EQ(tmp.device_count, 2);
+
+    /* Two devices with ABSENT node_id (0 = never routed) do not
+     * collide with each other on node_id. */
+    dup_dev(&d, "R-DUP5", 0, 0);
+    ASSERT_OK(onode_add_device(&tmp, &d));
+    dup_dev(&d, "R-DUP6", 0, 0);
+    ASSERT_OK(onode_add_device(&tmp, &d));
+    ASSERT_EQ(tmp.device_count, 4);
+
+    onode_destroy(&tmp);
+}
+
+#define DUP_CFG "/tmp/virp-onode-dupcfg.json"
+
+static int dup_load(const char *json)
+{
+    FILE *f = fopen(DUP_CFG, "w");
+    if (!f) return -99;
+    fputs(json, f);
+    fclose(f);
+
+    onode_state_t tmp;
+    if (onode_init(&tmp, 0xDEAD0005, NULL,
+                   "/tmp/virp-onode-dupcfg.sock") != VIRP_OK)
+        return -98;
+    int loaded = load_devices(&tmp, DUP_CFG);
+    onode_destroy(&tmp);
+    unlink(DUP_CFG);
+    return loaded;
+}
+
+TEST(test_load_devices_duplicate_identities_fatal)
+{
+    /* Duplicate hostname → whole config refused, not one device kept. */
+    ASSERT_EQ(dup_load(
+        "{ \"devices\": ["
+        " { \"hostname\": \"R-A\", \"host\": \"10.1.1.1\", \"vendor\": \"mock\", \"node_id\": \"0a000001\" },"
+        " { \"hostname\": \"R-A\", \"host\": \"10.1.1.2\", \"vendor\": \"mock\", \"node_id\": \"0a000002\" }"
+        "] }"), -1);
+
+    /* Duplicate node_id → refused. */
+    ASSERT_EQ(dup_load(
+        "{ \"devices\": ["
+        " { \"hostname\": \"R-A\", \"host\": \"10.1.1.1\", \"vendor\": \"mock\", \"node_id\": \"0a000001\" },"
+        " { \"hostname\": \"R-B\", \"host\": \"10.1.1.2\", \"vendor\": \"mock\", \"node_id\": \"0a000001\" }"
+        "] }"), -1);
+
+    /* Duplicate explicit device_id → refused. */
+    ASSERT_EQ(dup_load(
+        "{ \"devices\": ["
+        " { \"hostname\": \"R-A\", \"host\": \"10.1.1.1\", \"vendor\": \"mock\", \"node_id\": \"0a000001\", \"device_id\": \"deadbeef00000001\" },"
+        " { \"hostname\": \"R-B\", \"host\": \"10.1.1.2\", \"vendor\": \"mock\", \"node_id\": \"0a000002\", \"device_id\": \"deadbeef00000001\" }"
+        "] }"), -1);
+
+    /* Unique config still loads both. */
+    ASSERT_EQ(dup_load(
+        "{ \"devices\": ["
+        " { \"hostname\": \"R-A\", \"host\": \"10.1.1.1\", \"vendor\": \"mock\", \"node_id\": \"0a000001\" },"
+        " { \"hostname\": \"R-B\", \"host\": \"10.1.1.2\", \"vendor\": \"mock\", \"node_id\": \"0a000002\" }"
+        "] }"), 2);
+}
+
+/* =========================================================================
  * Autopilot hard exclusions — 10.0.10.1 / 10.0.10.10 must never load
  *
  * The text scan is boundary-aware: the LibreNMS host 10.0.10.12 and a
@@ -3068,6 +3182,8 @@ int main(void)
     printf("[Device Config Parser Robustness (issue #7)]\n");
     RUN_TEST(test_load_devices_wrong_type_does_not_crash);
     RUN_TEST(test_load_devices_skips_missing_required_fields);
+    RUN_TEST(test_add_device_rejects_duplicate_identities);
+    RUN_TEST(test_load_devices_duplicate_identities_fatal);
 
     printf("\n[Autopilot hard exclusions (10.0.10.1 / 10.0.10.10)]\n");
     RUN_TEST(test_blocked_address_text_scan);

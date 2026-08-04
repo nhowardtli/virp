@@ -433,6 +433,14 @@ typedef enum {
      * and must never be reported as command output. */
     VIRP_ERR_NO_PROMPT                = -45,  /* read ended without prompt */
 
+    /* Device identity is the unit of authorization binding (approvals,
+     * observations, chain sessions). Two devices sharing a hostname,
+     * node_id, or device_id would let evidence or approvals for one be
+     * read as the other's — refused at config load, fail closed. */
+    VIRP_ERR_DUPLICATE_DEVICE         = -46,  /* hostname/node_id/device_id
+                                                 collides with a loaded
+                                                 device */
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency
