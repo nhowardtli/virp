@@ -67,7 +67,7 @@ static int tcp_connect(const char *host, uint16_t port)
     int sockfd = -1;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     char port_str[8];
