@@ -275,6 +275,16 @@ virp_error_t virp_chain_intent_execute(virp_chain_state_t *state,
  * Store an artifact's raw content in the artifacts table.
  * artifact_id must match the chain_entries.artifact_id for cross-reference.
  * Returns VIRP_ERR_NULL_PTR if any parameter is NULL or content is empty.
+ *
+ * Storage is keyed by (artifact_id, artifact_hash) — the pair the chain
+ * entry commits to — never by artifact_id alone. A colliding artifact_id
+ * carrying DIFFERENT content stores a second row; nothing ever displaces
+ * previously stored bytes (2026-08-03 production audit: a second-
+ * resolution id collision under the old UNIQUE(artifact_id) + OR REPLACE
+ * silently destroyed one observation's evidence). An identical
+ * (artifact_id, artifact_hash) re-store is idempotent. Readers resolving
+ * a chain entry to its body MUST join on both columns; an id-only lookup
+ * can return a different entry's evidence.
  */
 virp_error_t virp_chain_artifact_store(virp_chain_state_t *state,
                                         const char *artifact_id,

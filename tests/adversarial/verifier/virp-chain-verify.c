@@ -66,11 +66,20 @@ int main(int argc, char **argv)
     }
     sqlite3_finalize(st);
 
-    /* The question the crypto does not ask: is the committed body present? */
+    /* The question the crypto does not ask: is the committed body present?
+     *
+     * CORRECTED 2026-08-04: the join must be on (artifact_id, artifact_hash)
+     * — the pair the entry commits to — not artifact_id alone. The id-only
+     * join produced test #2's near-miss: a second-resolution id collision
+     * (obs:pbs-lab:1785538992) stored only the second observation's body,
+     * and this check found *a* body under the first entry's id and called
+     * it present. An entry whose committed hash has no matching stored
+     * body is orphaned even when some other entry's body shares its id. */
     printf("\n-- entries committing to an artifact body that is NOT stored --\n");
     const char *q2 =
         "SELECT e.session_id, e.sequence, e.artifact_id, substr(e.artifact_hash,1,16) "
-        "FROM chain_entries e LEFT JOIN artifacts a ON a.artifact_id = e.artifact_id "
+        "FROM chain_entries e LEFT JOIN artifacts a "
+        "  ON a.artifact_id = e.artifact_id AND a.artifact_hash = e.artifact_hash "
         "WHERE a.artifact_id IS NULL ORDER BY e.session_id, e.sequence";
     sqlite3_prepare_v2(raw, q2, -1, &st, NULL);
     int missing = 0;
