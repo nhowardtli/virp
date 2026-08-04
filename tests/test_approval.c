@@ -709,13 +709,13 @@ static void test_wrong_algorithm_rejected(void)
 /* Concurrency: two simultaneous SUBMITs for one proposal must yield
  * exactly ONE APPROVAL chain entry. */
 struct submit_arg { char pid[33]; uint8_t sig[VIRP_APPROVER_SIG_SIZE];
-                    char kid[33]; virp_error_t rc; };
+                    char kid[33]; virp_error_t rc; virp_approval_rec_t apr; };
 static void *submit_thread(void *a)
 {
     struct submit_arg *s = a;
-    virp_approval_rec_t apr;
     s->rc = virp_approval_submit(DIR, &g.approvers, &g.chain, s->pid,
-                                 s->kid, s->sig, VIRP_APPROVER_SIG_SIZE, &apr);
+                                 s->kid, s->sig, VIRP_APPROVER_SIG_SIZE,
+                                 &s->apr);
     return NULL;
 }
 
@@ -741,7 +741,13 @@ static void test_concurrent_submit_one_entry(void)
     pthread_create(&t1, NULL, submit_thread, &a1);
     pthread_create(&t2, NULL, submit_thread, &a2);
     pthread_join(t1, NULL); pthread_join(t2, NULL);
-    ASSERT(a1.rc == VIRP_OK && a2.rc == VIRP_OK, "both submits ok/idempotent");
+    /* Success-class both, but distinguishable: exactly one submission
+     * created the record (VIRP_OK), the other found it already there. */
+    ASSERT((a1.rc == VIRP_OK) + (a2.rc == VIRP_OK) == 1,
+           "exactly one winner");
+    ASSERT((a1.rc == VIRP_APPROVAL_ALREADY_EXISTS) +
+           (a2.rc == VIRP_APPROVAL_ALREADY_EXISTS) == 1,
+           "exactly one already-exists");
 
     /* EXACTLY one APPROVAL chain entry for this proposal — count directly. */
     char aid[64];
@@ -759,6 +765,123 @@ static void test_concurrent_submit_one_entry(void)
     sqlite3_finalize(st);
     sqlite3_close(db);
     ASSERT(count == 1, "must be exactly one APPROVAL entry");
+    PASS();
+}
+
+/* Attribution race: two DIFFERENT enrolled approvers submit for one
+ * proposal concurrently. Exactly one identity becomes the approver of
+ * record; the loser must be told so (VIRP_APPROVAL_ALREADY_EXISTS) and
+ * must receive the WINNER's identity in *out — never its own. Before
+ * the fix the loser got VIRP_OK with its own key/operator in *out while
+ * the winner's approval was canonical on disk. */
+static virp_fed_keypair_t g_kp2;     /* second enrolled approver */
+
+static int write_registry_two(const char *path)
+{
+    char e1[1024], e2[1024];
+    uint8_t spki[44];
+    virp_approver_ed25519_spki(g_kp.public_key, spki);
+    if (virp_approver_entry_json(spki, sizeof(spki), "operator-one",
+                                 true, e1, sizeof(e1)) != VIRP_OK)
+        return -1;
+    virp_approver_ed25519_spki(g_kp2.public_key, spki);
+    if (virp_approver_entry_json(spki, sizeof(spki), "operator-two",
+                                 true, e2, sizeof(e2)) != VIRP_OK)
+        return -1;
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "[%s,\n%s]\n", e1, e2);
+    fclose(f);
+    return 0;
+}
+
+static void test_concurrent_submit_attribution_two_approvers(void)
+{
+    TEST("Concurrency: race loser gets winner's identity + already-exists");
+    ASSERT(virp_fed_generate(&g_kp2, 1) == VIRP_OK, "keygen2");
+    ASSERT(write_registry_two(REGISTRY) == 0, "two-key registry");
+    ASSERT(onode_set_approvers(&g, DIR, REGISTRY) == VIRP_OK, "reload reg");
+
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_approval_challenge_t ch;
+    ASSERT(virp_approval_challenge(DIR, &g.chain, pid, 0, &ch) == VIRP_OK,
+           "challenge");
+
+    /* Both approvers sign the same canonical bytes with their OWN keys —
+     * two independently valid submissions with distinct identities. */
+    struct submit_arg a1, a2;
+    memset(&a1, 0, sizeof(a1)); memset(&a2, 0, sizeof(a2));
+    snprintf(a1.pid, sizeof(a1.pid), "%s", pid);
+    snprintf(a2.pid, sizeof(a2.pid), "%s", pid);
+    keyid_hex(&g_kp, a1.kid); keyid_hex(&g_kp2, a2.kid);
+    ASSERT(virp_fed_sign(&g_kp, ch.canonical, VIRP_APPROVAL_CANON_SIZE,
+                         a1.sig) == VIRP_OK, "sign1");
+    ASSERT(virp_fed_sign(&g_kp2, ch.canonical, VIRP_APPROVAL_CANON_SIZE,
+                         a2.sig) == VIRP_OK, "sign2");
+
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, submit_thread, &a1);
+    pthread_create(&t2, NULL, submit_thread, &a2);
+    pthread_join(t1, NULL); pthread_join(t2, NULL);
+
+    ASSERT((a1.rc == VIRP_OK) + (a2.rc == VIRP_OK) == 1,
+           "exactly one winner");
+    ASSERT((a1.rc == VIRP_APPROVAL_ALREADY_EXISTS) +
+           (a2.rc == VIRP_APPROVAL_ALREADY_EXISTS) == 1,
+           "loser told already-exists, not plain OK");
+
+    struct submit_arg *win = (a1.rc == VIRP_OK) ? &a1 : &a2;
+    struct submit_arg *lose = (a1.rc == VIRP_OK) ? &a2 : &a1;
+
+    /* The winner's *out is its own identity... */
+    ASSERT(strcmp(win->apr.approver_key_id, win->kid) == 0,
+           "winner sees itself as approver");
+    /* ...and the loser's *out is ALSO the winner's identity — the
+     * approver of record — not the loser's own. */
+    ASSERT(strcmp(lose->apr.approver_key_id, win->kid) == 0,
+           "loser must see the approver of record");
+    ASSERT(strcmp(lose->apr.approver_key_id, lose->kid) != 0,
+           "loser must NOT see itself");
+    ASSERT(strcmp(lose->apr.operator, win->apr.operator) == 0,
+           "operator is the winner's");
+    ASSERT(lose->apr.approved_at_ns == win->apr.approved_at_ns,
+           "timestamp is the record's");
+    ASSERT(strcmp(lose->apr.chain_entry_hash, win->apr.chain_entry_hash) == 0,
+           "chain hash is the record's");
+
+    /* What is persisted attributes the winner: the on-disk record (via
+     * the same loader the apply path uses) and the single chain entry. */
+    virp_approval_rec_t disk;
+    ASSERT(virp_approval_verify_consume(DIR, &g.approvers, pid, "R-APP",
+                                        0xA0A0A0A1, "reload", NULL,
+                                        0 /* now */, &disk) == VIRP_OK,
+           "persisted record verifies and consumes once");
+    ASSERT(strcmp(disk.approver_key_id, win->kid) == 0,
+           "persisted approver is the winner");
+    ASSERT(strcmp(disk.operator, win->apr.operator) == 0,
+           "persisted operator is the winner's");
+
+    char aid[64];
+    snprintf(aid, sizeof(aid), "approval:%s", pid);
+    sqlite3 *db = NULL;
+    ASSERT(sqlite3_open_v2(CHAIN_DB, &db, SQLITE_OPEN_READONLY, NULL)
+               == SQLITE_OK, "open chain ro");
+    sqlite3_stmt *st = NULL;
+    ASSERT(sqlite3_prepare_v2(db,
+               "SELECT COUNT(*) FROM chain_entries WHERE artifact_id = ?",
+               -1, &st, NULL) == SQLITE_OK, "prepare");
+    sqlite3_bind_text(st, 1, aid, -1, SQLITE_TRANSIENT);
+    ASSERT(sqlite3_step(st) == SQLITE_ROW, "step");
+    int count = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    ASSERT(count == 1, "still exactly one APPROVAL entry");
+
+    /* Restore the single-key registry for the tests that follow. */
+    ASSERT(write_registry(REGISTRY, true, false) == 0, "restore registry");
+    ASSERT(onode_set_approvers(&g, DIR, REGISTRY) == VIRP_OK,
+           "restore reload");
     PASS();
 }
 
@@ -1121,6 +1244,7 @@ int main(void)
     test_no_approval_plain_block();
     test_reuse_survives_restart();
     test_concurrent_submit_one_entry();
+    test_concurrent_submit_attribution_two_approvers();
 
     /* Serve the daemon socket for the CLI client tests. */
     pthread_t srv;

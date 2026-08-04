@@ -432,6 +432,15 @@ typedef enum {
      * that ends without the learned prompt is incomplete by definition
      * and must never be reported as command output. */
     VIRP_ERR_NO_PROMPT                = -45,  /* read ended without prompt */
+
+    /* Success-class status codes (> 0). Not errors: the operation's
+     * postcondition holds, but not because of this call. */
+    VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency
+                                                 race (or repeated): a
+                                                 canonical approval record
+                                                 already exists; *out holds
+                                                 the approver OF RECORD,
+                                                 not the caller. */
 } virp_error_t;
 
 /* =========================================================================

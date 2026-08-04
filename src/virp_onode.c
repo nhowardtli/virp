@@ -925,17 +925,30 @@ static virp_error_t onode_approval_submit(onode_state_t *state,
             state->approval_dir, &state->approvers,
             state->chain_enabled ? &state->chain : NULL,
             proposal_id, key_id, sig, sizeof(sig), &apr);
-    if (err != VIRP_OK) {
+    if (err != VIRP_OK && err != VIRP_APPROVAL_ALREADY_EXISTS) {
         fprintf(stderr, "[APPROVAL] submit rejected: proposal=%s key_id=%s "
                 "code=%d (%s)\n", proposal_id, key_id, (int)err,
                 virp_approval_err_name(err));
         return err;
     }
 
-    fprintf(stderr, "[APPROVAL] submitted: proposal=%s key_id=%s operator=%s "
-            "chain=%.16s\n", apr.proposal_id, apr.approver_key_id,
-            apr.operator[0] ? apr.operator : "(unknown)",
-            apr.chain_entry_hash[0] ? apr.chain_entry_hash : "-");
+    if (err == VIRP_APPROVAL_ALREADY_EXISTS) {
+        /* apr carries the approver OF RECORD (loaded from the canonical
+         * persisted record), which may differ from the submitter that
+         * lost the race — log both so the audit trail attributes the
+         * winner and still records that this submission arrived. */
+        fprintf(stderr, "[APPROVAL] submit idempotent: proposal=%s "
+                "submitted_key=%s approver_of_record=%s operator=%s "
+                "chain=%.16s\n", proposal_id, key_id, apr.approver_key_id,
+                apr.operator[0] ? apr.operator : "(unknown)",
+                apr.chain_entry_hash[0] ? apr.chain_entry_hash : "-");
+    } else {
+        fprintf(stderr, "[APPROVAL] submitted: proposal=%s key_id=%s "
+                "operator=%s chain=%.16s\n", apr.proposal_id,
+                apr.approver_key_id,
+                apr.operator[0] ? apr.operator : "(unknown)",
+                apr.chain_entry_hash[0] ? apr.chain_entry_hash : "-");
+    }
 
     cJSON *o = cJSON_CreateObject();
     if (!o) return VIRP_ERR_BUFFER_TOO_SMALL;
@@ -945,6 +958,8 @@ static virp_error_t onode_approval_submit(onode_state_t *state,
     cJSON_AddStringToObject(o, "chain_entry_hash", apr.chain_entry_hash);
     cJSON_AddNumberToObject(o, "approved_at_ns", (double)apr.approved_at_ns);
     cJSON_AddNumberToObject(o, "ttl_seconds", (double)apr.ttl_seconds);
+    cJSON_AddBoolToObject(o, "already_approved",
+                          err == VIRP_APPROVAL_ALREADY_EXISTS);
     char *json = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!json) return VIRP_ERR_BUFFER_TOO_SMALL;

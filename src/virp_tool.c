@@ -1265,9 +1265,19 @@ static int cmd_approve(int argc, char **argv)
     }
     if (rc != 0) return 1;
 
-    printf("\nAPPROVED — single use, TTL 300s from approval time.\n");
-    printf("  key_id: %s\n", key_id);
-    printf("  %s\n", payload);
+    /* The daemon reports the approver OF RECORD. If an approval already
+     * existed (this submission lost an idempotency race or repeated), the
+     * record belongs to someone else — do not claim it as ours. */
+    if (strstr(payload, "\"already_approved\":true")) {
+        printf("\nALREADY APPROVED — an approval of record exists; this "
+               "submission was NOT recorded.\n");
+        printf("  submitted with key_id: %s\n", key_id);
+        printf("  approval of record:    %s\n", payload);
+    } else {
+        printf("\nAPPROVED — single use, TTL 300s from approval time.\n");
+        printf("  key_id: %s\n", key_id);
+        printf("  %s\n", payload);
+    }
     printf("Re-submit within the TTL:  virp apply %s\n", proposal_id);
     return 0;
 }
