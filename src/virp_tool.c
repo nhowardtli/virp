@@ -582,6 +582,28 @@ static void json_escape(const char *src, char *dst, size_t dst_len)
     dst[o] = '\0';
 }
 
+/* Client-side counterpart of the daemon's send_all() (5cd1e2d9): write(2)
+ * on a SOCK_STREAM socket may short-write or take EINTR mid-frame, and a
+ * partially written request frame desynchronizes the connection exactly
+ * like a partial response frame would. Loop until every byte is out;
+ * retry EINTR; anything else is a dead connection. */
+static int write_all(int fd, const void *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, (const uint8_t *)buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0)
+            return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
 /* Send one framed JSON request, read one framed response.
  * Returns 0 and fills resp/resp_len on success, -1 on transport error. */
 static int onode_framed_roundtrip(const char *sock_path,
@@ -605,8 +627,8 @@ static int onode_framed_roundtrip(const char *sock_path,
     /* v2 framing: [4-byte BE length][version byte][JSON] */
     uint32_t frame_len = htonl((uint32_t)(1 + json_len));
     uint8_t version = VIRP_FRAME_VERSION;
-    if (write(fd, &frame_len, 4) != 4 || write(fd, &version, 1) != 1 ||
-        write(fd, json, json_len) != (ssize_t)json_len) {
+    if (write_all(fd, &frame_len, 4) != 0 || write_all(fd, &version, 1) != 0 ||
+        write_all(fd, json, json_len) != 0) {
         fprintf(stderr, "Error: send failed\n");
         close(fd);
         return -1;

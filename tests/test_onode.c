@@ -24,6 +24,7 @@
 #include "virp_message.h"
 #include "virp_onode.h"
 #include "virp_driver.h"
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1380,6 +1381,206 @@ TEST(test_v1_unframed_client_rejected)
     ASSERT_TRUE(more <= 0);  /* EOF */
 
     close(fd);
+}
+
+/* =========================================================================
+ * send_all unit tests (socketpair, no daemon needed)
+ *
+ * send_all is the send-side counterpart of recv_exact: it must deliver
+ * every byte across partial writes and EINTR, and report a dead peer
+ * as -1 instead of raising SIGPIPE. Exercised directly over a
+ * socketpair; a reader thread drains slowly through a shrunken send
+ * buffer while bombarding the sender with SIGUSR1 (installed WITHOUT
+ * SA_RESTART) so send() actually observes interruptions mid-frame.
+ * ========================================================================= */
+
+extern int send_all(int fd, const void *buf, size_t len);
+
+#define SENDALL_TOTAL (256 * 1024)
+
+typedef struct {
+    int        fd;
+    size_t     got;
+    int        pattern_ok;
+    pthread_t  sender;
+    volatile int bombard;
+} sendall_reader_arg_t;
+
+static void sendall_sigusr1_handler(int sig) { (void)sig; }
+
+static void *sendall_reader_thread(void *argp)
+{
+    sendall_reader_arg_t *a = argp;
+    uint8_t chunk[3000];
+    a->pattern_ok = 1;
+    while (a->got < SENDALL_TOTAL) {
+        if (a->bombard)
+            pthread_kill(a->sender, SIGUSR1);
+        ssize_t n = recv(a->fd, chunk, sizeof(chunk), 0);
+        if (n <= 0)
+            break;
+        for (ssize_t i = 0; i < n; i++)
+            if (chunk[i] != (uint8_t)((a->got + (size_t)i) & 0xFF))
+                a->pattern_ok = 0;
+        a->got += (size_t)n;
+        usleep(1000);   /* drain slowly — keep the send buffer full */
+    }
+    return NULL;
+}
+
+TEST(test_send_all_survives_partial_writes_and_eintr)
+{
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+    int sndbuf = 4096;   /* kernel clamps to its minimum; small is enough */
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    struct sigaction sa, old_sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sendall_sigusr1_handler;   /* no SA_RESTART on purpose */
+    sigaction(SIGUSR1, &sa, &old_sa);
+
+    uint8_t *buf = malloc(SENDALL_TOTAL);
+    ASSERT_TRUE(buf != NULL);
+    for (size_t i = 0; i < SENDALL_TOTAL; i++)
+        buf[i] = (uint8_t)(i & 0xFF);
+
+    sendall_reader_arg_t arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.fd = sv[1];
+    arg.sender = pthread_self();
+    arg.bombard = 1;
+    pthread_t reader;
+    pthread_create(&reader, NULL, sendall_reader_thread, &arg);
+
+    int rc = send_all(sv[0], buf, SENDALL_TOTAL);
+
+    arg.bombard = 0;
+    pthread_join(reader, NULL);
+    sigaction(SIGUSR1, &old_sa, NULL);
+    free(buf);
+    close(sv[0]);
+    close(sv[1]);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ((int)arg.got, SENDALL_TOTAL);
+    ASSERT_TRUE(arg.pattern_ok);
+}
+
+TEST(test_send_all_reports_dead_peer)
+{
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    close(sv[1]);   /* peer gone before we send a byte */
+
+    uint8_t junk[512];
+    memset(junk, 0xAB, sizeof(junk));
+
+    /* MSG_NOSIGNAL inside send_all: EPIPE must surface as -1, not as
+     * SIGPIPE killing this test binary. */
+    ASSERT_EQ(send_all(sv[0], junk, sizeof(junk)), -1);
+    close(sv[0]);
+}
+
+/* send_framed itself under forced short writes: two frames through a
+ * shrunken send buffer while SIGUSR1 (no SA_RESTART) bombards the
+ * sender. The reader must recover EXACT framing — [len][payload] twice,
+ * lengths and every payload byte intact, no trailing bytes. With the
+ * old unlooped send() pair, a mid-frame short write drops bytes and
+ * permanently desynchronizes the stream. */
+
+extern int send_framed(int fd, const void *buf, size_t len);
+
+#define SF_LEN1 (96 * 1024)
+#define SF_LEN2 (32 * 1024 + 7)
+
+typedef struct {
+    int          fd;
+    uint8_t     *buf;        /* collects everything until EOF */
+    size_t       cap;
+    size_t       got;
+    pthread_t    sender;
+    volatile int bombard;
+} sf_reader_arg_t;
+
+static void *sf_reader_thread(void *argp)
+{
+    sf_reader_arg_t *a = argp;
+    uint8_t chunk[3000];
+    for (;;) {
+        if (a->bombard)
+            pthread_kill(a->sender, SIGUSR1);
+        ssize_t n = recv(a->fd, chunk, sizeof(chunk), 0);
+        if (n <= 0)
+            break;              /* EOF after the sender's SHUT_WR */
+        if (a->got + (size_t)n <= a->cap)
+            memcpy(a->buf + a->got, chunk, (size_t)n);
+        a->got += (size_t)n;
+        usleep(1000);           /* drain slowly — keep the buffer full */
+    }
+    return NULL;
+}
+
+TEST(test_send_framed_short_write_no_desync)
+{
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+    int sndbuf = 4096;   /* kernel clamps to its minimum; small is enough */
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    struct sigaction sa, old_sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sendall_sigusr1_handler;   /* no SA_RESTART on purpose */
+    sigaction(SIGUSR1, &sa, &old_sa);
+
+    uint8_t *p1 = malloc(SF_LEN1), *p2 = malloc(SF_LEN2);
+    ASSERT_TRUE(p1 != NULL && p2 != NULL);
+    for (size_t i = 0; i < SF_LEN1; i++) p1[i] = (uint8_t)(i * 7 & 0xFF);
+    for (size_t i = 0; i < SF_LEN2; i++) p2[i] = (uint8_t)(i * 13 & 0xFF);
+
+    size_t expect = 4 + SF_LEN1 + 4 + SF_LEN2;
+    sf_reader_arg_t arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.fd = sv[1];
+    arg.cap = expect + 4096;    /* room to detect surplus bytes */
+    arg.buf = malloc(arg.cap);
+    ASSERT_TRUE(arg.buf != NULL);
+    arg.sender = pthread_self();
+    arg.bombard = 1;
+    pthread_t reader;
+    pthread_create(&reader, NULL, sf_reader_thread, &arg);
+
+    int rc1 = send_framed(sv[0], p1, SF_LEN1);
+    int rc2 = send_framed(sv[0], p2, SF_LEN2);
+
+    arg.bombard = 0;
+    /* Aug 2 lesson: EOF the reader BEFORE joining, so a regression
+     * hangs the write (visible failure), not the test harness. */
+    shutdown(sv[0], SHUT_WR);
+    pthread_join(reader, NULL);
+    sigaction(SIGUSR1, &old_sa, NULL);
+
+    ASSERT_EQ(rc1, 0);
+    ASSERT_EQ(rc2, 0);
+    ASSERT_EQ((long)arg.got, (long)expect);   /* nothing lost, nothing extra */
+
+    /* Frame 1: length prefix intact, every payload byte intact. */
+    uint32_t l1_n;
+    memcpy(&l1_n, arg.buf, 4);
+    ASSERT_EQ((long)ntohl(l1_n), (long)SF_LEN1);
+    ASSERT_EQ(memcmp(arg.buf + 4, p1, SF_LEN1), 0);
+
+    /* Frame 2 starts exactly where frame 1 ends — the desync check. */
+    uint32_t l2_n;
+    memcpy(&l2_n, arg.buf + 4 + SF_LEN1, 4);
+    ASSERT_EQ((long)ntohl(l2_n), (long)SF_LEN2);
+    ASSERT_EQ(memcmp(arg.buf + 4 + SF_LEN1 + 4, p2, SF_LEN2), 0);
+
+    free(p1); free(p2); free(arg.buf);
+    close(sv[0]);
+    close(sv[1]);
 }
 
 /* =========================================================================
@@ -2935,6 +3136,9 @@ int main(void)
     RUN_TEST(test_v1_unframed_client_rejected);
     RUN_TEST(test_framed_request_split_across_three_sends);
     RUN_TEST(test_framed_oversize_length_rejected);
+    RUN_TEST(test_send_all_survives_partial_writes_and_eintr);
+    RUN_TEST(test_send_all_reports_dead_peer);
+    RUN_TEST(test_send_framed_short_write_no_desync);
 
     printf("\n[Worker Pool / Concurrency Tests]\n");
     RUN_TEST(test_concurrent_clients_no_head_of_line);
