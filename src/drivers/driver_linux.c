@@ -240,6 +240,7 @@ static virp_error_t linux_execute(virp_conn_t *conn,
 
     if (!conn->connected) {
         result->success = false;
+        result->no_dispatch = true;   /* refused before any transport write */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Not connected to %s", conn->device.hostname);
         return VIRP_OK;
@@ -258,6 +259,7 @@ static virp_error_t linux_execute(virp_conn_t *conn,
         libssh2_session_last_error(conn->session, &errmsg, NULL, 0);
         conn->connected = false;
         result->success = false;
+        result->no_dispatch = true;   /* channel never opened; command not sent */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Channel open failed on %s: %s", conn->device.hostname, errmsg);
         return VIRP_OK;

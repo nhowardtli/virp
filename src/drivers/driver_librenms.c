@@ -295,6 +295,7 @@ static virp_error_t librenms_execute(virp_conn_t *base_conn,
     }
     if (path[0] != '/') {
         result->success = false;
+        result->no_dispatch = true;   /* refused before any request went out */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Refused: GET-only REST driver cannot honor '%.64s' "
                  "(non-GET method or unrooted path)", command);

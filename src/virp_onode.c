@@ -1453,6 +1453,8 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     }
 
     virp_exec_result_t result;
+    memset(&result, 0, sizeof(result));   /* no_dispatch=false unless the
+                                             driver proves otherwise */
     VIRP_FI("pre_exec");
     virp_error_t err = drv->execute(conn, command, &result);
     VIRP_FI("post_exec");
@@ -1477,8 +1479,15 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                       &state->okey);
     }
 
-    /* On failure: drop stale connection, retry once with fresh connection */
-    if (!result.success && result.output_len == 0) {
+    /* On failure with no output: retry once with a fresh connection —
+     * but ONLY when the driver proved the command was never dispatched
+     * (result.no_dispatch). Nothing reached the device, so a second
+     * execute is a first execution, not a repeat. Without that proof,
+     * absence of a response is not absence of a side effect, and this
+     * block used to re-execute generically: authorized once, executed
+     * twice. The unprovable case is handled below as a typed
+     * OUTCOME_UNKNOWN instead. */
+    if (!result.success && result.output_len == 0 && result.no_dispatch) {
         drop_connection(state, dev_idx);
         conn = get_connection(state, dev_idx);
         if (conn) {
@@ -1511,11 +1520,52 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
 
     /*
+     * Failure with no output and NO proof of non-dispatch: the command
+     * may have reached and executed on the device (SSH write completed
+     * but the response was lost; REST request timed out after send;
+     * output exceeded the evidence limit). Re-executing here is the
+     * authorized-once-executed-twice bug; claiming executed=no is a
+     * lie. Report the typed UNKNOWN. The connection is dropped — its
+     * state is unknowable too. Approval outcome stays the existing
+     * binary failure record (a consumed approval cannot be replayed to
+     * "try again"); expressing UNKNOWN in the outcome artifact itself
+     * is EXECUTION_INTENT territory, deferred with Part B.
+     */
+    if (!result.success && result.output_len == 0 && !result.no_dispatch) {
+        pthread_mutex_lock(&state->exec_mutex[dev_idx]);
+        drop_connection(state, dev_idx);
+        pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+        char err_msg[sizeof(result.error_msg) + 160];
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: outcome UNKNOWN on '%s': %s — no response after "
+                 "possible dispatch; not retried (command may have "
+                 "executed)",
+                 device_name,
+                 result.error_msg[0] ? result.error_msg
+                                     : virp_error_str(VIRP_ERR_OUTCOME_UNKNOWN));
+        if (approved)
+            approval_emit_outcome(state, proposal_id, &apr,
+                                  device_name, false);
+        fprintf(stderr, "[ERROR-OBS] device=%s tier=%s executed=unknown "
+                "reason=\"%s\"\n", device_name, gate_tier_name(gate_tier),
+                err_msg);
+        return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                      state->devices[dev_idx].node_id,
+                                      onode_next_seq(state),
+                                      VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                      gate_obs_tier(gate_tier),
+                                      (const uint8_t *)err_msg,
+                                      (uint16_t)strlen(err_msg),
+                                      &state->okey);
+    }
+
+    /*
      * Driver soft-failure with no output: the driver refused the command
      * before any device I/O (VIRP_OK + success=false + error_msg — the
      * shape REST drivers like Wazuh use for invalid or BLACK-tier
-     * endpoints). Nothing executed, so this must be a signed ERROR
-     * observation carrying the command's true tier — never the
+     * endpoints). Nothing executed (no_dispatch proven — the unproven
+     * case returned above as OUTCOME_UNKNOWN), so this must be a signed
+     * ERROR observation carrying the command's true tier — never the
      * DEVICE_OUTPUT / v2 session-bound constructor used for executed
      * output, which downstream renders as a logged change.
      */

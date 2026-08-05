@@ -35,6 +35,14 @@ void virp_driver_mock_set_connect_fail(bool fail) { mock_connect_fail = fail; }
 static const char *mock_soft_fail_msg = NULL;
 void virp_driver_mock_set_soft_fail(const char *msg) { mock_soft_fail_msg = msg; }
 
+/* Test hook: execute() returns VIRP_OK with success=false, no output,
+ * this error_msg, and no_dispatch=false — the shape of a command that
+ * may have DISPATCHED but produced no response (SSH write completed,
+ * response lost; REST timeout after send). The O-Node must not retry
+ * this and must report OUTCOME_UNKNOWN. NULL disables. */
+static const char *mock_unknown_fail_msg = NULL;
+void virp_driver_mock_set_unknown_fail(const char *msg) { mock_unknown_fail_msg = msg; }
+
 /*
  * Test hook: simulate a single shared SSH channel per connection.
  *
@@ -63,6 +71,25 @@ static bool mock_shared_channel = false;
 static pthread_mutex_t mock_hook_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int  mock_probe_count = 0;
 static char mock_probe_filter[64] = "";
+
+/* Count every execute() invocation, so retry tests can assert exactly
+ * how many times the O-Node dispatched. Reset returns the prior count. */
+static int mock_exec_attempts = 0;
+int virp_driver_mock_exec_attempts_reset(void)
+{
+    pthread_mutex_lock(&mock_hook_mutex);
+    int n = mock_exec_attempts;
+    mock_exec_attempts = 0;
+    pthread_mutex_unlock(&mock_hook_mutex);
+    return n;
+}
+
+static void mock_count_exec_attempt(void)
+{
+    pthread_mutex_lock(&mock_hook_mutex);
+    mock_exec_attempts++;
+    pthread_mutex_unlock(&mock_hook_mutex);
+}
 
 void virp_driver_mock_set_shared_channel(bool on)
 {
@@ -204,14 +231,25 @@ static virp_error_t mock_execute(virp_conn_t *conn,
         return VIRP_ERR_NULL_PTR;
 
     memset(result, 0, sizeof(*result));
+    mock_count_exec_attempt();
 
     /* Test hook: simulate driver-level error (not just result.success=false) */
     if (mock_forced_error != VIRP_OK)
         return mock_forced_error;
 
+    /* Test hook: possible dispatch, no response — no_dispatch stays
+     * false; the O-Node must not retry and must report OUTCOME_UNKNOWN. */
+    if (mock_unknown_fail_msg) {
+        result->success = false;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "%s", mock_unknown_fail_msg);
+        return VIRP_OK;
+    }
+
     /* Test hook: simulate a driver soft-failure (refused before device I/O) */
     if (mock_soft_fail_msg) {
         result->success = false;
+        result->no_dispatch = true;   /* refusal is provably pre-dispatch */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "%s", mock_soft_fail_msg);
         return VIRP_OK;
@@ -219,6 +257,7 @@ static virp_error_t mock_execute(virp_conn_t *conn,
 
     if (!conn->connected) {
         result->success = false;
+        result->no_dispatch = true;   /* refused before any transport write */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Not connected to %s", conn->device.hostname);
         return VIRP_OK;

@@ -143,6 +143,19 @@ typedef struct {
     int         exit_code;              /* Meaningful for Linux, 0/1 for network */
     char        error_msg[256];         /* Human-readable error if !success */
     uint64_t    exec_time_ms;           /* Execution time in milliseconds */
+    /*
+     * no_dispatch — the driver PROVES that no part of the command was
+     * sent toward the device: the failure happened strictly before the
+     * first transport write of the command (not-connected refusal,
+     * pre-I/O validation, channel that never opened, TLS pin rejected
+     * before the request went out). This is the O-Node's ONLY license
+     * to auto-retry a failed execute: absence of a response is not
+     * absence of a side effect, so a failure the driver cannot prove
+     * non-dispatched must never be re-executed (authorized once,
+     * executed twice). Zero-initialized false = "cannot prove" = no
+     * retry — a driver that never sets it loses retry, never safety.
+     */
+    bool        no_dispatch;
 } virp_exec_result_t;
 
 /* =========================================================================
@@ -297,6 +310,12 @@ void virp_driver_mock_set_shared_channel(bool on);
  * against their own devices, so an unfiltered count proves nothing. */
 void virp_driver_mock_watch_probes(const char *hostname);
 int  virp_driver_mock_probe_count(void);
+/* Possible-dispatch failure hook (success=false, no output, no_dispatch
+ * =false): the O-Node must NOT retry and must report OUTCOME_UNKNOWN.
+ * NULL disables. */
+void virp_driver_mock_set_unknown_fail(const char *msg);
+/* Total execute() invocations since the last reset; resets to zero. */
+int  virp_driver_mock_exec_attempts_reset(void);
 
 /* Real drivers — conditionally compiled */
 #ifdef VIRP_DRIVER_CISCO

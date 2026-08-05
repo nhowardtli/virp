@@ -1226,6 +1226,7 @@ static virp_error_t pbs_execute(virp_conn_t *base_conn, const char *command,
     if (pbs_parse_command(command, &req, &reason) != 0) {
         result->success = false;
         result->exit_code = 1;
+        result->no_dispatch = true;   /* refused before any request went out */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Refused before any network activity: %s",
                  reason ? reason : REASON_GRAMMAR);
@@ -1241,6 +1242,7 @@ static virp_error_t pbs_execute(virp_conn_t *base_conn, const char *command,
                        path, sizeof(path), &reason) != 0) {
         result->success = false;
         result->exit_code = 1;
+        result->no_dispatch = true;   /* refused before any request went out */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Refused before any network activity: %s",
                  reason ? reason : REASON_GRAMMAR);
@@ -1283,6 +1285,8 @@ static virp_error_t pbs_execute(virp_conn_t *base_conn, const char *command,
     if (err == PBS_ERR_PIN_MISMATCH) {
         result->success = false;
         result->exit_code = 1;
+        result->no_dispatch = true;   /* TLS verify aborted the connection
+                                         before the request was sent */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "TLS certificate pin mismatch on %s — the peer is not the "
                  "recorded PBS certificate", conn->device.hostname);

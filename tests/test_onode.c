@@ -1998,6 +1998,91 @@ TEST(test_error_obs_driver_refusal_is_error_not_output)
     errobs_teardown(&tmp);
 }
 
+extern void virp_driver_mock_set_unknown_fail(const char *msg);
+extern int  virp_driver_mock_exec_attempts_reset(void);
+
+/* (b2) Failure with no output and NO proof of non-dispatch (SSH write
+ * completed but the response was lost; REST timeout after send): the
+ * O-Node must execute EXACTLY ONCE — re-executing turns one
+ * authorization into two executions — and must report a typed
+ * OUTCOME_UNKNOWN, never executed=no and never executed output. */
+TEST(test_unprovable_dispatch_unknown_not_retried)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-UNK", 0xE220000E), 0);
+
+    virp_driver_mock_exec_attempts_reset();
+    virp_driver_mock_set_unknown_fail(
+        "response lost after write on R-UNK");
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    virp_error_t err = onode_execute(&tmp, "R-UNK", "show version",
+                                     buf, sizeof(buf), &len);
+    virp_driver_mock_set_unknown_fail(NULL);
+    int attempts = virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(err);
+
+    /* The load-bearing assertion: one authorization, one dispatch. */
+    ASSERT_EQ(attempts, 1);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(buf, len, &tmp.okey, &hdr));
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(buf + VIRP_HEADER_SIZE,
+                                     len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr((const char *)data, "outcome UNKNOWN") != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "may have executed") != NULL);
+    /* Must carry the driver's detail and not look like executed output */
+    ASSERT_TRUE(strstr((const char *)data, "response lost after write")
+                != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "R-UNK#") == NULL);
+
+    errobs_teardown(&tmp);
+}
+
+/* (b3) PROVABLY non-dispatched failure (driver refusal with
+ * no_dispatch=true): the single auto-retry is retained — nothing
+ * reached the device, so the second execute is a first execution.
+ * Exactly two attempts, then the refusal reported as before. */
+TEST(test_provable_no_dispatch_retry_retained)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-RETRY", 0xE220000F), 0);
+
+    virp_driver_mock_exec_attempts_reset();
+    virp_driver_mock_set_soft_fail("refused before device I/O");
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    virp_error_t err = onode_execute(&tmp, "R-RETRY", "show version",
+                                     buf, sizeof(buf), &len);
+    virp_driver_mock_set_soft_fail(NULL);
+    int attempts = virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(err);
+
+    /* Refusal on a proven-undispatched command retries exactly once. */
+    ASSERT_EQ(attempts, 2);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(buf, len, &tmp.okey, &hdr));
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(buf + VIRP_HEADER_SIZE,
+                                     len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr((const char *)data, "refused before device I/O")
+                != NULL);
+    /* Refusal stays a refusal — not mislabeled UNKNOWN */
+    ASSERT_TRUE(strstr((const char *)data, "outcome UNKNOWN") == NULL);
+
+    errobs_teardown(&tmp);
+}
+
 /* (c) Gate-blocked RED command under ENFORCE max=YELLOW (live repro:
  * "clear counters" on R1 while it was RED-classified): the observation
  * must be VIRP_OBS_ERROR at tier RED, nothing may execute, and the gate
@@ -3268,6 +3353,8 @@ int main(void)
     RUN_TEST(test_driver_error_returns_signed_observation);
     RUN_TEST(test_error_obs_connect_failure_is_error_with_true_tier);
     RUN_TEST(test_error_obs_driver_refusal_is_error_not_output);
+    RUN_TEST(test_unprovable_dispatch_unknown_not_retried);
+    RUN_TEST(test_provable_no_dispatch_retry_retained);
     RUN_TEST(test_error_obs_gate_block_logs_as_error_not_change);
 
     printf("\n--- Watchdog / execute serialization (finding N3) ---\n");

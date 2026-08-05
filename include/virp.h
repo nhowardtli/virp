@@ -449,6 +449,17 @@ typedef enum {
                                                  read-only verifier
                                                  chain handle */
 
+    /* Execution disposition honesty: the driver reported failure with
+     * no output and could NOT prove the command was never dispatched.
+     * The command may have executed on the device. The O-Node refuses
+     * to re-execute (authorized once must never become executed twice)
+     * and refuses to claim executed=no; it reports this typed UNKNOWN
+     * instead. Full disposition taxonomy (NOT_SENT/SENT_NO_ACK/...) is
+     * deferred to the EXECUTION_INTENT work. */
+    VIRP_ERR_OUTCOME_UNKNOWN          = -48,  /* response absent after
+                                                 possible dispatch;
+                                                 not retried */
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency

@@ -1072,6 +1072,7 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_APPROVAL_KEY_DISABLED:    return "Approver key disabled";
     case VIRP_ERR_DUPLICATE_DEVICE:  return "Duplicate device identity (hostname/node_id/device_id)";
     case VIRP_ERR_CHAIN_READONLY:    return "Write refused on read-only verifier chain handle";
+    case VIRP_ERR_OUTCOME_UNKNOWN:   return "Outcome unknown: response absent after possible dispatch; not retried";
     default:                         return "Unknown error";
     }
 }
