@@ -83,6 +83,16 @@ typedef struct {
     /* Artifact store */
     sqlite3_stmt       *stmt_artifact_insert;
 
+    /* Set by virp_chain_open_verifier(): the connection is
+     * SQLITE_OPEN_READONLY and every mutating entry point returns
+     * VIRP_ERR_CHAIN_READONLY. */
+    bool                read_only;
+    /* Verifier-open only: the database predates the chain_heads table
+     * (legacy shape). Chain length cannot be authenticated; sessions
+     * report LEGACY_CHAIN / COMPLETENESS_UNPROVABLE instead of the DB
+     * being migrated under the auditor. */
+    bool                legacy_no_heads;
+
     /*
      * Serializes ALL chain operations. The db + prepared statements above
      * are shared mutable state; sqlite3_stmt objects are not safe to use
@@ -113,6 +123,42 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
                              const char *chain_key_path,
                              uint32_t node_id,
                              const char *org_id);
+
+/*
+ * Open an existing chain database for VERIFICATION ONLY.
+ *
+ * virp_chain_init() is the daemon's open: it creates schema, migrates
+ * legacy shapes, sets WAL, and backfills trust-on-upgrade head records —
+ * every one of which REWRITES the database. An offline verifier must
+ * never do any of that: a verifier that manufactures the head record it
+ * then checks has blessed the very length claim it exists to test.
+ *
+ * This open:
+ *   - opens the file SQLITE_OPEN_READONLY (missing file is an error,
+ *     never created) and additionally sets PRAGMA query_only=ON;
+ *   - runs no schema ensure, no migration, no backfill;
+ *   - requires chain_entries to exist (else VIRP_ERR_CHAIN_DB — not a
+ *     chain database);
+ *   - tolerates a legacy database with no chain_heads table: the handle
+ *     opens, state->legacy_no_heads is set, and every session verifies
+ *     as invalid with "LEGACY_CHAIN ... COMPLETENESS_UNPROVABLE" —
+ *     reported, not migrated;
+ *   - leaves a legacy UNIQUE(artifact_id) artifacts table untouched
+ *     (noted on stderr; verification never reads artifacts).
+ *
+ * Every mutating chain call on this handle returns
+ * VIRP_ERR_CHAIN_READONLY. Close with virp_chain_destroy() as usual.
+ *
+ * NOTE: a WAL-mode database whose -wal sidecar needs recovery cannot be
+ * opened read-only by SQLite; the first query fails and this returns
+ * VIRP_ERR_CHAIN_DB. That is fail-closed by design — verify a cleanly
+ * copied database file.
+ */
+virp_error_t virp_chain_open_verifier(virp_chain_state_t *state,
+                                      const char *db_path,
+                                      const char *chain_key_path,
+                                      uint32_t node_id,
+                                      const char *org_id);
 
 /*
  * Append an artifact to the chain for a given session.

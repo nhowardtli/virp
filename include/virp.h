@@ -441,6 +441,14 @@ typedef enum {
                                                  collides with a loaded
                                                  device */
 
+    /* A chain handle opened by virp_chain_open_verifier() can prove or
+     * refute what a database says; it must never be able to change what
+     * the database says. Every mutating chain entry point refuses on
+     * such a handle. */
+    VIRP_ERR_CHAIN_READONLY           = -47,  /* write attempted on a
+                                                 read-only verifier
+                                                 chain handle */
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency

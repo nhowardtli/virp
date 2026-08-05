@@ -133,6 +133,19 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
     memset(result, 0, sizeof(*result));
     result->first_broken = -1;
 
+    /* Verifier handle on a pre-chain_heads database: there is no signed
+     * head, so no length claim exists to verify against. Report that —
+     * a read-only verifier must not manufacture the head it would then
+     * check (virp_chain_init's backfill does exactly that, correctly,
+     * for the DAEMON's own database on upgrade). */
+    if (state->legacy_no_heads) {
+        result->valid = false;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "LEGACY_CHAIN: no chain_heads table; chain length "
+                 "unauthenticated — COMPLETENESS_UNPROVABLE");
+        return VIRP_OK;
+    }
+
     /* Load the head record */
     int64_t head_seq = -1;
     char head_hash[65] = {0};
@@ -918,6 +931,129 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
     return VIRP_OK;
 }
 
+/* Does a table exist? Returns 1/0, or -1 on query failure. */
+static int table_exists(sqlite3 *db, const char *name)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_ROW) return 1;
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+virp_error_t virp_chain_open_verifier(virp_chain_state_t *state,
+                                      const char *db_path,
+                                      const char *chain_key_path,
+                                      uint32_t node_id,
+                                      const char *org_id)
+{
+    if (!state || !db_path || !chain_key_path)
+        return VIRP_ERR_NULL_PTR;
+
+    memset(state, 0, sizeof(*state));
+    pthread_mutex_init(&state->lock, NULL);
+    state->node_id = node_id;
+    state->read_only = true;
+    snprintf(state->org_id, sizeof(state->org_id), "%s",
+             org_id ? org_id : "local");
+
+    virp_error_t err = virp_key_load_file(&state->chain_key,
+                                          VIRP_KEY_TYPE_CHAIN,
+                                          chain_key_path);
+    if (err != VIRP_OK) {
+        fprintf(stderr, "[Chain] Failed to load chain key from %s: %s\n",
+                chain_key_path, virp_error_str(err));
+        return err;
+    }
+
+    int rc = sqlite3_open_v2(db_path, &state->db,
+                             SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[Chain] Failed to open DB %s read-only: %s\n",
+                db_path, sqlite3_errmsg(state->db));
+        sqlite3_close(state->db);
+        state->db = NULL;
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* Belt over the braces: even a coding error in this module cannot
+     * write through this connection. */
+    sqlite3_exec(state->db, "PRAGMA query_only=ON;", NULL, NULL, NULL);
+
+    /* No schema ensure, no migration, no backfill — inspect only. */
+    int has_entries = table_exists(state->db, "chain_entries");
+    if (has_entries != 1) {
+        fprintf(stderr, "[Chain] %s: %s\n", db_path,
+                has_entries == 0 ? "no chain_entries table — not a chain "
+                                   "database"
+                                 : "cannot inspect schema (WAL sidecar "
+                                   "needing recovery?)");
+        sqlite3_close(state->db);
+        state->db = NULL;
+        virp_key_destroy(&state->chain_key);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    int has_heads = table_exists(state->db, "chain_heads");
+    if (has_heads == -1) {
+        sqlite3_close(state->db);
+        state->db = NULL;
+        virp_key_destroy(&state->chain_key);
+        return VIRP_ERR_CHAIN_DB;
+    }
+    state->legacy_no_heads = (has_heads == 0);
+    if (state->legacy_no_heads)
+        fprintf(stderr, "[Chain] verifier: LEGACY_CHAIN shape (no "
+                "chain_heads) — sessions will report "
+                "COMPLETENESS_UNPROVABLE; database left untouched\n");
+
+    /* Legacy artifacts key shape: irrelevant to verification (which
+     * never reads artifacts) and, on this handle, impossible to
+     * migrate. Note it so an auditor knows what they are holding. */
+    {
+        sqlite3_stmt *ck = NULL;
+        if (sqlite3_prepare_v2(state->db,
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='artifacts'",
+                -1, &ck, NULL) == SQLITE_OK) {
+            if (sqlite3_step(ck) == SQLITE_ROW) {
+                const char *sql = (const char *)sqlite3_column_text(ck, 0);
+                if (sql && strstr(sql, "UNIQUE(artifact_id)") &&
+                    !strstr(sql, "UNIQUE(artifact_id,"))
+                    fprintf(stderr, "[Chain] verifier: legacy artifacts "
+                            "shape (UNIQUE(artifact_id)) — left "
+                            "untouched\n");
+            }
+            sqlite3_finalize(ck);
+        }
+    }
+
+    /* Prepare ONLY what verification reads. Mutating statements stay
+     * NULL; the read_only guards refuse before any of them is touched.
+     * stmt_head_get is skipped on a legacy database (no table to
+     * prepare against) — legacy_no_heads short-circuits verify first. */
+    if (sqlite3_prepare_v2(state->db, SQL_GET_LAST, -1,
+                           &state->stmt_get_last, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(state->db, SQL_GET_RANGE, -1,
+                           &state->stmt_get_range, NULL) != SQLITE_OK ||
+        (!state->legacy_no_heads &&
+         sqlite3_prepare_v2(state->db, SQL_HEAD_GET, -1,
+                            &state->stmt_head_get, NULL) != SQLITE_OK)) {
+        fprintf(stderr, "[Chain] verifier: failed to prepare read "
+                "statements: %s\n", sqlite3_errmsg(state->db));
+        virp_chain_destroy(state);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    fprintf(stderr, "[Chain] Verifier open (read-only): db=%s\n", db_path);
+    return VIRP_OK;
+}
+
 /* =========================================================================
  * Append
  * ========================================================================= */
@@ -936,6 +1072,9 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
 
     if (!state->db)
         return VIRP_ERR_CHAIN_DB;
+
+    if (state->read_only)
+        return VIRP_ERR_CHAIN_READONLY;
 
     /* BEGIN IMMEDIATE — exclusive write lock */
     int rc = sqlite3_exec(state->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
@@ -1330,6 +1469,9 @@ static virp_error_t chain_intent_store_locked(virp_chain_state_t *state,
     if (!state || !state->db || !entry)
         return VIRP_ERR_NULL_PTR;
 
+    if (state->read_only)
+        return VIRP_ERR_CHAIN_READONLY;
+
     /* Compute HMAC of intent_hash using K_chain */
     hmac_sha256_hex(state->chain_key.key.key,
                     entry->intent_hash, strlen(entry->intent_hash),
@@ -1393,6 +1535,9 @@ static virp_error_t chain_intent_execute_locked(virp_chain_state_t *state,
     if (!state || !state->db || !intent_id || !entry)
         return VIRP_ERR_NULL_PTR;
 
+    if (state->read_only)
+        return VIRP_ERR_CHAIN_READONLY;
+
     /* Atomically increment commands_executed (only if < max_commands) */
     sqlite3_stmt *stmt = state->stmt_intent_execute;
     sqlite3_reset(stmt);
@@ -1434,6 +1579,9 @@ static virp_error_t chain_artifact_store_locked(virp_chain_state_t *state,
 
     if (artifact_content[0] == '\0')
         return VIRP_ERR_NULL_PTR;
+
+    if (state->read_only)
+        return VIRP_ERR_CHAIN_READONLY;
 
     sqlite3_stmt *stmt = state->stmt_artifact_insert;
     sqlite3_reset(stmt);

@@ -1506,10 +1506,12 @@ static int cmd_chain_tail(int argc, char **argv)
  *   OFFLINE virp chain verify --db PATH --key PATH [--session S]
  *          Call virp_chain_verify_session() directly — the auditor
  *          handed a chain.db and its key. Without --session, every
- *          session in the DB is verified. CAUTION, stated in the help
- *          too: virp_chain_init() opens the DB READ-WRITE (schema
- *          ensure, WAL journal, trust-on-upgrade head backfill), so run
- *          this against a COPY, never in place on a daemon's live DB.
+ *          session in the DB is verified. Opens through
+ *          virp_chain_open_verifier(): SQLITE_OPEN_READONLY, no schema
+ *          ensure, no migration, no head backfill — the evidence file
+ *          is byte-identical after verification. A legacy database
+ *          (no chain_heads) reports LEGACY_CHAIN /
+ *          COMPLETENESS_UNPROVABLE instead of being migrated.
  * ========================================================================= */
 
 static void chain_verify_print(const char *sess,
@@ -1611,13 +1613,9 @@ static int chain_verify_socket(const char *sock_path, const char *session)
 static int chain_verify_offline(const char *db_path, const char *key_path,
                                 const char *only_session)
 {
-    fprintf(stderr, "NOTE: offline verify opens the DB read-write (schema "
-                    "ensure, WAL, head backfill).\n"
-                    "      Run it against a COPY of a live daemon's "
-                    "chain.db, never in place.\n");
-
     virp_chain_state_t chain;
-    if (virp_chain_init(&chain, db_path, key_path, 1, "local") != VIRP_OK) {
+    if (virp_chain_open_verifier(&chain, db_path, key_path, 1,
+                                 "local") != VIRP_OK) {
         fprintf(stderr, "Error: cannot open chain %s with key %s\n",
                 db_path, key_path);
         return 1;
@@ -1699,8 +1697,10 @@ static void chain_verify_usage(void)
         "Offline form (--db + --key):\n"
         "  verifies directly — for an auditor handed a chain.db and its\n"
         "  chain key. Without --session, verifies every session. Opens\n"
-        "  the DB READ-WRITE (schema ensure, WAL, head backfill): run\n"
-        "  against a copy, never a live daemon's DB in place.\n"
+        "  the DB READ-ONLY: no schema ensure, no migration, no head\n"
+        "  backfill — the file is byte-identical after verification.\n"
+        "  Legacy DBs (no chain_heads) report LEGACY_CHAIN /\n"
+        "  COMPLETENESS_UNPROVABLE rather than being migrated.\n"
         "Exit status: 0 all verified, 1 anything broken or no sessions.\n",
         ONODE_DEFAULT_SOCKET);
 }

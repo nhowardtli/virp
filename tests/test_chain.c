@@ -1007,6 +1007,209 @@ static void test_artifacts_schema_migration(void)
 }
 
 /* =========================================================================
+ * Test: read-only verifier open (virp_chain_open_verifier)
+ * ========================================================================= */
+
+/* Whole-file snapshot for byte-identity assertions. Returns malloc'd
+ * buffer (caller frees), sets *len; NULL on error. */
+static unsigned char *read_file_bytes(const char *path, long *len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char *buf = malloc(n > 0 ? (size_t)n : 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (n > 0 && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *len = n;
+    return buf;
+}
+
+static void test_verifier_readonly_modern_db(void)
+{
+    TEST("verifier: modern DB verifies, byte-identical, writes refused");
+    cleanup();
+    create_test_key();
+
+    /* Daemon-side handle builds the evidence, then closes cleanly —
+     * the auditor's copy. */
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "ver-sess", 5);
+    virp_chain_destroy(&state);
+
+    long before_len = 0, after_len = 0;
+    unsigned char *before = read_file_bytes(TEST_DB, &before_len);
+    ASSERT(before != NULL, "snapshot before failed");
+
+    virp_chain_state_t ver;
+    virp_error_t err = virp_chain_open_verifier(&ver, TEST_DB, TEST_KEY,
+                                                1, "local");
+    ASSERT(err == VIRP_OK, "verifier open failed");
+    ASSERT(ver.read_only, "verifier handle must be marked read-only");
+    ASSERT(!ver.legacy_no_heads, "modern DB is not legacy-shaped");
+
+    virp_chain_verify_result_t r;
+    err = virp_chain_verify_session(&ver, "ver-sess", &r);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(r.valid, "intact session must verify through verifier handle");
+    ASSERT(r.entries_checked == 5, "should check all 5 entries");
+
+    /* Every mutating entry point refuses the handle. */
+    virp_chain_entry_t e;
+    err = virp_chain_append(&ver, "ver-sess", "observation",
+                            "obs:x", "aa", &e);
+    ASSERT(err == VIRP_ERR_CHAIN_READONLY, "append must be refused");
+    err = virp_chain_append_with_artifact(&ver, "ver-sess", "observation",
+                                          "obs:x", "aa", "body", &e);
+    ASSERT(err == VIRP_ERR_CHAIN_READONLY,
+           "append_with_artifact must be refused");
+    virp_intent_entry_t ie;
+    memset(&ie, 0, sizeof(ie));
+    err = virp_chain_intent_store(&ver, &ie);
+    ASSERT(err == VIRP_ERR_CHAIN_READONLY, "intent_store must be refused");
+    err = virp_chain_intent_execute(&ver, "intent:x", &ie);
+    ASSERT(err == VIRP_ERR_CHAIN_READONLY,
+           "intent_execute must be refused");
+    err = virp_chain_artifact_store(&ver, "obs:x", "observation",
+                                    "body", "aa", "ver-sess");
+    ASSERT(err == VIRP_ERR_CHAIN_READONLY,
+           "artifact_store must be refused");
+
+    virp_chain_destroy(&ver);
+
+    unsigned char *after = read_file_bytes(TEST_DB, &after_len);
+    ASSERT(after != NULL, "snapshot after failed");
+    int identical = (before_len == after_len) &&
+                    (memcmp(before, after, (size_t)before_len) == 0);
+    free(before);
+    free(after);
+    ASSERT(identical, "verify must leave the DB byte-identical");
+    PASS();
+}
+
+static void test_verifier_legacy_reported_not_migrated(void)
+{
+    TEST("verifier: legacy DB reports LEGACY_CHAIN, byte-identical");
+    cleanup();
+    create_test_key();
+
+    /* Pre-chain_heads, pre-two-column-artifacts database — the shape
+     * virp_chain_init() would migrate and head-backfill on open. */
+    static const char *LEG_DB = "/tmp/virp_test_chain_verifier_legacy.db";
+    unlink(LEG_DB);
+
+    sqlite3 *raw = NULL;
+    ASSERT(sqlite3_open(LEG_DB, &raw) == SQLITE_OK, "raw open failed");
+    ASSERT(sqlite3_exec(raw,
+        "CREATE TABLE chain_entries ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  session_id TEXT NOT NULL,"
+        "  sequence INTEGER NOT NULL,"
+        "  chain_entry_hash TEXT NOT NULL,"
+        "  previous_entry_hash TEXT NOT NULL,"
+        "  timestamp_ns INTEGER NOT NULL,"
+        "  monotonic_ns INTEGER NOT NULL,"
+        "  artifact_type TEXT NOT NULL,"
+        "  artifact_id TEXT NOT NULL,"
+        "  artifact_hash TEXT NOT NULL,"
+        "  artifact_hash_alg TEXT NOT NULL DEFAULT 'sha256',"
+        "  artifact_schema_version TEXT NOT NULL DEFAULT '1',"
+        "  signer_node_id INTEGER NOT NULL,"
+        "  signer_org_id TEXT NOT NULL DEFAULT 'local',"
+        "  chain_hmac TEXT NOT NULL,"
+        "  UNIQUE(session_id, sequence)"
+        ");"
+        "CREATE TABLE artifacts ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  artifact_id TEXT NOT NULL,"
+        "  artifact_type TEXT NOT NULL,"
+        "  artifact_content TEXT NOT NULL,"
+        "  artifact_hash TEXT NOT NULL,"
+        "  session_id TEXT NOT NULL,"
+        "  created_at_ns INTEGER NOT NULL,"
+        "  UNIQUE(artifact_id)"
+        ");"
+        "INSERT INTO chain_entries (session_id, sequence,"
+        " chain_entry_hash, previous_entry_hash, timestamp_ns,"
+        " monotonic_ns, artifact_type, artifact_id, artifact_hash,"
+        " signer_node_id, chain_hmac)"
+        " VALUES ('legacy:sess', 0, 'aa11', 'genesis', 1000, 1000,"
+        " 'observation', 'obs:x:1', 'bb22', 1, 'cc33');",
+        NULL, NULL, NULL) == SQLITE_OK, "legacy schema setup failed");
+    sqlite3_close(raw);
+
+    long before_len = 0, after_len = 0;
+    unsigned char *before = read_file_bytes(LEG_DB, &before_len);
+    ASSERT(before != NULL, "snapshot before failed");
+
+    virp_chain_state_t ver;
+    virp_error_t err = virp_chain_open_verifier(&ver, LEG_DB, TEST_KEY,
+                                                1, "local");
+    ASSERT(err == VIRP_OK, "verifier must open a legacy DB");
+    ASSERT(ver.legacy_no_heads, "legacy shape must be detected");
+
+    virp_chain_verify_result_t r;
+    err = virp_chain_verify_session(&ver, "legacy:sess", &r);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(!r.valid, "legacy session must not verify as valid");
+    ASSERT(strstr(r.error_detail, "LEGACY_CHAIN") != NULL,
+           "detail must name LEGACY_CHAIN");
+    ASSERT(strstr(r.error_detail, "COMPLETENESS_UNPROVABLE") != NULL,
+           "detail must name COMPLETENESS_UNPROVABLE");
+
+    virp_chain_destroy(&ver);
+
+    unsigned char *after = read_file_bytes(LEG_DB, &after_len);
+    ASSERT(after != NULL, "snapshot after failed");
+    int identical = (before_len == after_len) &&
+                    (memcmp(before, after, (size_t)before_len) == 0);
+    free(before);
+    free(after);
+    ASSERT(identical,
+           "legacy DB must be byte-identical after offline verify");
+    unlink(LEG_DB);
+    PASS();
+}
+
+static void test_verifier_refuses_non_chain_db(void)
+{
+    TEST("verifier: non-chain DB and missing file refused");
+    cleanup();
+    create_test_key();
+
+    static const char *NOT_DB = "/tmp/virp_test_chain_notachain.db";
+    unlink(NOT_DB);
+    sqlite3 *raw = NULL;
+    ASSERT(sqlite3_open(NOT_DB, &raw) == SQLITE_OK, "raw open failed");
+    ASSERT(sqlite3_exec(raw, "CREATE TABLE unrelated (x);",
+                        NULL, NULL, NULL) == SQLITE_OK, "setup failed");
+    sqlite3_close(raw);
+
+    virp_chain_state_t ver;
+    virp_error_t err = virp_chain_open_verifier(&ver, NOT_DB, TEST_KEY,
+                                                1, "local");
+    ASSERT(err == VIRP_ERR_CHAIN_DB,
+           "DB without chain_entries must be refused");
+
+    err = virp_chain_open_verifier(&ver, "/tmp/virp_test_chain_nofile.db",
+                                   TEST_KEY, 1, "local");
+    ASSERT(err == VIRP_ERR_CHAIN_DB,
+           "missing file must be refused, never created");
+    ASSERT(access("/tmp/virp_test_chain_nofile.db", F_OK) != 0,
+           "verifier open must not create a database file");
+
+    unlink(NOT_DB);
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -1037,6 +1240,9 @@ int main(void)
     test_colliding_id_keeps_both_bodies();
     test_colliding_id_identical_content_idempotent();
     test_artifacts_schema_migration();
+    test_verifier_readonly_modern_db();
+    test_verifier_legacy_reported_not_migrated();
+    test_verifier_refuses_non_chain_db();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);
