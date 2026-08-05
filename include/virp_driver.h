@@ -136,6 +136,47 @@ typedef struct {
 
 #define VIRP_OUTPUT_MAX     65536   /* 64KB max output per command */
 
+/*
+ * How an execution TERMINATED — the only honest basis for claiming a device
+ * did or did not run a command.
+ *
+ * The bug this exists to kill (reproduced against a real device 2026-08-05,
+ * TRANSCRIPT-05): libssh2_channel_get_exit_status() returns 0 both for a
+ * genuine exit-0 AND when the peer never sent an exit-status message at all,
+ * which is exactly what an abnormally-killed channel produces. Deriving
+ * success from that alone signed aborted commands into the chain as
+ * success=true — a false attestation.
+ *
+ * The discriminator is HOW the completion sequence ended, never how many
+ * bytes came back. Output length must play NO part in this decision: the
+ * linux driver seeds its buffer with a "<host>$ <cmd>\n" prefix before
+ * reading, so an output-length test is always false and silently dead.
+ */
+typedef enum {
+    /*
+     * Driver has not been converted to the classifier. Legacy success
+     * semantics apply, unchanged. This is the zero value ONLY so that
+     * unconverted drivers keep their existing behaviour rather than being
+     * mass-reclassified as UNKNOWN — converting the remaining drivers is
+     * deliberately out of scope here. A converted driver must set a real
+     * disposition on every return path.
+     */
+    VIRP_DISPOSITION_UNSET              = 0,
+    /* Bytes provably never dispatched (pre-dispatch failure). Retryable. */
+    VIRP_DISPOSITION_NOT_SENT           = 1,
+    /* Clean, complete close AND a trustworthy exit status of 0. */
+    VIRP_DISPOSITION_EXECUTED_CONFIRMED = 2,
+    /* Clean, complete close AND a trustworthy non-zero exit (or a signal). */
+    VIRP_DISPOSITION_EXECUTED_FAILED    = 3,
+    /*
+     * Dispatched, but the channel never closed cleanly / no exit status was
+     * received. The command MAY have executed. Never success, never retried.
+     */
+    VIRP_DISPOSITION_EXECUTED_UNKNOWN   = 4,
+} virp_disposition_t;
+
+const char *virp_disposition_str(virp_disposition_t d);
+
 typedef struct {
     char        output[VIRP_OUTPUT_MAX];
     size_t      output_len;
@@ -143,6 +184,23 @@ typedef struct {
     int         exit_code;              /* Meaningful for Linux, 0/1 for network */
     char        error_msg[256];         /* Human-readable error if !success */
     uint64_t    exec_time_ms;           /* Execution time in milliseconds */
+    /*
+     * Termination classification. success == true is permitted ONLY for
+     * VIRP_DISPOSITION_EXECUTED_CONFIRMED.
+     */
+    virp_disposition_t disposition;
+    /*
+     * exit_code carries a status the peer actually reported. False means the
+     * peer never reported one — do NOT read exit_code at all in that case,
+     * and in particular do not treat 0 as success or non-zero as failure.
+     */
+    bool        exit_code_trusted;
+    /*
+     * Output stopped because the capture buffer filled, not because the
+     * device finished. The body is a PREFIX of the real output and must
+     * never be presented as a complete response.
+     */
+    bool        output_truncated;
     /*
      * no_dispatch — the driver PROVES that no part of the command was
      * sent toward the device: the failure happened strictly before the

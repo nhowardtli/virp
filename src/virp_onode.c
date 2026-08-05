@@ -1479,15 +1479,20 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                       &state->okey);
     }
 
-    /* On failure with no output: retry once with a fresh connection —
-     * but ONLY when the driver proved the command was never dispatched
-     * (result.no_dispatch). Nothing reached the device, so a second
-     * execute is a first execution, not a repeat. Without that proof,
-     * absence of a response is not absence of a side effect, and this
-     * block used to re-execute generically: authorized once, executed
-     * twice. The unprovable case is handled below as a typed
-     * OUTCOME_UNKNOWN instead. */
-    if (!result.success && result.output_len == 0 && result.no_dispatch) {
+    /* Retry once with a fresh connection, but ONLY when the driver proved
+     * the command was never dispatched (result.no_dispatch). Nothing
+     * reached the device, so a second execute is a first execution, not a
+     * repeat. Without that proof, absence of a response is not absence of
+     * a side effect, and this block used to re-execute generically:
+     * authorized once, executed twice. The unprovable case is handled
+     * below as a typed OUTCOME_UNKNOWN instead.
+     *
+     * The old `output_len == 0` conjunct is GONE and must not come back:
+     * the linux driver seeds its output buffer with a "<host>$ <cmd>\n"
+     * prefix before reading, so that test was always false and silently
+     * disabled this branch for that driver (TRANSCRIPT-05). Buffer
+     * contents say nothing about whether bytes were dispatched. */
+    if (!result.success && result.no_dispatch) {
         drop_connection(state, dev_idx);
         conn = get_connection(state, dev_idx);
         if (conn) {
@@ -1531,7 +1536,16 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * "try again"); expressing UNKNOWN in the outcome artifact itself
      * is EXECUTION_INTENT territory, deferred with Part B.
      */
-    if (!result.success && result.output_len == 0 && !result.no_dispatch) {
+    /* A driver that classifies its termination (linux) states UNKNOWN
+     * directly. The output_len test in the second clause is the LEGACY path
+     * for drivers not yet converted to the classifier — it is deliberately
+     * NOT part of the new decision, and must never be reintroduced into it:
+     * for the linux driver it was always false, which is precisely how this
+     * branch came to be dead code. Converting the remaining drivers retires
+     * that clause. */
+    if (result.disposition == VIRP_DISPOSITION_EXECUTED_UNKNOWN ||
+        (result.disposition == VIRP_DISPOSITION_UNSET &&
+         !result.success && result.output_len == 0 && !result.no_dispatch)) {
         pthread_mutex_lock(&state->exec_mutex[dev_idx]);
         drop_connection(state, dev_idx);
         pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -1547,8 +1561,9 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             approval_emit_outcome(state, proposal_id, &apr,
                                   device_name, false);
         fprintf(stderr, "[ERROR-OBS] device=%s tier=%s executed=unknown "
-                "reason=\"%s\"\n", device_name, gate_tier_name(gate_tier),
-                err_msg);
+                "disposition=%s reason=\"%s\"\n", device_name,
+                gate_tier_name(gate_tier),
+                virp_disposition_str(result.disposition), err_msg);
         return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
                                       onode_next_seq(state),
@@ -1587,6 +1602,16 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                       (uint16_t)strlen(err_msg),
                                       &state->okey);
     }
+
+    /* What the device's termination actually told us, recorded before the
+     * observation is built so the log and the signed artifact cannot drift. */
+    fprintf(stderr, "[EXEC] device=%s disposition=%s success=%s exit=%d "
+            "exit_trusted=%s truncated=%s reason=\"%s\"\n",
+            device_name, virp_disposition_str(result.disposition),
+            result.success ? "true" : "false", result.exit_code,
+            result.exit_code_trusted ? "yes" : "no",
+            result.output_truncated ? "yes" : "no",
+            result.error_msg[0] ? result.error_msg : "-");
 
     const uint8_t *obs_data = (const uint8_t *)result.output;
     uint16_t data_len = (result.output_len > 65530) ?

@@ -43,6 +43,18 @@ int virp_driver_count(void)
     return registry_count;
 }
 
+const char *virp_disposition_str(virp_disposition_t d)
+{
+    switch (d) {
+    case VIRP_DISPOSITION_UNSET:              return "UNSET";
+    case VIRP_DISPOSITION_NOT_SENT:           return "NOT_SENT";
+    case VIRP_DISPOSITION_EXECUTED_CONFIRMED: return "EXECUTED_CONFIRMED";
+    case VIRP_DISPOSITION_EXECUTED_FAILED:    return "EXECUTED_FAILED";
+    case VIRP_DISPOSITION_EXECUTED_UNKNOWN:   return "EXECUTED_UNKNOWN";
+    }
+    return "INVALID";
+}
+
 uint64_t virp_device_id_from_hostname(const char *hostname)
 {
     if (!hostname)
