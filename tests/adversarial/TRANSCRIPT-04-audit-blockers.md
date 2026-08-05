@@ -287,3 +287,21 @@ No production impact risk found: no devices.yaml exists in the repo or
 loads identically.
 
 ---
+## Post-rewrite hash map (2026-08-05)
+
+The branch's local history was rewritten on 2026-08-05 to correct the
+author name (Nick Howard → Nate Howard); trees are byte-identical.
+Commit hashes cited in this transcript and in transcripts/03-fixes.md
+map as follows:
+
+| cited (old) | current (new) |
+|---|---|
+| 8d2d49ae | ced8e20a |
+| ba6d6d14 | 3e5c7e57 |
+| 6732d9eb | 50722cdd |
+| f93324a6 | 919b2f5a |
+| 20fffc00 | fff4dfd8 |
+| b3ecfb80 | 5bab16bd |
+| 27ad2b5f | 74ae4d2e |
+| 3163365c | 02ca40bf |
+| 6ce8544e | 7f884e80 |
