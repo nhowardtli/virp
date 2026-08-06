@@ -715,6 +715,216 @@ static void test_dropped_heads_table_is_fatal(void)
 }
 
 /* =========================================================================
+ * Test: full-chain verifier binds artifacts (adversarial audit 2026-08-06)
+ *
+ * Entry hash + link + HMAC all prove the ENTRY is intact and
+ * K_chain-authenticated. None of them proves the entry commits to the
+ * body the chain actually stores. Before this fix the C verifier stopped
+ * at the HMAC, so a body swapped under a valid entry verified VALID from
+ * the operator CLI while report/verify.py flagged it. These tests FAIL
+ * against that code.
+ * ========================================================================= */
+
+static void sha256_hex_str(const char *s, char out[65])
+{
+    unsigned char d[32];
+    SHA256((const unsigned char *)s, strlen(s), d);
+    for (int i = 0; i < 32; i++) snprintf(out + i * 2, 3, "%02x", d[i]);
+}
+
+static void test_verify_binds_stored_artifact(void)
+{
+    TEST("Verify binds stored artifact bodies");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    const char *body = "{\"schema\":\"evidence/1\",\"ok\":true}";
+    char hash[65];
+    sha256_hex_str(body, hash);
+
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append_with_artifact(&state, "session-bind",
+               "evidence_item", "ev-1", hash, body, &e) == VIRP_OK,
+           "append with body failed");
+
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify(&state, "session-bind", 0, 0, &r) == VIRP_OK,
+           "verify call failed");
+    ASSERT(r.valid, "a correctly bound entry must verify");
+    ASSERT(r.artifacts_bound == 1, "the body should be counted as bound");
+    ASSERT(r.artifacts_unverifiable == 0, "nothing here is unverifiable");
+
+    /* Swap the stored body for different bytes under the SAME id+hash —
+     * the entry is untouched, so only a binding check can catch it. */
+    sqlite3_exec(state.db,
+        "UPDATE artifacts SET artifact_content = "
+        "'{\"schema\":\"evidence/1\",\"ok\":false}' "
+        "WHERE artifact_id = 'ev-1';", NULL, NULL, NULL);
+
+    ASSERT(virp_chain_verify(&state, "session-bind", 0, 0, &r) == VIRP_OK,
+           "verify call failed after swap");
+    ASSERT(!r.valid, "a body that does not hash to its commitment must FAIL");
+    ASSERT(r.first_broken == 0, "the swapped entry should be named");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* Observation bodies are stored base64-encoded and the commitment is over
+ * the DECODED bytes. A binding check that hashed the stored string would
+ * fail every observation in production. */
+static void test_verify_binds_base64_body(void)
+{
+    TEST("Verify binds base64-stored bodies by decoded bytes");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    /* "hello world" base64 = aGVsbG8gd29ybGQ= ; commitment is over the
+     * plaintext bytes, exactly as the autopilot client computes it. */
+    const char *raw = "hello world";
+    char hash[65];
+    sha256_hex_str(raw, hash);
+
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append_with_artifact(&state, "session-b64",
+               "observation", "obs-b64", hash,
+               "base64:aGVsbG8gd29ybGQ=", &e) == VIRP_OK,
+           "append failed");
+
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify(&state, "session-b64", 0, 0, &r) == VIRP_OK,
+           "verify call failed");
+    ASSERT(r.valid, "base64 body must bind against the decoded bytes");
+    ASSERT(r.artifacts_bound == 1, "should count as bound");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* Indirect-commitment types must report UNVERIFIABLE, never a silent
+ * pass: their hash names a signed observation the chain does not retain.
+ * A carve-out that reads as clean in the operator CLI is worse than no
+ * check, because it looks verified when it is not. */
+static void test_verify_indirect_type_is_unverifiable(void)
+{
+    TEST("Verify reports indirect types UNVERIFIABLE not bound");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    /* Exactly the autopilot comparator's shape: hash commits to the
+     * signed observation, body is the plain verdict JSON. */
+    const char *verdict = "{\"peer\":\"nodeB\",\"disagreements\":[]}";
+    char signed_obs_hash[65];
+    sha256_hex_str("pretend signed observation bytes", signed_obs_hash);
+
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append_with_artifact(&state, "cmp:test",
+               "comparator_verd", "comparator:1", signed_obs_hash,
+               verdict, &e) == VIRP_OK, "append failed");
+
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify(&state, "cmp:test", 0, 0, &r) == VIRP_OK,
+           "verify call failed");
+    ASSERT(r.valid, "an indirect entry is not tampering");
+    ASSERT(r.artifacts_unverifiable == 1,
+           "indirect commitment must count UNVERIFIABLE");
+    ASSERT(r.artifacts_bound == 0,
+           "indirect commitment must NOT count as bound");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* A commitment-only entry (no body ever stored) is a retention limit, not
+ * tampering — it must not flip the chain to INVALID. */
+static void test_verify_missing_body_is_unverifiable(void)
+{
+    TEST("Verify reports absent body UNVERIFIABLE not broken");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    char hash[65];
+    sha256_hex_str("bytes the chain never held", hash);
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append(&state, "session-nobody", "observation",
+                             "obs-nobody", hash, &e) == VIRP_OK,
+           "append failed");
+
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify(&state, "session-nobody", 0, 0, &r) == VIRP_OK,
+           "verify call failed");
+    ASSERT(r.valid, "absent body is a retention limit, not tampering");
+    ASSERT(r.artifacts_unverifiable == 1, "should count UNVERIFIABLE");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* The type policy itself, asserted directly: these three predicates are
+ * what the external append path and the verifier both key on. */
+static void test_artifact_type_policy(void)
+{
+    TEST("Artifact type policy: reserved / indirect / external");
+
+    ASSERT(virp_chain_type_is_daemon_reserved("approval"), "approval");
+    ASSERT(virp_chain_type_is_daemon_reserved("proposal"), "proposal");
+    ASSERT(virp_chain_type_is_daemon_reserved("outcome"), "outcome");
+    ASSERT(virp_chain_type_is_daemon_reserved("gate_rejection"), "gate_rej");
+    ASSERT(virp_chain_type_is_daemon_reserved("validation"), "validation");
+    ASSERT(!virp_chain_type_is_daemon_reserved("observation"), "observation");
+
+    /* The 16-byte artifact_type field truncates both indirect names, so
+     * the truncated spellings are the ones that actually arrive. */
+    ASSERT(virp_chain_type_is_indirect("comparator_verd"), "cmp truncated");
+    ASSERT(virp_chain_type_is_indirect("chainwalk_summa"), "cw truncated");
+    ASSERT(!virp_chain_type_is_indirect("observation"), "obs not indirect");
+
+    ASSERT(virp_chain_type_is_external_allowed("observation"), "obs allowed");
+    ASSERT(virp_chain_type_is_external_allowed("evidence_item"), "ev allowed");
+    ASSERT(virp_chain_type_is_external_allowed("no_drift"), "nd allowed");
+    ASSERT(virp_chain_type_is_external_allowed("comparator_verd"),
+           "indirect types are allowed externally");
+    ASSERT(!virp_chain_type_is_external_allowed("audit_passed"),
+           "invented types are refused");
+    ASSERT(!virp_chain_type_is_external_allowed("outcome"),
+           "reserved types are not externally allowed");
+    PASS();
+}
+
+/* The digest helper decodes base64 bodies and rejects undecodable ones. */
+static void test_artifact_digest_helper(void)
+{
+    TEST("Artifact digest: base64 aware, rejects garbage");
+
+    char want[65], got[65];
+    sha256_hex_str("hello world", want);
+
+    ASSERT(virp_chain_artifact_digest("base64:aGVsbG8gd29ybGQ=", got)
+               == VIRP_OK, "base64 decode failed");
+    ASSERT(strcmp(got, want) == 0, "base64 digest must match plaintext");
+
+    ASSERT(virp_chain_artifact_digest("hello world", got) == VIRP_OK,
+           "literal digest failed");
+    ASSERT(strcmp(got, want) == 0, "literal digest must match");
+
+    ASSERT(virp_chain_artifact_digest("base64:!!!not-base64!!!", got)
+               != VIRP_OK, "undecodable base64 must be refused");
+    PASS();
+}
+
+/* =========================================================================
  * Test: malformed MAC/hash fields still fail closed (audit §4.4)
  *
  * The constant-time comparison that replaced strcmp() reads every byte it
@@ -1288,6 +1498,12 @@ int main(void)
     test_verify_session_forged_head();
     test_restart_does_not_launder_truncation();
     test_dropped_heads_table_is_fatal();
+    test_verify_binds_stored_artifact();
+    test_verify_binds_base64_body();
+    test_verify_indirect_type_is_unverifiable();
+    test_verify_missing_body_is_unverifiable();
+    test_artifact_type_policy();
+    test_artifact_digest_helper();
     test_malformed_mac_fails_closed();
     test_append_with_artifact_stores_both();
     test_append_with_artifact_rolls_back_together();

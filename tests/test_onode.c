@@ -3217,6 +3217,284 @@ TEST(test_sign_outcome_accepts_valid_digest)
 }
 
 /* =========================================================================
+ * CHAIN_APPEND is not a signing oracle for arbitrary artifacts
+ * (adversarial audit 2026-08-06)
+ *
+ * The external append path validated only that four strings were
+ * non-empty and passed them straight to the chain writer, which copied
+ * the CALLER's artifact_hash into the canonical object, SHA-256'd it and
+ * HMAC'd it with K_chain. A socket client holding no K_chain could
+ * therefore induce a K_chain-authenticated entry that no chain reader
+ * can distinguish from a daemon-minted record. Three attacks, all
+ * reproduced against the pre-fix code:
+ *
+ *   1. body/hash mismatch — declare a hash that is not sha256(body)
+ *   2. reserved type      — claim artifact_type "outcome" / "approval"
+ *   3. invented type      — claim a type the daemon has never minted
+ *
+ * These tests need their OWN chain-enabled daemon: the shared g_state
+ * instance runs without a chain, where chain_append fails early for an
+ * unrelated reason and proves nothing.
+ * ========================================================================= */
+
+#define CA_SOCKET    "/tmp/virp-onode-test-cappend.sock"
+#define CA_CHAIN_DB  "/tmp/virp-onode-test-cappend.db"
+#define CA_CHAIN_KEY "/tmp/virp-onode-test-cappend.key"
+
+static onode_state_t ca_state;
+static pthread_t ca_thread_id;
+
+static void ca_cleanup_files(void)
+{
+    unlink(CA_CHAIN_DB);
+    unlink(CA_CHAIN_DB "-wal");
+    unlink(CA_CHAIN_DB "-shm");
+    unlink(CA_CHAIN_KEY);
+    unlink(CA_SOCKET);
+}
+
+static void *ca_thread(void *arg)
+{
+    (void)arg;
+    onode_start(&ca_state);
+    return NULL;
+}
+
+/* Start a chain-enabled daemon on its own socket. Returns 0 on success. */
+static int ca_start(void)
+{
+    ca_cleanup_files();
+
+    virp_signing_key_t ck;
+    if (virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN) != VIRP_OK) return -1;
+    if (virp_key_save_file(&ck, CA_CHAIN_KEY) != VIRP_OK) return -1;
+    virp_key_destroy(&ck);
+
+    if (onode_init(&ca_state, 0x00000042, NULL, CA_SOCKET) != VIRP_OK)
+        return -1;
+    ca_state.ctx = virp_context_new();
+    if (!ca_state.ctx) return -1;
+    if (onode_setup_chain_and_approvals(&ca_state, 0x00000042,
+                                        CA_CHAIN_DB, CA_CHAIN_KEY,
+                                        "/tmp/virp-onode-test-ca-approvals",
+                                        "/tmp/virp-onode-test-no-registry")
+            != VIRP_OK)
+        return -1;
+    if (!ca_state.chain_enabled) return -1;
+    if (pthread_create(&ca_thread_id, NULL, ca_thread, NULL) != 0) return -1;
+    usleep(200000);
+    return 0;
+}
+
+static void ca_stop(void)
+{
+    onode_shutdown(&ca_state);
+    pthread_join(ca_thread_id, NULL);
+    onode_destroy(&ca_state);
+    virp_context_destroy(ca_state.ctx);
+    ca_state.ctx = NULL;
+}
+
+/* Same framing as client_request(), against the chain-enabled socket. */
+static ssize_t ca_request(const char *json, uint8_t *resp, size_t resp_cap)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", CA_SOCKET);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    size_t json_len = strlen(json);
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+    send(fd, &frame_len, 4, 0);
+    uint8_t version = VIRP_FRAME_VERSION;
+    send(fd, &version, 1, 0);
+    send(fd, json, json_len, 0);
+    usleep(50000);
+
+    uint32_t net_rlen;
+    if (recv(fd, &net_rlen, 4, 0) != 4) { close(fd); return -1; }
+    uint32_t rlen = ntohl(net_rlen);
+    if (rlen > resp_cap) { close(fd); return -1; }
+    size_t got = 0;
+    while (got < rlen) {
+        ssize_t n = recv(fd, resp + got, rlen - got, 0);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    return (ssize_t)got;
+}
+
+static void ca_sha256_hex(const char *s, char out[65])
+{
+    unsigned char md[32];
+    unsigned int mdlen = 0;
+    EVP_Digest(s, strlen(s), md, &mdlen, EVP_sha256(), NULL);
+    for (int i = 0; i < 32; i++)
+        snprintf(out + i * 2, 3, "%02x", md[i]);
+}
+
+/* Ask the chain-enabled daemon to append. Returns the response length;
+ * a 4-byte response is a typed error (rejection). */
+static ssize_t ca_append(const char *session, const char *type,
+                         const char *aid, const char *hash,
+                         const char *content, uint8_t *resp, size_t cap)
+{
+    char json[2048];
+    if (content) {
+        /* The bodies under test are themselves JSON. Escaping them into
+         * the request is not cosmetic: an unescaped quote makes the
+         * REQUEST malformed, the daemon rejects the parse, and the test
+         * passes for entirely the wrong reason — it never reaches the
+         * append path it claims to attack. */
+        char esc[1024];
+        size_t o = 0;
+        for (const char *p = content; *p && o + 2 < sizeof(esc); p++) {
+            if (*p == '"' || *p == '\\') esc[o++] = '\\';
+            esc[o++] = *p;
+        }
+        esc[o] = '\0';
+        snprintf(json, sizeof(json),
+                 "{\"action\":\"chain_append\",\"session_id\":\"%s\","
+                 "\"artifact_type\":\"%s\",\"artifact_id\":\"%s\","
+                 "\"artifact_hash\":\"%s\",\"artifact_content\":\"%s\"}",
+                 session, type, aid, hash, esc);
+    }
+    else {
+        snprintf(json, sizeof(json),
+                 "{\"action\":\"chain_append\",\"session_id\":\"%s\","
+                 "\"artifact_type\":\"%s\",\"artifact_id\":\"%s\","
+                 "\"artifact_hash\":\"%s\"}",
+                 session, type, aid, hash);
+    }
+    return ca_request(json, resp, cap);
+}
+
+/* Count entries with the given artifact_id in the chain database. The
+ * daemon holds the db open in WAL mode; a second connection sees
+ * committed rows. */
+static int ca_count_entries(const char *artifact_id)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open(CA_CHAIN_DB, &db) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*) FROM chain_entries WHERE artifact_id = ?",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, artifact_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+
+/* ATTACK 1: the declared hash is not sha256(the submitted body). The
+ * daemon must recompute over the received bytes and refuse. */
+TEST(test_chain_append_rejects_body_hash_mismatch)
+{
+    const char *body = "{\"success\":true,\"note\":\"not what the hash says\"}";
+    char wrong[65];
+    ca_sha256_hex("entirely different bytes", wrong);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("attack:mismatch", "observation",
+                          "attack-mismatch-1", wrong, body,
+                          resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("attack-mismatch-1"), 0);
+}
+
+/* ATTACK 2: a reserved, daemon-only semantic type submitted from the
+ * external socket path. Hash and body agree here, so ONLY the type
+ * namespace check can catch it. */
+TEST(test_chain_append_rejects_reserved_type_outcome)
+{
+    const char *body =
+        "{\"proposal_id\":\"deadbeef\",\"device\":\"R5\",\"success\":true}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("approval:R5", "outcome", "outcome:deadbeef", h,
+                          body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("outcome:deadbeef"), 0);
+}
+
+TEST(test_chain_append_rejects_reserved_type_approval)
+{
+    const char *body =
+        "{\"proposal_id\":\"deadbeef\",\"operator\":\"mallory\"}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("approval:R5", "approval", "approval:deadbeef", h,
+                          body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("approval:deadbeef"), 0);
+}
+
+/* ATTACK 3: a type the daemon has never minted and no client is known to
+ * send. Unknown types are refused rather than recorded as if meaningful. */
+TEST(test_chain_append_rejects_invented_type)
+{
+    const char *body = "{\"anything\":\"at all\"}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("attack:invent", "audit_passed",
+                          "invented-1", h, body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("invented-1"), 0);
+}
+
+/* GUARD: the legitimate external append — a known client type whose body
+ * hashes to its declared commitment — must still be accepted, or the fix
+ * has simply broken chain registration. */
+TEST(test_chain_append_accepts_bound_observation)
+{
+    const char *body = "{\"device\":\"R5\",\"output\":\"up/up\"}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "observation",
+                          "obs-legit-1", h, body, resp, sizeof(resp));
+
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("obs-legit-1"), 1);
+}
+
+/* GUARD: a commitment-only append (no body at all) stays legal — the
+ * caller may choose to register a hash commitment without the bytes. */
+TEST(test_chain_append_accepts_commitment_without_body)
+{
+    char h[65];
+    ca_sha256_hex("bytes the chain will not hold", h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "observation",
+                          "obs-commitment-1", h, NULL, resp, sizeof(resp));
+
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("obs-commitment-1"), 1);
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -3363,6 +3641,21 @@ int main(void)
     printf("\n[SO_PEERCRED Allowlist Tests]\n");
     RUN_TEST(test_peer_uid_allowed);
     RUN_TEST(test_peer_uid_rejected);
+
+    printf("\n  -- Audit 2026-08-06: CHAIN_APPEND artifact forgery --\n");
+    if (ca_start() == 0) {
+        RUN_TEST(test_chain_append_rejects_body_hash_mismatch);
+        RUN_TEST(test_chain_append_rejects_reserved_type_outcome);
+        RUN_TEST(test_chain_append_rejects_reserved_type_approval);
+        RUN_TEST(test_chain_append_rejects_invented_type);
+        RUN_TEST(test_chain_append_accepts_bound_observation);
+        RUN_TEST(test_chain_append_accepts_commitment_without_body);
+        ca_stop();
+        ca_cleanup_files();
+    } else {
+        printf("  *** chain-enabled test daemon failed to start\n");
+        tests_run++; tests_failed++;
+    }
 
     printf("\n  -- Audit §4.1: sign_intent/sign_outcome signing oracle --\n");
     RUN_TEST(test_sign_intent_predicate);

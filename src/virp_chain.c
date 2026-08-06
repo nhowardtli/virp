@@ -57,6 +57,7 @@ static void head_hmac_hex(virp_chain_state_t *state,
                           char out_hex[65]);
 /* Constant-time hex digest/MAC comparison — see definition for why (§4.4). */
 static bool hexdigest_eq(const char *a, const char *b);
+static void sha256_hex(const char *data, size_t len, char out[65]);
 static int table_exists(sqlite3 *db, const char *name);
 static virp_error_t head_upsert_locked(virp_chain_state_t *state,
                                        const char *session_id,
@@ -313,6 +314,137 @@ virp_error_t virp_chain_artifact_store(virp_chain_state_t *state,
                                                   artifact_hash, session_id);
     pthread_mutex_unlock(&state->lock);
     return rc;
+}
+
+/* =========================================================================
+ * Artifact type policy + body digest (adversarial audit 2026-08-06)
+ *
+ * One definition, two consumers: the external append path in
+ * src/virp_onode.c refuses forgeries with it, and the verifier below
+ * grades artifact binding with it. Types are compared against the
+ * TRUNCATED forms the 16-byte artifact_type field can actually hold —
+ * "comparator_verdict" and "chainwalk_summary" reach the daemon as
+ * "comparator_verd" and "chainwalk_summa", which is also how they are
+ * stored in production. Both spellings are listed so the predicate is
+ * correct wherever it is called from.
+ * ========================================================================= */
+
+static bool type_in(const char *t, const char *const *set, size_t n)
+{
+    if (!t) return false;
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(t, set[i]) == 0) return true;
+    return false;
+}
+
+bool virp_chain_type_is_daemon_reserved(const char *artifact_type)
+{
+    static const char *const RESERVED[] = {
+        "approval",        /* src/virp_approval.c  (submit)   */
+        "proposal",        /* src/virp_approval.c  (file)     */
+        "outcome",         /* src/virp_onode.c     (gate)     */
+        "gate_rejection",  /* src/virp_onode.c     (gate)     */
+        "validation",      /* src/virp_validator.c            */
+    };
+    return type_in(artifact_type, RESERVED,
+                   sizeof(RESERVED) / sizeof(RESERVED[0]));
+}
+
+bool virp_chain_type_is_indirect(const char *artifact_type)
+{
+    static const char *const INDIRECT[] = {
+        "comparator_verdict", "comparator_verd",
+        "chainwalk_summary",  "chainwalk_summa",
+    };
+    return type_in(artifact_type, INDIRECT,
+                   sizeof(INDIRECT) / sizeof(INDIRECT[0]));
+}
+
+bool virp_chain_type_is_external_allowed(const char *artifact_type)
+{
+    static const char *const EXTERNAL[] = {
+        "observation",     /* autopilot, evidence, config-backup, virp-tool */
+        "evidence_item",   /* autopilot/virp_evidence.py                    */
+        "no_drift",        /* autopilot/virp_config_backup.py               */
+        "baseline_set",    /* autopilot/virp_config_backup.py               */
+        "drift_alert",     /* autopilot/virp_config_backup.py               */
+    };
+    if (virp_chain_type_is_indirect(artifact_type)) return true;
+    return type_in(artifact_type, EXTERNAL,
+                   sizeof(EXTERNAL) / sizeof(EXTERNAL[0]));
+}
+
+/* Standard base64 decode (RFC 4648, '=' padding). Returns decoded length
+ * or -1. Local to this file; the approver registry has its own copy for
+ * SPKI decoding and the two must not become entangled. */
+static int artifact_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int artifact_b64_decode(const char *in, size_t in_len,
+                               uint8_t *out, size_t out_max)
+{
+    if (in_len % 4 != 0) return -1;
+    size_t o = 0;
+    for (size_t i = 0; i < in_len; i += 4) {
+        int v[4];
+        int pad = 0;
+        for (int k = 0; k < 4; k++) {
+            char c = in[i + k];
+            if (c == '=') {
+                /* Padding is legal only in the final quantum's tail. */
+                if (i + 4 != in_len || k < 2) return -1;
+                v[k] = 0;
+                pad++;
+            } else {
+                if (pad) return -1;
+                v[k] = artifact_b64_val(c);
+                if (v[k] < 0) return -1;
+            }
+        }
+        uint32_t trip = ((uint32_t)v[0] << 18) | ((uint32_t)v[1] << 12) |
+                        ((uint32_t)v[2] << 6)  | (uint32_t)v[3];
+        int want = 3 - pad;
+        for (int k = 0; k < want; k++) {
+            if (o >= out_max) return -1;
+            out[o++] = (uint8_t)((trip >> (16 - 8 * k)) & 0xFF);
+        }
+    }
+    return (int)o;
+}
+
+virp_error_t virp_chain_artifact_digest(const char *artifact_content,
+                                        char out_hex[65])
+{
+    if (!artifact_content || !out_hex) return VIRP_ERR_NULL_PTR;
+
+    static const char PREFIX[] = "base64:";
+    const size_t plen = sizeof(PREFIX) - 1;
+
+    if (strncmp(artifact_content, PREFIX, plen) == 0) {
+        const char *b64 = artifact_content + plen;
+        size_t b64_len = strlen(b64);
+        size_t max = b64_len / 4 * 3 + 3;
+        uint8_t *raw = (uint8_t *)malloc(max ? max : 1);
+        if (!raw) return VIRP_ERR_BUFFER_TOO_SMALL;
+        int n = artifact_b64_decode(b64, b64_len, raw, max);
+        if (n < 0) {
+            free(raw);
+            return VIRP_ERR_INVALID_LENGTH;
+        }
+        sha256_hex((const char *)raw, (size_t)n, out_hex);
+        free(raw);
+        return VIRP_OK;
+    }
+
+    sha256_hex(artifact_content, strlen(artifact_content), out_hex);
+    return VIRP_OK;
 }
 
 /* =========================================================================
@@ -1233,6 +1365,60 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
  * Verify
  * ========================================================================= */
 
+/*
+ * Grade one entry's artifact binding.
+ *   1  bound      — a body is stored and hashes to the entry's commitment
+ *   0  unverifiable — nothing was retained that COULD be bound: no body
+ *                   row, or an INDIRECT-commitment type whose hash names a
+ *                   signed observation the chain does not hold, or a body
+ *                   stored at the daemon's 8192-byte field limit (a prefix,
+ *                   which cannot hash to the whole)
+ *  -1  broken     — a body IS retained and does NOT hash to its commitment
+ *
+ * The body is looked up by (artifact_id, artifact_hash), the pair the
+ * entry commits to and the artifacts table is keyed by — resolving by
+ * artifact_id alone would pick up a colliding id's body and grade the
+ * wrong bytes.
+ */
+static int chain_verify_binding_locked(virp_chain_state_t *state,
+                                       const virp_chain_entry_t *e)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT artifact_content FROM artifacts "
+            "WHERE artifact_id = ? AND artifact_hash = ?",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;   /* cannot read the store: report unverifiable, not broken */
+
+    sqlite3_bind_text(st, 1, e->artifact_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, e->artifact_hash, -1, SQLITE_TRANSIENT);
+
+    int verdict = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *body = (const char *)sqlite3_column_text(st, 0);
+        size_t blen = body ? strlen(body) : 0;
+
+        if (!body || blen == 0) {
+            verdict = 0;                       /* nothing retained to bind */
+        } else if (blen >= VIRP_CHAIN_ARTIFACT_CONTENT_MAX) {
+            verdict = 0;                       /* stored truncated: a prefix */
+        } else if (virp_chain_type_is_indirect(e->artifact_type)) {
+            /* Body required and present, but artifact_hash commits to a
+             * signed observation the chain does not retain — honest
+             * verdict is unverifiable, never a silent pass. */
+            verdict = 0;
+        } else {
+            char digest[65];
+            if (virp_chain_artifact_digest(body, digest) != VIRP_OK)
+                verdict = -1;                  /* undecodable body */
+            else
+                verdict = hexdigest_eq(digest, e->artifact_hash) ? 1 : -1;
+        }
+    }
+    sqlite3_finalize(st);
+    return verdict;
+}
+
 static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                                const char *session_id,
                                int64_t from_sequence,
@@ -1351,6 +1537,30 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                      "HMAC mismatch at sequence %lld",
                      (long long)e.sequence);
             break;
+        }
+
+        /* ARTIFACT BINDING (2026-08-06). The checks above prove the entry
+         * is internally consistent and K_chain-authenticated; none of them
+         * proves the entry commits to the body the chain actually stores.
+         * Default-on, with the same three-way grading report/verify.py
+         * uses, because an operator CLI that prints VALID for an entry it
+         * never bound is worse than one that says so: a retained body that
+         * disagrees with its commitment is tampering (fatal), while a body
+         * the format never retained is UNVERIFIABLE (counted, never
+         * counted as verified, not fatal). */
+        {
+            int bind = chain_verify_binding_locked(state, &e);
+            if (bind < 0) {
+                result->valid = false;
+                result->first_broken = e.sequence;
+                snprintf(result->error_detail, sizeof(result->error_detail),
+                         "Artifact binding failed at sequence %lld: stored "
+                         "body does not hash to artifact_hash",
+                         (long long)e.sequence);
+                break;
+            }
+            if (bind == 0) result->artifacts_unverifiable++;
+            else           result->artifacts_bound++;
         }
 
         /* Advance */

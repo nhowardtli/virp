@@ -2339,6 +2339,87 @@ static void handle_client(onode_state_t *state, int client_fd)
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
+        /*
+         * CHAIN_APPEND is not a signing oracle (adversarial audit
+         * 2026-08-06). Everything below this point gets a K_chain HMAC,
+         * so a caller holding no key could otherwise induce an
+         * authenticated entry a reader cannot tell from a daemon-minted
+         * one. Two gates, both fail-closed, both on the EXTERNAL path
+         * only — internal callers reach the chain writer directly and
+         * mint their own hashes from bodies they built.
+         */
+
+        /* GATE 1 — type namespace. Daemon-minted semantic types are
+         * refused outright, and unknown types are refused rather than
+         * recorded as if they meant something. */
+        if (virp_chain_type_is_daemon_reserved(req.artifact_type)) {
+            fprintf(stderr, "[O-Node] chain_append REJECTED: artifact_type "
+                    "'%s' is daemon-generated and may not be submitted by a "
+                    "socket client (session=%s id=%s)\n",
+                    req.artifact_type, req.session_id, req.artifact_id);
+            send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
+            break;
+        }
+        if (!virp_chain_type_is_external_allowed(req.artifact_type)) {
+            fprintf(stderr, "[O-Node] chain_append REJECTED: unknown "
+                    "artifact_type '%s' (session=%s id=%s)\n",
+                    req.artifact_type, req.session_id, req.artifact_id);
+            send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
+            break;
+        }
+
+        /* GATE 2 — body binding. When a body is submitted the daemon
+         * recomputes SHA-256 over the exact received bytes and refuses a
+         * declared hash that does not match, constant-time.
+         *
+         * The INDIRECT types are the one exception and are NOT a hole
+         * left open for convenience: their artifact_hash commits to a
+         * signed observation the chain does not retain (the autopilot
+         * comparator and chainwalk register the verdict JSON as the body
+         * while committing to the signed message), so sha256(body) can
+         * never match by design. They still must supply a non-empty body,
+         * and the verifier grades them UNVERIFIABLE rather than passing
+         * them silently. With GATE 1 above reserving every semantic type,
+         * the exception is exactly two non-semantic type names wide.
+         *
+         * DEFERRED: making the indirection explicit as a commitment_mode
+         * field inside the HMAC'd canonical object would let both modes
+         * be verified instead of one being UNVERIFIABLE. That changes the
+         * canonical form, so it belongs with the provenance field in a
+         * chain-format change window. */
+        if (req.artifact_content[0] != '\0') {
+            if (virp_chain_type_is_indirect(req.artifact_type)) {
+                /* body present is all that can be required here */
+            } else {
+                char computed[65];
+                virp_error_t derr = virp_chain_artifact_digest(
+                                        req.artifact_content, computed);
+                if (derr != VIRP_OK) {
+                    fprintf(stderr, "[O-Node] chain_append REJECTED: "
+                            "artifact_content is not decodable (session=%s "
+                            "id=%s)\n", req.session_id, req.artifact_id);
+                    send_framed_error(client_fd, derr);
+                    break;
+                }
+                if (strlen(req.artifact_hash) != 64 ||
+                    virp_consttime_eq(computed, req.artifact_hash, 64) != 1) {
+                    fprintf(stderr, "[O-Node] chain_append REJECTED: declared "
+                            "artifact_hash does not match sha256 of the "
+                            "submitted body (session=%s id=%s type=%s)\n",
+                            req.session_id, req.artifact_id,
+                            req.artifact_type);
+                    send_framed_error(client_fd, VIRP_ERR_CHAIN_BROKEN);
+                    break;
+                }
+            }
+        } else if (virp_chain_type_is_indirect(req.artifact_type)) {
+            fprintf(stderr, "[O-Node] chain_append REJECTED: artifact_type "
+                    "'%s' commits indirectly and must carry a body "
+                    "(session=%s id=%s)\n",
+                    req.artifact_type, req.session_id, req.artifact_id);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
+            break;
+        }
         {
             /* Entry and (optional) raw content commit in one transaction.
              * A content-store failure now fails the whole request with a

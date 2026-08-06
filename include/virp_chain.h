@@ -24,6 +24,11 @@
  * ========================================================================= */
 
 #define VIRP_CHAIN_MILESTONE_INTERVAL  100
+
+/* The daemon's request field is char artifact_content[8192], so a body at
+ * or past this length reached the chain truncated: a prefix, which cannot
+ * hash to the whole. Mirrors ARTIFACT_CONTENT_MAX in report/verify.py. */
+#define VIRP_CHAIN_ARTIFACT_CONTENT_MAX 8191
 #define VIRP_CHAIN_GENESIS_PREFIX      "VIRP_CHAIN_GENESIS:"
 
 /* =========================================================================
@@ -58,7 +63,63 @@ typedef struct {
     int64_t  entries_checked;
     int64_t  first_broken;              /* -1 if none */
     char     error_detail[256];
+    /* Artifact binding (2026-08-06). Entries whose stored body hashes to
+     * the entry's artifact_hash are counted verified; entries the chain
+     * format cannot bind — no body retained, or an INDIRECT-commitment
+     * type whose hash commits to a signed observation the chain does not
+     * hold — are counted UNVERIFIABLE and never as verified. valid stays
+     * true for those: unverifiable is a retention limit, not tampering.
+     * A body that IS retained and does NOT hash to its commitment is
+     * tampering and clears valid. */
+    int64_t  artifacts_bound;
+    int64_t  artifacts_unverifiable;
 } virp_chain_verify_result_t;
+
+/* =========================================================================
+ * Artifact type policy — one definition, used by the external append path
+ * (to refuse forgeries) and by the verifier (to grade binding honestly)
+ * ========================================================================= */
+
+/*
+ * Types the DAEMON mints on internal paths and an external socket client
+ * may never claim: "approval" and "proposal" (src/virp_approval.c),
+ * "outcome" and "gate_rejection" (src/virp_onode.c), "validation"
+ * (src/virp_validator.c). A chain reader treats these as semantic
+ * records of the approval/gate/validation flows, so accepting one from a
+ * socket client makes a forged record indistinguishable from a minted one.
+ */
+bool virp_chain_type_is_daemon_reserved(const char *artifact_type);
+
+/*
+ * INDIRECT-commitment types: artifact_hash commits to a SIGNED
+ * OBSERVATION that the chain does not retain, while the stored body is
+ * the plain JSON. sha256(body) therefore does not equal artifact_hash by
+ * design, and the entry cannot be bound from within the chain. Matches
+ * INDIRECT_COMMITMENT_TYPES in report/verify.py.
+ *
+ * DEFERRED (2026-08-06): the honest fix is an explicit commitment_mode
+ * field inside the HMAC'd canonical object, so both modes are defined and
+ * verifiable rather than one being UNVERIFIABLE. That changes the
+ * canonical form and belongs in the same change window as the provenance
+ * field and a chain format version bump.
+ */
+bool virp_chain_type_is_indirect(const char *artifact_type);
+
+/*
+ * Types an external client may submit at all. Anything else — including a
+ * wholly invented type — is refused rather than recorded as if meaningful.
+ */
+bool virp_chain_type_is_external_allowed(const char *artifact_type);
+
+/*
+ * SHA-256 hex of the bytes an artifact_hash commits to. Bodies are stored
+ * either as "base64:<b64>" (signed wire messages) or as literal text, and
+ * the commitment is over the DECODED bytes in the first case — the same
+ * rule report/verify.py decode_artifact() applies. Returns
+ * VIRP_ERR_INVALID_LENGTH if a base64 body does not decode.
+ */
+virp_error_t virp_chain_artifact_digest(const char *artifact_content,
+                                        char out_hex[65]);
 
 /* =========================================================================
  * Chain State — owns the SQLite database and prepared statements
