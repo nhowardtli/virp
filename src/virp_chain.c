@@ -57,6 +57,7 @@ static void head_hmac_hex(virp_chain_state_t *state,
                           char out_hex[65]);
 /* Constant-time hex digest/MAC comparison — see definition for why (§4.4). */
 static bool hexdigest_eq(const char *a, const char *b);
+static int table_exists(sqlite3 *db, const char *name);
 static virp_error_t head_upsert_locked(virp_chain_state_t *state,
                                        const char *session_id,
                                        int64_t last_sequence,
@@ -135,9 +136,11 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
 
     /* Verifier handle on a pre-chain_heads database: there is no signed
      * head, so no length claim exists to verify against. Report that —
-     * a read-only verifier must not manufacture the head it would then
-     * check (virp_chain_init's backfill does exactly that, correctly,
-     * for the DAEMON's own database on upgrade). */
+     * NOBODY may manufacture the head it would then check. (The daemon's
+     * init-time trust-on-upgrade backfill that once did was removed
+     * 2026-08-06, Finding A: it let a restart launder a tail+head
+     * deletion. virp_chain_init now refuses heads-less entry-bearing
+     * databases outright.) */
     if (state->legacy_no_heads) {
         result->valid = false;
         snprintf(result->error_detail, sizeof(result->error_detail),
@@ -757,6 +760,49 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
     sqlite3_exec(state->db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_exec(state->db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
 
+    /* Adversarial audit 2026-08-06 (Finding A): a database that already
+     * has chain entries but no chain_heads table is NOT adopted as a
+     * pre-2026-08-01 legacy upgrade candidate. The schema generation is
+     * the discriminator: every database this binary has ever touched
+     * carries the table (SCHEMA_SQL creates it before the first append,
+     * and appends maintain it transactionally), so entries without the
+     * TABLE can only mean the table was dropped to re-open the one-time
+     * trust-on-upgrade window and have fresh heads signed over a
+     * truncated chain. Refuse the database outright — the evidence is
+     * preserved for offline inspection (virp_chain_open_verifier reads
+     * such a database and reports LEGACY_CHAIN without repairing it). */
+    {
+        int had_heads = table_exists(state->db, "chain_heads");
+        int had_entries = table_exists(state->db, "chain_entries");
+        if (had_heads < 0 || had_entries < 0) {
+            fprintf(stderr, "[Chain] Failed to inspect schema of %s\n",
+                    db_path);
+            sqlite3_close(state->db);
+            return VIRP_ERR_CHAIN_DB;
+        }
+        if (!had_heads && had_entries) {
+            int64_t n = 0;
+            sqlite3_stmt *ck = NULL;
+            if (sqlite3_prepare_v2(state->db,
+                    "SELECT COUNT(*) FROM chain_entries",
+                    -1, &ck, NULL) == SQLITE_OK &&
+                sqlite3_step(ck) == SQLITE_ROW)
+                n = sqlite3_column_int64(ck, 0);
+            sqlite3_finalize(ck);
+            if (n > 0) {
+                fprintf(stderr, "[Chain] FATAL: %s has %lld chain entries "
+                        "but no chain_heads table — either the table was "
+                        "dropped (tampering) or this is a never-upgraded "
+                        "pre-2026-08-01 database. Refusing to adopt it: "
+                        "heads are never signed retroactively. Inspect it "
+                        "offline with the read-only verifier.\n",
+                        db_path, (long long)n);
+                sqlite3_close(state->db);
+                return VIRP_ERR_CHAIN_BROKEN;
+            }
+        }
+    }
+
     /* Create schema */
     char *errmsg = NULL;
     rc = sqlite3_exec(state->db, SCHEMA_SQL, NULL, NULL, &errmsg);
@@ -874,55 +920,35 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
         return VIRP_ERR_CHAIN_DB;
     }
 
-    /* Backfill head records for sessions created before chain_heads
-     * existed. Only sessions LACKING a head get one — an existing head is
-     * never overwritten here, because a head that disagrees with the
-     * entries is a tampering signal virp_chain_verify_session must report,
-     * not repair. TRUST-ON-UPGRADE: a backfilled head blesses whatever
-     * length the database has at upgrade time; only appends after this
-     * point extend the authenticated length. A backfill failure is logged
-     * and left alone — the affected session then fails
-     * virp_chain_verify_session (no head), which is the fail-closed
-     * outcome, rather than blocking daemon startup. */
+    /* A session with entries but no head row is tampering evidence
+     * (tail+head deletion), never a repair candidate. Heads are written
+     * in the same transaction as every append and the one-time legacy
+     * backfill window closed with the 2026-08-01 migration (production
+     * carries no headless session), so nothing legitimate looks like
+     * this. Adversarial audit 2026-08-06 (Finding A): the backfill that
+     * used to run here re-signed such sessions with the live K_chain on
+     * restart, laundering the deletion. Log each one loudly and leave it
+     * failing virp_chain_verify_session permanently. */
     {
-        sqlite3_stmt *bf = NULL, *hh = NULL;
+        sqlite3_stmt *bf = NULL;
         const char *sql_bf =
             "SELECT ce.session_id, MAX(ce.sequence) "
             "FROM chain_entries ce "
             "LEFT JOIN chain_heads ch ON ch.session_id = ce.session_id "
             "WHERE ch.session_id IS NULL "
             "GROUP BY ce.session_id";
-        const char *sql_hh =
-            "SELECT chain_entry_hash FROM chain_entries "
-            "WHERE session_id = ? AND sequence = ?";
-        if (sqlite3_prepare_v2(state->db, sql_bf, -1, &bf, NULL) == SQLITE_OK &&
-            sqlite3_prepare_v2(state->db, sql_hh, -1, &hh, NULL) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(state->db, sql_bf, -1, &bf, NULL)
+                == SQLITE_OK) {
             while (sqlite3_step(bf) == SQLITE_ROW) {
-                const char *sid = (const char *)sqlite3_column_text(bf, 0);
-                int64_t last = sqlite3_column_int64(bf, 1);
-                sqlite3_reset(hh);
-                sqlite3_bind_text(hh, 1, sid, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(hh, 2, last);
-                if (sqlite3_step(hh) == SQLITE_ROW) {
-                    const char *hash =
-                        (const char *)sqlite3_column_text(hh, 0);
-                    if (head_upsert_locked(state, sid, last, hash)
-                            == VIRP_OK) {
-                        fprintf(stderr,
-                            "[Chain] Head backfill: session=%s "
-                            "last_seq=%lld (trust-on-upgrade)\n",
-                            sid, (long long)last);
-                    } else {
-                        fprintf(stderr,
-                            "[Chain] Head backfill FAILED: session=%s "
-                            "— session will not verify until resolved\n",
-                            sid);
-                    }
-                }
+                fprintf(stderr,
+                    "[Chain] TAMPER EVIDENCE: session=%s has entries "
+                    "(max_seq=%lld) but no signed head — consistent with "
+                    "tail+head deletion; the session will never verify\n",
+                    (const char *)sqlite3_column_text(bf, 0),
+                    (long long)sqlite3_column_int64(bf, 1));
             }
         }
         if (bf) sqlite3_finalize(bf);
-        if (hh) sqlite3_finalize(hh);
     }
 
     fprintf(stderr, "[Chain] Initialized: db=%s node=%u org=%s\n",

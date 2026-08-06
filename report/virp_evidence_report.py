@@ -307,6 +307,7 @@ def section_integrity(story, ss, summary, stats):
         line("Chain HMAC", summary["chain_hmac"]),
         line("Artifact binding", summary["artifact_bind"]),
         line("Observation HMAC", summary["obs_hmac"]),
+        line("Session head (chain length)", summary["heads"]["tally"]),
         ("Collection status", " &nbsp; ".join(
             "%s %d" % (k, v)
             for k, v in sorted(stats["status_counts"].items())) or "-"),
@@ -319,7 +320,15 @@ def section_integrity(story, ss, summary, stats):
             "place, in red, on the control they belong to. Nothing was "
             "dropped to keep this report tidy."
             % (failed, "y" if failed == 1 else "ies"), ss["Bad"]))
-    else:
+    # Head failures are session-level, so no control row carries them —
+    # print each one here where the verdict tally is.
+    for sid, (verdict, detail) in sorted(
+            summary["heads"]["per_session"].items()):
+        if verdict == verify.FAIL:
+            story.append(Paragraph(
+                "<b>SESSION HEAD FAILED:</b> %s — %s"
+                % (sid, detail), ss["Bad"]))
+    if not failed:
         story.append(Paragraph(
             "Every check that could be run passed. UNVERIFIABLE, where it "
             "appears, is a retention limit of the chain format and is never "

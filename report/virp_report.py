@@ -442,6 +442,8 @@ def section_integrity(story, ss, summary, verifications):
         line("Chain HMAC (K_chain)", summary["chain_hmac"], total),
         line("Artifact→entry binding", summary["artifact_bind"], total),
         line("Observation HMAC (O-Key)", summary["obs_hmac"], obs),
+        line("Session head (chain length)", summary["heads"]["tally"],
+             summary["sessions"]),
     ]
     t = Table(data, colWidths=(2.3 * inch, 8.0 * inch), hAlign="LEFT")
     t.setStyle(TableStyle([
@@ -457,12 +459,17 @@ def section_integrity(story, ss, summary, verifications):
     broken = summary["first_broken_link"]
 
     if failed:
+        head_note = ""
+        if any(getattr(v, "is_head", False) for v in failed):
+            head_note = (" Session-head failures are session-level "
+                         "verdicts (the signed chain-length commitment) "
+                         "and appear in this table only.")
         story.append(Paragraph(
             '<font color="%s"><b>%d ENTR%s FAILED VERIFICATION.</b></font> '
             "Each is reproduced in full at its position in the session "
-            "breakdown below; none has been omitted."
+            "breakdown below; none has been omitted.%s"
             % (vhex(verify.FAIL), len(failed),
-               "Y" if len(failed) == 1 else "IES"), ss["Note"]))
+               "Y" if len(failed) == 1 else "IES", head_note), ss["Note"]))
         story.append(Spacer(1, 4))
         rows = [[Paragraph("<b>%s</b>" % h, ss["MonoSmall"]) for h in
                  ("session", "seq", "check", "detail")]]

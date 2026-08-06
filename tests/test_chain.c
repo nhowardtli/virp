@@ -620,44 +620,97 @@ static void test_verify_session_forged_head(void)
 }
 
 /* =========================================================================
- * Test: Head backfill on init for pre-upgrade databases
+ * Test: restart must not launder a tail+head deletion (adversarial audit
+ * 2026-08-06, Finding A)
+ *
+ * REGRESSION SEMANTICS: before this fix, virp_chain_init's unconditional
+ * head backfill treated ANY headless session as pre-upgrade legacy and
+ * signed a fresh head with the live K_chain over whatever length the
+ * attacker left behind. Pre-restart the deletion was INVALID ("head
+ * missing"); one restart later it verified VALID and the evidence was
+ * gone. This test FAILS against that code on the !result.valid asserts.
  * ========================================================================= */
 
-static void test_head_backfill(void)
+static void test_restart_does_not_launder_truncation(void)
 {
-    TEST("Head backfill on init (trust-on-upgrade)");
+    TEST("Restart does not launder tail+head deletion");
     cleanup();
     create_test_key();
 
     virp_chain_state_t state;
     virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
-    append_n(&state, "session-legacy", 4);
-
-    /* Simulate a pre-chain_heads database: drop the head rows */
-    sqlite3_exec(state.db, "DELETE FROM chain_heads;", NULL, NULL, NULL);
-    virp_chain_destroy(&state);
-
-    /* Re-init: backfill should mint a head from the existing entries */
-    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-launder", 5);
+    append_n(&state, "session-clean", 3);
 
     virp_chain_verify_result_t result;
-    virp_error_t err = virp_chain_verify_session(&state, "session-legacy",
+    virp_error_t err = virp_chain_verify_session(&state, "session-launder",
                                                  &result);
-    ASSERT(err == VIRP_OK, "verify_session call failed");
-    ASSERT(result.valid, "backfilled session should verify");
-    ASSERT(result.entries_checked == 4, "should check all 4 entries");
+    ASSERT(err == VIRP_OK && result.valid, "pre-attack session must verify");
 
-    /* And appends after backfill keep extending the head */
-    virp_chain_entry_t e;
-    virp_chain_append(&state, "session-legacy", "observation", "art-post",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        &e);
-    err = virp_chain_verify_session(&state, "session-legacy", &result);
-    ASSERT(err == VIRP_OK, "verify_session call failed post-append");
-    ASSERT(result.valid && result.entries_checked == 5,
-           "head should track the post-backfill append");
+    /* Attacker with DB write access but no K_chain deletes the last two
+     * entries AND the head row, then waits for a daemon restart. */
+    sqlite3_exec(state.db,
+        "DELETE FROM chain_entries "
+        "WHERE session_id = 'session-launder' AND sequence >= 3;"
+        "DELETE FROM chain_heads WHERE session_id = 'session-launder';",
+        NULL, NULL, NULL);
+    virp_chain_destroy(&state);
+
+    /* Simulated restart */
+    err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    ASSERT(err == VIRP_OK, "restart init failed");
+
+    err = virp_chain_verify_session(&state, "session-launder", &result);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(!result.valid,
+           "truncated headless session must STAY invalid after restart");
+
+    /* No collateral damage: the untouched session still verifies. */
+    err = virp_chain_verify_session(&state, "session-clean", &result);
+    ASSERT(err == VIRP_OK && result.valid,
+           "untampered session must still verify after restart");
+    virp_chain_destroy(&state);
+
+    /* Permanence: a second restart must not repair it either. */
+    err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    ASSERT(err == VIRP_OK, "second restart init failed");
+    err = virp_chain_verify_session(&state, "session-launder", &result);
+    ASSERT(err == VIRP_OK && !result.valid,
+           "headless session must remain invalid on every restart");
 
     virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Test: a dropped chain_heads table is tampering, not a legacy upgrade
+ *
+ * Dropping the whole table is the remaining way to make a modern database
+ * impersonate a pre-2026-08-01 one. The daemon must refuse to adopt such
+ * a database (and must certainly not re-sign heads over it) — the one
+ * genuine trust-on-upgrade migration already happened and is closed.
+ * ========================================================================= */
+
+static void test_dropped_heads_table_is_fatal(void)
+{
+    TEST("Dropped chain_heads table refuses init");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-drop", 4);
+    virp_chain_destroy(&state);
+
+    sqlite3 *raw = NULL;
+    ASSERT(sqlite3_open(TEST_DB, &raw) == SQLITE_OK, "raw open failed");
+    sqlite3_exec(raw, "DROP TABLE chain_heads;", NULL, NULL, NULL);
+    sqlite3_close(raw);
+
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    ASSERT(err != VIRP_OK,
+           "init must refuse a database with entries but no chain_heads "
+           "table instead of re-signing heads over it");
     PASS();
 }
 
@@ -1233,7 +1286,8 @@ int main(void)
     test_verify_session_tail_deleted();
     test_verify_session_head_deleted();
     test_verify_session_forged_head();
-    test_head_backfill();
+    test_restart_does_not_launder_truncation();
+    test_dropped_heads_table_is_fatal();
     test_malformed_mac_fails_closed();
     test_append_with_artifact_stores_both();
     test_append_with_artifact_rolls_back_together();
