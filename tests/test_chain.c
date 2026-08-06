@@ -620,44 +620,307 @@ static void test_verify_session_forged_head(void)
 }
 
 /* =========================================================================
- * Test: Head backfill on init for pre-upgrade databases
+ * Test: restart must not launder a tail+head deletion (adversarial audit
+ * 2026-08-06, Finding A)
+ *
+ * REGRESSION SEMANTICS: before this fix, virp_chain_init's unconditional
+ * head backfill treated ANY headless session as pre-upgrade legacy and
+ * signed a fresh head with the live K_chain over whatever length the
+ * attacker left behind. Pre-restart the deletion was INVALID ("head
+ * missing"); one restart later it verified VALID and the evidence was
+ * gone. This test FAILS against that code on the !result.valid asserts.
  * ========================================================================= */
 
-static void test_head_backfill(void)
+static void test_restart_does_not_launder_truncation(void)
 {
-    TEST("Head backfill on init (trust-on-upgrade)");
+    TEST("Restart does not launder tail+head deletion");
     cleanup();
     create_test_key();
 
     virp_chain_state_t state;
     virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
-    append_n(&state, "session-legacy", 4);
-
-    /* Simulate a pre-chain_heads database: drop the head rows */
-    sqlite3_exec(state.db, "DELETE FROM chain_heads;", NULL, NULL, NULL);
-    virp_chain_destroy(&state);
-
-    /* Re-init: backfill should mint a head from the existing entries */
-    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-launder", 5);
+    append_n(&state, "session-clean", 3);
 
     virp_chain_verify_result_t result;
-    virp_error_t err = virp_chain_verify_session(&state, "session-legacy",
+    virp_error_t err = virp_chain_verify_session(&state, "session-launder",
                                                  &result);
-    ASSERT(err == VIRP_OK, "verify_session call failed");
-    ASSERT(result.valid, "backfilled session should verify");
-    ASSERT(result.entries_checked == 4, "should check all 4 entries");
+    ASSERT(err == VIRP_OK && result.valid, "pre-attack session must verify");
 
-    /* And appends after backfill keep extending the head */
-    virp_chain_entry_t e;
-    virp_chain_append(&state, "session-legacy", "observation", "art-post",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        &e);
-    err = virp_chain_verify_session(&state, "session-legacy", &result);
-    ASSERT(err == VIRP_OK, "verify_session call failed post-append");
-    ASSERT(result.valid && result.entries_checked == 5,
-           "head should track the post-backfill append");
+    /* Attacker with DB write access but no K_chain deletes the last two
+     * entries AND the head row, then waits for a daemon restart. */
+    sqlite3_exec(state.db,
+        "DELETE FROM chain_entries "
+        "WHERE session_id = 'session-launder' AND sequence >= 3;"
+        "DELETE FROM chain_heads WHERE session_id = 'session-launder';",
+        NULL, NULL, NULL);
+    virp_chain_destroy(&state);
+
+    /* Simulated restart */
+    err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    ASSERT(err == VIRP_OK, "restart init failed");
+
+    err = virp_chain_verify_session(&state, "session-launder", &result);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(!result.valid,
+           "truncated headless session must STAY invalid after restart");
+
+    /* No collateral damage: the untouched session still verifies. */
+    err = virp_chain_verify_session(&state, "session-clean", &result);
+    ASSERT(err == VIRP_OK && result.valid,
+           "untampered session must still verify after restart");
+    virp_chain_destroy(&state);
+
+    /* Permanence: a second restart must not repair it either. */
+    err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    ASSERT(err == VIRP_OK, "second restart init failed");
+    err = virp_chain_verify_session(&state, "session-launder", &result);
+    ASSERT(err == VIRP_OK && !result.valid,
+           "headless session must remain invalid on every restart");
 
     virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Test: a dropped chain_heads table is tampering, not a legacy upgrade
+ *
+ * Dropping the whole table is the remaining way to make a modern database
+ * impersonate a pre-2026-08-01 one. The daemon must refuse to adopt such
+ * a database (and must certainly not re-sign heads over it) — the one
+ * genuine trust-on-upgrade migration already happened and is closed.
+ * ========================================================================= */
+
+static void test_dropped_heads_table_is_fatal(void)
+{
+    TEST("Dropped chain_heads table refuses init");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "session-drop", 4);
+    virp_chain_destroy(&state);
+
+    sqlite3 *raw = NULL;
+    ASSERT(sqlite3_open(TEST_DB, &raw) == SQLITE_OK, "raw open failed");
+    sqlite3_exec(raw, "DROP TABLE chain_heads;", NULL, NULL, NULL);
+    sqlite3_close(raw);
+
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    ASSERT(err != VIRP_OK,
+           "init must refuse a database with entries but no chain_heads "
+           "table instead of re-signing heads over it");
+    PASS();
+}
+
+/* =========================================================================
+ * Test: full-chain verifier binds artifacts (adversarial audit 2026-08-06)
+ *
+ * Entry hash + link + HMAC all prove the ENTRY is intact and
+ * K_chain-authenticated. None of them proves the entry commits to the
+ * body the chain actually stores. Before this fix the C verifier stopped
+ * at the HMAC, so a body swapped under a valid entry verified VALID from
+ * the operator CLI while report/verify.py flagged it. These tests FAIL
+ * against that code.
+ * ========================================================================= */
+
+static void sha256_hex_str(const char *s, char out[65])
+{
+    unsigned char d[32];
+    SHA256((const unsigned char *)s, strlen(s), d);
+    for (int i = 0; i < 32; i++) snprintf(out + i * 2, 3, "%02x", d[i]);
+}
+
+static void test_verify_binds_stored_artifact(void)
+{
+    TEST("Verify binds stored artifact bodies");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    const char *body = "{\"schema\":\"evidence/1\",\"ok\":true}";
+    char hash[65];
+    sha256_hex_str(body, hash);
+
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append_with_artifact(&state, "session-bind",
+               "evidence_item", "ev-1", hash, body, &e) == VIRP_OK,
+           "append with body failed");
+
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify(&state, "session-bind", 0, 0, &r) == VIRP_OK,
+           "verify call failed");
+    ASSERT(r.valid, "a correctly bound entry must verify");
+    ASSERT(r.artifacts_bound == 1, "the body should be counted as bound");
+    ASSERT(r.artifacts_unverifiable == 0, "nothing here is unverifiable");
+
+    /* Swap the stored body for different bytes under the SAME id+hash —
+     * the entry is untouched, so only a binding check can catch it. */
+    sqlite3_exec(state.db,
+        "UPDATE artifacts SET artifact_content = "
+        "'{\"schema\":\"evidence/1\",\"ok\":false}' "
+        "WHERE artifact_id = 'ev-1';", NULL, NULL, NULL);
+
+    ASSERT(virp_chain_verify(&state, "session-bind", 0, 0, &r) == VIRP_OK,
+           "verify call failed after swap");
+    ASSERT(!r.valid, "a body that does not hash to its commitment must FAIL");
+    ASSERT(r.first_broken == 0, "the swapped entry should be named");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* Observation bodies are stored base64-encoded and the commitment is over
+ * the DECODED bytes. A binding check that hashed the stored string would
+ * fail every observation in production. */
+static void test_verify_binds_base64_body(void)
+{
+    TEST("Verify binds base64-stored bodies by decoded bytes");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    /* "hello world" base64 = aGVsbG8gd29ybGQ= ; commitment is over the
+     * plaintext bytes, exactly as the autopilot client computes it. */
+    const char *raw = "hello world";
+    char hash[65];
+    sha256_hex_str(raw, hash);
+
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append_with_artifact(&state, "session-b64",
+               "observation", "obs-b64", hash,
+               "base64:aGVsbG8gd29ybGQ=", &e) == VIRP_OK,
+           "append failed");
+
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify(&state, "session-b64", 0, 0, &r) == VIRP_OK,
+           "verify call failed");
+    ASSERT(r.valid, "base64 body must bind against the decoded bytes");
+    ASSERT(r.artifacts_bound == 1, "should count as bound");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* Indirect-commitment types must report UNVERIFIABLE, never a silent
+ * pass: their hash names a signed observation the chain does not retain.
+ * A carve-out that reads as clean in the operator CLI is worse than no
+ * check, because it looks verified when it is not. */
+static void test_verify_indirect_type_is_unverifiable(void)
+{
+    TEST("Verify reports indirect types UNVERIFIABLE not bound");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    /* Exactly the autopilot comparator's shape: hash commits to the
+     * signed observation, body is the plain verdict JSON. */
+    const char *verdict = "{\"peer\":\"nodeB\",\"disagreements\":[]}";
+    char signed_obs_hash[65];
+    sha256_hex_str("pretend signed observation bytes", signed_obs_hash);
+
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append_with_artifact(&state, "cmp:test",
+               "comparator_verd", "comparator:1", signed_obs_hash,
+               verdict, &e) == VIRP_OK, "append failed");
+
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify(&state, "cmp:test", 0, 0, &r) == VIRP_OK,
+           "verify call failed");
+    ASSERT(r.valid, "an indirect entry is not tampering");
+    ASSERT(r.artifacts_unverifiable == 1,
+           "indirect commitment must count UNVERIFIABLE");
+    ASSERT(r.artifacts_bound == 0,
+           "indirect commitment must NOT count as bound");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* A commitment-only entry (no body ever stored) is a retention limit, not
+ * tampering — it must not flip the chain to INVALID. */
+static void test_verify_missing_body_is_unverifiable(void)
+{
+    TEST("Verify reports absent body UNVERIFIABLE not broken");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    char hash[65];
+    sha256_hex_str("bytes the chain never held", hash);
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append(&state, "session-nobody", "observation",
+                             "obs-nobody", hash, &e) == VIRP_OK,
+           "append failed");
+
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify(&state, "session-nobody", 0, 0, &r) == VIRP_OK,
+           "verify call failed");
+    ASSERT(r.valid, "absent body is a retention limit, not tampering");
+    ASSERT(r.artifacts_unverifiable == 1, "should count UNVERIFIABLE");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* The type policy itself, asserted directly: these three predicates are
+ * what the external append path and the verifier both key on. */
+static void test_artifact_type_policy(void)
+{
+    TEST("Artifact type policy: reserved / indirect / external");
+
+    ASSERT(virp_chain_type_is_daemon_reserved("approval"), "approval");
+    ASSERT(virp_chain_type_is_daemon_reserved("proposal"), "proposal");
+    ASSERT(virp_chain_type_is_daemon_reserved("outcome"), "outcome");
+    ASSERT(virp_chain_type_is_daemon_reserved("gate_rejection"), "gate_rej");
+    ASSERT(virp_chain_type_is_daemon_reserved("validation"), "validation");
+    ASSERT(!virp_chain_type_is_daemon_reserved("observation"), "observation");
+
+    /* The 16-byte artifact_type field truncates both indirect names, so
+     * the truncated spellings are the ones that actually arrive. */
+    ASSERT(virp_chain_type_is_indirect("comparator_verd"), "cmp truncated");
+    ASSERT(virp_chain_type_is_indirect("chainwalk_summa"), "cw truncated");
+    ASSERT(!virp_chain_type_is_indirect("observation"), "obs not indirect");
+
+    ASSERT(virp_chain_type_is_external_allowed("observation"), "obs allowed");
+    ASSERT(virp_chain_type_is_external_allowed("evidence_item"), "ev allowed");
+    ASSERT(virp_chain_type_is_external_allowed("no_drift"), "nd allowed");
+    ASSERT(virp_chain_type_is_external_allowed("comparator_verd"),
+           "indirect types are allowed externally");
+    ASSERT(!virp_chain_type_is_external_allowed("audit_passed"),
+           "invented types are refused");
+    ASSERT(!virp_chain_type_is_external_allowed("outcome"),
+           "reserved types are not externally allowed");
+    PASS();
+}
+
+/* The digest helper decodes base64 bodies and rejects undecodable ones. */
+static void test_artifact_digest_helper(void)
+{
+    TEST("Artifact digest: base64 aware, rejects garbage");
+
+    char want[65], got[65];
+    sha256_hex_str("hello world", want);
+
+    ASSERT(virp_chain_artifact_digest("base64:aGVsbG8gd29ybGQ=", got)
+               == VIRP_OK, "base64 decode failed");
+    ASSERT(strcmp(got, want) == 0, "base64 digest must match plaintext");
+
+    ASSERT(virp_chain_artifact_digest("hello world", got) == VIRP_OK,
+           "literal digest failed");
+    ASSERT(strcmp(got, want) == 0, "literal digest must match");
+
+    ASSERT(virp_chain_artifact_digest("base64:!!!not-base64!!!", got)
+               != VIRP_OK, "undecodable base64 must be refused");
     PASS();
 }
 
@@ -720,6 +983,496 @@ static void test_malformed_mac_fails_closed(void)
 }
 
 /* =========================================================================
+ * Test: append_with_artifact — entry and body are one transaction
+ *
+ * Adversarial test #2 (`mid_outcome`) showed the old split calls could
+ * leave a chain entry committing to a body that was never stored (crash
+ * between the calls, or a snapshot taken between them; production carries
+ * 20 such entries). These tests pin the combined API's contract: both
+ * records or neither.
+ * ========================================================================= */
+
+static void test_append_with_artifact_stores_both(void)
+{
+    TEST("append_with_artifact stores entry AND body");
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init failed");
+
+    const char *body = "{\"kind\":\"outcome\",\"success\":true}";
+    char hash[65];
+    unsigned char d[32];
+    SHA256((const unsigned char *)body, strlen(body), d);
+    for (int i = 0; i < 32; i++) snprintf(hash + i * 2, 3, "%02x", d[i]);
+
+    virp_chain_entry_t e;
+    err = virp_chain_append_with_artifact(&state, "session-atomic",
+                                          "outcome", "outcome:atomic-1",
+                                          hash, body, &e);
+    ASSERT(err == VIRP_OK, "combined append failed");
+
+    /* The body must be retrievable under the id the entry names, with
+     * the hash the entry commits to. */
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(state.db,
+        "SELECT artifact_content, artifact_hash FROM artifacts "
+        "WHERE artifact_id = 'outcome:atomic-1'", -1, &st, NULL);
+    ASSERT(rc == SQLITE_OK, "prepare failed");
+    ASSERT(sqlite3_step(st) == SQLITE_ROW, "artifact body missing");
+    ASSERT(strcmp((const char *)sqlite3_column_text(st, 0), body) == 0,
+           "stored body differs");
+    ASSERT(strcmp((const char *)sqlite3_column_text(st, 1), hash) == 0,
+           "stored hash differs");
+    sqlite3_finalize(st);
+
+    virp_chain_verify_result_t result;
+    err = virp_chain_verify_session(&state, "session-atomic", &result);
+    ASSERT(err == VIRP_OK && result.valid, "session must verify");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+static void test_append_with_artifact_rolls_back_together(void)
+{
+    TEST("append_with_artifact body failure rolls back entry");
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init failed");
+
+    /* Seed one good combined append so there is a head to protect. */
+    virp_chain_entry_t e;
+    err = virp_chain_append_with_artifact(&state, "session-rollback",
+                                          "outcome", "outcome:rb-0",
+                                          "aa11", "seed body", &e);
+    ASSERT(err == VIRP_OK, "seed append failed");
+
+    /* Force the body store to fail: drop the artifacts table out from
+     * under the prepared statement. The append must then fail AS A WHOLE
+     * — no entry, no head advance — never commit an entry whose body
+     * cannot exist. */
+    sqlite3_exec(state.db, "DROP TABLE artifacts;", NULL, NULL, NULL);
+
+    err = virp_chain_append_with_artifact(&state, "session-rollback",
+                                          "outcome", "outcome:rb-1",
+                                          "bb22", "doomed body", &e);
+    ASSERT(err == VIRP_ERR_CHAIN_DB, "append must fail typed");
+
+    virp_chain_entry_t last;
+    err = virp_chain_get_last(&state, "session-rollback", &last);
+    ASSERT(err == VIRP_OK, "get_last failed");
+    ASSERT(last.sequence == 0, "failed append must not advance the chain");
+    ASSERT(strcmp(last.artifact_id, "outcome:rb-0") == 0,
+           "last entry must be the seed, not the failed append");
+
+    virp_chain_verify_result_t result;
+    err = virp_chain_verify_session(&state, "session-rollback", &result);
+    ASSERT(err == VIRP_OK && result.valid,
+           "session must still verify after rolled-back append");
+    ASSERT(result.to_sequence == 0, "head must not have advanced");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Test: artifact id collisions must never displace evidence
+ *
+ * Production audit 2026-08-03: on Jul 31 two distinct observations in the
+ * same second both received the second-resolution id
+ * obs:pbs-lab:1785538992. Both chain entries committed their own correct
+ * hashes, but artifacts was UNIQUE(artifact_id) and the store kept only
+ * the second body — the first observation's evidence bytes are
+ * permanently lost, silently. These tests replay that exact collision
+ * and pin the required behavior: distinct evidence never displaces
+ * distinct evidence, and a colliding id never loses an append.
+ * ========================================================================= */
+
+static void sha256_hex_of(const char *s, char out[65])
+{
+    unsigned char d[32];
+    SHA256((const unsigned char *)s, strlen(s), d);
+    for (int i = 0; i < 32; i++) snprintf(out + i * 2, 3, "%02x", d[i]);
+}
+
+static int artifact_body_count(virp_chain_state_t *state, const char *id)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT COUNT(*) FROM artifacts WHERE artifact_id = ?",
+            -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return n;
+}
+
+static int artifact_body_matches(virp_chain_state_t *state, const char *id,
+                                 const char *hash, const char *want_body)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT artifact_content FROM artifacts "
+            "WHERE artifact_id = ? AND artifact_hash = ?",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, hash, -1, SQLITE_TRANSIENT);
+    int ok = 0;
+    if (sqlite3_step(st) == SQLITE_ROW)
+        ok = strcmp((const char *)sqlite3_column_text(st, 0), want_body) == 0;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static void test_colliding_id_keeps_both_bodies(void)
+{
+    TEST("id collision: distinct evidence keeps BOTH bodies");
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init failed");
+
+    /* Tonight's exact shape: same second-resolution id, same session,
+     * two different observation bodies. */
+    const char *id = "obs:pbs-lab:1785538992";
+    const char *body_a = "{\"obs\":\"first distinct observation\"}";
+    const char *body_b = "{\"obs\":\"second distinct observation\"}";
+    char hash_a[65], hash_b[65];
+    sha256_hex_of(body_a, hash_a);
+    sha256_hex_of(body_b, hash_b);
+
+    virp_chain_entry_t e0, e1;
+    err = virp_chain_append_with_artifact(&state, "session-collide",
+                                          "observation", id, hash_a,
+                                          body_a, &e0);
+    ASSERT(err == VIRP_OK, "first append failed");
+    err = virp_chain_append_with_artifact(&state, "session-collide",
+                                          "observation", id, hash_b,
+                                          body_b, &e1);
+    ASSERT(err == VIRP_OK,
+           "colliding id must never lose an append");
+
+    ASSERT(artifact_body_count(&state, id) == 2,
+           "both bodies must be stored (evidence displaced!)");
+    ASSERT(artifact_body_matches(&state, id, hash_a, body_a),
+           "first body must be retrievable by (id, hash)");
+    ASSERT(artifact_body_matches(&state, id, hash_b, body_b),
+           "second body must be retrievable by (id, hash)");
+
+    virp_chain_verify_result_t result;
+    err = virp_chain_verify_session(&state, "session-collide", &result);
+    ASSERT(err == VIRP_OK && result.valid, "session must verify");
+    ASSERT(result.entries_checked == 2, "both entries must verify");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+static void test_colliding_id_identical_content_idempotent(void)
+{
+    TEST("id collision: identical evidence is idempotent");
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init failed");
+
+    const char *id = "obs:pbs-lab:idempotent";
+    const char *body = "{\"obs\":\"same bytes both times\"}";
+    char hash[65];
+    sha256_hex_of(body, hash);
+
+    virp_chain_entry_t e0, e1;
+    err = virp_chain_append_with_artifact(&state, "session-idem",
+                                          "observation", id, hash,
+                                          body, &e0);
+    ASSERT(err == VIRP_OK, "first append failed");
+    err = virp_chain_append_with_artifact(&state, "session-idem",
+                                          "observation", id, hash,
+                                          body, &e1);
+    ASSERT(err == VIRP_OK, "identical re-store must not fail the append");
+
+    ASSERT(artifact_body_count(&state, id) == 1,
+           "identical evidence stores once");
+    ASSERT(artifact_body_matches(&state, id, hash, body),
+           "body must be retrievable");
+
+    virp_chain_verify_result_t result;
+    err = virp_chain_verify_session(&state, "session-idem", &result);
+    ASSERT(err == VIRP_OK && result.valid, "session must verify");
+    ASSERT(result.entries_checked == 2,
+           "both chain entries exist even though the body stored once");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+static void test_artifacts_schema_migration(void)
+{
+    TEST("legacy UNIQUE(artifact_id) DB migrates on init");
+
+    /* Build a database with the PRE-fix artifacts schema and one legacy
+     * row, exactly what an existing deployment's chain.db looks like. */
+    static const char *MIG_DB = "/tmp/virp_test_chain_migrate.db";
+    unlink(MIG_DB);
+    unlink("/tmp/virp_test_chain_migrate.db-wal");
+    unlink("/tmp/virp_test_chain_migrate.db-shm");
+
+    sqlite3 *raw = NULL;
+    ASSERT(sqlite3_open(MIG_DB, &raw) == SQLITE_OK, "raw open failed");
+    ASSERT(sqlite3_exec(raw,
+        "CREATE TABLE artifacts ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  artifact_id TEXT NOT NULL,"
+        "  artifact_type TEXT NOT NULL,"
+        "  artifact_content TEXT NOT NULL,"
+        "  artifact_hash TEXT NOT NULL,"
+        "  session_id TEXT NOT NULL,"
+        "  created_at_ns INTEGER NOT NULL,"
+        "  UNIQUE(artifact_id)"
+        ");"
+        "INSERT INTO artifacts (artifact_id, artifact_type,"
+        " artifact_content, artifact_hash, session_id, created_at_ns)"
+        " VALUES ('obs:legacy:1', 'observation', 'legacy body',"
+        " 'aa', 'legacy-sess', 1);",
+        NULL, NULL, NULL) == SQLITE_OK, "legacy schema setup failed");
+    sqlite3_close(raw);
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, MIG_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init on legacy DB failed");
+
+    /* Legacy row survived the rebuild... */
+    ASSERT(artifact_body_matches(&state, "obs:legacy:1", "aa",
+                                 "legacy body"),
+           "legacy row lost in migration");
+
+    /* ...and the collision class is closed on the migrated DB. */
+    const char *body_b = "post-migration distinct body";
+    char hash_b[65];
+    sha256_hex_of(body_b, hash_b);
+    virp_chain_entry_t e;
+    err = virp_chain_append_with_artifact(&state, "legacy-sess",
+                                          "observation", "obs:legacy:1",
+                                          hash_b, body_b, &e);
+    ASSERT(err == VIRP_OK, "post-migration colliding append failed");
+    ASSERT(artifact_body_count(&state, "obs:legacy:1") == 2,
+           "post-migration collision must keep both bodies");
+
+    virp_chain_destroy(&state);
+    unlink(MIG_DB);
+    unlink("/tmp/virp_test_chain_migrate.db-wal");
+    unlink("/tmp/virp_test_chain_migrate.db-shm");
+    PASS();
+}
+
+/* =========================================================================
+ * Test: read-only verifier open (virp_chain_open_verifier)
+ * ========================================================================= */
+
+/* Whole-file snapshot for byte-identity assertions. Returns malloc'd
+ * buffer (caller frees), sets *len; NULL on error. */
+static unsigned char *read_file_bytes(const char *path, long *len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char *buf = malloc(n > 0 ? (size_t)n : 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (n > 0 && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *len = n;
+    return buf;
+}
+
+static void test_verifier_readonly_modern_db(void)
+{
+    TEST("verifier: modern DB verifies, byte-identical, writes refused");
+    cleanup();
+    create_test_key();
+
+    /* Daemon-side handle builds the evidence, then closes cleanly —
+     * the auditor's copy. */
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+    append_n(&state, "ver-sess", 5);
+    virp_chain_destroy(&state);
+
+    long before_len = 0, after_len = 0;
+    unsigned char *before = read_file_bytes(TEST_DB, &before_len);
+    ASSERT(before != NULL, "snapshot before failed");
+
+    virp_chain_state_t ver;
+    virp_error_t err = virp_chain_open_verifier(&ver, TEST_DB, TEST_KEY,
+                                                1, "local");
+    ASSERT(err == VIRP_OK, "verifier open failed");
+    ASSERT(ver.read_only, "verifier handle must be marked read-only");
+    ASSERT(!ver.legacy_no_heads, "modern DB is not legacy-shaped");
+
+    virp_chain_verify_result_t r;
+    err = virp_chain_verify_session(&ver, "ver-sess", &r);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(r.valid, "intact session must verify through verifier handle");
+    ASSERT(r.entries_checked == 5, "should check all 5 entries");
+
+    /* Every mutating entry point refuses the handle. */
+    virp_chain_entry_t e;
+    err = virp_chain_append(&ver, "ver-sess", "observation",
+                            "obs:x", "aa", &e);
+    ASSERT(err == VIRP_ERR_CHAIN_READONLY, "append must be refused");
+    err = virp_chain_append_with_artifact(&ver, "ver-sess", "observation",
+                                          "obs:x", "aa", "body", &e);
+    ASSERT(err == VIRP_ERR_CHAIN_READONLY,
+           "append_with_artifact must be refused");
+    virp_intent_entry_t ie;
+    memset(&ie, 0, sizeof(ie));
+    err = virp_chain_intent_store(&ver, &ie);
+    ASSERT(err == VIRP_ERR_CHAIN_READONLY, "intent_store must be refused");
+    err = virp_chain_intent_execute(&ver, "intent:x", &ie);
+    ASSERT(err == VIRP_ERR_CHAIN_READONLY,
+           "intent_execute must be refused");
+    err = virp_chain_artifact_store(&ver, "obs:x", "observation",
+                                    "body", "aa", "ver-sess");
+    ASSERT(err == VIRP_ERR_CHAIN_READONLY,
+           "artifact_store must be refused");
+
+    virp_chain_destroy(&ver);
+
+    unsigned char *after = read_file_bytes(TEST_DB, &after_len);
+    ASSERT(after != NULL, "snapshot after failed");
+    int identical = (before_len == after_len) &&
+                    (memcmp(before, after, (size_t)before_len) == 0);
+    free(before);
+    free(after);
+    ASSERT(identical, "verify must leave the DB byte-identical");
+    PASS();
+}
+
+static void test_verifier_legacy_reported_not_migrated(void)
+{
+    TEST("verifier: legacy DB reports LEGACY_CHAIN, byte-identical");
+    cleanup();
+    create_test_key();
+
+    /* Pre-chain_heads, pre-two-column-artifacts database — the shape
+     * virp_chain_init() would migrate and head-backfill on open. */
+    static const char *LEG_DB = "/tmp/virp_test_chain_verifier_legacy.db";
+    unlink(LEG_DB);
+
+    sqlite3 *raw = NULL;
+    ASSERT(sqlite3_open(LEG_DB, &raw) == SQLITE_OK, "raw open failed");
+    ASSERT(sqlite3_exec(raw,
+        "CREATE TABLE chain_entries ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  session_id TEXT NOT NULL,"
+        "  sequence INTEGER NOT NULL,"
+        "  chain_entry_hash TEXT NOT NULL,"
+        "  previous_entry_hash TEXT NOT NULL,"
+        "  timestamp_ns INTEGER NOT NULL,"
+        "  monotonic_ns INTEGER NOT NULL,"
+        "  artifact_type TEXT NOT NULL,"
+        "  artifact_id TEXT NOT NULL,"
+        "  artifact_hash TEXT NOT NULL,"
+        "  artifact_hash_alg TEXT NOT NULL DEFAULT 'sha256',"
+        "  artifact_schema_version TEXT NOT NULL DEFAULT '1',"
+        "  signer_node_id INTEGER NOT NULL,"
+        "  signer_org_id TEXT NOT NULL DEFAULT 'local',"
+        "  chain_hmac TEXT NOT NULL,"
+        "  UNIQUE(session_id, sequence)"
+        ");"
+        "CREATE TABLE artifacts ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  artifact_id TEXT NOT NULL,"
+        "  artifact_type TEXT NOT NULL,"
+        "  artifact_content TEXT NOT NULL,"
+        "  artifact_hash TEXT NOT NULL,"
+        "  session_id TEXT NOT NULL,"
+        "  created_at_ns INTEGER NOT NULL,"
+        "  UNIQUE(artifact_id)"
+        ");"
+        "INSERT INTO chain_entries (session_id, sequence,"
+        " chain_entry_hash, previous_entry_hash, timestamp_ns,"
+        " monotonic_ns, artifact_type, artifact_id, artifact_hash,"
+        " signer_node_id, chain_hmac)"
+        " VALUES ('legacy:sess', 0, 'aa11', 'genesis', 1000, 1000,"
+        " 'observation', 'obs:x:1', 'bb22', 1, 'cc33');",
+        NULL, NULL, NULL) == SQLITE_OK, "legacy schema setup failed");
+    sqlite3_close(raw);
+
+    long before_len = 0, after_len = 0;
+    unsigned char *before = read_file_bytes(LEG_DB, &before_len);
+    ASSERT(before != NULL, "snapshot before failed");
+
+    virp_chain_state_t ver;
+    virp_error_t err = virp_chain_open_verifier(&ver, LEG_DB, TEST_KEY,
+                                                1, "local");
+    ASSERT(err == VIRP_OK, "verifier must open a legacy DB");
+    ASSERT(ver.legacy_no_heads, "legacy shape must be detected");
+
+    virp_chain_verify_result_t r;
+    err = virp_chain_verify_session(&ver, "legacy:sess", &r);
+    ASSERT(err == VIRP_OK, "verify_session call failed");
+    ASSERT(!r.valid, "legacy session must not verify as valid");
+    ASSERT(strstr(r.error_detail, "LEGACY_CHAIN") != NULL,
+           "detail must name LEGACY_CHAIN");
+    ASSERT(strstr(r.error_detail, "COMPLETENESS_UNPROVABLE") != NULL,
+           "detail must name COMPLETENESS_UNPROVABLE");
+
+    virp_chain_destroy(&ver);
+
+    unsigned char *after = read_file_bytes(LEG_DB, &after_len);
+    ASSERT(after != NULL, "snapshot after failed");
+    int identical = (before_len == after_len) &&
+                    (memcmp(before, after, (size_t)before_len) == 0);
+    free(before);
+    free(after);
+    ASSERT(identical,
+           "legacy DB must be byte-identical after offline verify");
+    unlink(LEG_DB);
+    PASS();
+}
+
+static void test_verifier_refuses_non_chain_db(void)
+{
+    TEST("verifier: non-chain DB and missing file refused");
+    cleanup();
+    create_test_key();
+
+    static const char *NOT_DB = "/tmp/virp_test_chain_notachain.db";
+    unlink(NOT_DB);
+    sqlite3 *raw = NULL;
+    ASSERT(sqlite3_open(NOT_DB, &raw) == SQLITE_OK, "raw open failed");
+    ASSERT(sqlite3_exec(raw, "CREATE TABLE unrelated (x);",
+                        NULL, NULL, NULL) == SQLITE_OK, "setup failed");
+    sqlite3_close(raw);
+
+    virp_chain_state_t ver;
+    virp_error_t err = virp_chain_open_verifier(&ver, NOT_DB, TEST_KEY,
+                                                1, "local");
+    ASSERT(err == VIRP_ERR_CHAIN_DB,
+           "DB without chain_entries must be refused");
+
+    err = virp_chain_open_verifier(&ver, "/tmp/virp_test_chain_nofile.db",
+                                   TEST_KEY, 1, "local");
+    ASSERT(err == VIRP_ERR_CHAIN_DB,
+           "missing file must be refused, never created");
+    ASSERT(access("/tmp/virp_test_chain_nofile.db", F_OK) != 0,
+           "verifier open must not create a database file");
+
+    unlink(NOT_DB);
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -743,8 +1496,23 @@ int main(void)
     test_verify_session_tail_deleted();
     test_verify_session_head_deleted();
     test_verify_session_forged_head();
-    test_head_backfill();
+    test_restart_does_not_launder_truncation();
+    test_dropped_heads_table_is_fatal();
+    test_verify_binds_stored_artifact();
+    test_verify_binds_base64_body();
+    test_verify_indirect_type_is_unverifiable();
+    test_verify_missing_body_is_unverifiable();
+    test_artifact_type_policy();
+    test_artifact_digest_helper();
     test_malformed_mac_fails_closed();
+    test_append_with_artifact_stores_both();
+    test_append_with_artifact_rolls_back_together();
+    test_colliding_id_keeps_both_bodies();
+    test_colliding_id_identical_content_idempotent();
+    test_artifacts_schema_migration();
+    test_verifier_readonly_modern_db();
+    test_verifier_legacy_reported_not_migrated();
+    test_verifier_refuses_non_chain_db();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

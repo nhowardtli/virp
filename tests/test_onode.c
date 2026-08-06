@@ -1483,6 +1483,106 @@ TEST(test_send_all_reports_dead_peer)
     close(sv[0]);
 }
 
+/* send_framed itself under forced short writes: two frames through a
+ * shrunken send buffer while SIGUSR1 (no SA_RESTART) bombards the
+ * sender. The reader must recover EXACT framing — [len][payload] twice,
+ * lengths and every payload byte intact, no trailing bytes. With the
+ * old unlooped send() pair, a mid-frame short write drops bytes and
+ * permanently desynchronizes the stream. */
+
+extern int send_framed(int fd, const void *buf, size_t len);
+
+#define SF_LEN1 (96 * 1024)
+#define SF_LEN2 (32 * 1024 + 7)
+
+typedef struct {
+    int          fd;
+    uint8_t     *buf;        /* collects everything until EOF */
+    size_t       cap;
+    size_t       got;
+    pthread_t    sender;
+    volatile int bombard;
+} sf_reader_arg_t;
+
+static void *sf_reader_thread(void *argp)
+{
+    sf_reader_arg_t *a = argp;
+    uint8_t chunk[3000];
+    for (;;) {
+        if (a->bombard)
+            pthread_kill(a->sender, SIGUSR1);
+        ssize_t n = recv(a->fd, chunk, sizeof(chunk), 0);
+        if (n <= 0)
+            break;              /* EOF after the sender's SHUT_WR */
+        if (a->got + (size_t)n <= a->cap)
+            memcpy(a->buf + a->got, chunk, (size_t)n);
+        a->got += (size_t)n;
+        usleep(1000);           /* drain slowly — keep the buffer full */
+    }
+    return NULL;
+}
+
+TEST(test_send_framed_short_write_no_desync)
+{
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+    int sndbuf = 4096;   /* kernel clamps to its minimum; small is enough */
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    struct sigaction sa, old_sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sendall_sigusr1_handler;   /* no SA_RESTART on purpose */
+    sigaction(SIGUSR1, &sa, &old_sa);
+
+    uint8_t *p1 = malloc(SF_LEN1), *p2 = malloc(SF_LEN2);
+    ASSERT_TRUE(p1 != NULL && p2 != NULL);
+    for (size_t i = 0; i < SF_LEN1; i++) p1[i] = (uint8_t)(i * 7 & 0xFF);
+    for (size_t i = 0; i < SF_LEN2; i++) p2[i] = (uint8_t)(i * 13 & 0xFF);
+
+    size_t expect = 4 + SF_LEN1 + 4 + SF_LEN2;
+    sf_reader_arg_t arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.fd = sv[1];
+    arg.cap = expect + 4096;    /* room to detect surplus bytes */
+    arg.buf = malloc(arg.cap);
+    ASSERT_TRUE(arg.buf != NULL);
+    arg.sender = pthread_self();
+    arg.bombard = 1;
+    pthread_t reader;
+    pthread_create(&reader, NULL, sf_reader_thread, &arg);
+
+    int rc1 = send_framed(sv[0], p1, SF_LEN1);
+    int rc2 = send_framed(sv[0], p2, SF_LEN2);
+
+    arg.bombard = 0;
+    /* Aug 2 lesson: EOF the reader BEFORE joining, so a regression
+     * hangs the write (visible failure), not the test harness. */
+    shutdown(sv[0], SHUT_WR);
+    pthread_join(reader, NULL);
+    sigaction(SIGUSR1, &old_sa, NULL);
+
+    ASSERT_EQ(rc1, 0);
+    ASSERT_EQ(rc2, 0);
+    ASSERT_EQ((long)arg.got, (long)expect);   /* nothing lost, nothing extra */
+
+    /* Frame 1: length prefix intact, every payload byte intact. */
+    uint32_t l1_n;
+    memcpy(&l1_n, arg.buf, 4);
+    ASSERT_EQ((long)ntohl(l1_n), (long)SF_LEN1);
+    ASSERT_EQ(memcmp(arg.buf + 4, p1, SF_LEN1), 0);
+
+    /* Frame 2 starts exactly where frame 1 ends — the desync check. */
+    uint32_t l2_n;
+    memcpy(&l2_n, arg.buf + 4 + SF_LEN1, 4);
+    ASSERT_EQ((long)ntohl(l2_n), (long)SF_LEN2);
+    ASSERT_EQ(memcmp(arg.buf + 4 + SF_LEN1 + 4, p2, SF_LEN2), 0);
+
+    free(p1); free(p2); free(arg.buf);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 /* =========================================================================
  * Worker pool / head-of-line-blocking test
  *
@@ -1898,6 +1998,91 @@ TEST(test_error_obs_driver_refusal_is_error_not_output)
     errobs_teardown(&tmp);
 }
 
+extern void virp_driver_mock_set_unknown_fail(const char *msg);
+extern int  virp_driver_mock_exec_attempts_reset(void);
+
+/* (b2) Failure with no output and NO proof of non-dispatch (SSH write
+ * completed but the response was lost; REST timeout after send): the
+ * O-Node must execute EXACTLY ONCE — re-executing turns one
+ * authorization into two executions — and must report a typed
+ * OUTCOME_UNKNOWN, never executed=no and never executed output. */
+TEST(test_unprovable_dispatch_unknown_not_retried)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-UNK", 0xE220000E), 0);
+
+    virp_driver_mock_exec_attempts_reset();
+    virp_driver_mock_set_unknown_fail(
+        "response lost after write on R-UNK");
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    virp_error_t err = onode_execute(&tmp, "R-UNK", "show version",
+                                     buf, sizeof(buf), &len);
+    virp_driver_mock_set_unknown_fail(NULL);
+    int attempts = virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(err);
+
+    /* The load-bearing assertion: one authorization, one dispatch. */
+    ASSERT_EQ(attempts, 1);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(buf, len, &tmp.okey, &hdr));
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(buf + VIRP_HEADER_SIZE,
+                                     len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr((const char *)data, "outcome UNKNOWN") != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "may have executed") != NULL);
+    /* Must carry the driver's detail and not look like executed output */
+    ASSERT_TRUE(strstr((const char *)data, "response lost after write")
+                != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "R-UNK#") == NULL);
+
+    errobs_teardown(&tmp);
+}
+
+/* (b3) PROVABLY non-dispatched failure (driver refusal with
+ * no_dispatch=true): the single auto-retry is retained — nothing
+ * reached the device, so the second execute is a first execution.
+ * Exactly two attempts, then the refusal reported as before. */
+TEST(test_provable_no_dispatch_retry_retained)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-RETRY", 0xE220000F), 0);
+
+    virp_driver_mock_exec_attempts_reset();
+    virp_driver_mock_set_soft_fail("refused before device I/O");
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    virp_error_t err = onode_execute(&tmp, "R-RETRY", "show version",
+                                     buf, sizeof(buf), &len);
+    virp_driver_mock_set_soft_fail(NULL);
+    int attempts = virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(err);
+
+    /* Refusal on a proven-undispatched command retries exactly once. */
+    ASSERT_EQ(attempts, 2);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(buf, len, &tmp.okey, &hdr));
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(buf + VIRP_HEADER_SIZE,
+                                     len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr((const char *)data, "refused before device I/O")
+                != NULL);
+    /* Refusal stays a refusal — not mislabeled UNKNOWN */
+    ASSERT_TRUE(strstr((const char *)data, "outcome UNKNOWN") == NULL);
+
+    errobs_teardown(&tmp);
+}
+
 /* (c) Gate-blocked RED command under ENFORCE max=YELLOW (live repro:
  * "clear counters" on R1 while it was RED-classified): the observation
  * must be VIRP_OBS_ERROR at tier RED, nothing may execute, and the gate
@@ -2173,6 +2358,120 @@ TEST(test_load_devices_skips_missing_required_fields)
     onode_destroy(&tmp);
     virp_context_destroy(tmp.ctx);
     unlink(WRONG_TYPE_CFG);
+}
+
+/* =========================================================================
+ * Duplicate device identities — hostname, node_id, and device_id are
+ * each an authorization-binding key (request routing, approval device
+ * binding, v2 observation identity). A collision in any of them lets
+ * one device's evidence read as another's, so onode_add_device refuses
+ * them and both loaders refuse the whole config, fail closed.
+ * ========================================================================= */
+
+static void dup_dev(virp_device_t *d, const char *hostname,
+                    uint32_t node_id, uint64_t device_id)
+{
+    memset(d, 0, sizeof(*d));
+    snprintf(d->hostname, sizeof(d->hostname), "%s", hostname);
+    snprintf(d->host, sizeof(d->host), "10.9.9.9");
+    d->port = 22;
+    d->vendor = VIRP_VENDOR_MOCK;
+    d->node_id = node_id;
+    d->device_id = device_id;
+    d->enabled = true;
+}
+
+TEST(test_add_device_rejects_duplicate_identities)
+{
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0004, NULL,
+                         "/tmp/virp-onode-dup.sock"));
+
+    virp_device_t d;
+    dup_dev(&d, "R-DUP1", 0xD0000001, 0);   /* device_id derived */
+    ASSERT_OK(onode_add_device(&tmp, &d));
+
+    /* Duplicate hostname (everything else differs). */
+    dup_dev(&d, "R-DUP1", 0xD0000002, 0);
+    ASSERT_EQ(onode_add_device(&tmp, &d), VIRP_ERR_DUPLICATE_DEVICE);
+
+    /* Duplicate node_id (hostname differs). */
+    dup_dev(&d, "R-DUP2", 0xD0000001, 0);
+    ASSERT_EQ(onode_add_device(&tmp, &d), VIRP_ERR_DUPLICATE_DEVICE);
+
+    /* Duplicate device_id: explicit id colliding with the first
+     * device's DERIVED id — the post-derivation check. */
+    dup_dev(&d, "R-DUP3", 0xD0000003,
+            virp_device_id_from_hostname("R-DUP1"));
+    ASSERT_EQ(onode_add_device(&tmp, &d), VIRP_ERR_DUPLICATE_DEVICE);
+
+    /* A rejected device must not occupy a slot. */
+    ASSERT_EQ(tmp.device_count, 1);
+
+    /* Fully unique device still loads. */
+    dup_dev(&d, "R-DUP4", 0xD0000004, 0);
+    ASSERT_OK(onode_add_device(&tmp, &d));
+    ASSERT_EQ(tmp.device_count, 2);
+
+    /* Two devices with ABSENT node_id (0 = never routed) do not
+     * collide with each other on node_id. */
+    dup_dev(&d, "R-DUP5", 0, 0);
+    ASSERT_OK(onode_add_device(&tmp, &d));
+    dup_dev(&d, "R-DUP6", 0, 0);
+    ASSERT_OK(onode_add_device(&tmp, &d));
+    ASSERT_EQ(tmp.device_count, 4);
+
+    onode_destroy(&tmp);
+}
+
+#define DUP_CFG "/tmp/virp-onode-dupcfg.json"
+
+static int dup_load(const char *json)
+{
+    FILE *f = fopen(DUP_CFG, "w");
+    if (!f) return -99;
+    fputs(json, f);
+    fclose(f);
+
+    onode_state_t tmp;
+    if (onode_init(&tmp, 0xDEAD0005, NULL,
+                   "/tmp/virp-onode-dupcfg.sock") != VIRP_OK)
+        return -98;
+    int loaded = load_devices(&tmp, DUP_CFG);
+    onode_destroy(&tmp);
+    unlink(DUP_CFG);
+    return loaded;
+}
+
+TEST(test_load_devices_duplicate_identities_fatal)
+{
+    /* Duplicate hostname → whole config refused, not one device kept. */
+    ASSERT_EQ(dup_load(
+        "{ \"devices\": ["
+        " { \"hostname\": \"R-A\", \"host\": \"10.1.1.1\", \"vendor\": \"mock\", \"node_id\": \"0a000001\" },"
+        " { \"hostname\": \"R-A\", \"host\": \"10.1.1.2\", \"vendor\": \"mock\", \"node_id\": \"0a000002\" }"
+        "] }"), -1);
+
+    /* Duplicate node_id → refused. */
+    ASSERT_EQ(dup_load(
+        "{ \"devices\": ["
+        " { \"hostname\": \"R-A\", \"host\": \"10.1.1.1\", \"vendor\": \"mock\", \"node_id\": \"0a000001\" },"
+        " { \"hostname\": \"R-B\", \"host\": \"10.1.1.2\", \"vendor\": \"mock\", \"node_id\": \"0a000001\" }"
+        "] }"), -1);
+
+    /* Duplicate explicit device_id → refused. */
+    ASSERT_EQ(dup_load(
+        "{ \"devices\": ["
+        " { \"hostname\": \"R-A\", \"host\": \"10.1.1.1\", \"vendor\": \"mock\", \"node_id\": \"0a000001\", \"device_id\": \"deadbeef00000001\" },"
+        " { \"hostname\": \"R-B\", \"host\": \"10.1.1.2\", \"vendor\": \"mock\", \"node_id\": \"0a000002\", \"device_id\": \"deadbeef00000001\" }"
+        "] }"), -1);
+
+    /* Unique config still loads both. */
+    ASSERT_EQ(dup_load(
+        "{ \"devices\": ["
+        " { \"hostname\": \"R-A\", \"host\": \"10.1.1.1\", \"vendor\": \"mock\", \"node_id\": \"0a000001\" },"
+        " { \"hostname\": \"R-B\", \"host\": \"10.1.1.2\", \"vendor\": \"mock\", \"node_id\": \"0a000002\" }"
+        "] }"), 2);
 }
 
 /* =========================================================================
@@ -2918,6 +3217,284 @@ TEST(test_sign_outcome_accepts_valid_digest)
 }
 
 /* =========================================================================
+ * CHAIN_APPEND is not a signing oracle for arbitrary artifacts
+ * (adversarial audit 2026-08-06)
+ *
+ * The external append path validated only that four strings were
+ * non-empty and passed them straight to the chain writer, which copied
+ * the CALLER's artifact_hash into the canonical object, SHA-256'd it and
+ * HMAC'd it with K_chain. A socket client holding no K_chain could
+ * therefore induce a K_chain-authenticated entry that no chain reader
+ * can distinguish from a daemon-minted record. Three attacks, all
+ * reproduced against the pre-fix code:
+ *
+ *   1. body/hash mismatch — declare a hash that is not sha256(body)
+ *   2. reserved type      — claim artifact_type "outcome" / "approval"
+ *   3. invented type      — claim a type the daemon has never minted
+ *
+ * These tests need their OWN chain-enabled daemon: the shared g_state
+ * instance runs without a chain, where chain_append fails early for an
+ * unrelated reason and proves nothing.
+ * ========================================================================= */
+
+#define CA_SOCKET    "/tmp/virp-onode-test-cappend.sock"
+#define CA_CHAIN_DB  "/tmp/virp-onode-test-cappend.db"
+#define CA_CHAIN_KEY "/tmp/virp-onode-test-cappend.key"
+
+static onode_state_t ca_state;
+static pthread_t ca_thread_id;
+
+static void ca_cleanup_files(void)
+{
+    unlink(CA_CHAIN_DB);
+    unlink(CA_CHAIN_DB "-wal");
+    unlink(CA_CHAIN_DB "-shm");
+    unlink(CA_CHAIN_KEY);
+    unlink(CA_SOCKET);
+}
+
+static void *ca_thread(void *arg)
+{
+    (void)arg;
+    onode_start(&ca_state);
+    return NULL;
+}
+
+/* Start a chain-enabled daemon on its own socket. Returns 0 on success. */
+static int ca_start(void)
+{
+    ca_cleanup_files();
+
+    virp_signing_key_t ck;
+    if (virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN) != VIRP_OK) return -1;
+    if (virp_key_save_file(&ck, CA_CHAIN_KEY) != VIRP_OK) return -1;
+    virp_key_destroy(&ck);
+
+    if (onode_init(&ca_state, 0x00000042, NULL, CA_SOCKET) != VIRP_OK)
+        return -1;
+    ca_state.ctx = virp_context_new();
+    if (!ca_state.ctx) return -1;
+    if (onode_setup_chain_and_approvals(&ca_state, 0x00000042,
+                                        CA_CHAIN_DB, CA_CHAIN_KEY,
+                                        "/tmp/virp-onode-test-ca-approvals",
+                                        "/tmp/virp-onode-test-no-registry")
+            != VIRP_OK)
+        return -1;
+    if (!ca_state.chain_enabled) return -1;
+    if (pthread_create(&ca_thread_id, NULL, ca_thread, NULL) != 0) return -1;
+    usleep(200000);
+    return 0;
+}
+
+static void ca_stop(void)
+{
+    onode_shutdown(&ca_state);
+    pthread_join(ca_thread_id, NULL);
+    onode_destroy(&ca_state);
+    virp_context_destroy(ca_state.ctx);
+    ca_state.ctx = NULL;
+}
+
+/* Same framing as client_request(), against the chain-enabled socket. */
+static ssize_t ca_request(const char *json, uint8_t *resp, size_t resp_cap)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", CA_SOCKET);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    size_t json_len = strlen(json);
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+    send(fd, &frame_len, 4, 0);
+    uint8_t version = VIRP_FRAME_VERSION;
+    send(fd, &version, 1, 0);
+    send(fd, json, json_len, 0);
+    usleep(50000);
+
+    uint32_t net_rlen;
+    if (recv(fd, &net_rlen, 4, 0) != 4) { close(fd); return -1; }
+    uint32_t rlen = ntohl(net_rlen);
+    if (rlen > resp_cap) { close(fd); return -1; }
+    size_t got = 0;
+    while (got < rlen) {
+        ssize_t n = recv(fd, resp + got, rlen - got, 0);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    return (ssize_t)got;
+}
+
+static void ca_sha256_hex(const char *s, char out[65])
+{
+    unsigned char md[32];
+    unsigned int mdlen = 0;
+    EVP_Digest(s, strlen(s), md, &mdlen, EVP_sha256(), NULL);
+    for (int i = 0; i < 32; i++)
+        snprintf(out + i * 2, 3, "%02x", md[i]);
+}
+
+/* Ask the chain-enabled daemon to append. Returns the response length;
+ * a 4-byte response is a typed error (rejection). */
+static ssize_t ca_append(const char *session, const char *type,
+                         const char *aid, const char *hash,
+                         const char *content, uint8_t *resp, size_t cap)
+{
+    char json[2048];
+    if (content) {
+        /* The bodies under test are themselves JSON. Escaping them into
+         * the request is not cosmetic: an unescaped quote makes the
+         * REQUEST malformed, the daemon rejects the parse, and the test
+         * passes for entirely the wrong reason — it never reaches the
+         * append path it claims to attack. */
+        char esc[1024];
+        size_t o = 0;
+        for (const char *p = content; *p && o + 2 < sizeof(esc); p++) {
+            if (*p == '"' || *p == '\\') esc[o++] = '\\';
+            esc[o++] = *p;
+        }
+        esc[o] = '\0';
+        snprintf(json, sizeof(json),
+                 "{\"action\":\"chain_append\",\"session_id\":\"%s\","
+                 "\"artifact_type\":\"%s\",\"artifact_id\":\"%s\","
+                 "\"artifact_hash\":\"%s\",\"artifact_content\":\"%s\"}",
+                 session, type, aid, hash, esc);
+    }
+    else {
+        snprintf(json, sizeof(json),
+                 "{\"action\":\"chain_append\",\"session_id\":\"%s\","
+                 "\"artifact_type\":\"%s\",\"artifact_id\":\"%s\","
+                 "\"artifact_hash\":\"%s\"}",
+                 session, type, aid, hash);
+    }
+    return ca_request(json, resp, cap);
+}
+
+/* Count entries with the given artifact_id in the chain database. The
+ * daemon holds the db open in WAL mode; a second connection sees
+ * committed rows. */
+static int ca_count_entries(const char *artifact_id)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open(CA_CHAIN_DB, &db) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*) FROM chain_entries WHERE artifact_id = ?",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, artifact_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+
+/* ATTACK 1: the declared hash is not sha256(the submitted body). The
+ * daemon must recompute over the received bytes and refuse. */
+TEST(test_chain_append_rejects_body_hash_mismatch)
+{
+    const char *body = "{\"success\":true,\"note\":\"not what the hash says\"}";
+    char wrong[65];
+    ca_sha256_hex("entirely different bytes", wrong);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("attack:mismatch", "observation",
+                          "attack-mismatch-1", wrong, body,
+                          resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("attack-mismatch-1"), 0);
+}
+
+/* ATTACK 2: a reserved, daemon-only semantic type submitted from the
+ * external socket path. Hash and body agree here, so ONLY the type
+ * namespace check can catch it. */
+TEST(test_chain_append_rejects_reserved_type_outcome)
+{
+    const char *body =
+        "{\"proposal_id\":\"deadbeef\",\"device\":\"R5\",\"success\":true}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("approval:R5", "outcome", "outcome:deadbeef", h,
+                          body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("outcome:deadbeef"), 0);
+}
+
+TEST(test_chain_append_rejects_reserved_type_approval)
+{
+    const char *body =
+        "{\"proposal_id\":\"deadbeef\",\"operator\":\"mallory\"}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("approval:R5", "approval", "approval:deadbeef", h,
+                          body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("approval:deadbeef"), 0);
+}
+
+/* ATTACK 3: a type the daemon has never minted and no client is known to
+ * send. Unknown types are refused rather than recorded as if meaningful. */
+TEST(test_chain_append_rejects_invented_type)
+{
+    const char *body = "{\"anything\":\"at all\"}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("attack:invent", "audit_passed",
+                          "invented-1", h, body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("invented-1"), 0);
+}
+
+/* GUARD: the legitimate external append — a known client type whose body
+ * hashes to its declared commitment — must still be accepted, or the fix
+ * has simply broken chain registration. */
+TEST(test_chain_append_accepts_bound_observation)
+{
+    const char *body = "{\"device\":\"R5\",\"output\":\"up/up\"}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "observation",
+                          "obs-legit-1", h, body, resp, sizeof(resp));
+
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("obs-legit-1"), 1);
+}
+
+/* GUARD: a commitment-only append (no body at all) stays legal — the
+ * caller may choose to register a hash commitment without the bytes. */
+TEST(test_chain_append_accepts_commitment_without_body)
+{
+    char h[65];
+    ca_sha256_hex("bytes the chain will not hold", h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "observation",
+                          "obs-commitment-1", h, NULL, resp, sizeof(resp));
+
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("obs-commitment-1"), 1);
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -2968,6 +3545,8 @@ int main(void)
     printf("[Device Config Parser Robustness (issue #7)]\n");
     RUN_TEST(test_load_devices_wrong_type_does_not_crash);
     RUN_TEST(test_load_devices_skips_missing_required_fields);
+    RUN_TEST(test_add_device_rejects_duplicate_identities);
+    RUN_TEST(test_load_devices_duplicate_identities_fatal);
 
     printf("\n[Autopilot hard exclusions (10.0.10.1 / 10.0.10.10)]\n");
     RUN_TEST(test_blocked_address_text_scan);
@@ -3038,6 +3617,7 @@ int main(void)
     RUN_TEST(test_framed_oversize_length_rejected);
     RUN_TEST(test_send_all_survives_partial_writes_and_eintr);
     RUN_TEST(test_send_all_reports_dead_peer);
+    RUN_TEST(test_send_framed_short_write_no_desync);
 
     printf("\n[Worker Pool / Concurrency Tests]\n");
     RUN_TEST(test_concurrent_clients_no_head_of_line);
@@ -3051,6 +3631,8 @@ int main(void)
     RUN_TEST(test_driver_error_returns_signed_observation);
     RUN_TEST(test_error_obs_connect_failure_is_error_with_true_tier);
     RUN_TEST(test_error_obs_driver_refusal_is_error_not_output);
+    RUN_TEST(test_unprovable_dispatch_unknown_not_retried);
+    RUN_TEST(test_provable_no_dispatch_retry_retained);
     RUN_TEST(test_error_obs_gate_block_logs_as_error_not_change);
 
     printf("\n--- Watchdog / execute serialization (finding N3) ---\n");
@@ -3059,6 +3641,21 @@ int main(void)
     printf("\n[SO_PEERCRED Allowlist Tests]\n");
     RUN_TEST(test_peer_uid_allowed);
     RUN_TEST(test_peer_uid_rejected);
+
+    printf("\n  -- Audit 2026-08-06: CHAIN_APPEND artifact forgery --\n");
+    if (ca_start() == 0) {
+        RUN_TEST(test_chain_append_rejects_body_hash_mismatch);
+        RUN_TEST(test_chain_append_rejects_reserved_type_outcome);
+        RUN_TEST(test_chain_append_rejects_reserved_type_approval);
+        RUN_TEST(test_chain_append_rejects_invented_type);
+        RUN_TEST(test_chain_append_accepts_bound_observation);
+        RUN_TEST(test_chain_append_accepts_commitment_without_body);
+        ca_stop();
+        ca_cleanup_files();
+    } else {
+        printf("  *** chain-enabled test daemon failed to start\n");
+        tests_run++; tests_failed++;
+    }
 
     printf("\n  -- Audit §4.1: sign_intent/sign_outcome signing oracle --\n");
     RUN_TEST(test_sign_intent_predicate);

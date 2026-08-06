@@ -447,7 +447,27 @@ virp_error_t virp_parse_observation(const uint8_t *payload, size_t payload_len,
     memcpy(&dl_n, payload + 2, 2);
     obs->obs_length = ntohs(dl_n);
 
-    if (data) *data = (payload_len > 4) ? payload + 4 : NULL;
+    /*
+     * Bound the embedded length by the buffer that actually arrived.
+     * obs_length comes off the wire; before this check a malformed
+     * observation could claim more data than the payload carries and
+     * every caller trusting *data_len (hex_dump, printf %.*s, memcpy)
+     * read past the buffer.
+     *
+     * <= rather than ==: spec §9 (draft-howard-virp-03) says the data
+     * length field "specifies the exact number of bytes of device
+     * output that follow" precisely so parsers can "distinguish between
+     * device output and any future trailer fields" — trailing bytes
+     * after the data are an anticipated extension point, so they are
+     * tolerated here. The Python evidence layer
+     * (virp_bridge.parse_observation) additionally enforces exact
+     * equality for v1 evidence, where no trailer is defined; that
+     * stricter app-layer check is unchanged.
+     */
+    if ((size_t)obs->obs_length > payload_len - 4)
+        return VIRP_ERR_INVALID_LENGTH;
+
+    if (data) *data = (obs->obs_length > 0) ? payload + 4 : NULL;
     if (data_len) *data_len = obs->obs_length;
 
     return VIRP_OK;
@@ -539,8 +559,24 @@ virp_error_t virp_parse_proposal(const uint8_t *payload, size_t payload_len,
     memcpy(&orc_n, payload + 8, 4);
     prop->obs_ref_count = ntohl(orc_n);
 
+    /*
+     * obs_ref_count comes off the wire. Mirror the builder's contract
+     * before handing out a refs pointer: proposals MUST carry evidence
+     * (count 0 never leaves virp_build_proposal), the count is capped
+     * at VIRP_MAX_OBS_REFS, and the refs array must physically fit in
+     * the payload — otherwise a 12-byte payload claiming 2^32-1 refs
+     * hands the caller a pointer it will walk far out of bounds.
+     */
+    if (prop->obs_ref_count == 0)
+        return VIRP_ERR_NO_EVIDENCE;
+    if (prop->obs_ref_count > VIRP_MAX_OBS_REFS)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+
     size_t refs_size = prop->obs_ref_count * sizeof(virp_obs_ref_t);
     size_t refs_offset = 12;
+
+    if (refs_size > payload_len - refs_offset)
+        return VIRP_ERR_INVALID_LENGTH;
 
     if (obs_refs)
         *obs_refs = (const virp_obs_ref_t *)(payload + refs_offset);
@@ -1034,6 +1070,9 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_APPROVAL_CONSUMED:        return "Proposal already has an outcome";
     case VIRP_ERR_APPROVAL_KEY_UNENROLLED:  return "Approver key_id not enrolled";
     case VIRP_ERR_APPROVAL_KEY_DISABLED:    return "Approver key disabled";
+    case VIRP_ERR_DUPLICATE_DEVICE:  return "Duplicate device identity (hostname/node_id/device_id)";
+    case VIRP_ERR_CHAIN_READONLY:    return "Write refused on read-only verifier chain handle";
+    case VIRP_ERR_OUTCOME_UNKNOWN:   return "Outcome unknown: response absent after possible dispatch; not retried";
     default:                         return "Unknown error";
     }
 }

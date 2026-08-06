@@ -40,12 +40,69 @@ _cache: Optional[dict] = None
 _cache_mtime: float = 0.0
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """SafeLoader that refuses duplicate mapping keys.
+
+    Plain yaml.safe_load silently keeps the LAST duplicate key, so two
+    devices sharing a hostname would collapse into one with whichever
+    definition appears later — the same silent-identity-collision the C
+    loader refuses. Device identity is an authorization-binding key;
+    fail closed at load instead.
+    """
+
+
+def _strict_map(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError(
+                f"duplicate key '{key}' in {DEVICES_YAML} "
+                f"(line {key_node.start_mark.line + 1}) — device identity "
+                f"must be unique"
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _strict_map
+)
+
+
+def _check_unique_node_ids(devices: dict) -> None:
+    """Refuse two devices sharing a node_id.
+
+    node_id_to_hostname() builds an int→hostname map; a duplicate
+    node_id would silently overwrite, attributing one device's
+    observations to another. Empty/absent node_ids are exempt (never
+    routed; other lookups key on the unique hostname).
+    """
+    seen: dict[int, str] = {}
+    for name, d in devices.items():
+        nid_raw = (d or {}).get("node_id", "")
+        if not nid_raw:
+            continue
+        try:
+            nid = int(str(nid_raw), 16)
+        except ValueError:
+            continue  # unparseable ids never reach the int map either
+        if nid in seen:
+            raise ValueError(
+                f"duplicate node_id '{nid_raw}' in {DEVICES_YAML}: "
+                f"shared by devices '{seen[nid]}' and '{name}'"
+            )
+        seen[nid] = name
+
+
 def load_devices(force_reload: bool = False) -> dict:
     """Load and cache all devices from the canonical YAML.
 
     Returns a dict keyed by device hostname, each value is the full
     device descriptor (minus credentials).  Auto-reloads if the file's
-    mtime has changed since the last load.
+    mtime has changed since the last load. Raises ValueError on
+    duplicate hostnames (YAML keys) or duplicate node_ids — identity
+    collisions fail closed rather than silently merging devices.
     """
     global _cache, _cache_mtime
 
@@ -58,7 +115,9 @@ def load_devices(force_reload: bool = False) -> dict:
 
     if _cache is None or force_reload or current_mtime != _cache_mtime:
         with open(DEVICES_YAML) as f:
-            _cache = yaml.safe_load(f) or {}
+            loaded = yaml.load(f, Loader=_StrictLoader) or {}
+        _check_unique_node_ids(loaded)
+        _cache = loaded
         _cache_mtime = current_mtime
 
     return _cache

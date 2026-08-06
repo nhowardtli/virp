@@ -430,6 +430,7 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
     }
     if (endpoint[0] != '/') {
         result->success = false;
+        result->no_dispatch = true;   /* refused before any request went out */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Refused: GET-only REST driver cannot honor '%.64s' "
                  "(non-GET method or unrooted path)", command);
@@ -449,6 +450,7 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
         conn->connected = false;
         conn->authenticated = false;
         result->success = false;
+        result->no_dispatch = true;   /* the command request was never issued */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Token refresh failed on %s", conn->device.hostname);
         return VIRP_OK;
@@ -499,6 +501,12 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
 
     if (rc != CURLE_OK) {
         result->success = false;
+        /* Connect-class failures prove the request never went out; a
+         * timeout or mid-transfer death proves nothing — the server
+         * may have processed the request. */
+        result->no_dispatch = (rc == CURLE_COULDNT_CONNECT ||
+                               rc == CURLE_COULDNT_RESOLVE_HOST ||
+                               rc == CURLE_SSL_CONNECT_ERROR);
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "curl error on %s: %s", conn->device.hostname,
                  curl_easy_strerror(rc));

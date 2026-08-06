@@ -709,6 +709,7 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
 
     if (!conn->connected) {
         result->success = false;
+        result->no_dispatch = true;   /* refused before any transport write */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Not connected to %s", conn->device.hostname);
         return VIRP_OK;

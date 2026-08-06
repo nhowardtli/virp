@@ -700,6 +700,7 @@ static virp_error_t pa_execute(virp_conn_t *conn,
 
     if (!conn->connected) {
         result->success = false;
+        result->no_dispatch = true;   /* refused before any transport write */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Not connected to %s", conn->device.hostname);
         return VIRP_OK;
@@ -716,6 +717,7 @@ static virp_error_t pa_execute(virp_conn_t *conn,
         conn->connected = false;
         pthread_mutex_unlock(&conn->session_mutex);
         result->success = false;
+        result->no_dispatch = true;   /* probe failed before the command was sent */
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Session dead (liveness probe) on %s", conn->device.hostname);
         return VIRP_OK;

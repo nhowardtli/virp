@@ -8,6 +8,8 @@ chain.db*
 build/
 # driver-enabled test build tree (make test-drivers)
 build-drivers/
+# lab-only fault-injection build tree (make onode-fi) — never installed
+build-fi/
 __pycache__/
 api/__pycache__/
 tests/__pycache__/

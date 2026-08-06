@@ -494,6 +494,17 @@ int load_devices(onode_state_t *state, const char *path)
         /* device_id == 0 (absent/unparseable) is derived from the
          * hostname inside onode_add_device — the single choke point. */
         virp_error_t err = onode_add_device(state, &device);
+        if (err == VIRP_ERR_DUPLICATE_DEVICE) {
+            /* Colliding identities are a config error, not a device to
+             * skip: silently dropping one of the pair would leave which
+             * ever happened to be listed first answering for both.
+             * Refuse the whole config (add_device already named both
+             * devices on stderr). */
+            fprintf(stderr, "[O-Node] FATAL: refusing device config %s "
+                    "with duplicate identities\n", path);
+            json_object_put(root);
+            return -1;
+        }
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] Failed to add %s: %s\n",
                     device.hostname, virp_error_str(err));

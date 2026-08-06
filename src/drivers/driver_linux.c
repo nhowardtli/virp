@@ -43,8 +43,44 @@
  * ========================================================================= */
 
 #define SSH_CONNECT_TIMEOUT_SEC 10
-#define SSH_READ_TIMEOUT_MS     30000   /* 30s — some commands are slow */
+#define SSH_READ_TIMEOUT_MS     30000   /* 30s idle — some commands are slow */
 #define SSH_READ_BUF_SIZE       32768
+#define SSH_POLL_INTERVAL_MS    50
+/*
+ * Hard wall-clock cap on the WHOLE post-exec sequence (read + stderr drain +
+ * EOF + close). SSH_READ_TIMEOUT_MS bounds only idle time between reads; it
+ * bounded nothing at all in the teardown, which ran blocking with no
+ * deadline. TRANSCRIPT-05 measured a device that accepted a command and went
+ * silent holding its execute path open for >200s. Exceeding this deadline is
+ * an EXECUTED_UNKNOWN outcome, not a retry and not a success.
+ */
+#define SSH_EXEC_DEADLINE_MS    40000
+
+static uint64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/*
+ * Drive one non-blocking libssh2 channel call to completion or to the
+ * deadline. Returns the call's own rc, or LIBSSH2_ERROR_TIMEOUT if the
+ * deadline passed first. Every completion-sequence call goes through this so
+ * none of them can block indefinitely.
+ */
+static int chan_wait(int (*op)(LIBSSH2_CHANNEL *), LIBSSH2_CHANNEL *ch,
+                     uint64_t deadline_ms)
+{
+    for (;;) {
+        int rc = op(ch);
+        if (rc != LIBSSH2_ERROR_EAGAIN)
+            return rc;
+        if (mono_ms() >= deadline_ms)
+            return LIBSSH2_ERROR_TIMEOUT;
+        usleep(SSH_POLL_INTERVAL_MS * 1000);
+    }
+}
 
 /* =========================================================================
  * Connection State
@@ -240,6 +276,8 @@ static virp_error_t linux_execute(virp_conn_t *conn,
 
     if (!conn->connected) {
         result->success = false;
+        result->no_dispatch = true;   /* refused before any transport write */
+        result->disposition = VIRP_DISPOSITION_NOT_SENT;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Not connected to %s", conn->device.hostname);
         return VIRP_OK;
@@ -258,6 +296,8 @@ static virp_error_t linux_execute(virp_conn_t *conn,
         libssh2_session_last_error(conn->session, &errmsg, NULL, 0);
         conn->connected = false;
         result->success = false;
+        result->no_dispatch = true;   /* channel never opened; command not sent */
+        result->disposition = VIRP_DISPOSITION_NOT_SENT;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Channel open failed on %s: %s", conn->device.hostname, errmsg);
         return VIRP_OK;
@@ -268,6 +308,11 @@ static virp_error_t linux_execute(virp_conn_t *conn,
         char *errmsg;
         libssh2_session_last_error(conn->session, &errmsg, NULL, 0);
         result->success = false;
+        /* The exec request may have reached the server before the failure —
+         * not provably non-dispatch, so it is never retried. */
+        result->disposition = VIRP_DISPOSITION_EXECUTED_UNKNOWN;
+        result->exit_code_trusted = false;
+        result->exit_code = -1;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Exec failed on %s: %s", conn->device.hostname, errmsg);
         libssh2_channel_close(channel);
@@ -275,74 +320,191 @@ static virp_error_t linux_execute(virp_conn_t *conn,
         return VIRP_OK;
     }
 
-    /* Switch to non-blocking for reading */
+    /*
+     * Non-blocking for the ENTIRE completion sequence — read, stderr drain,
+     * EOF and close are all polled against one deadline. The teardown used to
+     * run blocking with no timeout, so a silent device wedged this path
+     * indefinitely.
+     */
     libssh2_session_set_blocking(conn->session, 0);
+    const uint64_t deadline = mono_ms() + SSH_EXEC_DEADLINE_MS;
 
-    /* Read stdout */
-    size_t total = 0;
-    int elapsed = 0;
-    int poll_interval = 50;  /* ms */
-    /* Reserve space for hostname prefix */
-    size_t prefix_len = (size_t)snprintf(result->output, sizeof(result->output),
-                                          "%s$ %s\n", conn->device.hostname, command);
-    total = prefix_len;
+    /* Reserve space for hostname prefix. NOTE: this is exactly why output
+     * length can never be the "did we get a response" signal — the buffer is
+     * non-empty before a single byte is read from the device. */
+    size_t total = (size_t)snprintf(result->output, sizeof(result->output),
+                                    "%s$ %s\n", conn->device.hostname, command);
 
-    while (total < sizeof(result->output) - 1 && elapsed < SSH_READ_TIMEOUT_MS) {
+    /*
+     * Record HOW the read ended. Previously EOF and transport error shared
+     * one `break`, which is what made an aborted command indistinguishable
+     * from a completed one.
+     */
+    /*
+     * WHY the read stopped. Do not try to decide "was this a clean end"
+     * inside the loop from the EOF flag at the instant of a zero-length
+     * read: the flag is set when libssh2 processes the peer's EOF packet,
+     * which races the drained-buffer read. Testing it there made normally
+     * completed commands spin to the deadline and classify UNKNOWN — an
+     * over-correction worse than the original bug. Record the reason here;
+     * let the deadline-bounded EOF/close handshake below be the authority.
+     */
+    enum { END_DATA, END_DEADLINE, END_TRANSPORT, END_BUFFER } how = END_DATA;
+    int idle_ms = 0;
+    int last_rc = 0;   /* libssh2 rc that ended the loop, for diagnostics */
+
+    for (;;) {
+        if (total >= sizeof(result->output) - 1) { how = END_BUFFER; break; }
+
         ssize_t n = libssh2_channel_read(channel,
                                           result->output + total,
                                           sizeof(result->output) - total - 1);
         if (n > 0) {
             total += n;
-            elapsed = 0;
-        } else if (n == LIBSSH2_ERROR_EAGAIN) {
-            usleep(poll_interval * 1000);
-            elapsed += poll_interval;
-        } else {
-            break;  /* EOF or error */
+            idle_ms = 0;
+            continue;
         }
+        if (n == 0) {          /* stream drained */
+            how = END_DATA;
+            break;
+        }
+        if (n == LIBSSH2_ERROR_EAGAIN) {
+            if (mono_ms() >= deadline || idle_ms >= SSH_READ_TIMEOUT_MS) {
+                how     = END_DEADLINE;   /* silent device: nothing concluded */
+                last_rc = -1000;          /* sentinel: our deadline */
+                break;
+            }
+            usleep(SSH_POLL_INTERVAL_MS * 1000);
+            idle_ms += SSH_POLL_INTERVAL_MS;
+            continue;
+        }
+        /* n < 0 and not EAGAIN. A peer that already finished and closed the
+         * channel makes reads fail here, which is an end of stream, not a
+         * transport failure — the EOF flag distinguishes them. */
+        last_rc = (int)n;
+        how = libssh2_channel_eof(channel) ? END_DATA : END_TRANSPORT;
+        break;
     }
 
-    /* Also capture stderr and append */
-    int stderr_elapsed = 0;
-    while (total < sizeof(result->output) - 1 && stderr_elapsed < 1000) {
+    /* Drain stderr into the same body. Bounded, and never extends the
+     * deadline; stdout has already decided the verdict. */
+    int stderr_idle = 0;
+    while (how == END_DATA && total < sizeof(result->output) - 1) {
         ssize_t n = libssh2_channel_read_stderr(channel,
                                                  result->output + total,
                                                  sizeof(result->output) - total - 1);
         if (n > 0) {
             total += n;
-            stderr_elapsed = 0;
-        } else if (n == LIBSSH2_ERROR_EAGAIN) {
-            usleep(poll_interval * 1000);
-            stderr_elapsed += poll_interval;
-        } else {
-            break;
+            stderr_idle = 0;
+            continue;
         }
+        if (n == LIBSSH2_ERROR_EAGAIN) {
+            if (stderr_idle >= 1000 || mono_ms() >= deadline)
+                break;
+            usleep(SSH_POLL_INTERVAL_MS * 1000);
+            stderr_idle += SSH_POLL_INTERVAL_MS;
+            continue;
+        }
+        break;
     }
 
     result->output[total] = '\0';
     result->output_len = total;
+    if (total >= sizeof(result->output) - 1)
+        result->output_truncated = true;   /* body is a PREFIX, not a response */
 
-    /* Back to blocking for channel close */
-    libssh2_session_set_blocking(conn->session, 1);
+    /* Completion sequence — every call deadline-bounded. */
+    int eof_rc = chan_wait(libssh2_channel_send_eof, channel, deadline);
+    if (eof_rc == 0)
+        eof_rc = chan_wait(libssh2_channel_wait_eof, channel, deadline);
+    int close_rc  = chan_wait(libssh2_channel_close, channel, deadline);
+    int closed_rc = (close_rc == 0)
+                    ? chan_wait(libssh2_channel_wait_closed, channel, deadline)
+                    : close_rc;
 
-    /* Close channel and get exit status */
-    libssh2_channel_send_eof(channel);
-    libssh2_channel_wait_eof(channel);
-    libssh2_channel_close(channel);
-    libssh2_channel_wait_closed(channel);
+    /*
+     * A command killed by a signal did NOT exit cleanly, whatever
+     * get_exit_status() reports for it. Ask explicitly.
+     */
+    int died_on_signal = 0;
+    char signame[64] = {0};
+    {
+        char *sig = NULL, *em = NULL, *lt = NULL;
+        size_t siglen = 0, emlen = 0, ltlen = 0;
+        if (libssh2_channel_get_exit_signal(channel, &sig, &siglen,
+                                            &em, &emlen, &lt, &ltlen) == 0
+            && sig && siglen > 0) {
+            died_on_signal = 1;
+            snprintf(signame, sizeof(signame), "%.*s", (int)siglen, sig);
+        }
+        free(sig); free(em); free(lt);
+    }
 
-    result->exit_code = libssh2_channel_get_exit_status(channel);
+    /*
+     * THE DISCRIMINATOR. exit_code is trustworthy only when the channel
+     * reached a clean, complete close: the peer signalled EOF, and both the
+     * EOF wait and the close handshake completed without error or deadline.
+     * Anything else means we never received the peer's verdict, and
+     * libssh2_channel_get_exit_status() would hand back its initial 0 —
+     * indistinguishable from a genuine exit-0. That conflation is the false
+     * attestation this classifier exists to prevent.
+     *
+     * Residual assumption, stated: a peer that completes the channel
+     * normally is required by RFC 4254 to send exit-status or exit-signal,
+     * so a clean close without either is protocol-anomalous and is not
+     * separately detectable through libssh2's API.
+     */
+    const int peer_eof = libssh2_channel_eof(channel) ? 1 : 0;
+    const int clean_close = (how == END_DATA) && !result->output_truncated
+                            && eof_rc == 0 && closed_rc == 0 && peer_eof;
+
+    if (!clean_close) {
+        result->disposition       = VIRP_DISPOSITION_EXECUTED_UNKNOWN;
+        result->success           = false;
+        result->exit_code_trusted = false;
+        result->exit_code         = -1;   /* never read; not a real status */
+        if (result->error_msg[0] == '\0')
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "No clean close on %s (how=%d peer_eof=%d trunc=%d "
+                     "read_rc=%d eof_rc=%d closed_rc=%d) — command may have "
+                     "executed",
+                     conn->device.hostname, (int)how, peer_eof,
+                     (int)result->output_truncated, last_rc, eof_rc, closed_rc);
+    } else if (died_on_signal) {
+        /*
+         * The peer explicitly reported an exit-signal, so this is a KNOWN
+         * fate, not an unknown one: the command ran and was killed. That is
+         * strictly more information than EXECUTED_UNKNOWN, and it is never a
+         * success. Whatever output arrived is what the command emitted
+         * before dying — a prefix, not a complete response — so it is
+         * flagged rather than presented as the whole answer.
+         */
+        result->disposition       = VIRP_DISPOSITION_EXECUTED_FAILED;
+        result->success           = false;
+        result->exit_code_trusted = false;
+        result->exit_code         = -1;
+        result->output_truncated  = true;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Command on %s died on signal %s",
+                 conn->device.hostname, signame);
+    } else {
+        result->exit_code         = libssh2_channel_get_exit_status(channel);
+        result->exit_code_trusted = true;
+        result->disposition = (result->exit_code == 0)
+                              ? VIRP_DISPOSITION_EXECUTED_CONFIRMED
+                              : VIRP_DISPOSITION_EXECUTED_FAILED;
+        result->success = (result->disposition ==
+                           VIRP_DISPOSITION_EXECUTED_CONFIRMED);
+        if (!result->success && result->error_msg[0] == '\0')
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Command exited with code %d", result->exit_code);
+    }
+
     libssh2_channel_free(channel);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
                                        (end.tv_nsec - start.tv_nsec) / 1000000);
-
-    result->success = (result->exit_code == 0);
-    if (!result->success && result->error_msg[0] == '\0') {
-        snprintf(result->error_msg, sizeof(result->error_msg),
-                 "Command exited with code %d", result->exit_code);
-    }
 
     return VIRP_OK;
 }

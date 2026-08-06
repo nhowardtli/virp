@@ -14,6 +14,7 @@
 #define _POSIX_C_SOURCE 199309L  /* clock_gettime */
 
 #include "virp_chain.h"
+#include "virp_fault_inject.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,7 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
                                         const char *artifact_type,
                                         const char *artifact_id,
                                         const char *artifact_hash,
+                                        const char *artifact_content,
                                         virp_chain_entry_t *entry);
 static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                                         const char *session_id,
@@ -55,6 +57,8 @@ static void head_hmac_hex(virp_chain_state_t *state,
                           char out_hex[65]);
 /* Constant-time hex digest/MAC comparison — see definition for why (§4.4). */
 static bool hexdigest_eq(const char *a, const char *b);
+static void sha256_hex(const char *data, size_t len, char out[65]);
+static int table_exists(sqlite3 *db, const char *name);
 static virp_error_t head_upsert_locked(virp_chain_state_t *state,
                                        const char *session_id,
                                        int64_t last_sequence,
@@ -84,7 +88,25 @@ virp_error_t virp_chain_append(virp_chain_state_t *state,
     if (!state) return VIRP_ERR_NULL_PTR;
     pthread_mutex_lock(&state->lock);
     virp_error_t rc = chain_append_locked(state, session_id, artifact_type,
-                                          artifact_id, artifact_hash, entry);
+                                          artifact_id, artifact_hash, NULL,
+                                          entry);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+virp_error_t virp_chain_append_with_artifact(virp_chain_state_t *state,
+                                             const char *session_id,
+                                             const char *artifact_type,
+                                             const char *artifact_id,
+                                             const char *artifact_hash,
+                                             const char *artifact_content,
+                                             virp_chain_entry_t *entry)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_append_locked(state, session_id, artifact_type,
+                                          artifact_id, artifact_hash,
+                                          artifact_content, entry);
     pthread_mutex_unlock(&state->lock);
     return rc;
 }
@@ -112,6 +134,21 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
 
     memset(result, 0, sizeof(*result));
     result->first_broken = -1;
+
+    /* Verifier handle on a pre-chain_heads database: there is no signed
+     * head, so no length claim exists to verify against. Report that —
+     * NOBODY may manufacture the head it would then check. (The daemon's
+     * init-time trust-on-upgrade backfill that once did was removed
+     * 2026-08-06, Finding A: it let a restart launder a tail+head
+     * deletion. virp_chain_init now refuses heads-less entry-bearing
+     * databases outright.) */
+    if (state->legacy_no_heads) {
+        result->valid = false;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "LEGACY_CHAIN: no chain_heads table; chain length "
+                 "unauthenticated — COMPLETENESS_UNPROVABLE");
+        return VIRP_OK;
+    }
 
     /* Load the head record */
     int64_t head_seq = -1;
@@ -280,6 +317,137 @@ virp_error_t virp_chain_artifact_store(virp_chain_state_t *state,
 }
 
 /* =========================================================================
+ * Artifact type policy + body digest (adversarial audit 2026-08-06)
+ *
+ * One definition, two consumers: the external append path in
+ * src/virp_onode.c refuses forgeries with it, and the verifier below
+ * grades artifact binding with it. Types are compared against the
+ * TRUNCATED forms the 16-byte artifact_type field can actually hold —
+ * "comparator_verdict" and "chainwalk_summary" reach the daemon as
+ * "comparator_verd" and "chainwalk_summa", which is also how they are
+ * stored in production. Both spellings are listed so the predicate is
+ * correct wherever it is called from.
+ * ========================================================================= */
+
+static bool type_in(const char *t, const char *const *set, size_t n)
+{
+    if (!t) return false;
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(t, set[i]) == 0) return true;
+    return false;
+}
+
+bool virp_chain_type_is_daemon_reserved(const char *artifact_type)
+{
+    static const char *const RESERVED[] = {
+        "approval",        /* src/virp_approval.c  (submit)   */
+        "proposal",        /* src/virp_approval.c  (file)     */
+        "outcome",         /* src/virp_onode.c     (gate)     */
+        "gate_rejection",  /* src/virp_onode.c     (gate)     */
+        "validation",      /* src/virp_validator.c            */
+    };
+    return type_in(artifact_type, RESERVED,
+                   sizeof(RESERVED) / sizeof(RESERVED[0]));
+}
+
+bool virp_chain_type_is_indirect(const char *artifact_type)
+{
+    static const char *const INDIRECT[] = {
+        "comparator_verdict", "comparator_verd",
+        "chainwalk_summary",  "chainwalk_summa",
+    };
+    return type_in(artifact_type, INDIRECT,
+                   sizeof(INDIRECT) / sizeof(INDIRECT[0]));
+}
+
+bool virp_chain_type_is_external_allowed(const char *artifact_type)
+{
+    static const char *const EXTERNAL[] = {
+        "observation",     /* autopilot, evidence, config-backup, virp-tool */
+        "evidence_item",   /* autopilot/virp_evidence.py                    */
+        "no_drift",        /* autopilot/virp_config_backup.py               */
+        "baseline_set",    /* autopilot/virp_config_backup.py               */
+        "drift_alert",     /* autopilot/virp_config_backup.py               */
+    };
+    if (virp_chain_type_is_indirect(artifact_type)) return true;
+    return type_in(artifact_type, EXTERNAL,
+                   sizeof(EXTERNAL) / sizeof(EXTERNAL[0]));
+}
+
+/* Standard base64 decode (RFC 4648, '=' padding). Returns decoded length
+ * or -1. Local to this file; the approver registry has its own copy for
+ * SPKI decoding and the two must not become entangled. */
+static int artifact_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int artifact_b64_decode(const char *in, size_t in_len,
+                               uint8_t *out, size_t out_max)
+{
+    if (in_len % 4 != 0) return -1;
+    size_t o = 0;
+    for (size_t i = 0; i < in_len; i += 4) {
+        int v[4];
+        int pad = 0;
+        for (int k = 0; k < 4; k++) {
+            char c = in[i + k];
+            if (c == '=') {
+                /* Padding is legal only in the final quantum's tail. */
+                if (i + 4 != in_len || k < 2) return -1;
+                v[k] = 0;
+                pad++;
+            } else {
+                if (pad) return -1;
+                v[k] = artifact_b64_val(c);
+                if (v[k] < 0) return -1;
+            }
+        }
+        uint32_t trip = ((uint32_t)v[0] << 18) | ((uint32_t)v[1] << 12) |
+                        ((uint32_t)v[2] << 6)  | (uint32_t)v[3];
+        int want = 3 - pad;
+        for (int k = 0; k < want; k++) {
+            if (o >= out_max) return -1;
+            out[o++] = (uint8_t)((trip >> (16 - 8 * k)) & 0xFF);
+        }
+    }
+    return (int)o;
+}
+
+virp_error_t virp_chain_artifact_digest(const char *artifact_content,
+                                        char out_hex[65])
+{
+    if (!artifact_content || !out_hex) return VIRP_ERR_NULL_PTR;
+
+    static const char PREFIX[] = "base64:";
+    const size_t plen = sizeof(PREFIX) - 1;
+
+    if (strncmp(artifact_content, PREFIX, plen) == 0) {
+        const char *b64 = artifact_content + plen;
+        size_t b64_len = strlen(b64);
+        size_t max = b64_len / 4 * 3 + 3;
+        uint8_t *raw = (uint8_t *)malloc(max ? max : 1);
+        if (!raw) return VIRP_ERR_BUFFER_TOO_SMALL;
+        int n = artifact_b64_decode(b64, b64_len, raw, max);
+        if (n < 0) {
+            free(raw);
+            return VIRP_ERR_INVALID_LENGTH;
+        }
+        sha256_hex((const char *)raw, (size_t)n, out_hex);
+        free(raw);
+        return VIRP_OK;
+    }
+
+    sha256_hex(artifact_content, strlen(artifact_content), out_hex);
+    return VIRP_OK;
+}
+
+/* =========================================================================
  * SQL Schema
  * ========================================================================= */
 
@@ -342,6 +510,15 @@ static const char *SCHEMA_SQL =
     "  created_at_ns INTEGER NOT NULL"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_intents_id ON intents(intent_id);"
+    /* Artifact bodies are keyed by (artifact_id, artifact_hash), NOT by
+     * artifact_id alone. Production audit 2026-08-03: two distinct
+     * observations minted the same second-resolution id in one second;
+     * under UNIQUE(artifact_id) + OR REPLACE the second body silently
+     * displaced the first, losing its evidence bytes forever while both
+     * chain entries stayed valid. The chain entry commits to
+     * artifact_hash, so (id, hash) is the identity readers must join on
+     * — a colliding id then stores both bodies side by side, and an
+     * identical (id, hash) re-store is a no-op. */
     "CREATE TABLE IF NOT EXISTS artifacts ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  artifact_id TEXT NOT NULL,"
@@ -350,7 +527,7 @@ static const char *SCHEMA_SQL =
     "  artifact_hash TEXT NOT NULL,"
     "  session_id TEXT NOT NULL,"
     "  created_at_ns INTEGER NOT NULL,"
-    "  UNIQUE(artifact_id)"
+    "  UNIQUE(artifact_id, artifact_hash)"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_artifacts_id ON artifacts(artifact_id);";
 
@@ -416,11 +593,15 @@ static const char *SQL_INTENT_EXECUTE =
     "UPDATE intents SET commands_executed = commands_executed + 1 "
     "WHERE intent_id = ? AND commands_executed < max_commands";
 
+/* DO NOTHING, never REPLACE: an identical (id, hash) re-store is
+ * idempotent; distinct evidence under a colliding id lands as its own
+ * row via the two-column key above. Nothing can displace stored bytes. */
 static const char *SQL_ARTIFACT_INSERT =
-    "INSERT OR REPLACE INTO artifacts "
+    "INSERT INTO artifacts "
     "(artifact_id, artifact_type, artifact_content, artifact_hash, "
     " session_id, created_at_ns) "
-    "VALUES (?,?,?,?,?,?)";
+    "VALUES (?,?,?,?,?,?) "
+    "ON CONFLICT(artifact_id, artifact_hash) DO NOTHING";
 
 /* =========================================================================
  * Helpers
@@ -711,6 +892,49 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
     sqlite3_exec(state->db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_exec(state->db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
 
+    /* Adversarial audit 2026-08-06 (Finding A): a database that already
+     * has chain entries but no chain_heads table is NOT adopted as a
+     * pre-2026-08-01 legacy upgrade candidate. The schema generation is
+     * the discriminator: every database this binary has ever touched
+     * carries the table (SCHEMA_SQL creates it before the first append,
+     * and appends maintain it transactionally), so entries without the
+     * TABLE can only mean the table was dropped to re-open the one-time
+     * trust-on-upgrade window and have fresh heads signed over a
+     * truncated chain. Refuse the database outright — the evidence is
+     * preserved for offline inspection (virp_chain_open_verifier reads
+     * such a database and reports LEGACY_CHAIN without repairing it). */
+    {
+        int had_heads = table_exists(state->db, "chain_heads");
+        int had_entries = table_exists(state->db, "chain_entries");
+        if (had_heads < 0 || had_entries < 0) {
+            fprintf(stderr, "[Chain] Failed to inspect schema of %s\n",
+                    db_path);
+            sqlite3_close(state->db);
+            return VIRP_ERR_CHAIN_DB;
+        }
+        if (!had_heads && had_entries) {
+            int64_t n = 0;
+            sqlite3_stmt *ck = NULL;
+            if (sqlite3_prepare_v2(state->db,
+                    "SELECT COUNT(*) FROM chain_entries",
+                    -1, &ck, NULL) == SQLITE_OK &&
+                sqlite3_step(ck) == SQLITE_ROW)
+                n = sqlite3_column_int64(ck, 0);
+            sqlite3_finalize(ck);
+            if (n > 0) {
+                fprintf(stderr, "[Chain] FATAL: %s has %lld chain entries "
+                        "but no chain_heads table — either the table was "
+                        "dropped (tampering) or this is a never-upgraded "
+                        "pre-2026-08-01 database. Refusing to adopt it: "
+                        "heads are never signed retroactively. Inspect it "
+                        "offline with the read-only verifier.\n",
+                        db_path, (long long)n);
+                sqlite3_close(state->db);
+                return VIRP_ERR_CHAIN_BROKEN;
+            }
+        }
+    }
+
     /* Create schema */
     char *errmsg = NULL;
     rc = sqlite3_exec(state->db, SCHEMA_SQL, NULL, NULL, &errmsg);
@@ -719,6 +943,72 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
         sqlite3_free(errmsg);
         sqlite3_close(state->db);
         return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* MIGRATION (2026-08-04): rebuild a legacy artifacts table keyed
+     * UNIQUE(artifact_id) to the two-column key above. CREATE IF NOT
+     * EXISTS leaves an existing table untouched, so every database
+     * created before this change still carries the constraint that let
+     * one observation's body displace another's. The rebuild is one
+     * transaction, preserves every stored row, and must run BEFORE the
+     * statements are prepared — SQL_ARTIFACT_INSERT names the
+     * (artifact_id, artifact_hash) conflict target, which fails to
+     * prepare against the legacy table. Fail closed: no migrated
+     * artifacts table, no chain. Detection keys on the table's stored
+     * CREATE text: the legacy shape says "UNIQUE(artifact_id)" and the
+     * current shape "UNIQUE(artifact_id, artifact_hash)", so the comma
+     * distinguishes them. */
+    {
+        int legacy = 0;
+        sqlite3_stmt *ck = NULL;
+        if (sqlite3_prepare_v2(state->db,
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='artifacts'",
+                -1, &ck, NULL) == SQLITE_OK) {
+            if (sqlite3_step(ck) == SQLITE_ROW) {
+                const char *sql = (const char *)sqlite3_column_text(ck, 0);
+                if (sql && strstr(sql, "UNIQUE(artifact_id)") &&
+                    !strstr(sql, "UNIQUE(artifact_id,"))
+                    legacy = 1;
+            }
+            sqlite3_finalize(ck);
+        }
+        if (legacy) {
+            rc = sqlite3_exec(state->db,
+                "BEGIN IMMEDIATE;"
+                "ALTER TABLE artifacts RENAME TO artifacts_legacy_uid;"
+                "CREATE TABLE artifacts ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  artifact_id TEXT NOT NULL,"
+                "  artifact_type TEXT NOT NULL,"
+                "  artifact_content TEXT NOT NULL,"
+                "  artifact_hash TEXT NOT NULL,"
+                "  session_id TEXT NOT NULL,"
+                "  created_at_ns INTEGER NOT NULL,"
+                "  UNIQUE(artifact_id, artifact_hash)"
+                ");"
+                "INSERT INTO artifacts "
+                "  (artifact_id, artifact_type, artifact_content,"
+                "   artifact_hash, session_id, created_at_ns)"
+                "  SELECT artifact_id, artifact_type, artifact_content,"
+                "         artifact_hash, session_id, created_at_ns"
+                "  FROM artifacts_legacy_uid;"
+                "DROP TABLE artifacts_legacy_uid;"
+                "CREATE INDEX IF NOT EXISTS idx_artifacts_id "
+                "  ON artifacts(artifact_id);"
+                "COMMIT;", NULL, NULL, &errmsg);
+            if (rc != SQLITE_OK) {
+                fprintf(stderr, "[Chain] artifacts migration FAILED: %s\n",
+                        errmsg ? errmsg : "unknown");
+                sqlite3_free(errmsg);
+                sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+                sqlite3_close(state->db);
+                return VIRP_ERR_CHAIN_DB;
+            }
+            fprintf(stderr, "[Chain] artifacts migrated: "
+                    "UNIQUE(artifact_id) -> "
+                    "UNIQUE(artifact_id, artifact_hash)\n");
+        }
     }
 
     /* Prepare statements */
@@ -762,60 +1052,163 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
         return VIRP_ERR_CHAIN_DB;
     }
 
-    /* Backfill head records for sessions created before chain_heads
-     * existed. Only sessions LACKING a head get one — an existing head is
-     * never overwritten here, because a head that disagrees with the
-     * entries is a tampering signal virp_chain_verify_session must report,
-     * not repair. TRUST-ON-UPGRADE: a backfilled head blesses whatever
-     * length the database has at upgrade time; only appends after this
-     * point extend the authenticated length. A backfill failure is logged
-     * and left alone — the affected session then fails
-     * virp_chain_verify_session (no head), which is the fail-closed
-     * outcome, rather than blocking daemon startup. */
+    /* A session with entries but no head row is tampering evidence
+     * (tail+head deletion), never a repair candidate. Heads are written
+     * in the same transaction as every append and the one-time legacy
+     * backfill window closed with the 2026-08-01 migration (production
+     * carries no headless session), so nothing legitimate looks like
+     * this. Adversarial audit 2026-08-06 (Finding A): the backfill that
+     * used to run here re-signed such sessions with the live K_chain on
+     * restart, laundering the deletion. Log each one loudly and leave it
+     * failing virp_chain_verify_session permanently. */
     {
-        sqlite3_stmt *bf = NULL, *hh = NULL;
+        sqlite3_stmt *bf = NULL;
         const char *sql_bf =
             "SELECT ce.session_id, MAX(ce.sequence) "
             "FROM chain_entries ce "
             "LEFT JOIN chain_heads ch ON ch.session_id = ce.session_id "
             "WHERE ch.session_id IS NULL "
             "GROUP BY ce.session_id";
-        const char *sql_hh =
-            "SELECT chain_entry_hash FROM chain_entries "
-            "WHERE session_id = ? AND sequence = ?";
-        if (sqlite3_prepare_v2(state->db, sql_bf, -1, &bf, NULL) == SQLITE_OK &&
-            sqlite3_prepare_v2(state->db, sql_hh, -1, &hh, NULL) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(state->db, sql_bf, -1, &bf, NULL)
+                == SQLITE_OK) {
             while (sqlite3_step(bf) == SQLITE_ROW) {
-                const char *sid = (const char *)sqlite3_column_text(bf, 0);
-                int64_t last = sqlite3_column_int64(bf, 1);
-                sqlite3_reset(hh);
-                sqlite3_bind_text(hh, 1, sid, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(hh, 2, last);
-                if (sqlite3_step(hh) == SQLITE_ROW) {
-                    const char *hash =
-                        (const char *)sqlite3_column_text(hh, 0);
-                    if (head_upsert_locked(state, sid, last, hash)
-                            == VIRP_OK) {
-                        fprintf(stderr,
-                            "[Chain] Head backfill: session=%s "
-                            "last_seq=%lld (trust-on-upgrade)\n",
-                            sid, (long long)last);
-                    } else {
-                        fprintf(stderr,
-                            "[Chain] Head backfill FAILED: session=%s "
-                            "— session will not verify until resolved\n",
-                            sid);
-                    }
-                }
+                fprintf(stderr,
+                    "[Chain] TAMPER EVIDENCE: session=%s has entries "
+                    "(max_seq=%lld) but no signed head — consistent with "
+                    "tail+head deletion; the session will never verify\n",
+                    (const char *)sqlite3_column_text(bf, 0),
+                    (long long)sqlite3_column_int64(bf, 1));
             }
         }
         if (bf) sqlite3_finalize(bf);
-        if (hh) sqlite3_finalize(hh);
     }
 
     fprintf(stderr, "[Chain] Initialized: db=%s node=%u org=%s\n",
             db_path, node_id, state->org_id);
 
+    return VIRP_OK;
+}
+
+/* Does a table exist? Returns 1/0, or -1 on query failure. */
+static int table_exists(sqlite3 *db, const char *name)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_ROW) return 1;
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+virp_error_t virp_chain_open_verifier(virp_chain_state_t *state,
+                                      const char *db_path,
+                                      const char *chain_key_path,
+                                      uint32_t node_id,
+                                      const char *org_id)
+{
+    if (!state || !db_path || !chain_key_path)
+        return VIRP_ERR_NULL_PTR;
+
+    memset(state, 0, sizeof(*state));
+    pthread_mutex_init(&state->lock, NULL);
+    state->node_id = node_id;
+    state->read_only = true;
+    snprintf(state->org_id, sizeof(state->org_id), "%s",
+             org_id ? org_id : "local");
+
+    virp_error_t err = virp_key_load_file(&state->chain_key,
+                                          VIRP_KEY_TYPE_CHAIN,
+                                          chain_key_path);
+    if (err != VIRP_OK) {
+        fprintf(stderr, "[Chain] Failed to load chain key from %s: %s\n",
+                chain_key_path, virp_error_str(err));
+        return err;
+    }
+
+    int rc = sqlite3_open_v2(db_path, &state->db,
+                             SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[Chain] Failed to open DB %s read-only: %s\n",
+                db_path, sqlite3_errmsg(state->db));
+        sqlite3_close(state->db);
+        state->db = NULL;
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* Belt over the braces: even a coding error in this module cannot
+     * write through this connection. */
+    sqlite3_exec(state->db, "PRAGMA query_only=ON;", NULL, NULL, NULL);
+
+    /* No schema ensure, no migration, no backfill — inspect only. */
+    int has_entries = table_exists(state->db, "chain_entries");
+    if (has_entries != 1) {
+        fprintf(stderr, "[Chain] %s: %s\n", db_path,
+                has_entries == 0 ? "no chain_entries table — not a chain "
+                                   "database"
+                                 : "cannot inspect schema (WAL sidecar "
+                                   "needing recovery?)");
+        sqlite3_close(state->db);
+        state->db = NULL;
+        virp_key_destroy(&state->chain_key);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    int has_heads = table_exists(state->db, "chain_heads");
+    if (has_heads == -1) {
+        sqlite3_close(state->db);
+        state->db = NULL;
+        virp_key_destroy(&state->chain_key);
+        return VIRP_ERR_CHAIN_DB;
+    }
+    state->legacy_no_heads = (has_heads == 0);
+    if (state->legacy_no_heads)
+        fprintf(stderr, "[Chain] verifier: LEGACY_CHAIN shape (no "
+                "chain_heads) — sessions will report "
+                "COMPLETENESS_UNPROVABLE; database left untouched\n");
+
+    /* Legacy artifacts key shape: irrelevant to verification (which
+     * never reads artifacts) and, on this handle, impossible to
+     * migrate. Note it so an auditor knows what they are holding. */
+    {
+        sqlite3_stmt *ck = NULL;
+        if (sqlite3_prepare_v2(state->db,
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='artifacts'",
+                -1, &ck, NULL) == SQLITE_OK) {
+            if (sqlite3_step(ck) == SQLITE_ROW) {
+                const char *sql = (const char *)sqlite3_column_text(ck, 0);
+                if (sql && strstr(sql, "UNIQUE(artifact_id)") &&
+                    !strstr(sql, "UNIQUE(artifact_id,"))
+                    fprintf(stderr, "[Chain] verifier: legacy artifacts "
+                            "shape (UNIQUE(artifact_id)) — left "
+                            "untouched\n");
+            }
+            sqlite3_finalize(ck);
+        }
+    }
+
+    /* Prepare ONLY what verification reads. Mutating statements stay
+     * NULL; the read_only guards refuse before any of them is touched.
+     * stmt_head_get is skipped on a legacy database (no table to
+     * prepare against) — legacy_no_heads short-circuits verify first. */
+    if (sqlite3_prepare_v2(state->db, SQL_GET_LAST, -1,
+                           &state->stmt_get_last, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(state->db, SQL_GET_RANGE, -1,
+                           &state->stmt_get_range, NULL) != SQLITE_OK ||
+        (!state->legacy_no_heads &&
+         sqlite3_prepare_v2(state->db, SQL_HEAD_GET, -1,
+                            &state->stmt_head_get, NULL) != SQLITE_OK)) {
+        fprintf(stderr, "[Chain] verifier: failed to prepare read "
+                "statements: %s\n", sqlite3_errmsg(state->db));
+        virp_chain_destroy(state);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    fprintf(stderr, "[Chain] Verifier open (read-only): db=%s\n", db_path);
     return VIRP_OK;
 }
 
@@ -828,6 +1221,7 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
                                const char *artifact_type,
                                const char *artifact_id,
                                const char *artifact_hash,
+                               const char *artifact_content,
                                virp_chain_entry_t *entry)
 {
     if (!state || !session_id || !artifact_type ||
@@ -836,6 +1230,9 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
 
     if (!state->db)
         return VIRP_ERR_CHAIN_DB;
+
+    if (state->read_only)
+        return VIRP_ERR_CHAIN_READONLY;
 
     /* BEGIN IMMEDIATE — exclusive write lock */
     int rc = sqlite3_exec(state->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
@@ -927,6 +1324,27 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
         return VIRP_ERR_CHAIN_DB;
     }
 
+    /* Store the artifact body in the SAME transaction as the entry that
+     * commits to its hash. Before this the body was written by a separate
+     * autocommit statement after COMMIT, so a crash between the two — or a
+     * snapshot taken between them — yielded a chain entry committing to a
+     * body that does not exist (adversarial test #2, `mid_outcome`; 20
+     * such entries in production). Now entry, head and body land or roll
+     * back together: a store failure fails the whole append, typed, and
+     * can never leave a dangling commitment. The FI point keeps its name
+     * and its meaning — "between entry insert and body store" — but the
+     * boundary is now inside the transaction, so dying here must lose
+     * both records, not one. */
+    if (artifact_content && artifact_content[0] != '\0') {
+        VIRP_FI("mid_outcome");
+        if (chain_artifact_store_locked(state, artifact_id, artifact_type,
+                                        artifact_content, artifact_hash,
+                                        session_id) != VIRP_OK) {
+            sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+            return VIRP_ERR_CHAIN_DB;
+        }
+    }
+
     /* COMMIT — sequence is now permanent */
     rc = sqlite3_exec(state->db, "COMMIT;", NULL, NULL, NULL);
     if (rc != SQLITE_OK) {
@@ -946,6 +1364,60 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
 /* =========================================================================
  * Verify
  * ========================================================================= */
+
+/*
+ * Grade one entry's artifact binding.
+ *   1  bound      — a body is stored and hashes to the entry's commitment
+ *   0  unverifiable — nothing was retained that COULD be bound: no body
+ *                   row, or an INDIRECT-commitment type whose hash names a
+ *                   signed observation the chain does not hold, or a body
+ *                   stored at the daemon's 8192-byte field limit (a prefix,
+ *                   which cannot hash to the whole)
+ *  -1  broken     — a body IS retained and does NOT hash to its commitment
+ *
+ * The body is looked up by (artifact_id, artifact_hash), the pair the
+ * entry commits to and the artifacts table is keyed by — resolving by
+ * artifact_id alone would pick up a colliding id's body and grade the
+ * wrong bytes.
+ */
+static int chain_verify_binding_locked(virp_chain_state_t *state,
+                                       const virp_chain_entry_t *e)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT artifact_content FROM artifacts "
+            "WHERE artifact_id = ? AND artifact_hash = ?",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;   /* cannot read the store: report unverifiable, not broken */
+
+    sqlite3_bind_text(st, 1, e->artifact_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, e->artifact_hash, -1, SQLITE_TRANSIENT);
+
+    int verdict = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *body = (const char *)sqlite3_column_text(st, 0);
+        size_t blen = body ? strlen(body) : 0;
+
+        if (!body || blen == 0) {
+            verdict = 0;                       /* nothing retained to bind */
+        } else if (blen >= VIRP_CHAIN_ARTIFACT_CONTENT_MAX) {
+            verdict = 0;                       /* stored truncated: a prefix */
+        } else if (virp_chain_type_is_indirect(e->artifact_type)) {
+            /* Body required and present, but artifact_hash commits to a
+             * signed observation the chain does not retain — honest
+             * verdict is unverifiable, never a silent pass. */
+            verdict = 0;
+        } else {
+            char digest[65];
+            if (virp_chain_artifact_digest(body, digest) != VIRP_OK)
+                verdict = -1;                  /* undecodable body */
+            else
+                verdict = hexdigest_eq(digest, e->artifact_hash) ? 1 : -1;
+        }
+    }
+    sqlite3_finalize(st);
+    return verdict;
+}
 
 static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                                const char *session_id,
@@ -1065,6 +1537,30 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                      "HMAC mismatch at sequence %lld",
                      (long long)e.sequence);
             break;
+        }
+
+        /* ARTIFACT BINDING (2026-08-06). The checks above prove the entry
+         * is internally consistent and K_chain-authenticated; none of them
+         * proves the entry commits to the body the chain actually stores.
+         * Default-on, with the same three-way grading report/verify.py
+         * uses, because an operator CLI that prints VALID for an entry it
+         * never bound is worse than one that says so: a retained body that
+         * disagrees with its commitment is tampering (fatal), while a body
+         * the format never retained is UNVERIFIABLE (counted, never
+         * counted as verified, not fatal). */
+        {
+            int bind = chain_verify_binding_locked(state, &e);
+            if (bind < 0) {
+                result->valid = false;
+                result->first_broken = e.sequence;
+                snprintf(result->error_detail, sizeof(result->error_detail),
+                         "Artifact binding failed at sequence %lld: stored "
+                         "body does not hash to artifact_hash",
+                         (long long)e.sequence);
+                break;
+            }
+            if (bind == 0) result->artifacts_unverifiable++;
+            else           result->artifacts_bound++;
         }
 
         /* Advance */
@@ -1209,6 +1705,9 @@ static virp_error_t chain_intent_store_locked(virp_chain_state_t *state,
     if (!state || !state->db || !entry)
         return VIRP_ERR_NULL_PTR;
 
+    if (state->read_only)
+        return VIRP_ERR_CHAIN_READONLY;
+
     /* Compute HMAC of intent_hash using K_chain */
     hmac_sha256_hex(state->chain_key.key.key,
                     entry->intent_hash, strlen(entry->intent_hash),
@@ -1272,6 +1771,9 @@ static virp_error_t chain_intent_execute_locked(virp_chain_state_t *state,
     if (!state || !state->db || !intent_id || !entry)
         return VIRP_ERR_NULL_PTR;
 
+    if (state->read_only)
+        return VIRP_ERR_CHAIN_READONLY;
+
     /* Atomically increment commands_executed (only if < max_commands) */
     sqlite3_stmt *stmt = state->stmt_intent_execute;
     sqlite3_reset(stmt);
@@ -1313,6 +1815,9 @@ static virp_error_t chain_artifact_store_locked(virp_chain_state_t *state,
 
     if (artifact_content[0] == '\0')
         return VIRP_ERR_NULL_PTR;
+
+    if (state->read_only)
+        return VIRP_ERR_CHAIN_READONLY;
 
     sqlite3_stmt *stmt = state->stmt_artifact_insert;
     sqlite3_reset(stmt);

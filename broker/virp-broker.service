@@ -1,0 +1,38 @@
+[Unit]
+Description=VIRP network intent-broker (Stage 1: localhost only)
+Documentation=file:/opt/virp/broker/virp_broker.py
+After=virp-onode.service
+Requires=virp-onode.service
+
+[Service]
+Type=simple
+# DEDICATED credential-less identity, same pattern as virp-backup /
+# virp-evidence: no key or credential group membership, socket reach by
+# ACL only (broker-access.sh), cannot read /run/virp/devices.json. The
+# broker itself refuses to start (--require-unprivileged) if any of
+# that regresses.
+User=virp-broker
+Group=virp-broker
+UMask=0077
+# Root pre-step ('+'): fail-loud identity checks + socket ACL grant.
+# Re-runs on every start, so `systemctl restart virp-broker` after a
+# daemon restart re-applies the ACL to the recreated socket.
+ExecStartPre=+/opt/virp/broker/broker-access.sh
+ExecStart=/usr/bin/python3 /opt/virp/broker/virp_broker.py --require-unprivileged
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/virp
+RestrictAddressFamilies=AF_UNIX AF_INET
+# The broker code binds 127.0.0.1 by construction; this makes the VLAN
+# unreachable even if the code regressed. No firewall rule involved.
+IPAddressDeny=any
+IPAddressAllow=127.0.0.0/8
+# Belt over braces: no keys, no credential stores, no chain db.
+InaccessiblePaths=-/etc/virp/keys -/etc/virp/autopilot.env -/var/lib/virp
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

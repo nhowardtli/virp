@@ -367,17 +367,33 @@ def verify_observation(raw, workdir="/tmp"):
 
 def chain_append(session_id, device, raw_obs):
     """Register a verified observation in the trust chain, bridge-style:
-    the daemon computes the entry hashes; we supply sha256(raw bytes)."""
+    the daemon computes the entry hashes; we supply sha256(raw bytes).
+
+    Bodies at or past the daemon's 8192-byte artifact_content field would
+    be stored TRUNCATED, and a truncated body cannot hash to the
+    commitment the entry carries. Those register commitment-only: the
+    entry and its hash over the FULL signed message are recorded, no body
+    is stored, and a verifier honestly reports "no body retained" instead
+    of a body that fails binding. virp_evidence.py and
+    virp_config_backup.py have always done this; this client did not, so
+    it submitted oversized bodies that the daemon silently truncated
+    (2,211 such bodies are in the chain, all librenms). Since the daemon
+    began binding submitted bodies to their declared hash on 2026-08-06,
+    an oversized submission is refused outright and the observation loses
+    its chain entry entirely — hence this guard."""
     h = hashlib.sha256(raw_obs).hexdigest()
     artifact_id = "obs:%s:%d" % (device, time.time_ns())
-    resp = onode_send({
+    req = {
         "action": "chain_append",
         "session_id": session_id,
         "artifact_type": "observation",
         "artifact_id": artifact_id,
         "artifact_hash": h,
-        "artifact_content": "base64:" + base64.b64encode(raw_obs).decode(),
-    })
+    }
+    content = "base64:" + base64.b64encode(raw_obs).decode()
+    if len(content) < 8192:
+        req["artifact_content"] = content
+    resp = onode_send(req)
     if len(resp) == 4:
         return None
     return artifact_id

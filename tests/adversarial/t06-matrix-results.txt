@@ -1,0 +1,15 @@
+==============================================================================================================
+CASE                               OBSERVED_DISP        SUCC   EXPECTED_DISP        WANT   R    
+==============================================================================================================
+1 channel death mid-command        EXECUTED_FAILED      false  EXECUTED_UNKNOWN|EXECUTED_FAILED false  PASS     5s recv=2 side=1 chain_outcome=false
+2 TCP session death                EXECUTED_UNKNOWN     false  EXECUTED_UNKNOWN     false  PASS     0s recv=1 side=1 chain_outcome=false
+3 die-only (no side effect)        EXECUTED_FAILED      false  EXECUTED_UNKNOWN|EXECUTED_FAILED false  PASS     5s recv=2 side=0 chain_outcome=false
+4 NORMAL exit 0, clean close       EXECUTED_CONFIRMED   true   EXECUTED_CONFIRMED   true   PASS     0s recv=1 side=1 chain_outcome=true
+5 clean non-zero exit              EXECUTED_FAILED      false  EXECUTED_FAILED      false  PASS     0s recv=1 side=1 chain_outcome=false
+6 hang (never responds)            EXECUTED_UNKNOWN     false  EXECUTED_UNKNOWN     false  PASS    41s recv=1 side=0 chain_outcome=false
+7a partial/truncated               EXECUTED_FAILED      false  EXECUTED_UNKNOWN|EXECUTED_FAILED false  PASS     5s recv=2 side=1 chain_outcome=false
+7b oversized (buffer full)         EXECUTED_UNKNOWN     false  EXECUTED_UNKNOWN     false  PASS     0s recv=1 side=0 chain_outcome=false
+==============================================================================================================
+GREEN read (unapproved path, exit 0) — proves the gate's normal read path still confirms:
+4b GREEN read exit 0               EXECUTED_CONFIRMED   true   EXECUTED_CONFIRMED   true   PASS     0s recv=1 side=0 chain_outcome=n/a
+==============================================================================================================

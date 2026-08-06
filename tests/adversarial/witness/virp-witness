@@ -1,0 +1,133 @@
+#!/bin/sh
+# virp-witness — target-side witness for the VIRP adversarial test program.
+#
+# WHAT THIS IS
+#   An independent record, kept BY THE TARGET, of every operation delivered to
+#   it over SSH. It exists so that the adversarial transcripts can answer
+#   "what actually happened at the target" WITHOUT asking VIRP. It is column 1
+#   of the results table; VIRP's own artifacts are columns 2-4.
+#
+# HOW IT IS REACHED
+#   sshd ForceCommand (see 99-virp-witness.conf). The VIRP linux driver opens
+#   one SSH *exec channel per command*, so sshd invokes this script exactly
+#   once per delivered operation, with the operation in $SSH_ORIGINAL_COMMAND.
+#   That makes this the true chokepoint: nothing reaches the device without
+#   passing through here first.
+#
+# FIDELITY RULES (deliberate, do not "improve" without re-reading these)
+#   1. FAIL-OPEN. Every logging step is guarded. If the witness cannot write
+#      its log, the operation still runs. A witness that can block operations
+#      would be measuring itself, not the system under test.
+#   2. NO PIPES around the command. The command is run with `eval` in this same
+#      process, so its stdout/stderr are the raw SSH channel file descriptors
+#      and its bytes reach VIRP unaltered. Exit status is passed through.
+#      Consequence, stated plainly: this witness does NOT independently hash the
+#      response body. Byte-level response attestation needs capture mode, which
+#      inserts a filter and is therefore OFF by default. See CAPTURE below.
+#   3. RECV IS WRITTEN BEFORE THE COMMAND RUNS. So a crash, kill, or hang
+#      mid-operation still leaves proof the operation was delivered. RECV means
+#      "delivered and entered"; DONE means "ran to completion with this rc".
+#      The gap between them is exactly the ambiguity window test #2 hunts for.
+#
+# COUNTING RULE FOR TRANSCRIPTS
+#   executions at the target == number of RECV lines matching the command.
+#   Never count DONE lines for this; an operation that took effect and then
+#   died writes RECV and no DONE.
+#
+# LOG FORMAT — one line, tab-separated, fixed marker so it survives grep:
+#   VIRPWITNESS v1 RECV seq= nonce= host= epoch= mono= utc= pid= client= user= cmdsha= cmd=
+#   VIRPWITNESS v1 DONE seq= nonce= epoch= mono= rc=
+#   nonce joins the RECV/DONE pair. seq is a per-container atomic counter
+#   (flock-serialised) and is the authoritative ordering under concurrency.
+#   mono is /proc/uptime (10ms monotonic) — busybox date has no %N, so mono is
+#   the sub-second field. epoch/utc are wall clock and can step; do not use
+#   them to order concurrent events.
+
+WITNESS_DIR=/var/log/virp-witness
+LOG="$WITNESS_DIR/witness.log"
+CTR="$WITNESS_DIR/counter"
+LOCK="$WITNESS_DIR/lock"
+CAPTURE_FLAG="$WITNESS_DIR/capture-enabled"
+
+cmd="$SSH_ORIGINAL_COMMAND"
+
+# Interactive login (no forced command payload): hand straight to a shell.
+# Still logged, so an operator poking at the box shows up in the record too.
+if [ -z "$cmd" ]; then
+    _kind=LOGIN
+else
+    _kind=RECV
+fi
+
+# --- atomic monotonic counter + RECV line, under one lock -------------------
+# All of this is best-effort. `|| true` everywhere: see FIDELITY RULE 1.
+seq="?"
+nonce="?"
+
+_witness_log() {
+    # $1 = record kind, $2.. = preformatted fields
+    _k="$1"; shift
+    printf 'VIRPWITNESS\tv1\t%s\t%s\n' "$_k" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+if [ -d "$WITNESS_DIR" ]; then
+    nonce=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "no-nonce")
+    seq=$(flock "$LOCK" sh -c '
+        n=$(cat "$1" 2>/dev/null || echo 0)
+        n=$((n + 1))
+        printf "%s" "$n" > "$1".tmp 2>/dev/null && mv -f "$1".tmp "$1" 2>/dev/null
+        printf "%s" "$n"
+    ' _ "$CTR" 2>/dev/null) || seq="?"
+    [ -n "$seq" ] || seq="?"
+
+    _epoch=$(date -u +%s 2>/dev/null || echo 0)
+    _utc=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)
+    _mono=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo 0)
+    _host=$(hostname 2>/dev/null || echo unknown)
+    _user=$(id -un 2>/dev/null || echo unknown)
+    _client=$(printf '%s' "${SSH_CLIENT:-none}" | tr ' \t' ',,')
+    # Command digest: lets a transcript match target-side and VIRP-side records
+    # without quoting games, and survives the newline escaping below.
+    _cmdsha=$(printf '%s' "$cmd" | sha256sum 2>/dev/null | cut -c1-16 || echo unknown)
+    # Newlines/tabs escaped so one operation is always exactly one log line.
+    _cmdesc=$(printf '%s' "$cmd" | sed -e 's/\\/\\\\/g' -e 's/\t/\\t/g' | tr '\n' '\001' | sed -e 's/\001/\\n/g')
+
+    _witness_log "$_kind" "seq=$seq	nonce=$nonce	host=$_host	epoch=$_epoch	mono=$_mono	utc=$_utc	pid=$$	client=$_client	user=$_user	cmdsha=$_cmdsha	cmd=$_cmdesc"
+fi
+
+# --- run the operation ------------------------------------------------------
+if [ -z "$cmd" ]; then
+    exec "${SHELL:-/bin/sh}"
+fi
+
+if [ -f "$CAPTURE_FLAG" ]; then
+    # CAPTURE MODE — opt-in, OFF by default. Inserts a tee, so the response
+    # crosses a pipe on its way to VIRP. That is a perturbation of the system
+    # under test: it changes buffering and introduces a SIGPIPE path. Enable it
+    # ONLY for the oversized-response transcript, where independently hashing
+    # the real target bytes is the whole point, and say so in that transcript.
+    _cap="$WITNESS_DIR/cap.$nonce"
+    eval "$cmd" > "$_cap" 2>"$_cap.err"
+    rc=$?
+    _bytes=$(wc -c < "$_cap" 2>/dev/null || echo -1)
+    _sha=$(sha256sum < "$_cap" 2>/dev/null | cut -d' ' -f1 || echo unknown)
+    _ebytes=$(wc -c < "$_cap.err" 2>/dev/null || echo -1)
+    cat "$_cap" 2>/dev/null
+    cat "$_cap.err" >&2 2>/dev/null
+    _witness_log CAPT "seq=$seq	nonce=$nonce	out_bytes=$_bytes	out_sha256=$_sha	err_bytes=$_ebytes"
+    rm -f "$_cap" "$_cap.err" 2>/dev/null || true
+else
+    # DEFAULT — no pipes, no filters. Bytes and exit status pass through
+    # untouched. See FIDELITY RULE 2.
+    eval "$cmd"
+    rc=$?
+fi
+
+# --- DONE line --------------------------------------------------------------
+if [ -d "$WITNESS_DIR" ]; then
+    _epoch2=$(date -u +%s 2>/dev/null || echo 0)
+    _mono2=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo 0)
+    _witness_log DONE "seq=$seq	nonce=$nonce	epoch=$_epoch2	mono=$_mono2	rc=$rc"
+fi
+
+exit $rc

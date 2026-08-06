@@ -24,6 +24,11 @@
  * ========================================================================= */
 
 #define VIRP_CHAIN_MILESTONE_INTERVAL  100
+
+/* The daemon's request field is char artifact_content[8192], so a body at
+ * or past this length reached the chain truncated: a prefix, which cannot
+ * hash to the whole. Mirrors ARTIFACT_CONTENT_MAX in report/verify.py. */
+#define VIRP_CHAIN_ARTIFACT_CONTENT_MAX 8191
 #define VIRP_CHAIN_GENESIS_PREFIX      "VIRP_CHAIN_GENESIS:"
 
 /* =========================================================================
@@ -58,7 +63,63 @@ typedef struct {
     int64_t  entries_checked;
     int64_t  first_broken;              /* -1 if none */
     char     error_detail[256];
+    /* Artifact binding (2026-08-06). Entries whose stored body hashes to
+     * the entry's artifact_hash are counted verified; entries the chain
+     * format cannot bind — no body retained, or an INDIRECT-commitment
+     * type whose hash commits to a signed observation the chain does not
+     * hold — are counted UNVERIFIABLE and never as verified. valid stays
+     * true for those: unverifiable is a retention limit, not tampering.
+     * A body that IS retained and does NOT hash to its commitment is
+     * tampering and clears valid. */
+    int64_t  artifacts_bound;
+    int64_t  artifacts_unverifiable;
 } virp_chain_verify_result_t;
+
+/* =========================================================================
+ * Artifact type policy — one definition, used by the external append path
+ * (to refuse forgeries) and by the verifier (to grade binding honestly)
+ * ========================================================================= */
+
+/*
+ * Types the DAEMON mints on internal paths and an external socket client
+ * may never claim: "approval" and "proposal" (src/virp_approval.c),
+ * "outcome" and "gate_rejection" (src/virp_onode.c), "validation"
+ * (src/virp_validator.c). A chain reader treats these as semantic
+ * records of the approval/gate/validation flows, so accepting one from a
+ * socket client makes a forged record indistinguishable from a minted one.
+ */
+bool virp_chain_type_is_daemon_reserved(const char *artifact_type);
+
+/*
+ * INDIRECT-commitment types: artifact_hash commits to a SIGNED
+ * OBSERVATION that the chain does not retain, while the stored body is
+ * the plain JSON. sha256(body) therefore does not equal artifact_hash by
+ * design, and the entry cannot be bound from within the chain. Matches
+ * INDIRECT_COMMITMENT_TYPES in report/verify.py.
+ *
+ * DEFERRED (2026-08-06): the honest fix is an explicit commitment_mode
+ * field inside the HMAC'd canonical object, so both modes are defined and
+ * verifiable rather than one being UNVERIFIABLE. That changes the
+ * canonical form and belongs in the same change window as the provenance
+ * field and a chain format version bump.
+ */
+bool virp_chain_type_is_indirect(const char *artifact_type);
+
+/*
+ * Types an external client may submit at all. Anything else — including a
+ * wholly invented type — is refused rather than recorded as if meaningful.
+ */
+bool virp_chain_type_is_external_allowed(const char *artifact_type);
+
+/*
+ * SHA-256 hex of the bytes an artifact_hash commits to. Bodies are stored
+ * either as "base64:<b64>" (signed wire messages) or as literal text, and
+ * the commitment is over the DECODED bytes in the first case — the same
+ * rule report/verify.py decode_artifact() applies. Returns
+ * VIRP_ERR_INVALID_LENGTH if a base64 body does not decode.
+ */
+virp_error_t virp_chain_artifact_digest(const char *artifact_content,
+                                        char out_hex[65]);
 
 /* =========================================================================
  * Chain State — owns the SQLite database and prepared statements
@@ -82,6 +143,16 @@ typedef struct {
     sqlite3_stmt       *stmt_intent_execute;
     /* Artifact store */
     sqlite3_stmt       *stmt_artifact_insert;
+
+    /* Set by virp_chain_open_verifier(): the connection is
+     * SQLITE_OPEN_READONLY and every mutating entry point returns
+     * VIRP_ERR_CHAIN_READONLY. */
+    bool                read_only;
+    /* Verifier-open only: the database predates the chain_heads table
+     * (legacy shape). Chain length cannot be authenticated; sessions
+     * report LEGACY_CHAIN / COMPLETENESS_UNPROVABLE instead of the DB
+     * being migrated under the auditor. */
+    bool                legacy_no_heads;
 
     /*
      * Serializes ALL chain operations. The db + prepared statements above
@@ -115,6 +186,42 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
                              const char *org_id);
 
 /*
+ * Open an existing chain database for VERIFICATION ONLY.
+ *
+ * virp_chain_init() is the daemon's open: it creates schema, migrates
+ * legacy shapes, sets WAL, and backfills trust-on-upgrade head records —
+ * every one of which REWRITES the database. An offline verifier must
+ * never do any of that: a verifier that manufactures the head record it
+ * then checks has blessed the very length claim it exists to test.
+ *
+ * This open:
+ *   - opens the file SQLITE_OPEN_READONLY (missing file is an error,
+ *     never created) and additionally sets PRAGMA query_only=ON;
+ *   - runs no schema ensure, no migration, no backfill;
+ *   - requires chain_entries to exist (else VIRP_ERR_CHAIN_DB — not a
+ *     chain database);
+ *   - tolerates a legacy database with no chain_heads table: the handle
+ *     opens, state->legacy_no_heads is set, and every session verifies
+ *     as invalid with "LEGACY_CHAIN ... COMPLETENESS_UNPROVABLE" —
+ *     reported, not migrated;
+ *   - leaves a legacy UNIQUE(artifact_id) artifacts table untouched
+ *     (noted on stderr; verification never reads artifacts).
+ *
+ * Every mutating chain call on this handle returns
+ * VIRP_ERR_CHAIN_READONLY. Close with virp_chain_destroy() as usual.
+ *
+ * NOTE: a WAL-mode database whose -wal sidecar needs recovery cannot be
+ * opened read-only by SQLite; the first query fails and this returns
+ * VIRP_ERR_CHAIN_DB. That is fail-closed by design — verify a cleanly
+ * copied database file.
+ */
+virp_error_t virp_chain_open_verifier(virp_chain_state_t *state,
+                                      const char *db_path,
+                                      const char *chain_key_path,
+                                      uint32_t node_id,
+                                      const char *org_id);
+
+/*
  * Append an artifact to the chain for a given session.
  * Transactional: sequence assigned only at COMMIT.
  *
@@ -126,6 +233,31 @@ virp_error_t virp_chain_append(virp_chain_state_t *state,
                                const char *artifact_id,
                                const char *artifact_hash,
                                virp_chain_entry_t *entry);
+
+/*
+ * Append a chain entry AND store the artifact body it commits to, in one
+ * SQLite transaction. Either both are durable or neither is: a crash (or
+ * a snapshot of the database) can never capture an entry whose committed
+ * body is absent, and a failed body store fails the whole append with
+ * VIRP_ERR_CHAIN_DB instead of being silently dropped.
+ *
+ * artifact_content may be NULL or empty, in which case this behaves
+ * exactly like virp_chain_append() — an entry-only append (commitment
+ * without retained body) remains a deliberate, caller-chosen state, not
+ * something a crash can manufacture.
+ *
+ * Every call site that pairs virp_chain_append() with
+ * virp_chain_artifact_store() for the same artifact must use this
+ * instead; the split calls are only for bodies stored without a chain
+ * entry of their own (e.g. the intent store).
+ */
+virp_error_t virp_chain_append_with_artifact(virp_chain_state_t *state,
+                                             const char *session_id,
+                                             const char *artifact_type,
+                                             const char *artifact_id,
+                                             const char *artifact_hash,
+                                             const char *artifact_content,
+                                             virp_chain_entry_t *entry);
 
 /*
  * Verify chain integrity for a sequence range within a session.
@@ -250,6 +382,16 @@ virp_error_t virp_chain_intent_execute(virp_chain_state_t *state,
  * Store an artifact's raw content in the artifacts table.
  * artifact_id must match the chain_entries.artifact_id for cross-reference.
  * Returns VIRP_ERR_NULL_PTR if any parameter is NULL or content is empty.
+ *
+ * Storage is keyed by (artifact_id, artifact_hash) — the pair the chain
+ * entry commits to — never by artifact_id alone. A colliding artifact_id
+ * carrying DIFFERENT content stores a second row; nothing ever displaces
+ * previously stored bytes (2026-08-03 production audit: a second-
+ * resolution id collision under the old UNIQUE(artifact_id) + OR REPLACE
+ * silently destroyed one observation's evidence). An identical
+ * (artifact_id, artifact_hash) re-store is idempotent. Readers resolving
+ * a chain entry to its body MUST join on both columns; an id-only lookup
+ * can return a different entry's evidence.
  */
 virp_error_t virp_chain_artifact_store(virp_chain_state_t *state,
                                         const char *artifact_id,

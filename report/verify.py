@@ -548,6 +548,17 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None,
 
     summary = summarize(verifications)
     summary["heads"] = head_results
+    # Fold head FAILs into failed_entries so every consumer of the summary
+    # — the PDF failure table, the printed tally, the process exit code —
+    # fails when a session's length claim fails. Adversarial audit
+    # 2026-08-06 (Finding B): these verdicts used to be computed and then
+    # read by nobody, so a tail+head-deleted chain reported clean.
+    for sid in sorted(head_results["per_session"]):
+        verdict, detail = head_results["per_session"][sid]
+        if verdict == FAIL:
+            last_seq = max(e["sequence"] for e in by_session[sid])
+            summary["failed_entries"].append(
+                HeadFailure(sid, last_seq, detail))
     return verifications, summary
 
 
@@ -561,6 +572,21 @@ def head_canonical(session_id, last_sequence, last_entry_hash):
             '"session_id":"%s",'
             '"v":"VIRP-CHAIN-HEAD-v1"}'
             % (last_entry_hash, last_sequence, session_id))
+
+
+class HeadFailure:
+    """A per-session head FAIL, shaped like a failed entry so it rides the
+    same failed_entries plumbing as per-entry failures (renderers read
+    .entry["session_id"], .entry["sequence"], .ok and .failures)."""
+
+    is_head = True
+
+    def __init__(self, session_id, last_visible_sequence, detail):
+        self.entry = {"session_id": session_id,
+                      "sequence": last_visible_sequence,
+                      "artifact_type": "(session head)"}
+        self.ok = False
+        self.failures = [("session head", detail)]
 
 
 def verify_heads(by_session, heads, chain_key, selection_complete=False):

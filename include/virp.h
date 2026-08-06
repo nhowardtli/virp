@@ -432,6 +432,42 @@ typedef enum {
      * that ends without the learned prompt is incomplete by definition
      * and must never be reported as command output. */
     VIRP_ERR_NO_PROMPT                = -45,  /* read ended without prompt */
+
+    /* Device identity is the unit of authorization binding (approvals,
+     * observations, chain sessions). Two devices sharing a hostname,
+     * node_id, or device_id would let evidence or approvals for one be
+     * read as the other's — refused at config load, fail closed. */
+    VIRP_ERR_DUPLICATE_DEVICE         = -46,  /* hostname/node_id/device_id
+                                                 collides with a loaded
+                                                 device */
+
+    /* A chain handle opened by virp_chain_open_verifier() can prove or
+     * refute what a database says; it must never be able to change what
+     * the database says. Every mutating chain entry point refuses on
+     * such a handle. */
+    VIRP_ERR_CHAIN_READONLY           = -47,  /* write attempted on a
+                                                 read-only verifier
+                                                 chain handle */
+
+    /* Execution disposition honesty: the driver reported failure with
+     * no output and could NOT prove the command was never dispatched.
+     * The command may have executed on the device. The O-Node refuses
+     * to re-execute (authorized once must never become executed twice)
+     * and refuses to claim executed=no; it reports this typed UNKNOWN
+     * instead. Full disposition taxonomy (NOT_SENT/SENT_NO_ACK/...) is
+     * deferred to the EXECUTION_INTENT work. */
+    VIRP_ERR_OUTCOME_UNKNOWN          = -48,  /* response absent after
+                                                 possible dispatch;
+                                                 not retried */
+
+    /* Success-class status codes (> 0). Not errors: the operation's
+     * postcondition holds, but not because of this call. */
+    VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency
+                                                 race (or repeated): a
+                                                 canonical approval record
+                                                 already exists; *out holds
+                                                 the approver OF RECORD,
+                                                 not the caller. */
 } virp_error_t;
 
 /* =========================================================================

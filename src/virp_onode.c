@@ -17,6 +17,7 @@
 #define _GNU_SOURCE   /* struct ucred (SO_PEERCRED) */
 
 #include "virp_onode.h"
+#include "virp_fault_inject.h"   /* lab-only; compiles away without -DVIRP_FAULT_INJECT */
 #include "virp_message.h"
 #include "virp_handshake.h"
 #include "virp_transcript.h"
@@ -771,19 +772,22 @@ static void approval_emit_outcome(onode_state_t *state,
     char chain_session[96];
     snprintf(chain_session, sizeof(chain_session), "approval:%s", device_name);
 
+    /* Entry and body commit in one transaction; the mid_outcome fault
+     * point lives inside virp_chain_append_with_artifact() now, between
+     * the two inserts, where dying must lose both records instead of
+     * stranding a body-less entry. */
     virp_chain_entry_t ce;
-    virp_error_t cerr = virp_chain_append(&state->chain, chain_session,
-                                          "outcome", artifact_id,
-                                          artifact_hash, &ce);
+    virp_error_t cerr = virp_chain_append_with_artifact(&state->chain,
+                                          chain_session, "outcome",
+                                          artifact_id, artifact_hash,
+                                          content, &ce);
     if (cerr == VIRP_OK) {
-        virp_chain_artifact_store(&state->chain, artifact_id, "outcome",
-                                  content, artifact_hash, chain_session);
         fprintf(stderr, "[GATE] outcome persisted: proposal=%s seq=%lld "
                 "hash=%.16s success=%s\n", proposal_id,
                 (long long)ce.sequence, ce.chain_entry_hash,
                 success ? "true" : "false");
     } else {
-        fprintf(stderr, "[GATE] outcome chain_append failed: %s\n",
+        fprintf(stderr, "[GATE] outcome chain append+store failed: %s\n",
                 virp_error_str(cerr));
     }
 }
@@ -921,17 +925,30 @@ static virp_error_t onode_approval_submit(onode_state_t *state,
             state->approval_dir, &state->approvers,
             state->chain_enabled ? &state->chain : NULL,
             proposal_id, key_id, sig, sizeof(sig), &apr);
-    if (err != VIRP_OK) {
+    if (err != VIRP_OK && err != VIRP_APPROVAL_ALREADY_EXISTS) {
         fprintf(stderr, "[APPROVAL] submit rejected: proposal=%s key_id=%s "
                 "code=%d (%s)\n", proposal_id, key_id, (int)err,
                 virp_approval_err_name(err));
         return err;
     }
 
-    fprintf(stderr, "[APPROVAL] submitted: proposal=%s key_id=%s operator=%s "
-            "chain=%.16s\n", apr.proposal_id, apr.approver_key_id,
-            apr.operator[0] ? apr.operator : "(unknown)",
-            apr.chain_entry_hash[0] ? apr.chain_entry_hash : "-");
+    if (err == VIRP_APPROVAL_ALREADY_EXISTS) {
+        /* apr carries the approver OF RECORD (loaded from the canonical
+         * persisted record), which may differ from the submitter that
+         * lost the race — log both so the audit trail attributes the
+         * winner and still records that this submission arrived. */
+        fprintf(stderr, "[APPROVAL] submit idempotent: proposal=%s "
+                "submitted_key=%s approver_of_record=%s operator=%s "
+                "chain=%.16s\n", proposal_id, key_id, apr.approver_key_id,
+                apr.operator[0] ? apr.operator : "(unknown)",
+                apr.chain_entry_hash[0] ? apr.chain_entry_hash : "-");
+    } else {
+        fprintf(stderr, "[APPROVAL] submitted: proposal=%s key_id=%s "
+                "operator=%s chain=%.16s\n", apr.proposal_id,
+                apr.approver_key_id,
+                apr.operator[0] ? apr.operator : "(unknown)",
+                apr.chain_entry_hash[0] ? apr.chain_entry_hash : "-");
+    }
 
     cJSON *o = cJSON_CreateObject();
     if (!o) return VIRP_ERR_BUFFER_TOO_SMALL;
@@ -941,6 +958,8 @@ static virp_error_t onode_approval_submit(onode_state_t *state,
     cJSON_AddStringToObject(o, "chain_entry_hash", apr.chain_entry_hash);
     cJSON_AddNumberToObject(o, "approved_at_ns", (double)apr.approved_at_ns);
     cJSON_AddNumberToObject(o, "ttl_seconds", (double)apr.ttl_seconds);
+    cJSON_AddBoolToObject(o, "already_approved",
+                          err == VIRP_APPROVAL_ALREADY_EXISTS);
     char *json = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!json) return VIRP_ERR_BUFFER_TOO_SMALL;
@@ -1393,37 +1412,29 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                 snprintf(artifact_id, sizeof(artifact_id),
                          "gatereject-%.16s", artifact_hash);
 
+                /* Entry and body are one transaction now: a stored
+                 * rejection always has its reason recoverable, and a
+                 * body-store failure fails the whole append (logged
+                 * below) instead of stranding a commitment. The
+                 * body==NULL fallback keeps the historical entry-only
+                 * append — a rejection must always be recorded even
+                 * when its body could not be built. */
                 virp_chain_entry_t ce;
-                virp_error_t cerr = virp_chain_append(&state->chain, session_id,
-                                                      "gate_rejection",
-                                                      artifact_id, artifact_hash,
-                                                      &ce);
+                virp_error_t cerr = virp_chain_append_with_artifact(
+                                        &state->chain, session_id,
+                                        "gate_rejection", artifact_id,
+                                        artifact_hash, body, &ce);
                 if (cerr == VIRP_OK) {
-                    /* Store the body under the same id the entry names.
-                     * Best-effort like the append itself: a storage
-                     * failure must not alter the rejection, but it is
-                     * logged so a chain with unrecoverable reasons is
-                     * visible rather than silent. */
-                    if (body) {
-                        virp_error_t serr = virp_chain_artifact_store(
-                                &state->chain, artifact_id, "gate_rejection",
-                                body, artifact_hash, session_id);
-                        if (serr != VIRP_OK)
-                            fprintf(stderr, "[GATE] rejection reason body "
-                                    "store failed: %s (entry %s retains only "
-                                    "the commitment)\n",
-                                    virp_error_str(serr), artifact_id);
-                    } else {
+                    if (!body)
                         fprintf(stderr, "[GATE] rejection reason body could "
                                 "not be built; entry %s retains only the "
                                 "commitment\n", artifact_id);
-                    }
                     fprintf(stderr, "[GATE] rejection persisted: session=%s "
                             "seq=%lld hash=%.16s\n", session_id,
                             (long long)ce.sequence, ce.chain_entry_hash);
                 } else {
-                    fprintf(stderr, "[GATE] rejection chain_append failed: %s\n",
-                            virp_error_str(cerr));
+                    fprintf(stderr, "[GATE] rejection chain append+store "
+                            "failed: %s\n", virp_error_str(cerr));
                 }
 
                 if (body) free(body);
@@ -1442,7 +1453,11 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     }
 
     virp_exec_result_t result;
+    memset(&result, 0, sizeof(result));   /* no_dispatch=false unless the
+                                             driver proves otherwise */
+    VIRP_FI("pre_exec");
     virp_error_t err = drv->execute(conn, command, &result);
+    VIRP_FI("post_exec");
     if (err != VIRP_OK) {
         drop_connection(state, dev_idx);
         pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -1464,8 +1479,20 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                       &state->okey);
     }
 
-    /* On failure: drop stale connection, retry once with fresh connection */
-    if (!result.success && result.output_len == 0) {
+    /* Retry once with a fresh connection, but ONLY when the driver proved
+     * the command was never dispatched (result.no_dispatch). Nothing
+     * reached the device, so a second execute is a first execution, not a
+     * repeat. Without that proof, absence of a response is not absence of
+     * a side effect, and this block used to re-execute generically:
+     * authorized once, executed twice. The unprovable case is handled
+     * below as a typed OUTCOME_UNKNOWN instead.
+     *
+     * The old `output_len == 0` conjunct is GONE and must not come back:
+     * the linux driver seeds its output buffer with a "<host>$ <cmd>\n"
+     * prefix before reading, so that test was always false and silently
+     * disabled this branch for that driver (TRANSCRIPT-05). Buffer
+     * contents say nothing about whether bytes were dispatched. */
+    if (!result.success && result.no_dispatch) {
         drop_connection(state, dev_idx);
         conn = get_connection(state, dev_idx);
         if (conn) {
@@ -1498,11 +1525,62 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
 
     /*
+     * Failure with no output and NO proof of non-dispatch: the command
+     * may have reached and executed on the device (SSH write completed
+     * but the response was lost; REST request timed out after send;
+     * output exceeded the evidence limit). Re-executing here is the
+     * authorized-once-executed-twice bug; claiming executed=no is a
+     * lie. Report the typed UNKNOWN. The connection is dropped — its
+     * state is unknowable too. Approval outcome stays the existing
+     * binary failure record (a consumed approval cannot be replayed to
+     * "try again"); expressing UNKNOWN in the outcome artifact itself
+     * is EXECUTION_INTENT territory, deferred with Part B.
+     */
+    /* A driver that classifies its termination (linux) states UNKNOWN
+     * directly. The output_len test in the second clause is the LEGACY path
+     * for drivers not yet converted to the classifier — it is deliberately
+     * NOT part of the new decision, and must never be reintroduced into it:
+     * for the linux driver it was always false, which is precisely how this
+     * branch came to be dead code. Converting the remaining drivers retires
+     * that clause. */
+    if (result.disposition == VIRP_DISPOSITION_EXECUTED_UNKNOWN ||
+        (result.disposition == VIRP_DISPOSITION_UNSET &&
+         !result.success && result.output_len == 0 && !result.no_dispatch)) {
+        pthread_mutex_lock(&state->exec_mutex[dev_idx]);
+        drop_connection(state, dev_idx);
+        pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+        char err_msg[sizeof(result.error_msg) + 160];
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: outcome UNKNOWN on '%s': %s — no response after "
+                 "possible dispatch; not retried (command may have "
+                 "executed)",
+                 device_name,
+                 result.error_msg[0] ? result.error_msg
+                                     : virp_error_str(VIRP_ERR_OUTCOME_UNKNOWN));
+        if (approved)
+            approval_emit_outcome(state, proposal_id, &apr,
+                                  device_name, false);
+        fprintf(stderr, "[ERROR-OBS] device=%s tier=%s executed=unknown "
+                "disposition=%s reason=\"%s\"\n", device_name,
+                gate_tier_name(gate_tier),
+                virp_disposition_str(result.disposition), err_msg);
+        return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                      state->devices[dev_idx].node_id,
+                                      onode_next_seq(state),
+                                      VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                      gate_obs_tier(gate_tier),
+                                      (const uint8_t *)err_msg,
+                                      (uint16_t)strlen(err_msg),
+                                      &state->okey);
+    }
+
+    /*
      * Driver soft-failure with no output: the driver refused the command
      * before any device I/O (VIRP_OK + success=false + error_msg — the
      * shape REST drivers like Wazuh use for invalid or BLACK-tier
-     * endpoints). Nothing executed, so this must be a signed ERROR
-     * observation carrying the command's true tier — never the
+     * endpoints). Nothing executed (no_dispatch proven — the unproven
+     * case returned above as OUTCOME_UNKNOWN), so this must be a signed
+     * ERROR observation carrying the command's true tier — never the
      * DEVICE_OUTPUT / v2 session-bound constructor used for executed
      * output, which downstream renders as a logged change.
      */
@@ -1524,6 +1602,16 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                       (uint16_t)strlen(err_msg),
                                       &state->okey);
     }
+
+    /* What the device's termination actually told us, recorded before the
+     * observation is built so the log and the signed artifact cannot drift. */
+    fprintf(stderr, "[EXEC] device=%s disposition=%s success=%s exit=%d "
+            "exit_trusted=%s truncated=%s reason=\"%s\"\n",
+            device_name, virp_disposition_str(result.disposition),
+            result.success ? "true" : "false", result.exit_code,
+            result.exit_code_trusted ? "yes" : "no",
+            result.output_truncated ? "yes" : "no",
+            result.error_msg[0] ? result.error_msg : "-");
 
     const uint8_t *obs_data = (const uint8_t *)result.output;
     uint16_t data_len = (result.output_len > 65530) ?
@@ -1590,6 +1678,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
 
     /* Approved apply reached execution: link PROPOSAL + APPROVAL to the
      * outcome, whatever the device reported. */
+    VIRP_FI("pre_outcome");
     if (approved)
         approval_emit_outcome(state, proposal_id, &apr,
                               device_name, result.success);
@@ -1968,8 +2057,11 @@ int send_all(int fd, const void *buf, size_t len)
  * Returns 0 on success, -1 on failure. On failure the connection is
  * dead (see send_all) — callers must not attempt further sends on it;
  * every handle_client path closes the fd before returning.
+ *
+ * Non-static so tests/test_onode.c can drive the framing path itself
+ * under forced short writes — same precedent as send_all above.
  */
-static int send_framed(int fd, const void *buf, size_t len)
+int send_framed(int fd, const void *buf, size_t len)
 {
     uint32_t net_len = htonl((uint32_t)len);
     if (send_all(fd, &net_len, 4) < 0)
@@ -2247,21 +2339,104 @@ static void handle_client(onode_state_t *state, int client_fd)
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
+        /*
+         * CHAIN_APPEND is not a signing oracle (adversarial audit
+         * 2026-08-06). Everything below this point gets a K_chain HMAC,
+         * so a caller holding no key could otherwise induce an
+         * authenticated entry a reader cannot tell from a daemon-minted
+         * one. Two gates, both fail-closed, both on the EXTERNAL path
+         * only — internal callers reach the chain writer directly and
+         * mint their own hashes from bodies they built.
+         */
+
+        /* GATE 1 — type namespace. Daemon-minted semantic types are
+         * refused outright, and unknown types are refused rather than
+         * recorded as if they meant something. */
+        if (virp_chain_type_is_daemon_reserved(req.artifact_type)) {
+            fprintf(stderr, "[O-Node] chain_append REJECTED: artifact_type "
+                    "'%s' is daemon-generated and may not be submitted by a "
+                    "socket client (session=%s id=%s)\n",
+                    req.artifact_type, req.session_id, req.artifact_id);
+            send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
+            break;
+        }
+        if (!virp_chain_type_is_external_allowed(req.artifact_type)) {
+            fprintf(stderr, "[O-Node] chain_append REJECTED: unknown "
+                    "artifact_type '%s' (session=%s id=%s)\n",
+                    req.artifact_type, req.session_id, req.artifact_id);
+            send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
+            break;
+        }
+
+        /* GATE 2 — body binding. When a body is submitted the daemon
+         * recomputes SHA-256 over the exact received bytes and refuses a
+         * declared hash that does not match, constant-time.
+         *
+         * The INDIRECT types are the one exception and are NOT a hole
+         * left open for convenience: their artifact_hash commits to a
+         * signed observation the chain does not retain (the autopilot
+         * comparator and chainwalk register the verdict JSON as the body
+         * while committing to the signed message), so sha256(body) can
+         * never match by design. They still must supply a non-empty body,
+         * and the verifier grades them UNVERIFIABLE rather than passing
+         * them silently. With GATE 1 above reserving every semantic type,
+         * the exception is exactly two non-semantic type names wide.
+         *
+         * DEFERRED: making the indirection explicit as a commitment_mode
+         * field inside the HMAC'd canonical object would let both modes
+         * be verified instead of one being UNVERIFIABLE. That changes the
+         * canonical form, so it belongs with the provenance field in a
+         * chain-format change window. */
+        if (req.artifact_content[0] != '\0') {
+            if (virp_chain_type_is_indirect(req.artifact_type)) {
+                /* body present is all that can be required here */
+            } else {
+                char computed[65];
+                virp_error_t derr = virp_chain_artifact_digest(
+                                        req.artifact_content, computed);
+                if (derr != VIRP_OK) {
+                    fprintf(stderr, "[O-Node] chain_append REJECTED: "
+                            "artifact_content is not decodable (session=%s "
+                            "id=%s)\n", req.session_id, req.artifact_id);
+                    send_framed_error(client_fd, derr);
+                    break;
+                }
+                if (strlen(req.artifact_hash) != 64 ||
+                    virp_consttime_eq(computed, req.artifact_hash, 64) != 1) {
+                    fprintf(stderr, "[O-Node] chain_append REJECTED: declared "
+                            "artifact_hash does not match sha256 of the "
+                            "submitted body (session=%s id=%s type=%s)\n",
+                            req.session_id, req.artifact_id,
+                            req.artifact_type);
+                    send_framed_error(client_fd, VIRP_ERR_CHAIN_BROKEN);
+                    break;
+                }
+            }
+        } else if (virp_chain_type_is_indirect(req.artifact_type)) {
+            fprintf(stderr, "[O-Node] chain_append REJECTED: artifact_type "
+                    "'%s' commits indirectly and must carry a body "
+                    "(session=%s id=%s)\n",
+                    req.artifact_type, req.session_id, req.artifact_id);
+            send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
+            break;
+        }
         {
+            /* Entry and (optional) raw content commit in one transaction.
+             * A content-store failure now fails the whole request with a
+             * typed error instead of acking an entry whose committed body
+             * was silently dropped. Content-less appends remain valid:
+             * commitment-only is a caller choice, not a failure mode. */
             virp_chain_entry_t chain_entry;
-            err = virp_chain_append(&state->chain, req.session_id,
+            err = virp_chain_append_with_artifact(&state->chain,
+                                     req.session_id,
                                      req.artifact_type, req.artifact_id,
-                                     req.artifact_hash, &chain_entry);
+                                     req.artifact_hash,
+                                     req.artifact_content[0] != '\0'
+                                         ? req.artifact_content : NULL,
+                                     &chain_entry);
             if (err != VIRP_OK) {
                 send_framed_error(client_fd, err);
                 break;
-            }
-            /* Store raw artifact content if provided */
-            if (req.artifact_content[0] != '\0') {
-                virp_chain_artifact_store(&state->chain,
-                    req.artifact_id, req.artifact_type,
-                    req.artifact_content, req.artifact_hash,
-                    req.session_id);
             }
             /* JSON-encode the chain entry as observation payload */
             char json_buf[2048];
@@ -3408,6 +3583,39 @@ virp_error_t onode_add_device(onode_state_t *state,
     if (state->devices[state->device_count].device_id == 0)
         state->devices[state->device_count].device_id =
             virp_device_id_from_hostname(device->hostname);
+
+    /* Identity uniqueness, same choke point (checked AFTER derivation so
+     * an explicit device_id colliding with another device's derived one
+     * is caught too). hostname routes requests, node_id routes wire
+     * messages and binds approvals, device_id binds v2 observations —
+     * a duplicate in any of them makes one device's evidence readable
+     * as another's. Fail closed, naming both devices. */
+    {
+        const virp_device_t *nd = &state->devices[state->device_count];
+        for (int i = 0; i < state->device_count; i++) {
+            const virp_device_t *ed = &state->devices[i];
+            const char *field = NULL;
+            if (strcmp(ed->hostname, nd->hostname) == 0)
+                field = "hostname";
+            else if (nd->node_id != 0 && ed->node_id == nd->node_id)
+                field = "node_id";   /* 0 = absent: never routed, and
+                                        approval binding pairs it with
+                                        the (unique) hostname */
+            else if (ed->device_id == nd->device_id)
+                field = "device_id";
+            if (field) {
+                fprintf(stderr, "[O-Node] FATAL: duplicate %s — device "
+                        "'%s' (node_id=0x%08x device_id=0x%016llx) "
+                        "collides with already-loaded '%s' (node_id=0x%08x "
+                        "device_id=0x%016llx)\n", field,
+                        nd->hostname, nd->node_id,
+                        (unsigned long long)nd->device_id,
+                        ed->hostname, ed->node_id,
+                        (unsigned long long)ed->device_id);
+                return VIRP_ERR_DUPLICATE_DEVICE;
+            }
+        }
+    }
 
     state->connections[state->device_count] = NULL;
     state->device_count++;

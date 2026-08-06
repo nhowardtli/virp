@@ -689,6 +689,134 @@ class TestTamperDetection(unittest.TestCase):
         self.assertIsNotNone(summary["first_broken_link"])
 
 
+HEADS_CREATE_SQL = """
+CREATE TABLE chain_heads (
+  session_id TEXT PRIMARY KEY, last_sequence INTEGER NOT NULL,
+  last_entry_hash TEXT NOT NULL, head_hmac TEXT NOT NULL,
+  updated_at_ns INTEGER NOT NULL);
+"""
+
+
+def add_signed_heads(db_path, chain_key=TEST_CHAIN_KEY):
+    """Upgrade a ChainBuilder database to the modern shape: a chain_heads
+    table with one correctly signed head per session, byte-identical to what
+    src/virp_chain.c head_upsert_locked() writes."""
+    conn = sqlite3.connect(db_path)
+    conn.executescript(HEADS_CREATE_SQL)
+    rows = conn.execute(
+        "SELECT ce.session_id, ce.sequence, ce.chain_entry_hash "
+        "FROM chain_entries ce JOIN ("
+        "  SELECT session_id, MAX(sequence) AS m FROM chain_entries "
+        "  GROUP BY session_id) t "
+        "ON t.session_id = ce.session_id AND t.m = ce.sequence").fetchall()
+    for sid, seq, ehash in rows:
+        mac = hmac_mod.new(chain_key,
+                           verify.head_canonical(sid, seq, ehash).encode(),
+                           hashlib.sha256).hexdigest()
+        conn.execute("INSERT INTO chain_heads VALUES (?,?,?,?,?)",
+                     (sid, seq, ehash, mac, 1785300000000000000))
+    conn.commit()
+    conn.close()
+
+
+class TestHeadVerdictGatesReport(unittest.TestCase):
+    """The signed head verdicts must GATE the report, not just be computed.
+
+    Adversarial audit 2026-08-06, Finding B: verify_chain() set
+    summary["heads"] with correct FAIL verdicts for the tail+head-deletion
+    attack, but nothing read it — on a truncated chain the PDF printed
+    "No entry failed verification" and the process exited 0. These tests
+    FAIL against that code.
+    """
+
+    SESSION = "autopilot:test"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="virp-report-heads-")
+        self.db = os.path.join(self.tmp, "chain.db")
+        build_reference_chain(self.db)
+        add_signed_heads(self.db)
+        self.okey_file = os.path.join(self.tmp, "okey")
+        with open(self.okey_file, "wb") as fh:
+            fh.write(TEST_OKEY)
+        self.chain_key_file = os.path.join(self.tmp, "ckey")
+        with open(self.chain_key_file, "wb") as fh:
+            fh.write(TEST_CHAIN_KEY)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _delete_tail_and_head(self, keep_up_to=2):
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "DELETE FROM chain_entries WHERE session_id=? AND sequence>?",
+            (self.SESSION, keep_up_to))
+        conn.execute("DELETE FROM chain_heads WHERE session_id=?",
+                     (self.SESSION,))
+        conn.commit()
+        conn.close()
+
+    def _run(self, name="r.pdf"):
+        out = os.path.join(self.tmp, name)
+        code = run_report(self.db, out,
+                          ["--okey", self.okey_file,
+                           "--chain-key", self.chain_key_file])
+        return code, out
+
+    def test_intact_headed_chain_passes(self):
+        """Guard against the fix over-firing: a healthy chain whose heads
+        all authenticate must still exit 0."""
+        code, out = self._run()
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(out))
+
+    def test_tail_and_head_deletion_exits_nonzero(self):
+        self._delete_tail_and_head()
+        code, out = self._run("truncated.pdf")
+        self.assertEqual(
+            code, 1,
+            "tail+head deletion left every per-entry check passing; the "
+            "head FAIL must gate the exit code")
+        self.assertTrue(os.path.exists(out))
+
+    def test_tail_and_head_deletion_is_rendered(self):
+        self._delete_tail_and_head()
+        code, out = self._run("truncated.pdf")
+        text = extract_pdf_text(out)
+        if text is None:
+            self.skipTest("no pdftotext available to inspect the PDF")
+        self.assertNotIn("No entry failed verification", text)
+        self.assertIn("FAILED VERIFICATION", text)
+        self.assertIn("head", text.lower())
+
+    def test_truncation_with_stale_head_exits_nonzero(self):
+        """Tail deleted but the (now stale) signed head left in place: the
+        head commits to a sequence the session no longer reaches."""
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "DELETE FROM chain_entries WHERE session_id=? AND sequence>?",
+            (self.SESSION, 2))
+        conn.commit()
+        conn.close()
+        code, _ = self._run("stale-head.pdf")
+        self.assertEqual(code, 1)
+
+    def test_evidence_report_exits_nonzero_on_truncation(self):
+        """The second PDF path (virp-evidence-report) must gate on the same
+        head verdicts."""
+        import virp_evidence_report
+        self._delete_tail_and_head()
+        out = os.path.join(self.tmp, "evidence.pdf")
+        code = virp_evidence_report.main(
+            ["--db", self.db, "--out", out, "--session", self.SESSION,
+             "--okey", self.okey_file, "--chain-key", self.chain_key_file])
+        self.assertEqual(code, 1)
+        text = extract_pdf_text(out)
+        if text is None:
+            self.skipTest("no pdftotext available to inspect the PDF")
+        self.assertIn("failed verification", text.lower())
+
+
 class TestCLIArgumentHandling(unittest.TestCase):
     def test_timestamp_parsing_forms(self):
         self.assertEqual(virp_report.parse_timestamp("1785300000"),

@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <arpa/inet.h>
 
 #define FUZZ_ROUNDS     100000
 #define MAX_FUZZ_SIZE   (VIRP_MAX_MESSAGE_SIZE + 64)
@@ -235,6 +236,48 @@ static int fuzz_boundary(void)
     virp_tlv_parse(buf, 0, 0, &tlv, &val);
     virp_tlv_parse(buf, 2, 0, &tlv, &val);
     virp_tlv_parse(buf, sizeof(buf), 0, &tlv, &val);
+
+    /* Embedded-length liars — obs_length / obs_ref_count claiming more
+     * than the buffer carries. The parsers must reject these, never
+     * return a data_len/refs pointer that overruns the payload. */
+    {
+        virp_observation_t obs;
+        const uint8_t *odata;
+        uint16_t odata_len;
+
+        uint8_t opay[14];
+        opay[0] = VIRP_OBS_DEVICE_OUTPUT;
+        opay[1] = VIRP_SCOPE_LOCAL;
+        uint16_t big = htons(0xFFFF);           /* max claim, 10 bytes present */
+        memcpy(opay + 2, &big, 2);
+        memset(opay + 4, 'Z', 10);
+        virp_parse_observation(opay, sizeof(opay), &obs, &odata, &odata_len);
+
+        uint16_t off_by_one = htons(11);        /* one byte more than present */
+        memcpy(opay + 2, &off_by_one, 2);
+        virp_parse_observation(opay, sizeof(opay), &obs, &odata, &odata_len);
+
+        uint16_t zero = htons(0);               /* zero claim, bare sub-header */
+        memcpy(opay + 2, &zero, 2);
+        virp_parse_observation(opay, 4, &obs, &odata, &odata_len);
+
+        virp_proposal_t prop;
+        const virp_obs_ref_t *refs;
+        const uint8_t *pdata;
+        uint16_t pdata_len;
+
+        uint8_t ppay[12];
+        memset(ppay, 0, sizeof(ppay));
+        uint32_t huge = htonl(0xFFFFFFFFu);     /* 4G refs in 12 bytes */
+        memcpy(ppay + 8, &huge, 4);
+        virp_parse_proposal(ppay, sizeof(ppay), &prop, &refs,
+                            &pdata, &pdata_len);
+
+        uint32_t one = htonl(1);                /* 1 ref claimed, 0 present */
+        memcpy(ppay + 8, &one, 4);
+        virp_parse_proposal(ppay, sizeof(ppay), &prop, &refs,
+                            &pdata, &pdata_len);
+    }
 
     printf("[OK] no crashes\n");
     return 0;

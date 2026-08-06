@@ -256,6 +256,14 @@ static int load_devices_json(onode_state_t *state, const char *path)
         /* device_id == 0 (absent/unparseable) is derived from the
          * hostname inside onode_add_device — the single choke point. */
         virp_error_t err = onode_add_device(state, &device);
+        if (err == VIRP_ERR_DUPLICATE_DEVICE) {
+            /* Config error, not a device to skip — refuse the whole
+             * config (add_device already named both devices). */
+            fprintf(stderr, "[O-Node] FATAL: refusing device config %s "
+                    "with duplicate identities\n", path);
+            json_object_put(root);
+            return -1;
+        }
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] Failed to add %s: %s\n",
                     device.hostname, virp_error_str(err));
@@ -421,9 +429,17 @@ int main(int argc, char **argv)
     }
     g_state.ctx = ctx;
 
-    /* Load devices */
+    /* Load devices. A negative return is a refused config (duplicate
+     * identities) — startup must fail closed, not run with a partial
+     * device list. */
     if (devices_path) {
-        load_devices_json(&g_state, devices_path);
+        if (load_devices_json(&g_state, devices_path) < 0) {
+            fprintf(stderr, "[O-Node] Startup aborted: device config "
+                    "refused. Exiting.\n");
+            onode_destroy(&g_state);
+            virp_context_destroy(ctx);
+            return 1;
+        }
     } else if (use_mock) {
         add_mock_devices(&g_state);
     }

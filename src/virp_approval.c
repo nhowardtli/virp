@@ -15,6 +15,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_approval.h"
+#include "virp_fault_inject.h"   /* lab-only; compiles away without -DVIRP_FAULT_INJECT */
 #include "virp_crypto.h"
 
 #include <errno.h>
@@ -51,6 +52,7 @@ const char *virp_approval_err_name(virp_error_t err)
     case VIRP_ERR_APPROVAL_CONSUMED:        return "approval_proposal_consumed";
     case VIRP_ERR_APPROVAL_KEY_UNENROLLED:  return "approval_key_unenrolled";
     case VIRP_ERR_APPROVAL_KEY_DISABLED:    return "approval_key_disabled";
+    case VIRP_APPROVAL_ALREADY_EXISTS:      return "approval_already_exists";
     default:                                return "error";
     }
 }
@@ -376,12 +378,14 @@ virp_error_t virp_approval_propose(const char *dir,
                  out->proposal_id);
         char chain_session[96];
         snprintf(chain_session, sizeof(chain_session), "approval:%s", device);
+        /* Entry + body in one transaction: a filed proposal always has
+         * its body recoverable from the chain, and a body-store failure
+         * fails the filing typed instead of stranding a commitment. */
         virp_chain_entry_t ce;
-        err = virp_chain_append(chain, chain_session, "proposal",
-                                artifact_id, artifact_hash, &ce);
+        err = virp_chain_append_with_artifact(chain, chain_session,
+                                              "proposal", artifact_id,
+                                              artifact_hash, body, &ce);
         if (err != VIRP_OK) return err;
-        virp_chain_artifact_store(chain, artifact_id, "proposal",
-                                  body, artifact_hash, chain_session);
         snprintf(out->chain_entry_hash, sizeof(out->chain_entry_hash), "%s",
                  ce.chain_entry_hash);
     }
@@ -646,6 +650,10 @@ virp_error_t virp_approval_challenge(const char *dir,
     return challenge_write(dir, out);
 }
 
+static virp_error_t approval_record_load(const char *dir,
+                                         const char *proposal_id,
+                                         virp_approval_rec_t *out);
+
 virp_error_t virp_approval_submit(const char *dir,
                                   const virp_approver_registry_t *reg,
                                   virp_chain_state_t *chain,
@@ -710,9 +718,15 @@ virp_error_t virp_approval_submit(const char *dir,
     approval_path(dir, proposal_id, apath, sizeof(apath));
     char probe[16];
     if (read_file(apath, probe, sizeof(probe)) >= 0) {
-        /* Already approved by a concurrent/earlier submit — idempotent. */
+        /* Already approved by a concurrent/earlier submit. Attribution
+         * is the product: *out was filled above with the CALLER's
+         * identity, but the approver of record is whoever won the race
+         * — overwrite *out from the canonical persisted record and say
+         * so with a distinct success-class code, so no caller can log
+         * or report the loser as the approver. */
+        virp_error_t lerr = approval_record_load(dir, proposal_id, out);
         pthread_mutex_unlock(&submit_mu);
-        return VIRP_OK;
+        return (lerr == VIRP_OK) ? VIRP_APPROVAL_ALREADY_EXISTS : lerr;
     }
 
     if (chain) {
@@ -727,12 +741,13 @@ virp_error_t virp_approval_submit(const char *dir,
         char chain_session[96];
         snprintf(chain_session, sizeof(chain_session), "approval:%s",
                  out->device);
+        /* Entry + body in one transaction — same rationale as the
+         * proposal filing above. */
         virp_chain_entry_t ce;
-        err = virp_chain_append(chain, chain_session, "approval",
-                                artifact_id, artifact_hash, &ce);
+        err = virp_chain_append_with_artifact(chain, chain_session,
+                                              "approval", artifact_id,
+                                              artifact_hash, content, &ce);
         if (err != VIRP_OK) { pthread_mutex_unlock(&submit_mu); return err; }
-        virp_chain_artifact_store(chain, artifact_id, "approval",
-                                  content, artifact_hash, chain_session);
         snprintf(out->chain_entry_hash, sizeof(out->chain_entry_hash), "%s",
                  ce.chain_entry_hash);
     }
@@ -780,6 +795,59 @@ static virp_error_t approval_load_raw(const char *dir,
     chain_hash[0] = '\0';
     if (lines[2][0] && strcmp(lines[2], "-") != 0)
         snprintf(chain_hash, 65, "%s", lines[2]);
+    return VIRP_OK;
+}
+
+/*
+ * Load + parse the persisted approval record into *out — the single
+ * parser for the on-disk record, shared by verify_consume and the
+ * submit already-exists path so "who is the approver of record" has
+ * exactly one answer. Structural validation only (shape, proposal-id
+ * echo, hex fields); enrollment, signature, command/device binding and
+ * TTL checks remain the caller's job.
+ */
+static virp_error_t approval_record_load(const char *dir,
+                                         const char *proposal_id,
+                                         virp_approval_rec_t *out)
+{
+    char body[2048];
+    uint8_t sig[VIRP_FED_SIG_SIZE];
+    char chain_hash[65];
+    virp_error_t err = approval_load_raw(dir, proposal_id, body, sizeof(body),
+                                         sig, chain_hash);
+    if (err != VIRP_OK) return err;
+
+    /* Parse the binding (untrusted until the caller's signature check,
+     * which covers the whole body — a tampered field changes the signed
+     * bytes). */
+    cJSON *o = cJSON_Parse(body);
+    if (!o || !cJSON_IsObject(o)) {
+        if (o) cJSON_Delete(o);
+        return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
+    }
+    memset(out, 0, sizeof(*out));
+    uint64_t nid = 0, at = 0, ttl = 0;
+    bool ok =
+        jget_str(o, "proposal_id", out->proposal_id, sizeof(out->proposal_id)) &&
+        jget_str(o, "command_hash", out->command_hash, sizeof(out->command_hash)) &&
+        jget_str(o, "device", out->device, sizeof(out->device)) &&
+        jget_u64(o, "device_node_id", &nid) &&
+        jget_u64str(o, "approved_at_ns", &at) &&
+        jget_u64(o, "ttl_seconds", &ttl) &&
+        jget_str(o, "approver_key_id", out->approver_key_id,
+                 sizeof(out->approver_key_id));
+    jget_str(o, "operator", out->operator, sizeof(out->operator));
+    cJSON_Delete(o);
+    if (!ok || nid > UINT32_MAX || ttl > 86400 ||
+        strcmp(out->proposal_id, proposal_id) != 0 ||
+        !hex64_valid(out->command_hash))
+        return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
+    out->device_node_id = (uint32_t)nid;
+    out->approved_at_ns = at;
+    out->ttl_seconds = (uint32_t)ttl;
+    memcpy(out->sig, sig, sizeof(out->sig));
+    snprintf(out->chain_entry_hash, sizeof(out->chain_entry_hash), "%s",
+             chain_hash);
     return VIRP_OK;
 }
 
@@ -849,43 +917,8 @@ virp_error_t virp_approval_verify_consume(const char *dir,
     if (!proposal_id_valid(proposal_id))
         return VIRP_ERR_APPROVAL_NOT_FOUND;
 
-    char body[2048];
-    uint8_t sig[VIRP_FED_SIG_SIZE];
-    char chain_hash[65];
-    virp_error_t err = approval_load_raw(dir, proposal_id, body, sizeof(body),
-                                         sig, chain_hash);
+    virp_error_t err = approval_record_load(dir, proposal_id, out);
     if (err != VIRP_OK) return err;
-
-    /* Parse the binding (untrusted until the signature check below, which
-     * covers the whole body — a tampered field changes the signed bytes). */
-    cJSON *o = cJSON_Parse(body);
-    if (!o || !cJSON_IsObject(o)) {
-        if (o) cJSON_Delete(o);
-        return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
-    }
-    memset(out, 0, sizeof(*out));
-    uint64_t nid = 0, at = 0, ttl = 0;
-    bool ok =
-        jget_str(o, "proposal_id", out->proposal_id, sizeof(out->proposal_id)) &&
-        jget_str(o, "command_hash", out->command_hash, sizeof(out->command_hash)) &&
-        jget_str(o, "device", out->device, sizeof(out->device)) &&
-        jget_u64(o, "device_node_id", &nid) &&
-        jget_u64str(o, "approved_at_ns", &at) &&
-        jget_u64(o, "ttl_seconds", &ttl) &&
-        jget_str(o, "approver_key_id", out->approver_key_id,
-                 sizeof(out->approver_key_id));
-    jget_str(o, "operator", out->operator, sizeof(out->operator));
-    cJSON_Delete(o);
-    if (!ok || nid > UINT32_MAX || ttl > 86400 ||
-        strcmp(out->proposal_id, proposal_id) != 0 ||
-        !hex64_valid(out->command_hash))
-        return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
-    out->device_node_id = (uint32_t)nid;
-    out->approved_at_ns = at;
-    out->ttl_seconds = (uint32_t)ttl;
-    memcpy(out->sig, sig, sizeof(out->sig));
-    snprintf(out->chain_entry_hash, sizeof(out->chain_entry_hash), "%s",
-             chain_hash);
 
     /* 1. The signing key must be enrolled (and enabled). Distinguish
      * unenrolled from disabled so the rejection names the true cause. */
@@ -905,7 +938,7 @@ virp_error_t virp_approval_verify_consume(const char *dir,
                                       out->ttl_seconds, canon) != VIRP_OK)
         return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
     if (virp_approver_verify(ent, canon, sizeof(canon),
-                             sig, sizeof(sig)) != VIRP_OK)
+                             out->sig, sizeof(out->sig)) != VIRP_OK)
         return VIRP_ERR_APPROVAL_BAD_SIGNATURE;
 
     /* 3. Command binding. */
@@ -930,5 +963,10 @@ virp_error_t virp_approval_verify_consume(const char *dir,
         return VIRP_ERR_APPROVAL_EXPIRED;
 
     /* 6. Single-use consume (durable; persist failure fails closed). */
-    return consume_once(dir, proposal_id);
+    VIRP_FI("pre_consume");
+    {
+        virp_error_t _c = consume_once(dir, proposal_id);
+        if (_c == VIRP_OK) VIRP_FI("post_consume");
+        return _c;
+    }
 }

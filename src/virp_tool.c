@@ -582,6 +582,28 @@ static void json_escape(const char *src, char *dst, size_t dst_len)
     dst[o] = '\0';
 }
 
+/* Client-side counterpart of the daemon's send_all() (5cd1e2d9): write(2)
+ * on a SOCK_STREAM socket may short-write or take EINTR mid-frame, and a
+ * partially written request frame desynchronizes the connection exactly
+ * like a partial response frame would. Loop until every byte is out;
+ * retry EINTR; anything else is a dead connection. */
+static int write_all(int fd, const void *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, (const uint8_t *)buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0)
+            return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
 /* Send one framed JSON request, read one framed response.
  * Returns 0 and fills resp/resp_len on success, -1 on transport error. */
 static int onode_framed_roundtrip(const char *sock_path,
@@ -605,8 +627,8 @@ static int onode_framed_roundtrip(const char *sock_path,
     /* v2 framing: [4-byte BE length][version byte][JSON] */
     uint32_t frame_len = htonl((uint32_t)(1 + json_len));
     uint8_t version = VIRP_FRAME_VERSION;
-    if (write(fd, &frame_len, 4) != 4 || write(fd, &version, 1) != 1 ||
-        write(fd, json, json_len) != (ssize_t)json_len) {
+    if (write_all(fd, &frame_len, 4) != 0 || write_all(fd, &version, 1) != 0 ||
+        write_all(fd, json, json_len) != 0) {
         fprintf(stderr, "Error: send failed\n");
         close(fd);
         return -1;
@@ -1265,9 +1287,19 @@ static int cmd_approve(int argc, char **argv)
     }
     if (rc != 0) return 1;
 
-    printf("\nAPPROVED — single use, TTL 300s from approval time.\n");
-    printf("  key_id: %s\n", key_id);
-    printf("  %s\n", payload);
+    /* The daemon reports the approver OF RECORD. If an approval already
+     * existed (this submission lost an idempotency race or repeated), the
+     * record belongs to someone else — do not claim it as ours. */
+    if (strstr(payload, "\"already_approved\":true")) {
+        printf("\nALREADY APPROVED — an approval of record exists; this "
+               "submission was NOT recorded.\n");
+        printf("  submitted with key_id: %s\n", key_id);
+        printf("  approval of record:    %s\n", payload);
+    } else {
+        printf("\nAPPROVED — single use, TTL 300s from approval time.\n");
+        printf("  key_id: %s\n", key_id);
+        printf("  %s\n", payload);
+    }
     printf("Re-submit within the TTL:  virp apply %s\n", proposal_id);
     return 0;
 }
@@ -1458,16 +1490,279 @@ static int cmd_chain_tail(int argc, char **argv)
     return 0;
 }
 
-static int cmd_chain(int argc, char **argv)
+/* =========================================================================
+ * chain verify — expose virp_chain_verify_session() from the CLI
+ *
+ * Test #2's finding: the verification logic (per-entry HMAC, prev-hash
+ * linkage, completeness against the signed head) existed only as a
+ * library function; `virp chain` offered nothing that verifies. This is
+ * the wiring, in the two shapes an operator actually needs:
+ *
+ *   LIVE   virp chain verify --session S [--socket PATH]
+ *          Ask the running daemon (ONODE_ACTION_CHAIN_VERIFY_SESSION).
+ *          The daemon stays the chain's only writer/key-holder, so this
+ *          is the safe form against a live chain.
+ *
+ *   OFFLINE virp chain verify --db PATH --key PATH [--session S]
+ *          Call virp_chain_verify_session() directly — the auditor
+ *          handed a chain.db and its key. Without --session, every
+ *          session in the DB is verified. Opens through
+ *          virp_chain_open_verifier(): SQLITE_OPEN_READONLY, no schema
+ *          ensure, no migration, no head backfill — the evidence file
+ *          is byte-identical after verification. A legacy database
+ *          (no chain_heads) reports LEGACY_CHAIN /
+ *          COMPLETENESS_UNPROVABLE instead of being migrated.
+ * ========================================================================= */
+
+static void chain_verify_print(const char *sess,
+                               const virp_chain_verify_result_t *r)
 {
-    if (argc < 1 || strcmp(argv[0], "tail") != 0) {
-        fprintf(stderr,
-            "Usage: virp chain tail [-n N] [--db PATH]\n"
-            "Prints the last N chain entries (default 10, oldest first),\n"
-            "read-only, so a PROPOSAL->APPROVAL->OUTCOME audit is one command.\n");
+    printf("%-32s %s  entries=%lld to_seq=%lld",
+           sess, r->valid ? "VALID" : "BROKEN",
+           (long long)r->entries_checked, (long long)r->to_sequence);
+    if (!r->valid) {
+        if (r->first_broken >= 0)
+            printf(" first_broken=%lld", (long long)r->first_broken);
+        if (r->error_detail[0])
+            printf("  (%s)", r->error_detail);
+    }
+    printf("\n");
+}
+
+static int chain_verify_socket(const char *sock_path, const char *session)
+{
+    /* The id is pasted into JSON: refuse anything that could escape the
+     * string rather than trying to quote it. Real session ids are
+     * "approval:<device>" / "gate-enforce:<device>" shaped. */
+    for (const char *p = session; *p; p++) {
+        if (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) {
+            fprintf(stderr, "Error: session id contains characters that "
+                            "cannot appear in a request\n");
+            return 1;
+        }
+    }
+
+    char json[256];
+    int jl = snprintf(json, sizeof(json),
+                      "{\"action\":\"chain_verify_session\","
+                      "\"session_id\":\"%s\"}", session);
+    if (jl < 0 || (size_t)jl >= sizeof(json)) {
+        fprintf(stderr, "Error: session id too long\n");
         return 1;
     }
-    return cmd_chain_tail(argc - 1, argv + 1);
+
+    static uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    uint32_t resp_len = 0;
+    if (onode_framed_roundtrip(sock_path, json, (size_t)jl,
+                               resp, sizeof(resp), &resp_len) != 0)
+        return 1;
+    if (resp_len == 4) {
+        int32_t code = (int32_t)ntohl(*(const uint32_t *)resp);
+        fprintf(stderr, "chain verify: O-Node error %d (%s)\n", code,
+                virp_error_str((virp_error_t)code));
+        return 1;
+    }
+
+    /* Signed CHAIN_VERIFY observation: 56-byte header, then obs
+     * sub-header (type, scope, 2-byte BE length), then JSON payload. */
+    if (resp_len < VIRP_HEADER_SIZE + 4) {
+        fprintf(stderr, "chain verify: response too short (%u bytes)\n",
+                resp_len);
+        return 1;
+    }
+    uint16_t plen = (uint16_t)((resp[VIRP_HEADER_SIZE + 2] << 8) |
+                                resp[VIRP_HEADER_SIZE + 3]);
+    if ((size_t)VIRP_HEADER_SIZE + 4 + plen > resp_len) {
+        fprintf(stderr, "chain verify: response payload truncated\n");
+        return 1;
+    }
+    char payload[2048];
+    if (plen >= sizeof(payload)) {
+        fprintf(stderr, "chain verify: response payload too large\n");
+        return 1;
+    }
+    memcpy(payload, resp + VIRP_HEADER_SIZE + 4, plen);
+    payload[plen] = '\0';
+
+    cJSON *o = cJSON_Parse(payload);
+    if (!o) {
+        fprintf(stderr, "chain verify: unparseable response payload\n");
+        return 1;
+    }
+    virp_chain_verify_result_t r;
+    memset(&r, 0, sizeof(r));
+    const cJSON *j;
+    j = cJSON_GetObjectItemCaseSensitive(o, "valid");
+    r.valid = cJSON_IsTrue(j);
+    j = cJSON_GetObjectItemCaseSensitive(o, "entries_checked");
+    if (cJSON_IsNumber(j)) r.entries_checked = (int64_t)j->valuedouble;
+    j = cJSON_GetObjectItemCaseSensitive(o, "to_sequence");
+    if (cJSON_IsNumber(j)) r.to_sequence = (int64_t)j->valuedouble;
+    j = cJSON_GetObjectItemCaseSensitive(o, "first_broken");
+    r.first_broken = cJSON_IsNumber(j) ? (int64_t)j->valuedouble : -1;
+    j = cJSON_GetObjectItemCaseSensitive(o, "error_detail");
+    if (cJSON_IsString(j) && j->valuestring)
+        snprintf(r.error_detail, sizeof(r.error_detail), "%s",
+                 j->valuestring);
+    cJSON_Delete(o);
+
+    chain_verify_print(session, &r);
+    return r.valid ? 0 : 1;
+}
+
+static int chain_verify_offline(const char *db_path, const char *key_path,
+                                const char *only_session)
+{
+    virp_chain_state_t chain;
+    if (virp_chain_open_verifier(&chain, db_path, key_path, 1,
+                                 "local") != VIRP_OK) {
+        fprintf(stderr, "Error: cannot open chain %s with key %s\n",
+                db_path, key_path);
+        return 1;
+    }
+
+    int sessions = 0, broken = 0;
+    if (only_session) {
+        virp_chain_verify_result_t r;
+        memset(&r, 0, sizeof(r));
+        if (virp_chain_verify_session(&chain, only_session, &r) != VIRP_OK) {
+            fprintf(stderr, "Error: verify failed for session %s\n",
+                    only_session);
+            virp_chain_destroy(&chain);
+            return 1;
+        }
+        sessions = 1;
+        if (!r.valid) broken++;
+        chain_verify_print(only_session, &r);
+    } else {
+        /* Enumerate sessions with a second read-only handle; the public
+         * chain API has no session iterator. */
+        sqlite3 *raw = NULL;
+        if (sqlite3_open_v2(db_path, &raw, SQLITE_OPEN_READONLY, NULL)
+                != SQLITE_OK) {
+            fprintf(stderr, "Error: cannot reopen %s read-only\n", db_path);
+            virp_chain_destroy(&chain);
+            return 1;
+        }
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(raw,
+                "SELECT DISTINCT session_id FROM chain_entries "
+                "ORDER BY session_id", -1, &st, NULL) != SQLITE_OK) {
+            fprintf(stderr, "Error: session query failed: %s\n",
+                    sqlite3_errmsg(raw));
+            sqlite3_close(raw);
+            virp_chain_destroy(&chain);
+            return 1;
+        }
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *sess = (const char *)sqlite3_column_text(st, 0);
+            virp_chain_verify_result_t r;
+            memset(&r, 0, sizeof(r));
+            if (virp_chain_verify_session(&chain, sess, &r) != VIRP_OK) {
+                fprintf(stderr, "Error: verify failed for session %s\n",
+                        sess);
+                broken++;
+                sessions++;
+                continue;
+            }
+            sessions++;
+            if (!r.valid) broken++;
+            chain_verify_print(sess, &r);
+        }
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
+
+    virp_chain_destroy(&chain);
+    printf("sessions=%d broken=%d\n", sessions, broken);
+    if (sessions == 0) {
+        fprintf(stderr, "Error: no sessions found — nothing was verified\n");
+        return 1;
+    }
+    return broken ? 1 : 0;
+}
+
+static void chain_verify_usage(void)
+{
+    fprintf(stderr,
+        "Usage: virp chain verify --session S [--socket PATH]\n"
+        "       virp chain verify --db PATH --key PATH [--session S]\n"
+        "\n"
+        "Verifies whole sessions against the signed head record\n"
+        "(per-entry HMAC, prev-hash linkage, completeness).\n"
+        "\n"
+        "Live form (--socket, default %s):\n"
+        "  asks the running daemon; the daemon remains the chain's only\n"
+        "  writer and key-holder. --session is required.\n"
+        "Offline form (--db + --key):\n"
+        "  verifies directly — for an auditor handed a chain.db and its\n"
+        "  chain key. Without --session, verifies every session. Opens\n"
+        "  the DB READ-ONLY: no schema ensure, no migration, no head\n"
+        "  backfill — the file is byte-identical after verification.\n"
+        "  Legacy DBs (no chain_heads) report LEGACY_CHAIN /\n"
+        "  COMPLETENESS_UNPROVABLE rather than being migrated.\n"
+        "Exit status: 0 all verified, 1 anything broken or no sessions.\n",
+        ONODE_DEFAULT_SOCKET);
+}
+
+static int cmd_chain_verify(int argc, char **argv)
+{
+    const char *session = NULL, *sock_path = NULL;
+    const char *db_path = NULL, *key_path = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--session") == 0 && i + 1 < argc)
+            session = argv[++i];
+        else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
+            sock_path = argv[++i];
+        else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
+            db_path = argv[++i];
+        else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc)
+            key_path = argv[++i];
+        else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            chain_verify_usage();
+            return 1;
+        }
+    }
+
+    if (db_path || key_path) {
+        if (!db_path || !key_path) {
+            fprintf(stderr, "Error: --db and --key go together\n");
+            chain_verify_usage();
+            return 1;
+        }
+        if (sock_path) {
+            fprintf(stderr, "Error: --socket and --db are different "
+                            "modes; pick one\n");
+            chain_verify_usage();
+            return 1;
+        }
+        return chain_verify_offline(db_path, key_path, session);
+    }
+
+    if (!session) {
+        fprintf(stderr, "Error: --session is required with --socket\n");
+        chain_verify_usage();
+        return 1;
+    }
+    return chain_verify_socket(sock_path ? sock_path
+                                         : ONODE_DEFAULT_SOCKET, session);
+}
+
+static int cmd_chain(int argc, char **argv)
+{
+    if (argc >= 1 && strcmp(argv[0], "tail") == 0)
+        return cmd_chain_tail(argc - 1, argv + 1);
+    if (argc >= 1 && strcmp(argv[0], "verify") == 0)
+        return cmd_chain_verify(argc - 1, argv + 1);
+    fprintf(stderr,
+        "Usage: virp chain tail [-n N] [--db PATH]\n"
+        "       virp chain verify --session S [--socket PATH]\n"
+        "       virp chain verify --db PATH --key PATH [--session S]\n"
+        "`tail` prints the last N chain entries (default 10, oldest\n"
+        "first), read-only. `verify` checks whole sessions against the\n"
+        "signed head record — see `virp chain verify` for details.\n");
+    return 1;
 }
 
 /* =========================================================================
@@ -1506,6 +1801,7 @@ static void usage(void)
     printf("  enroll   (--key|--spki) [--operator N]    Print an approvers.json entry\n");
     printf("  exec     <device> \"<command>\" [options]   Submit a command through the gate\n");
     printf("  chain    tail [-n N] [--db PATH]          Show last N chain entries\n");
+    printf("  chain    verify (--session S | --db --key) Verify sessions against signed head\n");
     printf("  version                                   Print build git hash\n");
     printf("\n");
 }

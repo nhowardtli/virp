@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
 
 /* =========================================================================
  * Test framework — minimal, no dependencies
@@ -733,6 +734,175 @@ TEST(test_reserved_nonzero_rejected)
 }
 
 /* =========================================================================
+ * 11b. Embedded-length bounds — the parser must never return a data_len
+ * that overruns the buffer it was given. obs_length and obs_ref_count
+ * come off the wire; before these checks a malformed message could make
+ * every downstream consumer (hex_dump, printf %.*s, memcpy) read past
+ * the payload.
+ * ========================================================================= */
+
+/* Payload claims 20 data bytes but carries only 10: reject. */
+TEST(test_parse_obs_truncated_claim)
+{
+    uint8_t payload[14];
+    payload[0] = VIRP_OBS_DEVICE_OUTPUT;
+    payload[1] = VIRP_SCOPE_LOCAL;
+    uint16_t dl_n = htons(20);          /* claims 20 */
+    memcpy(payload + 2, &dl_n, 2);
+    memset(payload + 4, 'A', 10);       /* carries 10 */
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    virp_error_t err = virp_parse_observation(payload, sizeof(payload),
+                                              &obs, &data, &data_len);
+    ASSERT_EQ(err, VIRP_ERR_INVALID_LENGTH);
+}
+
+/* Maximum possible embedded length against a minimal payload: reject. */
+TEST(test_parse_obs_oversized_length)
+{
+    uint8_t payload[8];
+    payload[0] = VIRP_OBS_DEVICE_OUTPUT;
+    payload[1] = VIRP_SCOPE_LOCAL;
+    uint16_t dl_n = htons(0xFFFF);
+    memcpy(payload + 2, &dl_n, 2);
+    memset(payload + 4, 'B', 4);
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    virp_error_t err = virp_parse_observation(payload, sizeof(payload),
+                                              &obs, &data, &data_len);
+    ASSERT_EQ(err, VIRP_ERR_INVALID_LENGTH);
+}
+
+/* Zero-length data in a bare 4-byte sub-header is legal. */
+TEST(test_parse_obs_zero_length_data)
+{
+    uint8_t payload[4];
+    payload[0] = VIRP_OBS_ERROR;
+    payload[1] = VIRP_SCOPE_LOCAL;
+    uint16_t dl_n = htons(0);
+    memcpy(payload + 2, &dl_n, 2);
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(payload, sizeof(payload),
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(data_len, 0);
+    ASSERT_TRUE(data == NULL);
+}
+
+/* obs_length exactly filling the payload is legal (the common case). */
+TEST(test_parse_obs_exact_boundary)
+{
+    uint8_t payload[4 + 32];
+    payload[0] = VIRP_OBS_DEVICE_OUTPUT;
+    payload[1] = VIRP_SCOPE_LOCAL;
+    uint16_t dl_n = htons(32);
+    memcpy(payload + 2, &dl_n, 2);
+    memset(payload + 4, 'C', 32);
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(payload, sizeof(payload),
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(data_len, 32);
+    ASSERT_TRUE(data == payload + 4);
+}
+
+/* obs_length shorter than the payload is legal: spec §9 reserves the
+ * tail for future trailer fields; data_len reports only the data. */
+TEST(test_parse_obs_trailer_allowed)
+{
+    uint8_t payload[4 + 16];
+    payload[0] = VIRP_OBS_DEVICE_OUTPUT;
+    payload[1] = VIRP_SCOPE_LOCAL;
+    uint16_t dl_n = htons(10);          /* 10 data + 6 trailer bytes */
+    memcpy(payload + 2, &dl_n, 2);
+    memset(payload + 4, 'D', 16);
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(payload, sizeof(payload),
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(data_len, 10);
+}
+
+/* Proposal whose obs_ref_count would overrun the payload: reject.
+ * Before the fix the parser handed back the wire count and a refs
+ * pointer into a 12-byte buffer. */
+TEST(test_parse_proposal_refs_overrun)
+{
+    uint8_t payload[12];
+    memset(payload, 0, sizeof(payload));
+    uint32_t pid_n = htonl(77);
+    memcpy(payload, &pid_n, 4);
+    payload[4] = VIRP_PROP_CONFIG_APPLY;
+    payload[5] = VIRP_PSTATE_PROPOSED;
+    uint32_t orc_n = htonl(2);          /* 2 refs claimed, zero bytes of refs */
+    memcpy(payload + 8, &orc_n, 4);
+
+    virp_proposal_t prop;
+    const virp_obs_ref_t *refs;
+    const uint8_t *prop_data;
+    uint16_t prop_data_len;
+    virp_error_t err = virp_parse_proposal(payload, sizeof(payload),
+                                           &prop, &refs,
+                                           &prop_data, &prop_data_len);
+    ASSERT_EQ(err, VIRP_ERR_INVALID_LENGTH);
+}
+
+/* obs_ref_count above VIRP_MAX_OBS_REFS is rejected even when the
+ * bytes are physically present (builder parity). */
+TEST(test_parse_proposal_count_over_max)
+{
+    static uint8_t payload[12 + (VIRP_MAX_OBS_REFS + 1) * sizeof(virp_obs_ref_t)];
+    memset(payload, 0, sizeof(payload));
+    uint32_t pid_n = htonl(78);
+    memcpy(payload, &pid_n, 4);
+    payload[4] = VIRP_PROP_CONFIG_APPLY;
+    payload[5] = VIRP_PSTATE_PROPOSED;
+    uint32_t orc_n = htonl(VIRP_MAX_OBS_REFS + 1);
+    memcpy(payload + 8, &orc_n, 4);
+
+    virp_proposal_t prop;
+    const virp_obs_ref_t *refs;
+    const uint8_t *prop_data;
+    uint16_t prop_data_len;
+    virp_error_t err = virp_parse_proposal(payload, sizeof(payload),
+                                           &prop, &refs,
+                                           &prop_data, &prop_data_len);
+    ASSERT_EQ(err, VIRP_ERR_MESSAGE_TOO_LARGE);
+}
+
+/* Zero obs refs: the builder refuses to create one (proposals MUST
+ * carry evidence); the parser must refuse to bless one. */
+TEST(test_parse_proposal_zero_refs)
+{
+    uint8_t payload[12];
+    memset(payload, 0, sizeof(payload));
+    uint32_t pid_n = htonl(79);
+    memcpy(payload, &pid_n, 4);
+    payload[4] = VIRP_PROP_CONFIG_APPLY;
+    payload[5] = VIRP_PSTATE_PROPOSED;
+    /* obs_ref_count stays 0 */
+
+    virp_proposal_t prop;
+    const virp_obs_ref_t *refs;
+    const uint8_t *prop_data;
+    uint16_t prop_data_len;
+    virp_error_t err = virp_parse_proposal(payload, sizeof(payload),
+                                           &prop, &refs,
+                                           &prop_data, &prop_data_len);
+    ASSERT_EQ(err, VIRP_ERR_NO_EVIDENCE);
+}
+
+/* =========================================================================
  * 12. Hello message
  * ========================================================================= */
 
@@ -1337,6 +1507,16 @@ int main(void)
     RUN_TEST(test_null_pointers);
     RUN_TEST(test_buffer_too_small);
     RUN_TEST(test_reserved_nonzero_rejected);
+
+    printf("\n[Embedded-Length Bounds]\n");
+    RUN_TEST(test_parse_obs_truncated_claim);
+    RUN_TEST(test_parse_obs_oversized_length);
+    RUN_TEST(test_parse_obs_zero_length_data);
+    RUN_TEST(test_parse_obs_exact_boundary);
+    RUN_TEST(test_parse_obs_trailer_allowed);
+    RUN_TEST(test_parse_proposal_refs_overrun);
+    RUN_TEST(test_parse_proposal_count_over_max);
+    RUN_TEST(test_parse_proposal_zero_refs);
 
     printf("\n[Teardown Messages]\n");
     RUN_TEST(test_teardown_on_oc);

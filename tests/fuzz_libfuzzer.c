@@ -35,11 +35,25 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     virp_header_t hdr;
     virp_validate_message(data, size, &okey, &hdr);
 
-    /* Try to parse observation payload if large enough */
-    if (size >= VIRP_HEADER_SIZE) {
-        char output[65536];
-        size_t output_len = 0;
-        virp_parse_observation(data, size, output, sizeof(output), &output_len);
+    /* Try the payload parsers if large enough. These take the payload
+     * after the 56-byte header and must reject any embedded length or
+     * ref count that overruns the buffer. (This call previously used a
+     * stale pre-refactor signature and the harness did not compile.) */
+    if (size > VIRP_HEADER_SIZE) {
+        const uint8_t *payload = data + VIRP_HEADER_SIZE;
+        size_t payload_len = size - VIRP_HEADER_SIZE;
+
+        virp_observation_t obs;
+        const uint8_t *odata;
+        uint16_t odata_len;
+        virp_parse_observation(payload, payload_len, &obs, &odata, &odata_len);
+
+        virp_proposal_t prop;
+        const virp_obs_ref_t *refs;
+        const uint8_t *pdata;
+        uint16_t pdata_len;
+        virp_parse_proposal(payload, payload_len, &prop, &refs,
+                            &pdata, &pdata_len);
     }
 
     return 0;
