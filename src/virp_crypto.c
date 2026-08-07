@@ -768,6 +768,199 @@ virp_error_t virp_build_observation_v2(
     return VIRP_OK;
 }
 
+/* =========================================================================
+ * V3 (Ed25519-signed) Observation Building
+ *
+ * Deliberately a sibling of the v2 path, not a refactor of it: this
+ * phase is additive prove-out, and duplicating ~40 lines is the price
+ * of a provably untouched v1/v2. The observation re-cut unifies them.
+ * Wire format and signing rules: the VIRP_VERSION_3 comment in virp.h.
+ * ========================================================================= */
+
+virp_error_t virp_build_observation_ed25519(
+    virp_context_t *ctx,
+    const virp_obskey_t *obskey,
+    uint64_t node_id, uint64_t device_id,
+    uint8_t tier, uint64_t seq_num,
+    const char *command,
+    const char *typed_profile,
+    const uint8_t *payload, size_t payload_len,
+    uint8_t *out_buf, size_t out_buf_len, size_t *out_len)
+{
+    if (!ctx || !obskey || !command || !payload || !out_buf || !out_len)
+        return VIRP_ERR_NULL_PTR;
+    if (!obskey->loaded)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    /* Same wraparound guard as v1/v2: bound before any arithmetic. */
+    if (payload_len > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+
+    size_t total = VIRP_OBS_V2_HEADER_SIZE + payload_len +
+                   VIRP_OBS_V2_SIG_SIZE + VIRP_OBS_ED25519_SIG_SIZE;
+    if (total > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+    if (out_buf_len < total)
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+
+    /* v3 keeps v2's session discipline: ACTIVE session, derived key. */
+    virp_error_t serr = virp_session_require_active(ctx);
+    if (serr != VIRP_OK) return serr;
+    if (!ctx->session.session_key_valid)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    {
+        struct timespec ts_act;
+        clock_gettime(CLOCK_REALTIME, &ts_act);
+        ctx->session.last_activity_ns =
+            (uint64_t)ts_act.tv_sec * 1000000000ULL + ts_act.tv_nsec;
+    }
+
+    virp_obs_header_v2_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.version      = VIRP_VERSION_3;   /* the dispatch byte */
+    hdr.channel      = VIRP_CHANNEL_OBS;
+    hdr.tier         = tier;
+    hdr.node_id      = node_id;
+    hdr.device_id    = device_id;
+    hdr.seq_num      = seq_num;
+    hdr.payload_len  = (uint32_t)payload_len;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    hdr.timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+    memcpy(hdr.session_id, ctx->session.session_id, 16);
+
+    virp_error_t cherr = command_hash(command, typed_profile,
+                                      hdr.command_hash);
+    if (cherr != VIRP_OK) return cherr;
+
+    /*
+     * Both trailers sign the identical bytes: explicit wire encoding
+     * of the header, then the payload. Serialize straight into the
+     * output buffer — it is also the signing buffer.
+     */
+    size_t signed_len = VIRP_OBS_V2_HEADER_SIZE + payload_len;
+    virp_error_t herr = virp_obs_header_v2_serialize(&hdr, out_buf,
+                                                     out_buf_len);
+    if (herr != VIRP_OK) return herr;
+    memcpy(out_buf + VIRP_OBS_V2_HEADER_SIZE, payload, payload_len);
+
+    /* Trailer 1: HMAC-SHA256 with the session key (v2 semantics). */
+    unsigned int hmac_len = VIRP_OBS_V2_SIG_SIZE;
+    if (!HMAC(EVP_sha256(),
+              ctx->session.session_key, 32,
+              out_buf, signed_len,
+              out_buf + signed_len, &hmac_len))
+        return VIRP_ERR_CRYPTO;
+
+    /* Trailer 2: Ed25519 detached signature with the obskey secret. */
+    if (crypto_sign_detached(out_buf + signed_len + VIRP_OBS_V2_SIG_SIZE,
+                             NULL, out_buf, signed_len,
+                             obskey->secret_key) != 0)
+        return VIRP_ERR_CRYPTO;
+
+    *out_len = total;
+    return VIRP_OK;
+}
+
+/*
+ * Public-key-only verification of a v3 observation. THE POINT of the
+ * asymmetric scheme: this function takes no context, no session, no
+ * secret of any kind — a consumer or auditor holding nothing but the
+ * 32 public bytes can check authenticity, and nothing this function
+ * touches would let them mint one.
+ *
+ * What it checks: version/channel, exact framing, and the Ed25519
+ * trailer over serialized_header || payload.
+ * What it deliberately does NOT check: the HMAC trailer (that is the
+ * session holder's check — a consumer has no session key, and MUST NOT
+ * need one), and replay/staleness/session acceptance rules, which are
+ * an accepting endpoint's job (virp_verify_observation_v2 semantics;
+ * unified dispatch is the observation re-cut's phase).
+ */
+/*
+ * Structural validity of an observation header against its buffer —
+ * THE ONE gate shared by the v2 (HMAC) and v3 (Ed25519) verifiers, so
+ * the two formats can never drift apart on what a legal header is
+ * (the drift is exactly how the v3 verifier initially shipped
+ * accepting BLACK tiers and nonzero reserved bytes that v2 refuses).
+ * Checks run in v2's historical order so v2's error precedence is
+ * unchanged. `trailer_len` is the format's total trailer size (v2: 32
+ * HMAC; v3: 32 HMAC + 64 Ed25519); callers must have already bounded
+ * msg_len >= header + trailer, so the subtraction cannot wrap.
+ */
+virp_error_t virp_obs_header_sanity(const virp_obs_header_v2_t *hdr,
+                                    uint8_t expected_version,
+                                    size_t msg_len, size_t trailer_len)
+{
+    if (!hdr)
+        return VIRP_ERR_NULL_PTR;
+    if (msg_len < VIRP_OBS_V2_HEADER_SIZE + trailer_len)
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+
+    if (hdr->version != expected_version)
+        return VIRP_ERR_VERSION_MISMATCH;
+    if (hdr->channel != VIRP_CHANNEL_OBS)
+        return VIRP_ERR_INVALID_CHANNEL;
+    if (hdr->tier == VIRP_TIER_BLACK)
+        return VIRP_ERR_TIER_VIOLATION;
+    if (hdr->tier > VIRP_TIER_RED)
+        return VIRP_ERR_INVALID_TIER;
+    if (hdr->_reserved != 0)
+        return VIRP_ERR_RESERVED_NONZERO;
+    /* Exact framing: the declared payload length must account for
+     * every byte of the message. A surplus or deficit is refused —
+     * unattributed bytes in a signed message are how splices hide. */
+    if ((size_t)hdr->payload_len !=
+        msg_len - VIRP_OBS_V2_HEADER_SIZE - trailer_len)
+        return VIRP_ERR_INVALID_LENGTH;
+
+    return VIRP_OK;
+}
+
+virp_error_t virp_verify_observation_ed25519(
+    const uint8_t public_key[VIRP_OBSKEY_PK_SIZE],
+    const uint8_t *msg, size_t msg_len,
+    virp_obs_header_v2_t *hdr_out,
+    const uint8_t **payload_out, uint32_t *payload_len_out)
+{
+    if (!public_key || !msg)
+        return VIRP_ERR_NULL_PTR;
+    if (msg_len < VIRP_OBS_V3_MIN_SIZE || msg_len > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_INVALID_LENGTH;
+
+    virp_obs_header_v2_t hdr;
+    virp_error_t err = virp_obs_header_v2_deserialize(&hdr, msg, msg_len);
+    if (err != VIRP_OK) return err;
+
+    /*
+     * Structural sanity BEFORE signature verification, on purpose:
+     * a structurally illegal blob does not earn a signature check,
+     * and the caller learns "header illegal" vs "signature bad" as
+     * distinct errors. Ordering cannot leak key material via timing
+     * here — this verifier holds no secret at all, and every field
+     * the sanity gate reads is attacker-visible plaintext.
+     */
+    err = virp_obs_header_sanity(&hdr, VIRP_VERSION_3, msg_len,
+                                 VIRP_OBS_V2_SIG_SIZE +
+                                 VIRP_OBS_ED25519_SIG_SIZE);
+    if (err != VIRP_OK) return err;
+
+    size_t signed_len = (size_t)VIRP_OBS_V2_HEADER_SIZE + hdr.payload_len;
+    const uint8_t *sig = msg + signed_len + VIRP_OBS_V2_SIG_SIZE;
+
+    if (crypto_sign_verify_detached(sig, msg, signed_len,
+                                    public_key) != 0)
+        return VIRP_ERR_OBS_SIG_INVALID;
+
+    if (hdr_out)         *hdr_out = hdr;
+    if (payload_out)     *payload_out = msg + VIRP_OBS_V2_HEADER_SIZE;
+    if (payload_len_out) *payload_len_out = hdr.payload_len;
+    return VIRP_OK;
+}
+
 virp_error_t virp_verify_observation_v2(
     virp_context_t *ctx,
     uint64_t expected_device_id,
@@ -806,24 +999,14 @@ virp_error_t virp_verify_observation_v2(
                            VIRP_OBS_V2_SIG_SIZE))
         return VIRP_ERR_HMAC_FAILED;
 
-    /* Check 2 — header sanity */
+    /* Check 2 — header sanity (shared gate, see virp_obs_header_sanity) */
     virp_obs_header_v2_t hdr;
     virp_error_t err = virp_obs_header_v2_deserialize(&hdr, msg, msg_len);
     if (err != VIRP_OK) return err;
 
-    if (hdr.version != VIRP_VERSION_2)
-        return VIRP_ERR_VERSION_MISMATCH;
-    if (hdr.channel != VIRP_CHANNEL_OBS)
-        return VIRP_ERR_INVALID_CHANNEL;
-    if (hdr.tier == VIRP_TIER_BLACK)
-        return VIRP_ERR_TIER_VIOLATION;
-    if (hdr.tier > VIRP_TIER_RED)
-        return VIRP_ERR_INVALID_TIER;
-    if (hdr._reserved != 0)
-        return VIRP_ERR_RESERVED_NONZERO;
-    if ((size_t)hdr.payload_len !=
-        msg_len - VIRP_OBS_V2_HEADER_SIZE - VIRP_OBS_V2_SIG_SIZE)
-        return VIRP_ERR_INVALID_LENGTH;
+    err = virp_obs_header_sanity(&hdr, VIRP_VERSION_2, msg_len,
+                                 VIRP_OBS_V2_SIG_SIZE);
+    if (err != VIRP_OK) return err;
 
     /* Check 3 — session binding */
     if (!virp_consttime_eq(hdr.session_id, ctx->session.session_id, 16))

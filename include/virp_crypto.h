@@ -16,6 +16,7 @@
 #include "virp.h"
 #include "virp_session.h"  /* virp_context_t forward decl */
 #include "virp_seqstore.h" /* replay high-water store for v2 verification */
+#include "virp_obskey.h"   /* virp_obskey_t (v3 Ed25519 observations) */
 #include <sys/types.h>     /* uid_t (virp_key_owner_ok) */
 
 /* =========================================================================
@@ -232,6 +233,60 @@ virp_error_t virp_build_observation_v2(
     const char *typed_profile,
     const uint8_t *payload, size_t payload_len,
     uint8_t *out_buf, size_t out_buf_len, size_t *out_len);
+
+/*
+ * Build a complete v3 (Ed25519-signed) observation wire message:
+ *   [header (88, version=3)] [payload] [hmac (32)] [ed25519 sig (64)]
+ *
+ * ADDITIVE alongside v1/v2 — deliberately implemented as its own
+ * function rather than a refactor of the v2 path, so introducing it
+ * provably cannot change v1/v2 behaviour; unification is the
+ * observation re-cut's job. Both trailers cover exactly
+ * serialized_header || payload (see the v3 comment in virp.h): the
+ * HMAC keeps the v2 session semantics for the caller, the Ed25519
+ * detached signature (obskey secret; the O-Node is the attester) is
+ * what a public-key-only consumer verifies. Session must be ACTIVE
+ * with a valid derived key; obskey must be loaded.
+ */
+virp_error_t virp_build_observation_ed25519(
+    virp_context_t *ctx,
+    const virp_obskey_t *obskey,
+    uint64_t node_id, uint64_t device_id,
+    uint8_t tier, uint64_t seq_num,
+    const char *command,
+    const char *typed_profile,
+    const uint8_t *payload, size_t payload_len,
+    uint8_t *out_buf, size_t out_buf_len, size_t *out_len);
+
+/*
+ * PUBLIC-KEY-ONLY verification of a v3 observation — no context, no
+ * session, no secret parameter exists. Checks version=3, channel,
+ * exact framing, and the Ed25519 trailer over header || payload;
+ * returns VIRP_ERR_OBS_SIG_INVALID on a bad signature. Deliberately
+ * does NOT check the HMAC trailer (session holder's check; a consumer
+ * must not need a forge-capable key to verify) and does NOT apply
+ * replay/staleness acceptance rules (accepting-endpoint duties; see
+ * virp_verify_observation_v2). On success, optionally returns the
+ * parsed header and a pointer into msg for the payload.
+ */
+virp_error_t virp_verify_observation_ed25519(
+    const uint8_t public_key[VIRP_OBSKEY_PK_SIZE],
+    const uint8_t *msg, size_t msg_len,
+    virp_obs_header_v2_t *hdr_out,
+    const uint8_t **payload_out, uint32_t *payload_len_out);
+
+/*
+ * Structural validity of an observation header against its buffer —
+ * the ONE gate shared by the v2 and v3 verifiers (version, channel,
+ * tier range + no BLACK, reserved byte zero, exact payload_len
+ * framing). trailer_len is the format's total trailer size (v2: 32,
+ * v3: 96). Checks run in v2's historical order; error codes are the
+ * v2 codes. Callers must already have bounded msg_len to at least
+ * header + trailer.
+ */
+virp_error_t virp_obs_header_sanity(const virp_obs_header_v2_t *hdr,
+                                    uint8_t expected_version,
+                                    size_t msg_len, size_t trailer_len);
 
 /*
  * Verify a v2 observation wire message. This is the single home for

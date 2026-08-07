@@ -4,7 +4,7 @@
  * CLI Tool — key generation, message inspection, test message building
  *
  * Usage:
- *   virp-tool keygen  <okey|rkey> <output_file>
+ *   virp-tool keygen  <okey|rkey|approval|obskey> <output_file>
  *   virp-tool inspect <message_file> <key_file> <okey|rkey>
  *   virp-tool build   <observation|heartbeat|proposal> [options]
  *   virp-tool hexdump <message_file>
@@ -19,9 +19,11 @@
 #include "virp_approver_registry.h"
 #include "virp_chain.h"
 #include "virp_federation.h"
+#include "virp_obskey.h"
 #include "cJSON.h"
 #include <arpa/inet.h>
 #include <openssl/evp.h>
+#include <openssl/sha.h>
 #include <stdbool.h>
 #include <time.h>
 #include <errno.h>
@@ -136,10 +138,57 @@ static int cmd_keygen_approval(const char *prefix)
     return 0;
 }
 
+/*
+ * keygen obskey — generate the O-Node Ed25519 OBSERVATION-signing
+ * keypair (wire version 3 observations). Custody is the MIRROR of the
+ * approval keypair, on purpose:
+ *
+ *   approval:  secret OFF-box with a human, daemon holds pub only —
+ *              so the daemon can never approve its own proposals.
+ *   obskey:    secret ON the daemon host — the daemon IS the attester;
+ *              an observation is the daemon's own signed statement.
+ *
+ * What consumers gain: the .pub file verifies observations but cannot
+ * mint them (unlike the symmetric O-Key, where verify key == forge
+ * key). A compromised daemon can still forge; that boundary is not
+ * changed by this key.
+ */
+static int cmd_keygen_obskey(const char *prefix)
+{
+    virp_obskey_t kp;
+    if (virp_obskey_generate(&kp) != VIRP_OK) {
+        fprintf(stderr, "Error: observation keypair generation failed\n");
+        return 1;
+    }
+
+    char pk_path[512], sk_path[512];
+    snprintf(pk_path, sizeof(pk_path), "%s.pub", prefix);
+    snprintf(sk_path, sizeof(sk_path), "%s.key", prefix);
+
+    if (virp_obskey_save(&kp, sk_path, pk_path) != VIRP_OK) {
+        fprintf(stderr, "Error: saving observation keypair failed "
+                        "(existing %s is never overwritten)\n", sk_path);
+        virp_obskey_destroy(&kp);
+        return 1;
+    }
+
+    printf("Generated observation signing keypair (Ed25519):\n");
+    printf("  Secret key:  %s (0600 — DAEMON HOST ONLY; every holder "
+           "can sign observations)\n", sk_path);
+    printf("  Public key:  %s (distribute to consumers/auditors — "
+           "verify-only, cannot forge)\n", pk_path);
+    printf("  Key ID:      ");
+    for (int i = 0; i < VIRP_OBSKEY_KEYID_SIZE; i++)
+        printf("%02x", kp.key_id[i]);
+    printf("\n");
+    virp_obskey_destroy(&kp);
+    return 0;
+}
+
 static int cmd_keygen(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: virp-tool keygen <okey|rkey|approval> <output>\n");
+        fprintf(stderr, "Usage: virp-tool keygen <okey|rkey|approval|obskey> <output>\n");
         return 1;
     }
 
@@ -149,13 +198,16 @@ static int cmd_keygen(int argc, char **argv)
     if (strcmp(type_str, "approval") == 0)
         return cmd_keygen_approval(path);
 
+    if (strcmp(type_str, "obskey") == 0)
+        return cmd_keygen_obskey(path);
+
     virp_key_type_t type;
     if (strcmp(type_str, "okey") == 0)
         type = VIRP_KEY_TYPE_OKEY;
     else if (strcmp(type_str, "rkey") == 0)
         type = VIRP_KEY_TYPE_RKEY;
     else {
-        fprintf(stderr, "Error: key type must be 'okey', 'rkey', or 'approval'\n");
+        fprintf(stderr, "Error: key type must be 'okey', 'rkey', 'approval', or 'obskey'\n");
         return 1;
     }
 
@@ -1792,7 +1844,7 @@ static void usage(void)
     printf("build: ");
     print_version();
     printf("\nCommands:\n");
-    printf("  keygen   <okey|rkey|approval> <output>    Generate signing key\n");
+    printf("  keygen   <okey|rkey|approval|obskey> <output>  Generate signing key\n");
     printf("  inspect  <msg_file> <key_file> <type>    Inspect and verify message\n");
     printf("  build    <type> [options]                 Build test message\n");
     printf("  hexdump  <msg_file>                       Raw hex dump\n");
@@ -1802,12 +1854,117 @@ static void usage(void)
     printf("  exec     <device> \"<command>\" [options]   Submit a command through the gate\n");
     printf("  chain    tail [-n N] [--db PATH]          Show last N chain entries\n");
     printf("  chain    verify (--session S | --db --key) Verify sessions against signed head\n");
+    printf("  obs-verify <pubkey> <obs_file>            Verify a v3 observation with ONLY the public key\n");
     printf("  version                                   Print build git hash\n");
     printf("\n");
 }
 
+/* =========================================================================
+ * obs-verify — public-key-only verification of a v3 observation
+ *
+ * Takes ONLY the public key (raw 32-byte .pub or 44-byte SPKI DER) and
+ * the observation file. There is deliberately no way to hand this
+ * command a secret: the whole point of the Ed25519 observation scheme
+ * is that the verifying party holds no forge-capable material.
+ * ========================================================================= */
+
+static int cmd_obs_verify(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr,
+                "Usage: virp-tool obs-verify <pubkey.pub|spki> <obs_file>\n"
+                "       pubkey: raw 32-byte Ed25519 public key, or 44-byte\n"
+                "       SPKI DER. Never a secret key — a 64-byte file is\n"
+                "       refused, this command verifies only.\n");
+        return 1;
+    }
+
+    /* Load the public key. */
+    FILE *f = fopen(argv[0], "rb");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open public key %s\n", argv[0]);
+        return 1;
+    }
+    uint8_t keybuf[64];
+    size_t klen = fread(keybuf, 1, sizeof(keybuf), f);
+    fclose(f);
+
+    static const uint8_t spki_prefix[12] = {
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+        0x03, 0x21, 0x00
+    };
+    uint8_t pub[VIRP_OBSKEY_PK_SIZE];
+    if (klen == VIRP_OBSKEY_PK_SIZE) {
+        memcpy(pub, keybuf, VIRP_OBSKEY_PK_SIZE);
+    } else if (klen == VIRP_OBSKEY_SPKI_SIZE &&
+               memcmp(keybuf, spki_prefix, sizeof(spki_prefix)) == 0) {
+        memcpy(pub, keybuf + 12, VIRP_OBSKEY_PK_SIZE);
+    } else {
+        fprintf(stderr, "Error: %s is not a public key (expected raw 32 "
+                        "bytes or 44-byte Ed25519 SPKI; a 64-byte secret "
+                        "key is refused — obs-verify takes no secrets)\n",
+                argv[0]);
+        return 1;
+    }
+
+    /* Load the observation. */
+    f = fopen(argv[1], "rb");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open observation %s\n", argv[1]);
+        return 1;
+    }
+    static uint8_t msg[VIRP_MAX_MESSAGE_SIZE + 1];
+    size_t msg_len = fread(msg, 1, sizeof(msg), f);
+    fclose(f);
+
+    virp_obs_header_v2_t hdr;
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+    virp_error_t err = virp_verify_observation_ed25519(pub, msg, msg_len,
+                                                       &hdr, &payload,
+                                                       &payload_len);
+    if (err != VIRP_OK) {
+        printf("INVALID: %s\n", virp_error_str(err));
+        return 1;
+    }
+
+    unsigned char kid[32];
+    SHA256(pub, VIRP_OBSKEY_PK_SIZE, kid);
+    printf("VALID (Ed25519, public-key-only verification)\n");
+    printf("  verify key_id: ");
+    for (int i = 0; i < VIRP_OBSKEY_KEYID_SIZE; i++) printf("%02x", kid[i]);
+    printf("\n");
+    printf("  node_id:       0x%016llx\n", (unsigned long long)hdr.node_id);
+    printf("  device_id:     0x%016llx\n", (unsigned long long)hdr.device_id);
+    printf("  tier:          %u\n", hdr.tier);
+    printf("  seq_num:       %llu\n", (unsigned long long)hdr.seq_num);
+    printf("  timestamp_ns:  %llu\n", (unsigned long long)hdr.timestamp_ns);
+    printf("  payload_len:   %u\n", payload_len);
+    printf("  command_hash:  ");
+    for (int i = 0; i < 8; i++) printf("%02x", hdr.command_hash[i]);
+    printf("...\n");
+    printf("NOTE: proves the observation was signed by the holder of the\n");
+    printf("      matching PRIVATE key (the O-Node). Does not check the\n");
+    printf("      session HMAC, replay or staleness — those are the\n");
+    printf("      accepting endpoint's checks, not a consumer's.\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    /*
+     * Harden BEFORE any subcommand runs, i.e. before any secret exists
+     * in this process: keygen (O-Key, R-Key, approval, obskey) and
+     * `virp approve` all hold key material, and until 2026-08-07 they
+     * did so in a dumpable process (review finding P2-2). What this
+     * buys: PR_SET_DUMPABLE=0 (no core dumps, no same-UID ptrace,
+     * /proc/self/mem unreadable). What it does NOT buy: the
+     * coredump_filter probe only warns, secrets still transit stack
+     * copies, and a root attacker is out of scope. Trade-off: gdb as
+     * the same non-root user no longer attaches to a running virp-tool.
+     */
+    virp_crypto_harden_process();
+
     if (argc < 2) {
         usage();
         return 1;
@@ -1833,6 +1990,8 @@ int main(int argc, char **argv)
         return cmd_exec(argc - 2, argv + 2);
     else if (strcmp(cmd, "chain") == 0)
         return cmd_chain(argc - 2, argv + 2);
+    else if (strcmp(cmd, "obs-verify") == 0)
+        return cmd_obs_verify(argc - 2, argv + 2);
     else if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0)
         print_version();
     else if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0)

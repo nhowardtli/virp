@@ -27,3 +27,6 @@ demo/output/
 # The demo target config is mock-only and safe to publish; it must survive
 # the devices.json rule above, which exists to keep real credentials out.
 !demo/devices.json
+
+# libFuzzer build tree (make fuzz-obs-ed25519) — instrumented artifacts, never tracked
+build-fuzz/

@@ -122,6 +122,83 @@ the dashboard bridge and the socat endpoint, or request-side signing
 at the VIRP message layer — is not yet implemented and is tracked as
 follow-up hardening.
 
+## Ed25519 Observation Signing (added 2026-08-07)
+
+**The scheme.** Observations can now additionally be emitted as wire
+version 3 (`virp_build_observation_ed25519`): the v2 header layout and
+session-HMAC trailer, PLUS an Ed25519 detached signature by the O-Node's
+observation-signing key over exactly the same bytes the HMAC covers
+(`header || payload`). Wire format and rationale:
+`docs/DRAFT06-NOTES.md` §1 and the `VIRP_VERSION_3` block in
+`include/virp.h`. Verification needs only the public key
+(`virp_verify_observation_ed25519`, `virp-tool obs-verify`) — the
+verifier holds no secret of any kind.
+
+**Exactly what this adds, and what it does not.**
+
+- **Added — consumer/auditor non-forgeability.** Under the symmetric
+  HMAC schemes, any party given the verify key can also mint a
+  valid-verifying observation: verify key == forge key. That ceiling is
+  reproduced as a unit test (a clean-VALID fake BGP route, the original
+  BGP-test finding) in `tests/test_obs_ed25519_forge.c`, alongside the
+  proof that the same forgery attempted with only the Ed25519 PUBLIC
+  key fails for every signature a public-key holder can compute. A
+  report consumer, dashboard, or external auditor can now verify
+  without being trusted not to forge.
+- **NOT added — daemon-compromise resistance.** The daemon holds the
+  signing private key because the O-Node is the attester; a compromised
+  O-Node forges v3 observations exactly as it forges HMAC ones. The
+  win is independent verifiability, nothing more.
+- **NOT yet enforced.** v3 is additive and coexists with v1/v2; nothing
+  that produces or verifies HMAC observations changed behavior, no
+  client default changed, and chain append does not yet require or
+  check Ed25519 signatures — that enforcement is the observation
+  re-cut phase. Until then, v3 observations are only as load-bearing
+  as the verifier a consumer actually runs.
+- The public-key verifier checks authenticity and integrity of the
+  signed bytes only. Replay, staleness and session acceptance remain
+  the accepting endpoint's checks (v2 verify semantics).
+- **NOT formally modeled.** The ProVerif proofs
+  (`proofs/virp_obs_v2.pv`, re-runnable via `make proofs`) cover the
+  v2 HMAC observation path only — README's formal-verification claim
+  is scoped the same way. A passing `make proofs` says NOTHING about
+  the v3 Ed25519 path: no machine-checked model of v3 signing,
+  verification, or cross-version downgrade exists yet. Its properties
+  rest on the test evidence above (forge contrast, negative battery,
+  fuzzing) until a v3 ProVerif model is written — future work, slated
+  alongside the observation re-cut.
+
+### Observation-Signing Key — Custody
+
+An O-Node Ed25519 observation-signing keypair exists (`virp-tool keygen
+obskey`, loader `virp_obskey_load`), distinct from both the symmetric
+O-Key and the approval keypair. Its custody is deliberately the MIRROR
+of the approval keypair's, and that is correct, not a contradiction:
+
+- **Approval keypair:** the secret lives OFF-box with a human approver;
+  the daemon holds only the public key. The property purchased is that
+  the daemon can never approve its own proposals — approval answers
+  "did a human other than the daemon authorize this?".
+- **Observation-signing keypair:** the secret lives ON the daemon host.
+  The O-Node is the attester — an observation is precisely the daemon's
+  own signed statement of what a device returned, so only the daemon
+  may hold the key that makes that statement. What the asymmetry buys
+  is on the CONSUMER side: the public key verifies observations but
+  cannot mint them, unlike the symmetric O-Key where the verify key
+  and the forge key are the same bytes.
+
+This key does NOT change the daemon-compromise boundary: a compromised
+O-Node still forges observations, because the O-Node is the attester.
+
+Custody enforcement (tested in `tests/test_obskey.c`): the private key
+file must be a regular file, mode 0400/0600, owned by the daemon's
+effective UID (or root); symlinks, group/world-accessible modes and
+wrong-size (non-64-byte) files are refused at load with distinct
+errors. The secret is `sodium_mlock`'d while loaded, zeroized on
+destroy, and appears in no log or export path; only the public key is
+exportable (raw or SPKI DER, `key_id = SHA-256(pub)[:16]`, the same
+convention the approver registry uses).
+
 ## Observation-Body Integrity
 
 The HMAC-SHA256 signature on an observation is sound, and the v2 header
