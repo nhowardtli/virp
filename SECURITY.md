@@ -69,6 +69,28 @@ there is no window in which a world-accessible node exists on disk.
 
 ## Trust Boundaries and Transport Paths
 
+**The trusted request boundary for 1.0 is the local Unix domain socket,
+and only that.** (Corrected/clarified 2026-08-07.) The controls that
+decide *who may submit a request* — filesystem permissions on the
+socket, `SO_PEERCRED` peer-UID allowlisting, and the uid allowlist — are
+properties of the local Unix socket. They do NOT extend over a network.
+Any TCP exposure of the O-Node MUST sit behind an authenticated gateway
+(mTLS, or request-side signing at the VIRP message layer). **Unauthenticated
+TCP is not a supported trust boundary for 1.0** — a plain socat/TCP
+forwarder in front of the socket is a convenience for a trusted lab
+segment, not a security boundary, and nothing below should be read as
+saying otherwise.
+
+Why the boundary is the socket and not "the handshake": the v1 EXECUTE
+path does **not** require a VIRP session handshake (see the correction
+in the Unix-socket bullets below). There is therefore no per-connection
+cryptographic proof of caller identity on a submit — whoever can deliver
+bytes to the listener can submit a request. On the Unix socket, "who can
+deliver bytes" is exactly what `SO_PEERCRED` + the uid allowlist
+constrain. Over unauthenticated TCP, "who can deliver bytes" is "anyone
+who can reach the port," which is why that path needs an authenticating
+gateway to become a boundary at all.
+
 VIRP defines two distinct paths that reach the O-Node. Their protections
 are not the same, and a protection that applies to one does not
 automatically apply to the other.
@@ -83,11 +105,22 @@ local attack vector that SO_PEERCRED does not defend against.) Protected by:
   startup-loaded allowlist before any bytes are read.
 - Filesystem mode `0660` with ownership restricted to the daemon's
   service user/group.
-- VIRP message-layer session handshake (`SESSION_HELLO` /
-  `SESSION_HELLO_ACK` with nonces, followed by HKDF session-key
-  derivation) on every fresh connection.
 - HMAC-SHA256 signing of every observation returned to the caller,
   using an O-Key the caller does not possess.
+
+> **Correction (2026-08-07): the session handshake is NOT required to
+> submit a v1 request.** An earlier version of this list stated a VIRP
+> session handshake (`SESSION_HELLO` / `SESSION_HELLO_ACK` + HKDF
+> derivation) happens "on every fresh connection." That is false for the
+> v1 EXECUTE path, which is the deployed submit path: an active session
+> is required only for v2 *observation* requests (`obs_version == 2`,
+> enforced at `src/virp_onode.c`), not for submitting a v1 command. A
+> caller can connect and submit without any handshake. The consequence,
+> stated plainly: **network access to the listener == the ability to
+> submit a request.** There is no cryptographic caller-identity check on
+> submit — which is precisely why the trusted boundary is the Unix
+> socket (where `SO_PEERCRED` + the uid allowlist decide who can deliver
+> bytes), and why unauthenticated TCP is not a supported boundary.
 
 **TCP path (CT 210 dashboard ↔ CT 211 O-Node, ports 9998/9999)** — the
 dashboard's `virp-bridge.py` listens on TCP 9998 locally on CT 210 and
@@ -98,14 +131,18 @@ to the Unix socket. On this path:
   dashboard's identity. It cannot distinguish authorized dashboard
   traffic from any other process on CT 211 that can reach the socat
   forwarder.
-- The VIRP message-layer session handshake and HMAC signing of
-  observations still apply — observations returned across the TCP
-  bridge are signed at collection time with the O-Key and are as
-  verifiable as on the local path. An attacker who intercepts or
-  injects on the TCP path cannot forge observations without the O-Key.
+- HMAC signing of observations still applies — observations returned
+  across the TCP bridge are signed at collection time with the O-Key and
+  are as verifiable as on the local path. An attacker who intercepts or
+  injects on the TCP path cannot forge *observations* without the O-Key.
   (What "signed at collection time" does and does not guarantee about
   the observation *body* is narrowed in §Observation-Body Integrity —
-  the caveat applies equally on both paths.)
+  the caveat applies equally on both paths.) **This protects returned
+  observations, not the submit direction:** it does nothing to
+  authenticate *who submitted the request*. Because v1 EXECUTE needs no
+  handshake, anyone who can reach the TCP forwarder can submit — the
+  observation-signing property does not make the TCP path a trust
+  boundary for requests.
 - The TCP path itself is **not** currently TLS-protected, and the
   session handshake authenticates session establishment via nonce
   exchange but does not cryptographically bind to a TCP endpoint
@@ -121,6 +158,22 @@ to the Unix socket. On this path:
 the dashboard bridge and the socat endpoint, or request-side signing
 at the VIRP message layer — is not yet implemented and is tracked as
 follow-up hardening.
+
+> **TODO — per-caller request policy (future control, NOT implemented).**
+> The honest boundary today is all-or-nothing: any caller who can submit
+> can submit at any tier the gate allows, because the daemon has no
+> notion of *which* caller a request came from beyond the transport-level
+> `SO_PEERCRED` uid. A real per-caller policy — e.g. capping
+> remotely-sourced operations at GREEN, or attaching a requester role —
+> depends on requester-identity plumbing that does not exist yet (the
+> 2026-08-04 all-or-nothing finding). It is a later architectural phase.
+> This section documents the current boundary honestly; it deliberately
+> does not describe a per-caller control as if it existed. Until that
+> plumbing lands, the enforced control is the Unix-socket uid allowlist,
+> full stop. *(No CI assertion ties this doc claim to code yet: the
+> invariant "v1 EXECUTE requires no session" is an absence, which is
+> awkward to grep-assert without pinning internals; a positive test that
+> a submit succeeds with no prior handshake is the right future hook.)*
 
 ## Ed25519 Observation Signing (added 2026-08-07)
 
