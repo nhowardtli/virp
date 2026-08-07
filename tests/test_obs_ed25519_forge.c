@@ -24,6 +24,22 @@
  * non-forgeability. They do not — cannot — prove daemon-compromise
  * resistance: the daemon holds the signing secret because the daemon
  * is the attester. See SECURITY.md "Ed25519 Observation Signing".
+ *
+ * WHY TEST 1 USES v1 AND TESTS 2-3 USE v3 (pre-empting the
+ * apples-to-apples objection, review finding P2-4). Test 1
+ * reproduces the ceiling on the v1 O-Key format deliberately: v1 is
+ * the DEPLOYED scheme the original BGP-test finding was filed
+ * against, so reproducing it there documents the exact defect that
+ * motivated this work, not a constructed analogue. The contrast is
+ * still apples-to-apples because the property under test is a
+ * property of the SCHEME (symmetric: verify key == forge key;
+ * asymmetric: public key cannot sign), not of the wire version — and
+ * the attested content class is identical on both sides (a signed
+ * device-output observation of a never-received result). The v2
+ * session-HMAC has the SAME ceiling as v1 for any session-key holder;
+ * v1 is simply the cleanest reproduction of the filed finding. A
+ * v2-on-v2 forge would add nothing the scheme-level argument does not
+ * already cover.
  */
 
 #include <assert.h>
