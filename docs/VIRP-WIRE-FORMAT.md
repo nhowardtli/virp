@@ -290,7 +290,7 @@ Expected HMAC: (compute with: HMAC-SHA256(key, header[0:24] || payload))
 ## 12. Known Limitations
 
 - Single O-Node: no chain replication between nodes. Failover for RED-tier operations requires chain DB sync (not yet implemented).
-- HMAC-SHA256 is symmetric: cross-organizational verification requires sharing the key. Ed25519 asymmetric signing is planned for Trust Federation (Primitive 7).
+- HMAC-SHA256 is symmetric: cross-organizational verification requires sharing the key — and any holder of the shared key can also mint a valid-verifying observation (verify key == forge key). *Updated 2026-08-07:* an additive Ed25519-signed observation format (wire version 3) now exists so a consumer holding only the public key can verify without forge capability; see `docs/DRAFT06-NOTES.md` §1. v1/v2 HMAC observations are unchanged and remain the default; Ed25519 use in Trust Federation (Primitive 7) is separate and unaffected.
 - No hardware attestation of the O-Node itself. The observation is only as trustworthy as the host running the O-Node.
 
 ---
