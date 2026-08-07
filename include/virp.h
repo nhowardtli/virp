@@ -490,6 +490,12 @@ typedef enum {
                                                  possible dispatch;
                                                  not retried */
 
+    /* v3 observations: the Ed25519 trailer did not verify under the
+     * given public key. Distinct from VIRP_ERR_HMAC_FAILED so a
+     * consumer log line names which scheme refused the message. */
+    VIRP_ERR_OBS_SIG_INVALID          = -49,  /* Ed25519 observation
+                                                 signature invalid */
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency

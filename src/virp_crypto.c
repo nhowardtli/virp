@@ -865,6 +865,62 @@ virp_error_t virp_build_observation_ed25519(
     return VIRP_OK;
 }
 
+/*
+ * Public-key-only verification of a v3 observation. THE POINT of the
+ * asymmetric scheme: this function takes no context, no session, no
+ * secret of any kind — a consumer or auditor holding nothing but the
+ * 32 public bytes can check authenticity, and nothing this function
+ * touches would let them mint one.
+ *
+ * What it checks: version/channel, exact framing, and the Ed25519
+ * trailer over serialized_header || payload.
+ * What it deliberately does NOT check: the HMAC trailer (that is the
+ * session holder's check — a consumer has no session key, and MUST NOT
+ * need one), and replay/staleness/session acceptance rules, which are
+ * an accepting endpoint's job (virp_verify_observation_v2 semantics;
+ * unified dispatch is the observation re-cut's phase).
+ */
+virp_error_t virp_verify_observation_ed25519(
+    const uint8_t public_key[VIRP_OBSKEY_PK_SIZE],
+    const uint8_t *msg, size_t msg_len,
+    virp_obs_header_v2_t *hdr_out,
+    const uint8_t **payload_out, uint32_t *payload_len_out)
+{
+    if (!public_key || !msg)
+        return VIRP_ERR_NULL_PTR;
+    if (msg_len < VIRP_OBS_V3_MIN_SIZE || msg_len > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_INVALID_LENGTH;
+
+    virp_obs_header_v2_t hdr;
+    virp_error_t err = virp_obs_header_v2_deserialize(&hdr, msg, msg_len);
+    if (err != VIRP_OK) return err;
+
+    if (hdr.version != VIRP_VERSION_3)
+        return VIRP_ERR_INVALID_VERSION;
+    if (hdr.channel != VIRP_CHANNEL_OBS)
+        return VIRP_ERR_INVALID_CHANNEL;
+
+    /* Exact framing: declared payload length must account for every
+     * byte of the message. A trailing-byte surplus is not tolerated —
+     * unattributed bytes in a signed message are how splices hide. */
+    size_t expect = (size_t)VIRP_OBS_V2_HEADER_SIZE + hdr.payload_len +
+                    VIRP_OBS_V2_SIG_SIZE + VIRP_OBS_ED25519_SIG_SIZE;
+    if (hdr.payload_len > VIRP_MAX_MESSAGE_SIZE || expect != msg_len)
+        return VIRP_ERR_INVALID_LENGTH;
+
+    size_t signed_len = (size_t)VIRP_OBS_V2_HEADER_SIZE + hdr.payload_len;
+    const uint8_t *sig = msg + signed_len + VIRP_OBS_V2_SIG_SIZE;
+
+    if (crypto_sign_verify_detached(sig, msg, signed_len,
+                                    public_key) != 0)
+        return VIRP_ERR_OBS_SIG_INVALID;
+
+    if (hdr_out)         *hdr_out = hdr;
+    if (payload_out)     *payload_out = msg + VIRP_OBS_V2_HEADER_SIZE;
+    if (payload_len_out) *payload_len_out = hdr.payload_len;
+    return VIRP_OK;
+}
+
 virp_error_t virp_verify_observation_v2(
     virp_context_t *ctx,
     uint64_t expected_device_id,

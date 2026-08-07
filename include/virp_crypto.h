@@ -259,6 +259,23 @@ virp_error_t virp_build_observation_ed25519(
     uint8_t *out_buf, size_t out_buf_len, size_t *out_len);
 
 /*
+ * PUBLIC-KEY-ONLY verification of a v3 observation — no context, no
+ * session, no secret parameter exists. Checks version=3, channel,
+ * exact framing, and the Ed25519 trailer over header || payload;
+ * returns VIRP_ERR_OBS_SIG_INVALID on a bad signature. Deliberately
+ * does NOT check the HMAC trailer (session holder's check; a consumer
+ * must not need a forge-capable key to verify) and does NOT apply
+ * replay/staleness acceptance rules (accepting-endpoint duties; see
+ * virp_verify_observation_v2). On success, optionally returns the
+ * parsed header and a pointer into msg for the payload.
+ */
+virp_error_t virp_verify_observation_ed25519(
+    const uint8_t public_key[VIRP_OBSKEY_PK_SIZE],
+    const uint8_t *msg, size_t msg_len,
+    virp_obs_header_v2_t *hdr_out,
+    const uint8_t **payload_out, uint32_t *payload_len_out);
+
+/*
  * Verify a v2 observation wire message. This is the single home for
  * every check an accepting verifier must make:
  *

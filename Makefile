@@ -715,6 +715,17 @@ $(TEST_OBS_ED25519): tests/test_obs_ed25519.c $(LIB)
 test-obs-ed25519: $(TEST_OBS_ED25519)
 	./$(TEST_OBS_ED25519)
 
+# The forge-resistance contrast: HMAC verify-key holder can mint a
+# valid observation (the BGP-test ceiling, reproduced); an Ed25519
+# public-key holder cannot; tampered covered bytes fail.
+TEST_OBS_FORGE = $(BUILD_DIR)/test_obs_ed25519_forge
+
+$(TEST_OBS_FORGE): tests/test_obs_ed25519_forge.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-obs-ed25519-forge: $(TEST_OBS_FORGE)
+	./$(TEST_OBS_FORGE)
+
 # Session key derivation tests
 TEST_SESSION_KEY = $(BUILD_DIR)/test_session_key
 
@@ -1152,4 +1163,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-validator test-approval test-approvers test-pkcs11

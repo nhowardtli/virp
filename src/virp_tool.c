@@ -23,6 +23,7 @@
 #include "cJSON.h"
 #include <arpa/inet.h>
 #include <openssl/evp.h>
+#include <openssl/sha.h>
 #include <stdbool.h>
 #include <time.h>
 #include <errno.h>
@@ -1853,8 +1854,100 @@ static void usage(void)
     printf("  exec     <device> \"<command>\" [options]   Submit a command through the gate\n");
     printf("  chain    tail [-n N] [--db PATH]          Show last N chain entries\n");
     printf("  chain    verify (--session S | --db --key) Verify sessions against signed head\n");
+    printf("  obs-verify <pubkey> <obs_file>            Verify a v3 observation with ONLY the public key\n");
     printf("  version                                   Print build git hash\n");
     printf("\n");
+}
+
+/* =========================================================================
+ * obs-verify — public-key-only verification of a v3 observation
+ *
+ * Takes ONLY the public key (raw 32-byte .pub or 44-byte SPKI DER) and
+ * the observation file. There is deliberately no way to hand this
+ * command a secret: the whole point of the Ed25519 observation scheme
+ * is that the verifying party holds no forge-capable material.
+ * ========================================================================= */
+
+static int cmd_obs_verify(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr,
+                "Usage: virp-tool obs-verify <pubkey.pub|spki> <obs_file>\n"
+                "       pubkey: raw 32-byte Ed25519 public key, or 44-byte\n"
+                "       SPKI DER. Never a secret key — a 64-byte file is\n"
+                "       refused, this command verifies only.\n");
+        return 1;
+    }
+
+    /* Load the public key. */
+    FILE *f = fopen(argv[0], "rb");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open public key %s\n", argv[0]);
+        return 1;
+    }
+    uint8_t keybuf[64];
+    size_t klen = fread(keybuf, 1, sizeof(keybuf), f);
+    fclose(f);
+
+    static const uint8_t spki_prefix[12] = {
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+        0x03, 0x21, 0x00
+    };
+    uint8_t pub[VIRP_OBSKEY_PK_SIZE];
+    if (klen == VIRP_OBSKEY_PK_SIZE) {
+        memcpy(pub, keybuf, VIRP_OBSKEY_PK_SIZE);
+    } else if (klen == VIRP_OBSKEY_SPKI_SIZE &&
+               memcmp(keybuf, spki_prefix, sizeof(spki_prefix)) == 0) {
+        memcpy(pub, keybuf + 12, VIRP_OBSKEY_PK_SIZE);
+    } else {
+        fprintf(stderr, "Error: %s is not a public key (expected raw 32 "
+                        "bytes or 44-byte Ed25519 SPKI; a 64-byte secret "
+                        "key is refused — obs-verify takes no secrets)\n",
+                argv[0]);
+        return 1;
+    }
+
+    /* Load the observation. */
+    f = fopen(argv[1], "rb");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open observation %s\n", argv[1]);
+        return 1;
+    }
+    static uint8_t msg[VIRP_MAX_MESSAGE_SIZE + 1];
+    size_t msg_len = fread(msg, 1, sizeof(msg), f);
+    fclose(f);
+
+    virp_obs_header_v2_t hdr;
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+    virp_error_t err = virp_verify_observation_ed25519(pub, msg, msg_len,
+                                                       &hdr, &payload,
+                                                       &payload_len);
+    if (err != VIRP_OK) {
+        printf("INVALID: %s\n", virp_error_str(err));
+        return 1;
+    }
+
+    unsigned char kid[32];
+    SHA256(pub, VIRP_OBSKEY_PK_SIZE, kid);
+    printf("VALID (Ed25519, public-key-only verification)\n");
+    printf("  verify key_id: ");
+    for (int i = 0; i < VIRP_OBSKEY_KEYID_SIZE; i++) printf("%02x", kid[i]);
+    printf("\n");
+    printf("  node_id:       0x%016llx\n", (unsigned long long)hdr.node_id);
+    printf("  device_id:     0x%016llx\n", (unsigned long long)hdr.device_id);
+    printf("  tier:          %u\n", hdr.tier);
+    printf("  seq_num:       %llu\n", (unsigned long long)hdr.seq_num);
+    printf("  timestamp_ns:  %llu\n", (unsigned long long)hdr.timestamp_ns);
+    printf("  payload_len:   %u\n", payload_len);
+    printf("  command_hash:  ");
+    for (int i = 0; i < 8; i++) printf("%02x", hdr.command_hash[i]);
+    printf("...\n");
+    printf("NOTE: proves the observation was signed by the holder of the\n");
+    printf("      matching PRIVATE key (the O-Node). Does not check the\n");
+    printf("      session HMAC, replay or staleness — those are the\n");
+    printf("      accepting endpoint's checks, not a consumer's.\n");
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -1884,6 +1977,8 @@ int main(int argc, char **argv)
         return cmd_exec(argc - 2, argv + 2);
     else if (strcmp(cmd, "chain") == 0)
         return cmd_chain(argc - 2, argv + 2);
+    else if (strcmp(cmd, "obs-verify") == 0)
+        return cmd_obs_verify(argc - 2, argv + 2);
     else if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0)
         print_version();
     else if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0)
