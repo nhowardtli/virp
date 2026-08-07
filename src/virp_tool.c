@@ -1952,6 +1952,19 @@ static int cmd_obs_verify(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
+    /*
+     * Harden BEFORE any subcommand runs, i.e. before any secret exists
+     * in this process: keygen (O-Key, R-Key, approval, obskey) and
+     * `virp approve` all hold key material, and until 2026-08-07 they
+     * did so in a dumpable process (review finding P2-2). What this
+     * buys: PR_SET_DUMPABLE=0 (no core dumps, no same-UID ptrace,
+     * /proc/self/mem unreadable). What it does NOT buy: the
+     * coredump_filter probe only warns, secrets still transit stack
+     * copies, and a root attacker is out of scope. Trade-off: gdb as
+     * the same non-root user no longer attaches to a running virp-tool.
+     */
+    virp_crypto_harden_process();
+
     if (argc < 2) {
         usage();
         return 1;

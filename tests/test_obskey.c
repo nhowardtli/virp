@@ -15,16 +15,18 @@
  *   4. SPKI public export round-trips to the same key_id
  */
 
-#define _GNU_SOURCE     /* memmem */
+#define _GNU_SOURCE     /* memmem, prctl */
 
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
 #include <openssl/sha.h>
 
 #include "virp.h"
+#include "virp_crypto.h"
 #include "virp_obskey.h"
 
 #define TEST_DIR    "/tmp/virp-test-obskey"
@@ -133,6 +135,20 @@ static void test_lax_permissions_refused(void)
     virp_obskey_destroy(&kp);
 }
 
+/* The hardening routine virp-tool calls before any keygen subcommand
+ * must actually flip PR_SET_DUMPABLE off — a key custody claim that
+ * depends on it (no core dumps / no same-UID ptrace while a secret is
+ * in memory) is only as good as this bit. */
+static void test_harden_process_clears_dumpable(void)
+{
+    /* Precondition on a normal test runner: processes start dumpable.
+     * If a wrapper already cleared it, the postcondition still holds. */
+    assert(virp_crypto_harden_process() == VIRP_OK);
+#ifdef __linux__
+    assert(prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 0);
+#endif
+}
+
 static void test_spki_export_roundtrip_key_id(void)
 {
     virp_obskey_t kp;
@@ -173,6 +189,7 @@ int main(void)
     RUN_TEST(test_truncated_key_distinct_error);
     RUN_TEST(test_lax_permissions_refused);
     RUN_TEST(test_spki_export_roundtrip_key_id);
+    RUN_TEST(test_harden_process_clears_dumpable);
 
     printf("=== All %d obskey custody tests passed (%d/%d) ===\n",
            tests_run, tests_passed, tests_run);
