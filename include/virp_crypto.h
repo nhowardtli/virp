@@ -276,6 +276,19 @@ virp_error_t virp_verify_observation_ed25519(
     const uint8_t **payload_out, uint32_t *payload_len_out);
 
 /*
+ * Structural validity of an observation header against its buffer —
+ * the ONE gate shared by the v2 and v3 verifiers (version, channel,
+ * tier range + no BLACK, reserved byte zero, exact payload_len
+ * framing). trailer_len is the format's total trailer size (v2: 32,
+ * v3: 96). Checks run in v2's historical order; error codes are the
+ * v2 codes. Callers must already have bounded msg_len to at least
+ * header + trailer.
+ */
+virp_error_t virp_obs_header_sanity(const virp_obs_header_v2_t *hdr,
+                                    uint8_t expected_version,
+                                    size_t msg_len, size_t trailer_len);
+
+/*
  * Verify a v2 observation wire message. This is the single home for
  * every check an accepting verifier must make:
  *

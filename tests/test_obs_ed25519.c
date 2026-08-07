@@ -216,6 +216,99 @@ static void test_hmac_present_in_addition_with_v2_semantics(void)
     virp_context_destroy(ctx);
 }
 
+/* Re-sign a (possibly mutated) v3 buffer with the real secret key —
+ * the hostile-attester model: a signing-key holder emits a header the
+ * format forbids. The signature is genuinely VALID over the mutated
+ * bytes, so any rejection below is the shared structural gate firing,
+ * not the signature check. Remove virp_obs_header_sanity() from the
+ * verifier and every one of these accepts. */
+static void resign_v3(uint8_t *buf, size_t len, const virp_obskey_t *kp)
+{
+    size_t signed_len = len - VIRP_OBS_V2_SIG_SIZE -
+                        VIRP_OBS_ED25519_SIG_SIZE;
+    assert(crypto_sign_detached(buf + signed_len + VIRP_OBS_V2_SIG_SIZE,
+                                NULL, buf, signed_len,
+                                kp->secret_key) == 0);
+    /* Confirm the mutated blob really is validly signed. */
+    assert(crypto_sign_verify_detached(
+               buf + signed_len + VIRP_OBS_V2_SIG_SIZE,
+               buf, signed_len, kp->public_key) == 0);
+}
+
+static void test_signed_but_malformed_header_rejected(void)
+{
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx && virp_session_init(ctx, "obs-v3-test") == VIRP_OK);
+    activate_session(ctx, 0x36);
+
+    virp_obskey_t kp;
+    assert(virp_obskey_generate(&kp) == VIRP_OK);
+
+    uint8_t ref[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = build_v3(ctx, &kp, 6, ref, sizeof(ref));
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+
+    /* Nonzero reserved byte (offset 3), validly signed. */
+    memcpy(buf, ref, len);
+    buf[3] = 0x01;
+    resign_v3(buf, len, &kp);
+    assert(virp_verify_observation_ed25519(kp.public_key, buf, len,
+                                           NULL, NULL, NULL)
+           == VIRP_ERR_RESERVED_NONZERO);
+
+    /* BLACK tier — buildable through the API, so exercise that path
+     * end to end rather than by mutation. */
+    size_t blen = 0;
+    assert(virp_build_observation_ed25519(
+               ctx, &kp, TEST_NODE_ID, TEST_DEVICE_ID, VIRP_TIER_BLACK,
+               6, CMD, NULL, PAYLOAD, PAYLOAD_LEN,
+               buf, sizeof(buf), &blen) == VIRP_OK);
+    assert(virp_verify_observation_ed25519(kp.public_key, buf, blen,
+                                           NULL, NULL, NULL)
+           == VIRP_ERR_TIER_VIOLATION);
+
+    /* Out-of-range tier (offset 2), validly signed. */
+    memcpy(buf, ref, len);
+    buf[2] = 0x7F;
+    resign_v3(buf, len, &kp);
+    assert(virp_verify_observation_ed25519(kp.public_key, buf, len,
+                                           NULL, NULL, NULL)
+           == VIRP_ERR_INVALID_TIER);
+
+    /* Wrong version byte (a signed v2-labeled blob at the v3 door). */
+    memcpy(buf, ref, len);
+    buf[0] = VIRP_VERSION_2;
+    resign_v3(buf, len, &kp);
+    assert(virp_verify_observation_ed25519(kp.public_key, buf, len,
+                                           NULL, NULL, NULL)
+           == VIRP_ERR_VERSION_MISMATCH);
+
+    /* Wrong channel (offset 1), validly signed. */
+    memcpy(buf, ref, len);
+    buf[1] = VIRP_CHANNEL_IC;
+    resign_v3(buf, len, &kp);
+    assert(virp_verify_observation_ed25519(kp.public_key, buf, len,
+                                           NULL, NULL, NULL)
+           == VIRP_ERR_INVALID_CHANNEL);
+
+    /* payload_len inconsistent with the buffer (off by one, field at
+     * offset 84..87), validly signed over the mutated header. */
+    memcpy(buf, ref, len);
+    buf[87] ^= 0x01;
+    resign_v3(buf, len, &kp);
+    assert(virp_verify_observation_ed25519(kp.public_key, buf, len,
+                                           NULL, NULL, NULL)
+           == VIRP_ERR_INVALID_LENGTH);
+
+    /* Control: the untouched reference still verifies — the six
+     * rejections above are the gate, not a broken verifier. */
+    assert(virp_verify_observation_ed25519(kp.public_key, ref, len,
+                                           NULL, NULL, NULL) == VIRP_OK);
+
+    virp_obskey_destroy(&kp);
+    virp_context_destroy(ctx);
+}
+
 static void test_v3_requires_active_session_and_loaded_key(void)
 {
     virp_context_t *ctx = virp_context_new();
@@ -254,6 +347,7 @@ int main(void)
     RUN_TEST(test_signature_covers_exactly_canonical_bytes);
     RUN_TEST(test_every_covered_byte_is_covered);
     RUN_TEST(test_hmac_present_in_addition_with_v2_semantics);
+    RUN_TEST(test_signed_but_malformed_header_rejected);
     RUN_TEST(test_v3_requires_active_session_and_loaded_key);
 
     printf("=== All %d v3 observation build tests passed (%d/%d) ===\n",
