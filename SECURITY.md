@@ -404,11 +404,26 @@ session) is the intended answer for genuinely session-bound config
 transactions. Not designed yet. Until it exists, session-bound config
 work is out of scope for VIRP.
 
-**wazuh has no classifier.** The Wazuh driver registers no
-`route_command` hook, so `gate_classify` returns UNCLASSIFIED for every
-command it receives. Under ENFORCE that blocks; under a SHADOW override
-it logs and proceeds. The layer-1 separator boundary still applies (it is
-driver-agnostic). Nothing else about its commands is tiered.
+**wazuh classifies its read endpoints (GREEN-only), everything else is
+RED by absence.** The Wazuh driver registers `.route_command =
+wazuh_gate_tier` (`driver_wazuh.c`), which `gate_classify`
+(`src/virp_onode.c`) consults: the three autopilot read endpoints
+(`/agents`, `/agents/summary/status`, `/manager/stats/analysisd`) are
+GREEN by EXACT path match, and every other endpoint is RED. Under
+ENFORCE, RED is a signed rejection plus a filed proposal. The layer-1
+separator boundary still applies (it is driver-agnostic).
+
+> **Corrected 2026-08-07.** This paragraph previously read "wazuh has no
+> classifier" and stated `gate_classify` returns UNCLASSIFIED for every
+> Wazuh command. That has been false since `53348603` (2026-07-29),
+> which added the GREEN-only autopilot monitoring layer and wired
+> `wazuh_gate_tier` into the driver's `.route_command` slot. The stale
+> text claimed the fleet was *less* protected than it is — the same
+> class of dangerous stale reassurance the 2026-07-31 correction below
+> records, so it is corrected here in the same style rather than
+> silently edited. (The paragraph further down, "REST-shaped drivers
+> need their own command grammar," still correctly explains why the
+> table uses exact-match paths rather than a full URL grammar.)
 
 > **Corrected 2026-07-31.** This paragraph previously read "linux and
 > wazuh have no classifier" and stated that every linux command executes
@@ -428,9 +443,12 @@ is a CLI grammar. Wazuh's "command" is a URL path, where `&` is a
 legitimate query-string separator and `?`/`/` are structural — so
 applying the CLI set verbatim would refuse ordinary endpoints like
 `/agents?limit=100&offset=0`. A REST driver therefore needs a per-driver
-grammar (path + allowed query parameters) rather than the CLI set. This
-is why `WZ_ROUTE_TABLE` is not wired to a `route_command` hook despite
-now defaulting to RED.
+grammar (path + allowed query parameters) rather than the CLI set.
+`wazuh_gate_tier` is the minimal form of that: it strips an optional
+`GET ` method prefix and the query string, then EXACT-matches the path
+against `WZ_ROUTE_TABLE` (GREEN for the three enumerated reads, RED for
+everything else). A fuller path+query grammar is still future work; the
+exact-match table is the conservative interim.
 
 **The PBS driver answers that paragraph differently, and better.** Rather
 than giving a REST driver a grammar for *paths*, `driver_pbs.c` removes

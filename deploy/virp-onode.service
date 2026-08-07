@@ -46,10 +46,14 @@ StateDirectoryMode=0750
 # render script never echoes credential values.
 ExecStartPre=+/usr/local/lib/virp/render-devices.sh
 
-# Wazuh manager (10.0.20.10) presents a self-signed cert on the lab
-# management VLAN — TLS verification is disabled for that driver ONLY.
-# Replace with VIRP_CA_BUNDLE once the lab CA exists.
-Environment=VIRP_WAZUH_INSECURE=1
+# Wazuh TLS: the driver validates the Wazuh manager's certificate by
+# default (VERIFYPEER=1, VERIFYHOST=2 in driver_wazuh.c). To point at a
+# real Wazuh, set VIRP_CA_BUNDLE to the CA that signed its cert. The lab
+# manager (10.0.20.10) presents a self-signed cert; disabling validation
+# for it is a DELIBERATE, MANUAL act — install the drop-in
+# deploy/virp-onode-wazuh-lab.dropin.conf, which is never wired into the
+# default install path. `make check-deploy-unit` fails if
+# VIRP_WAZUH_INSECURE ever reappears in this canonical unit.
 
 # Chain flags (-c/-C) are REQUIRED here: approval mode (enabled whenever
 # /etc/virp/approvers.json enrolls a key) refuses to start without a

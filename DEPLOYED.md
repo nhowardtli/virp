@@ -110,8 +110,13 @@ virp-onode start, `ExecStartPre=+/opt/virp/deploy/render-devices.sh` renders
 `/etc/virp/devices.template.json` (no secrets, git-tracked) into `/run/virp/devices.json`
 (0640 root:virp, tmpfs). The old `/var/lib/virp/devices.json` was retired to
 `devices.json.pre-autopilot.bak`. Verified: zero credential strings in the journal.
-Wazuh uses `VIRP_WAZUH_INSECURE=1` (self-signed lab cert) — replace with VIRP_CA_BUNDLE
-when the lab CA exists.
+Wazuh TLS (updated 2026-08-07): the canonical unit no longer ships
+`VIRP_WAZUH_INSECURE=1`. The driver validates the Wazuh cert by default;
+disabling that for the self-signed lab manager is now a manual opt-in via
+the `deploy/virp-onode-wazuh-lab.dropin.conf` drop-in (never in the
+default install path; `make check-deploy-unit` fails if the flag returns
+to the main unit). For a real Wazuh, set `VIRP_CA_BUNDLE` to its signing
+CA and leave validation on.
 
 ### Classification (GREEN-only, everything else RED by absence)
 - wazuh: `/agents`, `/agents/summary/status`, `/manager/stats/analysisd` — **EXACT** path
@@ -563,6 +568,11 @@ What is public as a result:
   - approver key_id `a88c58a6…`, chain artifact ids, installed-binary sha256s
   - the security-posture narrative: which drivers carry no classifier, that
     `VIRP_WAZUH_INSECURE=1` is live on the deployed unit, and the open items
+    <br>*(2026-08-07: this records the 2026-08-01 disclosure state. Since
+    then the canonical unit no longer ships `VIRP_WAZUH_INSECURE` and the
+    Wazuh driver does carry a classifier — see the dated corrections in
+    SECURITY.md. The RUNNING deployed unit still carries the flag until a
+    redeploy, which is a separate act.)*
 
 What is NOT public: no passwords, API tokens, or private key material. The
 one credential in the tree — the FRR lab container password in

@@ -1014,6 +1014,15 @@ check-deploy-unit:
 	@grep -Eq '^ExecStart=$(VIRP_INSTALL_BIN)([[:space:]]|\\\\|$$)' deploy/virp-onode.service || \
 	    { echo "FAIL: ExecStart is not $(VIRP_INSTALL_BIN)"; exit 1; }
 	@echo "  PASS: ExecStart=$(VIRP_INSTALL_BIN)"
+	@echo "=== checking canonical unit does not disable Wazuh TLS ==="
+	@if grep -Eq '^[[:space:]]*Environment=.*VIRP_WAZUH_INSECURE' deploy/virp-onode.service; then \
+	     echo "FAIL: deploy/virp-onode.service sets VIRP_WAZUH_INSECURE —"; \
+	     echo "      this disables Wazuh certificate validation for every"; \
+	     echo "      install of the shipped unit. Insecure Wazuh is a manual,"; \
+	     echo "      lab-only opt-in via deploy/virp-onode-wazuh-lab.dropin.conf."; \
+	     exit 1; \
+	 fi
+	@echo "  PASS: no VIRP_WAZUH_INSECURE in canonical virp-onode.service (drop-in exempt)"
 
 # Lint: fail build if sprintf( appears in src/ (use snprintf instead)
 .PHONY: lint-sprintf

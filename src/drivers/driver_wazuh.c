@@ -45,19 +45,21 @@
  * Command Routing Table — Wazuh API endpoints → trust tiers
  *
  * All endpoints in this driver are read-only. Tier classification:
- *   GREEN  — agent status, health checks (passive monitoring)
- *   YELLOW — alerts, vulnerability, syscheck (security-sensitive data)
+ *   GREEN  — the three autopilot read endpoints (passive monitoring)
  *
- * Prefix-matched, longest match wins. FAIL-CLOSED: unmapped endpoints
- * default to RED.
+ * EXACT-matched (plen == ep_len in wz_route_endpoint, after the query
+ * string is stripped). FAIL-CLOSED: any unmapped endpoint is RED.
+ * Exact match — not longest-prefix — is deliberate: prefix matching let
+ * "/agents_evil" and "/agents/001/restart" inherit the GREEN "/agents"
+ * row (see the comment above wz_route_endpoint).
  *
- * This table is NOT currently wired to a route_command hook (see
- * wazuh_driver below), so gate_classify returns UNCLASSIFIED for this
- * driver today. The default is fail-closed regardless: whoever wires it
- * up must not inherit a permissive default. It previously defaulted to
- * GREEN — the most permissive tier there is — on the rationale that the
- * API user is read-only, which is a property of the deployed credential,
- * not of the endpoint being classified.
+ * This table IS wired to a route_command hook — wazuh_driver below sets
+ * .route_command = wazuh_gate_tier, and gate_classify() consults it, so
+ * an unmapped Wazuh endpoint classifies RED (a signed rejection plus a
+ * filed proposal under ENFORCE), not UNCLASSIFIED. It previously
+ * defaulted to GREEN — the most permissive tier there is — on the
+ * rationale that the API user is read-only, which is a property of the
+ * deployed credential, not of the endpoint being classified.
  * ========================================================================= */
 
 const wz_command_route_t WZ_ROUTE_TABLE[] = {

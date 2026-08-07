@@ -205,10 +205,12 @@ because no unit test opens a socket — by design. A live probe in both
 directions (correct pin connects, wrong pin refuses) is the only thing
 that catches it.
 
-Contrast `driver_wazuh.c`, which carries `VIRP_WAZUH_INSECURE=1` for the
-lab manager's self-signed cert. That is pre-existing and documented, and it
-is precisely the shape this driver must never grow: a boolean has a value
-meaning "do not check"; a fingerprint does not.
+Contrast `driver_wazuh.c`, which HONORS a `VIRP_WAZUH_INSECURE=1` escape
+hatch for the lab manager's self-signed cert (2026-08-07: no longer shipped
+in the canonical unit — it is a manual lab-only drop-in now — but the
+driver still reads the env var when set). That escape hatch is precisely
+the shape this driver must never grow: a boolean has a value meaning "do
+not check"; a fingerprint does not.
 
 ## 8. Credentials
 
