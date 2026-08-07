@@ -365,6 +365,36 @@ typedef struct {
 #define VIRP_OBS_V2_FRESHNESS_WINDOW_NS  (300ULL * 1000000000ULL)  /* 300 s */
 
 /*
+ * V3 (Ed25519-signed) observation wire format — PROTOCOL-VISIBLE,
+ * record for draft-06. ADDITIVE: coexists with v1/v2, changes neither.
+ *
+ *   [ header : 88 ][ payload : P ][ hmac : 32 ][ ed25519 sig : 64 ]
+ *
+ * The header is byte-for-byte the v2 layout above with version = 3 —
+ * byte 0 alone dispatches the format. Both trailers cover EXACTLY the
+ * same bytes, serialized_header || payload:
+ *
+ *   hmac = HMAC-SHA256(session_key, header || payload)   (v2 semantics)
+ *   sig  = Ed25519-detached(obskey_secret, header || payload)
+ *
+ * so the symmetric and asymmetric schemes attest identical content.
+ * Because the version byte is covered by both, a v3 observation cannot
+ * be re-labeled v2 (signature-stripping downgrade) without the session
+ * key, and a v3 signature can never validate a v2 blob.
+ *
+ * What the Ed25519 trailer adds: a consumer holding only the PUBLIC
+ * key can verify without being able to forge (the HMAC verify key is
+ * also the forge key). It does NOT change the daemon-compromise
+ * boundary — the daemon holds the signing secret because it is the
+ * attester.
+ */
+#define VIRP_VERSION_3            3
+#define VIRP_OBS_ED25519_SIG_SIZE 64
+#define VIRP_OBS_V3_MIN_SIZE      (VIRP_OBS_V2_HEADER_SIZE + \
+                                   VIRP_OBS_V2_SIG_SIZE + \
+                                   VIRP_OBS_ED25519_SIG_SIZE)
+
+/*
  * VIRP signing key pair — one per key type (O-Key or R-Key)
  */
 typedef struct {

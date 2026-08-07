@@ -706,6 +706,15 @@ $(TEST_OBSKEY): tests/test_obskey.c $(LIB)
 test-obskey: $(TEST_OBSKEY)
 	./$(TEST_OBSKEY)
 
+# v3 (Ed25519-signed) observation build tests
+TEST_OBS_ED25519 = $(BUILD_DIR)/test_obs_ed25519
+
+$(TEST_OBS_ED25519): tests/test_obs_ed25519.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-obs-ed25519: $(TEST_OBS_ED25519)
+	./$(TEST_OBS_ED25519)
+
 # Session key derivation tests
 TEST_SESSION_KEY = $(BUILD_DIR)/test_session_key
 
@@ -1143,4 +1152,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-validator test-approval test-approvers test-pkcs11

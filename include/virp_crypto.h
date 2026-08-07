@@ -16,6 +16,7 @@
 #include "virp.h"
 #include "virp_session.h"  /* virp_context_t forward decl */
 #include "virp_seqstore.h" /* replay high-water store for v2 verification */
+#include "virp_obskey.h"   /* virp_obskey_t (v3 Ed25519 observations) */
 #include <sys/types.h>     /* uid_t (virp_key_owner_ok) */
 
 /* =========================================================================
@@ -226,6 +227,30 @@ virp_error_t virp_typed_op_hash(const char *profile,
  */
 virp_error_t virp_build_observation_v2(
     virp_context_t *ctx,
+    uint64_t node_id, uint64_t device_id,
+    uint8_t tier, uint64_t seq_num,
+    const char *command,
+    const char *typed_profile,
+    const uint8_t *payload, size_t payload_len,
+    uint8_t *out_buf, size_t out_buf_len, size_t *out_len);
+
+/*
+ * Build a complete v3 (Ed25519-signed) observation wire message:
+ *   [header (88, version=3)] [payload] [hmac (32)] [ed25519 sig (64)]
+ *
+ * ADDITIVE alongside v1/v2 — deliberately implemented as its own
+ * function rather than a refactor of the v2 path, so introducing it
+ * provably cannot change v1/v2 behaviour; unification is the
+ * observation re-cut's job. Both trailers cover exactly
+ * serialized_header || payload (see the v3 comment in virp.h): the
+ * HMAC keeps the v2 session semantics for the caller, the Ed25519
+ * detached signature (obskey secret; the O-Node is the attester) is
+ * what a public-key-only consumer verifies. Session must be ACTIVE
+ * with a valid derived key; obskey must be loaded.
+ */
+virp_error_t virp_build_observation_ed25519(
+    virp_context_t *ctx,
+    const virp_obskey_t *obskey,
     uint64_t node_id, uint64_t device_id,
     uint8_t tier, uint64_t seq_num,
     const char *command,

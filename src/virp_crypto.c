@@ -768,6 +768,103 @@ virp_error_t virp_build_observation_v2(
     return VIRP_OK;
 }
 
+/* =========================================================================
+ * V3 (Ed25519-signed) Observation Building
+ *
+ * Deliberately a sibling of the v2 path, not a refactor of it: this
+ * phase is additive prove-out, and duplicating ~40 lines is the price
+ * of a provably untouched v1/v2. The observation re-cut unifies them.
+ * Wire format and signing rules: the VIRP_VERSION_3 comment in virp.h.
+ * ========================================================================= */
+
+virp_error_t virp_build_observation_ed25519(
+    virp_context_t *ctx,
+    const virp_obskey_t *obskey,
+    uint64_t node_id, uint64_t device_id,
+    uint8_t tier, uint64_t seq_num,
+    const char *command,
+    const char *typed_profile,
+    const uint8_t *payload, size_t payload_len,
+    uint8_t *out_buf, size_t out_buf_len, size_t *out_len)
+{
+    if (!ctx || !obskey || !command || !payload || !out_buf || !out_len)
+        return VIRP_ERR_NULL_PTR;
+    if (!obskey->loaded)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    /* Same wraparound guard as v1/v2: bound before any arithmetic. */
+    if (payload_len > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+
+    size_t total = VIRP_OBS_V2_HEADER_SIZE + payload_len +
+                   VIRP_OBS_V2_SIG_SIZE + VIRP_OBS_ED25519_SIG_SIZE;
+    if (total > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+    if (out_buf_len < total)
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+
+    /* v3 keeps v2's session discipline: ACTIVE session, derived key. */
+    virp_error_t serr = virp_session_require_active(ctx);
+    if (serr != VIRP_OK) return serr;
+    if (!ctx->session.session_key_valid)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    {
+        struct timespec ts_act;
+        clock_gettime(CLOCK_REALTIME, &ts_act);
+        ctx->session.last_activity_ns =
+            (uint64_t)ts_act.tv_sec * 1000000000ULL + ts_act.tv_nsec;
+    }
+
+    virp_obs_header_v2_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.version      = VIRP_VERSION_3;   /* the dispatch byte */
+    hdr.channel      = VIRP_CHANNEL_OBS;
+    hdr.tier         = tier;
+    hdr.node_id      = node_id;
+    hdr.device_id    = device_id;
+    hdr.seq_num      = seq_num;
+    hdr.payload_len  = (uint32_t)payload_len;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    hdr.timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+    memcpy(hdr.session_id, ctx->session.session_id, 16);
+
+    virp_error_t cherr = command_hash(command, typed_profile,
+                                      hdr.command_hash);
+    if (cherr != VIRP_OK) return cherr;
+
+    /*
+     * Both trailers sign the identical bytes: explicit wire encoding
+     * of the header, then the payload. Serialize straight into the
+     * output buffer — it is also the signing buffer.
+     */
+    size_t signed_len = VIRP_OBS_V2_HEADER_SIZE + payload_len;
+    virp_error_t herr = virp_obs_header_v2_serialize(&hdr, out_buf,
+                                                     out_buf_len);
+    if (herr != VIRP_OK) return herr;
+    memcpy(out_buf + VIRP_OBS_V2_HEADER_SIZE, payload, payload_len);
+
+    /* Trailer 1: HMAC-SHA256 with the session key (v2 semantics). */
+    unsigned int hmac_len = VIRP_OBS_V2_SIG_SIZE;
+    if (!HMAC(EVP_sha256(),
+              ctx->session.session_key, 32,
+              out_buf, signed_len,
+              out_buf + signed_len, &hmac_len))
+        return VIRP_ERR_CRYPTO;
+
+    /* Trailer 2: Ed25519 detached signature with the obskey secret. */
+    if (crypto_sign_detached(out_buf + signed_len + VIRP_OBS_V2_SIG_SIZE,
+                             NULL, out_buf, signed_len,
+                             obskey->secret_key) != 0)
+        return VIRP_ERR_CRYPTO;
+
+    *out_len = total;
+    return VIRP_OK;
+}
+
 virp_error_t virp_verify_observation_v2(
     virp_context_t *ctx,
     uint64_t expected_device_id,
