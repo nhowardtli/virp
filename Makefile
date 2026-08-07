@@ -726,6 +726,16 @@ $(TEST_OBS_FORGE): tests/test_obs_ed25519_forge.c $(LIB)
 test-obs-ed25519-forge: $(TEST_OBS_FORGE)
 	./$(TEST_OBS_FORGE)
 
+# v3 verifier malformed-framing negative battery (review P1-2): every
+# reject path executed with the exact expected error code.
+TEST_OBS_NEG = $(BUILD_DIR)/test_obs_ed25519_neg
+
+$(TEST_OBS_NEG): tests/test_obs_ed25519_neg.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-obs-ed25519-neg: $(TEST_OBS_NEG)
+	./$(TEST_OBS_NEG)
+
 # Session key derivation tests
 TEST_SESSION_KEY = $(BUILD_DIR)/test_session_key
 
@@ -1059,7 +1069,7 @@ asan-test:
 	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined"
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO) $(TEST_FG_SCRUB) $(TEST_CHAIN) \
-	        $(TEST_OBSKEY) $(TEST_OBS_ED25519) $(TEST_OBS_FORGE)
+	        $(TEST_OBSKEY) $(TEST_OBS_ED25519) $(TEST_OBS_FORGE) $(TEST_OBS_NEG)
 	@echo "=== Running tests under ASan+UBSan ==="
 	./$(TEST_BIN) 2>&1
 	./$(TEST_ONODE) 2>&1
@@ -1069,6 +1079,7 @@ asan-test:
 	./$(TEST_OBSKEY) 2>&1
 	./$(TEST_OBS_ED25519) 2>&1
 	./$(TEST_OBS_FORGE) 2>&1
+	./$(TEST_OBS_NEG) 2>&1
 	@echo "=== ASan+UBSan test run complete ==="
 
 # Driver suites under ASan+UBSan. Separate from asan-test because the
@@ -1100,6 +1111,25 @@ fuzz-libfuzzer: $(LIB)
 	      -I./include tests/fuzz_libfuzzer.c $(LIB) $(LDFLAGS) \
 	      -lstdc++ -o $(FUZZ_LIBFUZZER)
 	@echo "Built $(FUZZ_LIBFUZZER) — run with: ./$(FUZZ_LIBFUZZER) [corpus_dir]"
+
+# libFuzzer harness for the v3 public-key observation verifier — the
+# most exposed parser in the tree (attacker bytes, no secret, run by
+# third parties). Unlike fuzz-libfuzzer above, this target rebuilds
+# libvirp itself with instrumentation (fuzzer-no-link+ASan+UBSan) into
+# build-fuzz/ so coverage and sanitizers actually see the verifier's
+# code, not just the harness.
+FUZZ_OBS_DIR = build-fuzz
+FUZZ_OBS_BIN = $(FUZZ_OBS_DIR)/fuzz_obs_ed25519
+
+.PHONY: fuzz-obs-ed25519
+fuzz-obs-ed25519:
+	$(MAKE) BUILD_DIR=$(FUZZ_OBS_DIR) CC=clang \
+	        CFLAGS_EXTRA="-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer" \
+	        $(FUZZ_OBS_DIR)/libvirp.a
+	clang -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -g \
+	      -I./include -I./src/third_party tests/fuzz_obs_ed25519.c \
+	      $(FUZZ_OBS_DIR)/libvirp.a $(LDFLAGS) -lstdc++ -o $(FUZZ_OBS_BIN)
+	@echo "Built $(FUZZ_OBS_BIN) — run with: ./$(FUZZ_OBS_BIN) [corpus_dir]"
 
 # Approval flow tests (propose -> approve -> apply). Depends on the CLI
 # binary too: the suite drives `virp exec` / `virp chain tail` as
@@ -1167,4 +1197,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11
