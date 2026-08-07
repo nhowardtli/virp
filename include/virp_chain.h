@@ -153,6 +153,17 @@ virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
                                         bool *exists);
 
 /*
+ * Set *exists to true iff any chain entry already commits to the given
+ * artifact_hash. Used by the chain_append handler to reject replays: two
+ * genuine observations always differ in seq_num and timestamp, so
+ * identical bytes mean the same observation is being registered twice.
+ * Returns VIRP_OK on a successful query (whether or not it matched).
+ */
+virp_error_t virp_chain_hash_exists(virp_chain_state_t *state,
+                                    const char *artifact_hash,
+                                    bool *exists);
+
+/*
  * Clean up all resources.
  */
 void virp_chain_destroy(virp_chain_state_t *state);

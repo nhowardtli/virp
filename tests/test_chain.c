@@ -381,6 +381,54 @@ static void test_unique_constraint(void)
     PASS();
 }
 
+/*
+ * virp_chain_hash_exists() — the lookup the chain_append handler uses to
+ * reject replays. Two genuine observations never share a hash, so a hash
+ * already present means the same artifact is being registered twice.
+ */
+static void test_hash_exists(void)
+{
+    TEST("hash_exists finds a registered artifact_hash");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    const char *h_present =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const char *h_absent =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    virp_chain_entry_t e;
+    virp_chain_append(&state, "session-hash", "observation",
+                      "art-hash-0", h_present, &e);
+
+    bool exists = false;
+    ASSERT(virp_chain_hash_exists(&state, h_present, &exists) == VIRP_OK,
+           "query for a present hash should succeed");
+    ASSERT(exists, "registered hash should be found");
+
+    exists = true;
+    ASSERT(virp_chain_hash_exists(&state, h_absent, &exists) == VIRP_OK,
+           "query for an absent hash should succeed");
+    ASSERT(!exists, "unregistered hash must not be found");
+
+    /* A hash registered under a different session still counts as a
+     * replay — the audit log is global, not per-session. */
+    virp_chain_append(&state, "session-other", "observation",
+                      "art-hash-1", h_absent, &e);
+    exists = false;
+    virp_chain_hash_exists(&state, h_absent, &exists);
+    ASSERT(exists, "hash from another session should be found");
+
+    ASSERT(virp_chain_hash_exists(&state, NULL, &exists) == VIRP_ERR_NULL_PTR,
+           "NULL hash must be rejected");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
 /* =========================================================================
  * Main
  * ========================================================================= */
@@ -398,6 +446,7 @@ int main(void)
     test_key_type();
     test_session_independence();
     test_unique_constraint();
+    test_hash_exists();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

@@ -602,6 +602,148 @@ static void gate_sha256_hex(const void *data, size_t len, char out[65])
 }
 
 /*
+ * Base64 decode for chain artifact bodies. Strict about length; leniency
+ * elsewhere is harmless because the SHA-256 commitment check below is the
+ * real gate — bytes that decode wrongly simply fail the hash.
+ * Returns decoded length, or -1.
+ */
+static int chain_b64_decode(const char *in, uint8_t *out, size_t out_max)
+{
+    size_t len = strlen(in);
+    if (len == 0 || (len % 4) != 0) return -1;
+    if (out_max < (len / 4) * 3) return -1;
+    int n = EVP_DecodeBlock((unsigned char *)out,
+                            (const unsigned char *)in, (int)len);
+    if (n < 0) return -1;
+    /* EVP_DecodeBlock reports the padded length; trim the '=' bytes. */
+    if (in[len - 1] == '=') n--;
+    if (len >= 2 && in[len - 2] == '=') n--;
+    return n < 0 ? -1 : n;
+}
+
+/*
+ * Validate a chain_append request BEFORE it is written to the audit log.
+ *
+ * Before this existed the handler checked only that four strings were
+ * non-empty, so an observation whose HMAC failed, an artifact_hash that
+ * did not match its own body, and unlimited replays of one observation
+ * were all accepted in silence. The chain's integrity rested entirely on
+ * submit_execute() in the client choosing to verify first — a client-side
+ * policy the daemon did not enforce, on a socket any allowlisted uid can
+ * reach. Chain linkage stays intact across such rows, so `chain tail`
+ * shows them as ordinary history.
+ *
+ * Three fail-closed checks:
+ *
+ *   1. Commitment — artifact_hash must equal SHA-256 of the body as
+ *      stored. The body arrives either base64-wrapped ("base64:<b64>",
+ *      what virp_tool.c sends) or as verbatim UTF-8 (what virp-bridge.py
+ *      sends when the raw bytes happen to decode); the hash is over the
+ *      raw bytes either way. This also turns the silent 8192-byte
+ *      truncation of req.artifact_content into a loud rejection instead
+ *      of a stored body that no longer hashes to its commitment.
+ *
+ *   2. Signature — an "observation" whose body parses as a VIRP message
+ *      must carry a valid O-Key HMAC.
+ *
+ *   3. Replay — no earlier entry may already commit to this hash.
+ *
+ * A request with NO artifact_content commits to a hash the daemon cannot
+ * see (tests/test_validator_e2e.py seeds the chain this way, and it is a
+ * legitimate "I attest to this digest" append). Those are still allowed,
+ * but logged as uncommitted rather than quietly treated as verified.
+ */
+static virp_error_t chain_verify_artifact(onode_state_t *state,
+                                          const onode_request_t *req,
+                                          const char **detail)
+{
+    *detail = "ok";
+
+    /*
+     * Content checks run BEFORE the replay check so the reported error is
+     * the most specific one available: a forged body that also happens to
+     * collide with an existing entry should be reported as a bad
+     * signature, not as a duplicate.
+     */
+    if (req->artifact_content[0] == '\0') {
+        /* No body: nothing to check, and no basis for calling a repeat a
+         * replay — we cannot tell whether the digest is an observation.
+         * UNIQUE(artifact_id) remains the only constraint here. */
+        *detail = "no body supplied — hash not independently checkable";
+        return VIRP_OK;
+    }
+
+    /* Recover the exact bytes the commitment is taken over. */
+    static const char B64[] = "base64:";
+    const uint8_t *raw;
+    size_t raw_len;
+    uint8_t decoded[sizeof(req->artifact_content)];
+    if (strncmp(req->artifact_content, B64, sizeof(B64) - 1) == 0) {
+        int n = chain_b64_decode(req->artifact_content + sizeof(B64) - 1,
+                                 decoded, sizeof(decoded));
+        if (n < 0) {
+            *detail = "artifact_content is not valid base64";
+            return VIRP_ERR_INVALID_LENGTH;
+        }
+        raw = decoded;
+        raw_len = (size_t)n;
+    } else {
+        raw = (const uint8_t *)req->artifact_content;
+        raw_len = strlen(req->artifact_content);
+    }
+
+    char computed[65];
+    gate_sha256_hex(raw, raw_len, computed);
+    if (strcasecmp(computed, req->artifact_hash) != 0) {
+        *detail = "artifact_hash does not match sha256(artifact_content)";
+        return VIRP_ERR_CHAIN_BROKEN;
+    }
+
+    /*
+     * Signature check for observations. A body that does not parse as a
+     * VIRP message is left to the commitment check alone: the chain also
+     * carries intents, outcomes and plain-text artifacts, and rejecting
+     * those here would break every non-observation caller.
+     */
+    const char *ok_detail = "hash verified (body is not a signed observation)";
+    bool is_signed_obs = false;
+    if (strcmp(req->artifact_type, "observation") == 0 &&
+        raw_len >= VIRP_HEADER_SIZE) {
+        virp_header_t hdr;
+        if (virp_header_deserialize(&hdr, raw, raw_len) == VIRP_OK &&
+            hdr.type == VIRP_MSG_OBSERVATION) {
+            if (virp_verify(NULL, raw, raw_len, &state->okey) != VIRP_OK) {
+                *detail = "observation HMAC does not verify against the O-Key";
+                return VIRP_ERR_HMAC_FAILED;
+            }
+            is_signed_obs = true;
+            ok_detail = "hash + O-Key HMAC verified";
+        }
+    }
+
+    /*
+     * Replay last, and ONLY for signed observations. Those carry a
+     * seq_num and a nanosecond timestamp, so two genuine ones can never
+     * be byte-identical: identical bytes mean the same observation is
+     * being registered twice. No such argument holds for intents,
+     * outcomes or plain-text artifacts, where identical content is
+     * legitimate — the same outcome record written twice is not an
+     * attack. Those are left to the UNIQUE(artifact_id) constraint.
+     */
+    if (is_signed_obs) {
+        bool dup = false;
+        if (virp_chain_hash_exists(&state->chain, req->artifact_hash,
+                                   &dup) == VIRP_OK && dup) {
+            *detail = "replay: artifact_hash already in chain";
+            return VIRP_ERR_REPLAY_DETECTED;
+        }
+    }
+
+    *detail = ok_detail;
+    return VIRP_OK;
+}
+
+/*
  * Effective gate mode for a driver: its per-driver override if present in
  * gate_overrides, else gate_default_mode. Matched by driver name (drv->name).
  */
@@ -2021,14 +2163,34 @@ static void handle_client(onode_state_t *state, int client_fd)
             break;
         }
         {
+            /* Verify before the write — see chain_verify_artifact(). */
+            const char *why = "ok";
+            virp_error_t verr = chain_verify_artifact(state, &req, &why);
+            if (verr != VIRP_OK) {
+                fprintf(stderr, "[CHAIN] REJECTED append: session=%s id=%s "
+                        "type=%s code=%d (%s) — %s\n",
+                        req.session_id, req.artifact_id, req.artifact_type,
+                        (int)verr, virp_error_str(verr), why);
+                send_framed_error(client_fd, verr);
+                break;
+            }
+
             virp_chain_entry_t chain_entry;
             err = virp_chain_append(&state->chain, req.session_id,
                                      req.artifact_type, req.artifact_id,
                                      req.artifact_hash, &chain_entry);
             if (err != VIRP_OK) {
+                fprintf(stderr, "[CHAIN] append failed: session=%s id=%s "
+                        "code=%d (%s)\n", req.session_id, req.artifact_id,
+                        (int)err, virp_error_str(err));
                 send_framed_error(client_fd, err);
                 break;
             }
+            fprintf(stderr, "[CHAIN] appended: session=%s seq=%lld type=%s "
+                    "id=%s hash=%.16s… entry=%.16s… — %s\n",
+                    req.session_id, (long long)chain_entry.sequence,
+                    req.artifact_type, req.artifact_id,
+                    req.artifact_hash, chain_entry.chain_entry_hash, why);
             /* Store raw artifact content if provided */
             if (req.artifact_content[0] != '\0') {
                 virp_chain_artifact_store(&state->chain,
