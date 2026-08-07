@@ -1,0 +1,217 @@
+/*
+ * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
+ * VIRP — O-Node Ed25519 observation-signing key (custody)
+ *
+ * See include/virp_obskey.h for the custody model and why the private
+ * key living ON the daemon is correct for this key (the daemon is the
+ * attester) while the approval secret must live OFF-box.
+ *
+ * Crypto primitives are raw libsodium, the same calls the federation
+ * module already uses; the SPKI encoding and key_id convention are the
+ * approver registry's.
+ */
+
+#define _POSIX_C_SOURCE 200809L     /* O_NOFOLLOW, O_CLOEXEC */
+
+#include "virp_obskey.h"
+#include "virp_crypto.h"            /* virp_key_owner_ok */
+#include "virp_approver_registry.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sodium.h>
+#include <openssl/sha.h>
+
+static void obskey_key_id(const uint8_t pk[VIRP_OBSKEY_PK_SIZE],
+                          uint8_t key_id[VIRP_OBSKEY_KEYID_SIZE])
+{
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(pk, VIRP_OBSKEY_PK_SIZE, hash);
+    memcpy(key_id, hash, VIRP_OBSKEY_KEYID_SIZE);
+}
+
+static void obskey_mlock(virp_obskey_t *kp)
+{
+    if (sodium_mlock(kp->secret_key, VIRP_OBSKEY_SK_SIZE) != 0) {
+        /* Non-fatal, same policy as the federation keys: without
+         * CAP_IPC_LOCK the key still works, it just isn't pinned. */
+        fprintf(stderr, "[ObsKey] Warning: sodium_mlock() failed "
+                        "(may lack permissions)\n");
+    } else {
+        kp->locked = true;
+    }
+}
+
+virp_error_t virp_obskey_generate(virp_obskey_t *kp)
+{
+    if (!kp)
+        return VIRP_ERR_NULL_PTR;
+    if (sodium_init() < 0)
+        return VIRP_ERR_CRYPTO;
+
+    memset(kp, 0, sizeof(*kp));
+    if (crypto_sign_keypair(kp->public_key, kp->secret_key) != 0)
+        return VIRP_ERR_CRYPTO;
+
+    obskey_key_id(kp->public_key, kp->key_id);
+    kp->loaded = true;
+    obskey_mlock(kp);
+    return VIRP_OK;
+}
+
+virp_error_t virp_obskey_save(const virp_obskey_t *kp,
+                              const char *sk_path,
+                              const char *pk_path)
+{
+    if (!kp || !sk_path || !pk_path)
+        return VIRP_ERR_NULL_PTR;
+    if (!kp->loaded)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    /* Secret first, 0600 from birth — never a window where it exists
+     * with wider bits. O_EXCL: refuse to write over an existing key. */
+    int fd = open(sk_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "[ObsKey] cannot create %s: %s\n",
+                sk_path, strerror(errno));
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+    ssize_t n = write(fd, kp->secret_key, VIRP_OBSKEY_SK_SIZE);
+    close(fd);
+    if (n != VIRP_OBSKEY_SK_SIZE)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    fd = open(pk_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return VIRP_ERR_KEY_NOT_LOADED;
+    n = write(fd, kp->public_key, VIRP_OBSKEY_PK_SIZE);
+    close(fd);
+    if (n != VIRP_OBSKEY_PK_SIZE)
+        return VIRP_ERR_KEY_NOT_LOADED;
+
+    return VIRP_OK;
+}
+
+virp_error_t virp_obskey_load(virp_obskey_t *kp, const char *sk_path)
+{
+    if (!kp || !sk_path)
+        return VIRP_ERR_NULL_PTR;
+    if (sodium_init() < 0)
+        return VIRP_ERR_CRYPTO;
+
+    memset(kp, 0, sizeof(*kp));
+
+    /* Same custody gate as virp_key_load_file: no symlinks, regular
+     * file only, no group/world bits, owner must be us (or we are
+     * root). The observation-signing secret is daemon-resident, which
+     * is exactly why a lax mode must refuse: any other local reader
+     * has already become an observation forger. */
+    int fd = open(sk_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ELOOP)
+            fprintf(stderr, "[ObsKey] %s is a symlink — refusing to "
+                            "follow (O_NOFOLLOW)\n", sk_path);
+        else
+            fprintf(stderr, "[ObsKey] open(%s): %s\n",
+                    sk_path, strerror(errno));
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "[ObsKey] %s is not a regular file\n", sk_path);
+        close(fd);
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+        fprintf(stderr,
+                "[ObsKey] observation signing key %s has insecure mode "
+                "0%o — any group/world access makes every local reader "
+                "an observation forger. Refusing to load. "
+                "Run: chmod 0600 %s\n",
+                sk_path, (unsigned)(st.st_mode & 07777), sk_path);
+        close(fd);
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    uid_t euid = geteuid();
+    if (!virp_key_owner_ok(st.st_uid, euid)) {
+        fprintf(stderr,
+                "[ObsKey] observation signing key %s is owned by uid=%u, "
+                "expected %u — refusing to load\n",
+                sk_path, (unsigned)st.st_uid, (unsigned)euid);
+        close(fd);
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    if (st.st_size != (off_t)VIRP_OBSKEY_SK_SIZE) {
+        fprintf(stderr,
+                "[ObsKey] observation signing key %s is %lld bytes, "
+                "expected exactly %d (Ed25519 seed||pub) — malformed or "
+                "truncated key, refusing to load\n",
+                sk_path, (long long)st.st_size, VIRP_OBSKEY_SK_SIZE);
+        close(fd);
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+
+    ssize_t got = 0;
+    while (got < (ssize_t)VIRP_OBSKEY_SK_SIZE) {
+        ssize_t r = read(fd, kp->secret_key + got,
+                         VIRP_OBSKEY_SK_SIZE - (size_t)got);
+        if (r == 0) break;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            sodium_memzero(kp->secret_key, VIRP_OBSKEY_SK_SIZE);
+            return VIRP_ERR_KEY_NOT_LOADED;
+        }
+        got += r;
+    }
+    close(fd);
+    if (got != (ssize_t)VIRP_OBSKEY_SK_SIZE) {
+        sodium_memzero(kp->secret_key, VIRP_OBSKEY_SK_SIZE);
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+
+    /* libsodium sk = seed(32) || pub(32); derive and cross-check. */
+    if (crypto_sign_ed25519_sk_to_pk(kp->public_key, kp->secret_key) != 0) {
+        sodium_memzero(kp->secret_key, VIRP_OBSKEY_SK_SIZE);
+        return VIRP_ERR_CRYPTO;
+    }
+
+    obskey_key_id(kp->public_key, kp->key_id);
+    kp->loaded = true;
+    obskey_mlock(kp);
+    return VIRP_OK;
+}
+
+virp_error_t virp_obskey_spki(const virp_obskey_t *kp,
+                              uint8_t out[VIRP_OBSKEY_SPKI_SIZE])
+{
+    if (!kp || !out)
+        return VIRP_ERR_NULL_PTR;
+    if (!kp->loaded)
+        return VIRP_ERR_KEY_NOT_LOADED;
+    virp_approver_ed25519_spki(kp->public_key, out);
+    return VIRP_OK;
+}
+
+void virp_obskey_destroy(virp_obskey_t *kp)
+{
+    if (!kp)
+        return;
+    sodium_memzero(kp->secret_key, VIRP_OBSKEY_SK_SIZE);
+    if (kp->locked)
+        sodium_munlock(kp->secret_key, VIRP_OBSKEY_SK_SIZE);
+    memset(kp, 0, sizeof(*kp));
+}

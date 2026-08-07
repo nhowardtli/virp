@@ -39,6 +39,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_validator.o \
              $(BUILD_DIR)/virp_approval.o \
              $(BUILD_DIR)/virp_approver_registry.o \
+             $(BUILD_DIR)/virp_obskey.o \
              $(BUILD_DIR)/virp_ssh_io.o \
              $(BUILD_DIR)/cJSON.o
 
@@ -241,6 +242,9 @@ $(BUILD_DIR)/virp_approval.o: src/virp_approval.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_approver_registry.o: src/virp_approver_registry.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_obskey.o: src/virp_obskey.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(LIB): $(LIB_OBJS)
@@ -693,6 +697,15 @@ $(TEST_OBS_V2): tests/test_obs_v2.c $(LIB)
 test-obs-v2: $(TEST_OBS_V2)
 	./$(TEST_OBS_V2)
 
+# Observation-signing key (Ed25519 obskey) custody tests
+TEST_OBSKEY = $(BUILD_DIR)/test_obskey
+
+$(TEST_OBSKEY): tests/test_obskey.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-obskey: $(TEST_OBSKEY)
+	./$(TEST_OBSKEY)
+
 # Session key derivation tests
 TEST_SESSION_KEY = $(BUILD_DIR)/test_session_key
 
@@ -1130,4 +1143,4 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-validator test-approval test-approvers test-pkcs11
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-validator test-approval test-approvers test-pkcs11

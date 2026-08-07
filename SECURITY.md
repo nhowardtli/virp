@@ -122,6 +122,37 @@ the dashboard bridge and the socat endpoint, or request-side signing
 at the VIRP message layer — is not yet implemented and is tracked as
 follow-up hardening.
 
+## Ed25519 Observation-Signing Key — Custody (added 2026-08-07)
+
+An O-Node Ed25519 observation-signing keypair exists (`virp-tool keygen
+obskey`, loader `virp_obskey_load`), distinct from both the symmetric
+O-Key and the approval keypair. Its custody is deliberately the MIRROR
+of the approval keypair's, and that is correct, not a contradiction:
+
+- **Approval keypair:** the secret lives OFF-box with a human approver;
+  the daemon holds only the public key. The property purchased is that
+  the daemon can never approve its own proposals — approval answers
+  "did a human other than the daemon authorize this?".
+- **Observation-signing keypair:** the secret lives ON the daemon host.
+  The O-Node is the attester — an observation is precisely the daemon's
+  own signed statement of what a device returned, so only the daemon
+  may hold the key that makes that statement. What the asymmetry buys
+  is on the CONSUMER side: the public key verifies observations but
+  cannot mint them, unlike the symmetric O-Key where the verify key
+  and the forge key are the same bytes.
+
+This key does NOT change the daemon-compromise boundary: a compromised
+O-Node still forges observations, because the O-Node is the attester.
+
+Custody enforcement (tested in `tests/test_obskey.c`): the private key
+file must be a regular file, mode 0400/0600, owned by the daemon's
+effective UID (or root); symlinks, group/world-accessible modes and
+wrong-size (non-64-byte) files are refused at load with distinct
+errors. The secret is `sodium_mlock`'d while loaded, zeroized on
+destroy, and appears in no log or export path; only the public key is
+exportable (raw or SPKI DER, `key_id = SHA-256(pub)[:16]`, the same
+convention the approver registry uses).
+
 ## Observation-Body Integrity
 
 The HMAC-SHA256 signature on an observation is sound, and the v2 header

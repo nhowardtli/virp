@@ -4,7 +4,7 @@
  * CLI Tool — key generation, message inspection, test message building
  *
  * Usage:
- *   virp-tool keygen  <okey|rkey> <output_file>
+ *   virp-tool keygen  <okey|rkey|approval|obskey> <output_file>
  *   virp-tool inspect <message_file> <key_file> <okey|rkey>
  *   virp-tool build   <observation|heartbeat|proposal> [options]
  *   virp-tool hexdump <message_file>
@@ -19,6 +19,7 @@
 #include "virp_approver_registry.h"
 #include "virp_chain.h"
 #include "virp_federation.h"
+#include "virp_obskey.h"
 #include "cJSON.h"
 #include <arpa/inet.h>
 #include <openssl/evp.h>
@@ -136,10 +137,57 @@ static int cmd_keygen_approval(const char *prefix)
     return 0;
 }
 
+/*
+ * keygen obskey — generate the O-Node Ed25519 OBSERVATION-signing
+ * keypair (wire version 3 observations). Custody is the MIRROR of the
+ * approval keypair, on purpose:
+ *
+ *   approval:  secret OFF-box with a human, daemon holds pub only —
+ *              so the daemon can never approve its own proposals.
+ *   obskey:    secret ON the daemon host — the daemon IS the attester;
+ *              an observation is the daemon's own signed statement.
+ *
+ * What consumers gain: the .pub file verifies observations but cannot
+ * mint them (unlike the symmetric O-Key, where verify key == forge
+ * key). A compromised daemon can still forge; that boundary is not
+ * changed by this key.
+ */
+static int cmd_keygen_obskey(const char *prefix)
+{
+    virp_obskey_t kp;
+    if (virp_obskey_generate(&kp) != VIRP_OK) {
+        fprintf(stderr, "Error: observation keypair generation failed\n");
+        return 1;
+    }
+
+    char pk_path[512], sk_path[512];
+    snprintf(pk_path, sizeof(pk_path), "%s.pub", prefix);
+    snprintf(sk_path, sizeof(sk_path), "%s.key", prefix);
+
+    if (virp_obskey_save(&kp, sk_path, pk_path) != VIRP_OK) {
+        fprintf(stderr, "Error: saving observation keypair failed "
+                        "(existing %s is never overwritten)\n", sk_path);
+        virp_obskey_destroy(&kp);
+        return 1;
+    }
+
+    printf("Generated observation signing keypair (Ed25519):\n");
+    printf("  Secret key:  %s (0600 — DAEMON HOST ONLY; every holder "
+           "can sign observations)\n", sk_path);
+    printf("  Public key:  %s (distribute to consumers/auditors — "
+           "verify-only, cannot forge)\n", pk_path);
+    printf("  Key ID:      ");
+    for (int i = 0; i < VIRP_OBSKEY_KEYID_SIZE; i++)
+        printf("%02x", kp.key_id[i]);
+    printf("\n");
+    virp_obskey_destroy(&kp);
+    return 0;
+}
+
 static int cmd_keygen(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: virp-tool keygen <okey|rkey|approval> <output>\n");
+        fprintf(stderr, "Usage: virp-tool keygen <okey|rkey|approval|obskey> <output>\n");
         return 1;
     }
 
@@ -149,13 +197,16 @@ static int cmd_keygen(int argc, char **argv)
     if (strcmp(type_str, "approval") == 0)
         return cmd_keygen_approval(path);
 
+    if (strcmp(type_str, "obskey") == 0)
+        return cmd_keygen_obskey(path);
+
     virp_key_type_t type;
     if (strcmp(type_str, "okey") == 0)
         type = VIRP_KEY_TYPE_OKEY;
     else if (strcmp(type_str, "rkey") == 0)
         type = VIRP_KEY_TYPE_RKEY;
     else {
-        fprintf(stderr, "Error: key type must be 'okey', 'rkey', or 'approval'\n");
+        fprintf(stderr, "Error: key type must be 'okey', 'rkey', 'approval', or 'obskey'\n");
         return 1;
     }
 
@@ -1792,7 +1843,7 @@ static void usage(void)
     printf("build: ");
     print_version();
     printf("\nCommands:\n");
-    printf("  keygen   <okey|rkey|approval> <output>    Generate signing key\n");
+    printf("  keygen   <okey|rkey|approval|obskey> <output>  Generate signing key\n");
     printf("  inspect  <msg_file> <key_file> <type>    Inspect and verify message\n");
     printf("  build    <type> [options]                 Build test message\n");
     printf("  hexdump  <msg_file>                       Raw hex dump\n");
