@@ -269,6 +269,13 @@ def chain_register(session_id, artifact_type, artifact_id, body_bytes,
         content = "base64:" + base64.b64encode(body_bytes).decode()
     else:
         content = body_bytes.decode("utf-8")
+    stored_body = len(content) < 8192
+    if artifact_type == "observation" and not stored_body:
+        # Since the 2026-08-07 re-cut the daemon refuses a body-less
+        # "observation" — verified is what that type means. An oversized
+        # body registers commitment-only as "external_digest", the type
+        # whose name admits the daemon could not verify it.
+        artifact_type = "external_digest"
     req = {
         "action": "chain_append",
         "session_id": session_id,
@@ -276,7 +283,6 @@ def chain_register(session_id, artifact_type, artifact_id, body_bytes,
         "artifact_id": artifact_id,
         "artifact_hash": h,
     }
-    stored_body = len(content) < 8192
     if stored_body:
         req["artifact_content"] = content
     resp = send(req)

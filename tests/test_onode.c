@@ -3396,6 +3396,42 @@ static int ca_count_entries(const char *artifact_id)
     return n;
 }
 
+static void ca_sha256_hex_n(const uint8_t *buf, size_t len, char out[65])
+{
+    unsigned char md[32];
+    unsigned int mdlen = 0;
+    EVP_Digest(buf, len, md, &mdlen, EVP_sha256(), NULL);
+    for (int i = 0; i < 32; i++)
+        snprintf(out + i * 2, 3, "%02x", md[i]);
+}
+
+/* Build a genuine v1 observation signed with the chain daemon's own
+ * O-Key, and its "base64:<b64>" body + sha256 commitment — the exact
+ * shape virp_tool.c chain-register and autopilot submit. */
+static size_t ca_signed_observation(uint8_t *raw, size_t raw_cap,
+                                    char *content, size_t content_cap,
+                                    char hash_hex[65])
+{
+    size_t obs_len = 0;
+    const char *payload = "{\"device\":\"R5\",\"output\":\"up/up\"}";
+    if (virp_build_observation(raw, raw_cap, &obs_len, 0x42, 7,
+                               VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL,
+                               (const uint8_t *)payload,
+                               (uint16_t)strlen(payload),
+                               &ca_state.okey) != VIRP_OK)
+        return 0;
+    ca_sha256_hex_n(raw, obs_len, hash_hex);
+
+    if (content_cap < strlen("base64:") + (obs_len + 2) / 3 * 4 + 1)
+        return 0;
+    memcpy(content, "base64:", 7);
+    int b64_len = EVP_EncodeBlock((unsigned char *)content + 7, raw,
+                                  (int)obs_len);
+    if (b64_len <= 0) return 0;
+    content[7 + b64_len] = '\0';
+    return obs_len;
+}
+
 /* ATTACK 1: the declared hash is not sha256(the submitted body). The
  * daemon must recompute over the received bytes and refuse. */
 TEST(test_chain_append_rejects_body_hash_mismatch)
@@ -3462,10 +3498,37 @@ TEST(test_chain_append_rejects_invented_type)
     ASSERT_EQ(ca_count_entries("invented-1"), 0);
 }
 
-/* GUARD: the legitimate external append — a known client type whose body
- * hashes to its declared commitment — must still be accepted, or the fix
- * has simply broken chain registration. */
-TEST(test_chain_append_accepts_bound_observation)
+/* =========================================================================
+ * GATE 3 — body semantics (chain re-cut 2026-08-07). "observation" means
+ * VERIFIED: body required, body must parse as a VIRP observation, body
+ * must verify against the O-Key. The bytes pick the security path, not
+ * the label. Each test below breaks if its specific guard is removed
+ * from chain_verify_body().
+ * ========================================================================= */
+
+/* GUARD: the legitimate external append — a REAL signed observation whose
+ * body hashes to its declared commitment — must be accepted, or the
+ * re-cut has simply broken chain registration. */
+TEST(test_chain_append_accepts_verified_v1_observation)
+{
+    uint8_t raw[1024];
+    char content[2048], h[65];
+    size_t obs_len = ca_signed_observation(raw, sizeof(raw),
+                                           content, sizeof(content), h);
+    ASSERT_TRUE(obs_len > 0);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "observation",
+                          "obs-v1-legit-1", h, content, resp, sizeof(resp));
+
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("obs-v1-legit-1"), 1);
+}
+
+/* Guard removed => a JSON blob that hashes correctly registers as an
+ * "observation". The type must mean verified, so this is a REJECTION —
+ * there is no "hash bound but not a signed observation" pass-through. */
+TEST(test_chain_append_rejects_nonobservation_body_as_observation)
 {
     const char *body = "{\"device\":\"R5\",\"output\":\"up/up\"}";
     char h[65];
@@ -3473,25 +3536,150 @@ TEST(test_chain_append_accepts_bound_observation)
 
     uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
     ssize_t n = ca_append("autopilot:legit", "observation",
-                          "obs-legit-1", h, body, resp, sizeof(resp));
+                          "obs-json-body-1", h, body, resp, sizeof(resp));
 
-    ASSERT_TRUE(n > 4);
-    ASSERT_EQ(ca_count_entries("obs-legit-1"), 1);
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-json-body-1"), 0);
 }
 
-/* GUARD: a commitment-only append (no body at all) stays legal — the
- * caller may choose to register a hash commitment without the bytes. */
-TEST(test_chain_append_accepts_commitment_without_body)
+/* Guard removed => a commitment-only "observation" (no body) appends.
+ * Digest-only attestation is external_digest's job; for observation it
+ * is a rejection. */
+TEST(test_chain_append_rejects_empty_body_observation)
 {
     char h[65];
     ca_sha256_hex("bytes the chain will not hold", h);
 
     uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
     ssize_t n = ca_append("autopilot:legit", "observation",
-                          "obs-commitment-1", h, NULL, resp, sizeof(resp));
+                          "obs-empty-body-1", h, NULL, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-empty-body-1"), 0);
+}
+
+/* GUARD: the commitment-only registration that empty-body observations
+ * used to provide still exists — under the type whose name says what it
+ * is. autopilot registers oversized bodies this way. */
+TEST(test_chain_append_accepts_external_digest_commitment)
+{
+    char h[65];
+    ca_sha256_hex("bytes the chain will not hold", h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "external_digest",
+                          "digest-commitment-1", h, NULL, resp, sizeof(resp));
 
     ASSERT_TRUE(n > 4);
-    ASSERT_EQ(ca_count_entries("obs-commitment-1"), 1);
+    ASSERT_EQ(ca_count_entries("digest-commitment-1"), 1);
+}
+
+/* Guard removed => a flipped byte still registers: the attacker controls
+ * the declared hash (recomputed over the tampered bytes), so only the
+ * O-Key HMAC check can catch the tamper. */
+TEST(test_chain_append_rejects_tampered_v1_observation)
+{
+    uint8_t raw[1024];
+    char content[2048], h[65];
+    size_t obs_len = ca_signed_observation(raw, sizeof(raw),
+                                           content, sizeof(content), h);
+    ASSERT_TRUE(obs_len > 0);
+
+    /* Flip one payload byte AFTER signing, then re-derive body + hash
+     * so GATE 2's sha256 binding passes and GATE 3 must do the work. */
+    raw[obs_len - 1] ^= 0x01;
+    ca_sha256_hex_n(raw, obs_len, h);
+    memcpy(content, "base64:", 7);
+    int b64_len = EVP_EncodeBlock((unsigned char *)content + 7, raw,
+                                  (int)obs_len);
+    ASSERT_TRUE(b64_len > 0);
+    content[7 + b64_len] = '\0';
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "observation",
+                          "obs-tampered-1", h, content, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-tampered-1"), 0);
+}
+
+/* Guard removed => signed-observation bytes relabeled "evidence_item"
+ * skip HMAC + replay entirely. The bytes pick the path: a body that
+ * parses as a VIRP observation under any other type is a mismatch. */
+TEST(test_chain_append_rejects_observation_bytes_as_evidence_item)
+{
+    uint8_t raw[1024];
+    char content[2048], h[65];
+    size_t obs_len = ca_signed_observation(raw, sizeof(raw),
+                                           content, sizeof(content), h);
+    ASSERT_TRUE(obs_len > 0);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "evidence_item",
+                          "obs-relabel-1", h, content, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-relabel-1"), 0);
+}
+
+/* Guard removed => v2 bytes reach the v1 verifier. Both formats carry
+ * 0x01 in byte 1 (v1 message type / v2 OBS channel), so only the
+ * explicit version byte separates them. A v2 body is positively
+ * identified and rejected — session-bound observations cannot be
+ * verified at registration time, and mis-verifying them as v1 must not
+ * be the failure mode. */
+TEST(test_chain_append_rejects_v2_body_as_observation)
+{
+    /* Minimal v2 shape: 88-byte header + empty payload + 32-byte sig.
+     * version=2, channel=OBS(0x01), tier GREEN, reserved 0,
+     * payload_len=0 — deserializes as v2, never as v1. */
+    uint8_t raw[VIRP_OBS_V2_MIN_SIZE];
+    memset(raw, 0, sizeof(raw));
+    raw[0] = VIRP_VERSION_2;
+    raw[1] = VIRP_CHANNEL_OBS;
+
+    char h[65];
+    ca_sha256_hex_n(raw, sizeof(raw), h);
+    char content[512];
+    memcpy(content, "base64:", 7);
+    int b64_len = EVP_EncodeBlock((unsigned char *)content + 7, raw,
+                                  (int)sizeof(raw));
+    ASSERT_TRUE(b64_len > 0);
+    content[7 + b64_len] = '\0';
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "observation",
+                          "obs-v2-body-1", h, content, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-v2-body-1"), 0);
+}
+
+/* Guard removed => an unknown future version silently falls into some
+ * arm. Anything not positively identified as a supported version is
+ * rejected. */
+TEST(test_chain_append_rejects_unknown_version_body)
+{
+    uint8_t raw[VIRP_OBS_V2_MIN_SIZE];
+    memset(raw, 0, sizeof(raw));
+    raw[0] = 3;                     /* no such wire version */
+    raw[1] = VIRP_CHANNEL_OBS;
+
+    char h[65];
+    ca_sha256_hex_n(raw, sizeof(raw), h);
+    char content[512];
+    memcpy(content, "base64:", 7);
+    int b64_len = EVP_EncodeBlock((unsigned char *)content + 7, raw,
+                                  (int)sizeof(raw));
+    ASSERT_TRUE(b64_len > 0);
+    content[7 + b64_len] = '\0';
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "observation",
+                          "obs-v3-body-1", h, content, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-v3-body-1"), 0);
 }
 
 /* =========================================================================
@@ -3648,8 +3836,14 @@ int main(void)
         RUN_TEST(test_chain_append_rejects_reserved_type_outcome);
         RUN_TEST(test_chain_append_rejects_reserved_type_approval);
         RUN_TEST(test_chain_append_rejects_invented_type);
-        RUN_TEST(test_chain_append_accepts_bound_observation);
-        RUN_TEST(test_chain_append_accepts_commitment_without_body);
+        RUN_TEST(test_chain_append_accepts_verified_v1_observation);
+        RUN_TEST(test_chain_append_rejects_nonobservation_body_as_observation);
+        RUN_TEST(test_chain_append_rejects_empty_body_observation);
+        RUN_TEST(test_chain_append_accepts_external_digest_commitment);
+        RUN_TEST(test_chain_append_rejects_tampered_v1_observation);
+        RUN_TEST(test_chain_append_rejects_observation_bytes_as_evidence_item);
+        RUN_TEST(test_chain_append_rejects_v2_body_as_observation);
+        RUN_TEST(test_chain_append_rejects_unknown_version_body);
         ca_stop();
         ca_cleanup_files();
     } else {

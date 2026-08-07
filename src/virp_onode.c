@@ -2139,6 +2139,147 @@ static bool peer_uid_allowed(onode_state_t *state, int client_fd,
     return false;
 }
 
+/* =========================================================================
+ * CHAIN_APPEND GATE 3 — body semantics (chain re-cut, 2026-08-07)
+ *
+ * Runs AFTER the type-namespace gate and the sha256(body)==artifact_hash
+ * binding, BEFORE the append. Those gates prove the caller committed to
+ * the bytes it sent; this one decides what those bytes are allowed to
+ * MEAN. Two rules, both fail-closed:
+ *
+ *   1. "observation" means VERIFIED. The type requires a body, the body
+ *      must parse as a VIRP observation, and it must verify. There is no
+ *      "hash bound, but not actually a signed observation" pass-through:
+ *      a caller attesting to an external digest must say so with the
+ *      "external_digest" type, whose name carries its weaker meaning.
+ *
+ *   2. The BYTES pick the security path, not the client-supplied label.
+ *      A body that parses as a VIRP observation submitted under any
+ *      other type is refused — otherwise relabeling signed-observation
+ *      bytes as "evidence_item" would skip HMAC and replay checks.
+ *
+ * Version dispatch is on the EXPLICIT version field (byte 0). Both wire
+ * formats carry 0x01 in byte 1 — v1's message type and v2's channel — so
+ * that byte identifies nothing. As of 2026-08-07 every production caller
+ * registers v1 (O-Key HMAC) observations: no chain client sends
+ * obs_version=2, so nothing session-bound ever reaches this path. A v2
+ * body is still positively identified and REJECTED rather than fed to
+ * the v1 verifier: v2 verification (virp_verify_observation_v2) needs
+ * the live session key and the device/command binding of the exec that
+ * produced it, none of which exist at registration time. If v2
+ * registration is ever wanted, it needs its own design — not a silent
+ * fall-through here.
+ */
+
+/* Does `raw` have the shape of a v1 VIRP message? (version byte 1 and a
+ * deserializable common header — shape only, no verification.) */
+static bool body_is_v1_message(const uint8_t *raw, size_t raw_len,
+                               virp_header_t *hdr_out)
+{
+    if (raw_len < VIRP_HEADER_SIZE || raw[0] != VIRP_VERSION)
+        return false;
+    return virp_header_deserialize(hdr_out, raw, raw_len) == VIRP_OK;
+}
+
+/* Does `raw` have the shape of a v2 observation? (version byte 2, OBS
+ * channel, minimum size — shape only, no verification.) */
+static bool body_is_v2_observation(const uint8_t *raw, size_t raw_len)
+{
+    return raw_len >= VIRP_OBS_V2_MIN_SIZE &&
+           raw[0] == VIRP_VERSION_2 &&
+           raw[1] == VIRP_CHANNEL_OBS;
+}
+
+static virp_error_t chain_verify_body(onode_state_t *state,
+                                      const onode_request_t *req,
+                                      const char **why)
+{
+    bool is_obs_type = strcmp(req->artifact_type, "observation") == 0;
+
+    if (req->artifact_content[0] == '\0') {
+        if (is_obs_type) {
+            *why = "type 'observation' requires the signed body — register "
+                   "a bare digest as 'external_digest'";
+            return VIRP_ERR_NULL_PTR;
+        }
+        /* Commitment-only stays legal for the non-observation types
+         * (external_digest exists for exactly this; indirect types were
+         * already forced to carry a body by the gate above). */
+        return VIRP_OK;
+    }
+
+    /* The same bytes GATE 2 hashed — same decoding rule, one source. */
+    uint8_t *raw = NULL;
+    size_t raw_len = 0;
+    virp_error_t err = virp_chain_artifact_bytes(req->artifact_content,
+                                                 &raw, &raw_len);
+    if (err != VIRP_OK) {
+        *why = "artifact_content is not decodable";
+        return err;
+    }
+
+    virp_header_t hdr;
+    bool v1_shape = body_is_v1_message(raw, raw_len, &hdr);
+    bool v2_shape = !v1_shape && body_is_v2_observation(raw, raw_len);
+
+    if (!is_obs_type) {
+        /* Rule 2: observation-shaped bytes under any other label are a
+         * mismatch, not a lighter-weight registration. */
+        if ((v1_shape && hdr.type == VIRP_MSG_OBSERVATION) || v2_shape) {
+            free(raw);
+            *why = "body is a VIRP observation but artifact_type is not "
+                   "'observation' — label does not pick the security path";
+            return VIRP_ERR_INVALID_TYPE;
+        }
+        free(raw);
+        return VIRP_OK;
+    }
+
+    /* Rule 1: type 'observation' — the body must positively identify as
+     * a supported observation version and verify. */
+    if (v2_shape) {
+        free(raw);
+        *why = "v2 (session-bound) observation cannot be verified at "
+               "registration time — rejected, not run through the v1 "
+               "verifier";
+        return VIRP_ERR_VERSION_MISMATCH;
+    }
+    if (!v1_shape) {
+        free(raw);
+        *why = "body under type 'observation' does not parse as a VIRP "
+               "observation — register non-observation bytes under their "
+               "own type";
+        return VIRP_ERR_INVALID_TYPE;
+    }
+    if (hdr.type != VIRP_MSG_OBSERVATION) {
+        free(raw);
+        *why = "body is a VIRP message but not an OBSERVATION";
+        return VIRP_ERR_INVALID_TYPE;
+    }
+    err = virp_header_validate(&hdr);
+    if (err != VIRP_OK) {
+        free(raw);
+        *why = "observation header fails validation";
+        return err;
+    }
+    if ((size_t)hdr.length != raw_len) {
+        /* The header's own length must cover exactly the submitted
+         * bytes — trailing garbage after a valid message must not ride
+         * in under its signature. */
+        free(raw);
+        *why = "observation length field does not match the submitted body";
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+    err = virp_verify(NULL, raw, raw_len, &state->okey);
+    free(raw);
+    if (err != VIRP_OK) {
+        *why = "observation does not verify against the O-Key";
+        return err;
+    }
+    *why = "v1 observation verified (O-Key HMAC)";
+    return VIRP_OK;
+}
+
 static void handle_client(onode_state_t *state, int client_fd)
 {
     char recv_buf[ONODE_MAX_REQUEST_SIZE];
@@ -2419,6 +2560,27 @@ static void handle_client(onode_state_t *state, int client_fd)
                     req.artifact_type, req.session_id, req.artifact_id);
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
+        }
+
+        /* GATE 3 — body semantics: an "observation" must BE a verified
+         * observation, and observation bytes may not hide under another
+         * label. See chain_verify_body(). */
+        {
+            const char *why = NULL;
+            virp_error_t verr = chain_verify_body(state, &req, &why);
+            if (verr != VIRP_OK) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: %s "
+                        "(session=%s id=%s type=%s)\n",
+                        why ? why : "body verification failed",
+                        req.session_id, req.artifact_id, req.artifact_type);
+                send_framed_error(client_fd, verr);
+                break;
+            }
+            if (why)
+                fprintf(stderr, "[CHAIN] chain_append body check: %s "
+                        "(session=%s id=%s type=%s)\n",
+                        why, req.session_id, req.artifact_id,
+                        req.artifact_type);
         }
         {
             /* Entry and (optional) raw content commit in one transaction.

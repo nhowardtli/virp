@@ -368,6 +368,16 @@ bool virp_chain_type_is_external_allowed(const char *artifact_type)
         "no_drift",        /* autopilot/virp_config_backup.py               */
         "baseline_set",    /* autopilot/virp_config_backup.py               */
         "drift_alert",     /* autopilot/virp_config_backup.py               */
+        /* "external_digest" is a commitment the daemon has NOT verified:
+         * the caller attests to a digest of bytes the chain does not
+         * hold (the oversized-observation path in autopilot — a body at
+         * or past the 8192-byte field would be stored truncated, so
+         * only the hash is registered). It exists so that "observation"
+         * can mean VERIFIED: an entry of type observation always
+         * carried a body that parsed and HMAC-verified at append time,
+         * and anything weaker must say so in its type name. Readers
+         * must treat external_digest as unverified external input. */
+        "external_digest",
     };
     if (virp_chain_type_is_indirect(artifact_type)) return true;
     return type_in(artifact_type, EXTERNAL,
@@ -419,10 +429,10 @@ static int artifact_b64_decode(const char *in, size_t in_len,
     return (int)o;
 }
 
-virp_error_t virp_chain_artifact_digest(const char *artifact_content,
-                                        char out_hex[65])
+virp_error_t virp_chain_artifact_bytes(const char *artifact_content,
+                                       uint8_t **out_raw, size_t *out_len)
 {
-    if (!artifact_content || !out_hex) return VIRP_ERR_NULL_PTR;
+    if (!artifact_content || !out_raw || !out_len) return VIRP_ERR_NULL_PTR;
 
     static const char PREFIX[] = "base64:";
     const size_t plen = sizeof(PREFIX) - 1;
@@ -438,12 +448,32 @@ virp_error_t virp_chain_artifact_digest(const char *artifact_content,
             free(raw);
             return VIRP_ERR_INVALID_LENGTH;
         }
-        sha256_hex((const char *)raw, (size_t)n, out_hex);
-        free(raw);
+        *out_raw = raw;
+        *out_len = (size_t)n;
         return VIRP_OK;
     }
 
-    sha256_hex(artifact_content, strlen(artifact_content), out_hex);
+    size_t len = strlen(artifact_content);
+    uint8_t *raw = (uint8_t *)malloc(len ? len : 1);
+    if (!raw) return VIRP_ERR_BUFFER_TOO_SMALL;
+    memcpy(raw, artifact_content, len);
+    *out_raw = raw;
+    *out_len = len;
+    return VIRP_OK;
+}
+
+virp_error_t virp_chain_artifact_digest(const char *artifact_content,
+                                        char out_hex[65])
+{
+    if (!artifact_content || !out_hex) return VIRP_ERR_NULL_PTR;
+
+    uint8_t *raw = NULL;
+    size_t raw_len = 0;
+    virp_error_t err = virp_chain_artifact_bytes(artifact_content,
+                                                 &raw, &raw_len);
+    if (err != VIRP_OK) return err;
+    sha256_hex((const char *)raw, raw_len, out_hex);
+    free(raw);
     return VIRP_OK;
 }
 

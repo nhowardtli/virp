@@ -383,14 +383,20 @@ def chain_append(session_id, device, raw_obs):
     its chain entry entirely — hence this guard."""
     h = hashlib.sha256(raw_obs).hexdigest()
     artifact_id = "obs:%s:%d" % (device, time.time_ns())
+    content = "base64:" + base64.b64encode(raw_obs).decode()
     req = {
         "action": "chain_append",
         "session_id": session_id,
-        "artifact_type": "observation",
+        # Since the 2026-08-07 re-cut the daemon verifies every
+        # "observation" body (parse + O-Key HMAC) and refuses the type
+        # without a body. The oversized commitment-only registration
+        # keeps working under "external_digest", whose name says what
+        # it is: a digest the daemon could not verify.
+        "artifact_type": "observation" if len(content) < 8192
+                         else "external_digest",
         "artifact_id": artifact_id,
         "artifact_hash": h,
     }
-    content = "base64:" + base64.b64encode(raw_obs).decode()
     if len(content) < 8192:
         req["artifact_content"] = content
     resp = onode_send(req)

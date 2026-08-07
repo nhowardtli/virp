@@ -137,9 +137,12 @@ class ValidatorE2E(unittest.TestCase):
             cls.proc.terminate()
             raise RuntimeError("virp-onode socket never became connectable")
 
-        # Seed the chain with one observation so the PASS case has a
+        # Seed the chain with one commitment so the PASS case has a
         # real artifact_hash to cite. Use chain_append — the same
-        # dispatcher path a live tool result would take.
+        # dispatcher path a live tool result would take. Since the
+        # 2026-08-07 re-cut a body-less "observation" is refused
+        # (observation means verified); a bare digest registers as
+        # "external_digest".
         cls.seed_hash = hashlib.sha256(b"seed-tool-output").hexdigest()
         cls.seed_session = "s-e2e"
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -149,7 +152,7 @@ class ValidatorE2E(unittest.TestCase):
             _send_framed(s, {
                 "action":        "chain_append",
                 "session_id":    cls.seed_session,
-                "artifact_type": "observation",
+                "artifact_type": "external_digest",
                 "artifact_id":   "obs-seed",
                 "artifact_hash": cls.seed_hash,
             })

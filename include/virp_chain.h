@@ -121,6 +121,18 @@ bool virp_chain_type_is_external_allowed(const char *artifact_type);
 virp_error_t virp_chain_artifact_digest(const char *artifact_content,
                                         char out_hex[65]);
 
+/*
+ * Recover the exact bytes an artifact_hash commits to — the same
+ * decoding rule as virp_chain_artifact_digest ("base64:<b64>" decodes,
+ * anything else is literal text), exposed so a caller can run further
+ * checks (signature verification) over the SAME bytes the digest bound.
+ * On VIRP_OK, *out_raw is malloc'd and owned by the caller; *out_len is
+ * its length. Returns VIRP_ERR_INVALID_LENGTH if a base64 body does not
+ * decode.
+ */
+virp_error_t virp_chain_artifact_bytes(const char *artifact_content,
+                                       uint8_t **out_raw, size_t *out_len);
+
 /* =========================================================================
  * Chain State — owns the SQLite database and prepared statements
  * ========================================================================= */
