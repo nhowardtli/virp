@@ -158,6 +158,15 @@ verifier holds no secret of any kind.
 - The public-key verifier checks authenticity and integrity of the
   signed bytes only. Replay, staleness and session acceptance remain
   the accepting endpoint's checks (v2 verify semantics).
+- **NOT formally modeled.** The ProVerif proofs
+  (`proofs/virp_obs_v2.pv`, re-runnable via `make proofs`) cover the
+  v2 HMAC observation path only — README's formal-verification claim
+  is scoped the same way. A passing `make proofs` says NOTHING about
+  the v3 Ed25519 path: no machine-checked model of v3 signing,
+  verification, or cross-version downgrade exists yet. Its properties
+  rest on the test evidence above (forge contrast, negative battery,
+  fuzzing) until a v3 ProVerif model is written — future work, slated
+  alongside the observation re-cut.
 
 ### Observation-Signing Key — Custody
 
