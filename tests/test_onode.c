@@ -3682,6 +3682,129 @@ TEST(test_chain_append_rejects_unknown_version_body)
     ASSERT_EQ(ca_count_entries("obs-v3-body-1"), 0);
 }
 
+/* Count entries committing to a given artifact_hash (any artifact_id) —
+ * replay identity is the hash, not the caller-chosen id. */
+static int ca_count_entries_by_hash(const char *artifact_hash)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open(CA_CHAIN_DB, &db) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*) FROM chain_entries WHERE artifact_hash = ?",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, artifact_hash, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+
+/* =========================================================================
+ * GATE 4 — replay (chain re-cut 2026-08-07). A genuine signed
+ * observation registers once; the identical bytes again are the same
+ * observation being re-registered, and the authoritative check lives
+ * INSIDE the append transaction so concurrent submits cannot both pass
+ * the handler's early lookup. Scope: observations only.
+ * ========================================================================= */
+
+/* Guard removed => the same signed observation registers twice under two
+ * artifact_ids and a reader sees two "independent" confirmations of one
+ * measurement. The second submit must fail with the REPLAY code. */
+TEST(test_chain_append_rejects_replayed_observation)
+{
+    uint8_t raw[1024];
+    char content[2048], h[65];
+    size_t obs_len = ca_signed_observation(raw, sizeof(raw),
+                                           content, sizeof(content), h);
+    ASSERT_TRUE(obs_len > 0);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "observation",
+                          "obs-replay-first", h, content,
+                          resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+
+    n = ca_append("autopilot:legit", "observation",
+                  "obs-replay-second", h, content, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    {
+        uint32_t net;
+        memcpy(&net, resp, 4);
+        ASSERT_EQ((int32_t)ntohl(net), (int32_t)VIRP_ERR_REPLAY_DETECTED);
+    }
+    ASSERT_EQ(ca_count_entries_by_hash(h), 1);
+}
+
+/* Guard removed (the in-transaction copy) => two threads can both pass
+ * the handler's early lookup and both append. Mirrors the exactly-one-
+ * append approval concurrency structure: all racers submit the SAME
+ * observation, exactly one entry may exist afterwards. */
+#define CA_RACERS 8
+static char ca_race_content[2048];
+static char ca_race_hash[65];
+static int  ca_race_accepts;
+static pthread_mutex_t ca_race_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void *ca_race_thread(void *arg)
+{
+    char aid[64];
+    snprintf(aid, sizeof(aid), "obs-race-%d", (int)(intptr_t)arg);
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:race", "observation", aid,
+                          ca_race_hash, ca_race_content,
+                          resp, sizeof(resp));
+    if (n > 4) {
+        pthread_mutex_lock(&ca_race_mu);
+        ca_race_accepts++;
+        pthread_mutex_unlock(&ca_race_mu);
+    }
+    return NULL;
+}
+
+TEST(test_chain_append_concurrent_identical_observation_single_entry)
+{
+    uint8_t raw[1024];
+    size_t obs_len = ca_signed_observation(raw, sizeof(raw),
+                                           ca_race_content,
+                                           sizeof(ca_race_content),
+                                           ca_race_hash);
+    ASSERT_TRUE(obs_len > 0);
+    ca_race_accepts = 0;
+
+    pthread_t th[CA_RACERS];
+    for (int i = 0; i < CA_RACERS; i++)
+        pthread_create(&th[i], NULL, ca_race_thread, (void *)(intptr_t)i);
+    for (int i = 0; i < CA_RACERS; i++)
+        pthread_join(th[i], NULL);
+
+    ASSERT_EQ(ca_race_accepts, 1);
+    ASSERT_EQ(ca_count_entries_by_hash(ca_race_hash), 1);
+}
+
+/* Guard scope: replay applies to signed observations ONLY. Plain-text
+ * record classes legitimately repeat — the same no-drift outcome
+ * registered on two consecutive runs is two true statements, not an
+ * attack. If someone broadens the replay check past observations, this
+ * breaks. */
+TEST(test_chain_append_allows_repeated_plaintext_bodies)
+{
+    const char *body = "{\"device\":\"R5\",\"status\":\"clean\"}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:legit", "no_drift",
+                          "nodrift-repeat-1", h, body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    n = ca_append("autopilot:legit", "no_drift",
+                  "nodrift-repeat-2", h, body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries_by_hash(h), 2);
+}
+
 /* =========================================================================
  * Main
  * ========================================================================= */
@@ -3844,6 +3967,9 @@ int main(void)
         RUN_TEST(test_chain_append_rejects_observation_bytes_as_evidence_item);
         RUN_TEST(test_chain_append_rejects_v2_body_as_observation);
         RUN_TEST(test_chain_append_rejects_unknown_version_body);
+        RUN_TEST(test_chain_append_rejects_replayed_observation);
+        RUN_TEST(test_chain_append_concurrent_identical_observation_single_entry);
+        RUN_TEST(test_chain_append_allows_repeated_plaintext_bodies);
         ca_stop();
         ca_cleanup_files();
     } else {

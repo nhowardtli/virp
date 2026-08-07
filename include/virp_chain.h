@@ -155,6 +155,11 @@ typedef struct {
     sqlite3_stmt       *stmt_intent_execute;
     /* Artifact store */
     sqlite3_stmt       *stmt_artifact_insert;
+    /* Replay check: does any observation-type entry already commit to
+     * this artifact_hash? Consulted INSIDE the append transaction (and
+     * by the handler's early check). NULL is treated as a lookup
+     * failure — the append REJECTS rather than proceeding unchecked. */
+    sqlite3_stmt       *stmt_replay_check;
 
     /* Set by virp_chain_open_verifier(): the connection is
      * SQLITE_OPEN_READONLY and every mutating entry point returns
@@ -334,6 +339,21 @@ virp_error_t virp_chain_get_last(virp_chain_state_t *state,
 virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
                                         const char *artifact_id,
                                         bool *exists);
+
+/*
+ * Replay lookup: is there already an observation-type entry committing
+ * to artifact_hash? Scoped to SIGNED OBSERVATIONS — those carry a
+ * seq_num and nanosecond timestamp, so two genuine ones are never
+ * byte-identical, while plain-text outcomes and other record classes
+ * legitimately repeat. Contract is FAIL-CLOSED at every caller: a
+ * non-VIRP_OK return means the check could not run and the append must
+ * be refused, never waved through. (The authoritative check runs again
+ * inside the append transaction; this exists as a fast, friendly early
+ * error.)
+ */
+virp_error_t virp_chain_hash_exists(virp_chain_state_t *state,
+                                    const char *artifact_hash,
+                                    bool *exists);
 
 /*
  * Clean up all resources.

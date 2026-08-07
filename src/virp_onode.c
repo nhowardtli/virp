@@ -2582,6 +2582,33 @@ static void handle_client(onode_state_t *state, int client_fd)
                         why, req.session_id, req.artifact_id,
                         req.artifact_type);
         }
+
+        /* GATE 4 — replay, observations only. This early check exists
+         * for the friendly error; the authoritative, race-free copy
+         * runs inside the append transaction (chain_append_locked).
+         * Fail-closed: a lookup ERROR rejects — "could not check" is
+         * not "not a replay". */
+        if (strcmp(req.artifact_type, "observation") == 0) {
+            bool dup = false;
+            err = virp_chain_hash_exists(&state->chain, req.artifact_hash,
+                                         &dup);
+            if (err != VIRP_OK) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: replay "
+                        "lookup failed — refusing unchecked append "
+                        "(session=%s id=%s)\n",
+                        req.session_id, req.artifact_id);
+                send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
+                break;
+            }
+            if (dup) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: replay — "
+                        "an observation entry already commits to this "
+                        "artifact_hash (session=%s id=%s)\n",
+                        req.session_id, req.artifact_id);
+                send_framed_error(client_fd, VIRP_ERR_REPLAY_DETECTED);
+                break;
+            }
+        }
         {
             /* Entry and (optional) raw content commit in one transaction.
              * A content-store failure now fails the whole request with a

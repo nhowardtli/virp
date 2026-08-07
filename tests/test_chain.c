@@ -387,11 +387,17 @@ static void test_unique_constraint(void)
 
 static void append_n(virp_chain_state_t *state, const char *sid, int n)
 {
+    /* Globally unique fake hashes: the replay guard (2026-08-07) refuses
+     * a second observation-type entry committing to a hash the chain
+     * already holds, across ALL sessions — reusing "%064d" of the loop
+     * index here would make the second session's appends silent replays
+     * and starve the head/completeness tests of their entries. */
+    static int uniq;
     for (int i = 0; i < n; i++) {
         virp_chain_entry_t e;
         char id[32], hash[65];
         snprintf(id, sizeof(id), "art-%03d", i);
-        snprintf(hash, sizeof(hash), "%064d", i);
+        snprintf(hash, sizeof(hash), "%064d", uniq++);
         virp_chain_append(state, sid, "observation", id, hash, &e);
     }
 }
@@ -1176,6 +1182,13 @@ static void test_colliding_id_identical_content_idempotent(void)
 {
     TEST("id collision: identical evidence is idempotent");
 
+    /* Type is evidence_item, NOT observation: since the 2026-08-07
+     * replay guard, a second observation-type entry committing to the
+     * same hash is VIRP_ERR_REPLAY_DETECTED (covered below in
+     * test_replay_*). The artifacts-store idempotency contract this
+     * test pins — identical (id, hash) re-store is a no-op, the body
+     * stays retrievable — is type-independent, and record classes that
+     * legitimately repeat still exercise it. */
     virp_chain_state_t state;
     virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test");
     ASSERT(err == VIRP_OK, "init failed");
@@ -1187,11 +1200,11 @@ static void test_colliding_id_identical_content_idempotent(void)
 
     virp_chain_entry_t e0, e1;
     err = virp_chain_append_with_artifact(&state, "session-idem",
-                                          "observation", id, hash,
+                                          "evidence_item", id, hash,
                                           body, &e0);
     ASSERT(err == VIRP_OK, "first append failed");
     err = virp_chain_append_with_artifact(&state, "session-idem",
-                                          "observation", id, hash,
+                                          "evidence_item", id, hash,
                                           body, &e1);
     ASSERT(err == VIRP_OK, "identical re-store must not fail the append");
 
@@ -1205,6 +1218,132 @@ static void test_colliding_id_identical_content_idempotent(void)
     ASSERT(err == VIRP_OK && result.valid, "session must verify");
     ASSERT(result.entries_checked == 2,
            "both chain entries exist even though the body stored once");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+/* =========================================================================
+ * Replay guard (chain re-cut 2026-08-07): the check lives INSIDE the
+ * append transaction, scoped to observation-type entries, fail-closed
+ * on lookup error. Each test breaks if its guard leg is removed.
+ * ========================================================================= */
+
+static void test_replay_duplicate_observation_rejected(void)
+{
+    TEST("replay: duplicate observation hash rejected in the append txn");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    ASSERT(virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test") == VIRP_OK,
+           "init failed");
+
+    const char *hash =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append(&state, "s-replay", "observation",
+                             "obs-r-1", hash, &e) == VIRP_OK,
+           "first observation append failed");
+    /* Same hash, different id, different SESSION — replay identity is
+     * the signed bytes, not the caller-chosen id or session. */
+    ASSERT(virp_chain_append(&state, "s-replay-other", "observation",
+                             "obs-r-2", hash, &e)
+               == VIRP_ERR_REPLAY_DETECTED,
+           "duplicate observation hash must be VIRP_ERR_REPLAY_DETECTED");
+
+    /* hash_exists reports it too (the handler's friendly early check) */
+    bool dup = false;
+    ASSERT(virp_chain_hash_exists(&state, hash, &dup) == VIRP_OK && dup,
+           "hash_exists must report the existing observation");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+static void test_replay_scope_excludes_other_types(void)
+{
+    TEST("replay: non-observation types may repeat a hash");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    ASSERT(virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test") == VIRP_OK,
+           "init failed");
+
+    const char *hash =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append(&state, "s-scope", "no_drift",
+                             "nd-1", hash, &e) == VIRP_OK, "first failed");
+    ASSERT(virp_chain_append(&state, "s-scope", "no_drift",
+                             "nd-2", hash, &e) == VIRP_OK,
+           "a repeated plain-text record class must not trip replay");
+    /* And a hash used by a non-observation row does not poison the
+     * observation namespace's first legitimate use... */
+    ASSERT(virp_chain_append(&state, "s-scope", "observation",
+                             "obs-s-1", hash, &e) == VIRP_OK,
+           "observation may first-use a hash other types carry");
+    /* ...but the second observation use is a replay. */
+    ASSERT(virp_chain_append(&state, "s-scope", "observation",
+                             "obs-s-2", hash, &e)
+               == VIRP_ERR_REPLAY_DETECTED,
+           "second observation use must be a replay");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
+static void test_replay_lookup_error_fails_closed(void)
+{
+    TEST("replay: lookup error REJECTS the append (fail closed)");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    ASSERT(virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test") == VIRP_OK,
+           "init failed");
+
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append(&state, "s-fc", "observation", "obs-fc-0",
+                             "cccccccccccccccccccccccccccccccc"
+                             "cccccccccccccccccccccccccccccccc",
+                             &e) == VIRP_OK,
+           "baseline observation append failed");
+
+    /* Break ONLY the replay lookup: the insert path stays healthy, so
+     * the old proceed-on-lookup-error contract would append here and
+     * this test would fail. */
+    sqlite3_finalize(state.stmt_replay_check);
+    state.stmt_replay_check = NULL;
+
+    virp_error_t err = virp_chain_append(&state, "s-fc", "observation",
+                             "obs-fc-1",
+                             "dddddddddddddddddddddddddddddddd"
+                             "dddddddddddddddddddddddddddddddd",
+                             &e);
+    ASSERT(err == VIRP_ERR_CHAIN_DB,
+           "unrunnable replay lookup must reject, not proceed");
+
+    bool dup = true;
+    ASSERT(virp_chain_hash_exists(&state, "dddddddddddddddddddddddddddddddd"
+                                          "dddddddddddddddddddddddddddddddd",
+                                  &dup) == VIRP_ERR_CHAIN_DB,
+           "hash_exists must also fail closed");
+
+    /* Nothing may have been appended while the check was unrunnable. */
+    virp_chain_entry_t last;
+    ASSERT(virp_chain_get_last(&state, "s-fc", &last) == VIRP_OK &&
+           last.sequence == 0,
+           "the rejected append must not have grown the chain");
+
+    /* A non-observation append needs no replay lookup and still works —
+     * the breakage is scoped to what the guard actually guards. */
+    ASSERT(virp_chain_append(&state, "s-fc", "no_drift", "nd-fc-1",
+                             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                             &e) == VIRP_OK,
+           "non-observation append must not need the replay statement");
 
     virp_chain_destroy(&state);
     PASS();
@@ -1509,6 +1648,9 @@ int main(void)
     test_append_with_artifact_rolls_back_together();
     test_colliding_id_keeps_both_bodies();
     test_colliding_id_identical_content_idempotent();
+    test_replay_duplicate_observation_rejected();
+    test_replay_scope_excludes_other_types();
+    test_replay_lookup_error_fails_closed();
     test_artifacts_schema_migration();
     test_verifier_readonly_modern_db();
     test_verifier_legacy_reported_not_migrated();

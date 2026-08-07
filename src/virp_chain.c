@@ -268,6 +268,32 @@ virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
     return rc;
 }
 
+virp_error_t virp_chain_hash_exists(virp_chain_state_t *state,
+                                    const char *artifact_hash,
+                                    bool *exists)
+{
+    if (!state || !artifact_hash || !exists) return VIRP_ERR_NULL_PTR;
+    *exists = false;
+
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = VIRP_OK;
+    if (!state->db || !state->stmt_replay_check) {
+        rc = VIRP_ERR_CHAIN_DB;
+    } else {
+        sqlite3_reset(state->stmt_replay_check);
+        sqlite3_bind_text(state->stmt_replay_check, 1, artifact_hash, -1,
+                          SQLITE_TRANSIENT);
+        int step = sqlite3_step(state->stmt_replay_check);
+        sqlite3_reset(state->stmt_replay_check);
+        if (step == SQLITE_ROW)
+            *exists = true;
+        else if (step != SQLITE_DONE)
+            rc = VIRP_ERR_CHAIN_DB;
+    }
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
 virp_error_t virp_chain_intent_store(virp_chain_state_t *state,
                                      virp_intent_entry_t *entry)
 {
@@ -512,6 +538,16 @@ static const char *SCHEMA_SQL =
     ");"
     "CREATE INDEX IF NOT EXISTS idx_chain_session_seq "
     "  ON chain_entries(session_id, sequence);"
+    /* Replay lookups are by artifact_hash. Plain (non-unique) index by
+     * design: production chains predate replay protection and may
+     * already hold duplicate observation hashes — a UNIQUE index would
+     * refuse to build there and take the daemon down with it. The
+     * chain is append-only; existing rows are never rewritten. New
+     * duplicates are refused by the in-transaction check in
+     * chain_append_locked. IF NOT EXISTS makes this a no-op after the
+     * first open of an existing database. */
+    "CREATE INDEX IF NOT EXISTS idx_chain_artifact_hash "
+    "  ON chain_entries(artifact_hash);"
     /* Signed per-session head: authenticates chain LENGTH, not just links.
      * Updated in the same transaction as every append. A DB writer without
      * K_chain can neither forge a head for a truncated chain nor delete it
@@ -572,6 +608,12 @@ static const char *SQL_INSERT =
     " artifact_hash, artifact_hash_alg, artifact_schema_version, "
     " signer_node_id, signer_org_id, chain_hmac) "
     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+
+/* Scoped to observation-type rows — see virp_chain_hash_exists() for
+ * why replay applies to signed observations only. */
+static const char *SQL_REPLAY_CHECK =
+    "SELECT 1 FROM chain_entries "
+    "WHERE artifact_hash = ? AND artifact_type = 'observation' LIMIT 1";
 
 static const char *SQL_GET_LAST =
     "SELECT session_id, sequence, chain_entry_hash, previous_entry_hash, "
@@ -1082,6 +1124,15 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
         return VIRP_ERR_CHAIN_DB;
     }
 
+    /* Prepare replay-check statement */
+    if (sqlite3_prepare_v2(state->db, SQL_REPLAY_CHECK, -1,
+                           &state->stmt_replay_check, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[Chain] Failed to prepare replay statement: %s\n",
+                sqlite3_errmsg(state->db));
+        sqlite3_close(state->db);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
     /* A session with entries but no head row is tampering evidence
      * (tail+head deletion), never a repair candidate. Heads are written
      * in the same transaction as every append and the one-time legacy
@@ -1268,6 +1319,34 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
     int rc = sqlite3_exec(state->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
     if (rc != SQLITE_OK)
         return VIRP_ERR_CHAIN_DB;
+
+    /* Replay check INSIDE the transaction — observation-type entries
+     * only (see virp_chain_hash_exists for the scoping rationale; other
+     * record classes legitimately repeat). The handler's early
+     * hash_exists is check-then-act across two lock acquisitions, so
+     * two concurrent identical observations could both pass it; this
+     * one is atomic with the insert. Fail-closed on every leg: a
+     * lookup that cannot run (NULL statement, step error) REFUSES the
+     * append — an unverifiable "not a replay" claim is not a pass. */
+    if (strcmp(artifact_type, "observation") == 0) {
+        if (!state->stmt_replay_check) {
+            sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+            return VIRP_ERR_CHAIN_DB;
+        }
+        sqlite3_reset(state->stmt_replay_check);
+        sqlite3_bind_text(state->stmt_replay_check, 1, artifact_hash, -1,
+                          SQLITE_TRANSIENT);
+        int step = sqlite3_step(state->stmt_replay_check);
+        sqlite3_reset(state->stmt_replay_check);
+        if (step == SQLITE_ROW) {
+            sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+            return VIRP_ERR_REPLAY_DETECTED;
+        }
+        if (step != SQLITE_DONE) {
+            sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+            return VIRP_ERR_CHAIN_DB;
+        }
+    }
 
     /* Get max sequence for this session */
     int64_t next_seq = 0;
@@ -1687,6 +1766,8 @@ void virp_chain_destroy(virp_chain_state_t *state)
         sqlite3_finalize(state->stmt_intent_execute);
     if (state->stmt_artifact_insert)
         sqlite3_finalize(state->stmt_artifact_insert);
+    if (state->stmt_replay_check)
+        sqlite3_finalize(state->stmt_replay_check);
     if (state->db)
         sqlite3_close(state->db);
 
