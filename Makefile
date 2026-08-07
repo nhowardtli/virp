@@ -1058,13 +1058,17 @@ asan-test:
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined"
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
-	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO) $(TEST_FG_SCRUB) $(TEST_CHAIN)
+	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO) $(TEST_FG_SCRUB) $(TEST_CHAIN) \
+	        $(TEST_OBSKEY) $(TEST_OBS_ED25519) $(TEST_OBS_FORGE)
 	@echo "=== Running tests under ASan+UBSan ==="
 	./$(TEST_BIN) 2>&1
 	./$(TEST_ONODE) 2>&1
 	./$(TEST_SSH_IO) 2>&1
 	./$(TEST_FG_SCRUB) 2>&1
 	./$(TEST_CHAIN) 2>&1
+	./$(TEST_OBSKEY) 2>&1
+	./$(TEST_OBS_ED25519) 2>&1
+	./$(TEST_OBS_FORGE) 2>&1
 	@echo "=== ASan+UBSan test run complete ==="
 
 # Driver suites under ASan+UBSan. Separate from asan-test because the
