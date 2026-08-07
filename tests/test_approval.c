@@ -1054,6 +1054,9 @@ static void test_cli_approve_apply_e2e(void)
      * (virp_fed_save writes exactly what `keygen approval` writes; the
      * dedicated keygen-subprocess load is covered by the next test.) */
     const char *pub = "/tmp/virp-test-cli.pub", *sk = "/tmp/virp-test-cli.key";
+    /* virp_fed_save is O_EXCL (never overwrites) — clear any file left by
+     * a prior run before saving. */
+    unlink(pub); unlink(sk);
     ASSERT(virp_fed_save(&g_kp, pub, sk) == VIRP_OK, "save key");
 
     /* 1. Block a fresh RED command via the CLI to file a proposal.
@@ -1161,6 +1164,7 @@ static void test_cli_approve_key_diagnostics(void)
 
     /* (b) a 32-byte PUBLIC key passed where the secret is wanted */
     const char *pub = "/tmp/virp-test-diag.pub", *sk = "/tmp/virp-test-diag.key";
+    unlink(pub); unlink(sk);   /* O_EXCL save: clear any prior-run file */
     ASSERT(virp_fed_save(&g_kp, pub, sk) == VIRP_OK, "save");
     snprintf(cmd, sizeof(cmd),
              CLI_BIN " approve %s --socket %s --key %s", pid, g.socket_path, pub);

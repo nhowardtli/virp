@@ -6,6 +6,8 @@
  *        save/load roundtrip, key_id computation
  */
 
+#define _POSIX_C_SOURCE 200809L     /* symlink() */
+
 #include "virp_federation.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -203,6 +205,51 @@ static void test_save_load(void)
     PASS();
 }
 
+/* Carry-over of the Ed25519-review P2-3 fix: virp_fed_save must refuse an
+ * existing file and a pre-planted symlink at either path (O_EXCL |
+ * O_NOFOLLOW), mirroring the obskey save. */
+static void test_save_refuses_existing_and_symlink(void)
+{
+    TEST("Save refuses existing file and symlink (O_EXCL|O_NOFOLLOW)");
+    cleanup();
+
+    virp_fed_keypair_t kp;
+    virp_fed_generate(&kp, 7);
+
+    /* First save into an empty prefix succeeds. */
+    ASSERT(virp_fed_save(&kp, TEST_PK, TEST_SK) == VIRP_OK, "first save");
+
+    /* Second save over the now-existing files is refused (O_EXCL). */
+    ASSERT(virp_fed_save(&kp, TEST_PK, TEST_SK) != VIRP_OK,
+           "save over existing must refuse");
+
+    /* Pre-planted symlink at the PUBLIC path (fresh secret path) is
+     * refused and the symlink target is never created. */
+    cleanup();
+    const char *link_pub = "/tmp/virp_test_fed_link.pk";
+    const char *target   = "/tmp/virp_test_fed_target.pk";
+    unlink(link_pub); unlink(target);
+    ASSERT(symlink(target, link_pub) == 0, "make symlink");
+    ASSERT(virp_fed_save(&kp, link_pub, TEST_SK) != VIRP_OK,
+           "save through symlinked pub must refuse");
+    ASSERT(access(target, F_OK) != 0, "symlink target must not be created");
+    unlink(link_pub); unlink(target); cleanup();
+
+    /* Pre-planted symlink at the SECRET path (fresh pub path) is refused
+     * too — the secret must never be written through a symlink. */
+    const char *link_sk   = "/tmp/virp_test_fed_link.sk";
+    const char *target_sk = "/tmp/virp_test_fed_target.sk";
+    unlink(link_sk); unlink(target_sk); unlink(TEST_PK);
+    ASSERT(symlink(target_sk, link_sk) == 0, "make sk symlink");
+    ASSERT(virp_fed_save(&kp, TEST_PK, link_sk) != VIRP_OK,
+           "save through symlinked sk must refuse");
+    ASSERT(access(target_sk, F_OK) != 0, "sk symlink target must not be created");
+    unlink(link_sk); unlink(target_sk); unlink(TEST_PK);
+
+    virp_fed_destroy(&kp);
+    PASS();
+}
+
 /* =========================================================================
  * Test: mlock on secret key
  * ========================================================================= */
@@ -281,6 +328,7 @@ int main(void)
     test_wrong_key();
     test_tampered_message();
     test_save_load();
+    test_save_refuses_existing_and_symlink();
     test_mlock();
     test_key_id();
     test_destroy_zeros();

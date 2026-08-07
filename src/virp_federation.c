@@ -7,7 +7,10 @@
  * Key protection: sodium_mlock() on secret key, sodium_memzero() on destroy.
  */
 
+#define _POSIX_C_SOURCE 200809L     /* O_NOFOLLOW, O_CLOEXEC */
+
 #include "virp_federation.h"
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
@@ -138,16 +141,35 @@ virp_error_t virp_fed_save(const virp_fed_keypair_t *kp,
     if (!kp->loaded)
         return VIRP_ERR_KEY_NOT_LOADED;
 
-    /* Write public key */
-    int fd = open(pk_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return VIRP_ERR_KEY_NOT_LOADED;
+    /*
+     * O_EXCL | O_NOFOLLOW on both writes — the same discipline the
+     * obskey save uses (SECURITY.md P2-3 carry-over). O_NOFOLLOW refuses
+     * a pre-planted symlink at the final path component; O_EXCL refuses
+     * to write over an existing file at all, which closes the case where
+     * an attacker pre-creates a wide-mode regular file at sk_path and our
+     * O_TRUNC would have written the secret into their readable file. A
+     * keypair is generated into an EMPTY prefix — regenerating over an
+     * existing key is deliberately unsupported; remove both files first.
+     */
+    int fd = open(pk_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "[Federation] cannot create %s: %s "
+                        "(existing files are never overwritten)\n",
+                pk_path, strerror(errno));
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
     ssize_t n = write(fd, kp->public_key, VIRP_FED_PK_SIZE);
     close(fd);
     if (n != VIRP_FED_PK_SIZE) return VIRP_ERR_KEY_NOT_LOADED;
 
     /* Write secret key (0600 permissions) */
-    fd = open(sk_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) return VIRP_ERR_KEY_NOT_LOADED;
+    fd = open(sk_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "[Federation] cannot create %s: %s "
+                        "(existing files are never overwritten)\n",
+                sk_path, strerror(errno));
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
     n = write(fd, kp->secret_key, VIRP_FED_SK_SIZE);
     close(fd);
     if (n != VIRP_FED_SK_SIZE) return VIRP_ERR_KEY_NOT_LOADED;
