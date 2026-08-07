@@ -898,3 +898,32 @@ incomplete: new tokens were created but the compromised one
 live for a further ~2 hours and only revoked at the end of the session,
 confirmed HTTP 401. At one point four tokens were valid simultaneously.
 A rotation is not complete until the old credential is verified dead.
+
+## Update 2026-08-07 — API server refuses unsafe network binds at startup
+
+`api/server.py` now enforces a bind-safety guard at startup (and again in
+`__main__`): binding to a non-loopback address (0.0.0.0 or any routable
+IP) with no `VIRP_API_TOKEN` set is REFUSED — that configuration would
+serve every mutating route unauthenticated to the network. The three
+cases:
+
+- loopback (127.0.0.1 / ::1) + no token → allowed, logs a `DEV MODE` line;
+- non-loopback + no token → **refuses to start** (`UnsafeBindError`),
+  naming the fix (set `VIRP_API_TOKEN`, or bind loopback behind an
+  authenticated gateway);
+- token set (any bind) → allowed.
+
+Only a literal loopback IP counts as loopback; a hostname such as
+`localhost`, `0.0.0.0`, `::`, or any routable address is treated as
+non-loopback (fail closed). The guard runs at module import too, so
+`uvicorn server:app --host 0.0.0.0` cannot bypass it via a runner that
+never executes `__main__`; the runner's `--host` / `-b`/`--bind` argv is
+also parsed.
+
+**KNOWN GAP (do not assume coverage we do not have).** The guard sees
+`VIRP_BIND_HOST` and common `--host`/`--bind` command-line forms. A bind
+declared ONLY in a server config file/module (e.g. a gunicorn config
+module) or a server-specific environment variable is NOT detected — an
+operator using those must set `VIRP_API_TOKEN`. This is a config-sanity
+guard, not per-request auth (`check_auth` is unchanged). Covered by
+`api/test_bind_guard.py`, run via `make test-api`.

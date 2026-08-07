@@ -1206,4 +1206,28 @@ test-validator: $(TEST_VALIDATOR)
 test-validator-e2e: prod-full
 	python3 tests/test_validator_e2e.py
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11
+# Python API server tests (auth guard, bind-safety guard, devices, key
+# loading). Fenced like test-interop: skip with a warning when the API
+# stack (fastapi/httpx) is absent, so all-tests stays runnable for a
+# reviewer without the Python API dependencies rather than hard-failing.
+.PHONY: test-api
+test-api:
+	@echo "=== VIRP API server tests (api/*.py) ==="
+	@if python3 -c 'import fastapi, httpx' >/dev/null 2>&1; then \
+	    if [ -f $(SHLIB) ] && nm $(SHLIB) 2>/dev/null | grep -q __asan; then \
+	        echo "  NOTE: $(SHLIB) is ASan-instrumented — the ctypes bridge"; \
+	        echo "        cannot dlopen it without the ASan runtime; rebuilding"; \
+	        echo "        a plain libvirp.so."; \
+	        $(MAKE) --no-print-directory clean >/dev/null; \
+	    fi; \
+	    $(MAKE) --no-print-directory shared >/dev/null; \
+	    python3 -m pytest -q api/test_auth.py api/test_bind_guard.py \
+	        api/test_devices.py api/test_gate_removed.py \
+	        api/test_key_loading.py; \
+	else \
+	    echo "  *** SKIPPING test-api: fastapi/httpx not importable."; \
+	    echo "      install them with: pip install fastapi httpx pytest"; \
+	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
+	fi
+
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-api

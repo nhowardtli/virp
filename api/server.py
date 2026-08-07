@@ -16,6 +16,7 @@ import os
 import re
 import socket
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -46,6 +47,111 @@ DEVICES_PATH = os.environ.get("VIRP_DEVICES", "/var/lib/virp/devices.json")
 WEB_DIR = os.environ.get("VIRP_WEB_DIR", "/opt/virp-appliance/web")
 API_TOKEN = os.environ.get("VIRP_API_TOKEN", "")  # Optional bearer token
 VIRP_ALLOW_PY_FALLBACK = os.environ.get("VIRP_ALLOW_PY_FALLBACK", "") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Startup bind safety guard
+#
+# check_auth is a no-op when VIRP_API_TOKEN is unset (POC/dev mode). That
+# is only safe on loopback. Binding to a routable address with no token
+# serves every mutating route unauthenticated to the network — the guard
+# below refuses that CONFIGURATION at startup rather than letting it come
+# up silently. It is NOT per-request auth (check_auth is unchanged); it is
+# a config sanity check that runs once, at import and in __main__.
+# ---------------------------------------------------------------------------
+
+class UnsafeBindError(RuntimeError):
+    """Raised at startup when the bind/token configuration would expose
+    unauthenticated mutating routes to a non-loopback address."""
+
+
+def _is_genuine_loopback(host: str) -> bool:
+    """True only for a literal loopback IP (127.0.0.0/8, ::1). A hostname
+    such as 'localhost', 0.0.0.0, '::', or any routable address is NOT
+    treated as loopback — fail closed on anything that is not an
+    unambiguous loopback IP literal."""
+    try:
+        return ipaddress.ip_address(host.strip()).is_loopback
+    except ValueError:
+        return False  # hostname or garbage -> not a proven loopback
+
+
+def _argv_bind_hosts() -> list:
+    """Best-effort extraction of the bind host from the runner's command
+    line, so `uvicorn server:app --host 0.0.0.0` (which never sets
+    VIRP_BIND_HOST) is still caught. Covers uvicorn --host/--host=, and
+    gunicorn -b/--bind host:port. Does NOT cover binds declared in a
+    config file/module or a server-specific env var — see the KNOWN GAP
+    note; operators using those must set VIRP_API_TOKEN."""
+    hosts = []
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--host", "--uds") and i + 1 < len(argv):
+            hosts.append(argv[i + 1]); i += 2; continue
+        if a.startswith("--host="):
+            hosts.append(a.split("=", 1)[1]); i += 1; continue
+        if a in ("-b", "--bind") and i + 1 < len(argv):
+            hosts.append(_host_of_bind(argv[i + 1])); i += 2; continue
+        if a.startswith("--bind="):
+            hosts.append(_host_of_bind(a.split("=", 1)[1])); i += 1; continue
+        i += 1
+    return [h for h in hosts if h]
+
+
+def _host_of_bind(value: str) -> str:
+    """host from a gunicorn-style 'host:port' / '[::]:port' bind value."""
+    value = value.strip()
+    if value.startswith("["):                 # [::1]:8470
+        return value[1:].split("]", 1)[0]
+    if value.count(":") == 1:                  # 0.0.0.0:8470
+        return value.rsplit(":", 1)[0]
+    return value                               # bare host, or ambiguous v6
+
+
+def _resolve_effective_bind_hosts() -> list:
+    """Every bind host this process might actually listen on. Fail closed:
+    if ANY is non-loopback the effective exposure is non-loopback. When
+    nothing is declared, the effective bind is the loopback default that
+    both this module's __main__ and uvicorn use."""
+    declared = []
+    env_host = os.environ.get("VIRP_BIND_HOST")
+    if env_host:
+        declared.append(env_host)
+    declared.extend(_argv_bind_hosts())
+    return declared or ["127.0.0.1"]
+
+
+def enforce_safe_bind(hosts=None) -> None:
+    """Refuse to start if any effective bind is non-loopback and no token
+    is set. Called at import (catches `uvicorn server:app ...`) and again
+    from __main__ with the resolved host. Raises UnsafeBindError on the
+    unsafe config; logs a clear DEV MODE line on loopback-without-token."""
+    if hosts is None:
+        hosts = _resolve_effective_bind_hosts()
+    exposed = [h for h in hosts if not _is_genuine_loopback(h)]
+
+    if API_TOKEN:
+        return  # a token is set: any bind is the operator's call
+
+    if exposed:
+        raise UnsafeBindError(
+            "REFUSING TO START: binding to non-loopback "
+            f"{exposed!r} with no VIRP_API_TOKEN would serve every mutating "
+            "route unauthenticated to the network. Fix ONE of:\n"
+            "  - set VIRP_API_TOKEN=<secret> (per-request bearer auth), or\n"
+            "  - bind loopback (127.0.0.1/::1) and put an authenticated "
+            "gateway (mTLS or signed requests) in front.\n"
+            "KNOWN GAP: a bind declared only in a server config file/module "
+            "or a server-specific env var is not detected here — set "
+            "VIRP_API_TOKEN when using those."
+        )
+
+    _audit_log.warning(
+        "DEV MODE: loopback bind %r, no VIRP_API_TOKEN — mutating routes "
+        "are UNAUTHENTICATED. Safe only because the bind is loopback. Set "
+        "VIRP_API_TOKEN before any non-loopback exposure.", hosts)
 
 # Drivers that the VIRP daemon actually knows how to talk to. This
 # list is authoritative for /api/devices/add; anything else is
@@ -930,6 +1036,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Enforce the bind/token safety guard at IMPORT time, so `uvicorn
+# server:app --host 0.0.0.0` (which never runs this module's __main__)
+# cannot come up unauthenticated on the network. __main__ re-checks with
+# its resolved host below.
+enforce_safe_bind()
+
 if VIRP_ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -1263,4 +1375,8 @@ if __name__ == "__main__":
     # setting VIRP_BIND_HOST (e.g. 0.0.0.0) — usually behind a reverse
     # proxy that terminates TLS and adds the bearer token.
     bind_host = os.environ.get("VIRP_BIND_HOST", "127.0.0.1")
+    # Re-check with the exact host we are about to hand uvicorn — same
+    # guard as at import, now against the resolved value. Refuses a
+    # non-loopback bind with no VIRP_API_TOKEN (raises UnsafeBindError).
+    enforce_safe_bind([bind_host])
     uvicorn.run(app, host=bind_host, port=8470, log_level="info")
