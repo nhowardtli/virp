@@ -61,7 +61,12 @@ typedef struct {
 /* Generate a fresh keypair in memory (mlocks the secret). */
 virp_error_t virp_obskey_generate(virp_obskey_t *kp);
 
-/* Write secret (0600) and public (0644) key files. */
+/*
+ * Write secret (0600) and public (0644) key files. Both are created
+ * O_EXCL|O_NOFOLLOW: an existing file or a pre-planted symlink at
+ * either path refuses the save. Regenerating into an existing prefix
+ * is deliberately unsupported — remove both files first.
+ */
 virp_error_t virp_obskey_save(const virp_obskey_t *kp,
                               const char *sk_path,
                               const char *pk_path);

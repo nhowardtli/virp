@@ -85,9 +85,19 @@ virp_error_t virp_obskey_save(const virp_obskey_t *kp,
     if (n != VIRP_OBSKEY_SK_SIZE)
         return VIRP_ERR_KEY_NOT_LOADED;
 
-    fd = open(pk_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0)
+    /* Same discipline as the secret: O_EXCL (never write over an
+     * existing file — a keypair is generated into an EMPTY prefix,
+     * and O_EXCL also refuses a pre-planted symlink) plus O_NOFOLLOW
+     * as belt-and-suspenders. The content is public; the write path
+     * is not. Regenerating into an existing prefix is deliberately
+     * not a supported workflow — remove both files first. */
+    fd = open(pk_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "[ObsKey] cannot create %s: %s (existing files "
+                        "are never overwritten)\n",
+                pk_path, strerror(errno));
         return VIRP_ERR_KEY_NOT_LOADED;
+    }
     n = write(fd, kp->public_key, VIRP_OBSKEY_PK_SIZE);
     close(fd);
     if (n != VIRP_OBSKEY_PK_SIZE)

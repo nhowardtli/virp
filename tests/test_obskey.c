@@ -75,6 +75,21 @@ static void test_generate_save_load_roundtrip(void)
     /* Saving over an existing secret key must refuse (O_EXCL). */
     assert(virp_obskey_save(&gen, SK_PATH, PK_PATH) != VIRP_OK);
 
+    /* The PUBLIC side has the same write discipline: fresh secret
+     * path, but the pub path already exists -> refused... */
+    assert(virp_obskey_save(&gen, TEST_DIR "/fresh.key", PK_PATH)
+           != VIRP_OK);
+    unlink(TEST_DIR "/fresh.key");
+    /* ...and a pre-planted symlink at the pub path is refused too
+     * (O_EXCL/O_NOFOLLOW), leaving the symlink target untouched. */
+    assert(symlink(TEST_DIR "/target.pub", TEST_DIR "/link.pub") == 0);
+    assert(virp_obskey_save(&gen, TEST_DIR "/fresh.key",
+                            TEST_DIR "/link.pub") != VIRP_OK);
+    struct stat lt;
+    assert(stat(TEST_DIR "/target.pub", &lt) != 0);   /* never created */
+    unlink(TEST_DIR "/link.pub");
+    unlink(TEST_DIR "/fresh.key");
+
     virp_obskey_destroy(&gen);
     virp_obskey_destroy(&loaded);
 }
