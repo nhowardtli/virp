@@ -640,12 +640,22 @@ static bool tok_prefix(const char *canon, const char *tok)
            (canon[n] == '\0' || canon[n] == ' ');
 }
 
-/* Row charset for GREEN/YELLOW remainders: [a-z0-9 ./-] only. */
+/* Row charset for GREEN/YELLOW remainders: [a-z0-9 ./:-] only.
+ *   a-z 0-9   keywords, hostnames, hex quads of IPv6 addresses
+ *   ' '       argument separation
+ *   '.'       IPv4 addresses, interface names (eth0.100)
+ *   '/'       prefix lengths (10.0.0.0/8, 2001:db8::/32)
+ *   '-'       flag-style keywords (running-config)
+ *   ':'       IPv6 addresses (2001:db8::/32), BGP communities (65000:1)
+ *             and RD/RT values (65000:100) — without it every IPv6- or
+ *             community-scoped read is unreachable. ':' is not a shell
+ *             metacharacter and carries no meaning to vtysh beyond
+ *             these literal argument forms. */
 static bool rest_charset_ok(const char *rest)
 {
     for (const char *p = rest; *p; p++) {
         if ((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
-            *p == ' ' || *p == '.' || *p == '/' || *p == '-')
+            *p == ' ' || *p == '.' || *p == '/' || *p == '-' || *p == ':')
             continue;
         return false;
     }

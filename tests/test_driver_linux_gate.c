@@ -201,6 +201,65 @@ static void test_yellow(void)
     PASS();
 }
 
+/*
+ * BGP has no rows of its own — reads reach GREEN through the generic
+ * `show` rule and everything else is RED by absence. That makes it
+ * invisible to the rest of this suite: a charset or row change could
+ * silently flip every BGP read to RED (as the missing ':' did for IPv6
+ * and community forms) or, worse, open a YELLOW path to `clear bgp`.
+ * These are the named assertions that pin both directions.
+ */
+static void test_bgp_rows(void)
+{
+    printf("\n=== BGP — reads GREEN via the show rule, actions stay RED ===\n");
+
+    TEST("show bgp summary -> GREEN");
+    assert(linux_gate_tier("vtysh -c \"show bgp summary\"") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("show ip bgp summary -> GREEN");
+    assert(linux_gate_tier("vtysh -c \"show ip bgp summary\"") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("show bgp ipv6 unicast -> GREEN");
+    assert(linux_gate_tier("vtysh -c \"show bgp ipv6 unicast\"") == VIRP_TIER_GREEN);
+    PASS();
+
+    /* The two rows that demand ':' in the remainder charset. Before the
+     * charset carried ':' these classified RED — this pair is the
+     * differential proof for that one-character change. */
+    TEST("show bgp ipv6 unicast 2001:db8::/32 -> GREEN (':' in charset)");
+    assert(linux_gate_tier("vtysh -c \"show bgp ipv6 unicast 2001:db8::/32\"")
+           == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("show bgp community 65000:1 -> GREEN (':' in charset)");
+    assert(linux_gate_tier("vtysh -c \"show bgp community 65000:1\"")
+           == VIRP_TIER_GREEN);
+    PASS();
+
+    /* Session-resetting actions. No YELLOW row exists for these and none
+     * may be added casually: a BGP clear drops sessions and withdraws
+     * routes network-wide, which is propose/approve/apply territory. */
+    TEST("clear ip bgp 192.0.2.1 soft in -> RED (approval required)");
+    assert_red_blocked("vtysh -c \"clear ip bgp 192.0.2.1 soft in\"");
+    PASS();
+
+    TEST("clear bgp 192.0.2.1 soft in -> RED (approval required)");
+    assert_red_blocked("vtysh -c \"clear bgp 192.0.2.1 soft in\"");
+    PASS();
+
+    /* Anchor/shape neighbours: the same read through a path-prefixed
+     * binary or a daemon-targeted invocation must not inherit GREEN. */
+    TEST("/usr/bin/vtysh -c \"show bgp summary\" -> RED (anchored form)");
+    assert_red_blocked("/usr/bin/vtysh -c \"show bgp summary\"");
+    PASS();
+
+    TEST("vtysh -d bgpd -c \"show bgp summary\" -> RED (shape)");
+    assert_red_blocked("vtysh -d bgpd -c \"show bgp summary\"");
+    PASS();
+}
+
 static void test_red_teaching_rows(void)
 {
     printf("\n=== RED — explicit rows with instructive reasons ===\n");
@@ -449,6 +508,7 @@ int main(void)
     test_no_abbreviation_expansion();
     test_green();
     test_yellow();
+    test_bgp_rows();
     test_red_teaching_rows();
     test_red_by_absence();
     test_peer_health_rows();
