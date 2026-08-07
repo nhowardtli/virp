@@ -1090,6 +1090,15 @@ asan-test:
 	./$(TEST_OBS_FORGE) 2>&1
 	./$(TEST_OBS_NEG) 2>&1
 	@echo "=== ASan+UBSan test run complete ==="
+	# Leave no instrumented residue in the shared build/ tree. asan-test
+	# already clean-builds at the start, so the tree is disposable; a
+	# plain `make test-*` or the ctypes bridge (test-api) that links or
+	# dlopens an ASan-instrumented artifact left here would fail with
+	# '__asan_*' undefined-reference / 'ASan runtime does not come first'.
+	# (asan-drivers is already isolated in build-asan-drivers/.) If asan-test
+	# is INTERRUPTED before this line, run `make clean` once.
+	@echo "=== cleaning instrumented build/ so later plain builds are safe ==="
+	$(MAKE) --no-print-directory clean
 
 # Driver suites under ASan+UBSan. Separate from asan-test because the
 # driver objects need their -D guards, which are evaluated at Makefile
