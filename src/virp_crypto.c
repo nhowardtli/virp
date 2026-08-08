@@ -574,7 +574,8 @@ virp_error_t virp_verify(virp_context_t *ctx,
  * as a different (profile, command) pair.
  *
  * PROTOCOL-VISIBLE: a typed-profile driver's command hashes change value
- * under this scheme. Note for draft-06.
+ * under this scheme. Note for draft-07 (-06 did not specify typed
+ * profiles; its §17.7 scopes them as future work).
  */
 virp_error_t virp_typed_op_hash(const char *profile,
                                 const char *command, size_t command_len,

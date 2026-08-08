@@ -39,8 +39,14 @@
   protection at verify time) are NOT covered by these proofs.
 - There is **no Tamarin model** in this repository. Any claim of
   Tamarin verification is unsubstantiated and has been removed from the
-  docs; draft-howard-virp-05 §16.1 still carries the old claim and
-  needs the same correction in its next revision.
+  docs. The draft has been corrected to match: `draft-howard-virp-06`
+  (filed 2026-08-01) §11 states the ProVerif result scoped to the v2
+  path and says plainly that no Tamarin model exists, with the
+  second-tool cross-check listed as future work in §17.1. Appendix A of
+  -06 records the removal of the -05 "two-tool machine-verified" claim.
+- These proofs do **not** cover the v3 Ed25519 observation path. No
+  machine-checked model of v3 signing, verification, or cross-version
+  downgrade exists; see `docs/DRAFT07-NOTES.md` §1.
 
 ## Reproducing
 

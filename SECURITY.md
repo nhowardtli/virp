@@ -185,9 +185,9 @@ of the message except the signature itself, so the message is one
 atomic signed unit and the HMAC trailer cannot be rewritten in transit.
 (That span is normative and changed on 2026-08-08; the first cut signed
 `header || payload` only, leaving the 32 HMAC bytes bound by nothing.
-Changed while v3 had zero dependents — see `docs/DRAFT06-NOTES.md` §1
+Changed while v3 had zero dependents — see `docs/DRAFT07-NOTES.md` §1
 "Compatibility".) Wire format and rationale:
-`docs/DRAFT06-NOTES.md` §1 and the `VIRP_VERSION_3` block in
+`docs/DRAFT07-NOTES.md` §1 and the `VIRP_VERSION_3` block in
 `include/virp.h`. Verification needs only the public key
 (`virp_verify_observation_ed25519`, `virp-tool obs-verify`) — the
 verifier holds no secret of any kind.

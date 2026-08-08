@@ -366,7 +366,10 @@ typedef struct {
 
 /*
  * V3 (Ed25519-signed) observation wire format — PROTOCOL-VISIBLE,
- * record for draft-06. ADDITIVE: coexists with v1/v2, changes neither.
+ * record for draft-07. NOT specified by the filed draft: -06 covers
+ * v1/v2 only and lists asymmetric observation signing as future work
+ * (§17.3). This format is implemented ahead of specification.
+ * ADDITIVE: coexists with v1/v2, changes neither.
  *
  *   [ header : 88 ][ payload : P ][ hmac : 32 ][ ed25519 sig : 64 ]
  *

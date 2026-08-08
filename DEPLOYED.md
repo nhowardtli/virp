@@ -600,7 +600,9 @@ typed-op branch.
 
 FIX 1 replaces the canonicalizing command hash with an exact-octet one for
 any driver declaring a `typed_profile` (`"pbs/1"`). Every PBS command hash
-therefore has a different value after this deploy. Noted for draft-06.
+therefore has a different value after this deploy. Noted for draft-07
+(-06 was filed 2026-08-01 without typed profiles; its §17.7 scopes
+them as future work).
 
 Checked before deploying: **no signed approval existed for `pbs-lab`**, so
 nothing in force was invalidated. 120 gate-rejection *proposals* do exist for

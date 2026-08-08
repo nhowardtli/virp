@@ -1,9 +1,26 @@
-# Protocol-Visible Changes Pending for draft-06
+# Protocol-Visible Changes Pending for draft-07
 
 Running record of implemented, protocol-visible decisions that the next
-RFC revision (`draft-howard-virp-06`) must incorporate. Each entry
+RFC revision (`draft-howard-virp-07`) must incorporate. Each entry
 states the wire-level decision and where the normative comment lives in
 the tree. Append new entries; do not rewrite old ones.
+
+**Status of -06 (filed 2026-08-01).** This file was previously named
+`DRAFT06-NOTES.md`. `draft-howard-virp-06` is filed and specifies the
+**v1 and v2 observation formats only**. It incorporated NEITHER entry
+below:
+
+- **v3 Ed25519 observations** — not specified in -06. §17.3 of -06 lists
+  asymmetric observation signing as *future work*, and Appendix A
+  records the removal of the earlier per-observation Ed25519 claim that
+  the implementation did not support. v3 is -07 material.
+- **Typed-profile command hashing** — not specified in -06 either; §17.7
+  scopes it as future work. The in-tree markers for it (see
+  `src/virp_crypto.c virp_typed_op_hash` and `DEPLOYED.md`) therefore
+  carry to -07.
+
+Everything in this file is implemented **ahead of specification**. Do
+not cite the filed draft as the authority for any of it.
 
 ---
 
@@ -81,6 +98,7 @@ Normative comment in-tree: the `VIRP_VERSION_3` block in
 ---
 
 *(The typed-operation command hash — `virp_typed_op_hash`, see
-`src/virp_crypto.c` — is an earlier protocol-visible change also
-flagged "note for draft-06" in code; it predates this file and is
-recorded here only by reference.)*
+`src/virp_crypto.c` — is an earlier protocol-visible change, now
+flagged "note for draft-07" in code. It predates this file, was NOT
+incorporated into -06 (§17.7 scopes typed operations as future work),
+and is recorded here only by reference.)*

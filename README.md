@@ -348,7 +348,13 @@ Yes. VIRP is a protocol and a reference implementation. IronClaw is one consumer
 
 ## Protocol Specification
 
-- **IETF Draft:** `draft-howard-virp-06` (revisions -00 through -06 submitted)
+- **IETF Draft:** `draft-howard-virp-06` (filed 2026-08-01; revisions -00
+  through -06 submitted). **-06 specifies the v1 and v2 observation
+  formats only.** The Ed25519-signed observation format (wire version 3)
+  in this repository is implemented ahead of specification: -06 §17.3
+  lists asymmetric observation signing as *future work*, and Appendix A
+  records the removal of the earlier, unsupported per-observation
+  Ed25519 claim. v3 is slated for -07.
 - **Formal verification:** (1) injective agreement (every accepted v2
   observation corresponds to exactly one signing) and key secrecy
   (master O-Key and derived session keys) are machine-verified in
@@ -361,9 +367,11 @@ Yes. VIRP is a protocol and a reference implementation. IronClaw is one consumer
   including persistence across verifier restart. (3) Timestamp
   freshness is test-verified only (`test_stale_observation_rejected`),
   not modeled. There is no Tamarin model — that is future work. The
-  proofs cover the v2 observation path only; `draft-howard-virp-06`
-  §16.1 scopes its evidence claim to match (the -05 text carried the
-  older, broader claim).
+  proofs cover the v2 observation path only; `draft-howard-virp-06` §11
+  scopes its evidence claim to match — ProVerif only, v2 only, no
+  Tamarin — and §17.1 names the second-tool cross-check as future work.
+  (The -05 text carried the older, broader claim; -06 Appendix A records
+  the correction.)
 - **License:** Apache 2.0
 
 ---
