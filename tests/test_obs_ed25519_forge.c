@@ -186,18 +186,19 @@ static void test_ed25519_public_key_holder_cannot_forge(void)
     memset(fh.command_hash, 0x33, 32);
     fh.payload_len  = sizeof(FAKE_ROUTE) - 1;
 
-    size_t signed_len = VIRP_OBS_V2_HEADER_SIZE + fh.payload_len;
-    size_t total = signed_len + VIRP_OBS_V2_SIG_SIZE +
-                   VIRP_OBS_ED25519_SIG_SIZE;
+    size_t hmac_span = VIRP_OBS_V2_HEADER_SIZE + fh.payload_len;
+    size_t sig_span  = hmac_span + VIRP_OBS_V2_SIG_SIZE;
+    size_t total     = sig_span + VIRP_OBS_ED25519_SIG_SIZE;
     uint8_t forged[VIRP_MAX_MESSAGE_SIZE];
     assert(virp_obs_header_v2_serialize(&fh, forged,
                                         sizeof(forged)) == VIRP_OK);
     memcpy(forged + VIRP_OBS_V2_HEADER_SIZE, FAKE_ROUTE,
            fh.payload_len);
     /* HMAC trailer: attacker has no session key either; garbage. The
-     * public-key verifier never reads it — irrelevant to this proof. */
-    memset(forged + signed_len, 0x44, VIRP_OBS_V2_SIG_SIZE);
-    uint8_t *sig = forged + signed_len + VIRP_OBS_V2_SIG_SIZE;
+     * public-key verifier never READS it, but it is inside the signed
+     * span, so it must be present before the signature is computed. */
+    memset(forged + hmac_span, 0x44, VIRP_OBS_V2_SIG_SIZE);
+    uint8_t *sig = forged + sig_span;
 
     /* Attempt (a): zero signature. */
     memset(sig, 0x00, VIRP_OBS_ED25519_SIG_SIZE);
@@ -227,7 +228,7 @@ static void test_ed25519_public_key_holder_cannot_forge(void)
      * perfectly valid Ed25519 signature — under the wrong key. */
     virp_obskey_t attacker_key;
     assert(virp_obskey_generate(&attacker_key) == VIRP_OK);
-    assert(crypto_sign_detached(sig, NULL, forged, signed_len,
+    assert(crypto_sign_detached(sig, NULL, forged, sig_span,
                                 attacker_key.secret_key) == 0);
     assert(virp_verify_observation_ed25519(pub, forged, total,
                                            NULL, NULL, NULL)
@@ -268,11 +269,11 @@ static void test_tamper_any_covered_byte_fails(void)
                                            obs, obs_len,
                                            NULL, NULL, NULL) == VIRP_OK);
 
-    size_t signed_len = obs_len - VIRP_OBS_V2_SIG_SIZE -
-                        VIRP_OBS_ED25519_SIG_SIZE;
+    size_t sig_span = obs_len - VIRP_OBS_ED25519_SIG_SIZE;
+    size_t hmac_off = sig_span - VIRP_OBS_V2_SIG_SIZE;
 
-    /* Every covered byte: header + payload. */
-    for (size_t i = 0; i < signed_len; i++) {
+    /* Every covered byte: header + payload + the HMAC trailer. */
+    for (size_t i = 0; i < sig_span; i++) {
         obs[i] ^= 0x01;
         assert(virp_verify_observation_ed25519(onode_key.public_key,
                                                obs, obs_len,
@@ -296,14 +297,18 @@ static void test_tamper_any_covered_byte_fails(void)
                                            obs, obs_len,
                                            NULL, NULL, NULL) == VIRP_OK);
 
-    /* Documented non-coverage: the HMAC trailer is checked by the
-     * session holder, not the public-key consumer; each trailer is
-     * verified by its own audience and neither covers the other. */
-    obs[signed_len] ^= 0x01;    /* first HMAC byte */
+    /* The HMAC trailer IS covered (changed 2026-08-08). It is still
+     * only the session holder who can CHECK the HMAC — a public-key
+     * consumer cannot — but the signature BINDS it, so a relay holding
+     * neither key cannot rewrite those 32 bytes and keep the message
+     * verifying. Until this changed, it could: same attested content,
+     * unlimited distinct byte strings and artifact hashes. */
+    obs[hmac_off] ^= 0x01;    /* first HMAC byte */
     assert(virp_verify_observation_ed25519(onode_key.public_key,
                                            obs, obs_len,
-                                           NULL, NULL, NULL) == VIRP_OK);
-    obs[signed_len] ^= 0x01;
+                                           NULL, NULL, NULL)
+           == VIRP_ERR_OBS_SIG_INVALID);
+    obs[hmac_off] ^= 0x01;
 
     virp_obskey_destroy(&onode_key);
     virp_context_destroy(ctx);

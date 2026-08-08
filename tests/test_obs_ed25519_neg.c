@@ -69,11 +69,15 @@ static void build_reference_blob(void)
 
     assert(virp_obs_header_v2_serialize(&h, blob, sizeof(blob)) == VIRP_OK);
     memset(blob + VIRP_OBS_V2_HEADER_SIZE, 0x5A, PAYLOAD_LEN);
-    size_t signed_len = VIRP_OBS_V2_HEADER_SIZE + PAYLOAD_LEN;
-    memset(blob + signed_len, 0x44, VIRP_OBS_V2_SIG_SIZE);  /* HMAC: garbage */
-    assert(crypto_sign_detached(blob + signed_len + VIRP_OBS_V2_SIG_SIZE,
-                                NULL, blob, signed_len, sec) == 0);
-    blob_len = signed_len + VIRP_OBS_V2_SIG_SIZE + VIRP_OBS_ED25519_SIG_SIZE;
+    size_t hmac_span = VIRP_OBS_V2_HEADER_SIZE + PAYLOAD_LEN;
+    memset(blob + hmac_span, 0x44, VIRP_OBS_V2_SIG_SIZE);  /* HMAC: garbage */
+    /* The signature spans header || payload || HMAC. The HMAC bytes are
+     * garbage here on purpose — the public-key verifier does not check
+     * them, but it DOES bind them, so they must be signed as they are. */
+    size_t sig_span = hmac_span + VIRP_OBS_V2_SIG_SIZE;
+    assert(crypto_sign_detached(blob + sig_span, NULL, blob, sig_span,
+                                sec) == 0);
+    blob_len = sig_span + VIRP_OBS_ED25519_SIG_SIZE;
 
     assert(virp_verify_observation_ed25519(pub, blob, blob_len,
                                            NULL, NULL, NULL) == VIRP_OK);

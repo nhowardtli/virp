@@ -23,7 +23,15 @@ the tree. Append new entries; do not rewrite old ones.
   `HMAC-SHA256(session_key, header || payload)`.
 - `sig` is an Ed25519 detached signature by the O-Node's
   observation-signing key (the "obskey", key_id = SHA-256(pub)[:16])
-  over **exactly the same bytes**: `header || payload`.
+  over `header || payload || hmac` — **every byte of the message except
+  the signature itself**. This span is normative.
+
+**Build and verify order (normative).** Build: serialize the header,
+append the payload, compute the HMAC over `header || payload`, append
+it, then sign `header || payload || hmac`. Verify: check the Ed25519
+signature over `header || payload || hmac` first; a session-key holder
+MAY then check the HMAC over `header || payload`. A public-key consumer
+holds no session key and MUST NOT need one.
 
 **Why a distinct version, not an optional field.** Byte 0 alone
 determines the verification obligations (unambiguous dispatch — what
@@ -32,12 +40,30 @@ the version byte, stripping the Ed25519 trailer and relabeling the
 message v2 requires re-computing the HMAC, i.e. the session key; and a
 v3 signature can never validate a v2 blob.
 
-**Why the same covered bytes as the HMAC.** The symmetric and
-asymmetric schemes attest identical content, so their guarantees are
-directly comparable, and a future verifier can check either or both
-without canonicalization differences. Neither trailer covers the
-other: each is checked by its own audience (HMAC by the session
-holder, Ed25519 by public-key consumers).
+**Why the signature covers the HMAC (revised 2026-08-08).** The two
+trailers attest the same *content* — the HMAC over `header || payload`
+is unchanged v2 semantics — but they are **nested, not parallel**. The
+first cut had them parallel, each covering `header || payload` and
+neither covering the other, on the reasoning that each is checked by
+its own audience (HMAC by the session holder, Ed25519 by public-key
+consumers). That reasoning was wrong about one thing: it left the 32
+HMAC bytes inside the message and outside every signature. A relay
+holding neither key could rewrite them and the message still verified —
+the same attested observation under an unlimited number of distinct
+byte strings, hence an unlimited number of distinct SHA-256 artifact
+hashes. Since the chain binds `artifact_hash` to the exact submitted
+bytes, that malleability would have become a chain-identity problem the
+moment v3 reached `chain_append`. A signed message is one atomic unit;
+"checked by its own audience" is about who verifies, not about what is
+bound.
+
+**Compatibility.** This is a breaking change to the v3 signed span.
+`sig` computed over `header || payload` no longer verifies. It was made
+while **v3 has zero dependents** — nothing emits v3 in production, no
+chain entry carries a v3 body, and `chain_append` does not yet check
+Ed25519 signatures at all — so the change costs nothing today and would
+have been permanent the moment it had one dependent. v1 and v2 are
+untouched.
 
 **Scope of the guarantee (state this in the draft).** The Ed25519
 signature removes CONSUMER/AUDITOR forge capability — a holder of only

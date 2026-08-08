@@ -137,20 +137,21 @@ static void test_signature_covers_exactly_canonical_bytes(void)
     uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
     (void)build_v3(ctx, &kp, 2, buf, sizeof(buf));
 
-    size_t signed_len = VIRP_OBS_V2_HEADER_SIZE + PAYLOAD_LEN;
-    const uint8_t *sig = buf + signed_len + VIRP_OBS_V2_SIG_SIZE;
+    size_t hmac_span = VIRP_OBS_V2_HEADER_SIZE + PAYLOAD_LEN;
+    size_t sig_span  = hmac_span + VIRP_OBS_V2_SIG_SIZE;
+    const uint8_t *sig = buf + sig_span;
 
-    /* Verifies over exactly header || payload... */
-    assert(crypto_sign_verify_detached(sig, buf, signed_len,
+    /* Verifies over exactly header || payload || HMAC... */
+    assert(crypto_sign_verify_detached(sig, buf, sig_span,
                                        kp.public_key) == 0);
     /* ...and over nothing else: one byte narrower or wider fails, and
-     * including the HMAC trailer in the coverage fails. */
-    assert(crypto_sign_verify_detached(sig, buf, signed_len - 1,
+     * the old header||payload-only span (the pre-2026-08-08 format)
+     * must NOT verify — that is the malleability being closed. */
+    assert(crypto_sign_verify_detached(sig, buf, sig_span - 1,
                                        kp.public_key) != 0);
-    assert(crypto_sign_verify_detached(sig, buf, signed_len + 1,
+    assert(crypto_sign_verify_detached(sig, buf, sig_span + 1,
                                        kp.public_key) != 0);
-    assert(crypto_sign_verify_detached(sig, buf,
-                                       signed_len + VIRP_OBS_V2_SIG_SIZE,
+    assert(crypto_sign_verify_detached(sig, buf, hmac_span,
                                        kp.public_key) != 0);
 
     virp_obskey_destroy(&kp);
@@ -168,22 +169,85 @@ static void test_every_covered_byte_is_covered(void)
 
     uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
     size_t len = build_v3(ctx, &kp, 3, buf, sizeof(buf));
-    size_t signed_len = VIRP_OBS_V2_HEADER_SIZE + PAYLOAD_LEN;
-    const uint8_t *sig = buf + signed_len + VIRP_OBS_V2_SIG_SIZE;
+    size_t sig_span = VIRP_OBS_V2_HEADER_SIZE + PAYLOAD_LEN +
+                      VIRP_OBS_V2_SIG_SIZE;
+    const uint8_t *sig = buf + sig_span;
     (void)len;
 
-    /* Flip EVERY byte of header and payload in turn — version byte,
-     * tier, device, command hash, payload content, all of it must be
-     * bound by the signature. */
-    for (size_t i = 0; i < signed_len; i++) {
+    /* Flip EVERY byte of header, payload AND the HMAC trailer in turn —
+     * version byte, tier, device, command hash, payload content, and
+     * all 32 HMAC bytes must be bound by the signature. */
+    for (size_t i = 0; i < sig_span; i++) {
         buf[i] ^= 0xFF;
-        assert(crypto_sign_verify_detached(sig, buf, signed_len,
+        assert(crypto_sign_verify_detached(sig, buf, sig_span,
                                            kp.public_key) != 0);
         buf[i] ^= 0xFF;
     }
     /* Intact again after the sweep. */
-    assert(crypto_sign_verify_detached(sig, buf, signed_len,
+    assert(crypto_sign_verify_detached(sig, buf, sig_span,
                                        kp.public_key) == 0);
+
+    virp_obskey_destroy(&kp);
+    virp_context_destroy(ctx);
+}
+
+/*
+ * The Ed25519 trailer must cover the HMAC trailer too.
+ *
+ * Before 2026-08-08 it did not: the signature spanned header || payload
+ * only, leaving the 32 HMAC bytes inside the message but outside the
+ * signed span and binding neither trailer to the other. Anyone relaying
+ * an observation could rewrite those 32 bytes and the public-key
+ * verifier still returned VIRP_OK — the same attested content under an
+ * unlimited number of distinct byte strings, and so under an unlimited
+ * number of distinct SHA-256 artifact hashes.
+ */
+static void test_signature_covers_the_hmac_trailer(void)
+{
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx && virp_session_init(ctx, "obs-v3-test") == VIRP_OK);
+    activate_session(ctx, 0x37);
+
+    virp_obskey_t kp;
+    assert(virp_obskey_generate(&kp) == VIRP_OK);
+
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = build_v3(ctx, &kp, 9, buf, sizeof(buf));
+    const size_t hmac_off = VIRP_OBS_V2_HEADER_SIZE + PAYLOAD_LEN;
+
+    /* Baseline: the genuine message verifies. */
+    assert(virp_verify_observation_ed25519(kp.public_key, buf, len,
+                                           NULL, NULL, NULL) == VIRP_OK);
+
+    /* Invert the whole HMAC trailer. Distinct bytes, distinct digest. */
+    uint8_t alt[VIRP_MAX_MESSAGE_SIZE];
+    memcpy(alt, buf, len);
+    for (size_t i = 0; i < VIRP_OBS_V2_SIG_SIZE; i++)
+        alt[hmac_off + i] ^= 0xFF;
+
+    uint8_t d_orig[crypto_hash_sha256_BYTES];
+    uint8_t d_alt[crypto_hash_sha256_BYTES];
+    crypto_hash_sha256(d_orig, buf, len);
+    crypto_hash_sha256(d_alt,  alt, len);
+    assert(memcmp(d_orig, d_alt, sizeof(d_orig)) != 0);
+
+    /* The mutated message must NOT verify. */
+    assert(virp_verify_observation_ed25519(kp.public_key, alt, len,
+                                           NULL, NULL, NULL)
+           == VIRP_ERR_OBS_SIG_INVALID);
+
+    /* Every single trailer byte is bound, not just the block. */
+    for (size_t i = 0; i < VIRP_OBS_V2_SIG_SIZE; i++) {
+        memcpy(alt, buf, len);
+        alt[hmac_off + i] ^= 0x01;
+        assert(virp_verify_observation_ed25519(kp.public_key, alt, len,
+                                               NULL, NULL, NULL)
+               == VIRP_ERR_OBS_SIG_INVALID);
+    }
+
+    /* And the original is still good after the sweep. */
+    assert(virp_verify_observation_ed25519(kp.public_key, buf, len,
+                                           NULL, NULL, NULL) == VIRP_OK);
 
     virp_obskey_destroy(&kp);
     virp_context_destroy(ctx);
@@ -224,15 +288,12 @@ static void test_hmac_present_in_addition_with_v2_semantics(void)
  * verifier and every one of these accepts. */
 static void resign_v3(uint8_t *buf, size_t len, const virp_obskey_t *kp)
 {
-    size_t signed_len = len - VIRP_OBS_V2_SIG_SIZE -
-                        VIRP_OBS_ED25519_SIG_SIZE;
-    assert(crypto_sign_detached(buf + signed_len + VIRP_OBS_V2_SIG_SIZE,
-                                NULL, buf, signed_len,
+    size_t sig_span = len - VIRP_OBS_ED25519_SIG_SIZE;
+    assert(crypto_sign_detached(buf + sig_span, NULL, buf, sig_span,
                                 kp->secret_key) == 0);
     /* Confirm the mutated blob really is validly signed. */
-    assert(crypto_sign_verify_detached(
-               buf + signed_len + VIRP_OBS_V2_SIG_SIZE,
-               buf, signed_len, kp->public_key) == 0);
+    assert(crypto_sign_verify_detached(buf + sig_span, buf, sig_span,
+                                       kp->public_key) == 0);
 }
 
 static void test_signed_but_malformed_header_rejected(void)
@@ -346,6 +407,7 @@ int main(void)
     RUN_TEST(test_wire_layout);
     RUN_TEST(test_signature_covers_exactly_canonical_bytes);
     RUN_TEST(test_every_covered_byte_is_covered);
+    RUN_TEST(test_signature_covers_the_hmac_trailer);
     RUN_TEST(test_hmac_present_in_addition_with_v2_semantics);
     RUN_TEST(test_signed_but_malformed_header_rejected);
     RUN_TEST(test_v3_requires_active_session_and_loaded_key);

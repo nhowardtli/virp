@@ -180,8 +180,13 @@ follow-up hardening.
 **The scheme.** Observations can now additionally be emitted as wire
 version 3 (`virp_build_observation_ed25519`): the v2 header layout and
 session-HMAC trailer, PLUS an Ed25519 detached signature by the O-Node's
-observation-signing key over exactly the same bytes the HMAC covers
-(`header || payload`). Wire format and rationale:
+observation-signing key over `header || payload || hmac` — every byte
+of the message except the signature itself, so the message is one
+atomic signed unit and the HMAC trailer cannot be rewritten in transit.
+(That span is normative and changed on 2026-08-08; the first cut signed
+`header || payload` only, leaving the 32 HMAC bytes bound by nothing.
+Changed while v3 had zero dependents — see `docs/DRAFT06-NOTES.md` §1
+"Compatibility".) Wire format and rationale:
 `docs/DRAFT06-NOTES.md` §1 and the `VIRP_VERSION_3` block in
 `include/virp.h`. Verification needs only the public key
 (`virp_verify_observation_ed25519`, `virp-tool obs-verify`) — the

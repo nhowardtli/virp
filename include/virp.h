@@ -371,15 +371,33 @@ typedef struct {
  *   [ header : 88 ][ payload : P ][ hmac : 32 ][ ed25519 sig : 64 ]
  *
  * The header is byte-for-byte the v2 layout above with version = 3 —
- * byte 0 alone dispatches the format. Both trailers cover EXACTLY the
- * same bytes, serialized_header || payload:
+ * byte 0 alone dispatches the format. The trailers are NESTED, and the
+ * spans below are NORMATIVE wire format:
  *
  *   hmac = HMAC-SHA256(session_key, header || payload)   (v2 semantics)
- *   sig  = Ed25519-detached(obskey_secret, header || payload)
+ *   sig  = Ed25519-detached(obskey_secret, header || payload || hmac)
  *
- * so the symmetric and asymmetric schemes attest identical content.
- * Because the version byte is covered by both, a v3 observation cannot
- * be re-labeled v2 (signature-stripping downgrade) without the session
+ * The Ed25519 signature therefore covers every byte of the message
+ * except the signature itself. Build order is forced: HMAC first, then
+ * sign. Verify order: check the signature over header || payload || hmac
+ * first; the HMAC over header || payload is then an optional second
+ * check for a session-key holder (a public-key consumer has no session
+ * key and MUST NOT need one).
+ *
+ * Why the signature covers the HMAC (changed 2026-08-08): when it did
+ * not, the 32 HMAC bytes sat inside the message but outside the signed
+ * span, bound by nothing. Any relay could rewrite them and the message
+ * still verified — one attested observation under unlimited distinct
+ * byte strings, and so under unlimited distinct SHA-256 artifact
+ * hashes. A signed message must be one atomic unit.
+ *
+ * NOT BACKWARD COMPATIBLE with v3 bytes produced before 2026-08-08.
+ * Done now precisely because v3 has zero dependents: nothing emits it
+ * in production, no chain entry carries it, and chain_append does not
+ * yet check it. The window closes the moment it has a single dependent.
+ *
+ * Because the version byte is covered, a v3 observation cannot be
+ * re-labeled v2 (signature-stripping downgrade) without the session
  * key, and a v3 signature can never validate a v2 blob.
  *
  * What the Ed25519 trailer adds: a consumer holding only the PUBLIC

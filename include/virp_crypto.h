@@ -241,11 +241,13 @@ virp_error_t virp_build_observation_v2(
  * ADDITIVE alongside v1/v2 — deliberately implemented as its own
  * function rather than a refactor of the v2 path, so introducing it
  * provably cannot change v1/v2 behaviour; unification is the
- * observation re-cut's job. Both trailers cover exactly
- * serialized_header || payload (see the v3 comment in virp.h): the
- * HMAC keeps the v2 session semantics for the caller, the Ed25519
- * detached signature (obskey secret; the O-Node is the attester) is
- * what a public-key-only consumer verifies. Session must be ACTIVE
+ * observation re-cut's job. The trailers are NESTED (see the v3
+ * comment in virp.h): the HMAC covers header || payload and keeps the
+ * v2 session semantics for the caller; the Ed25519 detached signature
+ * (obskey secret; the O-Node is the attester) then covers
+ * header || payload || hmac, so the whole message but the signature is
+ * one atomic signed unit. That is what a public-key-only consumer
+ * verifies. Session must be ACTIVE
  * with a valid derived key; obskey must be loaded.
  */
 virp_error_t virp_build_observation_ed25519(
@@ -261,10 +263,11 @@ virp_error_t virp_build_observation_ed25519(
 /*
  * PUBLIC-KEY-ONLY verification of a v3 observation — no context, no
  * session, no secret parameter exists. Checks version=3, channel,
- * exact framing, and the Ed25519 trailer over header || payload;
- * returns VIRP_ERR_OBS_SIG_INVALID on a bad signature. Deliberately
- * does NOT check the HMAC trailer (session holder's check; a consumer
- * must not need a forge-capable key to verify) and does NOT apply
+ * exact framing, and the Ed25519 trailer over
+ * header || payload || hmac; returns VIRP_ERR_OBS_SIG_INVALID on a bad
+ * signature. Deliberately does NOT check the HMAC trailer (session
+ * holder's check; a consumer must not need a forge-capable key to
+ * verify) — though it does BIND it, so the trailer cannot be rewritten and does NOT apply
  * replay/staleness acceptance rules (accepting-endpoint duties; see
  * virp_verify_observation_v2). On success, optionally returns the
  * parsed header and a pointer into msg for the payload.

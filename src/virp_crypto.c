@@ -837,11 +837,17 @@ virp_error_t virp_build_observation_ed25519(
     if (cherr != VIRP_OK) return cherr;
 
     /*
-     * Both trailers sign the identical bytes: explicit wire encoding
-     * of the header, then the payload. Serialize straight into the
-     * output buffer — it is also the signing buffer.
+     * The two trailers are NESTED, not parallel. The HMAC covers
+     * header || payload (v2 semantics, unchanged); the Ed25519
+     * signature then covers header || payload || HMAC, so the whole
+     * message up to the signature is one atomic signed unit and no
+     * byte of it can be rewritten in transit. Serialize straight into
+     * the output buffer — it is also the signing buffer.
+     *
+     * Build order is therefore forced: HMAC first, sign second.
      */
-    size_t signed_len = VIRP_OBS_V2_HEADER_SIZE + payload_len;
+    size_t hmac_span = VIRP_OBS_V2_HEADER_SIZE + payload_len;
+    size_t sig_span  = hmac_span + VIRP_OBS_V2_SIG_SIZE;
     virp_error_t herr = virp_obs_header_v2_serialize(&hdr, out_buf,
                                                      out_buf_len);
     if (herr != VIRP_OK) return herr;
@@ -851,13 +857,14 @@ virp_error_t virp_build_observation_ed25519(
     unsigned int hmac_len = VIRP_OBS_V2_SIG_SIZE;
     if (!HMAC(EVP_sha256(),
               ctx->session.session_key, 32,
-              out_buf, signed_len,
-              out_buf + signed_len, &hmac_len))
+              out_buf, hmac_span,
+              out_buf + hmac_span, &hmac_len))
         return VIRP_ERR_CRYPTO;
 
-    /* Trailer 2: Ed25519 detached signature with the obskey secret. */
-    if (crypto_sign_detached(out_buf + signed_len + VIRP_OBS_V2_SIG_SIZE,
-                             NULL, out_buf, signed_len,
+    /* Trailer 2: Ed25519 detached signature with the obskey secret,
+     * over header || payload || HMAC. */
+    if (crypto_sign_detached(out_buf + sig_span,
+                             NULL, out_buf, sig_span,
                              obskey->secret_key) != 0)
         return VIRP_ERR_CRYPTO;
 
@@ -873,10 +880,13 @@ virp_error_t virp_build_observation_ed25519(
  * touches would let them mint one.
  *
  * What it checks: version/channel, exact framing, and the Ed25519
- * trailer over serialized_header || payload.
+ * trailer over serialized_header || payload || hmac — every byte of
+ * the message except the signature itself.
  * What it deliberately does NOT check: the HMAC trailer (that is the
  * session holder's check — a consumer has no session key, and MUST NOT
- * need one), and replay/staleness/session acceptance rules, which are
+ * need one). It does, however, BIND the HMAC trailer: a relay holding
+ * neither key cannot rewrite those 32 bytes and keep the message
+ * verifying, and replay/staleness/session acceptance rules, which are
  * an accepting endpoint's job (virp_verify_observation_v2 semantics;
  * unified dispatch is the observation re-cut's phase).
  */
@@ -948,10 +958,15 @@ virp_error_t virp_verify_observation_ed25519(
                                  VIRP_OBS_ED25519_SIG_SIZE);
     if (err != VIRP_OK) return err;
 
-    size_t signed_len = (size_t)VIRP_OBS_V2_HEADER_SIZE + hdr.payload_len;
-    const uint8_t *sig = msg + signed_len + VIRP_OBS_V2_SIG_SIZE;
+    /* The signature covers header || payload || HMAC — everything in
+     * the message except the signature itself. The HMAC trailer is
+     * inside the signed span, so a relay cannot rewrite it without
+     * invalidating the signature. */
+    size_t sig_span = (size_t)VIRP_OBS_V2_HEADER_SIZE + hdr.payload_len +
+                      VIRP_OBS_V2_SIG_SIZE;
+    const uint8_t *sig = msg + sig_span;
 
-    if (crypto_sign_verify_detached(sig, msg, signed_len,
+    if (crypto_sign_verify_detached(sig, msg, sig_span,
                                     public_key) != 0)
         return VIRP_ERR_OBS_SIG_INVALID;
 
