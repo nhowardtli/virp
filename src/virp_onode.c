@@ -2139,6 +2139,100 @@ static bool peer_uid_allowed(onode_state_t *state, int client_fd,
     return false;
 }
 
+/*
+ * GATE 3 — observation signature binding, fail-closed, all three wire
+ * formats.
+ *
+ * Before this gate, artifact_type="observation" accepted ANY bytes that
+ * hashed to their declared commitment. GATE 2 binds hash-to-body; it
+ * says nothing about who produced the body. A socket client could hand
+ * the daemon a fabricated device output, and the entry it got back
+ * carried a K_chain HMAC indistinguishable from a daemon-minted one.
+ * That is the "CHAIN_APPEND is not a signing oracle" property finished:
+ * GATE 1 reserved the type namespace, GATE 2 bound the bytes to the
+ * commitment, and GATE 3 binds the bytes to a signing key.
+ *
+ * Dispatch is on byte 0 of the DECODED body and is explicit, never
+ * heuristic. An unknown version is refused rather than guessed at.
+ *
+ *   v1  — HMAC under the O-Key. The daemon always holds it, and every
+ *         observation in the production chain today is v1.
+ *   v2  — HMAC under a derived SESSION key. The daemon holds exactly one
+ *         session at a time, so the message's own session_id must match
+ *         the active session; anything else cannot be checked and is
+ *         refused. Signature-only: replay/freshness/command binding are
+ *         an accepting endpoint's rules, and re-applying replay
+ *         rejection here would refuse the very message being registered.
+ *   v3  — Ed25519 under the O-Node's observation key. Verification needs
+ *         only the PUBLIC half, but the daemon must have the keypair
+ *         loaded to know which key to trust; with none loaded a v3 body
+ *         is refused, not recorded unverified.
+ *
+ * WHAT THIS GATE DOES NOT CLOSE: a commitment-only append (no body)
+ * cannot be signature-checked, because there are no bytes to check.
+ * Those stay legal — they are 3.8% of the live chain, the deliberate
+ * path for observations past the 8192-byte artifact field — and they
+ * are honestly graded: every reader reports an entry with no stored
+ * body as UNVERIFIABLE, never as a passing signature. A caller can
+ * still register an arbitrary hash; what it cannot do is obtain an
+ * entry that any verifier will report as authentic.
+ */
+static virp_error_t chain_append_verify_observation(
+    onode_state_t *state, const char *artifact_content, const char **why)
+{
+    static uint8_t raw[VIRP_MAX_MESSAGE_SIZE];
+    size_t raw_len = 0;
+
+    virp_error_t err = virp_chain_artifact_bytes(artifact_content, raw,
+                                                 sizeof(raw), &raw_len);
+    if (err != VIRP_OK) { *why = "body does not decode"; return err; }
+    if (raw_len < 1) { *why = "empty body"; return VIRP_ERR_INVALID_LENGTH; }
+
+    switch (raw[0]) {
+    case VIRP_VERSION: {          /* v1 */
+        virp_header_t hdr;
+        err = virp_validate_message(raw, raw_len, &state->okey, &hdr);
+        if (err != VIRP_OK) { *why = "v1 O-Key signature invalid"; return err; }
+        if (hdr.type != VIRP_MSG_OBSERVATION) {
+            *why = "v1 message is not an OBSERVATION";
+            return VIRP_ERR_INVALID_TYPE;
+        }
+        return VIRP_OK;
+    }
+    case VIRP_VERSION_2: {
+        virp_obs_header_v2_t vh;
+        if (!state->ctx || virp_session_state(state->ctx) != VIRP_SESSION_ACTIVE
+            || !state->ctx->session.session_key_valid) {
+            *why = "v2 body but no active session key to verify it under";
+            return VIRP_ERR_SESSION_INVALID;
+        }
+        /* The message must belong to the session we actually hold. */
+        if (raw_len >= VIRP_OBS_V2_HEADER_SIZE &&
+            !virp_consttime_eq(raw + 28, state->ctx->session.session_id, 16)) {
+            *why = "v2 body belongs to a different session";
+            return VIRP_ERR_SESSION_INVALID;
+        }
+        err = virp_verify_observation_v2_signature(
+                  state->ctx->session.session_key, raw, raw_len, &vh);
+        if (err != VIRP_OK) { *why = "v2 session-HMAC invalid"; return err; }
+        return VIRP_OK;
+    }
+    case VIRP_VERSION_3: {
+        if (!state->obskey_loaded) {
+            *why = "v3 body but no observation-signing key is loaded";
+            return VIRP_ERR_KEY_NOT_LOADED;
+        }
+        err = virp_verify_observation_ed25519(state->obskey.public_key,
+                                              raw, raw_len, NULL, NULL, NULL);
+        if (err != VIRP_OK) { *why = "v3 Ed25519 signature invalid"; return err; }
+        return VIRP_OK;
+    }
+    default:
+        *why = "unknown observation wire version";
+        return VIRP_ERR_VERSION_MISMATCH;
+    }
+}
+
 static void handle_client(onode_state_t *state, int client_fd)
 {
     char recv_buf[ONODE_MAX_REQUEST_SIZE];
@@ -2410,6 +2504,25 @@ static void handle_client(onode_state_t *state, int client_fd)
                             req.artifact_type);
                     send_framed_error(client_fd, VIRP_ERR_CHAIN_BROKEN);
                     break;
+                }
+
+                /* GATE 3 — an "observation" must actually be a signed
+                 * observation. Runs only once GATE 2 has proved the body
+                 * is the one the commitment names, so what gets verified
+                 * is exactly what gets recorded. */
+                if (strcmp(req.artifact_type, "observation") == 0) {
+                    const char *why = "unspecified";
+                    virp_error_t verr = chain_append_verify_observation(
+                                            state, req.artifact_content, &why);
+                    if (verr != VIRP_OK) {
+                        fprintf(stderr, "[O-Node] chain_append REJECTED: "
+                                "observation body failed signature "
+                                "verification — %s (session=%s id=%s err=%s)\n",
+                                why, req.session_id, req.artifact_id,
+                                virp_error_str(verr));
+                        send_framed_error(client_fd, verr);
+                        break;
+                    }
                 }
             }
         } else if (virp_chain_type_is_indirect(req.artifact_type)) {

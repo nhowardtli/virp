@@ -447,6 +447,39 @@ virp_error_t virp_chain_artifact_digest(const char *artifact_content,
     return VIRP_OK;
 }
 
+/*
+ * Produce the EXACT bytes virp_chain_artifact_digest() hashes.
+ *
+ * This must stay the same decoder the digest uses. A verifier that
+ * decoded with its own copy could, on some malformed input, recover
+ * different bytes than the ones the declared hash was checked against —
+ * and then the entry's commitment would bind bytes nobody verified.
+ * One decoder, two callers.
+ */
+virp_error_t virp_chain_artifact_bytes(const char *artifact_content,
+                                       uint8_t *out, size_t out_max,
+                                       size_t *out_len)
+{
+    if (!artifact_content || !out || !out_len) return VIRP_ERR_NULL_PTR;
+
+    static const char PREFIX[] = "base64:";
+    const size_t plen = sizeof(PREFIX) - 1;
+
+    if (strncmp(artifact_content, PREFIX, plen) == 0) {
+        const char *b64 = artifact_content + plen;
+        int n = artifact_b64_decode(b64, strlen(b64), out, out_max);
+        if (n < 0) return VIRP_ERR_INVALID_LENGTH;
+        *out_len = (size_t)n;
+        return VIRP_OK;
+    }
+
+    size_t n = strlen(artifact_content);
+    if (n > out_max) return VIRP_ERR_BUFFER_TOO_SMALL;
+    memcpy(out, artifact_content, n);
+    *out_len = n;
+    return VIRP_OK;
+}
+
 /* =========================================================================
  * SQL Schema
  * ========================================================================= */

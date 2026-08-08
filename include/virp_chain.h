@@ -121,6 +121,17 @@ bool virp_chain_type_is_external_allowed(const char *artifact_type);
 virp_error_t virp_chain_artifact_digest(const char *artifact_content,
                                         char out_hex[65]);
 
+/*
+ * The EXACT bytes virp_chain_artifact_digest() hashes, for a caller that
+ * must also verify a signature over them (chain_append's observation
+ * gate). Deliberately the same decoder: verifying bytes recovered by a
+ * second, independent decoder would risk binding a hash to one byte
+ * string while checking a signature over another.
+ */
+virp_error_t virp_chain_artifact_bytes(const char *artifact_content,
+                                       uint8_t *out, size_t out_max,
+                                       size_t *out_len);
+
 /* =========================================================================
  * Chain State — owns the SQLite database and prepared statements
  * ========================================================================= */

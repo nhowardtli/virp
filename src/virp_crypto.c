@@ -977,6 +977,55 @@ virp_error_t virp_verify_observation_ed25519(
     return VIRP_OK;
 }
 
+/*
+ * SIGNATURE-ONLY verification of a v2 observation: structural sanity
+ * plus the session-HMAC, and nothing else.
+ *
+ * This is deliberately NOT virp_verify_observation_v2(). That function
+ * is an ACCEPTING ENDPOINT's check — it additionally enforces session
+ * binding, device binding, command binding, freshness and replay
+ * rejection, all of which need context the verifier does not have when
+ * it is merely being asked "did this daemon mint these bytes?".
+ * chain_append is exactly that situation: the observation was minted
+ * earlier, possibly seconds ago, and re-applying replay rejection would
+ * reject the very message being registered.
+ *
+ * Callers must supply the session key the message was signed under;
+ * establishing WHICH session that is remains the caller's job.
+ */
+virp_error_t virp_verify_observation_v2_signature(
+    const uint8_t session_key[VIRP_KEY_SIZE],
+    const uint8_t *msg, size_t msg_len,
+    virp_obs_header_v2_t *hdr_out)
+{
+    if (!session_key || !msg)
+        return VIRP_ERR_NULL_PTR;
+    if (msg_len < VIRP_OBS_V2_MIN_SIZE)
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+    if (msg_len > VIRP_MAX_MESSAGE_SIZE)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+
+    /* HMAC first, exactly as the accepting verifier does: nothing
+     * unauthenticated influences a later decision except the length. */
+    size_t signed_len = msg_len - VIRP_OBS_V2_SIG_SIZE;
+    uint8_t expected_sig[VIRP_OBS_V2_SIG_SIZE];
+    virp_hmac_sha256(session_key, msg, signed_len, expected_sig);
+    if (!virp_consttime_eq(msg + signed_len, expected_sig,
+                           VIRP_OBS_V2_SIG_SIZE))
+        return VIRP_ERR_HMAC_FAILED;
+
+    virp_obs_header_v2_t hdr;
+    virp_error_t err = virp_obs_header_v2_deserialize(&hdr, msg, msg_len);
+    if (err != VIRP_OK) return err;
+
+    err = virp_obs_header_sanity(&hdr, VIRP_VERSION_2, msg_len,
+                                 VIRP_OBS_V2_SIG_SIZE);
+    if (err != VIRP_OK) return err;
+
+    if (hdr_out) *hdr_out = hdr;
+    return VIRP_OK;
+}
+
 virp_error_t virp_verify_observation_v2(
     virp_context_t *ctx,
     uint64_t expected_device_id,

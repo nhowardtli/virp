@@ -292,6 +292,21 @@ virp_error_t virp_obs_header_sanity(const virp_obs_header_v2_t *hdr,
                                     size_t msg_len, size_t trailer_len);
 
 /*
+ * SIGNATURE-ONLY v2 verification: structural sanity + the session HMAC.
+ * Answers "was this minted by a holder of this session key?" and
+ * nothing more. It deliberately does NOT apply the accepting-endpoint
+ * rules (session/device/command binding, freshness, replay) that
+ * virp_verify_observation_v2 enforces — a registrar re-checking replay
+ * would reject the very observation it is being asked to record.
+ * Use virp_verify_observation_v2 when accepting; use this when
+ * authenticating already-minted bytes, e.g. at chain_append.
+ */
+virp_error_t virp_verify_observation_v2_signature(
+    const uint8_t session_key[VIRP_KEY_SIZE],
+    const uint8_t *msg, size_t msg_len,
+    virp_obs_header_v2_t *hdr_out);
+
+/*
  * Verify a v2 observation wire message. This is the single home for
  * every check an accepting verifier must make:
  *

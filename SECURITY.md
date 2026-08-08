@@ -257,6 +257,61 @@ destroy, and appears in no log or export path; only the public key is
 exportable (raw or SPKI DER, `key_id = SHA-256(pub)[:16]`, the same
 convention the approver registry uses).
 
+## Chain Registration — Observation Signature Gate (added 2026-08-08)
+
+`CHAIN_APPEND` is the socket path by which a client asks the daemon to
+record an entry. Every entry it writes gets a `K_chain` HMAC, so an
+entry a caller induced is, at the chain layer, indistinguishable from
+one the daemon minted itself. Three gates now stand in front of it, all
+fail-closed, all on the EXTERNAL path only:
+
+1. **Type namespace.** Daemon-reserved semantic types are refused
+   outright; unknown types are refused rather than recorded as if they
+   meant something.
+2. **Body binding.** When a body is submitted the daemon recomputes
+   SHA-256 over the exact received bytes and refuses a declared
+   `artifact_hash` that does not match, constant-time.
+3. **Signature binding (new).** When `artifact_type` is `observation`
+   and a body is present, the body must actually BE a signed
+   observation. Until this gate existed, gates 1 and 2 together still
+   permitted arbitrary bytes — a plausible-looking device output a
+   client invented — to be recorded as an `observation`, hash-bound to
+   a commitment the client also chose, and stamped with the chain HMAC.
+   Binding bytes to a commitment says nothing about who produced them.
+
+Gate 3 dispatches on byte 0 of the decoded body, explicitly; an unknown
+version is refused, never guessed at. It verifies the SAME bytes gate 2
+hashed, via the same decoder, so what is verified is what is recorded.
+
+| wire version | verified with | if the key is unavailable |
+|---|---|---|
+| v1 | O-Key HMAC (daemon always holds it) | n/a |
+| v2 | derived session-key HMAC; the body's `session_id` must match the daemon's ACTIVE session | refused |
+| v3 | Ed25519, public half of the observation-signing key | refused |
+
+The v2 check is signature-only. Replay rejection, freshness and
+device/command binding are an *accepting endpoint's* rules; a registrar
+re-applying replay rejection would refuse the very observation it is
+being asked to record. Establishing that these bytes came from a holder
+of the key is the whole question here.
+
+**What this gate does NOT close.** A commitment-only append — an entry
+with a hash and no body — cannot be signature-checked, because there
+are no bytes to check. Those remain legal: they are the deliberate path
+for observations larger than the 8192-byte artifact field (3.8% of the
+live chain today, overwhelmingly LibreNMS). A caller can therefore
+still register an arbitrary hash under `artifact_type: observation`.
+What it cannot get is an entry any verifier will report as authentic:
+an entry with no stored body is graded UNVERIFIABLE by
+`report/verify.py`, never as a passing signature. Closing the remaining
+gap needs either a body-retention change or an authenticated-submitter
+mechanism, and neither is in this change.
+
+Note also that gate 3 constrains only `observation`. The other
+external-allowed types (`evidence_item`, `no_drift`, `baseline_set`,
+`drift_alert`) carry JSON bodies by design and are unaffected; the
+INDIRECT types keep their documented exception.
+
 ## Observation-Body Integrity
 
 The HMAC-SHA256 signature on an observation is sound, and the v2 header

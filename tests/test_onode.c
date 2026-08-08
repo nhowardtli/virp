@@ -23,6 +23,8 @@
 #include "virp_crypto.h"
 #include "virp_message.h"
 #include "virp_onode.h"
+#include "virp_obskey.h"
+#include <sodium.h>
 #include "virp_driver.h"
 #include <signal.h>
 #include <stdio.h>
@@ -3462,14 +3464,63 @@ TEST(test_chain_append_rejects_invented_type)
     ASSERT_EQ(ca_count_entries("invented-1"), 0);
 }
 
-/* GUARD: the legitimate external append — a known client type whose body
- * hashes to its declared commitment — must still be accepted, or the fix
- * has simply broken chain registration. */
-TEST(test_chain_append_accepts_bound_observation)
+/* ---- GATE 3 helpers: mint a REAL signed observation ---------------- */
+
+static void ca_sha256_hex_bin(const uint8_t *b, size_t n, char out[65])
 {
-    const char *body = "{\"device\":\"R5\",\"output\":\"up/up\"}";
-    char h[65];
-    ca_sha256_hex(body, h);
+    unsigned char md[32];
+    unsigned int mdlen = 0;
+    EVP_Digest(b, n, md, &mdlen, EVP_sha256(), NULL);
+    for (int i = 0; i < 32; i++)
+        snprintf(out + i * 2, 3, "%02x", md[i]);
+}
+
+static void ca_b64_body(const uint8_t *in, size_t len, char *out, size_t cap)
+{
+    static const char T[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = (size_t)snprintf(out, cap, "base64:");
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < len) v |= in[i + 2];
+        if (o + 4 >= cap) break;
+        out[o++] = T[(v >> 18) & 0x3F];
+        out[o++] = T[(v >> 12) & 0x3F];
+        out[o++] = (i + 1 < len) ? T[(v >> 6) & 0x3F] : '=';
+        out[o++] = (i + 2 < len) ? T[v & 0x3F] : '=';
+    }
+    out[o] = '\0';
+}
+
+/* A genuine v1 observation, signed with the daemon's own O-Key — the
+ * exact shape autopilot registers today. */
+static size_t ca_mint_v1_obs(uint8_t *buf, size_t cap, uint64_t seq)
+{
+    size_t len = 0;
+    /* ca_state, not g_state: the chain-append battery runs its OWN
+     * daemon instance (node 0x42, CA_SOCKET) with its own generated
+     * O-Key. Signing with the other instance's key would make the
+     * legitimate case fail for a reason that has nothing to do with
+     * the gate under test. */
+    virp_error_t e = virp_build_observation_tiered(
+        buf, cap, &len, 0x00000042u, (uint32_t)seq,
+        VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL, VIRP_TIER_GREEN,
+        (const uint8_t *)"GigabitEthernet0/1 up/up", 24, &ca_state.okey);
+    return (e == VIRP_OK) ? len : 0;
+}
+
+/* GUARD: the legitimate external append — a genuinely signed v1
+ * observation, the only format in the production chain — must still be
+ * accepted, or the gate has simply broken chain registration. */
+TEST(test_chain_append_accepts_signed_v1_observation)
+{
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9001);
+    ASSERT_TRUE(olen > 0);
+
+    char h[65];  ca_sha256_hex_bin(obs, olen, h);
+    char body[2048]; ca_b64_body(obs, olen, body, sizeof(body));
 
     uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
     ssize_t n = ca_append("autopilot:legit", "observation",
@@ -3477,6 +3528,208 @@ TEST(test_chain_append_accepts_bound_observation)
 
     ASSERT_TRUE(n > 4);
     ASSERT_EQ(ca_count_entries("obs-legit-1"), 1);
+}
+
+/* ATTACK 4 (GATE 3): a body that hashes to its commitment but is not a
+ * signed observation at all. This is what the chain accepted before the
+ * signature gate existed — arbitrary JSON recorded as "observation" and
+ * stamped with a K_chain HMAC no reader could distinguish from a
+ * daemon-minted entry. */
+TEST(test_chain_append_rejects_unsigned_observation_body)
+{
+    const char *body = "{\"device\":\"R5\",\"output\":\"up/up\"}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("attack:unsigned", "observation",
+                          "obs-unsigned-1", h, body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-unsigned-1"), 0);
+}
+
+/* ATTACK 5 (GATE 3): a REAL observation with one payload byte flipped,
+ * and the declared hash recomputed over the tampered bytes so GATE 2 is
+ * satisfied. Only the signature check can catch this — it proves the
+ * rejection comes from GATE 3, not from hash binding. */
+TEST(test_chain_append_rejects_tampered_v1_observation)
+{
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9002);
+    ASSERT_TRUE(olen > 0);
+
+    obs[olen - 1] ^= 0x01;                 /* flip a signed payload byte */
+
+    char h[65];  ca_sha256_hex_bin(obs, olen, h);   /* honest hash */
+    char body[2048]; ca_b64_body(obs, olen, body, sizeof(body));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("attack:tamper", "observation",
+                          "obs-tampered-1", h, body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-tampered-1"), 0);
+}
+
+/* ATTACK 6 (GATE 3): dispatch must be explicit. An unknown version byte
+ * is refused, never guessed at or waved through. */
+TEST(test_chain_append_rejects_unknown_obs_version)
+{
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9003);
+    ASSERT_TRUE(olen > 0);
+
+    obs[0] = 0x09;                          /* not 1, 2 or 3 */
+
+    char h[65];  ca_sha256_hex_bin(obs, olen, h);
+    char body[2048]; ca_b64_body(obs, olen, body, sizeof(body));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("attack:version", "observation",
+                          "obs-badver-1", h, body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-badver-1"), 0);
+}
+
+/* ATTACK 7 (GATE 3): a v3-labelled body when the daemon holds no
+ * observation-signing key. Fail CLOSED — refuse it rather than record an
+ * Ed25519 observation nobody checked. */
+TEST(test_chain_append_rejects_v3_without_obskey)
+{
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9004);
+    ASSERT_TRUE(olen > 0);
+
+    /* Long enough to clear VIRP_OBS_V3_MIN_SIZE, labelled v3. */
+    if (olen < VIRP_OBS_V3_MIN_SIZE) olen = VIRP_OBS_V3_MIN_SIZE;
+    obs[0] = VIRP_VERSION_3;
+
+    char h[65];  ca_sha256_hex_bin(obs, olen, h);
+    char body[2048]; ca_b64_body(obs, olen, body, sizeof(body));
+
+    ASSERT_TRUE(!ca_state.obskey_loaded);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("attack:v3", "observation",
+                          "obs-v3-nokey-1", h, body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-v3-nokey-1"), 0);
+}
+
+/* Hand-roll a v3 observation signed by `kp`. Built byte-wise rather
+ * than via virp_build_observation_ed25519 because that requires an
+ * ACTIVE session for the HMAC trailer, and the public-key gate does not
+ * read the HMAC — it only has to be present and inside the signed
+ * span. */
+static size_t ca_mint_v3_obs(uint8_t *buf, size_t cap,
+                             const virp_obskey_t *kp, uint64_t seq)
+{
+    const char *PAY = "GigabitEthernet0/2 up/up";
+    size_t P = strlen(PAY);
+    size_t total = VIRP_OBS_V2_HEADER_SIZE + P + VIRP_OBS_V2_SIG_SIZE +
+                   VIRP_OBS_ED25519_SIG_SIZE;
+    if (cap < total) return 0;
+
+    virp_obs_header_v2_t h;
+    memset(&h, 0, sizeof(h));
+    h.version = VIRP_VERSION_3;
+    h.channel = VIRP_CHANNEL_OBS;
+    h.tier    = VIRP_TIER_GREEN;
+    h.node_id = 0x00000042u;
+    h.device_id = 0x1122334455667788ULL;
+    h.seq_num = seq;
+    h.timestamp_ns = 1754582400ULL * 1000000000ULL;
+    memset(h.session_id, 0x21, 16);
+    memset(h.command_hash, 0x37, 32);
+    h.payload_len = (uint32_t)P;
+    if (virp_obs_header_v2_serialize(&h, buf, cap) != VIRP_OK) return 0;
+
+    memcpy(buf + VIRP_OBS_V2_HEADER_SIZE, PAY, P);
+    size_t hmac_span = VIRP_OBS_V2_HEADER_SIZE + P;
+    memset(buf + hmac_span, 0x5A, VIRP_OBS_V2_SIG_SIZE);   /* not read */
+    size_t sig_span = hmac_span + VIRP_OBS_V2_SIG_SIZE;
+    if (crypto_sign_detached(buf + sig_span, NULL, buf, sig_span,
+                             kp->secret_key) != 0) return 0;
+    return total;
+}
+
+/* GATE 3, v3 POSITIVE: with the observation-signing key loaded, a
+ * genuinely Ed25519-signed observation registers. Without this the v3
+ * arm would only ever be proved to say no. */
+TEST(test_chain_append_accepts_signed_v3_observation)
+{
+    virp_obskey_t kp;
+    ASSERT_OK(virp_obskey_generate(&kp));
+    ca_state.obskey = kp;
+    ca_state.obskey_loaded = true;
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v3_obs(obs, sizeof(obs), &kp, 9101);
+    ASSERT_TRUE(olen > 0);
+
+    char h[65];  ca_sha256_hex_bin(obs, olen, h);
+    char body[2048]; ca_b64_body(obs, olen, body, sizeof(body));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:v3", "observation",
+                          "obs-v3-good-1", h, body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("obs-v3-good-1"), 1);
+
+    /* ...and the same body signed by a DIFFERENT key is refused. */
+    virp_obskey_t other;
+    ASSERT_OK(virp_obskey_generate(&other));
+    size_t olen2 = ca_mint_v3_obs(obs, sizeof(obs), &other, 9102);
+    ASSERT_TRUE(olen2 > 0);
+    char h2[65]; ca_sha256_hex_bin(obs, olen2, h2);
+    char body2[2048]; ca_b64_body(obs, olen2, body2, sizeof(body2));
+    ssize_t n2 = ca_append("autopilot:v3", "observation",
+                           "obs-v3-wrongkey-1", h2, body2, resp, sizeof(resp));
+    ASSERT_EQ((int)n2, 4);
+    ASSERT_EQ(ca_count_entries("obs-v3-wrongkey-1"), 0);
+
+    ca_state.obskey_loaded = false;      /* restore for later tests */
+}
+
+/* GATE 3, v2: the daemon holds one session at a time. With no ACTIVE
+ * session there is no key to check a v2 body under, so it is refused
+ * rather than recorded unverified. */
+TEST(test_chain_append_rejects_v2_without_active_session)
+{
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9201);
+    ASSERT_TRUE(olen > 0);
+    if (olen < VIRP_OBS_V2_MIN_SIZE) olen = VIRP_OBS_V2_MIN_SIZE;
+    obs[0] = VIRP_VERSION_2;
+
+    char h[65];  ca_sha256_hex_bin(obs, olen, h);
+    char body[2048]; ca_b64_body(obs, olen, body, sizeof(body));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("attack:v2", "observation",
+                          "obs-v2-nosession-1", h, body, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-v2-nosession-1"), 0);
+}
+
+/* GUARD: a non-observation external type is NOT put through the
+ * signature gate — evidence_item and friends are JSON bodies by design
+ * and must keep registering. */
+TEST(test_chain_append_still_accepts_json_evidence_item)
+{
+    const char *body = "{\"item\":\"pkg-list\",\"sha\":\"abc\"}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("evidence:2026", "evidence_item",
+                          "evi-legit-1", h, body, resp, sizeof(resp));
+
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("evi-legit-1"), 1);
 }
 
 /* GUARD: a commitment-only append (no body at all) stays legal — the
@@ -3648,7 +3901,14 @@ int main(void)
         RUN_TEST(test_chain_append_rejects_reserved_type_outcome);
         RUN_TEST(test_chain_append_rejects_reserved_type_approval);
         RUN_TEST(test_chain_append_rejects_invented_type);
-        RUN_TEST(test_chain_append_accepts_bound_observation);
+        RUN_TEST(test_chain_append_accepts_signed_v1_observation);
+        RUN_TEST(test_chain_append_rejects_unsigned_observation_body);
+        RUN_TEST(test_chain_append_rejects_tampered_v1_observation);
+        RUN_TEST(test_chain_append_rejects_unknown_obs_version);
+        RUN_TEST(test_chain_append_rejects_v3_without_obskey);
+        RUN_TEST(test_chain_append_accepts_signed_v3_observation);
+        RUN_TEST(test_chain_append_rejects_v2_without_active_session);
+        RUN_TEST(test_chain_append_still_accepts_json_evidence_item);
         RUN_TEST(test_chain_append_accepts_commitment_without_body);
         ca_stop();
         ca_cleanup_files();

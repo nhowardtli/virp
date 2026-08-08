@@ -25,6 +25,7 @@
 #include "virp_chain.h"
 #include "virp_context.h"
 #include "virp_approver_registry.h"
+#include "virp_obskey.h"
 #include <pthread.h>
 #include <semaphore.h>   /* sem_t for worker pool cap */
 #include <stdint.h>
@@ -168,6 +169,16 @@ typedef struct {
     /* Identity */
     uint32_t            node_id;
     virp_signing_key_t  okey;           /* THE key — never leaves this process */
+
+    /*
+     * Observation-signing keypair (wire version 3). OPTIONAL: absent on
+     * every deployment that has not generated one, which is all of them
+     * today. Its ONLY use in the daemon is verifying v3 observation
+     * bodies submitted to CHAIN_APPEND; when it is not loaded, v3
+     * bodies are REFUSED rather than recorded unverified.
+     */
+    virp_obskey_t       obskey;
+    bool                obskey_loaded;
 
     /*
      * Tier-enforcement gate (Phase B), per-driver scoped.
