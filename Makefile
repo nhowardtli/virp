@@ -660,6 +660,15 @@ test-config-backup:
 test-evidence:
 	python3 tests/test_evidence.py
 
+# Commitment-only observation grading. Pins the chain_append GATE 3
+# decision that a body-less observation registers but grades
+# UNVERIFIABLE — the reason accepting it is not a signature bypass.
+# Pure-Python against report/verify.py; no daemon, no chain, no deps.
+.PHONY: test-commitment-grading
+test-commitment-grading:
+	@echo "=== commitment-only observation grading ==="
+	python3 tests/test_commitment_only_grading.py
+
 # virp report — consumer-side chain PDF generator. Synthetic-chain tests run
 # anywhere; the live-chain tests self-skip when /var/lib/virp/chain.db is
 # absent, so this target is safe on a build host. Requires reportlab
@@ -1239,4 +1248,4 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-api

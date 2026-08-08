@@ -3715,6 +3715,193 @@ TEST(test_chain_append_rejects_v2_without_active_session)
     ASSERT_EQ(ca_count_entries("obs-v2-nosession-1"), 0);
 }
 
+/* ===================================================================
+ * Q1 — commitment-only observations. THE production question.
+ *
+ * virp_autopilot.py omits artifact_content entirely when the encoded
+ * body would reach the daemon's 8192-byte field, which is roughly half
+ * of LibreNMS every five-minute cycle. If GATE 3 demanded a body, all
+ * of those would fail closed at the first restart after deploy.
+ *
+ * DECIDED, not incidental: no body means the entry commits to the hash
+ * ALONE and GATE 3 does not run — there are no bytes to verify. See
+ * src/virp_onode.c:2484, where the whole GATE 2 + GATE 3 block is
+ * conditioned on `req.artifact_content[0] != '\0'`.
+ *
+ * Why that is not a signature bypass: the attacker's reward for
+ * registering a hash-only entry is an entry with no body, and every
+ * reader grades a body-less observation UNVERIFIABLE rather than
+ * verified (report/verify.py, "no signed message body is stored").
+ * It buys an unverifiable row, not a forged observation.
+ * =================================================================== */
+
+/* The autopilot oversized path exactly: no artifact_content key. */
+TEST(test_chain_append_commitment_only_observation_accepted)
+{
+    char h[65];
+    ca_sha256_hex("an oversized librenms body the chain will not hold", h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:librenms", "observation",
+                          "obs-oversized-1", h, NULL, resp, sizeof(resp));
+
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("obs-oversized-1"), 1);
+}
+
+/* The same decision for a PRESENT-but-empty artifact_content, which is
+ * the other way a client can express "no body". */
+TEST(test_chain_append_commitment_only_empty_body_accepted)
+{
+    char h[65];
+    ca_sha256_hex("another oversized body", h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("autopilot:librenms", "observation",
+                          "obs-oversized-2", h, "", resp, sizeof(resp));
+
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("obs-oversized-2"), 1);
+}
+
+/* ===================================================================
+ * Q3 — the INDIRECT types must still register. They commit to a signed
+ * observation the chain does not retain and submit verdict JSON as the
+ * body, so sha256(body) != declared hash BY DESIGN. The comparator is
+ * the cross-node tamper-detection layer and runs on a short cycle; a
+ * silent rejection here is a real loss of coverage.
+ * =================================================================== */
+
+TEST(test_chain_append_accepts_comparator_verdict)
+{
+    const char *body = "{\"verdict\":\"MATCH\",\"peer\":\"node-b\"}";
+    char h[65];
+    /* Deliberately NOT sha256(body): commits to the signed observation. */
+    ca_sha256_hex("the signed observation this verdict is about", h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("comparator:2026", "comparator_verdict",
+                          "cmp-1", h, body, resp, sizeof(resp));
+
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("cmp-1"), 1);
+}
+
+TEST(test_chain_append_accepts_chainwalk_summary)
+{
+    const char *body = "{\"walked\":412,\"breaks\":0}";
+    char h[65];
+    ca_sha256_hex("the signed observation this summary is about", h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("chainwalk:2026", "chainwalk_summary",
+                          "walk-1", h, body, resp, sizeof(resp));
+
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("walk-1"), 1);
+}
+
+/* ===================================================================
+ * Q4 — version confusion across the dispatch boundary. Dispatch is on
+ * byte 0 (src/virp_onode.c chain_append_verify_observation), so the
+ * question is whether a body genuinely signed under one format can be
+ * relabelled into another arm and survive it. Each arm re-checks the
+ * version byte inside its own verifier, and the version byte is inside
+ * every format's signed span, so a relabel invalidates the signature it
+ * is trying to reuse. Both directions, exhaustively over the arms.
+ * =================================================================== */
+TEST(test_chain_append_version_confusion_all_arms)
+{
+    virp_obskey_t kp;
+    ASSERT_OK(virp_obskey_generate(&kp));
+    ca_state.obskey = kp;
+    ca_state.obskey_loaded = true;
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    char h[65], body[2048], aid[64];
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    int caseno = 0;
+
+    /* A genuine v1 observation, relabelled into each other arm. */
+    const uint8_t relabel_from_v1[] = { VIRP_VERSION_2, VIRP_VERSION_3 };
+    for (size_t i = 0; i < sizeof(relabel_from_v1); i++) {
+        size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9300 + i);
+        ASSERT_TRUE(olen > 0);
+        if (olen < VIRP_OBS_V3_MIN_SIZE) olen = VIRP_OBS_V3_MIN_SIZE;
+        obs[0] = relabel_from_v1[i];
+        ca_sha256_hex_bin(obs, olen, h);
+        ca_b64_body(obs, olen, body, sizeof(body));
+        snprintf(aid, sizeof(aid), "obs-confuse-v1-%d", caseno++);
+        ssize_t n = ca_append("attack:confusion", "observation", aid, h,
+                              body, resp, sizeof(resp));
+        ASSERT_EQ((int)n, 4);
+        ASSERT_EQ(ca_count_entries(aid), 0);
+    }
+
+    /* A genuine v3 observation, relabelled into each other arm. */
+    const uint8_t relabel_from_v3[] = { VIRP_VERSION, VIRP_VERSION_2 };
+    for (size_t i = 0; i < sizeof(relabel_from_v3); i++) {
+        size_t olen = ca_mint_v3_obs(obs, sizeof(obs), &kp, 9400 + i);
+        ASSERT_TRUE(olen > 0);
+        obs[0] = relabel_from_v3[i];
+        ca_sha256_hex_bin(obs, olen, h);
+        ca_b64_body(obs, olen, body, sizeof(body));
+        snprintf(aid, sizeof(aid), "obs-confuse-v3-%d", caseno++);
+        ssize_t n = ca_append("attack:confusion", "observation", aid, h,
+                              body, resp, sizeof(resp));
+        ASSERT_EQ((int)n, 4);
+        ASSERT_EQ(ca_count_entries(aid), 0);
+    }
+
+    /* And a genuine v3 kept as v3 still registers, so the sweep above
+     * is rejecting relabelling and not simply everything. */
+    size_t olen = ca_mint_v3_obs(obs, sizeof(obs), &kp, 9500);
+    ASSERT_TRUE(olen > 0);
+    ca_sha256_hex_bin(obs, olen, h);
+    ca_b64_body(obs, olen, body, sizeof(body));
+    ssize_t ok = ca_append("autopilot:v3", "observation", "obs-confuse-ctl",
+                           h, body, resp, sizeof(resp));
+    ASSERT_TRUE(ok > 4);
+    ASSERT_EQ(ca_count_entries("obs-confuse-ctl"), 1);
+
+    ca_state.obskey_loaded = false;
+}
+
+/* Q2 — artifact_hash commits to the FULL message bytes, so every byte
+ * of a submitted observation must be bound by something. The signed
+ * span covers all of it except the trailing 64-byte signature; this
+ * pins that last region at the handler boundary. The declared hash is
+ * recomputed over the tampered bytes so GATE 2 is satisfied and only
+ * the signature check can reject. */
+TEST(test_chain_append_binds_the_signature_region_too)
+{
+    virp_obskey_t kp;
+    ASSERT_OK(virp_obskey_generate(&kp));
+    ca_state.obskey = kp;
+    ca_state.obskey_loaded = true;
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    char h[65], body[2048], aid[64];
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+
+    /* First, last and a middle byte of the Ed25519 signature region. */
+    const int offs[] = { 0, 31, 63 };
+    for (size_t i = 0; i < sizeof(offs)/sizeof(offs[0]); i++) {
+        size_t olen = ca_mint_v3_obs(obs, sizeof(obs), &kp, 9600 + i);
+        ASSERT_TRUE(olen > 0);
+        obs[olen - VIRP_OBS_ED25519_SIG_SIZE + offs[i]] ^= 0x01;
+        ca_sha256_hex_bin(obs, olen, h);          /* honest hash */
+        ca_b64_body(obs, olen, body, sizeof(body));
+        snprintf(aid, sizeof(aid), "obs-sigregion-%zu", i);
+        ssize_t n = ca_append("attack:sigregion", "observation", aid, h,
+                              body, resp, sizeof(resp));
+        ASSERT_EQ((int)n, 4);
+        ASSERT_EQ(ca_count_entries(aid), 0);
+    }
+
+    ca_state.obskey_loaded = false;
+}
+
 /* GUARD: a non-observation external type is NOT put through the
  * signature gate — evidence_item and friends are JSON bodies by design
  * and must keep registering. */
@@ -3908,6 +4095,12 @@ int main(void)
         RUN_TEST(test_chain_append_rejects_v3_without_obskey);
         RUN_TEST(test_chain_append_accepts_signed_v3_observation);
         RUN_TEST(test_chain_append_rejects_v2_without_active_session);
+        RUN_TEST(test_chain_append_commitment_only_observation_accepted);
+        RUN_TEST(test_chain_append_commitment_only_empty_body_accepted);
+        RUN_TEST(test_chain_append_accepts_comparator_verdict);
+        RUN_TEST(test_chain_append_accepts_chainwalk_summary);
+        RUN_TEST(test_chain_append_version_confusion_all_arms);
+        RUN_TEST(test_chain_append_binds_the_signature_region_too);
         RUN_TEST(test_chain_append_still_accepts_json_evidence_item);
         RUN_TEST(test_chain_append_accepts_commitment_without_body);
         ca_stop();

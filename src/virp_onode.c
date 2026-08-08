@@ -2177,6 +2177,32 @@ static bool peer_uid_allowed(onode_state_t *state, int client_fd,
  * still register an arbitrary hash; what it cannot do is obtain an
  * entry that any verifier will report as authentic.
  */
+/*
+ * WHAT artifact_hash COMMITS TO — decided, not incidental (F2 follow-up).
+ *
+ * The commitment is over the FULL submitted message bytes, not over the
+ * canonical signed span. Every client computes it that way
+ * (autopilot/virp_autopilot.py sha256(raw_obs), and the same in
+ * virp_evidence.py / virp_config_backup.py / virp-tool), GATE 2
+ * recomputes it that way, and this gate verifies THOSE bytes.
+ *
+ * That is only safe because the full message is not malleable, which
+ * is exactly what commit 61a92e9b bought. Before it, a v3 message's 32
+ * HMAC bytes sat outside the Ed25519 signed span, so one attested
+ * observation had unlimited valid byte strings and therefore unlimited
+ * distinct artifact_hashes. Now the signed span is
+ * header || payload || hmac, so the ONLY region of a v3 message outside
+ * the signature is the 64-byte signature itself — and that is pinned
+ * too: libsodium refuses a non-canonical S, and the byte-by-byte sweep
+ * in tests/test_obs_ed25519_forge.c walks the signature bytes as well
+ * as the signed span. v1 and v2 have deterministic HMAC trailers and
+ * were never malleable.
+ *
+ * Consequence to hold on to: hash-over-full-message is load-bearing on
+ * that non-malleability. Any future format that puts an unsigned or
+ * attacker-writable region inside the message must either sign it or
+ * move the commitment to the canonical span.
+ */
 static virp_error_t chain_append_verify_observation(
     onode_state_t *state, const char *artifact_content, const char **why)
 {

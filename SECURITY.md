@@ -30,6 +30,7 @@ carries this tag**; every fix listed below is merged and deployed);
 **[aspirational]** intended, not yet built.
 
 - HMAC-SHA256 signing bypass or forgery *[tested — `tests/test_virp.c`, `tests/test_obs_v2.c`, ProVerif `proofs/virp_obs_v2.pv`. Scope caveat: the signature attests the bytes the O-Node read; that those bytes answer the signed command is enforced separately by the read path — see §Observation-Body Integrity]*
+- Observation lost to an O-Key rotation between minting and chain registration *[open — availability, not forgery; identified 2026-08-08 while writing the chain_append signature gate, undeployed at time of writing. Registration is a SEPARATE socket round-trip from collection: the daemon mints and returns a signed observation, the client (autopilot, evidence, config-backup, virp-tool) then submits it to `CHAIN_APPEND`, where GATE 3 re-verifies it under the key the daemon holds AT REGISTRATION TIME. If the O-Key changes in between — a restart onto a new key, or a key file replaced under a running daemon — the observation was signed under the old key, fails verification under the new one, and is refused. The window is one client round-trip wide, so it is narrow and only opens on rotation, but everything minted before the rotation and registered after it is lost, not merely delayed: the client has no retry and the observation has no second chance at a chain entry. Before GATE 3 such an observation registered unverified, so this is a new failure mode traded for the forgery defence. Not reproduced under a live rotation — the daemon was never restarted while this was written, and rotation is not exercised by any test. Closing it needs either key-id-tagged verification (try the key the observation names, not merely the current one) or a retained previous-key grace window.]*
 - Observation-body integrity — signed body not corresponding to the command in the signed header *[tested — five mechanisms: three from the `hardening-2026-07-29` review, two more from the five-driver read-path audit; all closed on `hardening/review-fixes-2026-07-29`, merged to `main`, and running in production since the 2026-08-01 deploy. Covered by `tests/test_ssh_io.c` and `tests/test_driver_fortigate_scrub.c`. The 2026-07-29 pa-850 occurrence was never root-caused. See §Observation-Body Integrity]*
 - Trust tier escalation (e.g., RED command executing as GREEN) *[tested — five driver suites incl. table-driven reachability and adversarial separator injection; see `docs/VIRP-CLAIMS.md` C22–C25]*
 - Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection. Production chain verified per-session 2026-07-28: 162/169 sessions hash-linked; the 7 failures are writer-convention mismatches, not tamper evidence. Narrowed 2026-07-29: "hash-linked" as measured then establishes internal link consistency, not completeness. Fixed, merged to `main`, and deployed 2026-08-01 (running commit `b6e9602c`): range completeness + signed per-session head record close the truncated-tail/zero-row acceptance — see §Verifier Limitations. Still open: the operator-facing `chain_verify` bridge API (consumer-side repo) never checks the keyed `chain_hmac` and reports a false negative on any multi-session database]*
@@ -295,17 +296,32 @@ re-applying replay rejection would refuse the very observation it is
 being asked to record. Establishing that these bytes came from a holder
 of the key is the whole question here.
 
-**What this gate does NOT close.** A commitment-only append — an entry
-with a hash and no body — cannot be signature-checked, because there
-are no bytes to check. Those remain legal: they are the deliberate path
-for observations larger than the 8192-byte artifact field (3.8% of the
-live chain today, overwhelmingly LibreNMS). A caller can therefore
-still register an arbitrary hash under `artifact_type: observation`.
-What it cannot get is an entry any verifier will report as authentic:
-an entry with no stored body is graded UNVERIFIABLE by
-`report/verify.py`, never as a passing signature. Closing the remaining
-gap needs either a body-retention change or an authenticated-submitter
-mechanism, and neither is in this change.
+**Commitment-only appends — an explicit decision, not a gap left open.**
+An entry with a hash and no body cannot be signature-checked, because
+there are no bytes to check. Such appends REMAIN LEGAL and GATE 3 does
+not run for them: the whole GATE 2 + GATE 3 block is conditioned on a
+body being present (`src/virp_onode.c`, `req.artifact_content[0] !=
+'\0'`). This is deliberate. It is the path `virp_autopilot.py` takes for
+observations past the 8192-byte artifact field — roughly half of
+LibreNMS on a five-minute cycle, 1,935 of 51,120 observation entries in
+the live chain — and requiring a body would fail every one of them
+closed at the first restart after deploy.
+
+Why that is not a signature bypass: registering a hash-only entry buys
+an entry with no body, and every reader grades a body-less observation
+UNVERIFIABLE rather than verified. An attacker gets an unverifiable
+row, not a forged observation — the same grade a legitimate oversized
+LibreNMS entry gets. *[tested — `tests/test_onode.c`
+`test_chain_append_commitment_only_observation_accepted` and
+`..._empty_body_accepted` drive both no-body shapes through the real
+handler; `tests/test_commitment_only_grading.py` pins the grade at
+UNVERIFIABLE and asserts it is not PASS, for a legitimate and an
+invented commitment alike]*
+
+The residue is real and stated: a caller can still write an arbitrary
+hash under `artifact_type: observation`. Closing that needs a
+body-retention change or an authenticated-submitter mechanism, and
+neither is in this change.
 
 Note also that gate 3 constrains only `observation`. The other
 external-allowed types (`evidence_item`, `no_drift`, `baseline_set`,
