@@ -2218,6 +2218,44 @@ static virp_error_t chain_append_verify_observation(
     case VIRP_VERSION: {          /* v1 */
         virp_header_t hdr;
         err = virp_validate_message(raw, raw_len, &state->okey, &hdr);
+
+        /*
+         * ROTATION GRACE WINDOW. The current key is always tried first;
+         * only its failure reaches here. An observation minted before a
+         * rotation and registered after it is signed under the previous
+         * key, and without this it would be refused and lost — no client
+         * retries a registration.
+         *
+         * Bounded three ways: the key must have been explicitly loaded,
+         * the deadline must not have passed, and it is verify-only —
+         * this is the sole read of prev_okey in the daemon.
+         */
+        if (err != VIRP_OK && state->prev_okey_loaded) {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL +
+                              (uint64_t)now.tv_nsec;
+            if (now_ns < state->prev_okey_deadline_ns) {
+                virp_error_t perr = virp_validate_message(raw, raw_len,
+                                                          &state->prev_okey,
+                                                          &hdr);
+                if (perr == VIRP_OK) {
+                    state->prev_okey_accepts++;
+                    fprintf(stderr, "[O-Node] chain_append: observation "
+                            "verified under the PREVIOUS O-Key (rotation "
+                            "grace window, %u accepted so far; %llu s of "
+                            "window left). This is expected only while "
+                            "in-flight observations from before a rotation "
+                            "drain.\n",
+                            state->prev_okey_accepts,
+                            (unsigned long long)
+                              ((state->prev_okey_deadline_ns - now_ns)
+                               / 1000000000ULL));
+                    err = VIRP_OK;
+                }
+            }
+        }
+
         if (err != VIRP_OK) { *why = "v1 O-Key signature invalid"; return err; }
         if (hdr.type != VIRP_MSG_OBSERVATION) {
             *why = "v1 message is not an OBSERVATION";
@@ -3762,6 +3800,63 @@ virp_error_t onode_add_device(onode_state_t *state,
     fprintf(stderr, "[O-Node] Added device: %s (%s) node_id=0x%08x\n",
             device->hostname, device->host, device->node_id);
 
+    return VIRP_OK;
+}
+
+virp_error_t onode_set_previous_okey(onode_state_t *state,
+                                     const char *path,
+                                     uint32_t window_seconds)
+{
+    if (!state || !path)
+        return VIRP_ERR_NULL_PTR;
+
+    /* An unbounded window is not a grace period, it is a second live
+     * key that never expires. Refuse rather than quietly pick a value. */
+    if (window_seconds == 0) {
+        fprintf(stderr, "[O-Node] previous O-Key refused: a grace window "
+                        "of 0 seconds is meaningless; give a bounded "
+                        "window or do not load a previous key\n");
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+
+    /* Same custody gate as the live key: no symlinks, no group/world
+     * bits, right owner, exact size. A previous key is still a key. */
+    virp_error_t err = virp_key_load_file(&state->prev_okey,
+                                          VIRP_KEY_TYPE_OKEY, path);
+    if (err != VIRP_OK) {
+        fprintf(stderr, "[O-Node] Failed to load previous O-Key from %s: "
+                "%s\n", path, virp_error_str(err));
+        return err;
+    }
+
+    /* Refusing an identical key is not pedantry: it means the operator
+     * pointed both flags at the same file and believes they have a
+     * rotation window they do not have. */
+    if (virp_consttime_eq(state->prev_okey.fingerprint,
+                          state->okey.fingerprint, VIRP_HMAC_SIZE)) {
+        fprintf(stderr, "[O-Node] previous O-Key refused: it is the SAME "
+                        "key as the live one (identical fingerprint) — "
+                        "there is nothing to grant grace to\n");
+        memset(&state->prev_okey, 0, sizeof(state->prev_okey));
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    state->prev_okey_deadline_ns =
+        (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec +
+        (uint64_t)window_seconds * 1000000000ULL;
+    state->prev_okey_loaded = true;
+    state->prev_okey_accepts = 0;
+
+    fprintf(stderr, "[O-Node] Rotation grace window OPEN for %u s: "
+            "observations signed under the previous O-Key (fingerprint ",
+            window_seconds);
+    for (int i = 0; i < 4; i++)
+        fprintf(stderr, "%02x", state->prev_okey.fingerprint[i]);
+    fprintf(stderr, "...) will still register. VERIFY-ONLY — it can never "
+            "sign. If you rotated because that key was COMPROMISED, stop "
+            "the daemon and restart without this option.\n");
     return VIRP_OK;
 }
 

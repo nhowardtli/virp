@@ -30,7 +30,7 @@ carries this tag**; every fix listed below is merged and deployed);
 **[aspirational]** intended, not yet built.
 
 - HMAC-SHA256 signing bypass or forgery *[tested — `tests/test_virp.c`, `tests/test_obs_v2.c`, ProVerif `proofs/virp_obs_v2.pv`. Scope caveat: the signature attests the bytes the O-Node read; that those bytes answer the signed command is enforced separately by the read path — see §Observation-Body Integrity]*
-- Observation lost to an O-Key rotation between minting and chain registration *[open — availability, not forgery; identified 2026-08-08 while writing the chain_append signature gate, undeployed at time of writing. Registration is a SEPARATE socket round-trip from collection: the daemon mints and returns a signed observation, the client (autopilot, evidence, config-backup, virp-tool) then submits it to `CHAIN_APPEND`, where GATE 3 re-verifies it under the key the daemon holds AT REGISTRATION TIME. If the O-Key changes in between — a restart onto a new key, or a key file replaced under a running daemon — the observation was signed under the old key, fails verification under the new one, and is refused. The window is one client round-trip wide, so it is narrow and only opens on rotation, but everything minted before the rotation and registered after it is lost, not merely delayed: the client has no retry and the observation has no second chance at a chain entry. Before GATE 3 such an observation registered unverified, so this is a new failure mode traded for the forgery defence. Not reproduced under a live rotation — the daemon was never restarted while this was written, and rotation is not exercised by any test. Closing it needs either key-id-tagged verification (try the key the observation names, not merely the current one) or a retained previous-key grace window.]*
+- Observation lost to an O-Key rotation between minting and chain registration *[tested — `tests/test_onode.c` `test_rotation_grace_window_saves_in_flight_observation`, `..._expires`, `..._does_not_accept_a_third_key`, `test_previous_okey_loader_refuses_bad_configurations`. Identified 2026-08-08 while writing the chain_append signature gate; closed the same day by a verify-only previous-key grace window. Registration is a SEPARATE socket round-trip from collection, so an observation minted under the old key and submitted after a rotation was refused by GATE 3 and LOST — no client retries a registration. The daemon now optionally holds the PREVIOUS O-Key (`-K <path>`, window `-W <seconds>`, default 900): when the live key fails a v1 body and the window is still open, the previous key is tried as well. Bounded by construction — the key must be explicitly loaded, the window expires on a deadline, an identical or zero-window configuration is refused at startup, and it is read at exactly one site so it can never sign. Every grace-path acceptance is logged with a running count and the remaining window. THE WINDOW IS WRONG FOR COMPROMISE-DRIVEN ROTATION: if the old key leaked, this keeps honouring it for the whole window — rotate without `-K` and accept the loss of in-flight observations, which is the correct trade when the key is burned. Still not exercised against a real daemon restart; the tests rotate the live key underneath a running in-process daemon instead.]*
 - Observation-body integrity — signed body not corresponding to the command in the signed header *[tested — five mechanisms: three from the `hardening-2026-07-29` review, two more from the five-driver read-path audit; all closed on `hardening/review-fixes-2026-07-29`, merged to `main`, and running in production since the 2026-08-01 deploy. Covered by `tests/test_ssh_io.c` and `tests/test_driver_fortigate_scrub.c`. The 2026-07-29 pa-850 occurrence was never root-caused. See §Observation-Body Integrity]*
 - Trust tier escalation (e.g., RED command executing as GREEN) *[tested — five driver suites incl. table-driven reachability and adversarial separator injection; see `docs/VIRP-CLAIMS.md` C22–C25]*
 - Chain database tampering without detection *[tested (logic) — `tests/test_chain.c` tamper detection. Production chain verified per-session 2026-07-28: 162/169 sessions hash-linked; the 7 failures are writer-convention mismatches, not tamper evidence. Narrowed 2026-07-29: "hash-linked" as measured then establishes internal link consistency, not completeness. Fixed, merged to `main`, and deployed 2026-08-01 (running commit `b6e9602c`): range completeness + signed per-session head record close the truncated-tail/zero-row acceptance — see §Verifier Limitations. Still open: the operator-facing `chain_verify` bridge API (consumer-side repo) never checks the keyed `chain_hmac` and reports a false negative on any multi-session database]*
@@ -322,6 +322,37 @@ The residue is real and stated: a caller can still write an arbitrary
 hash under `artifact_type: observation`. Closing that needs a
 body-retention change or an authenticated-submitter mechanism, and
 neither is in this change.
+
+### Rotating the O-Key without losing in-flight observations
+
+Because gate 3 verifies at REGISTRATION time and collection is a
+separate round-trip, a naive rotation drops every observation minted
+before the swap and submitted after it. They are lost, not delayed — no
+client retries a registration.
+
+Routine rotation (key not compromised):
+
+1. Keep the outgoing key file. Start the daemon with the new key and the
+   old one as verify-only:
+   `virp-onode-prod -k /etc/virp/keys/onode.key -K /etc/virp/keys/onode.key.prev -W 900`
+2. Watch for `verified under the PREVIOUS O-Key` lines. They carry a
+   running count and the remaining window, and they should stop well
+   before the window does — the drain is one collection cycle wide.
+3. After the window closes, restart without `-K` and delete the old key.
+
+The daemon refuses to start if `-K` names an unloadable file, a file
+whose fingerprint matches the live key, or a zero-length window. Failing
+the start is deliberate: an operator who passed `-K` believes in-flight
+observations are protected, and a daemon that silently ignored the flag
+would lose exactly the entries they were trying to save.
+
+**Compromised key — do NOT use `-K`.** The window's entire function is
+to keep honouring the old key, so it keeps honouring the attacker too,
+for its full duration. Rotate without it and accept the loss of
+in-flight observations; that is the correct trade when the key is
+burned. The same applies to `-W`: raising it past a collection cycle
+buys nothing and widens the exposure if the reason for rotating was
+ever compromise.
 
 Note also that gate 3 constrains only `observation`. The other
 external-allowed types (`evidence_item`, `no_drift`, `baseline_set`,

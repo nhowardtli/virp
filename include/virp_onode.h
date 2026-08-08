@@ -181,6 +181,32 @@ typedef struct {
     bool                obskey_loaded;
 
     /*
+     * PREVIOUS O-Key — VERIFY-ONLY, TIME-BOUNDED. Optional.
+     *
+     * Registration is a separate round-trip from collection: the daemon
+     * mints a signed observation, the client submits it to CHAIN_APPEND
+     * moments later, and chain_append GATE 3 re-verifies it under the
+     * key the daemon holds THEN. Rotate the O-Key in between and every
+     * in-flight observation fails verification and loses its chain
+     * entry — it is not retried. This key closes that window: when the
+     * current key fails a v1 body, and only until the deadline, the
+     * previous key is tried as well.
+     *
+     * NEVER used to sign. Nothing writes it into an observation; it is
+     * read at exactly one site, the v1 arm of the GATE 3 verifier.
+     *
+     * NOT for compromise-driven rotation. If the reason for rotating
+     * was that the old key leaked, this window keeps accepting anything
+     * the holder of that key produces, for its whole duration. Rotate
+     * without it in that case (the cost is the in-flight observations,
+     * which is the correct trade when the key is burned).
+     */
+    virp_signing_key_t  prev_okey;
+    bool                prev_okey_loaded;
+    uint64_t            prev_okey_deadline_ns;   /* CLOCK_REALTIME */
+    uint32_t            prev_okey_accepts;       /* grace-path uses */
+
+    /*
      * Tier-enforcement gate (Phase B), per-driver scoped.
      *
      *   gate_default_mode — mode for any driver NOT named in the override
@@ -345,6 +371,25 @@ virp_error_t onode_init(onode_state_t *state,
                         uint32_t node_id,
                         const char *okey_path,      /* NULL = generate new */
                         const char *socket_path);   /* NULL = default */
+
+/*
+ * Load a PREVIOUS O-Key for the rotation grace window — VERIFY-ONLY.
+ *
+ * Call after onode_init and before onode_start. `path` is subject to the
+ * same custody gate as the live key (no symlinks, no group/world bits,
+ * right owner, right size). `window_seconds` bounds it: the key stops
+ * being tried that many seconds after this call, whatever else happens,
+ * and 0 is rejected — an unbounded grace window is a second live key.
+ *
+ * Read at exactly one site: the v1 arm of chain_append's GATE 3, and
+ * only after the CURRENT key has already failed. It cannot sign.
+ *
+ * DO NOT USE when rotating because the old key was compromised. The
+ * window's whole function is to keep honouring that key for a while.
+ */
+virp_error_t onode_set_previous_okey(onode_state_t *state,
+                                     const char *path,
+                                     uint32_t window_seconds);
 
 /*
  * Add a device to the O-Node's inventory.

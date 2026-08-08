@@ -3902,6 +3902,179 @@ TEST(test_chain_append_binds_the_signature_region_too)
     ca_state.obskey_loaded = false;
 }
 
+/* ===================================================================
+ * O-Key rotation grace window.
+ *
+ * The failure it closes: registration is a separate round-trip from
+ * collection, so an observation minted under the old key and submitted
+ * after a rotation is refused by GATE 3 and LOST — no client retries.
+ *
+ * These tests rotate ca_state's live key underneath the running daemon,
+ * which is the whole point: an observation signed under the key that
+ * was live a moment ago must still register while the window is open,
+ * and must stop registering once it is not.
+ * =================================================================== */
+
+/* Sign a v1 observation under an ARBITRARY key, not the daemon's. */
+static size_t ca_mint_v1_obs_with(uint8_t *buf, size_t cap,
+                                  virp_signing_key_t *k, uint64_t seq)
+{
+    size_t len = 0;
+    virp_error_t e = virp_build_observation_tiered(
+        buf, cap, &len, 0x00000042u, (uint32_t)seq,
+        VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL, VIRP_TIER_GREEN,
+        (const uint8_t *)"GigabitEthernet0/3 up/up", 24, k);
+    return (e == VIRP_OK) ? len : 0;
+}
+
+static ssize_t ca_register_obs(const uint8_t *obs, size_t olen,
+                               const char *aid, uint8_t *resp, size_t cap)
+{
+    char h[65], body[2048];
+    ca_sha256_hex_bin(obs, olen, h);
+    ca_b64_body(obs, olen, body, sizeof(body));
+    return ca_append("autopilot:rotation", "observation", aid, h, body,
+                     resp, cap);
+}
+
+TEST(test_rotation_grace_window_saves_in_flight_observation)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+
+    /* An observation minted under the key that is live RIGHT NOW. */
+    virp_signing_key_t old_key = ca_state.okey;
+    size_t olen = ca_mint_v1_obs_with(obs, sizeof(obs), &old_key, 9700);
+    ASSERT_TRUE(olen > 0);
+
+    /* Rotate: a brand-new live key, old one kept for verification. */
+    virp_signing_key_t new_key;
+    ASSERT_OK(virp_key_generate(&new_key, VIRP_KEY_TYPE_OKEY));
+    ca_state.okey = new_key;
+
+    /* Without the window, this in-flight observation is simply lost. */
+    ca_state.prev_okey_loaded = false;
+    ssize_t lost = ca_register_obs(obs, olen, "obs-rot-lost", resp,
+                                   sizeof(resp));
+    ASSERT_EQ((int)lost, 4);
+    ASSERT_EQ(ca_count_entries("obs-rot-lost"), 0);
+
+    /* With the window open, the same bytes register. */
+    ca_state.prev_okey = old_key;
+    ca_state.prev_okey_loaded = true;
+    ca_state.prev_okey_accepts = 0;
+    {
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        ca_state.prev_okey_deadline_ns =
+            (uint64_t)now.tv_sec * 1000000000ULL +
+            (uint64_t)now.tv_nsec + 300ULL * 1000000000ULL;
+    }
+    ssize_t saved = ca_register_obs(obs, olen, "obs-rot-saved", resp,
+                                    sizeof(resp));
+    ASSERT_TRUE(saved > 4);
+    ASSERT_EQ(ca_count_entries("obs-rot-saved"), 1);
+    ASSERT_EQ((int)ca_state.prev_okey_accepts, 1);
+
+    /* Restore. */
+    ca_state.okey = old_key;
+    ca_state.prev_okey_loaded = false;
+}
+
+/* The window must CLOSE. A grace period that never expires is a second
+ * live key. Deadline in the past => the same bytes are refused again. */
+TEST(test_rotation_grace_window_expires)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+
+    virp_signing_key_t old_key = ca_state.okey;
+    size_t olen = ca_mint_v1_obs_with(obs, sizeof(obs), &old_key, 9701);
+    ASSERT_TRUE(olen > 0);
+
+    virp_signing_key_t new_key;
+    ASSERT_OK(virp_key_generate(&new_key, VIRP_KEY_TYPE_OKEY));
+    ca_state.okey = new_key;
+
+    ca_state.prev_okey = old_key;
+    ca_state.prev_okey_loaded = true;
+    ca_state.prev_okey_accepts = 0;
+    {   /* deadline one second in the PAST */
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        ca_state.prev_okey_deadline_ns =
+            (uint64_t)now.tv_sec * 1000000000ULL +
+            (uint64_t)now.tv_nsec - 1000000000ULL;
+    }
+    ssize_t n = ca_register_obs(obs, olen, "obs-rot-expired", resp,
+                                sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-rot-expired"), 0);
+    ASSERT_EQ((int)ca_state.prev_okey_accepts, 0);
+
+    ca_state.okey = old_key;
+    ca_state.prev_okey_loaded = false;
+}
+
+/* The window widens acceptance to exactly ONE extra key, not to
+ * anything. A body signed under a third key is still refused while the
+ * window is wide open. */
+TEST(test_rotation_grace_window_does_not_accept_a_third_key)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+
+    virp_signing_key_t old_key = ca_state.okey;
+    virp_signing_key_t attacker;
+    ASSERT_OK(virp_key_generate(&attacker, VIRP_KEY_TYPE_OKEY));
+    size_t olen = ca_mint_v1_obs_with(obs, sizeof(obs), &attacker, 9702);
+    ASSERT_TRUE(olen > 0);
+
+    ca_state.prev_okey = old_key;      /* window open, wrong key though */
+    ca_state.prev_okey_loaded = true;
+    ca_state.prev_okey_accepts = 0;
+    {
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        ca_state.prev_okey_deadline_ns =
+            (uint64_t)now.tv_sec * 1000000000ULL +
+            (uint64_t)now.tv_nsec + 300ULL * 1000000000ULL;
+    }
+    ssize_t n = ca_register_obs(obs, olen, "obs-rot-thirdkey", resp,
+                                sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-rot-thirdkey"), 0);
+    ASSERT_EQ((int)ca_state.prev_okey_accepts, 0);
+
+    ca_state.prev_okey_loaded = false;
+}
+
+/* onode_set_previous_okey refuses the two ways an operator can think
+ * they have a window when they do not. */
+TEST(test_previous_okey_loader_refuses_bad_configurations)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/virp-prev-okey-test.bin");
+    unlink(path);
+
+    /* Write the CURRENT key out, so the file is valid but identical. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_EQ((int)write(fd, ca_state.okey.key.key, VIRP_KEY_SIZE),
+              VIRP_KEY_SIZE);
+    close(fd);
+
+    /* Zero window is refused outright. */
+    ASSERT_TRUE(onode_set_previous_okey(&ca_state, path, 0) != VIRP_OK);
+    ASSERT_TRUE(!ca_state.prev_okey_loaded);
+
+    /* Same key as the live one is refused. */
+    ASSERT_TRUE(onode_set_previous_okey(&ca_state, path, 300) != VIRP_OK);
+    ASSERT_TRUE(!ca_state.prev_okey_loaded);
+
+    unlink(path);
+}
+
 /* GUARD: a non-observation external type is NOT put through the
  * signature gate — evidence_item and friends are JSON bodies by design
  * and must keep registering. */
@@ -4101,6 +4274,10 @@ int main(void)
         RUN_TEST(test_chain_append_accepts_chainwalk_summary);
         RUN_TEST(test_chain_append_version_confusion_all_arms);
         RUN_TEST(test_chain_append_binds_the_signature_region_too);
+        RUN_TEST(test_rotation_grace_window_saves_in_flight_observation);
+        RUN_TEST(test_rotation_grace_window_expires);
+        RUN_TEST(test_rotation_grace_window_does_not_accept_a_third_key);
+        RUN_TEST(test_previous_okey_loader_refuses_bad_configurations);
         RUN_TEST(test_chain_append_still_accepts_json_evidence_item);
         RUN_TEST(test_chain_append_accepts_commitment_without_body);
         ca_stop();

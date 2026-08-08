@@ -6,6 +6,12 @@
  * Usage:
  *   virp-onode-prod [options]
  *     -k <okey_path>      Path to O-Key file (generates if absent)
+ *     -K <prev_okey_path> Previous O-Key, VERIFY-ONLY, for the rotation
+ *                         grace window. Lets observations minted before a
+ *                         rotation still register instead of being lost.
+ *                         NOT for compromise-driven rotation — the window
+ *                         keeps honouring that key for its duration.
+ *     -W <seconds>        Grace window length (default 900). Only with -K.
  *     -s <socket_path>    Unix socket path (default: /run/virp/onode.sock)
  *     -d <devices_json>   Path to devices.json config
  *     -n <node_id_hex>    Node ID in hex (default: 0x00000001)
@@ -613,6 +619,13 @@ static void usage(const char *prog)
     printf("Usage: %s [options]\n\n", prog);
     printf("Options:\n");
     printf("  -k <path>   O-Key file path (generates new key if file doesn't exist)\n");
+    printf("  -K <path>   PREVIOUS O-Key, VERIFY-ONLY, for the rotation grace\n");
+    printf("              window. Observations minted before a rotation and\n");
+    printf("              registered after it would otherwise be refused by\n");
+    printf("              chain_append and LOST. Never used to sign.\n");
+    printf("              DO NOT USE if you rotated because the old key was\n");
+    printf("              COMPROMISED — the window keeps honouring it.\n");
+    printf("  -W <secs>   Grace window length (default 900). Only with -K.\n");
     printf("  -s <path>   Unix socket path (default: %s)\n", ONODE_SOCKET_PATH);
     printf("  -d <path>   Device config JSON file (required)\n");
     printf("  -n <hex>    Node ID in hex (default: 0x00000001)\n");
@@ -629,6 +642,8 @@ static void usage(const char *prog)
 int main(int argc, char **argv)
 {
     const char *okey_path = NULL;
+    const char *prev_okey_path = NULL;
+    uint32_t    prev_okey_window = 900;   /* 15 min; > the 5-min cycle */
     const char *socket_path = NULL;
     const char *devices_path = NULL;
     const char *chain_db_path = NULL;
@@ -638,10 +653,16 @@ int main(int argc, char **argv)
     uint32_t node_id = 0x00000001;
 
     int opt;
-    while ((opt = getopt(argc, argv, "k:s:d:n:c:C:a:A:h")) != -1) {
+    while ((opt = getopt(argc, argv, "k:K:W:s:d:n:c:C:a:A:h")) != -1) {
         switch (opt) {
         case 'k':
             okey_path = optarg;
+            break;
+        case 'K':
+            prev_okey_path = optarg;
+            break;
+        case 'W':
+            prev_okey_window = (uint32_t)strtoul(optarg, NULL, 10);
             break;
         case 's':
             socket_path = optarg;
@@ -730,6 +751,24 @@ int main(int argc, char **argv)
         fprintf(stderr, "[O-Node] Initialization failed: %s\n",
                 virp_error_str(err));
         return 1;
+    }
+
+    /*
+     * Rotation grace window, if the operator asked for one. Fail the
+     * START rather than run on silently: someone who passed -K believes
+     * in-flight observations are protected, and a daemon that quietly
+     * dropped the option would lose exactly the entries they were
+     * trying to save.
+     */
+    if (prev_okey_path) {
+        virp_error_t perr = onode_set_previous_okey(&g_state, prev_okey_path,
+                                                    prev_okey_window);
+        if (perr != VIRP_OK) {
+            fprintf(stderr, "[O-Node] refusing to start: -K %s could not be "
+                    "loaded (%s)\n", prev_okey_path, virp_error_str(perr));
+            onode_destroy(&g_state);
+            return 1;
+        }
     }
 
     /*
