@@ -558,6 +558,14 @@ int load_devices(onode_state_t *state, const char *path)
                         sizeof(device.tls_fingerprint));
         json_get_string(dev_obj, "datastore_allow", device.datastore_allow,
                         sizeof(device.datastore_allow));
+        /*
+         * write_ops_allow (Zammad): the typed write operations THIS
+         * device may execute. Absent → empty → no writes, which is the
+         * safe default and the read-only entry's configuration. There is
+         * deliberately no "allow all" spelling.
+         */
+        json_get_string(dev_obj, "write_ops_allow", device.write_ops_allow,
+                        sizeof(device.write_ops_allow));
         json_get_string(dev_obj, "tls_servername", device.tls_servername,
                         sizeof(device.tls_servername));
 

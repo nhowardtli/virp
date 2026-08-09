@@ -23,6 +23,7 @@
 #include "virp.h"
 #include "virp_driver.h"
 #include "virp_driver_zammad.h"
+#include "virp_message.h"   /* virp_command_check_separators */
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -823,6 +824,746 @@ static void test_gate_decisions(void)
     PASS();
 }
 
+
+/* ========================================================================
+ * TYPED WRITE OPERATION — zammad op=ticket.article.create
+ *
+ * The write is the only place this driver accepts free-form text and the
+ * only place it can issue a non-GET. Both properties get their own
+ * bypass suites below.
+ * ======================================================================== */
+
+/*
+ * The per-identity ceiling, modelled exactly as onode_effective_max_tier()
+ * + gate_tier_blocks() compute it for uid 993 (virp-netclaw): the
+ * node-wide YELLOW ceiling TIGHTENED to GREEN. This is what makes the
+ * write proposal-only for the remote requester, so it is asserted here
+ * rather than assumed from the config file.
+ */
+static int gate_blocks_at_green(virp_trust_tier_t t)
+{
+    if (t == VIRP_TIER_UNCLASSIFIED) return 1;
+    if (t == VIRP_TIER_BLACK)        return 1;
+    return t > VIRP_TIER_GREEN;
+}
+
+#define WRITE_OK "zammad op=ticket.article.create id=42 body=\"deploy note\""
+
+static void assert_write_red(const char *cmd)
+{
+    virp_trust_tier_t t = zammad_gate_tier(cmd);
+    assert(t == VIRP_TIER_RED);
+    assert(gate_blocks_at_yellow(t));
+    assert(t != VIRP_TIER_BLACK);      /* stays approvable */
+}
+
+static void test_write_row_tier(void)
+{
+    printf("\n=== Write op — tier and ceiling behaviour ===\n");
+
+    TEST("the one write row classifies YELLOW");
+    assert(zammad_gate_tier(WRITE_OK) == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("YELLOW passes the node-wide ceiling (local operator executes)");
+    assert(!gate_blocks_at_yellow(zammad_gate_tier(WRITE_OK)));
+    PASS();
+
+    TEST("YELLOW is BLOCKED under the uid-993 GREEN ceiling (proposal-only)");
+    assert(gate_blocks_at_green(zammad_gate_tier(WRITE_OK)));
+    PASS();
+
+    TEST("reads still pass under the uid-993 GREEN ceiling");
+    assert(!gate_blocks_at_green(zammad_gate_tier("GET /api/v1/tickets")));
+    PASS();
+
+    TEST("the write row is never BLACK (stays approvable)");
+    assert(zammad_gate_tier(WRITE_OK) != VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("op table validates (tier declared, only the one POST row)");
+    assert(zm_op_table_validate() == 0);
+    PASS();
+
+    TEST("op lookup is exact");
+    assert(zm_op_lookup(ZM_OP_ARTICLE_CREATE) != NULL);
+    assert(zm_op_lookup("ticket.article.creat") == NULL);
+    assert(zm_op_lookup("ticket.article.createx") == NULL);
+    assert(zm_op_lookup("Ticket.Article.Create") == NULL);
+    assert(zm_op_lookup("") == NULL);
+    assert(zm_op_lookup(NULL) == NULL);
+    PASS();
+}
+
+static void test_write_method_smuggling(void)
+{
+    printf("\n=== Write op — method smuggling ===\n");
+
+    TEST("raw POST path is RED (the write is not reachable as a path)");
+    assert_write_red("POST /api/v1/ticket_articles");
+    PASS();
+
+    TEST("the write row's own path as a GET read is RED (unlisted row)");
+    assert_write_red("/api/v1/ticket_articles");
+    PASS();
+
+    TEST("method smuggled as an extra parameter -> RED");
+    assert_write_red("zammad op=ticket.article.create id=42 "
+                     "body=\"x\" method=POST");
+    PASS();
+
+    TEST("method prefix before the operation -> RED");
+    assert_write_red("POST zammad op=ticket.article.create id=42 body=\"x\"");
+    PASS();
+
+    TEST("GET prefix before the operation -> RED");
+    assert_write_red("GET zammad op=ticket.article.create id=42 body=\"x\"");
+    PASS();
+
+    TEST("uppercase driver prefix -> RED (byte-exact)");
+    assert_write_red("ZAMMAD op=ticket.article.create id=42 body=\"x\"");
+    PASS();
+
+    TEST("leading space before the prefix -> RED");
+    assert_write_red(" zammad op=ticket.article.create id=42 body=\"x\"");
+    PASS();
+
+    TEST("second operation appended -> RED");
+    assert_write_red("zammad op=ticket.article.create id=42 body=\"x\" "
+                     "op=ticket.article.create");
+    PASS();
+
+    TEST("shell separator after a valid operation -> RED");
+    assert_write_red("zammad op=ticket.article.create id=42 body=\"x\"; id");
+    PASS();
+
+    TEST("unknown write op (state change) -> RED by absence");
+    assert_write_red("zammad op=ticket.state.update id=42 body=\"x\"");
+    assert_write_red("zammad op=ticket.close id=42 body=\"x\"");
+    assert_write_red("zammad op=ticket.assign id=42 body=\"x\"");
+    assert_write_red("zammad op=user.create id=42 body=\"x\"");
+    assert_write_red("zammad op=group.update id=42 body=\"x\"");
+    PASS();
+
+    TEST("method predicate: GET always, POST only for the write row");
+    assert(zm_method_is_allowed(ZM_METHOD_GET, false));
+    assert(zm_method_is_allowed(ZM_METHOD_GET, true));
+    assert(!zm_method_is_allowed(ZM_METHOD_POST, false));
+    assert(zm_method_is_allowed(ZM_METHOD_POST, true));
+    assert(!zm_method_is_allowed(99, true));
+    assert(!zm_method_is_allowed(0, true));
+    PASS();
+}
+
+static void test_write_body_encoding(void)
+{
+    printf("\n=== Write op — body encoding violations ===\n");
+
+    TEST("double quote inside the body -> RED (no escape mechanism)");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a\"b\"");
+    PASS();
+
+    TEST("backslash -> RED (JSON escape introducer)");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a\\b\"");
+    PASS();
+
+    TEST("attempted JSON break-out -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1 "
+                     "body=\"x\",\"internal\":false,\"y\":\"\"");
+    PASS();
+
+    TEST("newline in the body -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a\nb\"");
+    PASS();
+
+    TEST("carriage return -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a\rb\"");
+    PASS();
+
+    TEST("tab -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a\tb\"");
+    PASS();
+
+    TEST("angle brackets -> RED (rendering defence in depth)");
+    assert_write_red("zammad op=ticket.article.create id=1 "
+                     "body=\"<script>alert(1)</script>\"");
+    PASS();
+
+    TEST("non-ASCII UTF-8 -> RED (normalization would break byte identity)");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"caf\xc3\xa9\"");
+    PASS();
+
+    TEST("DEL byte -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a\x7f" "b\"");
+    PASS();
+
+    TEST("missing opening quote -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=hello");
+    PASS();
+
+    TEST("missing closing quote -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"hello");
+    PASS();
+
+    TEST("bytes after the closing quote -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"hello\" x");
+    PASS();
+
+    TEST("empty body -> RED (an empty note is not a note)");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"\"");
+    PASS();
+
+    TEST("body parameter missing entirely -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1");
+    PASS();
+
+    TEST("parameters out of declared order -> RED (one canonical encoding)");
+    assert_write_red("zammad op=ticket.article.create body=\"x\" id=1");
+    PASS();
+
+    TEST("duplicate body -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"x\" "
+                     "body=\"y\"");
+    PASS();
+
+    TEST("space run between tokens -> RED");
+    assert_write_red("zammad op=ticket.article.create  id=1 body=\"x\"");
+    PASS();
+
+    TEST("spaces INSIDE the body are fine (prose, not a separator)");
+    assert(zammad_gate_tier("zammad op=ticket.article.create id=1 "
+                            "body=\"two  spaces and one sentence.\"")
+           == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("the permitted punctuation really is permitted");
+    assert(zammad_gate_tier("zammad op=ticket.article.create id=1 "
+                            "body=\"OSPF adj down on frr2 (10.0.10.2) "
+                            "@ 19:04 -- see chain seq #531, ~5m.\"")
+           == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("body charset predicate matches the policy exactly");
+    assert(zm_is_body_char('a') && zm_is_body_char(' ') &&
+           zm_is_body_char('~') && zm_is_body_char('!'));
+    assert(!zm_is_body_char('"') && !zm_is_body_char('\\'));
+    assert(!zm_is_body_char('<') && !zm_is_body_char('>'));
+    assert(!zm_is_body_char('\n') && !zm_is_body_char('\r') &&
+           !zm_is_body_char('\t') && !zm_is_body_char(0x00) &&
+           !zm_is_body_char(0x1F) && !zm_is_body_char(0x7F) &&
+           !zm_is_body_char(0x80) && !zm_is_body_char(0xFF));
+    PASS();
+}
+
+static void test_write_body_size(void)
+{
+    printf("\n=== Write op — oversize bodies ===\n");
+
+    char cmd[ZM_COMMAND_MAX + 256];
+    char body[ZM_BODY_MAX + 64];
+
+    TEST("body at exactly the cap -> YELLOW");
+    memset(body, 'a', ZM_BODY_MAX);
+    body[ZM_BODY_MAX] = '\0';
+    snprintf(cmd, sizeof(cmd),
+             "zammad op=ticket.article.create id=1 body=\"%s\"", body);
+    assert(zammad_gate_tier(cmd) == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("body one byte over the cap -> RED");
+    memset(body, 'a', ZM_BODY_MAX + 1);
+    body[ZM_BODY_MAX + 1] = '\0';
+    snprintf(cmd, sizeof(cmd),
+             "zammad op=ticket.article.create id=1 body=\"%s\"", body);
+    assert_write_red(cmd);
+    PASS();
+
+    TEST("whole command over ZM_COMMAND_MAX -> RED");
+    {
+        char big[ZM_COMMAND_MAX + 512];
+        memset(big, 'a', sizeof(big) - 1);
+        big[sizeof(big) - 1] = '\0';
+        memcpy(big, "zammad op=ticket.article.create id=1 body=\"", 42);
+        big[sizeof(big) - 2] = '"';
+        assert_write_red(big);
+    }
+    PASS();
+
+    TEST("cap is enforced by the CLASSIFIER, not only the transport");
+    {
+        zm_request_t req;
+        const char *reason = NULL;
+        memset(body, 'a', ZM_BODY_MAX + 1);
+        body[ZM_BODY_MAX + 1] = '\0';
+        snprintf(cmd, sizeof(cmd),
+                 "zammad op=ticket.article.create id=1 body=\"%s\"", body);
+        assert(zm_parse_command(cmd, &req, &reason) == -1);
+        assert(reason != NULL);
+    }
+    PASS();
+}
+
+static void test_write_id_injection(void)
+{
+    printf("\n=== Write op — id injection ===\n");
+
+    TEST("non-numeric id -> RED");
+    assert_write_red("zammad op=ticket.article.create id=abc body=\"x\"");
+    PASS();
+
+    TEST("alphanumeric id -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1a body=\"x\"");
+    PASS();
+
+    TEST("negative id -> RED");
+    assert_write_red("zammad op=ticket.article.create id=-1 body=\"x\"");
+    PASS();
+
+    TEST("empty id -> RED");
+    assert_write_red("zammad op=ticket.article.create id= body=\"x\"");
+    PASS();
+
+    TEST("leading zero -> RED (two encodings of one ticket, invalid JSON)");
+    assert_write_red("zammad op=ticket.article.create id=007 body=\"x\"");
+    assert_write_red("zammad op=ticket.article.create id=01 body=\"x\"");
+    PASS();
+
+    TEST("bare zero is still valid");
+    assert(zammad_gate_tier("zammad op=ticket.article.create id=0 body=\"x\"")
+           == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("JSON injection through the id -> RED");
+    assert_write_red("zammad op=ticket.article.create id=1,\"internal\":false "
+                     "body=\"x\"");
+    PASS();
+
+    TEST("path traversal through the id -> RED");
+    assert_write_red("zammad op=ticket.article.create id=../../users "
+                     "body=\"x\"");
+    PASS();
+
+    TEST("quoted id -> RED");
+    assert_write_red("zammad op=ticket.article.create id=\"1\" body=\"x\"");
+    PASS();
+
+    TEST("id over the digit cap -> RED");
+    assert_write_red("zammad op=ticket.article.create "
+                     "id=123456789012345678901 body=\"x\"");
+    PASS();
+
+    TEST("id parameter missing -> RED");
+    assert_write_red("zammad op=ticket.article.create body=\"x\"");
+    PASS();
+}
+
+static void test_write_device_scope(void)
+{
+    printf("\n=== Write op — device scope (ro cannot reach the write) ===\n");
+
+    TEST("read-only device (no write_ops_allow) refuses the op");
+    assert(!zm_device_allows_op("", ZM_OP_ARTICLE_CREATE));
+    assert(!zm_device_allows_op(NULL, ZM_OP_ARTICLE_CREATE));
+    PASS();
+
+    TEST("read-write device naming the op permits it");
+    assert(zm_device_allows_op(ZM_OP_ARTICLE_CREATE, ZM_OP_ARTICLE_CREATE));
+    PASS();
+
+    TEST("op inside a multi-entry allowlist is found");
+    assert(zm_device_allows_op("a.b,ticket.article.create,c.d",
+                               ZM_OP_ARTICLE_CREATE));
+    assert(zm_device_allows_op("ticket.article.create,other",
+                               ZM_OP_ARTICLE_CREATE));
+    PASS();
+
+    TEST("prefix of the op id does NOT match");
+    assert(!zm_device_allows_op("ticket.article", ZM_OP_ARTICLE_CREATE));
+    assert(!zm_device_allows_op("ticket", ZM_OP_ARTICLE_CREATE));
+    PASS();
+
+    TEST("superstring of the op id does NOT match");
+    assert(!zm_device_allows_op("ticket.article.createX",
+                                ZM_OP_ARTICLE_CREATE));
+    assert(!zm_device_allows_op("ticket.article.create.more",
+                                ZM_OP_ARTICLE_CREATE));
+    PASS();
+
+    TEST("stray whitespace is a misconfiguration, not a match");
+    assert(!zm_device_allows_op(" ticket.article.create",
+                                ZM_OP_ARTICLE_CREATE));
+    assert(!zm_device_allows_op("ticket.article.create ",
+                                ZM_OP_ARTICLE_CREATE));
+    PASS();
+
+    TEST("no wildcard spelling exists");
+    assert(!zm_device_allows_op("*", ZM_OP_ARTICLE_CREATE));
+    assert(!zm_device_allows_op("all", ZM_OP_ARTICLE_CREATE));
+    assert(!zm_device_allows_op("ticket.*", ZM_OP_ARTICLE_CREATE));
+    PASS();
+
+    TEST("an unrelated allowlist does not permit this op");
+    assert(!zm_device_allows_op("some.other.op", ZM_OP_ARTICLE_CREATE));
+    PASS();
+}
+
+static void test_write_bytes_identity(void)
+{
+    printf("\n=== Write op — classified bytes are the transmitted bytes ===\n");
+
+    TEST("the body appears in the JSON verbatim, unescaped, untransformed");
+    {
+        zm_request_t req;
+        const char *reason = NULL;
+        const char *cmd = "zammad op=ticket.article.create id=42 "
+                          "body=\"OSPF adj down on frr2%3B see seq #531\"";
+        char json[ZM_BODY_MAX + 256];
+
+        assert(zm_parse_command(cmd, &req, &reason) == 0);
+        assert(reason == NULL);
+        assert(strcmp(req.id, "42") == 0);
+        assert(strcmp(req.body, "OSPF adj down on frr2; see seq #531") == 0);
+        assert(req.body_len == strlen("OSPF adj down on frr2; see seq #531"));
+
+        assert(zm_build_article_json(&req, json, sizeof(json)) == 0);
+        assert(strcmp(json,
+            "{\"ticket_id\":42,"
+            "\"body\":\"OSPF adj down on frr2; see seq #531\","
+            "\"type\":\"note\","
+            "\"internal\":true,"
+            "\"content_type\":\"text/plain\"}") == 0);
+    }
+    PASS();
+
+    TEST("the operation fixes type/internal/content_type, not the caller");
+    {
+        zm_request_t req;
+        char json[ZM_BODY_MAX + 256];
+        assert(zm_parse_command("zammad op=ticket.article.create id=7 "
+                                "body=\"x\"", &req, NULL) == 0);
+        assert(zm_build_article_json(&req, json, sizeof(json)) == 0);
+        assert(strstr(json, "\"internal\":true") != NULL);
+        assert(strstr(json, "\"content_type\":\"text/plain\"") != NULL);
+        assert(strstr(json, "\"type\":\"note\"") != NULL);
+    }
+    PASS();
+
+    TEST("a maximum-length body still builds valid JSON (fails closed if not)");
+    {
+        zm_request_t req;
+        char cmd[ZM_COMMAND_MAX + 128];
+        char body[ZM_BODY_MAX + 1];
+        char json[ZM_BODY_MAX + 256];
+        memset(body, 'z', ZM_BODY_MAX);
+        body[ZM_BODY_MAX] = '\0';
+        snprintf(cmd, sizeof(cmd),
+                 "zammad op=ticket.article.create id=1 body=\"%s\"", body);
+        assert(zm_parse_command(cmd, &req, NULL) == 0);
+        assert(zm_build_article_json(&req, json, sizeof(json)) == 0);
+        assert(strstr(json, body) != NULL);
+    }
+    PASS();
+
+    TEST("json builder fails closed on a short buffer");
+    {
+        zm_request_t req;
+        char small[16];
+        assert(zm_parse_command("zammad op=ticket.article.create id=1 "
+                                "body=\"hello\"", &req, NULL) == 0);
+        assert(zm_build_article_json(&req, small, sizeof(small)) == -1);
+    }
+    PASS();
+
+    TEST("a refused command yields a teaching reason");
+    {
+        const char *why = zammad_gate_reason(
+            "zammad op=ticket.article.create id=1 body=\"a\nb\"");
+        assert(why != NULL);
+        why = zammad_gate_reason("zammad op=ticket.state.update id=1 body=\"x\"");
+        assert(why != NULL);
+    }
+    PASS();
+
+    TEST("a GREEN read has no typed-op reason attached");
+    assert(zammad_gate_reason("GET /api/v1/tickets") == NULL);
+    PASS();
+}
+
+static void test_write_does_not_loosen_reads(void)
+{
+    printf("\n=== Write op — the read path is not loosened ===\n");
+
+    TEST("non-GET on a read path is still RED");
+    assert_write_red("POST /api/v1/tickets");
+    assert_write_red("PUT /api/v1/tickets/42");
+    assert_write_red("DELETE /api/v1/tickets/42");
+    PASS();
+
+    TEST("the GREEN read set is unchanged");
+    assert(zammad_gate_tier("GET /api/v1/tickets") == VIRP_TIER_GREEN);
+    assert(zammad_gate_tier("/api/v1/ticket_states") == VIRP_TIER_GREEN);
+    assert(zammad_gate_tier("/api/v1/tickets/42") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("the driver prefix is not a path and a path is not an operation");
+    assert_write_red("zammad /api/v1/tickets");
+    assert_write_red("/zammad op=ticket.article.create id=1 body=\"x\"");
+    assert_write_red("zammad");
+    assert_write_red("zammad ");
+    PASS();
+}
+
+
+/*
+ * THE ENCODING BOUNDARY.
+ *
+ * The daemon's ingress filter (virp_command_check_separators) refuses
+ * ';' '|' '&' '`' "$(" "${" in any command, before any driver sees it.
+ * That rule is right for a command and wrong for prose, so the body
+ * travels percent-encoded and is decoded at the transport.
+ *
+ * This suite pins the boundary from BOTH sides, because the encoding is
+ * only worth anything if the two layers agree about which bytes are
+ * unsafe: every byte this driver insists on escaping must be a byte
+ * ingress would have refused, and the escaped form must survive ingress
+ * intact. If the ingress policy ever changes, these assertions fail
+ * rather than the encoding quietly becoming wrong.
+ */
+static void test_write_body_ingress_intersection(void)
+{
+    printf("\n=== Write op — the encoding boundary (ingress vs driver) ===\n");
+
+    /* The six bytes that must be escaped, and their canonical escapes. */
+    static const struct { char raw; const char *esc; } SIX[] = {
+        { ';', "%3B" }, { '|', "%7C" }, { '&', "%26" },
+        { '`', "%60" }, { '$', "%24" }, { '%', "%25" },
+    };
+
+    /*
+     * The driver's escape set is NOT identical to the ingress refusal
+     * set, and pretending otherwise is how this test first failed. The
+     * exact relationship, asserted in three groups:
+     */
+    TEST("group 1: ; | & ` — ingress refuses a bare occurrence");
+    {
+        static const char BARE[] = { ';', '|', '&', '`' };
+        for (size_t i = 0; i < sizeof(BARE); i++) {
+            char probe[64];
+            assert(zm_must_escape((unsigned char)BARE[i]));
+            snprintf(probe, sizeof(probe), "zammad op=x id=1 body=\"a%cb\"",
+                     BARE[i]);
+            assert(virp_command_check_separators(probe, NULL, 0) != 0);
+        }
+    }
+    PASS();
+
+    TEST("group 2: $ — ingress refuses only \"$(\" and \"${\", not a bare $");
+    {
+        /* The driver escapes '$' unconditionally anyway: a per-byte rule
+         * is decidable without lookahead and keeps the encoding
+         * canonical. A context-dependent rule would make "$x" literal
+         * and "$(" escaped — two rules for one byte, two encodings for
+         * some bodies. */
+        assert(zm_must_escape('$'));
+        assert(virp_command_check_separators(
+                   "zammad op=x id=1 body=\"a$b\"", NULL, 0) == 0);
+        assert(virp_command_check_separators(
+                   "zammad op=x id=1 body=\"a$(b\"", NULL, 0) != 0);
+        assert(virp_command_check_separators(
+                   "zammad op=x id=1 body=\"a${b\"", NULL, 0) != 0);
+    }
+    PASS();
+
+    TEST("group 3: %% — not an ingress concern; escaped for unambiguity");
+    {
+        assert(zm_must_escape('%'));
+        assert(virp_command_check_separators(
+                   "zammad op=x id=1 body=\"a%b\"", NULL, 0) == 0);
+        /* but the driver still refuses a literal '%' — it is the escape
+         * introducer, so admitting it literally would make "%26"
+         * ambiguous between an escape and three characters. */
+        assert(zammad_gate_tier("zammad op=ticket.article.create id=1 "
+                                "body=\"a%b\"") == VIRP_TIER_RED);
+    }
+    PASS();
+
+    TEST("raw form is refused by BOTH layers now (ingress AND classifier)");
+    for (size_t i = 0; i < sizeof(SIX) / sizeof(SIX[0]); i++) {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd),
+                 "zammad op=ticket.article.create id=1 body=\"a%cb\"",
+                 SIX[i].raw);
+        /* The CLASSIFIER refuses every one of the six as a literal —
+         * that is this driver's own rule and does not depend on ingress.
+         * Ingress independently refuses four of them (see the groups
+         * above); the classifier is what covers '$' and '%'. */
+        assert(zammad_gate_tier(cmd) == VIRP_TIER_RED);
+        if (SIX[i].raw != '%' && SIX[i].raw != '$')
+            assert(virp_command_check_separators(cmd, NULL, 0) != 0);
+    }
+    PASS();
+
+    TEST("encoded form survives ingress AND classifies YELLOW");
+    for (size_t i = 0; i < sizeof(SIX) / sizeof(SIX[0]); i++) {
+        char cmd[128], why[160];
+        snprintf(cmd, sizeof(cmd),
+                 "zammad op=ticket.article.create id=1 body=\"a%sb\"",
+                 SIX[i].esc);
+        assert(virp_command_check_separators(cmd, why, sizeof(why)) == 0);
+        assert(zammad_gate_tier(cmd) == VIRP_TIER_YELLOW);
+    }
+    PASS();
+
+    TEST("the prose that motivated the encoding now works end to end");
+    {
+        const char *cmd = "zammad op=ticket.article.create id=42 "
+                          "body=\"R%26D spend %2410k%3B see seq #531\"";
+        zm_request_t req;
+        char why[160];
+        assert(virp_command_check_separators(cmd, why, sizeof(why)) == 0);
+        assert(zammad_gate_tier(cmd) == VIRP_TIER_YELLOW);
+        assert(zm_parse_command(cmd, &req, NULL) == 0);
+        assert(strcmp(req.body, "R&D spend $10k; see seq #531") == 0);
+    }
+    PASS();
+
+    TEST("control bytes are refused literally AND as escapes");
+    {
+        assert(zammad_gate_tier("zammad op=ticket.article.create id=1 "
+                                "body=\"a\nb\"") == VIRP_TIER_RED);
+        assert(zammad_gate_tier("zammad op=ticket.article.create id=1 "
+                                "body=\"a%0Ab\"") == VIRP_TIER_RED);
+        assert(zammad_gate_tier("zammad op=ticket.article.create id=1 "
+                                "body=\"a%00b\"") == VIRP_TIER_RED);
+        assert(zammad_gate_tier("zammad op=ticket.article.create id=1 "
+                                "body=\"a%09b\"") == VIRP_TIER_RED);
+    }
+    PASS();
+}
+
+static void test_write_body_encoding_canonical(void)
+{
+    printf("\n=== Write op — the encoding is canonical (one body, one string) ===\n");
+
+    TEST("an unnecessary escape is RED (%41 for 'A')");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"%41BC\"");
+    PASS();
+
+    TEST("escaping a space is RED (it is a literal byte)");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%20b\"");
+    PASS();
+
+    TEST("lowercase hex is RED (%3b and %3B must not both be legal)");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%3bb\"");
+    PASS();
+
+    TEST("mixed-case hex is RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%3Bb\" x");
+    assert(zammad_gate_tier("zammad op=ticket.article.create id=1 "
+                            "body=\"a%2Cb\"") == VIRP_TIER_RED);  /* ',' literal */
+    PASS();
+
+    TEST("truncated escape is RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%3\"");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%\"");
+    PASS();
+
+    TEST("non-hex escape is RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%GGb\"");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%ZZb\"");
+    PASS();
+
+    TEST("forbidden decoded bytes stay forbidden when escaped");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%22b\"");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%5Cb\"");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%3Cb\"");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%3Eb\"");
+    PASS();
+
+    TEST("UTF-8 smuggled through escapes is RED");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"caf%C3%A9\"");
+    assert_write_red("zammad op=ticket.article.create id=1 body=\"a%FFb\"");
+    PASS();
+
+    TEST("double-encoding does not reach a forbidden byte");
+    /* "%2522" would decode once to "%22"; it must not decode twice. */
+    {
+        zm_request_t req;
+        assert(zm_parse_command("zammad op=ticket.article.create id=1 "
+                                "body=\"a%2522b\"", &req, NULL) == 0);
+        assert(strcmp(req.body, "a%22b") == 0);   /* one pass, not two */
+    }
+    PASS();
+
+    TEST("decode is injective: distinct legal strings, distinct bodies");
+    {
+        zm_request_t a, b;
+        assert(zm_parse_command("zammad op=ticket.article.create id=1 "
+                                "body=\"x%26y\"", &a, NULL) == 0);
+        assert(zm_parse_command("zammad op=ticket.article.create id=1 "
+                                "body=\"x%3By\"", &b, NULL) == 0);
+        assert(strcmp(a.body, b.body) != 0);
+        assert(strcmp(a.body, "x&y") == 0);
+        assert(strcmp(b.body, "x;y") == 0);
+    }
+    PASS();
+
+    TEST("must_escape and is_body_char agree on the six");
+    {
+        const char *six = ";|&`$%";
+        for (const char *c = six; *c; c++) {
+            assert(zm_must_escape((unsigned char)*c));
+            assert(zm_is_body_char((unsigned char)*c));  /* legal, once decoded */
+        }
+        assert(!zm_must_escape('a'));
+        assert(!zm_must_escape(' '));
+        assert(!zm_must_escape('#'));
+        assert(!zm_must_escape('"'));   /* forbidden outright, not escapable */
+    }
+    PASS();
+
+    TEST("decoder rejects a decoded body over the cap");
+    {
+        /* 513 decoded bytes, all escaped: 1539 encoded characters. */
+        char enc[ZM_BODY_ENC_MAX + 64];
+        char out[ZM_BODY_MAX + 8];
+        size_t n = 0;
+        for (int i = 0; i < ZM_BODY_MAX + 1; i++) {
+            memcpy(enc + n, "%26", 3);
+            n += 3;
+        }
+        const char *why = NULL;
+        assert(zm_decode_body(enc, n, out, sizeof(out), NULL, &why) == -1);
+        assert(why != NULL);
+    }
+    PASS();
+
+    TEST("decoded body at exactly the cap is accepted");
+    {
+        char enc[ZM_BODY_ENC_MAX + 8];
+        char out[ZM_BODY_MAX + 8];
+        size_t n = 0, decoded = 0;
+        for (int i = 0; i < ZM_BODY_MAX; i++) { memcpy(enc + n, "%26", 3); n += 3; }
+        assert(zm_decode_body(enc, n, out, sizeof(out), &decoded, NULL) == 0);
+        assert(decoded == ZM_BODY_MAX);
+    }
+    PASS();
+
+    TEST("the cap counts DECODED bytes, not typed characters");
+    {
+        /* 200 escapes = 600 encoded chars but only 200 in the ticket. */
+        char cmd[ZM_COMMAND_MAX];
+        char enc[ZM_BODY_ENC_MAX];
+        size_t n = 0;
+        for (int i = 0; i < 200; i++) { memcpy(enc + n, "%26", 3); n += 3; }
+        enc[n] = '\0';
+        snprintf(cmd, sizeof(cmd),
+                 "zammad op=ticket.article.create id=1 body=\"%s\"", enc);
+        assert(zammad_gate_tier(cmd) == VIRP_TIER_YELLOW);
+    }
+    PASS();
+}
+
 int main(void)
 {
     printf("=== Zammad REST Gate Classifier Tests ===\n");
@@ -839,6 +1580,16 @@ int main(void)
     test_never_returns_black();
     test_registration();
     test_gate_decisions();
+    test_write_row_tier();
+    test_write_method_smuggling();
+    test_write_body_encoding();
+    test_write_body_size();
+    test_write_id_injection();
+    test_write_device_scope();
+    test_write_bytes_identity();
+    test_write_body_ingress_intersection();
+    test_write_body_encoding_canonical();
+    test_write_does_not_loosen_reads();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

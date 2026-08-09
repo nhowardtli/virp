@@ -110,6 +110,25 @@ typedef struct {
     char            tls_fingerprint[128];
     char            datastore_allow[256];
     /*
+     * Vendor-optional (Zammad) — zero-initialized for other vendors.
+     *
+     * write_ops_allow: comma-separated typed-operation ids this DEVICE
+     * may execute as a write. Empty (the default, and the case for every
+     * device that never names it) means NO write operation is permitted
+     * on this device, which is why omitting the field is safe.
+     *
+     * Same split as PBS's datastore_allow, for the same reason: the gate
+     * hook receives no device context, so it can only judge the COMMAND.
+     * "is this operation allowed against this particular credential" is a
+     * property of the device, not of the command bytes, so it has to be
+     * enforced in the driver. Two Zammad entries point at the same host —
+     * zammad-ro with a read-only token and no write_ops_allow, zammad-rw
+     * with a write-capable token and exactly one op id — and the ONLY
+     * thing that makes them different is this field plus the token behind
+     * them.
+     */
+    char            write_ops_allow[256];
+    /*
      * tls_servername: the name the server's certificate is issued for,
      * when that differs from `host`.
      *

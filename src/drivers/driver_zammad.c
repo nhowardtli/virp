@@ -252,6 +252,493 @@ virp_trust_tier_t zm_route_path(const char *path)
     return VIRP_TIER_RED;                                /* RED by absence */
 }
 
+/* =========================================================================
+ * TYPED WRITE OPERATION — exactly one row
+ *
+ * See the block comment in virp_driver_zammad.h for the grammar and the
+ * body policy. The short version: method and URL come from this table,
+ * never from input, and the JSON template's only substitutions are a
+ * digits-only id and a body whose charset cannot carry JSON syntax.
+ * ========================================================================= */
+
+static const char REASON_OP_GRAMMAR[] =
+    "typed-operation grammar violation — the exact form is "
+    "`zammad op=<operation.id> id=<digits> body=\"<text>\"`, one space "
+    "between tokens, parameters in the order the operation declares";
+static const char REASON_OP_UNKNOWN[] =
+    "unknown operation — this driver declares exactly one write, "
+    "ticket.article.create; every other operation is RED by absence";
+static const char REASON_OP_ID[] =
+    "ticket id must be 1..20 ASCII digits with no leading zero — a "
+    "leading zero would give one ticket two encodings and would not be "
+    "a valid JSON number";
+static const char REASON_BODY_CHARSET[] =
+    "body contains a byte outside the permitted set — printable ASCII "
+    "except \" \\ < >, no control bytes, no newlines, no non-ASCII";
+static const char REASON_BODY_LEN[] =
+    "decoded body exceeds the 512-byte cap";
+static const char REASON_BODY_ESCAPE[] =
+    "malformed percent-escape — an escape is %XX with two UPPERCASE hex "
+    "digits";
+static const char REASON_BODY_NONCANON[] =
+    "non-canonical body encoding — exactly the six ingress-unsafe bytes "
+    "(; | & ` $ %) are escaped and every other byte is literal, so each "
+    "body has exactly one legal encoding";
+static const char REASON_BODY_QUOTES[] =
+    "body must be wrapped in double quotes and the closing quote must "
+    "be the last byte of the command";
+static const char REASON_OP_NOT_ON_DEVICE[] =
+    "this device does not permit this write operation — write_ops_allow "
+    "does not name it (the read-only Zammad entry names nothing)";
+
+static const char *const ZM_PARAMS_ARTICLE[] = { "id", "body", NULL };
+
+static const zm_op_t ZM_OPS[] = {
+    {
+        /*
+         * The ONLY write. type/internal/content_type are part of the
+         * OPERATION, not caller parameters — the same reasoning as the
+         * PBS verify typefilter. Making any of them a parameter would
+         * let one approved op id reach a different effect: a
+         * customer-visible reply instead of an internal note, or an
+         * HTML article instead of plain text. A customer-visible reply
+         * is a DIFFERENT operation and would need its own row, its own
+         * tier and its own review.
+         */
+        .id     = ZM_OP_ARTICLE_CREATE,
+        .method = ZM_METHOD_POST,
+        .path   = "/api/v1/ticket_articles",
+        .params = ZM_PARAMS_ARTICLE,
+        .tier   = VIRP_TIER_YELLOW,   /* explicit: a bounded write that
+                                       * adds an internal note and changes
+                                       * no ticket state. Above the GREEN
+                                       * per-uid ceiling on purpose. */
+    },
+};
+
+#define ZM_OPS_COUNT (sizeof(ZM_OPS) / sizeof(ZM_OPS[0]))
+
+bool zm_method_is_allowed(int method, bool is_write_op)
+{
+    if (method == ZM_METHOD_GET) return true;
+    /*
+     * POST is reachable ONLY for the single write row. This is not a
+     * general allowance: the transport still refuses every other non-GET
+     * command before the connection is touched. Keeping it a predicate
+     * means "no method but GET, except for that one row" is something a
+     * test drives directly rather than something a reader reconstructs.
+     */
+    if (method == ZM_METHOD_POST && is_write_op) return true;
+    return false;
+}
+
+int zm_op_table_validate(void)
+{
+    int bad = 0;
+    for (size_t i = 0; i < ZM_OPS_COUNT; i++) {
+        const zm_op_t *op = &ZM_OPS[i];
+        if (!op->id || !op->path || !op->params) {
+            fprintf(stderr, "[Zammad] op table row %zu is malformed\n", i);
+            bad = 1; continue;
+        }
+        if (op->tier == VIRP_TIER_UNCLASSIFIED) {
+            fprintf(stderr, "[Zammad] op row '%s' declares no tier — every "
+                            "row must state one explicitly\n", op->id);
+            bad = 1;
+        }
+        if (op->tier == VIRP_TIER_BLACK) {
+            fprintf(stderr, "[Zammad] op row '%s' is BLACK — this table "
+                            "carries no BLACK rows so every refusal stays "
+                            "approvable\n", op->id);
+            bad = 1;
+        }
+        /* Only the one declared write may name POST. A second POST row
+         * added without review fails here, at startup, loudly. */
+        if (op->method != ZM_METHOD_GET &&
+            strcmp(op->id, ZM_OP_ARTICLE_CREATE) != 0) {
+            fprintf(stderr, "[Zammad] op row '%s' declares a non-GET method "
+                            "but is not the one reviewed write row\n", op->id);
+            bad = 1;
+        }
+        if (!zm_method_is_allowed((int)op->method,
+                                  strcmp(op->id, ZM_OP_ARTICLE_CREATE) == 0)) {
+            fprintf(stderr, "[Zammad] op row '%s' declares an unusable "
+                            "method\n", op->id);
+            bad = 1;
+        }
+    }
+    return bad ? -1 : 0;
+}
+
+const zm_op_t *zm_op_lookup(const char *id)
+{
+    if (!id) return NULL;
+    for (size_t i = 0; i < ZM_OPS_COUNT; i++)
+        if (strcmp(ZM_OPS[i].id, id) == 0)
+            return &ZM_OPS[i];
+    return NULL;
+}
+
+/*
+ * The body byte set. See the BODY POLICY block in virp_driver_zammad.h
+ * for why each exclusion is here; the two that carry the security
+ * property are '"' and '\\'.
+ *
+ * NOTE this is the DRIVER's set, not the effective one. The daemon's
+ * ingress separator policy (virp_command_check_separators) independently
+ * refuses ; | & ` $( ${ in any command before this function is reached,
+ * so the effective body charset is the intersection of the two. See the
+ * INTERACTION note in virp_driver_zammad.h.
+ *
+ * With both excluded (and every control byte excluded), a body needs NO
+ * JSON escaping, so zm_build_article_json() splices it in verbatim and
+ * the bytes that were classified are byte-for-byte the bytes that go on
+ * the wire. Admit either character and that identity is gone: the driver
+ * would have to transform the body, and a reviewer approving the command
+ * would be approving a pre-image of what actually lands in the ticket.
+ */
+/* Uppercase-only hex. Lowercase is refused so "%3b" and "%3B" cannot
+ * both be legal encodings of the same byte. */
+static int zm_hexval_upper(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+bool zm_must_escape(unsigned char c)
+{
+    /*
+     * Exactly the bytes the daemon's ingress filter refuses, plus the
+     * escape introducer itself. Kept in step with
+     * virp_command_check_separators() by the intersection test suite,
+     * which drives BOTH functions over the same bytes — if that filter
+     * ever changes, the test fails rather than the encoding silently
+     * becoming wrong.
+     *
+     * Note '$' is escaped unconditionally, though ingress only refuses
+     * "$(" and "${". A per-byte rule is decidable without lookahead and
+     * keeps the encoding canonical; a context-dependent one would make
+     * "$x" literal and "$(" escaped, i.e. two rules for one byte.
+     */
+    return c == ';' || c == '|' || c == '&' || c == '`' ||
+           c == '$' || c == '%';
+}
+
+int zm_decode_body(const char *enc, size_t enc_len,
+                   char *out, size_t out_max, size_t *out_len,
+                   const char **reason)
+{
+    if (reason) *reason = NULL;
+    if (!enc || !out || out_max == 0) {
+        if (reason) *reason = REASON_BODY_ESCAPE;
+        return -1;
+    }
+
+    size_t o = 0;
+    for (size_t i = 0; i < enc_len; i++) {
+        unsigned char c = (unsigned char)enc[i];
+        unsigned char decoded;
+
+        if (c == '%') {
+            /* "%XX", two UPPERCASE hex digits, nothing else. */
+            if (i + 2 >= enc_len) {
+                if (reason) *reason = REASON_BODY_ESCAPE;
+                return -1;
+            }
+            int hi = zm_hexval_upper(enc[i + 1]);
+            int lo = zm_hexval_upper(enc[i + 2]);
+            if (hi < 0 || lo < 0) {
+                if (reason) *reason = REASON_BODY_ESCAPE;
+                return -1;
+            }
+            decoded = (unsigned char)((hi << 4) | lo);
+            i += 2;
+
+            /*
+             * CANONICALITY, direction 1: only a byte that MUST be
+             * escaped may appear escaped. "%41" for 'A' is refused, or
+             * "A" and "%41" would be two signed strings with one
+             * meaning and the signature would stop pinning the outcome.
+             */
+            if (!zm_must_escape(decoded)) {
+                if (reason) *reason = REASON_BODY_NONCANON;
+                return -1;
+            }
+        } else {
+            /*
+             * CANONICALITY, direction 2: a byte that must be escaped may
+             * never appear literally. In production the daemon's ingress
+             * filter would already have refused five of these six, but
+             * this driver does not rely on another layer to enforce its
+             * own encoding.
+             */
+            if (zm_must_escape(c)) {
+                if (reason) *reason = REASON_BODY_NONCANON;
+                return -1;
+            }
+            decoded = c;
+        }
+
+        /* The decoded byte faces the same charset either way: an escape
+         * is a transport device, not a way past the body policy. "%0A"
+         * is a newline and is refused exactly like a literal one. */
+        if (!zm_is_body_char(decoded)) {
+            if (reason) *reason = REASON_BODY_CHARSET;
+            return -1;
+        }
+
+        /* Cap is on the DECODED length — what lands in the ticket. */
+        if (o + 1 >= out_max || o >= ZM_BODY_MAX) {
+            if (reason) *reason = REASON_BODY_LEN;
+            return -1;
+        }
+        out[o++] = (char)decoded;
+    }
+
+    out[o] = '\0';
+    if (out_len) *out_len = o;
+    return 0;
+}
+
+bool zm_is_body_char(unsigned char c)
+{
+    if (c < 0x20 || c >= 0x7F) return false;   /* CR/LF/TAB/NUL, all UTF-8 */
+    if (c == '"' || c == '\\') return false;   /* JSON syntax              */
+    if (c == '<' || c == '>')  return false;   /* rendering, defence in depth */
+    return true;
+}
+
+/*
+ * Ticket id: 1..ZM_DIGITS_MAX digits, no leading zero unless the id is
+ * exactly "0". Two reasons, and both matter:
+ *   - canonical encoding: "007" and "7" name one ticket, so admitting
+ *     both would give one request two signed forms.
+ *   - JSON validity: the id is emitted as a NUMBER, and {"ticket_id":007}
+ *     is not valid JSON. Rejecting the shape is better than quoting it
+ *     and hoping the server coerces.
+ */
+static bool zm_is_ticket_id(const char *s, size_t len)
+{
+    if (!zm_digits(s, len)) return false;
+    if (len > 1 && s[0] == '0') return false;
+    return true;
+}
+
+bool zm_device_allows_op(const char *write_ops_allow, const char *op_id)
+{
+    /* Absent or empty means no writes. This is the DEFAULT for every
+     * device that never names the field, which is what makes omitting
+     * it safe — including on the read-only Zammad entry. */
+    if (!write_ops_allow || !*write_ops_allow || !op_id || !*op_id)
+        return false;
+
+    size_t idlen = strlen(op_id);
+    const char *p = write_ops_allow;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t n = comma ? (size_t)(comma - p) : strlen(p);
+        /* Whole-entry exact match. No trimming, no prefixes, no
+         * wildcards: "ticket.article" must not reach
+         * "ticket.article.create", and " ticket.article.create" with a
+         * stray space is a misconfiguration the operator should see
+         * rather than one the driver silently repairs. */
+        if (n == idlen && memcmp(p, op_id, n) == 0)
+            return true;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return false;
+}
+
+static const char ZM_OP_PREFIX[] = "zammad ";
+
+int zm_parse_command(const char *command, zm_request_t *out,
+                     const char **reason)
+{
+    if (reason) *reason = NULL;
+    if (!command || !out) {
+        if (reason) *reason = REASON_OP_GRAMMAR;
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+
+    size_t len = strlen(command);
+    if (len == 0 || len >= ZM_COMMAND_MAX) {
+        if (reason) *reason = REASON_OP_GRAMMAR;
+        return -1;
+    }
+
+    /*
+     * Byte guards BEFORE tokenizing. Control bytes are refused across
+     * the whole command, not only inside the body: a CR or LF anywhere
+     * is a request-boundary smuggle, and the daemon's ingress separator
+     * policy treats it the same way one layer up.
+     *
+     * Space runs are refused so there is exactly one spelling of the
+     * token separator. The body is exempt from the space-run rule —
+     * "a  b" is legitimate prose — so the scan stops at `body=`.
+     */
+    const char *body_kw = strstr(command, " body=\"");
+    size_t guard_len = body_kw ? (size_t)(body_kw - command) : len;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)command[i];
+        if (c < 0x20 || c == 0x7F) {
+            if (reason) *reason = REASON_BODY_CHARSET;
+            return -1;
+        }
+        if (i < guard_len && c == ' ' && i + 1 < len && command[i + 1] == ' ') {
+            if (reason) *reason = REASON_OP_GRAMMAR;
+            return -1;
+        }
+    }
+    if (command[len - 1] == ' ') {
+        if (reason) *reason = REASON_OP_GRAMMAR;
+        return -1;
+    }
+
+    if (strncmp(command, ZM_OP_PREFIX, sizeof(ZM_OP_PREFIX) - 1) != 0) {
+        if (reason) *reason = REASON_OP_GRAMMAR;
+        return -1;
+    }
+    const char *p = command + sizeof(ZM_OP_PREFIX) - 1;
+
+    /* op=<id> */
+    static const char OP_KEY[] = "op=";
+    if (strncmp(p, OP_KEY, sizeof(OP_KEY) - 1) != 0) {
+        if (reason) *reason = REASON_OP_GRAMMAR;
+        return -1;
+    }
+    p += sizeof(OP_KEY) - 1;
+
+    char op_id[ZM_OP_ID_MAX];
+    size_t n = 0;
+    while (*p && *p != ' ') {
+        if (n + 1 >= sizeof(op_id)) {
+            if (reason) *reason = REASON_OP_GRAMMAR;
+            return -1;
+        }
+        op_id[n++] = *p++;
+    }
+    op_id[n] = '\0';
+
+    const zm_op_t *op = zm_op_lookup(op_id);
+    if (!op) {
+        if (reason) *reason = REASON_OP_UNKNOWN;
+        return -1;
+    }
+    out->op = op;
+
+    /*
+     * Parameters, in the ORDER the row declares. Positional order is the
+     * canonicalization here — see the header for why PBS's sort-by-key
+     * rule does not carry over to keys named before "op".
+     */
+    for (size_t k = 0; op->params[k]; k++) {
+        const char *key = op->params[k];
+        size_t klen = strlen(key);
+
+        if (*p != ' ') {                       /* missing parameter */
+            if (reason) *reason = REASON_OP_GRAMMAR;
+            return -1;
+        }
+        p++;
+
+        if (strncmp(p, key, klen) != 0 || p[klen] != '=') {
+            if (reason) *reason = REASON_OP_GRAMMAR;
+            return -1;
+        }
+        p += klen + 1;
+
+        if (strcmp(key, "id") == 0) {
+            const char *start = p;
+            while (*p && *p != ' ') p++;
+            size_t vlen = (size_t)(p - start);
+            if (!zm_is_ticket_id(start, vlen)) {
+                if (reason) *reason = REASON_OP_ID;
+                return -1;
+            }
+            memcpy(out->id, start, vlen);
+            out->id[vlen] = '\0';
+        } else if (strcmp(key, "body") == 0) {
+            /*
+             * Opening quote, then bytes, then a closing quote that MUST
+             * be the final byte of the command. Because '"' is not a
+             * permitted body byte, the first quote we meet IS the
+             * closing one — there is exactly one parse and no escape
+             * mechanism to reason about.
+             */
+            if (*p != '"') {
+                if (reason) *reason = REASON_BODY_QUOTES;
+                return -1;
+            }
+            p++;
+            const char *enc = p;
+            while (*p && *p != '"') p++;
+            if (*p != '"' || p[1] != '\0') {
+                if (reason) *reason = REASON_BODY_QUOTES;
+                return -1;
+            }
+            size_t enc_len = (size_t)(p - enc);
+            if (enc_len > ZM_BODY_ENC_MAX) {
+                if (reason) *reason = REASON_BODY_LEN;
+                return -1;
+            }
+            /*
+             * The CLASSIFIER decodes. It has to: the cap is on the
+             * decoded length and the charset applies to decoded bytes,
+             * so neither can be judged from the encoded form alone. The
+             * transport then decodes the same bytes with the same
+             * function — one decoder, so what was classified is what is
+             * posted.
+             */
+            if (zm_decode_body(enc, enc_len, out->body, sizeof(out->body),
+                               &out->body_len, reason) != 0)
+                return -1;
+            if (out->body_len == 0) {   /* an empty note is not a note */
+                if (reason) *reason = REASON_BODY_LEN;
+                return -1;
+            }
+            p++;                               /* consume closing quote */
+        } else {
+            if (reason) *reason = REASON_OP_GRAMMAR;   /* unreachable */
+            return -1;
+        }
+    }
+
+    if (*p != '\0') {                          /* trailing tokens */
+        if (reason) *reason = REASON_OP_GRAMMAR;
+        return -1;
+    }
+    return 0;
+}
+
+int zm_build_article_json(const zm_request_t *req, char *out, size_t out_len)
+{
+    if (!req || !req->op || !out) return -1;
+
+    /*
+     * Static template, two substitutions. `id` is digits with no leading
+     * zero, so it is a valid JSON number; `body` has already been
+     * restricted to bytes that need no JSON escaping, so it is spliced
+     * in VERBATIM. Nothing here transforms either value — that is what
+     * makes the classified bytes and the transmitted bytes the same
+     * bytes.
+     *
+     * type/internal/content_type are fixed: an internal plain-text note.
+     * They are properties of the approved OPERATION, not caller input.
+     */
+    int w = snprintf(out, out_len,
+                     "{\"ticket_id\":%s,"
+                     "\"body\":\"%s\","
+                     "\"type\":\"note\","
+                     "\"internal\":true,"
+                     "\"content_type\":\"text/plain\"}",
+                     req->id, req->body);
+    if (w < 0 || (size_t)w >= out_len) return -1;   /* fail closed */
+    return 0;
+}
+
 /*
  * The one place a submitted command becomes a request path — used by
  * BOTH the gate hook and execute(), so the bytes that were classified
@@ -275,11 +762,49 @@ static const char *zm_command_path(const char *command)
     return p;
 }
 
-virp_trust_tier_t zammad_gate_tier(const char *command)
+virp_trust_tier_t zammad_gate_classify(const char *command, const char **reason)
 {
+    if (reason) *reason = NULL;
+    if (!command) return VIRP_TIER_RED;
+
+    /*
+     * Shape dispatch. The two grammars cannot collide: a typed operation
+     * begins with the literal "zammad " and a read begins with '/' (after
+     * an optional "GET "). Anything matching neither is RED.
+     *
+     * The typed-op branch is checked FIRST and by exact prefix, so a
+     * read path can never be re-read as an operation or the reverse.
+     */
+    if (strncmp(command, ZM_OP_PREFIX, sizeof(ZM_OP_PREFIX) - 1) == 0) {
+        zm_request_t req;
+        const char *why = NULL;
+        if (zm_parse_command(command, &req, &why) != 0) {
+            if (reason) *reason = why;
+            return VIRP_TIER_RED;
+        }
+        /*
+         * The row's declared tier, not "parsed successfully, therefore
+         * fine". YELLOW here is what keeps the write above uid 993's
+         * GREEN ceiling — see the header.
+         */
+        return req.op->tier;
+    }
+
     const char *path = zm_command_path(command);
     if (!path) return VIRP_TIER_RED;
     return zm_route_path(path);
+}
+
+virp_trust_tier_t zammad_gate_tier(const char *command)
+{
+    return zammad_gate_classify(command, NULL);
+}
+
+const char *zammad_gate_reason(const char *command)
+{
+    const char *reason = NULL;
+    (void)zammad_gate_classify(command, &reason);
+    return reason;
 }
 
 /* =========================================================================
@@ -348,8 +873,46 @@ static void zm_configure_tls(CURL *curl)
  * before return — it must never reach a log line, an error_msg, or an
  * observation payload.
  */
-static virp_error_t zm_get(struct virp_conn *conn, const char *path,
-                           char *out, size_t out_len, long *http_code)
+static virp_error_t zm_perform(struct virp_conn *conn, zm_method_t method,
+                               const char *post_json, const char *path,
+                               char *out, size_t out_len, long *http_code);
+
+/*
+ * One request against the API.
+ *
+ * `method` is the typed enum, and `post_json` is the exact body to send
+ * for ZM_METHOD_POST (NULL for GET). `is_write_op` records whether the
+ * caller has established that this is the single reviewed write row; it
+ * is the ONLY thing that can unlock POST, and it is re-checked here
+ * rather than trusted from the caller's control flow.
+ */
+static virp_error_t zm_request(struct virp_conn *conn, zm_method_t method,
+                               bool is_write_op, const char *post_json,
+                               const char *path,
+                               char *out, size_t out_len, long *http_code)
+{
+    /*
+     * Method whitelist at the transport, not only at the table. The
+     * table says which method a row uses; this says which methods the
+     * driver is willing to put on a socket at all. Both have to agree,
+     * so a table row edited to POST without the corresponding review
+     * still cannot issue one.
+     */
+    if (!zm_method_is_allowed((int)method, is_write_op)) {
+        fprintf(stderr, "[Zammad] refusing method %d (write_op=%d) — the "
+                        "transport issues GET, and POST only for the one "
+                        "declared write operation\n",
+                (int)method, (int)is_write_op);
+        return ZM_ERR_METHOD;
+    }
+    if (method == ZM_METHOD_POST && !post_json) return ZM_ERR_METHOD;
+
+    return zm_perform(conn, method, post_json, path, out, out_len, http_code);
+}
+
+static virp_error_t zm_perform(struct virp_conn *conn, zm_method_t method,
+                               const char *post_json, const char *path,
+                               char *out, size_t out_len, long *http_code)
 {
     /*
      * The classifier caps a GREEN path at ZM_PATH_MAX, so a longer one
@@ -389,7 +952,20 @@ static virp_error_t zm_get(struct virp_conn *conn, const char *path,
 
     curl_easy_reset(conn->curl);
     curl_easy_setopt(conn->curl, CURLOPT_URL, url);
-    curl_easy_setopt(conn->curl, CURLOPT_HTTPGET, 1L);
+    if (method == ZM_METHOD_POST) {
+        /*
+         * POSTFIELDSIZE is set explicitly from strlen rather than left
+         * to libcurl's own strlen: the body is the approved bytes and
+         * its length is part of what was approved, so the transport
+         * states it instead of re-deriving it.
+         */
+        curl_easy_setopt(conn->curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(conn->curl, CURLOPT_POSTFIELDS, post_json);
+        curl_easy_setopt(conn->curl, CURLOPT_POSTFIELDSIZE,
+                         (long)strlen(post_json));
+    } else {
+        curl_easy_setopt(conn->curl, CURLOPT_HTTPGET, 1L);
+    }
     curl_easy_setopt(conn->curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(conn->curl, CURLOPT_WRITEFUNCTION, zm_write_cb);
     curl_easy_setopt(conn->curl, CURLOPT_WRITEDATA, &resp);
@@ -522,8 +1098,9 @@ static virp_conn_t *zammad_connect(const virp_device_t *device)
      */
     char probe[1024];
     long http_code = 0;
-    virp_error_t err = zm_get(conn, ZM_EP_TICKET_STATES,
-                              probe, sizeof(probe), &http_code);
+    virp_error_t err = zm_request(conn, ZM_METHOD_GET, false, NULL,
+                                  ZM_EP_TICKET_STATES,
+                                  probe, sizeof(probe), &http_code);
     if (err != VIRP_OK || http_code != 200) {
         fprintf(stderr, "[Zammad] Token probe failed on %s: HTTP %ld\n",
                 device->hostname, http_code);
@@ -555,9 +1132,135 @@ static virp_error_t zammad_execute(virp_conn_t *base_conn,
     memset(result, 0, sizeof(*result));
 
     /*
+     * WRITE PATH — the single typed operation, and the only way a
+     * non-GET method can ever be issued by this driver.
+     *
+     * Dispatched by exact literal prefix, before the read path, using
+     * the SAME parser the classifier used, so the operation that was
+     * classified is the operation that executes.
+     */
+    if (strncmp(command, ZM_OP_PREFIX, sizeof(ZM_OP_PREFIX) - 1) == 0) {
+        zm_request_t req;
+        const char *reason = NULL;
+
+        if (zm_parse_command(command, &req, &reason) != 0) {
+            result->success = false;
+            result->exit_code = 1;
+            result->no_dispatch = true;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Refused before any network activity: %s",
+                     reason ? reason : REASON_OP_GRAMMAR);
+            return VIRP_OK;
+        }
+
+        /*
+         * DEVICE SCOPE. The gate judged the command; only the driver can
+         * judge the credential. zammad-ro and zammad-rw point at the same
+         * host and differ in exactly two things: the token behind them
+         * and this allowlist. An approved, correctly-formed write
+         * submitted against the read-only entry dies here, before the
+         * connection is touched — it does not become a 403 from Zammad,
+         * because relying on the far side to enforce our own policy is
+         * how a token-permission change silently becomes a policy change.
+         */
+        if (!zm_device_allows_op(conn->device.write_ops_allow, req.op->id)) {
+            result->success = false;
+            result->exit_code = 1;
+            result->no_dispatch = true;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Refused on %.32s: %s",
+                     conn->device.hostname, REASON_OP_NOT_ON_DEVICE);
+            return VIRP_OK;
+        }
+
+        char json[ZM_BODY_MAX + 256];
+        if (zm_build_article_json(&req, json, sizeof(json)) != 0) {
+            result->success = false;
+            result->exit_code = 1;
+            result->no_dispatch = true;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Refused: request body would not fit its buffer");
+            return VIRP_OK;
+        }
+
+        if (!conn->connected) {
+            result->success = false;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Not connected to %s", conn->device.hostname);
+            return ZM_ERR_NOT_CONNECTED;
+        }
+
+        struct timespec wstart, wend;
+        clock_gettime(CLOCK_MONOTONIC, &wstart);
+
+        char wresp[ZM_RESPONSE_MAX];
+        long wcode = 0;
+        virp_error_t werr = zm_request(conn, req.op->method, /*is_write_op=*/true,
+                                       json, req.op->path,
+                                       wresp, sizeof(wresp), &wcode);
+
+        clock_gettime(CLOCK_MONOTONIC, &wend);
+        result->exec_time_ms =
+            (uint64_t)((wend.tv_sec - wstart.tv_sec) * 1000 +
+                       (wend.tv_nsec - wstart.tv_nsec) / 1000000);
+
+        if (werr != VIRP_OK) {
+            result->success = false;
+            result->exit_code = 1;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "transport error on %.48s%.64s",
+                     conn->device.hostname, req.op->path);
+            return VIRP_OK;
+        }
+
+        /*
+         * The observation records the operation as approved AND the exact
+         * JSON that was posted. Recording the derived body next to the
+         * command is what lets a later reader confirm the derivation
+         * without re-running the driver — the same reason the PBS
+         * observation carries its derived path.
+         */
+        int w = snprintf(result->output, sizeof(result->output),
+                         "%s>%s %s [HTTP %ld]\n%s\n%s",
+                         conn->device.hostname, "POST", req.op->path,
+                         wcode, json, wresp);
+        result->output_len = (w > 0) ? (size_t)w : 0;
+
+        if (wcode == 401 || wcode == 403) {
+            result->success = false;
+            result->exit_code = (int)wcode;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "HTTP %ld auth failure on %s", wcode,
+                     conn->device.hostname);
+        } else if (wcode >= 400) {
+            result->success = false;
+            result->exit_code = (int)wcode;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "HTTP %ld from %s%s", wcode,
+                     conn->device.hostname, req.op->path);
+        } else {
+            result->success = true;
+            result->exit_code = 0;
+            if (zm_body_is_error(wresp)) {
+                result->success = false;
+                result->exit_code = 1;
+                snprintf(result->error_msg, sizeof(result->error_msg),
+                         "Zammad API error in response from %s",
+                         conn->device.hostname);
+            }
+        }
+        return VIRP_OK;
+    }
+
+    /*
      * GET-only transport honesty — same rule, same ordering, and the
      * same helper the classifier used, so a command can never be
      * classified as one thing and dispatched as another.
+     *
+     * Everything that is not the typed write above still lands here, and
+     * this branch has NOT been loosened: a non-GET method prefix is
+     * refused exactly as before, before the connection is touched. POST
+     * did not become generally available; one table row became reachable.
      *
      * Checked BEFORE the connectivity test so the refusal is
      * deterministic and offline-testable. This driver can only issue
@@ -601,8 +1304,9 @@ static virp_error_t zammad_execute(virp_conn_t *base_conn,
 
     char api_response[ZM_RESPONSE_MAX];
     long http_code = 0;
-    virp_error_t err = zm_get(conn, path, api_response,
-                              sizeof(api_response), &http_code);
+    virp_error_t err = zm_request(conn, ZM_METHOD_GET, false, NULL, path,
+                                  api_response, sizeof(api_response),
+                                  &http_code);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
@@ -687,8 +1391,9 @@ static virp_error_t zammad_health_check(virp_conn_t *base_conn)
     /* Health probe stays inside the GREEN read set — see connect(). */
     char probe[1024];
     long http_code = 0;
-    virp_error_t err = zm_get(conn, ZM_EP_TICKET_STATES,
-                              probe, sizeof(probe), &http_code);
+    virp_error_t err = zm_request(conn, ZM_METHOD_GET, false, NULL,
+                                  ZM_EP_TICKET_STATES,
+                                  probe, sizeof(probe), &http_code);
     if (err != VIRP_OK) return err;
     return http_code == 200 ? VIRP_OK : ZM_ERR_AUTH_FAILED;
 }
@@ -706,6 +1411,7 @@ static virp_driver_t zammad_driver = {
     .detect     = zammad_detect,
     .health_check = zammad_health_check,
     .route_command = zammad_gate_tier,
+    .route_reason  = zammad_gate_reason,
 };
 
 const virp_driver_t *virp_driver_zammad(void)
@@ -715,5 +1421,17 @@ const virp_driver_t *virp_driver_zammad(void)
 
 void virp_driver_zammad_init(void)
 {
+    /*
+     * Table invariants BEFORE registration. A row that declares no tier,
+     * a BLACK row, or a second row that names POST is a startup failure
+     * rather than a silent runtime surprise — the write surface of this
+     * driver is one row and that has to be enforced somewhere the
+     * compiler cannot.
+     */
+    if (zm_op_table_validate() != 0) {
+        fprintf(stderr, "[Zammad] op table failed validation — driver NOT "
+                        "registered; no Zammad device will be usable\n");
+        return;
+    }
     virp_driver_register(&zammad_driver);
 }
