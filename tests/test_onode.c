@@ -4075,6 +4075,45 @@ TEST(test_previous_okey_loader_refuses_bad_configurations)
     unlink(path);
 }
 
+/* The -W deadline is anchored to KEY-LOAD TIME (process start in the
+ * daemon), not to the rotation event, and it is memory-only. This pins
+ * both halves: the deadline lands at now+W when loaded, and loading
+ * again — which is what an unrelated restart does — RE-OPENS a full
+ * window rather than continuing the old one. That is why the runbook
+ * says to remove -K after the drain instead of waiting for expiry. */
+TEST(test_previous_okey_window_anchors_to_load_time_and_resets)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/virp-prev-anchor-test.bin");
+    unlink(path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    ASSERT_TRUE(fd >= 0);
+    uint8_t k[VIRP_KEY_SIZE];
+    for (size_t i = 0; i < sizeof(k); i++) k[i] = (uint8_t)(0xA0 + i);
+    ASSERT_EQ((int)write(fd, k, sizeof(k)), (int)sizeof(k));
+    close(fd);
+
+    struct timespec t0;
+    clock_gettime(CLOCK_REALTIME, &t0);
+    uint64_t before = (uint64_t)t0.tv_sec * 1000000000ULL + t0.tv_nsec;
+
+    ASSERT_OK(onode_set_previous_okey(&ca_state, path, 300));
+    ASSERT_TRUE(ca_state.prev_okey_loaded);
+    uint64_t d1 = ca_state.prev_okey_deadline_ns;
+
+    /* Anchored at load: deadline sits within a second of now + 300s. */
+    ASSERT_TRUE(d1 >= before + 299ULL * 1000000000ULL);
+    ASSERT_TRUE(d1 <= before + 301ULL * 1000000000ULL);
+
+    /* Re-loading (what a restart does) moves the deadline FORWARD to a
+     * fresh full window — it does not continue the previous one. */
+    ASSERT_OK(onode_set_previous_okey(&ca_state, path, 300));
+    ASSERT_TRUE(ca_state.prev_okey_deadline_ns >= d1);
+
+    ca_state.prev_okey_loaded = false;
+    unlink(path);
+}
+
 /* GUARD: a non-observation external type is NOT put through the
  * signature gate — evidence_item and friends are JSON bodies by design
  * and must keep registering. */
@@ -4278,6 +4317,7 @@ int main(void)
         RUN_TEST(test_rotation_grace_window_expires);
         RUN_TEST(test_rotation_grace_window_does_not_accept_a_third_key);
         RUN_TEST(test_previous_okey_loader_refuses_bad_configurations);
+        RUN_TEST(test_previous_okey_window_anchors_to_load_time_and_resets);
         RUN_TEST(test_chain_append_still_accepts_json_evidence_item);
         RUN_TEST(test_chain_append_accepts_commitment_without_body);
         ca_stop();

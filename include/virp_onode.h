@@ -200,6 +200,21 @@ typedef struct {
      * the holder of that key produces, for its whole duration. Rotate
      * without it in that case (the cost is the in-flight observations,
      * which is the correct trade when the key is burned).
+     *
+     * WHAT THE DEADLINE IS ANCHORED TO: CLOCK_REALTIME at the moment
+     * onode_set_previous_okey() is called — i.e. KEY-LOAD TIME, which
+     * in the daemon is process start (main() calls it right after
+     * onode_init and before onode_start). It is NOT anchored to the
+     * rotation event, and it is held in memory only: nothing persists
+     * it across a restart.
+     *
+     * CONSEQUENCE, and the reason step 4 of the runbook is not
+     * optional: an unrelated restart mid-rotation RE-OPENS A FULL
+     * WINDOW. Restart 10 minutes into a 15-minute window and you get a
+     * fresh 15 minutes, not the remaining 5. So long as -K stays on the
+     * command line, every restart renews it, indefinitely — the window
+     * bounds a single process run, not the rotation. Remove -K once the
+     * drain is done; do not rely on expiry alone to close it.
      */
     virp_signing_key_t  prev_okey;
     bool                prev_okey_loaded;
