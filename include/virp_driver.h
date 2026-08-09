@@ -39,6 +39,7 @@ typedef enum {
     VIRP_VENDOR_CISCO_IOSXE = 10,  /* Cisco IOS-XE (Catalyst/ISR-XE); shares the cisco driver + gate core */
     VIRP_VENDOR_LIBRENMS    = 11,  /* LibreNMS REST API (token auth) */
     VIRP_VENDOR_PBS         = 12,  /* Proxmox Backup Server (typed ops, pinned TLS) */
+    VIRP_VENDOR_ZAMMAD      = 13,  /* Zammad REST API (personal access token) */
     VIRP_VENDOR_MOCK        = 99,   /* Testing only */
 } virp_vendor_t;
 

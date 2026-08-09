@@ -141,6 +141,19 @@ ifdef PBS
   LIB_OBJS += $(BUILD_DIR)/driver_pbs.o
 endif
 
+# Optional Zammad driver (requires libcurl — REST API, not SSH)
+ifdef ZAMMAD
+  CFLAGS  += -DVIRP_DRIVER_ZAMMAD $(shell pkg-config --cflags libcurl 2>/dev/null)
+  ifndef WAZUH
+    ifndef LIBRENMS
+      ifndef PBS
+        LDFLAGS += $(shell pkg-config --libs libcurl 2>/dev/null || echo "-lcurl")
+      endif
+    endif
+  endif
+  LIB_OBJS += $(BUILD_DIR)/driver_zammad.o
+endif
+
 # SSH host key verification — included when any SSH driver is enabled
 ifneq (,$(or $(CISCO),$(FORTIGATE),$(PANOS),$(ASA),$(JUNIPER),$(LINUX)))
   LIB_OBJS += $(BUILD_DIR)/virp_ssh_hostkey.o
@@ -203,6 +216,9 @@ $(BUILD_DIR)/driver_librenms.o: src/drivers/driver_librenms.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_pbs.o: src/drivers/driver_pbs.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/driver_zammad.o: src/drivers/driver_zammad.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_ssh_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
@@ -643,6 +659,23 @@ $(TEST_PBS_GATE): tests/test_driver_pbs_gate.c $(LIB)
 test-pbs-gate: $(TEST_PBS_GATE)
 	./$(TEST_PBS_GATE)
 
+# Zammad REST gate-classifier tests (build with ZAMMAD=1). Offline —
+# the suite classifies strings and never originates network contact.
+TEST_ZAMMAD_GATE = $(BUILD_DIR)/test_driver_zammad_gate
+
+$(TEST_ZAMMAD_GATE): tests/test_driver_zammad_gate.c $(LIB)
+ifndef ZAMMAD
+	@echo "ERROR: test-zammad-gate requires ZAMMAD=1 — driver objects are not in libvirp.a."
+	@echo "       Run:  make ZAMMAD=1 test-zammad-gate"
+	@echo "       Or:   make test-drivers   (builds every driver and runs all driver suites)"
+	@false
+else
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+endif
+
+test-zammad-gate: $(TEST_ZAMMAD_GATE)
+	./$(TEST_ZAMMAD_GATE)
+
 # Autopilot client unit tests (pure-python: baselines, corpus table,
 # RBAC empty-result handling — no daemon, no devices)
 test-autopilot:
@@ -799,10 +832,10 @@ DRIVER_BUILD_DIR = build-drivers
 
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, typed-hash, ingress-nul, pbs-trunc) ==="
-	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 \
+	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, zammad-gate, typed-hash, ingress-nul, pbs-trunc) ==="
+	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 ZAMMAD=1 \
 	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms \
-	        test-pbs test-pbs-gate test-typed-hash test-ingress-nul test-pbs-trunc
+	        test-pbs test-pbs-gate test-zammad-gate test-typed-hash test-ingress-nul test-pbs-trunc
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.
 #
@@ -1276,9 +1309,9 @@ asan-drivers:
 	        CFLAGS_EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS_EXTRA="-fsanitize=address,undefined" \
 	        CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 \
-	        LIBRENMS=1 PBS=1 \
+	        LIBRENMS=1 PBS=1 ZAMMAD=1 \
 	        test-pbs test-pbs-gate test-typed-hash test-ingress-nul \
-	        test-pbs-trunc test-linux-gate test-cisco-gate
+	        test-pbs-trunc test-linux-gate test-cisco-gate test-zammad-gate
 	@echo "=== ASan+UBSan driver run complete ==="
 
 # libFuzzer harness (requires clang)
