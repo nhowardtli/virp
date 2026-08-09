@@ -1039,6 +1039,69 @@ ever grew past 1 KB, connect would refuse rather than silently truncate.
 Correct, and better than the alternative, but it is a new way for connect to
 fail.
 
+## Deploy 2026-08-09 03:14 UTC — netclaw remote requester allowlist (commit 886c41a2)
+
+Config-only restart of virp-onode (binary sha256 unchanged `07b8eec4…`,
+same as the 32dd710f deploy — the commit touches only deploy/ + Makefile).
+Restarted 03:14:09→03:14:12 UTC, virp-broker immediately after. Added uids
+993 (`virp-netclaw`, remote requester) and 994 (`virp-broker`) to
+socket_allowed_uids; installed deploy/netclaw-access.sh + 52-netclaw.conf.
+
+- **No chain gap.** The autopilot 03:10 cycle completed pre-restart; the
+  03:15 cycle ran post-restart and minted entries (seq 2–36). No cycle was
+  missed, so — unlike the 2026-08-01 01:35–01:50 gap — there is nothing to
+  record as un-minted. chain.db persisted (not truncated); per-process seq
+  reset to low numbers at restart is expected and does not break the
+  hash-linked chain.
+- **Pre-existing, NOT caused by this deploy:** virp-autopilot.service has
+  been exiting non-zero since ~00:00 UTC because the battery raises alerts
+  (device `virp-node2-peer` not found + baseline deviations) and returns
+  the alert count as its exit status. Observations are still minted and
+  chained each cycle; only the unit's exit result is "failed". Flagged for
+  separate follow-up; it is orthogonal to the allowlist change.
+
+### Finding A — remote client tier ceiling is YELLOW-executes, not GREEN-only
+The gate ceiling is the GLOBAL `gate_max_tier=yellow`; there is no per-uid
+ceiling (confirmed in src: gate_tier_blocks compares against the one
+state->gate_max_tier). Verified end-to-end from netclaw through the tunnel
+(all as uid 993 via SO_PEERCRED):
+- GREEN `show ip ospf neighbor` → decision=allow → EXECUTED_CONFIRMED.
+- RED `configure terminal` / `ping …` → decision=block → proposal filed +
+  rejection persisted (proposal-only; approvable, but netclaw holds no
+  approver key so it can never apply). Correct.
+- YELLOW `clear ip ospf neighbor` → **decision=allow → EXECUTED_CONFIRMED.**
+  YELLOW is NOT proposal-only: with max_tier=yellow it auto-executes for
+  every allowlisted uid, netclaw included. (frr1 OSPF adjacencies cleared
+  and re-formed to 2 Full within the test window.)
+This contradicts the "YELLOW is proposal-only for the remote client"
+expectation. A true GREEN-only (or YELLOW-proposal-only) ceiling for uid
+993 needs per-uid tier support in the daemon — a code change, deferred
+pending a decision. RED is the tier that is currently proposal-only.
+
+### Finding B — bridge provenance/outcome chain entries rejected (pre-existing)
+The federation bridge's attribution entries do NOT land: `intent` →
+"unknown artifact_type" and `outcome` → "daemon-generated … may not be
+submitted" (both err=-4 INVALID_TYPE), from GATE 1 (adversarial audit
+2026-08-06). Only the `observation` entry lands (verified on this chain,
+session ncfed-netclaw-*). This is a bridge/daemon contract mismatch
+independent of transport and of this deploy — the same -4 occurs for a
+local diag append (session=diag:phase4) — so the bridge's
+federated_request/federated_outcome wrapper is degraded to
+observation-only on this daemon build regardless of how it is reached.
+
+### sshd transport deviation from the Phase 1 design (recorded intentionally)
+Phase 1 specified `AllowTcpForwarding no` + `PermitOpen none` for
+virp-netclaw. On this OpenSSH (9.6p1) BOTH also block the streamlocal
+(Unix-socket) forward the account exists for: sshd checks direct-streamlocal
+opens against the same local-perms list and logs "connect to path … request
+was denied" without ever calling connect(). The Match block therefore now
+sets `AllowTcpForwarding yes`, and TCP-forward denial is enforced one layer
+down by virp-netclaw-egress.service (nft: uid 993 may not originate IP
+connections; established inbound ssh exempt via ct state). Re-proven after
+the change: streamlocal to onode.sock works; TCP forward → "Connection
+refused" (nft counter incremented); shell/PTY → "account not available".
+The authorized_keys entry keeps `restrict,port-forwarding,from="10.0.30.30"`.
+
 ## Incident 2026-08-01 — daemon down 05:19–07:09 UTC (malformed autopilot.env)
 
 **Duration:** 1h 50m. **Successful starts in the window: 0** — this was a
