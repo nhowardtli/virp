@@ -107,6 +107,12 @@ extern void virp_driver_librenms_init(void);
 #include <curl/curl.h>
 #endif
 #endif
+#ifdef VIRP_DRIVER_ZAMMAD
+extern void virp_driver_zammad_init(void);
+#if !defined(VIRP_DRIVER_WAZUH) && !defined(VIRP_DRIVER_LIBRENMS)
+#include <curl/curl.h>
+#endif
+#endif
 #ifdef VIRP_DRIVER_JUNIPER
 extern void virp_driver_juniper_init(void);
 #endif
@@ -145,6 +151,7 @@ static virp_vendor_t vendor_from_string(const char *s)
     if (strcmp(s, "cisco_asa") == 0) return VIRP_VENDOR_CISCO_ASA;
     if (strcmp(s, "wazuh") == 0)     return VIRP_VENDOR_WAZUH;
     if (strcmp(s, "librenms") == 0)  return VIRP_VENDOR_LIBRENMS;
+    if (strcmp(s, "zammad") == 0)    return VIRP_VENDOR_ZAMMAD;
     if (strcmp(s, "mock") == 0)      return VIRP_VENDOR_MOCK;
     return VIRP_VENDOR_UNKNOWN;
 }
@@ -364,9 +371,13 @@ int main(int argc, char **argv)
     printf("  Copyright (c) 2026 Third Level IT LLC\n");
     printf("================================================================\n\n");
 
-#ifdef VIRP_DRIVER_WAZUH
+#if defined(VIRP_DRIVER_WAZUH) || defined(VIRP_DRIVER_LIBRENMS) || \
+    defined(VIRP_DRIVER_ZAMMAD)
     /* curl_global_init must be called before any CURL easy handles.
-     * Must happen before driver init since connect() creates handles. */
+     * Must happen before driver init since connect() creates handles.
+     * Guarded on EVERY libcurl-backed driver, not just Wazuh — a
+     * LIBRENMS=1 or ZAMMAD=1 build without WAZUH=1 was leaving libcurl
+     * to initialize itself lazily on the first curl_easy_init(). */
     curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
 
@@ -395,6 +406,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_LIBRENMS
     virp_driver_librenms_init();
+#endif
+#ifdef VIRP_DRIVER_ZAMMAD
+    virp_driver_zammad_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 

@@ -79,6 +79,13 @@ extern void virp_driver_pbs_init(void);
 #include <curl/curl.h>
 #endif
 #endif
+#ifdef VIRP_DRIVER_ZAMMAD
+extern void virp_driver_zammad_init(void);
+#if !defined(VIRP_DRIVER_WAZUH) && !defined(VIRP_DRIVER_LIBRENMS) && \
+    !defined(VIRP_DRIVER_PBS)
+#include <curl/curl.h>
+#endif
+#endif
 
 static void signal_handler(int sig)
 {
@@ -126,6 +133,7 @@ static virp_vendor_t vendor_from_string(const char *s)
     if (strcmp(s, "wazuh") == 0)     return VIRP_VENDOR_WAZUH;
     if (strcmp(s, "librenms") == 0)  return VIRP_VENDOR_LIBRENMS;
     if (strcmp(s, "pbs") == 0)       return VIRP_VENDOR_PBS;
+    if (strcmp(s, "zammad") == 0)    return VIRP_VENDOR_ZAMMAD;
     if (strcmp(s, "mock") == 0)      return VIRP_VENDOR_MOCK;
     return VIRP_VENDOR_UNKNOWN;
 }
@@ -550,6 +558,14 @@ int load_devices(onode_state_t *state, const char *path)
                         sizeof(device.tls_fingerprint));
         json_get_string(dev_obj, "datastore_allow", device.datastore_allow,
                         sizeof(device.datastore_allow));
+        /*
+         * write_ops_allow (Zammad): the typed write operations THIS
+         * device may execute. Absent → empty → no writes, which is the
+         * safe default and the read-only entry's configuration. There is
+         * deliberately no "allow all" spelling.
+         */
+        json_get_string(dev_obj, "write_ops_allow", device.write_ops_allow,
+                        sizeof(device.write_ops_allow));
         json_get_string(dev_obj, "tls_servername", device.tls_servername,
                         sizeof(device.tls_servername));
 
@@ -787,7 +803,15 @@ int main(int argc, char **argv)
     printf("  Copyright (c) 2026 Third Level IT LLC\n");
     printf("================================================================\n\n");
 
-#ifdef VIRP_DRIVER_WAZUH
+/*
+ * curl_global_init() for EVERY libcurl-backed driver, not just Wazuh.
+ * This was #ifdef VIRP_DRIVER_WAZUH alone, so a build with LIBRENMS=1,
+ * PBS=1 or ZAMMAD=1 and no WAZUH=1 left libcurl to initialize itself
+ * lazily inside the first curl_easy_init(). Modern libcurl tolerates
+ * that; relying on it is still a race the daemon does not need to run.
+ */
+#if defined(VIRP_DRIVER_WAZUH) || defined(VIRP_DRIVER_LIBRENMS) || \
+    defined(VIRP_DRIVER_PBS)   || defined(VIRP_DRIVER_ZAMMAD)
     curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
 
@@ -819,6 +843,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_PBS
     virp_driver_pbs_init();
+#endif
+#ifdef VIRP_DRIVER_ZAMMAD
+    virp_driver_zammad_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 
