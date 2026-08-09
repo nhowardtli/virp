@@ -150,15 +150,30 @@ fourth installed artifact class. Proposed, not implemented.
 knowledge of how the Aug-6 install was done, because that was done by
 hand and left no script.
 
-There are **three artifact classes**. A deploy that moves only the first
+There are **four artifact classes**. A deploy that moves only the first
 is incomplete, and the third can change behaviour with no code change at
 all:
 
 | class | what | installed by |
 |---|---|---|
 | 1. daemon binary + helper scripts + autopilot Python | `virp-onode-prod`, `render-devices.sh`, `config-backup-access.sh`, `evidence-access.sh`, `autopilot/*.py` | `make install-prod` |
-| 2. systemd unit | `/etc/systemd/system/virp-onode.service` | `make install-units` |
-| 3. optional drop-ins | e.g. the Wazuh lab TLS drop-in | `make install-wazuh-lab-dropin` (never automatic) |
+| 2. **client** | `virp-tool` + its `virp` alias, at `/usr/local/lib/virp/` | `make install-prod` |
+| 3. systemd unit | `/etc/systemd/system/virp-onode.service` | `make install-units` |
+| 4. optional drop-ins | e.g. the Wazuh lab TLS drop-in | `make install-wazuh-lab-dropin` (never automatic) |
+
+Class 2 was added 2026-08-09. `virp_autopilot.py` shells out to the
+client every cycle and previously did so at `/opt/virp/build/virp-tool`,
+inside the source worktree, so a `make clean` in the checkout took
+collection down — see "Chain gap 2026-08-09" above. It is now installed
+and captured like everything else.
+
+**One build-tree reference remains, deliberately.**
+`virp_autopilot.py`'s `PEER_CMD_CHAIN_HEAD` still names
+`/opt/virp/build/virp-tool` because that command runs on **virp-node2**
+and is exact-matched by the Linux gate allowlist
+(`src/drivers/driver_linux.c`). Moving it requires node2 updated, the
+gate row changed and `tests/test_driver_linux_gate.c` updated in the
+same window, or the peer check classifies RED and is blocked. Deferred.
 
 A `systemctl restart` on its own deploys **nothing** — it re-executes the
 installed binary. Nothing is deployed until step 4/5 below.

@@ -57,7 +57,18 @@ import time
 
 ONODE_SOCKET = "/run/virp/onode.sock"
 OKEY_PATH    = "/etc/virp/keys/onode.key"
-VIRP_TOOL    = "/opt/virp/build/virp-tool"
+# Installed path, NOT the build tree. This used to be
+# /opt/virp/build/virp-tool — a build artifact inside the source
+# checkout — so a `make clean` during a deploy deleted it and took
+# collection down for two cycles (DEPLOYED.md, "Chain gap
+# 2026-08-09"). `make install-prod` installs it alongside the daemon.
+#
+# NOTE: PEER_CMD_CHAIN_HEAD below still names the build-tree path
+# deliberately. That command runs on virp-node2 and is exact-matched
+# by the Linux gate allowlist (src/drivers/driver_linux.c), so moving
+# it needs node2 updated and the gate row changed in the same window
+# or the peer check classifies RED and is blocked.
+VIRP_TOOL    = "/usr/local/lib/virp/virp-tool"
 CHAIN_DB     = "/var/lib/virp/chain.db"
 STATE_DIR    = "/var/lib/virp/autopilot"
 ALERTS_FILE  = os.path.join(STATE_DIR, "alerts.jsonl")

@@ -1048,14 +1048,24 @@ VIRP_INSTALL_SCRIPTS = deploy/render-devices.sh \
 # what the next hourly timer ran. autopilot/ is self-contained — each
 # entry point does sys.path.insert(0, dirname(__file__)) and imports only
 # virp_autopilot — so installing the directory wholesale is sufficient.
+# The client. virp_autopilot.py shells out to it every cycle, and until
+# 2026-08-09 it did so at /opt/virp/build/virp-tool — a build artifact
+# INSIDE the source worktree. An ordinary `make clean` in the checkout
+# deleted it and took collection down for two cycles (see DEPLOYED.md,
+# "Chain gap 2026-08-09"). It is a production dependency and belongs at
+# an installed path like every other one.
+VIRP_INSTALL_TOOL   = $(VIRP_INSTALL_DIR)/virp-tool
+VIRP_INSTALL_TOOL_ALIAS = $(VIRP_INSTALL_DIR)/virp
+
 VIRP_INSTALL_PY_DIR = $(VIRP_INSTALL_DIR)/autopilot
 VIRP_INSTALL_PY     = autopilot/virp_autopilot.py \
                       autopilot/virp_config_backup.py \
                       autopilot/virp_evidence.py
 
 .PHONY: install-prod
-install-prod: prod deploy-capture
+install-prod: prod $(TOOL_BIN) deploy-capture
 	@test -f $(ONODE_PROD) || { echo "FAIL: $(ONODE_PROD) was not built"; exit 1; }
+	@test -f $(TOOL_BIN) || { echo "FAIL: $(TOOL_BIN) was not built"; exit 1; }
 	@st=$$(git status --porcelain 2>/dev/null); \
 	 if [ -n "$$st" ]; then \
 	     echo "FAIL: refusing to install from a dirty tree — what gets deployed"; \
@@ -1066,6 +1076,8 @@ install-prod: prod deploy-capture
 	@echo "=== installing to $(VIRP_INSTALL_DIR) (outside any worktree) ==="
 	install -d -m 0755 $(VIRP_INSTALL_DIR)
 	install -m 0755 $(ONODE_PROD) $(VIRP_INSTALL_BIN)
+	install -m 0755 $(TOOL_BIN) $(VIRP_INSTALL_TOOL)
+	ln -f $(VIRP_INSTALL_TOOL) $(VIRP_INSTALL_TOOL_ALIAS)
 	install -m 0755 $(VIRP_INSTALL_SCRIPTS) $(VIRP_INSTALL_DIR)/
 	install -d -m 0755 $(VIRP_INSTALL_PY_DIR)
 	install -m 0644 $(VIRP_INSTALL_PY) $(VIRP_INSTALL_PY_DIR)/
@@ -1086,6 +1098,7 @@ deploy-record:
 	@echo "- **Tree at install**: clean (\`git status --porcelain\` empty)"
 	@echo "- **Installed binary**: \`$(VIRP_INSTALL_BIN)\`"
 	@echo "- **sha256**: \`$$(sha256sum $(VIRP_INSTALL_BIN) | awk '{print $$1}')\`"
+	@echo "- **sha256** \`$(VIRP_INSTALL_TOOL)\`: \`$$(sha256sum $(VIRP_INSTALL_TOOL) | awk '{print $$1}')\`"
 	@for s in $(VIRP_INSTALL_SCRIPTS); do \
 	    b=$$(basename $$s); \
 	    echo "- **sha256** \`$(VIRP_INSTALL_DIR)/$$b\`: \`$$(sha256sum $(VIRP_INSTALL_DIR)/$$b | awk '{print $$1}')\`"; \
@@ -1133,6 +1146,7 @@ deploy-capture:
 	 install -d -m 0700 $$dst; \
 	 echo "=== capturing current install -> $$dst ==="; \
 	 for f in $(VIRP_INSTALL_BIN) \
+	          $(VIRP_INSTALL_TOOL) \
 	          $(VIRP_INSTALL_DIR)/render-devices.sh \
 	          $(VIRP_INSTALL_DIR)/config-backup-access.sh \
 	          $(VIRP_INSTALL_DIR)/evidence-access.sh \
@@ -1264,6 +1278,10 @@ rollback-prod:
 	@if [ -f "$(ROLLBACK_FROM)/virp-onode-prod" ]; then \
 	     install -m 0755 "$(ROLLBACK_FROM)/virp-onode-prod" $(VIRP_INSTALL_BIN); \
 	     echo "  restored $(VIRP_INSTALL_BIN)"; fi
+	@if [ -f "$(ROLLBACK_FROM)/virp-tool" ]; then \
+	     install -m 0755 "$(ROLLBACK_FROM)/virp-tool" $(VIRP_INSTALL_TOOL); \
+	     ln -f $(VIRP_INSTALL_TOOL) $(VIRP_INSTALL_TOOL_ALIAS); \
+	     echo "  restored $(VIRP_INSTALL_TOOL)"; fi
 	@for b in render-devices.sh config-backup-access.sh evidence-access.sh netclaw-access.sh; do \
 	     if [ -f "$(ROLLBACK_FROM)/$$b" ]; then \
 	         install -m 0755 "$(ROLLBACK_FROM)/$$b" $(VIRP_INSTALL_DIR)/$$b; \
