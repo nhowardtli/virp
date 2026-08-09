@@ -22,7 +22,6 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_driver.h"
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -574,10 +573,24 @@ static virp_error_t linux_health_check(virp_conn_t *conn)
  *      double-quoted argument, nothing before or after. Two or more -c
  *      flags are RED unconditionally (a multi-command sequence is a
  *      config session, not an observation).
- *   3. Whitespace runs are collapsed and keywords matched
- *      case-insensitively, but abbreviations are NOT expanded: FRR's
- *      parser would accept "sh ip os nei", this table does not — an
- *      unlisted spelling falls through RED, fail closed.
+ *   3. Whitespace runs are collapsed (the same equivalence
+ *      virp_canonicalize_command() applies before the v2 command hash
+ *      is signed), but keywords are matched CASE-SENSITIVELY and
+ *      abbreviations are NOT expanded: FRR's parser would accept
+ *      "SHOW VERSION" and "sh ip os nei", this table accepts neither —
+ *      an unlisted spelling falls through RED, fail closed.
+ *
+ *      Case-folding here was the 2026-08-09 classified≠executed bug:
+ *      `VTYSH -C "SHOW IP OSPF"` classified GREEN on the lowercased
+ *      copy while the driver executed the ORIGINAL bytes, so the gate
+ *      signed a GREEN execution of a string it never actually
+ *      classified. The invariant is: the exact byte string that was
+ *      classified is the exact byte string that executes, or nothing
+ *      executes (classifier equivalence may not exceed the equivalence
+ *      the signed command hash itself collapses — whitespace runs
+ *      only). Do NOT restore tolower() here, and do NOT "fix" a case
+ *      mismatch by canonicalizing before execution — rewriting the
+ *      executed bytes is the same bug in the other direction.
  *
  * Rows (on the vtysh argument):
  *   GREEN  — show <rest>, rest limited to [a-z0-9 ./-]
@@ -607,7 +620,9 @@ static const char *const REASON_MULTI_C =
 static const char *const REASON_VTYSH_FORM =
     "malformed vtysh invocation — expected exactly: vtysh -c \"<command>\"";
 
-/* Collapse whitespace runs, trim, lowercase. Returns -1 if too long. */
+/* Collapse whitespace runs and trim — case is PRESERVED (see the
+ * classified≠executed note in the table header). Returns -1 if too
+ * long. */
 static int linux_gate_canon(const char *in, char *out, size_t out_len)
 {
     size_t j = 0;
@@ -624,7 +639,7 @@ static int linux_gate_canon(const char *in, char *out, size_t out_len)
         }
         last_was_space = 0;
         if (j + 1 >= out_len) return -1;
-        out[j++] = (char)tolower((unsigned char)c);
+        out[j++] = c;
     }
     while (j > 0 && out[j - 1] == ' ') j--;
     out[j] = '\0';

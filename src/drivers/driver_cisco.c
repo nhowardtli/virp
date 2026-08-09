@@ -490,6 +490,15 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
  * These are prefix-matched (case-insensitive).  Any command that starts
  * with one of these strings is rejected outright — no SSH, no approval
  * queue, no code path.
+ *
+ * DELIBERATELY still case-insensitive after the 2026-08-09
+ * classified≠executed fix made the tier table exact-match: this is a
+ * DENY list, and over-matching a deny list is the fail-closed
+ * direction. "RELOAD" must stay BLACK (unapprovable, never
+ * transmitted), not fall through to RED-by-absence where the
+ * propose/approve path could in principle reach it. Nothing matched
+ * here ever executes, so the invariant "the classified bytes are the
+ * executed bytes" is untouched by the wider match.
  * ========================================================================= */
 
 static const char *CISCO_BLACK_COMMANDS[] = {
@@ -521,7 +530,11 @@ bool cisco_is_black_tier(const char *command)
 /* =========================================================================
  * Gate classifier — SHARED CORE for classic IOS and IOS-XE
  *
- * Longest-prefix match, case-insensitive. FAIL-CLOSED: unmatched -> RED.
+ * Longest-prefix match, CASE-SENSITIVE (2026-08-09: the driver executes
+ * the caller's original bytes, so the classifier may not vouch for any
+ * spelling it did not literally see — "SHOW VERSION" is not "show
+ * version" and falls through RED, exactly as abbreviations already
+ * did). FAIL-CLOSED: unmatched -> RED.
  * BLACK is handled separately by cisco_is_black_tier() and is NOT in this
  * table. The XE-delta table is intentionally empty for now — cisco_ios and
  * cisco_iosxe share this core until shadow evidence justifies a delta.
@@ -660,7 +673,7 @@ virp_trust_tier_t cisco_gate_tier(const char *command)
     size_t best_len = 0;
     for (size_t i = 0; i < CISCO_GATE_TABLE_SIZE; i++) {
         size_t plen = strlen(CISCO_GATE_TABLE[i].prefix);
-        if (strncasecmp(command, CISCO_GATE_TABLE[i].prefix, plen) != 0)
+        if (strncmp(command, CISCO_GATE_TABLE[i].prefix, plen) != 0)
             continue;
 
         /*

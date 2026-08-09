@@ -194,6 +194,21 @@ static void test_ordering_and_boundary(void)
     TEST("null command -> RED (fail closed)");
     assert(pa_route_command(NULL) == VIRP_TIER_RED);   /* fail closed */
     PASS();
+
+    /* REGRESSION (2026-08-09): matching is case-sensitive now — the
+     * driver executes the caller's ORIGINAL bytes, so the table may not
+     * vouch for a spelling it did not literally see. */
+    TEST("SHOW SYSTEM INFO -> RED (case variant is unlisted)");
+    assert(pa_route_command("SHOW SYSTEM INFO") == VIRP_TIER_RED);
+    PASS();
+
+    TEST("Show system info -> RED");
+    assert(pa_route_command("Show system info") == VIRP_TIER_RED);
+    PASS();
+
+    TEST("show system info (control, exact case) -> GREEN");
+    assert(pa_route_command("show system info") == VIRP_TIER_GREEN);
+    PASS();
 }
 
 

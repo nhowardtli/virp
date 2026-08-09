@@ -134,7 +134,21 @@ virp_trust_tier_t asa_route_command(const char *command)
 
     for (size_t i = 0; i < ASA_ROUTE_TABLE_SIZE; i++) {
         size_t plen = strlen(ASA_ROUTE_TABLE[i].command_pattern);
-        if (strncasecmp(command, ASA_ROUTE_TABLE[i].command_pattern, plen) != 0)
+        /*
+         * 2026-08-09 classified≠executed fix: tier rows match
+         * CASE-SENSITIVELY — the driver executes the caller's original
+         * bytes, so the table may not vouch for a spelling it did not
+         * literally see; "SHOW VERSION" falls through RED by absence.
+         * BLACK rows alone stay case-insensitive: they are a DENY
+         * list, over-matching is the fail-closed direction there
+         * ("RELOAD" must stay unapprovable BLACK, and nothing matched
+         * BLACK ever executes, so the invariant is untouched).
+         */
+        bool is_black = (ASA_ROUTE_TABLE[i].tier == VIRP_TIER_BLACK);
+        int cmp = is_black
+            ? strncasecmp(command, ASA_ROUTE_TABLE[i].command_pattern, plen)
+            : strncmp(command, ASA_ROUTE_TABLE[i].command_pattern, plen);
+        if (cmp != 0)
             continue;
 
         /*

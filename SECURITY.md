@@ -665,6 +665,30 @@ disagree. **Intended future shape:** a per-driver allowlist of pipe
 validated after the pipe, so filters are permitted and `| save`, `| tee`
 or a shell pipe remain refused. Not implemented.
 
+**Classified-equals-executed invariant (2026-08-09).** **[tested]** The
+exact byte string that was classified is the exact byte string that
+executes, or nothing executes. An agent test run found the classifiers
+canonicalizing case for matching (`strncasecmp` / `tolower`) while the
+drivers executed the caller's ORIGINAL bytes: `VTYSH -C "SHOW IP OSPF"`
+classified GREEN on a lowercased copy and the gate then signed a GREEN
+execution of a string it never classified. Every driver tier table now
+matches **case-sensitively** (linux/vtysh, cisco, asa, juniper,
+fortigate, panos — the whole class was swept, not just the reported
+path); a case variant is an unlisted spelling and falls through to the
+fail-closed tier with a signed refusal, exactly as abbreviations always
+have. Two deliberate boundaries of the invariant: (1) whitespace runs
+remain the ONE equivalence classifiers may collapse, because it is the
+same equivalence `virp_canonicalize_command()` applies before the v2
+command hash is signed — classifier equivalence never exceeds what the
+signed hash itself collapses (pinned by
+`test_case_variant_command_hash_rejected` in `tests/test_obs_v2.c`);
+(2) BLACK deny lists stay case-INSENSITIVE on purpose — over-matching a
+deny list is the fail-closed direction, and nothing matched BLACK ever
+executes. The fix is deliberately NOT canonicalize-before-execute:
+rewriting the executed bytes to match the classified copy is the same
+defect in the other direction. Regression tests in every driver gate
+suite (`test_no_case_folding` and per-suite case blocks).
+
 **Multi-line and config-mode payloads are unsupported through the
 single-command path.** JunOS config sequences (`configure; set ...;
 commit check; commit`), IOS config blocks and any other payload needing

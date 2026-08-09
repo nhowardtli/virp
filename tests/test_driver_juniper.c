@@ -298,6 +298,31 @@ static void test_command_routing(void)
     TEST("null command → RED (fail closed)");
     assert(junos_route_command(NULL) == VIRP_TIER_RED);   /* fail closed */
     PASS();
+
+    /* REGRESSION (2026-08-09): tier rows match case-sensitively now —
+     * the driver executes the caller's ORIGINAL bytes, so the table may
+     * not vouch for a spelling it did not literally see. BLACK rows
+     * alone stay case-insensitive (deny list — over-match is
+     * fail-closed, and BLACK never executes). */
+    TEST("SHOW VERSION → RED (case variant is unlisted)");
+    assert(junos_route_command("SHOW VERSION") == VIRP_TIER_RED);
+    PASS();
+
+    TEST("Show route → RED (case variant of GREEN row)");
+    assert(junos_route_command("Show route") == VIRP_TIER_RED);
+    PASS();
+
+    TEST("REQUEST SYSTEM REBOOT → still BLACK (deny stays insensitive)");
+    assert(junos_route_command("REQUEST SYSTEM REBOOT") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("Request System Zeroize → still BLACK");
+    assert(junos_route_command("Request System Zeroize") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("show version (control, exact case) → GREEN");
+    assert(junos_route_command("show version") == VIRP_TIER_GREEN);
+    PASS();
 }
 
 /* =========================================================================

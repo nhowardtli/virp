@@ -188,7 +188,13 @@ virp_trust_tier_t pa_route_command(const char *command)
      */
     for (size_t i = 0; i < PA_ROUTE_TABLE_SIZE; i++) {
         size_t plen = strlen(PA_ROUTE_TABLE[i].command_pattern);
-        if (strncasecmp(command, PA_ROUTE_TABLE[i].command_pattern, plen) == 0) {
+        /*
+         * 2026-08-09 classified≠executed fix: CASE-SENSITIVE — the
+         * driver executes the caller's original bytes, so this table
+         * may not vouch for a spelling it did not literally see;
+         * "SHOW SYSTEM INFO" falls through RED by absence.
+         */
+        if (strncmp(command, PA_ROUTE_TABLE[i].command_pattern, plen) == 0) {
             /*
              * Layer 3b — the match must END on a token boundary. '\n' was
              * previously accepted as a boundary, which WAS this driver's

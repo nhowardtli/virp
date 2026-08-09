@@ -353,6 +353,53 @@ static void test_command_substitution_rejected(void)
     printf("PASS\n");
 }
 
+/*
+ * REGRESSION (2026-08-09, classified≠executed): the signed record must
+ * bind the EXACT byte string that ran, including case. A case variant
+ * is a different command ("VTYSH -C ..." was classified GREEN on a
+ * lowercased copy while the original casing executed), so an
+ * observation signed for one spelling must never verify against
+ * another. Whitespace runs are the ONE equivalence the hash collapses
+ * (virp_canonicalize_command) — pinned here too, so the boundary of
+ * that equivalence class cannot drift silently in either direction.
+ */
+static void test_case_variant_command_hash_rejected(void)
+{
+    printf("  test_case_variant_command_hash_rejected... ");
+    virp_context_t *ctx = virp_context_new();
+    virp_session_init(ctx, "onode-test");
+    activate_session(ctx, 0xA9);
+
+    uint8_t msg[1024];
+    size_t n = build_obs(ctx, 1, "show clock", msg, sizeof(msg));
+
+    virp_seqstore_t store;
+    assert(virp_seqstore_init(&store, NULL) == VIRP_OK);
+
+    /* Case variant of the signed command: MUST NOT verify. */
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID,
+                                      "SHOW CLOCK", NULL,
+                                      msg, n, 0, &store,
+                                      NULL, NULL, NULL) ==
+           VIRP_ERR_CONTEXT_MISMATCH);
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID,
+                                      "Show clock", NULL,
+                                      msg, n, 0, &store,
+                                      NULL, NULL, NULL) ==
+           VIRP_ERR_CONTEXT_MISMATCH);
+
+    /* Whitespace-run variant: the deliberate canonical equivalence —
+     * verifies, because the hash is over the collapsed form. */
+    assert(virp_verify_observation_v2(ctx, TEST_DEVICE_ID,
+                                      "show   clock", NULL,
+                                      msg, n, 0, &store,
+                                      NULL, NULL, NULL) == VIRP_OK);
+
+    virp_seqstore_destroy(&store);
+    virp_context_destroy(ctx);
+    printf("PASS\n");
+}
+
 static void test_device_substitution_rejected(void)
 {
     printf("  test_device_substitution_rejected... ");
@@ -589,6 +636,7 @@ int main(void)
     test_replay_rejected_across_store_restart();
     test_stale_observation_rejected();
     test_command_substitution_rejected();
+    test_case_variant_command_hash_rejected();
     test_device_substitution_rejected();
     test_cross_session_replay_rejected();
     test_master_key_signature_rejected();
@@ -596,6 +644,6 @@ int main(void)
     test_verify_requires_active_session();
     test_seqstore_eviction_never_hits_own_session();
     test_seqstore_persist_failure_does_not_poison_mark();
-    printf("=== All 14 v2 observation tests passed ===\n");
+    printf("=== All 15 v2 observation tests passed ===\n");
     return 0;
 }

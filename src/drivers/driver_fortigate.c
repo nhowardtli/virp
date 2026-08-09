@@ -669,7 +669,15 @@ virp_trust_tier_t fg_route_command(const char *command)
 
     for (size_t i = 0; i < FG_ROUTE_TABLE_SIZE; i++) {
         size_t plen = strlen(FG_ROUTE_TABLE[i].command_pattern);
-        if (strncasecmp(command, FG_ROUTE_TABLE[i].command_pattern, plen) != 0)
+        /*
+         * 2026-08-09 classified≠executed fix: CASE-SENSITIVE — the
+         * driver executes the caller's original bytes, so this table
+         * may not vouch for a spelling it did not literally see;
+         * "SHOW SYSTEM STATUS" falls through RED by absence. (The
+         * separate FG_BLACK_COMMANDS deny list stays case-insensitive
+         * on purpose — over-matching a deny list is fail-closed.)
+         */
+        if (strncmp(command, FG_ROUTE_TABLE[i].command_pattern, plen) != 0)
             continue;
 
         /*
@@ -705,6 +713,10 @@ virp_trust_tier_t fg_route_command(const char *command)
  *
  * Prefix-matched (case-insensitive).  Any command that starts with
  * one of these strings is rejected outright at the driver level.
+ * Deliberately still case-insensitive after the 2026-08-09 exact-match
+ * fix to the tier table: this is a DENY list, over-matching it is
+ * fail-closed ("EXECUTE REBOOT" stays BLACK), and nothing matched here
+ * ever executes.
  * ══════════════════════════════════════════════════════════════════ */
 
 static const char *FG_BLACK_COMMANDS[] = {
