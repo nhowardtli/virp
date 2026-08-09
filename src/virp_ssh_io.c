@@ -128,12 +128,29 @@ size_t virp_ssh_read_quiescent(const virp_ssh_io_t *io,
 }
 
 /*
+ * What one learning read measured, for the prompt-learn log lines.
+ *
+ * The budgets are logged alongside because of how the read loop
+ * actually applies them: idle_ms starts at zero and is reset only by a
+ * byte arriving, so VIRP_SSH_QUIESCENT_MS is the wait for the FIRST
+ * byte, not just the gap between bytes. A device that stayed silent for
+ * 20 s and a read that stopped listening after 250 ms were previously
+ * the same journal line; these fields keep them distinguishable.
+ */
+typedef struct {
+    const char *reason;   /* "ok", or why the read produced no line */
+    size_t bytes;         /* raw bytes received before the read ended */
+    int    wait_ms;       /* time spent waiting on a quiet channel */
+} learn_read_diag_t;
+
+/*
  * Read to quiescence (not to a prompt — we do not know it yet) and
  * return the last non-empty line, trailing padding removed.
  */
 static virp_error_t read_quiescent_last_line(const virp_ssh_io_t *io,
                                              char *line_out, size_t line_cap,
-                                             size_t *line_len_out)
+                                             size_t *line_len_out,
+                                             learn_read_diag_t *diag)
 {
     char buf[8192];
     size_t total = 0;
@@ -157,23 +174,33 @@ static virp_error_t read_quiescent_last_line(const virp_ssh_io_t *io,
     }
     buf[total] = '\0';
 
-    if (total == 0)
+    diag->bytes = total;
+    diag->wait_ms = spent_ms;
+    diag->reason = "ok";
+
+    if (total == 0) {
+        diag->reason = "silence";
         return VIRP_ERR_NO_PROMPT;
+    }
 
     /* Trim trailing padding and newlines, then take the final line. */
     size_t end = total;
     while (end > 0 && (is_trailing_pad(buf[end - 1]) || buf[end - 1] == '\n'))
         end--;
-    if (end == 0)
+    if (end == 0) {
+        diag->reason = "no-nonblank-line";
         return VIRP_ERR_NO_PROMPT;
+    }
 
     size_t start = end;
     while (start > 0 && buf[start - 1] != '\n' && buf[start - 1] != '\r')
         start--;
 
     size_t len = end - start;
-    if (len == 0 || len >= line_cap)
+    if (len == 0 || len >= line_cap) {
+        diag->reason = len >= line_cap ? "line-too-long" : "no-nonblank-line";
         return VIRP_ERR_NO_PROMPT;
+    }
 
     memcpy(line_out, buf + start, len);
     line_out[len] = '\0';
@@ -193,20 +220,25 @@ virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
     const char *dev = device_label ? device_label : "(unknown)";
 
     /* Anything already buffered is not part of the answer. */
-    virp_ssh_drain(io, dev);
+    size_t drained = virp_ssh_drain(io, dev);
 
     char first[VIRP_SSH_MAX_PROMPT_LEN];
     char second[VIRP_SSH_MAX_PROMPT_LEN];
     size_t first_len = 0, second_len = 0;
+    learn_read_diag_t d1 = {0}, d2 = {0};
 
     if (io->write(io->ctx, "\n", 1) < 0) {
         fprintf(stderr, "[SSH] Prompt learn: write failed (device=%s)\n", dev);
         return VIRP_ERR_NO_PROMPT;
     }
     if (read_quiescent_last_line(io, first, sizeof(first),
-                                 &first_len) != VIRP_OK) {
-        fprintf(stderr, "[SSH] Prompt learn: no reply to probe 1 (device=%s)\n",
-                dev);
+                                 &first_len, &d1) != VIRP_OK) {
+        fprintf(stderr,
+                "[SSH] Prompt learn: probe 1 failed (device=%s reason=%s "
+                "bytes=%zu drained=%zu wait=%dms first-byte-budget=%dms "
+                "total-budget=%dms)\n",
+                dev, d1.reason, d1.bytes, drained, d1.wait_ms,
+                VIRP_SSH_QUIESCENT_MS, VIRP_SSH_LEARN_TIMEOUT_MS);
         return VIRP_ERR_NO_PROMPT;
     }
 
@@ -215,9 +247,13 @@ virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
         return VIRP_ERR_NO_PROMPT;
     }
     if (read_quiescent_last_line(io, second, sizeof(second),
-                                 &second_len) != VIRP_OK) {
-        fprintf(stderr, "[SSH] Prompt learn: no reply to probe 2 (device=%s)\n",
-                dev);
+                                 &second_len, &d2) != VIRP_OK) {
+        fprintf(stderr,
+                "[SSH] Prompt learn: probe 2 failed (device=%s reason=%s "
+                "bytes=%zu drained=%zu wait=%dms first-byte-budget=%dms "
+                "total-budget=%dms)\n",
+                dev, d2.reason, d2.bytes, drained, d2.wait_ms,
+                VIRP_SSH_QUIESCENT_MS, VIRP_SSH_LEARN_TIMEOUT_MS);
         return VIRP_ERR_NO_PROMPT;
     }
 
@@ -228,8 +264,13 @@ virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
      */
     if (first_len != second_len || memcmp(first, second, first_len) != 0) {
         fprintf(stderr,
-                "[SSH] Prompt learn: unconfirmed (device=%s '%s' != '%s')\n",
-                dev, first, second);
+                "[SSH] Prompt learn: unconfirmed (device=%s '%s' != '%s' "
+                "probe1-bytes=%zu probe1-wait=%dms probe2-bytes=%zu "
+                "probe2-wait=%dms drained=%zu first-byte-budget=%dms "
+                "total-budget=%dms)\n",
+                dev, first, second, d1.bytes, d1.wait_ms, d2.bytes,
+                d2.wait_ms, drained,
+                VIRP_SSH_QUIESCENT_MS, VIRP_SSH_LEARN_TIMEOUT_MS);
         return VIRP_ERR_NO_PROMPT;
     }
 
@@ -238,8 +279,13 @@ virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
     out->prompt_len = first_len;
     out->learned = true;
 
-    fprintf(stderr, "[SSH] Prompt learned: device=%s prompt='%s'\n",
-            dev, out->prompt);
+    fprintf(stderr,
+            "[SSH] Prompt learned: device=%s prompt='%s' "
+            "probe1-bytes=%zu probe1-wait=%dms probe2-bytes=%zu "
+            "probe2-wait=%dms drained=%zu first-byte-budget=%dms "
+            "total-budget=%dms\n",
+            dev, out->prompt, d1.bytes, d1.wait_ms, d2.bytes, d2.wait_ms,
+            drained, VIRP_SSH_QUIESCENT_MS, VIRP_SSH_LEARN_TIMEOUT_MS);
     return VIRP_OK;
 }
 
