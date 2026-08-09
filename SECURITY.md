@@ -307,16 +307,39 @@ LibreNMS on a five-minute cycle, 1,935 of 51,120 observation entries in
 the live chain — and requiring a body would fail every one of them
 closed at the first restart after deploy.
 
-Why that is not a signature bypass: registering a hash-only entry buys
-an entry with no body, and every reader grades a body-less observation
-UNVERIFIABLE rather than verified. An attacker gets an unverifiable
-row, not a forged observation — the same grade a legitimate oversized
-LibreNMS entry gets. *[tested — `tests/test_onode.c`
+Why that is not a signature bypass — stated at the level it is
+actually true. The PER-ENTRY FIELD is honest: a body-less observation
+grades `obs_hmac = UNVERIFIABLE`, never PASS, so an attacker who
+registers a hash gets an unverifiable row rather than a forged
+observation, the same grade a legitimate oversized LibreNMS entry gets.
+
+**The report roll-up does NOT currently carry that through, and this
+rationale must not be read as claiming it does.**
+`EntryVerification.ok` is `FAIL not in (...)`, and UNVERIFIABLE is not
+FAIL, so a commitment-only entry reports `ok = True`, is omitted from
+`summarize()`'s `failed_entries`, and is rendered as the literal string
+**PASS** by `report/virp_report.py` — for an observation whose
+signature was never checked. Verified on 2026-08-09 against a real
+production entry (`obs:librenms-lab:1786029902471700439`), not only a
+synthetic one.
+
+That is the PASS/UNCHECKED tri-state item from the 2026-08-07 review.
+It is deliberately NOT fixed here: changing `ok()` re-grades
+operator-facing verdicts on tens of thousands of existing entries and
+does not belong in a deploy payload assembled for something else. Until
+it is fixed, "the reader grades it UNVERIFIABLE" is true of the field
+and false of the PDF, and an operator reading a report cannot
+distinguish a verified observation from a commitment-only one.
+
+*[tested — `tests/test_onode.c`
 `test_chain_append_commitment_only_observation_accepted` and
 `..._empty_body_accepted` drive both no-body shapes through the real
-handler; `tests/test_commitment_only_grading.py` pins the grade at
-UNVERIFIABLE and asserts it is not PASS, for a legitimate and an
-invented commitment alike]*
+handler. `tests/test_commitment_only_grading.py` pins the FIELD at
+UNVERIFIABLE for a legitimate and an invented commitment alike, and
+pins the ROLL-UP GAP as an `expectedFailure`
+(`test_KNOWN_GAP_bodyless_entry_still_rolls_up_as_ok`) so that fixing
+`ok()` turns it into an unexpected success and fails the suite —
+forcing this wording to be revisited rather than left stale]*
 
 The residue is real and stated: a caller can still write an arbitrary
 hash under `artifact_type: observation`. Closing that needs a
@@ -381,6 +404,39 @@ need the same verify-side grace window at its own key rotation** — the
 obskey has exactly the mint-then-register-later shape that made this
 necessary for the O-Key, so design it in rather than rediscovering it.
 
+### Known benign artifact_bind mismatch — `obs:pbs-lab:1785538992`
+
+One entry in the production chain reports an artifact-binding mismatch
+for a reason that is NOT tampering, and anyone comparing verifier output
+before and after a deploy should know about it before chasing it.
+
+Measured read-only on 2026-08-09. Exactly one `artifact_id` appears on
+two chain entries — `obs:pbs-lab:1785538992`, session
+`virp-cli:pbs-lab`, sequences 0 and 1, minted 185 ms apart:
+
+| entry | commits to |
+|---|---|
+| seq 0 | `5f109f05…` |
+| seq 1 | `1b5550cb…` |
+| the single stored body hashes to | `1b5550cb…` — **seq 1 only** |
+
+The artifact store is keyed by `artifact_id`, so both entries resolve to
+one body, and that body satisfies seq 1's commitment. **Seq 0 therefore
+looks up a body that is not the one it committed to** and grades as a
+hash mismatch. The cause is the second-resolution artifact id — see the
+comment above `virp_chain.c`'s id construction — which two observations
+inside the same second collided on. It is a naming collision, not
+evidence of alteration: seq 0's own bytes were displaced, not modified.
+
+This also accounts for the only residue in the entry/body arithmetic:
+55,245 entries = 2,078 with no stored body + 53,167 with one, while the
+`artifacts` table holds 53,166 rows. The extra one is this shared body.
+There are no orphaned artifact rows and no duplicate artifact rows.
+
+Not fixed here. Re-registering seq 0's body is not possible (the bytes
+are gone) and rewriting chain history to drop the entry is worse than
+the mismatch. Recorded so it is recognised rather than re-investigated.
+
 ### Grace-verified entries are not marked in the chain — decided
 
 An entry whose observation verified under the PREVIOUS key is
@@ -399,7 +455,12 @@ than re-litigated:
 - **The alternative is a chain-format change.** Recording which key
   verified would mean a new field inside the HMAC'd canonical object,
   which changes the canonical form for every entry and breaks
-  comparability with the 51,120 already written. That belongs with the
+  comparability with every entry already written — **55,245 chain
+  entries as of 2026-08-09, of which 51,948 are observations** (an
+  earlier revision of this section cited 51,120 as the entry count; that
+  was the OBSERVATION count at the time, not the total, and the chain
+  grows every five-minute cycle, so treat both numbers as a dated
+  measurement rather than a constant). That belongs with the
   `commitment_mode` and provenance work in a deliberate chain-format
   window, not bolted on during a rotation fix.
 - **The exposure it would document is already bounded** by the window

@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
-"""Q1(c)(i) evidence: a commitment-only observation is UNVERIFIABLE.
+"""Q1(c)(i) evidence: commitment-only observations, FIELD vs ROLL-UP.
 
-chain_append GATE 3 (src/virp_onode.c:2484) does not run when no body is
-submitted — there are no bytes to check a signature over — so a caller
-CAN register an entry that commits to a hash alone. This test pins the
-reason that is not a signature bypass: what such a caller obtains is an
-entry every reader grades UNVERIFIABLE, never one that reports as a
-verified observation.
+chain_append GATE 3 (src/virp_onode.c:2548, inside the body-present
+branch at :2548) does not run when no body is submitted — there are no
+bytes to check a signature over — so a caller CAN register an entry
+that commits to a hash alone.
 
-If this ever starts returning PASS for a body-less observation, the
-commitment-only decision documented in SECURITY.md has silently become
-a real bypass and GATE 3 must start requiring a body.
+The two levels answer differently, and the tests below are split to
+match:
+
+  FIELD    — v.obs_hmac is UNVERIFIABLE, never PASS. Correct, and what
+             the SECURITY.md rationale for accepting commitment-only
+             appends rests on.
+  ROLL-UP  — v.ok is TRUE anyway, because it is `FAIL not in (...)` and
+             UNVERIFIABLE is not FAIL. So the entry is excluded from
+             summarize()'s failed_entries and rendered as the literal
+             string PASS by virp_report.py. That is a real gap, pinned
+             here as an expected failure rather than argued away.
+
+If the FIELD assertions ever start returning PASS for a body-less
+observation, the commitment-only decision has silently become a real
+bypass and GATE 3 must start requiring a body.
 """
+import hashlib
 import os
 import sys
 import unittest
@@ -60,6 +71,66 @@ class TestCommitmentOnlyGrading(unittest.TestCase):
                                 okey, None, None)
         self.assertEqual(v.obs_hmac, verify.UNVERIFIABLE)
         self.assertNotEqual(v.obs_hmac, verify.PASS)
+
+    # -----------------------------------------------------------------
+    # The scope line of everything above: they bind the per-entry FIELD.
+    # The roll-up is a different question, and it currently answers it
+    # the other way.
+    # -----------------------------------------------------------------
+
+    def _well_formed_bodyless_entry(self):
+        """A commitment-only observation whose OTHER checks all pass, so
+        nothing else masks what the roll-up does. Self-contained: the
+        entry hash is computed with verify's own canonical_json, so this
+        needs no chain database."""
+        e = self._entry("obs:librenms:oversized")
+        e["previous_entry_hash"] = "d" * 64
+        e["chain_entry_hash"] = hashlib.sha256(
+            verify.canonical_json(e).encode()).hexdigest()
+        return e
+
+    @unittest.expectedFailure
+    def test_KNOWN_GAP_bodyless_entry_still_rolls_up_as_ok(self):
+        """DOCUMENTS A KNOWN GAP. Expected to FAIL until the roll-up
+        gains a tri-state.
+
+        `EntryVerification.ok` is `FAIL not in (...)`, so UNVERIFIABLE
+        and UNCHECKED both pass through as "not a failure". A
+        commitment-only observation therefore reports ok=True, is left
+        out of summarize()'s failed_entries, and is rendered as the
+        literal string PASS in the generated PDF — for an observation
+        whose signature was never checked, because there were no bytes
+        to check.
+
+        Reproduced against a real production entry
+        (obs:librenms-lab:1786029902471700439) on 2026-08-09, not only
+        this synthetic one.
+
+        This is the PASS/UNCHECKED tri-state item from the 2026-08-07
+        review. Fixing it changes operator-facing verdicts on tens of
+        thousands of existing entries and is deliberately NOT bundled
+        into an unrelated deploy payload.
+
+        WHEN THAT IS FIXED this test will report an unexpected success,
+        which unittest treats as a failing run — that is the point. Drop
+        the decorator then, and tighten the SECURITY.md rationale, which
+        currently has to say the report renders PASS.
+        """
+        okey = bytes(range(32))
+        e = self._well_formed_bodyless_entry()
+        v = verify.verify_entry(e, None, okey, None, e["previous_entry_hash"])
+
+        # Preconditions: nothing but the body-less checks is unresolved,
+        # so ok() is answering about exactly this situation.
+        self.assertEqual(v.entry_hash, verify.PASS)
+        self.assertEqual(v.link, verify.PASS)
+        self.assertEqual(v.obs_hmac, verify.UNVERIFIABLE)
+
+        # THE GAP: an unverified observation must not roll up as ok.
+        self.assertFalse(
+            v.ok,
+            "commitment-only entry rolled up as ok=True — an observation "
+            "whose signature was never checked reads as PASS in the report")
 
 
 if __name__ == "__main__":
