@@ -129,6 +129,60 @@ static void test_guard_vtysh_form(void)
     PASS();
 }
 
+/*
+ * REGRESSION (2026-08-09): classification was case-insensitive while
+ * execution was case-sensitive — `VTYSH -C "SHOW IP OSPF"` classified
+ * GREEN on a lowercased copy and the driver then executed the ORIGINAL
+ * casing, so the gate signed a GREEN execution of a byte string it
+ * never classified. The invariant now pinned: the exact byte string
+ * that was classified is the exact byte string that executes, or
+ * nothing executes. Case variants of listed rows are unlisted spellings
+ * and fall through RED (blocked → signed refusal), exactly as
+ * abbreviations always have.
+ */
+static void test_no_case_folding(void)
+{
+    printf("\n=== No case folding (classified == executed bytes) ===\n");
+
+    TEST("VTYSH -C \"SHOW IP OSPF\" (the original repro) -> RED");
+    assert_red_blocked("VTYSH -C \"SHOW IP OSPF\"");
+    PASS();
+
+    TEST("uppercase GREEN row: vtysh -c \"SHOW VERSION\" -> RED");
+    assert_red_blocked("vtysh -c \"SHOW VERSION\"");
+    PASS();
+
+    TEST("mixed-case scaffold: VtYsH -c \"show version\" -> RED");
+    assert_red_blocked("VtYsH -c \"show version\"");
+    PASS();
+
+    TEST("uppercase flag: vtysh -C \"show version\" -> RED (form)");
+    assert_red_blocked("vtysh -C \"show version\"");
+    PASS();
+
+    TEST("mixed-case keyword: vtysh -c \"Show version\" -> RED");
+    assert_red_blocked("vtysh -c \"Show version\"");
+    PASS();
+
+    TEST("uppercase rest: vtysh -c \"show IP OSPF\" -> RED (charset)");
+    assert_red_blocked("vtysh -c \"show IP OSPF\"");
+    PASS();
+
+    TEST("uppercase YELLOW row: vtysh -c \"CLEAR IP OSPF NEIGHBOR\" -> RED");
+    assert_red_blocked("vtysh -c \"CLEAR IP OSPF NEIGHBOR\"");
+    PASS();
+
+    TEST("uppercase peer row: SYSTEMCTL IS-ACTIVE virp-onode -> RED");
+    assert_red_blocked("SYSTEMCTL IS-ACTIVE virp-onode");
+    PASS();
+
+    TEST("lowercase originals still classify (control)");
+    assert(linux_gate_tier("vtysh -c \"show ip ospf\"") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("vtysh -c \"clear ip ospf neighbor\"")
+           == VIRP_TIER_YELLOW);
+    PASS();
+}
+
 static void test_no_abbreviation_expansion(void)
 {
     printf("\n=== No abbreviation expansion ===\n");
@@ -163,8 +217,8 @@ static void test_green(void)
     assert(linux_gate_tier("vtysh -c \"show ip route 10.0.0.0/8\"") == VIRP_TIER_GREEN);
     PASS();
 
-    TEST("whitespace runs + keyword case canonicalized -> GREEN");
-    assert(linux_gate_tier("  VTYSH   -c   \"SHOW  IP  OSPF  NEIGHBOR\"  ") == VIRP_TIER_GREEN);
+    TEST("whitespace runs collapsed (case preserved) -> GREEN");
+    assert(linux_gate_tier("  vtysh   -c   \"show  ip  ospf  neighbor\"  ") == VIRP_TIER_GREEN);
     PASS();
 
     TEST("show with out-of-charset rest -> RED");
@@ -299,8 +353,8 @@ static void test_peer_health_rows(void)
            == VIRP_TIER_GREEN);
     PASS();
 
-    TEST("whitespace/case canonicalization still matches -> GREEN");
-    assert(linux_gate_tier("  SYSTEMCTL   IS-ACTIVE   virp-onode ")
+    TEST("whitespace canonicalization still matches (case preserved) -> GREEN");
+    assert(linux_gate_tier("  systemctl   is-active   virp-onode ")
            == VIRP_TIER_GREEN);
     PASS();
 
@@ -446,6 +500,7 @@ int main(void)
 
     test_guard_separators();
     test_guard_vtysh_form();
+    test_no_case_folding();
     test_no_abbreviation_expansion();
     test_green();
     test_yellow();

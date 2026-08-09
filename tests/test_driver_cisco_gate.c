@@ -86,6 +86,28 @@ static void test_red_credential_writes(void)
     TEST("password -> RED");             assert(cisco_gate_tier("password 0 Str0ng") == VIRP_TIER_RED); PASS();
 }
 
+/*
+ * REGRESSION (2026-08-09): tier-table matching was case-insensitive
+ * while the driver executes the caller's ORIGINAL bytes — the gate
+ * could sign an execution of a byte string it never classified. Tier
+ * rows now match case-sensitively: a case variant is an unlisted
+ * spelling and falls through RED, like abbreviations always have.
+ * (cisco_is_black_tier stays case-insensitive on purpose: a DENY list
+ * over-matching is fail-closed, and BLACK never executes —
+ * test_driver_cisco_black.c pins "RELOAD" == BLACK.)
+ */
+static void test_no_case_folding(void)
+{
+    printf("\n=== No case folding (classified == executed bytes) ===\n");
+    TEST("SHOW VERSION -> RED");     assert(cisco_gate_tier("SHOW VERSION") == VIRP_TIER_RED); PASS();
+    TEST("Show version -> RED");     assert(cisco_gate_tier("Show version") == VIRP_TIER_RED); PASS();
+    TEST("sHoW iP rOuTe -> RED");    assert(cisco_gate_tier("sHoW iP rOuTe") == VIRP_TIER_RED); PASS();
+    TEST("SHOW RUNNING-CONFIG -> RED (was YELLOW row)");
+    assert(cisco_gate_tier("SHOW RUNNING-CONFIG") == VIRP_TIER_RED); PASS();
+    TEST("show version (control, exact case) -> GREEN");
+    assert(cisco_gate_tier("show version") == VIRP_TIER_GREEN); PASS();
+}
+
 static void test_fail_closed(void)
 {
     printf("\n=== Fail-closed default ===\n");
@@ -349,6 +371,7 @@ int main(void)
     test_yellow();
     test_red_config_writes();
     test_red_credential_writes();
+    test_no_case_folding();
     test_fail_closed();
     test_promotions();
     test_prefix_safety();

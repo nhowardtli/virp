@@ -248,6 +248,20 @@ static void test_no_match_fails_closed(void)
 
     TEST("NULL command -> RED (fail closed)");
     assert(fg_route_command(NULL) == VIRP_TIER_RED); PASS();
+
+    /* REGRESSION (2026-08-09): tier rows match case-sensitively now —
+     * the driver executes the caller's ORIGINAL bytes, so the table may
+     * not vouch for a spelling it did not literally see. The
+     * FG_BLACK_COMMANDS deny list stays case-insensitive on purpose
+     * (pinned above in test_black_tier_blocked). */
+    TEST("GET SYSTEM STATUS -> RED (case variant is unlisted)");
+    assert(fg_route_command("GET SYSTEM STATUS") == VIRP_TIER_RED); PASS();
+
+    TEST("Get system status -> RED");
+    assert(fg_route_command("Get system status") == VIRP_TIER_RED); PASS();
+
+    TEST("get system status (control, exact case) keeps its tier");
+    assert(fg_route_command("get system status") != VIRP_TIER_RED); PASS();
 }
 
 extern size_t fg_route_table_count(void);

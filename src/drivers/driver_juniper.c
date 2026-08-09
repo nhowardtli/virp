@@ -161,7 +161,22 @@ virp_trust_tier_t junos_route_command(const char *command)
 
     for (size_t i = 0; i < JUNOS_ROUTE_TABLE_SIZE; i++) {
         size_t plen = strlen(JUNOS_ROUTE_TABLE[i].command_pattern);
-        if (strncasecmp(command, JUNOS_ROUTE_TABLE[i].command_pattern, plen) != 0)
+        /*
+         * 2026-08-09 classified≠executed fix: tier rows match
+         * CASE-SENSITIVELY — the driver executes the caller's original
+         * bytes, so the table may not vouch for a spelling it did not
+         * literally see; "SHOW VERSION" falls through RED by absence.
+         * BLACK rows alone stay case-insensitive: they are a DENY
+         * list, over-matching is the fail-closed direction there
+         * ("REQUEST SYSTEM REBOOT" must stay unapprovable BLACK, and
+         * nothing matched BLACK ever executes, so the invariant is
+         * untouched).
+         */
+        bool is_black = (JUNOS_ROUTE_TABLE[i].tier == VIRP_TIER_BLACK);
+        int cmp = is_black
+            ? strncasecmp(command, JUNOS_ROUTE_TABLE[i].command_pattern, plen)
+            : strncmp(command, JUNOS_ROUTE_TABLE[i].command_pattern, plen);
+        if (cmp != 0)
             continue;
 
         /*

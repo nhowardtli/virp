@@ -184,6 +184,31 @@ static void test_command_routing(void)
     TEST("null command → RED (fail closed)");
     assert(asa_route_command(NULL) == VIRP_TIER_RED);   /* fail closed */
     PASS();
+
+    /* REGRESSION (2026-08-09): tier rows match case-sensitively now —
+     * the driver executes the caller's ORIGINAL bytes, so the table may
+     * not vouch for a spelling it did not literally see. BLACK rows
+     * alone stay case-insensitive (deny list — over-match is
+     * fail-closed, and BLACK never executes). */
+    TEST("SHOW VERSION → RED (case variant is unlisted)");
+    assert(asa_route_command("SHOW VERSION") == VIRP_TIER_RED);
+    PASS();
+
+    TEST("Show running-config → RED (case variant of YELLOW row)");
+    assert(asa_route_command("Show running-config") == VIRP_TIER_RED);
+    PASS();
+
+    TEST("RELOAD → still BLACK (deny list stays case-insensitive)");
+    assert(asa_route_command("RELOAD") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("WrItE eRaSe → still BLACK");
+    assert(asa_route_command("WrItE eRaSe") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("show version (control, exact case) → GREEN");
+    assert(asa_route_command("show version") == VIRP_TIER_GREEN);
+    PASS();
 }
 
 /* =========================================================================
