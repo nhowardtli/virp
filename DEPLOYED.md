@@ -45,6 +45,143 @@ are now stale on two counts:
 2. The deployed commit has advanced through the update log below and is now
    `b6e9602c`, not `0c9c7338`.
 
+## Install procedure (written 2026-08-09, before the 8a2a6342 → HEAD deploy)
+
+**Read this whole section before running anything.** It assumes no
+knowledge of how the Aug-6 install was done, because that was done by
+hand and left no script.
+
+There are **three artifact classes**. A deploy that moves only the first
+is incomplete, and the third can change behaviour with no code change at
+all:
+
+| class | what | installed by |
+|---|---|---|
+| 1. daemon binary + helper scripts + autopilot Python | `virp-onode-prod`, `render-devices.sh`, `config-backup-access.sh`, `evidence-access.sh`, `autopilot/*.py` | `make install-prod` |
+| 2. systemd unit | `/etc/systemd/system/virp-onode.service` | `make install-units` |
+| 3. optional drop-ins | e.g. the Wazuh lab TLS drop-in | `make install-wazuh-lab-dropin` (never automatic) |
+
+A `systemctl restart` on its own deploys **nothing** — it re-executes the
+installed binary. Nothing is deployed until step 4/5 below.
+
+### Before you start — configuration actions this payload requires
+
+These come from two commits that change configuration expectations, not
+code behaviour alone. Do them first; both can break a service on restart.
+
+1. **Wazuh TLS (`ef6cfa6c`).** The canonical unit no longer sets
+   `VIRP_WAZUH_INSECURE=1`; the driver now validates the manager's
+   certificate by default. **The unit installed on virp-lab today still
+   sets it, and `wazuh-lab` is a live device in `/run/virp/devices.json`.**
+   So installing the new unit and restarting WILL break Wazuh collection
+   unless you either:
+   - point `VIRP_CA_BUNDLE` at the CA that signed the manager's cert
+     (the real fix), or
+   - `sudo make install-wazuh-lab-dropin` **before** restarting, which
+     restores the insecure setting for this host only and is a
+     deliberate, reversible act.
+2. **API bind guard (`4062610e`).** `api/server.py` now REFUSES TO START
+   on a non-loopback bind with no auth token, where it previously warned.
+   The API is not a systemd service on virp-lab and is not running, so
+   nothing breaks unattended — but anyone who starts it must now set a
+   token, or bind to loopback, or it will exit instead of serving.
+
+### The procedure
+
+1. **Confirm what is live**, so the rollback target is known:
+   ```sh
+   systemctl is-active virp-onode
+   ls -l --time-style=+%F\ %T /usr/local/lib/virp/
+   sha256sum /usr/local/lib/virp/virp-onode-prod
+   ```
+
+2. **Sync and verify the source.** Install refuses a dirty tree, because
+   what is deployed must be exactly what a commit hash names:
+   ```sh
+   cd /opt/virp && git status --porcelain     # must be empty
+   git log --oneline -1                       # record this hash
+   ```
+
+3. **Build and test.** Do not install an untested tree:
+   ```sh
+   make clean && make -j4 && make all-tests
+   ```
+
+4. **Capture, then install classes 1.** `install-prod` depends on
+   `deploy-capture`, so the snapshot happens automatically and cannot be
+   forgotten. It writes `/var/backups/virp/<UTC timestamp>/` with every
+   currently-installed artifact plus a `MANIFEST.sha256`, and points
+   `/var/backups/virp/latest` at it:
+   ```sh
+   sudo make install-prod
+   ```
+   Note the capture path it prints. That is your rollback target.
+
+5. **Install class 2 (the unit)** — separate because it needs
+   `daemon-reload` and changes configuration:
+   ```sh
+   sudo make install-units
+   ```
+   This reloads systemd but does **not** restart. If this host needs the
+   Wazuh drop-in (see above), install it now, before the restart.
+
+6. **Restart, deliberately:**
+   ```sh
+   sudo systemctl restart virp-onode
+   systemctl status virp-onode --no-pager
+   ```
+
+7. **Verify** — this payload makes chain ingestion fail-closed, so watch
+   the thing most likely to break:
+   ```sh
+   journalctl -u virp-onode -n 50 --no-pager
+   journalctl -u virp-onode -f | grep -i 'chain_append REJECTED'
+   ```
+   Registrations should continue at the normal cycle rate. A steady
+   stream of `chain_append REJECTED ... signature verification` means
+   observations are being refused and you should roll back.
+
+8. **Record the deploy** in this file:
+   ```sh
+   make deploy-record        # emits the commit/sha256 stanza; paste it in
+   ```
+
+### Rollback
+
+Rollback is a **copy-back of the captured bytes**, not a rebuild of an
+older commit. It does not depend on the old source still building, on
+the toolchain, or on anyone identifying which commit produced the
+running binary:
+
+```sh
+sudo make rollback-prod ROLLBACK_FROM=/var/backups/virp/latest
+sudo systemctl restart virp-onode
+```
+
+`rollback-prod` verifies the capture against its own `MANIFEST.sha256`
+first and refuses a partial or corrupted capture rather than
+half-restoring. It restores the binary, helper scripts, autopilot Python
+and the unit, reloads systemd, and does not restart on its own.
+
+To undo only the Wazuh drop-in:
+```sh
+sudo rm /etc/systemd/system/virp-onode.service.d/60-wazuh-lab.conf
+sudo systemctl daemon-reload && sudo systemctl restart virp-onode
+```
+
+### What restarts do NOT deploy
+
+Checked 2026-08-09 across every virp unit on virp-lab: no unit has an
+`ExecStartPre` that builds or installs, and `make check-deploy-unit`
+enforces that for `virp-onode.service`. One unit does execute from a
+source worktree — **`virp-broker.service` runs
+`/opt/virp/broker/virp_broker.py` and `ExecStartPre=+/opt/virp/broker/broker-access.sh`
+(as root) directly out of the git checkout.** It does not rebuild, but a
+`git pull` in `/opt/virp` followed by a broker restart changes what the
+broker runs, with no install step. `broker/` is unchanged in this
+payload, so this deploy does not move it — but it is the one path where
+updating the checkout is itself a deploy.
+
 ## Deploy-time record (2026-07-29, historical)
 
 - **Deployed**: 2026-07-29

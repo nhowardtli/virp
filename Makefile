@@ -911,7 +911,7 @@ VIRP_INSTALL_PY     = autopilot/virp_autopilot.py \
                       autopilot/virp_evidence.py
 
 .PHONY: install-prod
-install-prod: prod
+install-prod: prod deploy-capture
 	@test -f $(ONODE_PROD) || { echo "FAIL: $(ONODE_PROD) was not built"; exit 1; }
 	@st=$$(git status --porcelain 2>/dev/null); \
 	 if [ -n "$$st" ]; then \
@@ -951,6 +951,155 @@ deploy-record:
 	    b=$$(basename $$s); \
 	    echo "- **sha256** \`$(VIRP_INSTALL_PY_DIR)/$$b\`: \`$$(sha256sum $(VIRP_INSTALL_PY_DIR)/$$b | awk '{print $$1}')\`"; \
 	 done
+
+# =========================================================================
+# Systemd units, capture and rollback
+#
+# install-prod above covers the binary, the unit's helper scripts and the
+# autopilot Python. It does NOT cover the unit file itself, which is the
+# third artifact class and the one that changes daemon CONFIGURATION
+# rather than daemon code. Installing a unit is separated deliberately:
+# it needs `systemctl daemon-reload` to take effect and it can change
+# behaviour (environment, hardening, flags) without a single line of C
+# changing.
+# =========================================================================
+VIRP_UNIT_SRC          = deploy/virp-onode.service
+VIRP_UNIT_DST          = /etc/systemd/system/virp-onode.service
+VIRP_DROPIN_DIR        = /etc/systemd/system/virp-onode.service.d
+VIRP_WAZUH_DROPIN_SRC  = deploy/virp-onode-wazuh-lab.dropin.conf
+VIRP_WAZUH_DROPIN_DST  = $(VIRP_DROPIN_DIR)/60-wazuh-lab.conf
+
+# Where deploy-capture writes. One directory per capture, named by UTC
+# timestamp, so rollback names a directory rather than a commit.
+VIRP_CAPTURE_ROOT     ?= /var/backups/virp
+
+# -------------------------------------------------------------------------
+# deploy-capture — snapshot what is installed RIGHT NOW, before replacing
+# it. This is what makes rollback a copy-back instead of a rebuild of an
+# older commit: the bytes that were running are kept, so restoring them
+# does not depend on the old source still building, on the toolchain, or
+# on anyone identifying which commit produced them.
+#
+# Safe to run on a box with nothing installed yet: missing artifacts are
+# recorded as absent rather than failing the capture.
+# -------------------------------------------------------------------------
+.PHONY: deploy-capture
+deploy-capture:
+	@ts=$$(date -u +%Y%m%dT%H%M%SZ); \
+	 dst=$(VIRP_CAPTURE_ROOT)/$$ts; \
+	 install -d -m 0700 $$dst; \
+	 echo "=== capturing current install -> $$dst ==="; \
+	 for f in $(VIRP_INSTALL_BIN) \
+	          $(VIRP_INSTALL_DIR)/render-devices.sh \
+	          $(VIRP_INSTALL_DIR)/config-backup-access.sh \
+	          $(VIRP_INSTALL_DIR)/evidence-access.sh; do \
+	     if [ -f "$$f" ]; then cp -a "$$f" $$dst/; echo "  captured $$f"; \
+	     else echo "  ABSENT   $$f"; fi; \
+	 done; \
+	 install -d -m 0700 $$dst/autopilot; \
+	 for f in $(VIRP_INSTALL_PY_DIR)/*.py; do \
+	     [ -f "$$f" ] && { cp -a "$$f" $$dst/autopilot/; echo "  captured $$f"; }; \
+	 done; \
+	 install -d -m 0700 $$dst/systemd; \
+	 if [ -f $(VIRP_UNIT_DST) ]; then cp -a $(VIRP_UNIT_DST) $$dst/systemd/; \
+	     echo "  captured $(VIRP_UNIT_DST)"; else echo "  ABSENT   $(VIRP_UNIT_DST)"; fi; \
+	 if [ -d $(VIRP_DROPIN_DIR) ]; then cp -a $(VIRP_DROPIN_DIR) $$dst/systemd/dropins; \
+	     echo "  captured $(VIRP_DROPIN_DIR)/"; fi; \
+	 ( cd $$dst && find . -type f -exec sha256sum {} \; | sort ) > $$dst/MANIFEST.sha256; \
+	 echo "  wrote    $$dst/MANIFEST.sha256"; \
+	 ln -sfn $$dst $(VIRP_CAPTURE_ROOT)/latest; \
+	 echo; \
+	 echo "  Roll back to this exact state with:"; \
+	 echo "    sudo make rollback-prod ROLLBACK_FROM=$$dst"
+
+# -------------------------------------------------------------------------
+# install-units — the canonical unit only.
+#
+# The Wazuh lab drop-in is NOT installed here and that is the point: the
+# canonical unit validates the Wazuh manager's certificate, and disabling
+# that is a deliberate, manual act (see install-wazuh-lab-dropin). Wiring
+# it into the default install path is exactly the defect ef6cfa6c fixed.
+#
+# Runs daemon-reload so systemd sees the new unit. Does NOT restart —
+# restarting is a separate, deliberate step.
+# -------------------------------------------------------------------------
+.PHONY: install-units
+install-units: check-deploy-unit
+	@test -f $(VIRP_UNIT_SRC) || { echo "FAIL: $(VIRP_UNIT_SRC) missing"; exit 1; }
+	@st=$$(git status --porcelain 2>/dev/null); \
+	 if [ -n "$$st" ]; then \
+	     echo "FAIL: refusing to install a unit from a dirty tree:"; echo "$$st"; exit 1; fi
+	install -d -m 0755 $(VIRP_DROPIN_DIR)
+	install -m 0644 $(VIRP_UNIT_SRC) $(VIRP_UNIT_DST)
+	systemctl daemon-reload
+	@echo
+	@echo "  Installed $(VIRP_UNIT_DST) and reloaded systemd."
+	@echo "  NOT restarted — the new unit takes effect on the next restart."
+	@echo "  If this host collects from a self-signed Wazuh manager, install"
+	@echo "  the drop-in BEFORE restarting or Wazuh collection will fail:"
+	@echo "    sudo make install-wazuh-lab-dropin"
+
+# -------------------------------------------------------------------------
+# install-wazuh-lab-dropin — opt-in, never automatic.
+#
+# Restores VIRP_WAZUH_INSECURE=1 for a lab manager presenting a
+# self-signed certificate. This DISABLES certificate validation for the
+# Wazuh driver. Only for a lab manager on a trusted segment; the real fix
+# is VIRP_CA_BUNDLE pointing at the CA that signed the manager's cert.
+# -------------------------------------------------------------------------
+.PHONY: install-wazuh-lab-dropin
+install-wazuh-lab-dropin:
+	@test -f $(VIRP_WAZUH_DROPIN_SRC) || \
+	    { echo "FAIL: $(VIRP_WAZUH_DROPIN_SRC) missing"; exit 1; }
+	install -d -m 0755 $(VIRP_DROPIN_DIR)
+	install -m 0644 $(VIRP_WAZUH_DROPIN_SRC) $(VIRP_WAZUH_DROPIN_DST)
+	systemctl daemon-reload
+	@echo "  Installed $(VIRP_WAZUH_DROPIN_DST) — Wazuh TLS validation is now"
+	@echo "  DISABLED for this host on the next restart. Remove it with:"
+	@echo "    sudo rm $(VIRP_WAZUH_DROPIN_DST) && sudo systemctl daemon-reload"
+
+# -------------------------------------------------------------------------
+# rollback-prod — copy back a captured install. No rebuild, no git.
+#
+#   sudo make rollback-prod ROLLBACK_FROM=/var/backups/virp/<timestamp>
+#   sudo make rollback-prod ROLLBACK_FROM=$(VIRP_CAPTURE_ROOT)/latest
+#
+# Verifies the capture's own manifest first, so a corrupted or partial
+# capture is refused rather than half-restored. Does NOT restart.
+# -------------------------------------------------------------------------
+.PHONY: rollback-prod
+rollback-prod:
+	@test -n "$(ROLLBACK_FROM)" || \
+	    { echo "FAIL: set ROLLBACK_FROM=<capture dir> (see $(VIRP_CAPTURE_ROOT))"; exit 1; }
+	@test -d "$(ROLLBACK_FROM)" || \
+	    { echo "FAIL: $(ROLLBACK_FROM) is not a directory"; exit 1; }
+	@test -f "$(ROLLBACK_FROM)/MANIFEST.sha256" || \
+	    { echo "FAIL: $(ROLLBACK_FROM)/MANIFEST.sha256 missing — not a capture"; exit 1; }
+	@echo "=== verifying capture integrity ==="
+	@cd "$(ROLLBACK_FROM)" && sha256sum --quiet -c MANIFEST.sha256 || \
+	    { echo "FAIL: capture does not match its manifest; refusing to restore"; exit 1; }
+	@echo "=== restoring from $(ROLLBACK_FROM) ==="
+	@if [ -f "$(ROLLBACK_FROM)/virp-onode-prod" ]; then \
+	     install -m 0755 "$(ROLLBACK_FROM)/virp-onode-prod" $(VIRP_INSTALL_BIN); \
+	     echo "  restored $(VIRP_INSTALL_BIN)"; fi
+	@for b in render-devices.sh config-backup-access.sh evidence-access.sh; do \
+	     if [ -f "$(ROLLBACK_FROM)/$$b" ]; then \
+	         install -m 0755 "$(ROLLBACK_FROM)/$$b" $(VIRP_INSTALL_DIR)/$$b; \
+	         echo "  restored $(VIRP_INSTALL_DIR)/$$b"; fi; \
+	 done
+	@if [ -d "$(ROLLBACK_FROM)/autopilot" ]; then \
+	     install -d -m 0755 $(VIRP_INSTALL_PY_DIR); \
+	     for f in "$(ROLLBACK_FROM)"/autopilot/*.py; do \
+	         [ -f "$$f" ] && { install -m 0644 "$$f" $(VIRP_INSTALL_PY_DIR)/; \
+	             echo "  restored $(VIRP_INSTALL_PY_DIR)/$$(basename $$f)"; }; \
+	     done; fi
+	@if [ -f "$(ROLLBACK_FROM)/systemd/virp-onode.service" ]; then \
+	     install -m 0644 "$(ROLLBACK_FROM)/systemd/virp-onode.service" $(VIRP_UNIT_DST); \
+	     echo "  restored $(VIRP_UNIT_DST)"; \
+	     systemctl daemon-reload; fi
+	@echo
+	@echo "  Restored. NOT restarted — run when you are ready:"
+	@echo "    sudo systemctl restart virp-onode && systemctl status virp-onode"
 
 # Lint: the PBS driver must have NO way to weaken its certificate pin.
 #
