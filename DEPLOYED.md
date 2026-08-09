@@ -1235,3 +1235,46 @@ module) or a server-specific environment variable is NOT detected — an
 operator using those must set `VIRP_API_TOKEN`. This is a config-sanity
 guard, not per-request auth (`check_auth` is unchanged). Covered by
 `api/test_bind_guard.py`, run via `make test-api`.
+
+## Deploy 2026-08-09 17:49 UTC — case-exact classifiers, no-eval witness, v2-aware report, federation provenance types (commit 6a1bd278)
+
+Four merges deployed as one event after a full green battery on merged
+main (exit 0; only the two standing items — the Jul 31 virp-cli:pbs-lab
+binding failure and the api-suite skip):
+
+- **Commit**: `6a1bd27854ea401e457a16dffac281d826b74a49`
+- **Branch**: `main`
+- **Tree at install**: clean (`git status --porcelain` empty)
+- **Installed binary**: `/usr/local/lib/virp/virp-onode-prod`
+- **sha256**: `c8e266bfab7985b1b6af1d6f2bd58dfa1ded314ca6c6882e5c4a20c026f50ab2`
+- Pre-deploy state captured: `/var/backups/virp/20260809T174944Z`
+  (`sudo make rollback-prod ROLLBACK_FROM=` that path restores it)
+- Restarted 17:49:54 UTC; startup clean: chain enabled, approvals
+  loaded (keys=1), socket_allowed_uids 999 1000 997 995 993 994,
+  per-uid ceiling 993=GREEN, all 7 devices reconnected, autopilot
+  resumed GREEN cycles immediately.
+
+Post-deploy smoke, all via the netclaw bridge over the tunnel and
+verified from THIS node (chain/journal, never the bridge output):
+- `VTYSH -C "SHOW IP OSPF"` (the 2026-08-09 classified≠executed repro)
+  → RED by absence, SIGNED v1 refusal, executed=false, proposal filed.
+- `vtysh -c "show ip ospf neighbor"` → GREEN, chained observation wire
+  version byte 1, O-Key HMAC PASS, sha256 matches the bridge receipt.
+- Federation provenance now lands: fed_request → observation →
+  fed_outcome all chained for both smoke sessions; zero
+  `chain_append REJECTED` lines.
+- Live trust report: 59,672 entries, hashes/links/chain-HMAC all pass,
+  observation HMAC fail=0, the 5 legacy v2 frames in the V2-SESSION
+  category with journal corroboration pass=5, FAILED ENTRIES: 1 (the
+  standing Jul 31 binding item).
+
+Bridge side (netclaw, same event window): obs_version rolled back to 1
+via unit drop-in 50-obs-version.conf — code default stays 2; returning
+to v2 is deleting the drop-in once dual-signing lands.
+
+### Known-open, deliberately not fixed in this deploy
+- `virp_session_check_timeouts` has ZERO callers: an ACTIVE v2 session
+  never expires.
+- One shared session context: any allowlisted uid's HELLO races
+  another's session (fail-closed, but racy). Both belong with the
+  dual-signing design.
