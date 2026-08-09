@@ -91,6 +91,11 @@ static const char *const ZM_GREEN_ID_BASE[] = {
  * no whitespace, no '+', no separators, no percent-encoding, no
  * locale-dependent isdigit() (which admits other bytes under some
  * locales and takes a signed char as a negative index).
+ *
+ * The UPPER bound is load-bearing, not cosmetic: it is what makes a
+ * GREEN path length-bounded, which is what makes it un-truncatable in
+ * the URL buffer. See the invariant note on ZM_DIGITS_MAX in
+ * virp_driver_zammad.h before changing or dropping it.
  */
 static bool zm_digits(const char *s, size_t len)
 {
@@ -109,10 +114,11 @@ static bool zm_digits(const char *s, size_t len)
  * `q` points just past '?', `len` runs to the end of the string.
  * RED (false) for: a bare "?", an empty pair ("&&", a trailing "&"), a
  * pair with no '=', an unlisted name, an empty or non-numeric value, a
- * repeated name. Duplicates are refused rather than last-one-wins
- * because "which one counts" is a property of the server's parser, not
- * of the bytes we classified — two answers to that question is one too
- * many for something the gate signs.
+ * repeated name.
+ *
+ * On repeats, see the DO-NOT-RELAX note at the seen_page/seen_per_page
+ * check below. It is not a strictness preference; it is the property
+ * the protocol rests on.
  */
 static bool zm_query_ok(const char *q, size_t len)
 {
@@ -144,6 +150,40 @@ static bool zm_query_ok(const char *q, size_t len)
         size_t val_len  = pair_len - name_len - 1;
         const char *val = eq + 1;
 
+        /*
+         * DO NOT RELAX: a repeated parameter is RED, permanently.
+         *
+         * "?page=1&page=2" names two values for one parameter. Nothing
+         * in the bytes says which one wins — precedence is the private
+         * choice of whatever parses the query on the far side (Rack
+         * takes the last, some stacks take the first, some build an
+         * array), and it can change under us with a server upgrade we
+         * neither control nor observe.
+         *
+         * VIRP's whole claim is that the signed bytes determine what
+         * the device was asked to do. Accepting a repeat would mean the
+         * gate signs a request whose effect is decided elsewhere, by a
+         * rule that is not in the observation and not in the chain. The
+         * signature would still verify; it would simply no longer mean
+         * anything. That is a strictly worse failure than a refusal,
+         * because it is invisible.
+         *
+         * It looks like harmless pedantry — both names are listed, both
+         * values are digits — which is exactly why it needs this note
+         * rather than a one-line comment. The cost of refusing is that
+         * a caller emitting a duplicate gets a signed rejection and has
+         * to send one value. That is the intended cost.
+         *
+         * This is not a Zammad-local opinion. driver_pbs.c refuses a
+         * repeated typed-op key for the same reason, in its own words:
+         * REASON_DUP_PARAM, "a key may appear at most once, so the
+         * canonical encoding of a request is unique" — alongside
+         * REASON_UNSORTED, "byte identity and semantic identity
+         * coincide". The nightly corpus replay asserts it against the
+         * live gate ("pbs op=backup.snapshots.list store=a store=b" →
+         * RED). Relaxing it here would put two drivers in the same tree
+         * on opposite sides of the same question.
+         */
         if (name_len == 4 && memcmp(pair, "page", 4) == 0) {
             if (seen_page) return false;
             seen_page = true;
@@ -166,6 +206,13 @@ virp_trust_tier_t zm_route_path(const char *path)
 {
     if (!path) return VIRP_TIER_RED;                     /* fail closed */
 
+    /*
+     * The length cap is enforced HERE as well as in zm_get(), and both
+     * are required: the transport check alone would let an over-long
+     * path classify GREEN and be signed, only to be refused at
+     * dispatch — a gate blessing a request the driver cannot make.
+     * See the invariant note on ZM_PATH_MAX in virp_driver_zammad.h.
+     */
     size_t total = strlen(path);
     if (total == 0 || total > ZM_PATH_MAX) return VIRP_TIER_RED;
 
@@ -310,6 +357,10 @@ static virp_error_t zm_get(struct virp_conn *conn, const char *path,
      * independently rather than trusting that, and it checks the
      * snprintf return: a silently truncated URL is a request for a
      * DIFFERENT resource than the one that was classified.
+     *
+     * This is the second half of a two-sided invariant; the classifier
+     * holds the other half. See the ZM_PATH_MAX note in
+     * virp_driver_zammad.h for why neither side is redundant.
      */
     if (strlen(path) > ZM_PATH_MAX) {
         fprintf(stderr, "[Zammad] path exceeds %d bytes — refusing\n",

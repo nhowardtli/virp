@@ -51,16 +51,44 @@ extern "C" {
 #define ZM_RESPONSE_MAX         (VIRP_OUTPUT_MAX - 256)
 
 /*
- * Hard bounds on the only two variable-length things a GREEN path can
- * contain: the <id> segment and a page/per_page value. Both are digit
- * runs, and 20 digits holds any value a uint64 can express — far past
- * any real Zammad object id. Bounding them in the CLASSIFIER (not only
- * at the transport) is what keeps classification and dispatch in
- * agreement: no path this driver calls GREEN can be long enough for the
- * URL buffer to truncate it into some other request.
+ * LOAD-BEARING INVARIANT — these two caps are not tidiness, and
+ * removing or raising either one silently breaks a security property.
+ *
+ * The property: a path that classifies GREEN can never be long enough
+ * to truncate in the URL buffer, so the request that goes on the wire
+ * is always the request that was classified and signed.
+ *
+ * How the two caps produce it:
+ *
+ *   ZM_DIGITS_MAX bounds every variable-length element a GREEN path
+ *   can contain. There are only two — the <id> segment and a
+ *   page/per_page value — and both are digit runs. With the fixed row
+ *   text (longest base 34 bytes) plus at most one id and two query
+ *   values, a GREEN path cannot exceed 110 bytes. 20 digits holds any
+ *   value a uint64 can express, so no real Zammad object id is
+ *   excluded; the cap costs nothing and buys the bound.
+ *
+ *   ZM_PATH_MAX is the backstop for everything else, and is checked in
+ *   BOTH places that matter: zm_route_path() refuses a longer path
+ *   outright, and zm_get() refuses it again before building the URL.
+ *   512 + the longest base_url ("https://" + 255-byte host + ":65535")
+ *   stays far inside the 2048-byte url[] buffer, and zm_get() also
+ *   checks the snprintf return, so truncation is caught even if these
+ *   bounds are later wrong.
+ *
+ * Why the CLASSIFIER carries the cap and not just the transport: if
+ * only the transport enforced it, an over-long path could classify
+ * GREEN, be approved and signed, and then be refused at dispatch — the
+ * gate would have blessed a request the driver cannot make. Classifier
+ * and transport must agree on what is issuable, so the bound lives in
+ * both.
+ *
+ * If a future Zammad row needs a non-numeric variable segment, this
+ * argument does NOT carry over: the new element has to come with its
+ * own length bound, or the truncation property is gone.
  */
-#define ZM_DIGITS_MAX           20
-#define ZM_PATH_MAX             512     /* whole path incl. query string */
+#define ZM_DIGITS_MAX           20      /* see invariant above — load-bearing */
+#define ZM_PATH_MAX             512     /* see invariant above — load-bearing */
 
 /* ── Collector endpoints (the GREEN read set, verbatim) ───────── */
 #define ZM_API_PREFIX           "/api/v1"
