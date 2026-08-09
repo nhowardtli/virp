@@ -74,7 +74,29 @@ if "${VIRP_EVIDENCE_UID}" in text:
     os.environ.setdefault("VIRP_EVIDENCE_UID",
                           str(pwd.getpwnam("virp-evidence").pw_uid))
 
+# VIRP_NETCLAW_UID is the remote requester identity for netclaw
+# (virp-lab only): the sshd child serving netclaw's streamlocal
+# forward runs as this uid, so it is what SO_PEERCRED presents.
+# Resolved exactly like the uids above: if the template names it the
+# account MUST exist, so a missing account fails the render (and the
+# daemon start) loudly instead of silently shipping an allowlist that
+# rejects the remote requester.
+if "${VIRP_NETCLAW_UID}" in text:
+    import pwd
+    os.environ.setdefault("VIRP_NETCLAW_UID",
+                          str(pwd.getpwnam("virp-netclaw").pw_uid))
+
+# VIRP_BROKER_UID is the Stage 1 intent-broker's dedicated identity
+# (virp-lab only; see the template's broker note — Stage 1 is
+# otherwise still inert). Same rule: named in the template means the
+# account must exist, or the render fails loudly.
+if "${VIRP_BROKER_UID}" in text:
+    import pwd
+    os.environ.setdefault("VIRP_BROKER_UID",
+                          str(pwd.getpwnam("virp-broker").pw_uid))
+
 for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
+            "VIRP_NETCLAW_UID", "VIRP_BROKER_UID",
             "WAZUH_USER", "WAZUH_PASS",
             "LIBRENMS_TOKEN", "PEER_USER", "PEER_PASS",
             # PBS: the token SECRET is the only true credential here, but

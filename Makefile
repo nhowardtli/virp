@@ -896,7 +896,8 @@ VIRP_INSTALL_BIN  = $(VIRP_INSTALL_DIR)/virp-onode-prod
 # behaviour on the next restart just as surely as a rebuilt binary.
 VIRP_INSTALL_SCRIPTS = deploy/render-devices.sh \
                        deploy/config-backup-access.sh \
-                       deploy/evidence-access.sh
+                       deploy/evidence-access.sh \
+                       deploy/netclaw-access.sh
 
 # The timer-driven automations (autopilot cycle/comparator/chainwalk/
 # corpus, config-backup, evidence) run these Python modules. They had the
@@ -992,7 +993,8 @@ deploy-capture:
 	 for f in $(VIRP_INSTALL_BIN) \
 	          $(VIRP_INSTALL_DIR)/render-devices.sh \
 	          $(VIRP_INSTALL_DIR)/config-backup-access.sh \
-	          $(VIRP_INSTALL_DIR)/evidence-access.sh; do \
+	          $(VIRP_INSTALL_DIR)/evidence-access.sh \
+	          $(VIRP_INSTALL_DIR)/netclaw-access.sh; do \
 	     if [ -f "$$f" ]; then cp -a "$$f" $$dst/; echo "  captured $$f"; \
 	     else echo "  ABSENT   $$f"; fi; \
 	 done; \
@@ -1083,7 +1085,7 @@ rollback-prod:
 	@if [ -f "$(ROLLBACK_FROM)/virp-onode-prod" ]; then \
 	     install -m 0755 "$(ROLLBACK_FROM)/virp-onode-prod" $(VIRP_INSTALL_BIN); \
 	     echo "  restored $(VIRP_INSTALL_BIN)"; fi
-	@for b in render-devices.sh config-backup-access.sh evidence-access.sh; do \
+	@for b in render-devices.sh config-backup-access.sh evidence-access.sh netclaw-access.sh; do \
 	     if [ -f "$(ROLLBACK_FROM)/$$b" ]; then \
 	         install -m 0755 "$(ROLLBACK_FROM)/$$b" $(VIRP_INSTALL_DIR)/$$b; \
 	         echo "  restored $(VIRP_INSTALL_DIR)/$$b"; fi; \
