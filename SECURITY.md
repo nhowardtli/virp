@@ -734,6 +734,25 @@ separator boundary still applies (it is driver-agnostic).
 > believed the fleet was less protected than it was, and the same rot in
 > the other direction is the dangerous case.
 
+**Witness script executes argv, not shell (2026-08-09).** **[tested]**
+The target-side witness (`tests/adversarial/witness/virp-witness`, the
+sshd ForceCommand on the sacrificial clab-frr containers) previously ran
+the delivered operation with `eval` — safe only by composition with the
+upstream separator gate, and exactly the sharp edge a hostile reviewer
+lands on. The eval is gone: the operation is parsed into an argv over
+the classifier's known-good grammar (`vtysh -c "<arg>"` becomes the
+3-element argv; everything else is whitespace-split with globbing
+disabled) and invoked directly, so no shell ever parses the command
+bytes — a metacharacter that somehow reaches the witness is a literal
+argument, never syntax. Stdout/stderr remain the raw SSH channel fds
+and the exit status passes through, byte-identical to the old behaviour
+for every grammar-conformant command. Pinned by
+`tests/adversarial/witness/test-witness-noshell.sh`: live equivalence
+against an eval reference, one canary test per injection vector
+(`;`, `|`, `$( )`, backticks, `>`, `&&`, `$VAR`, glob, newline), and rc
+passthrough. The upstream refusal of those vectors is separately pinned
+by the driver gate suites (`virp_command_check_separators` tests).
+
 **REST-shaped drivers need their own command grammar.** The separator set
 is a CLI grammar. Wazuh's "command" is a URL path, where `&` is a
 legitimate query-string separator and `?`/`/` are structural — so

@@ -18,9 +18,11 @@
 #   1. FAIL-OPEN. Every logging step is guarded. If the witness cannot write
 #      its log, the operation still runs. A witness that can block operations
 #      would be measuring itself, not the system under test.
-#   2. NO PIPES around the command. The command is run with `eval` in this same
-#      process, so its stdout/stderr are the raw SSH channel file descriptors
-#      and its bytes reach VIRP unaltered. Exit status is passed through.
+#   2. NO PIPES around the command. The command is run as an ARGV in this same
+#      process (run_cmd below — NO eval, no shell interpretation of the
+#      command bytes), so its stdout/stderr are the raw SSH channel file
+#      descriptors and its bytes reach VIRP unaltered. Exit status is passed
+#      through.
 #      Consequence, stated plainly: this witness does NOT independently hash the
 #      response body. Byte-level response attestation needs capture mode, which
 #      inserts a filter and is therefore OFF by default. See CAPTURE below.
@@ -95,6 +97,62 @@ if [ -d "$WITNESS_DIR" ]; then
     _witness_log "$_kind" "seq=$seq	nonce=$nonce	host=$_host	epoch=$_epoch	mono=$_mono	utc=$_utc	pid=$$	client=$_client	user=$_user	cmdsha=$_cmdsha	cmd=$_cmdesc"
 fi
 
+# --- non-shell execution ----------------------------------------------------
+# The operation is executed as an ARGV, never fed to a shell. `eval` was
+# the previous implementation — safe only because the upstream separator
+# gate had already refused every shell-composition byte, but an auditor
+# should not have to compose two facts across two codebases to conclude
+# "no injection here". Now there is nothing to compose: no shell ever
+# parses the command bytes.
+#
+# The upstream classifier enforces the exact accepted shapes, so this
+# split is over a known-good grammar:
+#   - `vtysh -c "<arg>"` — the ONLY quoted form that can arrive —
+#     becomes the 3-element argv [vtysh, -c, <arg>]. Whitespace runs
+#     between the fixed tokens are tolerated exactly as the classifier
+#     (and the signed command hash's canonical form) tolerate them.
+#   - Everything else splits on whitespace with globbing disabled.
+# Quotes or metacharacters anywhere else are LITERAL argv bytes:
+# `show version; reload` runs `show` with three literal arguments — it
+# never runs two commands. Stdout/stderr stay this process's own fds
+# (the raw SSH channel) and the exit status is the command's own, so
+# behaviour is byte-identical to eval for every grammar-conformant
+# command (pinned by test-witness-noshell.sh).
+#
+# Deliberate behaviour change, stated plainly: shell features (pipes,
+# redirection, &&, variable expansion) no longer work in a forced
+# command. They never arrived from the VIRP driver — the separator gate
+# refuses them upstream — and a human operator still gets a real shell
+# via the interactive-login path above.
+run_cmd() {
+    case "$1" in
+    *"
+"*)
+        # Embedded newline: never the driver's grammar (refused
+        # upstream). Fall through to the literal word split, where a
+        # newline is just another separator and every fragment is a
+        # literal argv byte-string — nothing is ever a second command.
+        ;;
+    *)
+        if printf '%s' "$1" | grep -q \
+            '^[[:space:]]*vtysh[[:space:]][[:space:]]*-c[[:space:]][[:space:]]*".*"[[:space:]]*$'; then
+            _arg=$(printf '%s' "$1" | sed \
+                -e 's/^[[:space:]]*vtysh[[:space:]][[:space:]]*-c[[:space:]][[:space:]]*"//' \
+                -e 's/"[[:space:]]*$//')
+            vtysh -c "$_arg"
+            return $?
+        fi
+        ;;
+    esac
+    set -f
+    # shellcheck disable=SC2086 — the unquoted expansion IS the parser:
+    # field-split on whitespace, globbing disabled above, no other
+    # shell processing of the bytes.
+    set -- $1
+    set +f
+    "$@"
+}
+
 # --- run the operation ------------------------------------------------------
 if [ -z "$cmd" ]; then
     exec "${SHELL:-/bin/sh}"
@@ -107,7 +165,7 @@ if [ -f "$CAPTURE_FLAG" ]; then
     # ONLY for the oversized-response transcript, where independently hashing
     # the real target bytes is the whole point, and say so in that transcript.
     _cap="$WITNESS_DIR/cap.$nonce"
-    eval "$cmd" > "$_cap" 2>"$_cap.err"
+    run_cmd "$cmd" > "$_cap" 2>"$_cap.err"
     rc=$?
     _bytes=$(wc -c < "$_cap" 2>/dev/null || echo -1)
     _sha=$(sha256sum < "$_cap" 2>/dev/null | cut -d' ' -f1 || echo unknown)
@@ -119,7 +177,7 @@ if [ -f "$CAPTURE_FLAG" ]; then
 else
     # DEFAULT — no pipes, no filters. Bytes and exit status pass through
     # untouched. See FIDELITY RULE 2.
-    eval "$cmd"
+    run_cmd "$cmd"
     rc=$?
 fi
 
