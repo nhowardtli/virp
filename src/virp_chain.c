@@ -363,11 +363,25 @@ bool virp_chain_type_is_indirect(const char *artifact_type)
 bool virp_chain_type_is_external_allowed(const char *artifact_type)
 {
     static const char *const EXTERNAL[] = {
-        "observation",     /* autopilot, evidence, config-backup, virp-tool */
-        "evidence_item",   /* autopilot/virp_evidence.py                    */
-        "no_drift",        /* autopilot/virp_config_backup.py               */
-        "baseline_set",    /* autopilot/virp_config_backup.py               */
-        "drift_alert",     /* autopilot/virp_config_backup.py               */
+        "observation",       /* autopilot, evidence, config-backup, virp-tool */
+        "evidence_item",     /* autopilot/virp_evidence.py                    */
+        "no_drift",          /* autopilot/virp_config_backup.py               */
+        "baseline_set",      /* autopilot/virp_config_backup.py               */
+        "drift_alert",       /* autopilot/virp_config_backup.py               */
+        /* Federation-bridge provenance (broker/virp_bridge_mcp.py). These
+         * carry the peer + NCFED request_id that binds a federated caller
+         * to the command it put to the gate — the attribution the daemon's
+         * own observation/gate_rejection entries cannot record. They are
+         * client-submitted COMMITMENTS (body = provenance JSON tagged
+         * schema "federated_request/1" / "federated_outcome/1"; artifact_
+         * hash binds it via GATE 2), NOT daemon verdicts: deliberately
+         * NOT the reserved "outcome"/"proposal"/etc. names, so blessing
+         * them here does not let a socket client forge a daemon-minted
+         * semantic type. The signed observation stays separate (GATE 3).
+         * Names kept <=15 chars so they survive artifact_type[16] intact
+         * (unlike the INDIRECT entries, which need truncated aliases). */
+        "fed_request",     /* broker/virp_bridge_mcp.py (request provenance) */
+        "fed_outcome",     /* broker/virp_bridge_mcp.py (outcome record)     */
     };
     if (virp_chain_type_is_indirect(artifact_type)) return true;
     return type_in(artifact_type, EXTERNAL,
