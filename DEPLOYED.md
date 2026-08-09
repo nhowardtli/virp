@@ -2,7 +2,7 @@
 
 - **Role**: production reference instance
 
-## Current live state (verified 2026-08-03 01:28 UTC)
+## Current live state (verified 2026-08-09 01:55 UTC)
 
 **This block is authoritative for what is running right now.** Everything below
 it is a chronological, append-only log: each section describes the state at the
@@ -10,13 +10,25 @@ time it was written and is deliberately *not* corrected in place. Where a fact
 below disagrees with this block, this block wins. A copy of this file without
 this block is stale — check the commit before relying on it.
 
-- **Commit**: `b6e9602c9d5939c80d83af0dccfbef44858cec6a` (short `b6e9602c`)
-- **Branch**: `deploy/audit-fixes-2026-08-01`
+- **Commit**: `32dd710f28300a2fa47ebd44901aa6100d71ccd0` (short `32dd710f`)
+  — deployed 2026-08-09 01:38 UTC, superseding `8a2a6342` (51 commits).
+- **Branch**: `main`
 - **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
   socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
-  — binary sha256 `db8f3fabbfc6cc8ee838a5f38ed972f710ed8e098b7c0f91f463379d889d5154`
-- **Client**: `/opt/virp/build/virp` — `virp version` reports `virp-tool b6e9602c`,
-  binary sha256 `56d215702cfe2a558d8f5d1bd642c0488a8e0df9a1e7e149d3deb9ce15c57e50`
+  — binary sha256 `07b8eec46f12657ddf6df5ece42aa03b82c39893e8100d9b442fd4589ecda82f`
+- **Client**: `/opt/virp/build/virp` — built from `32dd710f`
+  (rebuilt 2026-08-09 01:47; see the outage note below — it lives in the
+  SOURCE WORKTREE, not an installed path, and that is a known defect).
+- **Chain ingestion gate**: `chain_append` GATE 3 is LIVE as of this deploy.
+  An `artifact_type=observation` submitted WITH a body must now carry a
+  valid v1/v2/v3 signature or it is refused. Commitment-only (no body)
+  appends remain accepted by design — see SECURITY.md.
+- **Systemd unit: NOT updated in this deploy.** The installed unit is still
+  the pre-`ef6cfa6c` one and still sets `VIRP_WAZUH_INSECURE=1`. That was a
+  deliberate choice: the canonical unit drops that variable, no lab CA
+  exists yet, and `wazuh-lab` is live. Wazuh collection verified working
+  after the restart. Installing the new unit REQUIRES the Wazuh drop-in or
+  a CA bundle first.
 - **Gate**: `default=ENFORCE max_tier=YELLOW overrides=0` — pure ENFORCE.
   There is **no per-driver SHADOW override for any driver**, `linux` included.
   The FRR/vtysh classifier is **live**: `vtysh -c "show ..."` reads classify as
@@ -44,6 +56,53 @@ are now stale on two counts:
    classifier it was waiting on has been live ever since.
 2. The deployed commit has advanced through the update log below and is now
    `b6e9602c`, not `0c9c7338`.
+
+## Chain gap 2026-08-09 01:35–01:50 UTC — operator-caused, during deploy
+
+**A reader of the chain will find a 15-minute hole here. It is not tamper
+evidence and it is not data loss. No observation was minted and then
+lost: the collector never ran, so those observations were never created.**
+
+- **Last entry before the gap**: `2026-08-09 01:35:03 UTC`,
+  `obs:virp-node2-peer:1786239303036276411`
+- **First entry after the gap**: `2026-08-09 01:50:03 UTC`,
+  `obs:clab-frr-ospf-frr1:1786240203080023488`
+- **Duration**: 15.0 minutes — exactly two missed autopilot cycles
+  (01:40 and 01:45; the timer fires every 5 minutes).
+- **Chain continuity is intact.** The hash chain is unbroken across the
+  gap; only the wall-clock spacing is wider than usual.
+
+**Cause — operator error during the `8a2a6342 → 32dd710f` deploy.** The
+first `make install-prod` failed to link: `/opt/virp/build/` still held
+ASan/UBSan-instrumented objects from an interrupted `asan-test` on
+2026-08-06, so the plain build hit `undefined reference to __asan_*`. The
+documented remedy is a single `make clean`, which was run — and it also
+deleted `/opt/virp/build/virp-tool`, which
+`/usr/local/lib/virp/autopilot/virp_autopilot.py:60` invokes by absolute
+path. `make install-prod` builds the `prod` target only, so it did not
+rebuild the client. The next two autopilot cycles died at startup with
+`FileNotFoundError: '/opt/virp/build/virp-tool'` before collecting
+anything. Rebuilding the client at 01:47:11 restored collection on the
+01:50 cycle.
+
+**Not caused by the deploy payload.** GATE 3 refused nothing: zero
+`chain_append REJECTED` lines across the whole window and since. The
+daemon itself was healthy throughout — 7/7 devices connected immediately
+after the 01:38:23 restart.
+
+**Note on `autopilot` exit status.** `virp-autopilot.service` exits 1 on
+any cycle that raises alerts, including the two `virp-node2-peer`
+baseline deviations that predate this deploy. A `status=1/FAILURE` line
+in the journal is therefore NOT evidence of a failed collection — check
+for a `cycle complete: N observations` line, which is what distinguishes
+the 01:40/01:45 crashes from the healthy 01:35 and 01:50 cycles.
+
+**Structural defect this exposed, not yet fixed.** A production service
+depends on a build artifact inside the source worktree
+(`/opt/virp/build/virp-tool`), so an ordinary `make clean` in the
+checkout can take out collection. `virp-tool` should be installed to
+`/usr/local/lib/virp/` and the autopilot pointed there, making it a
+fourth installed artifact class. Proposed, not implemented.
 
 ## Install procedure (written 2026-08-09, before the 8a2a6342 → HEAD deploy)
 

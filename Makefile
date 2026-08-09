@@ -1005,7 +1005,8 @@ deploy-capture:
 	     echo "  captured $(VIRP_UNIT_DST)"; else echo "  ABSENT   $(VIRP_UNIT_DST)"; fi; \
 	 if [ -d $(VIRP_DROPIN_DIR) ]; then cp -a $(VIRP_DROPIN_DIR) $$dst/systemd/dropins; \
 	     echo "  captured $(VIRP_DROPIN_DIR)/"; fi; \
-	 ( cd $$dst && find . -type f -exec sha256sum {} \; | sort ) > $$dst/MANIFEST.sha256; \
+	 ( cd $$dst && find . -type f ! -name MANIFEST.sha256 -exec sha256sum {} \; | sort ) \
+	     > $$dst/MANIFEST.sha256; \
 	 echo "  wrote    $$dst/MANIFEST.sha256"; \
 	 ln -sfn $$dst $(VIRP_CAPTURE_ROOT)/latest; \
 	 echo; \
