@@ -86,6 +86,9 @@ typedef struct {
     size_t      chunk;            /* max bytes per read */
     const char *reply_on_write;   /* queued on the first write */
     const char *reply_on_write2;  /* queued on the second and later writes */
+    const char *late_reply;       /* queued after late_after_reads EAGAINs */
+    int         late_after_reads; /* re-armed on every write */
+    int         late_countdown;
     int         writes;
     char        written[4096];
     size_t      written_len;
@@ -109,8 +112,14 @@ static ssize_t mock_read(void *ctx, char *buf, size_t len)
     while (m->pos < m->pending_len && m->pending[m->pos] == SEG)
         m->pos++;
 
-    if (m->pos >= m->pending_len)
+    if (m->pos >= m->pending_len) {
+        /* A device that answers, but only after the channel has sat
+         * quiet for a while — each EAGAIN the caller sees costs it one
+         * poll interval of real waiting. */
+        if (m->late_countdown > 0 && --m->late_countdown == 0)
+            mock_queue(m, m->late_reply);
         return VIRP_SSH_IO_EAGAIN;
+    }
 
     size_t avail = m->pending_len - m->pos;
     size_t n = avail < len ? avail : len;
@@ -144,6 +153,8 @@ static ssize_t mock_write(void *ctx, const char *buf, size_t len)
     else if (m->writes > 1)
         mock_queue(m, m->reply_on_write2 ? m->reply_on_write2
                                          : m->reply_on_write);
+    if (m->late_reply)
+        m->late_countdown = m->late_after_reads;
     return (ssize_t)len;
 }
 
@@ -439,7 +450,7 @@ TEST(test_learn_prompt_confirms_across_two_probes)
         virp_ssh_io_t io = { .ctx = &m, .read = mock_read, .write = mock_write };
 
         virp_ssh_prompt_t pr;
-        virp_error_t rc = virp_ssh_learn_prompt(&io, p->name, &pr);
+        virp_error_t rc = virp_ssh_learn_prompt(&io, p->name, NULL, &pr);
 
         CHECK(rc == VIRP_OK, "%s: learn failed (%d)", p->name, (int)rc);
         CHECK(pr.learned, "%s: prompt not marked learned", p->name);
@@ -464,9 +475,71 @@ TEST(test_learn_prompt_refuses_when_unconfirmed)
     virp_ssh_io_t io = { .ctx = &m, .read = mock_read, .write = mock_write };
 
     virp_ssh_prompt_t pr;
-    virp_error_t rc = virp_ssh_learn_prompt(&io, "unconfirmed", &pr);
+    virp_error_t rc = virp_ssh_learn_prompt(&io, "unconfirmed", NULL, &pr);
     CHECK(rc == VIRP_ERR_NO_PROMPT, "expected refusal, got %d", (int)rc);
     CHECK(!pr.learned, "prompt must not be marked learned on refusal");
+}
+
+TEST(test_learn_prompt_waits_out_blank_echo_then_learns)
+{
+    /*
+     * The pa-850 shape (2026-08-09): the device echoes the probe CRLF
+     * within one poll, then stalls past VIRP_SSH_QUIESCENT_MS before
+     * printing its prompt. The idle-only gate treated the echo as the
+     * whole answer and refused; the content-aware gate must keep
+     * listening and learn the prompt.
+     */
+    mock_pty_t m;
+    mock_init(&m, "", 32);
+    m.reply_on_write = "\r\n";                       /* echo, immediately */
+    m.late_reply = "\r\naiops-svc@pa-850> ";
+    m.late_after_reads = 16;      /* 16 polls ≈ 400 ms of dead air, well
+                                     past the 250 ms quiescence window */
+    virp_ssh_io_t io = { .ctx = &m, .read = mock_read, .write = mock_write };
+
+    virp_ssh_prompt_t pr;
+    virp_error_t rc = virp_ssh_learn_prompt(&io, "pa-850-slow", NULL, &pr);
+    CHECK(rc == VIRP_OK, "slow-prompt device must learn, got %d", (int)rc);
+    CHECK(strcmp(pr.prompt, "aiops-svc@pa-850>") == 0,
+          "learned '%s', expected 'aiops-svc@pa-850>'", pr.prompt);
+}
+
+TEST(test_learn_prompt_refuses_permanently_silent_device)
+{
+    /*
+     * A device that authenticates but never sends a byte must still be
+     * refused with VIRP_ERR_NO_PROMPT — the content-aware gate loosened
+     * WHEN a read may end, never WHETHER a failed learn refuses. Budgets
+     * are injected so the test does not sit through the real 20 s.
+     */
+    mock_pty_t m;
+    mock_init(&m, "", 32);                           /* no replies, ever */
+    virp_ssh_io_t io = { .ctx = &m, .read = mock_read, .write = mock_write };
+
+    virp_ssh_learn_opts_t lo = { .first_byte_ms = 100, .total_ms = 300 };
+    virp_ssh_prompt_t pr;
+    virp_error_t rc = virp_ssh_learn_prompt(&io, "mute", &lo, &pr);
+    CHECK(rc == VIRP_ERR_NO_PROMPT, "expected refusal, got %d", (int)rc);
+    CHECK(!pr.learned, "prompt must not be marked learned for a mute device");
+}
+
+TEST(test_learn_prompt_refuses_blank_echo_at_total_budget)
+{
+    /*
+     * A device that echoes CRLF but never follows with a line must be
+     * cut off by the TOTAL budget, not wait forever: blank bytes disarm
+     * the silence exit, so the ceiling is what bounds this read.
+     */
+    mock_pty_t m;
+    mock_init(&m, "", 32);
+    m.reply_on_write = "\r\n";                       /* echo and nothing else */
+    virp_ssh_io_t io = { .ctx = &m, .read = mock_read, .write = mock_write };
+
+    virp_ssh_learn_opts_t lo = { .total_ms = 400 };
+    virp_ssh_prompt_t pr;
+    virp_error_t rc = virp_ssh_learn_prompt(&io, "echo-only", &lo, &pr);
+    CHECK(rc == VIRP_ERR_NO_PROMPT, "expected refusal, got %d", (int)rc);
+    CHECK(!pr.learned, "prompt must not be marked learned from a blank echo");
 }
 
 TEST(test_read_refuses_without_learned_prompt)
@@ -642,6 +715,9 @@ int main(void)
     printf("\n--- Prompt learning ---\n");
     RUN_TEST(test_learn_prompt_confirms_across_two_probes);
     RUN_TEST(test_learn_prompt_refuses_when_unconfirmed);
+    RUN_TEST(test_learn_prompt_waits_out_blank_echo_then_learns);
+    RUN_TEST(test_learn_prompt_refuses_permanently_silent_device);
+    RUN_TEST(test_learn_prompt_refuses_blank_echo_at_total_budget);
     RUN_TEST(test_read_refuses_without_learned_prompt);
 
     printf("\n--- PAN-OS keepalive window (2b) ---\n");

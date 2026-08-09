@@ -129,13 +129,9 @@ size_t virp_ssh_read_quiescent(const virp_ssh_io_t *io,
 
 /*
  * What one learning read measured, for the prompt-learn log lines.
- *
- * The budgets are logged alongside because of how the read loop
- * actually applies them: idle_ms starts at zero and is reset only by a
- * byte arriving, so VIRP_SSH_QUIESCENT_MS is the wait for the FIRST
- * byte, not just the gap between bytes. A device that stayed silent for
- * 20 s and a read that stopped listening after 250 ms were previously
- * the same journal line; these fields keep them distinguishable.
+ * The budgets that applied are logged alongside, so a device that
+ * stayed silent and a read that stopped listening early stay
+ * distinguishable in the journal.
  */
 typedef struct {
     const char *reason;   /* "ok", or why the read produced no line */
@@ -144,24 +140,48 @@ typedef struct {
 } learn_read_diag_t;
 
 /*
- * Read to quiescence (not to a prompt — we do not know it yet) and
- * return the last non-empty line, trailing padding removed.
+ * Read until a non-blank line has arrived and the channel goes
+ * quiescent (not until a prompt — we do not know it yet), and return
+ * the last non-empty line, trailing padding removed.
+ *
+ * The gate is content-aware because quiescence alone measured the wrong
+ * thing: pa-850 echoes the probe CRLF within ~25 ms and then stalls
+ * past the quiescence window before printing its prompt, so an
+ * idle-only gate reported the echo as the whole answer. Once any byte
+ * has arrived, only a non-blank line (or the total budget) may end the
+ * read; a channel that never sends a byte is cut off at first_byte_ms.
  */
 static virp_error_t read_quiescent_last_line(const virp_ssh_io_t *io,
                                              char *line_out, size_t line_cap,
                                              size_t *line_len_out,
+                                             int first_byte_ms, int total_ms,
                                              learn_read_diag_t *diag)
 {
     char buf[8192];
     size_t total = 0;
     int idle_ms = 0;
     int spent_ms = 0;
+    bool have_content = false;   /* any byte beyond padding and newlines */
 
-    while (total < sizeof(buf) - 1 &&
-           idle_ms < VIRP_SSH_QUIESCENT_MS &&
-           spent_ms < VIRP_SSH_LEARN_TIMEOUT_MS) {
+    for (;;) {
+        if (total >= sizeof(buf) - 1)
+            break;                       /* full: parse what we have */
+        if (spent_ms >= total_ms)
+            break;                       /* hard ceiling */
+        if (total == 0 && idle_ms >= first_byte_ms)
+            break;                       /* pure silence */
+        if (have_content && idle_ms >= VIRP_SSH_QUIESCENT_MS)
+            break;                       /* answer arrived and went quiet */
+        /* total > 0 && !have_content — blank bytes only (the echo of
+         * our own probe): keep listening until the total budget. */
+
         ssize_t n = io->read(io->ctx, buf + total, sizeof(buf) - total - 1);
         if (n > 0) {
+            for (ssize_t i = 0; i < n && !have_content; i++) {
+                char c = buf[total + (size_t)i];
+                if (!is_trailing_pad(c) && c != '\n')
+                    have_content = true;
+            }
             total += (size_t)n;
             idle_ms = 0;
         } else if (n == VIRP_SSH_IO_EAGAIN) {
@@ -169,7 +189,7 @@ static virp_error_t read_quiescent_last_line(const virp_ssh_io_t *io,
             idle_ms += POLL_INTERVAL_MS;
             spent_ms += POLL_INTERVAL_MS;
         } else {
-            break;
+            break;                       /* EOF or transport error */
         }
     }
     buf[total] = '\0';
@@ -211,6 +231,7 @@ static virp_error_t read_quiescent_last_line(const virp_ssh_io_t *io,
 
 virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
                                    const char *device_label,
+                                   const virp_ssh_learn_opts_t *opts,
                                    virp_ssh_prompt_t *out)
 {
     if (!io || !io->read || !io->write || !out)
@@ -222,6 +243,19 @@ virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
     /* Anything already buffered is not part of the answer. */
     size_t drained = virp_ssh_drain(io, dev);
 
+    /* Drained residue is proof of life just as a banner is. */
+    bool spoken = (opts && opts->channel_has_spoken) || drained > 0;
+    int total_ms = (opts && opts->total_ms > 0)
+                       ? opts->total_ms : VIRP_SSH_LEARN_TIMEOUT_MS;
+    int fb_override = (opts && opts->first_byte_ms > 0)
+                          ? opts->first_byte_ms : 0;
+    int fb1_ms = fb_override ? fb_override
+               : spoken ? VIRP_SSH_LEARN_FIRST_BYTE_SPOKEN_MS
+                        : VIRP_SSH_LEARN_FIRST_BYTE_MS;
+    /* Probe 1 answering is itself the has-spoken signal for probe 2. */
+    int fb2_ms = fb_override ? fb_override
+                             : VIRP_SSH_LEARN_FIRST_BYTE_SPOKEN_MS;
+
     char first[VIRP_SSH_MAX_PROMPT_LEN];
     char second[VIRP_SSH_MAX_PROMPT_LEN];
     size_t first_len = 0, second_len = 0;
@@ -231,14 +265,14 @@ virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
         fprintf(stderr, "[SSH] Prompt learn: write failed (device=%s)\n", dev);
         return VIRP_ERR_NO_PROMPT;
     }
-    if (read_quiescent_last_line(io, first, sizeof(first),
-                                 &first_len, &d1) != VIRP_OK) {
+    if (read_quiescent_last_line(io, first, sizeof(first), &first_len,
+                                 fb1_ms, total_ms, &d1) != VIRP_OK) {
         fprintf(stderr,
                 "[SSH] Prompt learn: probe 1 failed (device=%s reason=%s "
                 "bytes=%zu drained=%zu wait=%dms first-byte-budget=%dms "
                 "total-budget=%dms)\n",
                 dev, d1.reason, d1.bytes, drained, d1.wait_ms,
-                VIRP_SSH_QUIESCENT_MS, VIRP_SSH_LEARN_TIMEOUT_MS);
+                fb1_ms, total_ms);
         return VIRP_ERR_NO_PROMPT;
     }
 
@@ -246,14 +280,14 @@ virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
         fprintf(stderr, "[SSH] Prompt learn: write failed (device=%s)\n", dev);
         return VIRP_ERR_NO_PROMPT;
     }
-    if (read_quiescent_last_line(io, second, sizeof(second),
-                                 &second_len, &d2) != VIRP_OK) {
+    if (read_quiescent_last_line(io, second, sizeof(second), &second_len,
+                                 fb2_ms, total_ms, &d2) != VIRP_OK) {
         fprintf(stderr,
                 "[SSH] Prompt learn: probe 2 failed (device=%s reason=%s "
                 "bytes=%zu drained=%zu wait=%dms first-byte-budget=%dms "
                 "total-budget=%dms)\n",
                 dev, d2.reason, d2.bytes, drained, d2.wait_ms,
-                VIRP_SSH_QUIESCENT_MS, VIRP_SSH_LEARN_TIMEOUT_MS);
+                fb2_ms, total_ms);
         return VIRP_ERR_NO_PROMPT;
     }
 
@@ -269,8 +303,7 @@ virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
                 "probe2-wait=%dms drained=%zu first-byte-budget=%dms "
                 "total-budget=%dms)\n",
                 dev, first, second, d1.bytes, d1.wait_ms, d2.bytes,
-                d2.wait_ms, drained,
-                VIRP_SSH_QUIESCENT_MS, VIRP_SSH_LEARN_TIMEOUT_MS);
+                d2.wait_ms, drained, fb1_ms, total_ms);
         return VIRP_ERR_NO_PROMPT;
     }
 
@@ -285,7 +318,7 @@ virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
             "probe2-wait=%dms drained=%zu first-byte-budget=%dms "
             "total-budget=%dms\n",
             dev, out->prompt, d1.bytes, d1.wait_ms, d2.bytes, d2.wait_ms,
-            drained, VIRP_SSH_QUIESCENT_MS, VIRP_SSH_LEARN_TIMEOUT_MS);
+            drained, fb1_ms, total_ms);
     return VIRP_OK;
 }
 

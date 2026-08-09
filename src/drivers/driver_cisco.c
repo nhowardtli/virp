@@ -425,16 +425,19 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
      * discarded or pattern-matched for the enable password prompt.
      */
     char scratch[4096];
-    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
+    size_t setup_bytes =
+        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
 
     /* Disable paging */
     ssh_write(conn, "terminal length 0\n");
-    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+    setup_bytes += virp_ssh_read_quiescent(&conn->io, scratch,
+                                           sizeof(scratch), 3000);
 
     /* Enter enable mode if we have an enable password */
     if (device->enable_password[0] != '\0') {
         ssh_write(conn, "enable\n");
-        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+        setup_bytes += virp_ssh_read_quiescent(&conn->io, scratch,
+                                               sizeof(scratch), 3000);
 
         /* If we got a password prompt, send enable password */
         if (strstr(scratch, "assword") != NULL) {
@@ -442,12 +445,14 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
             snprintf(enable_cmd, sizeof(enable_cmd), "%s\n",
                      device->enable_password);
             ssh_write(conn, enable_cmd);
-            virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+            setup_bytes += virp_ssh_read_quiescent(&conn->io, scratch,
+                                                   sizeof(scratch), 3000);
         }
 
         /* Disable paging again in enable mode */
         ssh_write(conn, "terminal length 0\n");
-        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+        setup_bytes += virp_ssh_read_quiescent(&conn->io, scratch,
+                                               sizeof(scratch), 3000);
     }
 
     /*
@@ -455,7 +460,8 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
      * connection without one cannot produce a trustworthy observation:
      * failure here fails the connect. No heuristic fallback.
      */
-    if (virp_ssh_learn_prompt(&conn->io, device->hostname,
+    virp_ssh_learn_opts_t lopts = { .channel_has_spoken = setup_bytes > 0 };
+    if (virp_ssh_learn_prompt(&conn->io, device->hostname, &lopts,
                               &conn->prompt) != VIRP_OK) {
         fprintf(stderr, "[Cisco] Prompt learning failed — refusing connection "
                 "to %s (%s:%u)\n", device->hostname, device->host, port);

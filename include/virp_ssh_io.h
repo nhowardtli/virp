@@ -54,8 +54,26 @@
 #define VIRP_SSH_DRAIN_MAX_MS       5000
 #define VIRP_SSH_DRAIN_MAX_BYTES    (256 * 1024)
 
-/* Time budget for learning the prompt (per confirmation round). */
-#define VIRP_SSH_LEARN_TIMEOUT_MS   5000
+/*
+ * Budgets for one prompt-learning read (per probe).
+ *
+ * The quiescence window above is NOT the wait for a reply: pa-850
+ * (observed 2026-08-09) echoes the probe newline within ~25 ms and then
+ * stalls well past 250 ms before printing a prompt. So a learning read
+ * keeps listening once ANY byte has arrived, bounded by the total
+ * budget, and quiescence only finishes a read that has produced a
+ * non-blank line.
+ *
+ * The first-byte budget is how long a COMPLETELY silent channel is
+ * given. A channel that has already demonstrably spoken — banner bytes,
+ * drained residue, an answered probe — gets the short budget: silence
+ * from it means dead or dropped, not slow. The watchdog is a single
+ * serial thread on a 5 s sweep, so a mute-but-authenticating device
+ * must burn the long budget at most once, never once per probe.
+ */
+#define VIRP_SSH_LEARN_TIMEOUT_MS            20000
+#define VIRP_SSH_LEARN_FIRST_BYTE_MS         20000
+#define VIRP_SSH_LEARN_FIRST_BYTE_SPOKEN_MS   2000
 
 /*
  * Transport return convention. Adapters translate their native codes:
@@ -99,16 +117,36 @@ typedef struct {
 size_t virp_ssh_drain(const virp_ssh_io_t *io, const char *device_label);
 
 /*
- * Learn the shell prompt. Sends a bare newline, reads to quiescence and
- * takes the last non-empty line, then repeats and requires an identical
- * result. Two matching rounds is what makes this a measurement rather
- * than a guess.
+ * What the caller already knows about the channel when learning starts.
+ *
+ * channel_has_spoken: an earlier read on this channel — the banner, cli
+ * setup output, an executed command — already produced bytes, so the
+ * short first-byte budget applies. The two _ms fields override the
+ * header defaults (0 means default); they exist so tests can exercise
+ * the silent-device path without a 20 s wall-clock wait.
+ */
+typedef struct {
+    bool channel_has_spoken;
+    int  first_byte_ms;
+    int  total_ms;
+} virp_ssh_learn_opts_t;
+
+/*
+ * Learn the shell prompt. Sends a bare newline, reads until a non-blank
+ * line has arrived and the channel goes quiescent, takes the last
+ * non-empty line, then repeats and requires an identical result. Two
+ * matching rounds is what makes this a measurement rather than a guess.
+ *
+ * opts may be NULL: never-spoken defaults (long first-byte budget).
+ * Probe 1 answering is itself the has-spoken signal for probe 2, so at
+ * most one long silent wait can occur per learn.
  *
  * Returns VIRP_OK with *out populated, or VIRP_ERR_NO_PROMPT. Callers
  * MUST fail the connection on error — there is no fallback prompt.
  */
 virp_error_t virp_ssh_learn_prompt(const virp_ssh_io_t *io,
                                    const char *device_label,
+                                   const virp_ssh_learn_opts_t *opts,
                                    virp_ssh_prompt_t *out);
 
 /*

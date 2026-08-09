@@ -617,12 +617,14 @@ static virp_conn_t *pa_connect(const virp_device_t *device)
      * quiescence-based and never signed.
      */
     char scratch[4096];
-    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
+    size_t setup_bytes =
+        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
 
     /* Disable paging — PAN-OS uses 'set cli pager off' */
     if (!conn->pager_disabled) {
         pa_ssh_write(conn, "set cli pager off\n");
-        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+        setup_bytes += virp_ssh_read_quiescent(&conn->io, scratch,
+                                               sizeof(scratch), 3000);
         conn->pager_disabled = true;
     }
 
@@ -631,7 +633,8 @@ static virp_conn_t *pa_connect(const virp_device_t *device)
      * mismatch was actually observed in production (2026-07-29), so the
      * strict path matters most here. No fallback: failure fails connect.
      */
-    if (virp_ssh_learn_prompt(&conn->io, device->hostname,
+    virp_ssh_learn_opts_t lopts = { .channel_has_spoken = setup_bytes > 0 };
+    if (virp_ssh_learn_prompt(&conn->io, device->hostname, &lopts,
                               &conn->prompt) != VIRP_OK) {
         fprintf(stderr, "[PAN-OS] Prompt learning failed — refusing connection "
                 "to %s (%s:%u)\n", device->hostname, device->host, port);

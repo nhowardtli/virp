@@ -373,7 +373,8 @@ static bool asa_enter_enable(virp_conn_t *conn)
     ssh_write(conn, "terminal width 512\n");
     virp_ssh_read_quiescent(&conn->io, buf, sizeof(buf), 3000);
 
-    if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+    virp_ssh_learn_opts_t lopts = { .channel_has_spoken = true };
+    if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname, &lopts,
                               &conn->prompt) != VIRP_OK) {
         conn->in_enable = false;
         return false;
@@ -400,7 +401,8 @@ static bool asa_verify_enable(virp_conn_t *conn)
      * read fail. Re-learning IS the check — it sends the probes and
      * confirms the answer.
      */
-    if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+    virp_ssh_learn_opts_t lopts = { .channel_has_spoken = true };
+    if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname, &lopts,
                               &conn->prompt) != VIRP_OK) {
         conn->in_enable = false;
         return false;
@@ -569,10 +571,12 @@ static virp_conn_t *asa_connect(const virp_device_t *device)
      * quiescence-based and never signed.
      */
     char scratch[4096];
-    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
+    size_t setup_bytes =
+        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
 
     /* Learn the prompt before deciding anything from it. */
-    if (virp_ssh_learn_prompt(&conn->io, device->hostname,
+    virp_ssh_learn_opts_t lopts = { .channel_has_spoken = setup_bytes > 0 };
+    if (virp_ssh_learn_prompt(&conn->io, device->hostname, &lopts,
                               &conn->prompt) != VIRP_OK) {
         fprintf(stderr, "[ASA] Prompt learning failed — refusing connection "
                 "to %s (%s:%u)\n", device->hostname, device->host, port);
@@ -599,8 +603,10 @@ static virp_conn_t *asa_connect(const virp_device_t *device)
         ssh_write(conn, "terminal width 512\n");
         virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
 
-        /* Those commands can alter the prompt line — re-learn. */
-        if (virp_ssh_learn_prompt(&conn->io, device->hostname,
+        /* Those commands can alter the prompt line — re-learn. The
+         * device has already produced a prompt once, so it has spoken. */
+        virp_ssh_learn_opts_t relearn = { .channel_has_spoken = true };
+        if (virp_ssh_learn_prompt(&conn->io, device->hostname, &relearn,
                                   &conn->prompt) != VIRP_OK) {
             fprintf(stderr, "[ASA] Prompt re-learn failed after pager setup "
                     "on %s\n", device->hostname);

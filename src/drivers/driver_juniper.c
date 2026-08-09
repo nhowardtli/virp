@@ -602,15 +602,18 @@ static virp_conn_t *junos_connect(const virp_device_t *device)
      * banner first), so they are quiescence-based and never signed.
      */
     char scratch[4096];
-    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
+    size_t setup_bytes =
+        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
 
     /* Disable paging — JunOS uses "set cli screen-length 0" */
     ssh_write(conn, "set cli screen-length 0\n");
-    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+    setup_bytes += virp_ssh_read_quiescent(&conn->io, scratch,
+                                           sizeof(scratch), 3000);
 
     /* Disable line wrapping — prevents mid-line breaks on wide output */
     ssh_write(conn, "set cli screen-width 0\n");
-    virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+    setup_bytes += virp_ssh_read_quiescent(&conn->io, scratch,
+                                           sizeof(scratch), 3000);
 
     /*
      * Learn the prompt AFTER the cli settings, which can change it.
@@ -618,7 +621,8 @@ static virp_conn_t *junos_connect(const virp_device_t *device)
      * a connection we cannot learn a prompt for cannot produce a
      * trustworthy observation.
      */
-    if (virp_ssh_learn_prompt(&conn->io, device->hostname,
+    virp_ssh_learn_opts_t lopts = { .channel_has_spoken = setup_bytes > 0 };
+    if (virp_ssh_learn_prompt(&conn->io, device->hostname, &lopts,
                               &conn->prompt) != VIRP_OK) {
         fprintf(stderr, "[JunOS] Prompt learning failed — refusing connection "
                 "to %s (%s:%u)\n", device->hostname, device->host, port);
@@ -726,7 +730,9 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
         virp_ssh_read_quiescent(&conn->io, rb_buf, sizeof(rb_buf), 5000);
         /* rollback can change the prompt — re-learn, best effort here
          * since we are already on an error path. */
-        virp_ssh_learn_prompt(&conn->io, conn->device.hostname, &conn->prompt);
+        virp_ssh_learn_opts_t rb_opts = { .channel_has_spoken = true };
+        virp_ssh_learn_prompt(&conn->io, conn->device.hostname, &rb_opts,
+                              &conn->prompt);
         conn->current_mode = junos_parse_mode(conn->prompt.prompt);
         conn->config_error = false;
         conn->commit_check_ok = false;
@@ -794,7 +800,8 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
          * transition itself as the result — still never a signed body
          * built from an unterminated read.
          */
-        if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+        virp_ssh_learn_opts_t mc_opts = { .channel_has_spoken = true };
+        if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname, &mc_opts,
                                   &conn->prompt) == VIRP_OK) {
             conn->current_mode = junos_parse_mode(conn->prompt.prompt);
             rerr = VIRP_OK;
@@ -823,7 +830,8 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
     /* Re-learn after any deliberate mode change so the next read has a
      * correct input prompt. */
     if (is_mode_changing) {
-        if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+        virp_ssh_learn_opts_t mc_opts = { .channel_has_spoken = true };
+        if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname, &mc_opts,
                                   &conn->prompt) != VIRP_OK) {
             conn->connected = false;
             result->success = false;
@@ -921,7 +929,8 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
             ssh_write(conn, "rollback 0\n");
             char rb_buf[4096];
             virp_ssh_read_quiescent(&conn->io, rb_buf, sizeof(rb_buf), 5000);
-            virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+            virp_ssh_learn_opts_t rb_opts = { .channel_has_spoken = true };
+            virp_ssh_learn_prompt(&conn->io, conn->device.hostname, &rb_opts,
                                   &conn->prompt);
             conn->current_mode = junos_parse_mode(conn->prompt.prompt);
         }
