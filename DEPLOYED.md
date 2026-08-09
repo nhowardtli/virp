@@ -1039,6 +1039,53 @@ ever grew past 1 KB, connect would refuse rather than silently truncate.
 Correct, and better than the alternative, but it is a new way for connect to
 fail.
 
+## Deploy 2026-08-09 04:11 UTC — per-uid GREEN ceiling for netclaw (commit 5841ec71)
+
+Resolves Finding A. Built + installed via `make install-prod` (binary
+sha256 3a440881…, new code; check-deploy-unit PASS, tree clean at
+5841ec71), ceiling template staged to /etc/virp, restarted 04:11:58→59
+UTC (onode then broker). Startup logged:
+`per-uid tier ceilings: 993=GREEN (node-wide ceiling = YELLOW)`.
+
+Verified live from netclaw through the tunnel (SO_PEERCRED uid 993 on
+.211) AND via the full Nexus spawn path (sudo -u nexus → sudo -u
+virp-bridge → MCP exec_device_command):
+- GREEN `show ip ospf neighbor` → threshold=GREEN decision=allow → executed.
+- YELLOW `clear ip ospf neighbor` → threshold=GREEN decision=block →
+  proposal filed (proposal-only; unappliable, netclaw holds no approver key).
+- RED `configure terminal` → threshold=GREEN decision=block.
+- Local operator uid 1000: same YELLOW → threshold=YELLOW decision=allow.
+  The ceiling tightens uid 993 ONLY; the node-wide YELLOW is unchanged.
+
+Two-domain isolation re-confirmed: nexus observations landed on THIS
+node's chain (sessions ncfed-nexus-*), netclaw's local chain unchanged.
+frr1 OSPF re-formed to 2 Full after the operational clears.
+
+### Finding A — RESOLVED
+Mechanism: socket_uid_tier_ceilings config → onode_effective_max_tier()
+= min(gate_max_tier, per-uid), consulted in onode_execute_obs_ex on the
+single AND batch paths; connecting uid is SO_PEERCRED, threaded
+explicitly (not thread-local, because batch fans out child threads).
+Test: test_per_uid_ceiling_caps_yellow_but_not_uncapped (test-onode
+101/101; approval 23/0; drivers 26/26).
+
+### Nexus path now live (netclaw side, no .211 change)
+- /etc/sudoers.d/nexus-virp-bridge: nexus may run ONLY the exact
+  `env VIRP_ONODE_SOCKET=/run/virp-remote/onode.sock python3 -u
+  /usr/local/lib/virp/virp-bridge-mcp.py` as virp-bridge. Deny checks
+  pass: arbitrary cmd + different-socket both refused.
+- virp-bridge-remote registered in /home/nexus/.openclaw/openclaw.json
+  (mcp.servers) — nexus-live only; deliberately NOT in the repo config
+  or catalog (reconcile-mcp.py PASS). Nexus isolation 8-check clean: the
+  grant adds ONLY the spawn capability; config/key/socket all still denied.
+
+### Finding B — still OPEN (not deployed; separate from this work)
+Bridge `intent`/`outcome` chain appends still rejected by GATE 1
+(-4 INVALID_TYPE); only `observation` lands. Attribution is therefore
+observation-only. Fix would reconcile the bridge's artifact types with
+the daemon's external-allowed set — a bridge/daemon contract change,
+deferred pending a decision.
+
 ## Deploy 2026-08-09 03:14 UTC — netclaw remote requester allowlist (commit 886c41a2)
 
 Config-only restart of virp-onode (binary sha256 unchanged `07b8eec4…`,
