@@ -127,7 +127,19 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             # inlined in the tracked template, which is world-readable
             # (0644) — unlike the throwaway "frrlab" lab passwords above
             # it, this is a real operator account on physical hardware.
-            "SWITCH_PASS"):
+            "SWITCH_PASS",
+            # IronClaw colo fleet (pa-850, ASA-5525, srx-300, R1..R35):
+            # ONE shared login password and ONE shared enable secret
+            # across the fleet, so the template names two placeholders
+            # rather than 38 pairs. They are SEPARATE names for the same
+            # reason the Zammad tokens are separate: an entry carrying
+            # only ${LAB_PASSWORD} reaches operational mode and no
+            # further, and that distinction should be visible in the
+            # template rather than implied. A vendor with no enable mode
+            # (panos) must name only ${LAB_PASSWORD} — naming ${LAB_ENABLE}
+            # on such a row loads a secret into the daemon's address space
+            # that no driver will ever read.
+            "LAB_PASSWORD", "LAB_ENABLE"):
     placeholder = "${%s}" % var
     if placeholder not in text:
         continue
