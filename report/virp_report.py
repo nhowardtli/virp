@@ -49,11 +49,16 @@ DEFAULT_CHAIN_KEY = "/etc/virp/keys/chain.key"
 DEFAULT_NODE_IDENTITY = "/etc/virp/autopilot-node.json"
 
 # Verdict → colour. UNVERIFIABLE is amber, never green: it is not a pass.
+# V2-SESSION is blue-violet — deliberately NEITHER the green of a verified
+# pass NOR the red/amber of failure and retention loss: it marks a frame
+# whose deployed version cannot be verified at rest by design, with its
+# own corroboration verdicts alongside.
 VERDICT_COLOR = {
     verify.PASS: colors.HexColor("#0b6b2f"),
     verify.FAIL: colors.HexColor("#b00020"),
     verify.UNCHECKED: colors.HexColor("#5a5a5a"),
     verify.UNVERIFIABLE: colors.HexColor("#8a5a00"),
+    verify.V2_SESSION: colors.HexColor("#3f3fae"),
     verify.NOT_APPLICABLE: colors.HexColor("#8a8a8a"),
 }
 
@@ -64,6 +69,7 @@ def vhex(verdict):
 
 FAIL_BG = colors.HexColor("#ffe3e6")
 UNVERIFIABLE_BG = colors.HexColor("#fff4e0")
+V2_BG = colors.HexColor("#eceafb")
 HEAD_BG = colors.HexColor("#e8eaed")
 
 
@@ -163,6 +169,47 @@ def load_heads(reader):
             "FROM chain_heads")}
     except sqlite3.OperationalError:
         return None
+
+
+def collect_journal_hello_acks(unit="virp-onode"):
+    """Gather SESSION_HELLO_ACK session ids from the daemon journal, for
+    corroborating v2 (session-key-signed) observations.
+
+    Returns {"session_ids": set, "since_ns": int|None}, or None when the
+    journal is unreadable here (not the daemon host, no privilege, no
+    systemd) — the verifier then reports the corroboration UNCHECKED
+    rather than inventing a verdict. This is the report's only subprocess
+    and it is local-machine-only; the no-network property holds.
+    """
+    import re
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["journalctl", "-u", unit, "-o", "short-unix", "--no-pager",
+             "--grep", "SESSION_HELLO_ACK sent"],
+            capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    sids = set(re.findall(rb"session_id=([0-9a-f]{32})", out.stdout))
+    sids = {s.decode() for s in sids}
+
+    # Earliest covered moment: the first line of the unit's journal. If a
+    # v2 frame predates this, its HELLO_ACK may simply have rotated out —
+    # corroboration is then UNCHECKED, not FAIL.
+    since_ns = None
+    try:
+        head = subprocess.run(
+            ["sh", "-c",
+             "journalctl -u %s -o short-unix --no-pager | head -n 1" % unit],
+            capture_output=True, timeout=120)
+        tok = head.stdout.split(None, 1)
+        if tok:
+            since_ns = int(float(tok[0]) * 1e9)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return {"session_ids": sids, "since_ns": since_ns}
 
 
 def load_node_identity(path):
@@ -425,7 +472,7 @@ def section_integrity(story, ss, summary, verifications):
     def line(label, tally, denom):
         parts = []
         for verdict in (verify.PASS, verify.FAIL, verify.UNVERIFIABLE,
-                        verify.UNCHECKED):
+                        verify.V2_SESSION, verify.UNCHECKED):
             n = tally.get(verdict, 0)
             if n:
                 parts.append('<font color="%s">%s %d</font>'
@@ -445,6 +492,9 @@ def section_integrity(story, ss, summary, verifications):
         line("Session head (chain length)", summary["heads"]["tally"],
              summary["sessions"]),
     ]
+    if summary["obs_v2"]:
+        data.append(line("V2 session-id journal corroboration",
+                         summary["v2_journal"], summary["obs_v2"]))
     t = Table(data, colWidths=(2.3 * inch, 8.0 * inch), hAlign="LEFT")
     t.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -531,6 +581,57 @@ def section_integrity(story, ss, summary, verifications):
         ]))
         story.append(t)
 
+    v2_frames = [v for v in verifications
+                 if v.obs_hmac == verify.V2_SESSION]
+    if v2_frames:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(
+            '<font color="%s"><b>%d V2 SESSION-SIGNED OBSERVATION%s.</b>'
+            "</font> Each is a version-2 frame signed with a per-session "
+            "key (HKDF of the O-Key and the handshake transcript). The "
+            "transcript is not retained past the session, so at-rest "
+            "cryptographic verification of these signatures is <b>not "
+            "possible with available material — a property of the "
+            "deployed version, not a verification failure</b>. What CAN "
+            "be checked is corroborated below and in the session tables: "
+            "the header session id against the daemon journal's "
+            "SESSION_HELLO_ACK record, sha256 of the stored bytes against "
+            "the entry's own artifact_hash, and the entry's hash-chain "
+            "linkage. A mismatch on any of those IS a failure and is "
+            "reported as one."
+            % (vhex(verify.V2_SESSION), len(v2_frames),
+               "" if len(v2_frames) == 1 else "S"), ss["Note"]))
+        story.append(Spacer(1, 4))
+        rows = [[Paragraph("<b>%s</b>" % h, ss["MonoSmall"]) for h in
+                 ("session", "seq", "signed (UTC)", "v2 session id",
+                  "journal", "binding", "linkage")]]
+        for v in v2_frames:
+            hdr = v.header or {}
+            linkage = (verify.PASS
+                       if verify.FAIL not in (v.entry_hash, v.link,
+                                              v.chain_hmac)
+                       else verify.FAIL)
+            rows.append([
+                Paragraph(trunc(v.entry["session_id"], 30), ss["MonoSmall"]),
+                Paragraph(str(v.entry["sequence"]), ss["MonoSmall"]),
+                Paragraph(ns_to_utc(hdr.get("timestamp_ns")), ss["MonoSmall"]),
+                Paragraph(trunc(hdr.get("session_id", "-"), 34),
+                          ss["MonoSmall"]),
+                verdict_para(v.v2_journal, ss),
+                verdict_para(v.artifact_bind, ss),
+                verdict_para(linkage, ss)])
+        t = Table(rows, colWidths=(2.0 * inch, 0.4 * inch, 1.35 * inch,
+                                   2.4 * inch, 1.35 * inch, 1.35 * inch,
+                                   1.35 * inch),
+                  hAlign="LEFT", repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), HEAD_BG),
+            ("BACKGROUND", (0, 1), (-1, -1), V2_BG),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#c0c0c0")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(t)
+
 
 def section_sessions(story, ss, verifications):
     # No page break here: section 2's length varies, and forcing one leaves a
@@ -574,11 +675,13 @@ def section_sessions(story, ss, verifications):
             for label, verdict in (("h", v.entry_hash), ("l", v.link),
                                    ("m", v.chain_hmac),
                                    ("b", v.artifact_bind),
-                                   ("o", v.obs_hmac)):
+                                   ("o", v.obs_hmac),
+                                   ("j", v.v2_journal)):
                 if verdict == verify.NOT_APPLICABLE:
                     continue
                 mark = {verify.PASS: "✓", verify.FAIL: "✗",
                         verify.UNVERIFIABLE: "?",
+                        verify.V2_SESSION: "◈",
                         verify.UNCHECKED: "·"}[verdict]
                 checks.append('<font color="%s">%s%s</font>'
                               % (vhex(verdict),
@@ -618,9 +721,12 @@ def section_sessions(story, ss, verifications):
 
     story.append(Paragraph(
         "Check legend: h=entry hash, l=hash link, m=chain HMAC, "
-        "b=artifact binding, o=observation HMAC. "
+        "b=artifact binding, o=observation HMAC, j=v2 session-id journal "
+        "corroboration (v2 frames only). "
         "✓ pass, ✗ fail, ? unverifiable (evidence not retained), "
-        "· unchecked (key not supplied).", ss["Note"]))
+        "◈ v2 session-signed (at-rest verification impossible by design "
+        "of the deployed version — see the V2 stanza in section 2), "
+        "· unchecked (key or journal not supplied).", ss["Note"]))
 
 
 def section_lifecycles(story, ss, lifecycles):
@@ -1051,6 +1157,13 @@ def build_parser():
                         "(default: %s)" % DEFAULT_CHAIN_KEY)
     p.add_argument("--node-identity", default=DEFAULT_NODE_IDENTITY,
                    help="JSON file naming this node")
+    p.add_argument("--journal-unit", default="virp-onode",
+                   help="systemd unit whose journal supplies HELLO_ACK "
+                        "session ids for v2 corroboration "
+                        "(default: virp-onode)")
+    p.add_argument("--no-journal", action="store_true",
+                   help="skip journal corroboration of v2 frames; their "
+                        "session ids are then reported UNCHECKED")
     p.add_argument("--allow-immutable", action="store_true",
                    help="permit the unsafe immutable=1 read as a last "
                         "resort; it can silently omit un-checkpointed WAL "
@@ -1098,9 +1211,15 @@ def main(argv=None):
         entries, artifacts = load_evidence(
             reader, args.session, since_ns, until_ns)
         heads = load_heads(reader)
+        v2_journal = (None if args.no_journal
+                      else collect_journal_hello_acks(args.journal_unit))
+        if v2_journal is None and not args.no_journal:
+            print("virp report: daemon journal unreadable here; v2 session "
+                  "corroboration will be reported UNCHECKED", file=sys.stderr)
         verifications, summary = verify.verify_chain(
             entries, artifacts, okey=okey, chain_key=chain_key,
-            heads=heads, selection_complete=since_ns is None and until_ns is None)
+            heads=heads, selection_complete=since_ns is None and until_ns is None,
+            v2_journal=v2_journal)
 
         identity = load_node_identity(args.node_identity)
         ctx = {
@@ -1135,6 +1254,12 @@ def main(argv=None):
     print("  chain HMAC      : %s" % _fmt(summary["chain_hmac"]))
     print("  artifact binding: %s" % _fmt(summary["artifact_bind"]))
     print("  observation HMAC: %s" % _fmt(summary["obs_hmac"]))
+    if summary["obs_v2"]:
+        jt = {k: v for k, v in summary["v2_journal"].items()
+              if k != verify.NOT_APPLICABLE}
+        print("  v2 session obs  : %d (at-rest unverifiable by design; "
+              "journal corroboration: %s)"
+              % (summary["obs_v2"], _fmt(jt)))
     if failed:
         print("  FAILED ENTRIES  : %d" % failed)
     # Exit 1 on any verification failure so a caller can gate on it. The PDF

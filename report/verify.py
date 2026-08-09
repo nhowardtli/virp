@@ -51,6 +51,22 @@ VIRP_HEADER_SIZE = 56
 VIRP_KEY_SIZE = 32
 VIRP_HMAC_SIZE = 32
 
+# v2 observation wire format (include/virp.h): 88-byte header, payload,
+# 32-byte session-key HMAC at the END. Byte 0 is the version: a v1 frame
+# starts 0x01, a v2 frame 0x02 — the dispatch key throughout this module.
+OBS_V2_HEADER_SIZE = 88
+OBS_V2_SIG_SIZE = 32
+OBS_V2_HEADER_FMT = "!BBBBQQQ16sQ32sI"
+
+V2_DESIGN_STATEMENT = (
+    "version 2, session-key-signed: at-rest cryptographic verification is "
+    "not possible with available material (the signing key is "
+    "HKDF(O-Key, handshake transcript) and the transcript is not retained "
+    "past the session). This is a property of the deployed version, not a "
+    "mismatch. Corroborated instead: header session_id vs the daemon "
+    "journal's HELLO_ACK (v2_journal check), sha256 vs the entry's "
+    "artifact_hash (artifact binding), and chain linkage.")
+
 CHAIN_GENESIS_PREFIX = "VIRP_CHAIN_GENESIS:"
 
 TIER_NAMES = {
@@ -91,12 +107,28 @@ CHANNEL_NAMES = {0x01: "OC", 0x02: "IC"}
 #   UNVERIFIABLE the check CANNOT run from this chain, ever, because the
 #                evidence it needs was never retained. No key or rerun fixes
 #                it. See RETENTION_* below for the structural causes.
+#   V2-SESSION   the observation is a version-2 frame: signed with a
+#                per-session key (HKDF of the O-Key and the handshake
+#                transcript) that exists only in daemon memory for the
+#                life of the session. At-rest cryptographic verification
+#                is not possible with available material — BY DESIGN OF
+#                THE DEPLOYED VERSION, not because anything mismatched.
+#                Kept apart from both PASS (nothing was verified) and
+#                FAIL (nothing failed), and apart from UNVERIFIABLE
+#                (which names retention limits of otherwise-verifiable
+#                material). What CAN be checked for such a frame is
+#                corroborated instead: header session_id against the
+#                daemon journal's HELLO_ACK record (the v2_journal
+#                verdict), sha256 against the entry's artifact_hash
+#                (artifact_bind), and chain linkage (entry_hash / link /
+#                chain_hmac). A corroboration mismatch IS a FAIL.
 #   N/A          the check does not apply to this entry at all (e.g. the
 #                observation-signature check on a proposal row).
 PASS = "PASS"
 FAIL = "FAIL"
 UNCHECKED = "UNCHECKED"
 UNVERIFIABLE = "UNVERIFIABLE"
+V2_SESSION = "V2-SESSION"
 NOT_APPLICABLE = "N/A"
 
 # ── Structural retention limits of the chain format ────────────────────────
@@ -263,6 +295,82 @@ def parse_message_header(raw):
     }
 
 
+def parse_observation_v2_header(raw):
+    """Parse the 88-byte v2 observation header. Returns a dict, or None if
+    too short. Field names deliberately mirror parse_message_header where
+    the semantics match, so renderers need no per-version branches for the
+    tier/type columns."""
+    if raw is None or len(raw) < OBS_V2_HEADER_SIZE:
+        return None
+    (version, channel, tier, _reserved, node_id, ts_ns, seq_num,
+     session_id, device_id, command_hash,
+     payload_len) = struct.unpack_from(OBS_V2_HEADER_FMT, raw, 0)
+    return {
+        "version": version,
+        "type": None,
+        "type_name": "OBSERVATION (v2)",
+        "length": OBS_V2_HEADER_SIZE + payload_len + OBS_V2_SIG_SIZE,
+        "node_id": node_id,
+        "channel": channel,
+        "channel_name": CHANNEL_NAMES.get(channel, "0x%02x" % channel),
+        "tier": tier,
+        "tier_name": TIER_NAMES.get(tier, "0x%02x" % tier),
+        "seq_num": seq_num,
+        "timestamp_ns": ts_ns,
+        "session_id": session_id.hex(),
+        "device_id": device_id,
+        "command_hash": command_hash.hex(),
+        "payload_len": payload_len,
+        "hmac": raw[-OBS_V2_SIG_SIZE:] if len(raw) >= OBS_V2_SIG_SIZE else b"",
+    }
+
+
+def parse_observation_v2_payload(raw):
+    """Extract the observation body from a v2 frame — same shape as
+    parse_observation_payload, minus the TLV fields v2 does not carry."""
+    hdr = parse_observation_v2_header(raw)
+    if hdr is None:
+        return None
+    data = raw[OBS_V2_HEADER_SIZE:OBS_V2_HEADER_SIZE + hdr["payload_len"]]
+    text = data.decode("utf-8", errors="replace")
+    command = ""
+    output = text
+    if "\n" in text:
+        first, rest = text.split("\n", 1)
+        if "$ " in first or first.endswith("$"):
+            command = first.split("$ ", 1)[-1] if "$ " in first else ""
+            output = rest
+    return {
+        "obs_type": None,
+        "obs_scope": None,
+        "obs_length": hdr["payload_len"],
+        "text": text,
+        "command": command.strip(),
+        "output": output,
+    }
+
+
+def classify_observation_v2(raw):
+    """Structural verdict for a frame whose version byte claims v2.
+
+    A well-formed v2 frame is V2-SESSION (see the verdict table): its
+    session-key signature cannot be recomputed at rest and nothing about
+    that is a mismatch. A frame that CLAIMS v2 but does not parse as one
+    is a FAIL — tamper-suspect, not a design property.
+    """
+    if len(raw) < OBS_V2_HEADER_SIZE + OBS_V2_SIG_SIZE:
+        return FAIL, ("claims version 2 but is %d bytes, shorter than the "
+                      "%d-byte v2 minimum"
+                      % (len(raw), OBS_V2_HEADER_SIZE + OBS_V2_SIG_SIZE))
+    hdr = parse_observation_v2_header(raw)
+    expected = OBS_V2_HEADER_SIZE + hdr["payload_len"] + OBS_V2_SIG_SIZE
+    if expected != len(raw):
+        return FAIL, ("claims version 2 but declared payload_len %d does "
+                      "not match frame size (%d expected, %d stored)"
+                      % (hdr["payload_len"], expected, len(raw)))
+    return V2_SESSION, V2_DESIGN_STATEMENT
+
+
 def verify_observation_hmac(raw, okey):
     """Recompute the O-Key HMAC over a signed VIRP message.
 
@@ -271,8 +379,17 @@ def verify_observation_hmac(raw, okey):
     header's declared length. Mirrors virp_verify() in the C library and the
     pure-Python parity check in tests/test_hmac_parity.py.
 
+    A frame whose version byte is 2 never reaches the O-Key math: it is
+    session-key-signed and classified V2-SESSION (or FAIL if malformed) by
+    classify_observation_v2 — dispatched HERE so every caller of this
+    function, not just verify_entry, treats v2 honestly. The dispatch runs
+    before the okey check because the O-Key would not verify a v2 frame
+    even if supplied.
+
     Returns (verdict, detail).
     """
+    if raw is not None and len(raw) >= 1 and raw[0] == 2:
+        return classify_observation_v2(raw)
     if okey is None:
         return UNCHECKED, "no O-Key available"
     if raw is None or len(raw) < VIRP_HEADER_SIZE:
@@ -347,7 +464,8 @@ class EntryVerification:
                  "link_detail", "chain_hmac", "chain_hmac_detail",
                  "artifact_bind", "artifact_bind_detail", "obs_hmac",
                  "obs_hmac_detail", "header", "payload", "artifact_raw",
-                 "artifact_content", "device")
+                 "artifact_content", "device", "v2_journal",
+                 "v2_journal_detail")
 
     def __init__(self, entry):
         self.entry = entry
@@ -364,6 +482,10 @@ class EntryVerification:
         # left undone.
         self.obs_hmac = NOT_APPLICABLE
         self.obs_hmac_detail = ""
+        # Journal corroboration of a v2 frame's session id. N/A for
+        # everything that is not a well-formed v2 observation.
+        self.v2_journal = NOT_APPLICABLE
+        self.v2_journal_detail = ""
         self.header = None
         self.payload = None
         self.artifact_raw = None
@@ -374,7 +496,8 @@ class EntryVerification:
     def ok(self):
         """True only if nothing that ran came back FAIL."""
         return FAIL not in (self.entry_hash, self.link, self.chain_hmac,
-                            self.artifact_bind, self.obs_hmac)
+                            self.artifact_bind, self.obs_hmac,
+                            self.v2_journal)
 
     @property
     def failures(self):
@@ -386,7 +509,9 @@ class EntryVerification:
                 ("chain_hmac", self.chain_hmac, self.chain_hmac_detail),
                 ("artifact_bind", self.artifact_bind,
                  self.artifact_bind_detail),
-                ("observation_hmac", self.obs_hmac, self.obs_hmac_detail)):
+                ("observation_hmac", self.obs_hmac, self.obs_hmac_detail),
+                ("v2_session_journal", self.v2_journal,
+                 self.v2_journal_detail)):
             if verdict == FAIL:
                 out.append((name, detail))
         return out
@@ -482,6 +607,14 @@ def verify_entry(entry, artifact_content, okey, chain_key, expected_prev):
             v.header = parse_message_header(raw)
             v.obs_hmac = UNVERIFIABLE
             v.obs_hmac_detail = RETENTION_TRUNCATED
+        elif raw[0:1] == b"\x02":
+            # v2 frame: session-key-signed. verify_observation_hmac
+            # classifies it (V2-SESSION, or FAIL if malformed); the
+            # journal corroboration verdict is filled in by verify_chain,
+            # which holds the journal data.
+            v.header = parse_observation_v2_header(raw)
+            v.payload = parse_observation_v2_payload(raw)
+            v.obs_hmac, v.obs_hmac_detail = verify_observation_hmac(raw, okey)
         else:
             v.header = parse_message_header(raw)
             v.payload = parse_observation_payload(raw)
@@ -490,11 +623,60 @@ def verify_entry(entry, artifact_content, okey, chain_key, expected_prev):
     return v
 
 
+def corroborate_v2(verifications, v2_journal):
+    """Fill in the v2_journal verdict for every well-formed v2 observation.
+
+    `v2_journal` is None when no journal data was supplied (verdict
+    UNCHECKED — rerun where the daemon journal is readable), or a dict:
+
+        {"session_ids": set of 32-hex HELLO_ACK session ids,
+         "since_ns": earliest journal timestamp in ns, or None}
+
+    A v2 header session_id that is absent from the journal's HELLO_ACK
+    record is a FAIL — a session-bound frame whose session the daemon
+    never acknowledged is exactly what a forgery would look like — UNLESS
+    the journal demonstrably does not reach back to the frame's own
+    timestamp, in which case the honest verdict is UNCHECKED, not a
+    manufactured failure.
+    """
+    for v in verifications:
+        if v.obs_hmac != V2_SESSION or v.header is None:
+            continue
+        sid = v.header.get("session_id")
+        if v2_journal is None:
+            v.v2_journal = UNCHECKED
+            v.v2_journal_detail = (
+                "daemon journal HELLO_ACK data not supplied; the session "
+                "id could not be corroborated (rerun where journalctl -u "
+                "virp-onode is readable)")
+        elif sid in v2_journal.get("session_ids", frozenset()):
+            v.v2_journal = PASS
+            v.v2_journal_detail = (
+                "header session_id %s matches a SESSION_HELLO_ACK in the "
+                "daemon journal" % sid)
+        elif (v2_journal.get("since_ns") is not None
+              and v.header.get("timestamp_ns", 0) < v2_journal["since_ns"]):
+            v.v2_journal = UNCHECKED
+            v.v2_journal_detail = (
+                "journal coverage begins after this frame was signed; the "
+                "HELLO_ACK for session %s has rotated out" % sid)
+        else:
+            v.v2_journal = FAIL
+            v.v2_journal_detail = (
+                "header session_id %s does not match any SESSION_HELLO_ACK "
+                "in the daemon journal for its time range" % sid)
+
+
 def verify_chain(entries, artifacts, okey=None, chain_key=None,
-                 heads=None, selection_complete=False):
+                 heads=None, selection_complete=False, v2_journal=None):
     """Verify a list of chain entries (dicts) in session/sequence order.
 
     `artifacts` maps artifact_id -> artifact_content (or is missing the key).
+
+    `v2_journal` supplies the daemon journal's HELLO_ACK session ids for
+    corroborating v2 (session-key-signed) observations — see
+    corroborate_v2. None means "not supplied": v2 frames then carry an
+    UNCHECKED corroboration verdict, never a silent pass.
 
     `heads` maps session_id -> head row dict (last_sequence,
     last_entry_hash, head_hmac) from the chain_heads table, or is None when
@@ -542,6 +724,8 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None,
             verifications.append(v)
             prev_hash = e["chain_entry_hash"]
             prev_seq = e["sequence"]
+
+    corroborate_v2(verifications, v2_journal)
 
     head_results = verify_heads(by_session, heads, chain_key,
                                 selection_complete)
@@ -706,7 +890,7 @@ def verify_heads(by_session, heads, chain_key, selection_complete=False):
 
 def _tally(verifications, attr):
     counts = {PASS: 0, FAIL: 0, UNCHECKED: 0, UNVERIFIABLE: 0,
-              NOT_APPLICABLE: 0}
+              V2_SESSION: 0, NOT_APPLICABLE: 0}
     for v in verifications:
         counts[getattr(v, attr)] += 1
     return counts
@@ -743,8 +927,11 @@ def summarize(verifications):
         "chain_hmac": _tally(verifications, "chain_hmac"),
         "artifact_bind": _tally(verifications, "artifact_bind"),
         "obs_hmac": _tally(verifications, "obs_hmac"),
+        "v2_journal": _tally(verifications, "v2_journal"),
         "observations": sum(1 for v in verifications
                             if v.entry["artifact_type"] == "observation"),
+        "obs_v2": sum(1 for v in verifications
+                      if v.obs_hmac == V2_SESSION),
         "failed_entries": [v for v in verifications if not v.ok],
         "first_broken_link": first_broken,
         "sessions": len({v.entry["session_id"] for v in verifications}),

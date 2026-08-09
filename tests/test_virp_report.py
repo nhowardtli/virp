@@ -82,6 +82,24 @@ def sign_observation(okey, payload, node_id=0x0A000A01, tier=0x01,
     return head + mac + body
 
 
+def sign_observation_v2(session_key, payload, session_id=b"\xab" * 16,
+                        node_id=0x0A000A01, tier=0x01, seq=1,
+                        timestamp_ns=1785300000000000000,
+                        device_id=0x1122334455667788,
+                        payload_len_override=None):
+    """Build a v2-format observation: 88-byte header, payload, trailing
+    32-byte session-key HMAC (include/virp.h wire layout). The verifier
+    cannot recompute this signature at rest — that is the point of the
+    V2-SESSION category — so the session_key here is a stand-in for the
+    daemon's HKDF-derived key, not shared with any test verifier."""
+    hdr = struct.pack(
+        verify.OBS_V2_HEADER_FMT, 2, 0x01, tier, 0, node_id, timestamp_ns,
+        seq, session_id, device_id, hashlib.sha256(b"show clock").digest(),
+        len(payload) if payload_len_override is None else payload_len_override)
+    sig = hmac_mod.new(session_key, hdr + payload, hashlib.sha256).digest()
+    return hdr + payload + sig
+
+
 class ChainBuilder:
     """Builds a valid chain database the way the daemon would."""
 
@@ -132,6 +150,19 @@ class ChainBuilder:
     def add_observation(self, session_id, device, text, tier=0x01):
         import base64
         raw = sign_observation(self.okey, text.encode(), tier=tier)
+        digest = hashlib.sha256(raw).hexdigest()
+        aid = "obs:%s:%d" % (device, self.ts)
+        return self.append(session_id, "observation", aid, digest,
+                           "base64:" + base64.b64encode(raw).decode())
+
+    def add_observation_v2(self, session_id, device, text,
+                           v2_session_id=b"\xab" * 16, tier=0x01,
+                           payload_len_override=None):
+        import base64
+        raw = sign_observation_v2(b"\x5c" * 32, text.encode(),
+                                  session_id=v2_session_id, tier=tier,
+                                  timestamp_ns=self.ts,
+                                  payload_len_override=payload_len_override)
         digest = hashlib.sha256(raw).hexdigest()
         aid = "obs:%s:%d" % (device, self.ts)
         return self.append(session_id, "observation", aid, digest,
@@ -848,6 +879,125 @@ class TestCLIArgumentHandling(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestV2SessionObservations(unittest.TestCase):
+    """v2 (session-key-signed) frames get their OWN category — never an
+    O-Key HMAC failure, never a pass — with journal corroboration of the
+    header session id. A corroboration mismatch IS a failure. And none of
+    this may weaken the v1 path: a corrupted v1 HMAC still fails hard."""
+
+    V2_SID = b"\x8f\x01\xfe\xd3" + b"\x11" * 12
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="virp-report-v2-")
+        self.db = os.path.join(self.tmp, "chain.db")
+        b = ChainBuilder(self.db)
+        b.add_observation("s:mixed", "dev0", "dev0$ show clock\n12:00")
+        b.add_observation_v2("s:mixed", "dev0",
+                             "dev0$ show clock\n12:01",
+                             v2_session_id=self.V2_SID)
+        b.close()
+        self.okey_file = os.path.join(self.tmp, "okey")
+        self.chain_key_file = os.path.join(self.tmp, "chainkey")
+        with open(self.okey_file, "wb") as fh:
+            fh.write(TEST_OKEY)
+        with open(self.chain_key_file, "wb") as fh:
+            fh.write(TEST_CHAIN_KEY)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _analyse(self, v2_journal=None):
+        with chain_read.open_chain(self.db) as reader:
+            entries, artifacts = virp_report.load_evidence(reader)
+            return verify.verify_chain(entries, artifacts, okey=TEST_OKEY,
+                                       chain_key=TEST_CHAIN_KEY,
+                                       v2_journal=v2_journal)
+
+    def test_v2_lands_in_its_own_category_not_fail_not_pass(self):
+        _, summary = self._analyse()
+        self.assertEqual(summary["obs_v2"], 1)
+        self.assertEqual(summary["obs_hmac"][verify.V2_SESSION], 1)
+        self.assertEqual(summary["obs_hmac"][verify.FAIL], 0)
+        # The v1 sibling still verifies PASS — its path is untouched.
+        self.assertEqual(summary["obs_hmac"][verify.PASS], 1)
+
+    def test_matching_journal_corroborates_green(self):
+        vs, summary = self._analyse(
+            {"session_ids": {self.V2_SID.hex()}, "since_ns": None})
+        self.assertEqual(summary["v2_journal"][verify.PASS], 1)
+        self.assertEqual(summary["v2_journal"][verify.FAIL], 0)
+        v2 = next(v for v in vs if v.obs_hmac == verify.V2_SESSION)
+        self.assertTrue(v2.ok)
+        self.assertEqual(v2.header["session_id"], self.V2_SID.hex())
+        # sha256 corroboration (binding) and linkage hold too.
+        self.assertEqual(v2.artifact_bind, verify.PASS)
+        self.assertEqual(v2.entry_hash, verify.PASS)
+
+    def test_session_id_absent_from_journal_is_a_FAILURE(self):
+        """A session-bound frame whose session the daemon never
+        acknowledged is what a forgery looks like."""
+        vs, summary = self._analyse(
+            {"session_ids": {"00" * 16}, "since_ns": None})
+        self.assertEqual(summary["v2_journal"][verify.FAIL], 1)
+        v2 = next(v for v in vs if v.obs_hmac == verify.V2_SESSION)
+        self.assertFalse(v2.ok)
+        self.assertIn("v2_session_journal",
+                      [name for name, _ in v2.failures])
+        self.assertIn(v2, summary["failed_entries"])
+
+    def test_no_journal_is_unchecked_never_silently_green(self):
+        vs, summary = self._analyse(None)
+        self.assertEqual(summary["v2_journal"][verify.UNCHECKED], 1)
+        self.assertEqual(summary["v2_journal"][verify.FAIL], 0)
+
+    def test_rotated_journal_is_unchecked_not_a_manufactured_failure(self):
+        vs, summary = self._analyse(
+            {"session_ids": {"00" * 16},
+             "since_ns": 3000000000000000000})   # after the frame was signed
+        self.assertEqual(summary["v2_journal"][verify.UNCHECKED], 1)
+        self.assertEqual(summary["v2_journal"][verify.FAIL], 0)
+
+    def test_malformed_v2_frame_is_a_FAILURE_not_a_category(self):
+        """A frame that CLAIMS version 2 but does not parse as one is
+        tamper-suspect — the design category is for well-formed frames
+        only."""
+        db2 = os.path.join(self.tmp, "malformed.db")
+        b = ChainBuilder(db2)
+        b.add_observation_v2("s:bad", "dev0", "dev0$ show clock\n12:02",
+                             payload_len_override=9999)
+        b.close()
+        with chain_read.open_chain(db2) as reader:
+            entries, artifacts = virp_report.load_evidence(reader)
+            _, summary = verify.verify_chain(entries, artifacts,
+                                             okey=TEST_OKEY,
+                                             chain_key=TEST_CHAIN_KEY)
+        self.assertEqual(summary["obs_hmac"][verify.FAIL], 1)
+        self.assertEqual(summary["obs_hmac"][verify.V2_SESSION], 0)
+        self.assertTrue(summary["failed_entries"])
+
+    def test_corrupted_v1_hmac_still_fails_hard(self):
+        """The v1 verification path is unweakened by the v2 dispatch."""
+        vs, _ = self._analyse()
+        v1 = next(v for v in vs if v.obs_hmac == verify.PASS)
+        raw = bytearray(v1.artifact_raw)
+        raw[24] ^= 0xFF                     # corrupt the stored HMAC
+        verdict, _detail = verify.verify_observation_hmac(bytes(raw),
+                                                          TEST_OKEY)
+        self.assertEqual(verdict, verify.FAIL)
+
+    def test_cli_reports_v2_without_failing_the_run(self):
+        """Through the real CLI: a chain whose only oddity is a v2 frame
+        exits 0 (with --no-journal the corroboration is UNCHECKED, which
+        is not a failure) and the summary names the category."""
+        out = os.path.join(self.tmp, "v2.pdf")
+        code = virp_report.main(["--db", self.db, "--out", out,
+                                 "--no-journal",
+                                 "--okey", self.okey_file,
+                                 "--chain-key", self.chain_key_file])
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(out))
+
+
 def extract_pdf_text(path):
     """Best-effort text extraction, for asserting on rendered content."""
     try:
@@ -946,12 +1096,47 @@ class TestAgainstLiveChain(unittest.TestCase):
     @unittest.skipUnless(os.access(LIVE_OKEY, os.R_OK),
                          "O-Key not readable by this user")
     def test_live_observations_verify_under_the_real_okey(self):
+        """Every v1 observation on the live chain verifies under the real
+        O-Key; the legacy v2 (session-key-signed) frames of 2026-08-09
+        land in their OWN category — never counted as HMAC failures, and
+        never as passes — with journal corroboration green. A corrupted
+        v1 HMAC still fails hard (checked in memory against real signed
+        bytes; the live database is never written)."""
         okey = verify.load_key(LIVE_OKEY)
+        v2_journal = virp_report.collect_journal_hello_acks()
         with chain_read.open_chain(LIVE_DB) as reader:
             entries, artifacts = virp_report.load_evidence(reader)
-            _, summary = verify.verify_chain(entries, artifacts, okey=okey)
+            vs, summary = verify.verify_chain(entries, artifacts, okey=okey,
+                                              v2_journal=v2_journal)
+
+        # v1 path, unweakened: zero HMAC failures, and real passes.
         self.assertEqual(summary["obs_hmac"][verify.FAIL], 0)
         self.assertGreater(summary["obs_hmac"][verify.PASS], 0)
+
+        # The 2026-08-09 v2 frames are in their category with clean
+        # corroboration: session id in the daemon journal (when the
+        # journal is readable and reaches back), sha256 binding, and
+        # linkage — a corroboration mismatch would be a FAIL and land in
+        # failed_entries.
+        self.assertGreaterEqual(summary["obs_v2"], 5)
+        self.assertEqual(summary["obs_hmac"][verify.V2_SESSION],
+                         summary["obs_v2"])
+        self.assertEqual(summary["v2_journal"][verify.FAIL], 0)
+        if v2_journal is not None:
+            self.assertGreater(summary["v2_journal"][verify.PASS], 0)
+        for v in vs:
+            if v.obs_hmac == verify.V2_SESSION:
+                self.assertEqual(v.artifact_bind, verify.PASS,
+                                 v.entry["artifact_id"])
+                self.assertTrue(v.ok, (v.entry["artifact_id"], v.failures))
+
+        # Negative control on real data: flip one byte of a stored HMAC
+        # and the v1 verification must fail hard.
+        v1 = next(v for v in vs if v.obs_hmac == verify.PASS)
+        raw = bytearray(v1.artifact_raw)
+        raw[24] ^= 0xFF
+        verdict, _ = verify.verify_observation_hmac(bytes(raw), okey)
+        self.assertEqual(verdict, verify.FAIL)
 
     def test_generates_a_pdf_from_the_live_chain(self):
         out = os.path.join(self.tmp, "live.pdf")

@@ -289,7 +289,8 @@ def section_integrity(story, ss, summary, stats):
     def line(label, tally):
         parts = []
         for verdict in (verify.PASS, verify.FAIL, verify.UNVERIFIABLE,
-                        verify.UNCHECKED, verify.NOT_APPLICABLE):
+                        verify.V2_SESSION, verify.UNCHECKED,
+                        verify.NOT_APPLICABLE):
             n = tally.get(verdict, 0)
             if n:
                 parts.append('<font color="%s">%s %d</font>'
