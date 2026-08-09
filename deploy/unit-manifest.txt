@@ -47,6 +47,21 @@ deploy/virp-evidence.timer /etc/systemd/system/virp-evidence.timer
 # ── Stage 1 intent broker (tracked under broker/, not deploy/) ────────
 broker/virp-broker.service /etc/systemd/system/virp-broker.service
 
+# ── netclaw egress lockdown ───────────────────────────────────────────
+# Tracked 2026-08-09. Both files existed only on the host until then:
+# the unit was enabled, systemd had never run it (no journal entries,
+# ActiveState=inactive), and the nft table was nonetheless loaded in the
+# kernel because someone applied it by hand with `nft -f`. The control
+# was in force and simultaneously unowned, unreviewed, and would not
+# have survived a rebuild.
+#
+# The ruleset is NOT a systemd unit and does not live under
+# /etc/systemd/system — it is listed here anyway because the thing that
+# needs to not drift is the RULE, not the unit that loads it. A unit
+# that faithfully installs an edited ruleset is not a working control.
+deploy/virp-netclaw-egress.service /etc/systemd/system/virp-netclaw-egress.service
+deploy/nftables-virp-netclaw-egress.nft /etc/nftables-virp-netclaw-egress.nft
+
 # ── optional integrations ─────────────────────────────────────────────
 # Not installed on virp-lab. Listed so that a node which DOES install it
 # gets the same comparison as everything else — an optional component is

@@ -1,0 +1,16 @@
+#!/usr/sbin/nft -f
+# virp-netclaw egress lockdown — compensating control for the OpenSSH
+# 9.6 quirk where AllowTcpForwarding=no also blocks streamlocal (Unix
+# socket) forwards: the Match block for virp-netclaw therefore carries
+# AllowTcpForwarding yes, and THIS rule is what denies TCP forwards.
+# Rejects NEW IPv4/IPv6 connections originated by uid 993; the
+# established inbound ssh session (also uid-owned after privilege
+# drop) keeps flowing via the ct state exemption, and AF_UNIX is
+# untouched by netfilter — the O-Node socket path stays open.
+table inet virp_netclaw_egress {
+    chain output {
+        type filter hook output priority 0; policy accept;
+        skuid 993 ct state established,related accept
+        skuid 993 counter reject
+    }
+}

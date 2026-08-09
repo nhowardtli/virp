@@ -1143,11 +1143,47 @@ virp-netclaw. On this OpenSSH (9.6p1) BOTH also block the streamlocal
 opens against the same local-perms list and logs "connect to path … request
 was denied" without ever calling connect(). The Match block therefore now
 sets `AllowTcpForwarding yes`, and TCP-forward denial is enforced one layer
-down by virp-netclaw-egress.service (nft: uid 993 may not originate IP
-connections; established inbound ssh exempt via ct state). Re-proven after
+down by an nft rule (uid 993 may not originate IP connections; established
+inbound ssh exempt via ct state). Re-proven after
 the change: streamlocal to onode.sock works; TCP forward → "Connection
 refused" (nft counter incremented); shell/PTY → "account not available".
 The authorized_keys entry keeps `restrict,port-forwarding,from="10.0.30.30"`.
+
+**Correction 2026-08-09 — what was actually enforcing this, and since when.**
+The sentence above credited `virp-netclaw-egress.service` with enforcing the
+denial. The RULE was in force; the SERVICE was not what put it there. Found
+during the installed-vs-tracked unit audit:
+
+- the unit was `enabled` but `ActiveState=inactive`, with **no journal
+  entries at any point** — systemd had never executed it;
+- the nft table was nonetheless loaded in the kernel, with a live counter;
+- unit and ruleset were both dated 2026-08-09 03:26 against 11 days of
+  uptime, i.e. applied by hand with `nft -f` after the last boot;
+- neither file was tracked in the repo, so a rebuild would have restored
+  the sshd `AllowTcpForwarding yes` half of this arrangement and not the
+  compensating half.
+
+The control was real and simultaneously unowned. The claim was true of the
+kernel and false of the mechanism, which is the same shape as the
+`VIRP_WAZUH_INSECURE` drift found in the same audit: an assertion about a
+file that was not in charge.
+
+Resolved the same day. Both files are now tracked (`deploy/virp-netclaw-egress.service`,
+`deploy/nftables-virp-netclaw-egress.nft`) and covered by
+`deploy/unit-manifest.txt`, so `make check-deploy-unit` diffs them against
+the host. The unit was then EXERCISED rather than assumed: the hand-applied
+table was deleted, `systemctl start virp-netclaw-egress` was run, and the
+resulting kernel ruleset compared against the saved original —
+`Result=success`, and byte-identical apart from the counter reset
+(`packets 1 bytes 60` → `packets 0 bytes 0`). That start is the first entry
+this unit has ever written to the journal. systemd now genuinely owns the
+rule, and the reboot path has been executed once instead of trusted.
+
+Known limitation, unresolved: `deploy/nftables-virp-netclaw-egress.nft`
+hardcodes uid 993. Everything else about this account is resolved by name at
+render time (`${VIRP_NETCLAW_UID}` via `deploy/render-devices.sh`), so on a
+node where `virp-netclaw` lands on a different uid this ruleset silently
+protects the wrong account — it would load without error and deny nothing.
 
 ## Incident 2026-08-01 — daemon down 05:19–07:09 UTC (malformed autopilot.env)
 

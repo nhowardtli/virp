@@ -1,0 +1,15 @@
+[Unit]
+Description=Egress lockdown for virp-netclaw (uid 993) — TCP-forward denial
+# See /etc/nftables-virp-netclaw-egress.nft for why this exists instead
+# of AllowTcpForwarding=no in sshd_config.d/61-virp-netclaw.conf.
+After=network-pre.target
+Before=network.target ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables-virp-netclaw-egress.nft
+ExecStop=/usr/sbin/nft delete table inet virp_netclaw_egress
+
+[Install]
+WantedBy=multi-user.target

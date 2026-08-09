@@ -33,7 +33,13 @@
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UNIT_DIR="${VIRP_UNIT_DIR:-/etc/systemd/system}"
+# Manifest install paths are absolute under /etc. VIRP_ETC_ROOT prefixes
+# them so the self-test can build a fixture tree without ever reading
+# the real /etc — the manifest now also covers a file outside
+# /etc/systemd/system (the netclaw nft ruleset), so rebasing has to be
+# general rather than a unit-directory swap.
+ETC_ROOT="${VIRP_ETC_ROOT:-}"
+UNIT_DIR="$ETC_ROOT/etc/systemd/system"
 MANIFEST="$REPO_ROOT/deploy/unit-manifest.txt"
 ALLOWLIST="$REPO_ROOT/deploy/unit-drift-allowlist.txt"
 
@@ -46,40 +52,61 @@ ALLOWLIST="$REPO_ROOT/deploy/unit-drift-allowlist.txt"
 if [ "${1:-}" = "--selftest" ]; then
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
-    mkdir -p "$tmp/virp-onode.service.d"
 
-    # Clean fixture: every manifest pair installed verbatim.
+    # Clean fixture: every manifest pair installed verbatim, at the same
+    # absolute path rebased under $tmp.
     while read -r tracked installed rest; do
         case "${tracked:-}" in ''|'#'*) continue ;; esac
         [ -n "${installed:-}" ] || continue
         [ -f "$REPO_ROOT/$tracked" ] || continue
-        dest="$tmp/${installed#/etc/systemd/system/}"
+        dest="$tmp$installed"
         mkdir -p "$(dirname "$dest")"
         cp "$REPO_ROOT/$tracked" "$dest"
     done < "$MANIFEST"
 
-    if VIRP_UNIT_DIR="$tmp" "$0" >/dev/null 2>&1; then
-        echo "  selftest 1/3 PASS: clean fixture reports clean"
+    if VIRP_ETC_ROOT="$tmp" "$0" >/dev/null 2>&1; then
+        echo "  selftest 1/4 PASS: clean fixture reports clean"
     else
-        echo "  selftest 1/3 FAIL: clean fixture reported drift"; exit 1
+        echo "  selftest 1/4 FAIL: clean fixture reported drift"
+        VIRP_ETC_ROOT="$tmp" "$0" | sed 's/^/      /'
+        exit 1
     fi
 
     # Drifted fixture: one added line in the daemon unit.
-    echo 'Environment=SOMETHING_NEW=1' >> "$tmp/virp-onode.service"
-    if VIRP_UNIT_DIR="$tmp" "$0" >/dev/null 2>&1; then
-        echo "  selftest 2/3 FAIL: a one-line edit went undetected"; exit 1
+    echo 'Environment=SOMETHING_NEW=1' \
+        >> "$tmp/etc/systemd/system/virp-onode.service"
+    if VIRP_ETC_ROOT="$tmp" "$0" >/dev/null 2>&1; then
+        echo "  selftest 2/4 FAIL: a one-line edit went undetected"; exit 1
     else
-        echo "  selftest 2/3 PASS: one added line is detected"
+        echo "  selftest 2/4 PASS: one added line is detected"
+    fi
+
+    # Drifted fixture, NON-unit file: the manifest also covers a plain
+    # config file (the nft ruleset), so prove that side too.
+    cp "$REPO_ROOT/deploy/virp-onode.service" \
+       "$tmp/etc/systemd/system/virp-onode.service"
+    if [ -f "$tmp/etc/nftables-virp-netclaw-egress.nft" ]; then
+        echo '# stray line' >> "$tmp/etc/nftables-virp-netclaw-egress.nft"
+        if VIRP_ETC_ROOT="$tmp" "$0" >/dev/null 2>&1; then
+            echo "  selftest 3/4 FAIL: non-unit file drift went undetected"
+            exit 1
+        else
+            echo "  selftest 3/4 PASS: non-unit file drift is detected"
+        fi
+        git -C "$REPO_ROOT" show HEAD:deploy/nftables-virp-netclaw-egress.nft \
+            > "$tmp/etc/nftables-virp-netclaw-egress.nft" 2>/dev/null || \
+            cp "$REPO_ROOT/deploy/nftables-virp-netclaw-egress.nft" \
+               "$tmp/etc/nftables-virp-netclaw-egress.nft"
+    else
+        echo "  selftest 3/4 SKIP: no non-unit file in the manifest"
     fi
 
     # Untracked fixture: a unit nobody named.
-    git -C "$REPO_ROOT" show HEAD:deploy/virp-autopilot.timer \
-        > "$tmp/virp-rogue.service" 2>/dev/null || \
-        echo "[Unit]" > "$tmp/virp-rogue.service"
-    if VIRP_UNIT_DIR="$tmp" "$0" >/dev/null 2>&1; then
-        echo "  selftest 3/3 FAIL: an untracked unit went undetected"; exit 1
+    echo "[Unit]" > "$tmp/etc/systemd/system/virp-rogue.service"
+    if VIRP_ETC_ROOT="$tmp" "$0" >/dev/null 2>&1; then
+        echo "  selftest 4/4 FAIL: an untracked unit went undetected"; exit 1
     else
-        echo "  selftest 3/3 PASS: an untracked unit is detected"
+        echo "  selftest 4/4 PASS: an untracked unit is detected"
     fi
     exit 0
 fi
@@ -136,11 +163,10 @@ while read -r tracked installed rest; do
     esac
     [ -n "${installed:-}" ] || continue
 
-    # The manifest records real install paths. When VIRP_UNIT_DIR points
-    # somewhere else (the self-test), rebase onto it — and key the
+    # Rebase onto VIRP_ETC_ROOT (empty in production) and key the
     # "is it tracked" map on the SAME rebased path the reverse scan
     # walks, or every fixture file reads as untracked.
-    installed="${installed/#\/etc\/systemd\/system/$UNIT_DIR}"
+    installed="$ETC_ROOT$installed"
     known_installed["$installed"]=1
 
     if [ ! -f "$REPO_ROOT/$tracked" ]; then
@@ -162,7 +188,7 @@ while read -r tracked installed rest; do
     # after this check has passed, and systemd will happily run it.
     perm="$(stat -c '%a %U:%G' "$installed" 2>/dev/null || echo '? ?')"
     mode="${perm%% *}"; owner="${perm##* }"
-    if [ "$UNIT_DIR" = "/etc/systemd/system" ]; then
+    if [ -z "$ETC_ROOT" ]; then
         case "$mode" in
             *[2367])  echo "FAIL: $installed is group/world writable (mode $mode)"; fail=1 ;;
         esac
