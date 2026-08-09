@@ -108,6 +108,33 @@ static bool zm_digits(const char *s, size_t len)
 }
 
 /*
+ * A CANONICAL number: a digit run with no leading zero, unless the whole
+ * value is exactly "0".
+ *
+ * Same argument as the duplicate-parameter rule, and it applies
+ * everywhere a number appears in a command — the path id, a page value,
+ * and the typed op's ticket id. "007" and "7" name one ticket and one
+ * page. Admitting both would give one request several signed forms, so
+ * an approval minted for one spelling would not match another, and any
+ * analysis keyed on the command string would count them as different
+ * requests. The bytes have to name the request uniquely or they do not
+ * determine it.
+ *
+ * Applied to the READ rows too, not just the typed write. The write
+ * rejected "id=007" from the day it was written while
+ * "/api/v1/tickets/007" still classified GREEN — the identical argument
+ * reaching opposite conclusions in one driver. There is no live Zammad
+ * traffic yet, so converging them costs nothing today and would be a
+ * breaking change the moment anything starts calling it.
+ */
+static bool zm_canonical_number(const char *s, size_t len)
+{
+    if (!zm_digits(s, len)) return false;
+    if (len > 1 && s[0] == '0') return false;
+    return true;
+}
+
+/*
  * Query-string policy: only "page" and "per_page", each at most once,
  * each with a digits-only value.
  *
@@ -195,8 +222,10 @@ static bool zm_query_ok(const char *q, size_t len)
         }
 
         /* A second '=' lands inside val and fails the digit test, which
-         * is the intended answer: "page=1=2" is not a number. */
-        if (!zm_digits(val, val_len)) return false;
+         * is the intended answer: "page=1=2" is not a number.
+         * Canonical, not merely numeric: "page=007" is RED for the same
+         * reason "?page=1&page=2" is. */
+        if (!zm_canonical_number(val, val_len)) return false;
     }
 
     return true;
@@ -245,7 +274,7 @@ virp_trust_tier_t zm_route_path(const char *path)
         size_t blen = strlen(ZM_GREEN_ID_BASE[i]);
         if (plen > blen &&
             memcmp(path, ZM_GREEN_ID_BASE[i], blen) == 0 &&
-            zm_digits(path + blen, plen - blen))
+            zm_canonical_number(path + blen, plen - blen))
             return VIRP_TIER_GREEN;
     }
 
@@ -520,9 +549,10 @@ bool zm_is_body_char(unsigned char c)
  */
 static bool zm_is_ticket_id(const char *s, size_t len)
 {
-    if (!zm_digits(s, len)) return false;
-    if (len > 1 && s[0] == '0') return false;
-    return true;
+    /* One rule, one implementation. This used to carry its own copy of
+     * the no-leading-zero test while the read rows carried none; the
+     * shared helper is what keeps the two from diverging again. */
+    return zm_canonical_number(s, len);
 }
 
 bool zm_device_allows_op(const char *write_ops_allow, const char *op_id)

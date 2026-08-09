@@ -1564,6 +1564,70 @@ static void test_write_body_encoding_canonical(void)
     PASS();
 }
 
+
+/*
+ * Leading zeros, converged across BOTH command shapes.
+ *
+ * The typed op rejected "id=007" from the day it was written while the
+ * GET row "/api/v1/tickets/007" classified GREEN — the same
+ * canonicality argument reaching opposite conclusions inside one
+ * driver. These assertions exist so the two cannot drift apart again.
+ */
+static void test_canonical_numbers_everywhere(void)
+{
+    printf("\n=== Canonical numbers — no leading zeros, in every shape ===\n");
+
+    TEST("read row: /api/v1/tickets/007 -> RED (was GREEN)");
+    assert_red_blocked("/api/v1/tickets/007");
+    PASS();
+
+    TEST("read row: /api/v1/tickets/01 -> RED");
+    assert_red_blocked("/api/v1/tickets/01");
+    PASS();
+
+    TEST("read row: by_ticket/007 -> RED");
+    assert_red_blocked("/api/v1/ticket_articles/by_ticket/007");
+    PASS();
+
+    TEST("read row: a bare 0 is canonical and stays GREEN");
+    assert_green("/api/v1/tickets/0");
+    assert_green("/api/v1/ticket_articles/by_ticket/0");
+    PASS();
+
+    TEST("read row: ordinary ids are unaffected");
+    assert_green("/api/v1/tickets/42");
+    assert_green("/api/v1/tickets/1");
+    assert_green("/api/v1/tickets/1000");
+    PASS();
+
+    TEST("query value: ?page=007 -> RED");
+    assert_red_blocked("/api/v1/tickets?page=007");
+    PASS();
+
+    TEST("query value: ?per_page=050 -> RED");
+    assert_red_blocked("/api/v1/tickets?per_page=050");
+    PASS();
+
+    TEST("query value: a bare 0 is canonical");
+    assert_green("/api/v1/tickets?page=0");
+    PASS();
+
+    TEST("typed op: id=007 -> RED (unchanged, now by the shared rule)");
+    assert_write_red("zammad op=ticket.article.create id=007 body=\"x\"");
+    PASS();
+
+    TEST("all three shapes agree on 007 and on 7");
+    assert(zm_route_path("/api/v1/tickets/007") == VIRP_TIER_RED);
+    assert(zm_route_path("/api/v1/tickets?page=007") == VIRP_TIER_RED);
+    assert(zammad_gate_tier("zammad op=ticket.article.create id=007 "
+                            "body=\"x\"") == VIRP_TIER_RED);
+    assert(zm_route_path("/api/v1/tickets/7") == VIRP_TIER_GREEN);
+    assert(zm_route_path("/api/v1/tickets?page=7") == VIRP_TIER_GREEN);
+    assert(zammad_gate_tier("zammad op=ticket.article.create id=7 "
+                            "body=\"x\"") == VIRP_TIER_YELLOW);
+    PASS();
+}
+
 int main(void)
 {
     printf("=== Zammad REST Gate Classifier Tests ===\n");
@@ -1590,6 +1654,7 @@ int main(void)
     test_write_body_ingress_intersection();
     test_write_body_encoding_canonical();
     test_write_does_not_loosen_reads();
+    test_canonical_numbers_everywhere();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

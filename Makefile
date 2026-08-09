@@ -159,6 +159,27 @@ ifneq (,$(or $(CISCO),$(FORTIGATE),$(PANOS),$(ASA),$(JUNIPER),$(LINUX)))
   LIB_OBJS += $(BUILD_DIR)/virp_ssh_hostkey.o
 endif
 
+# A failed build must not leave a RUNNABLE stale binary.
+#
+# Found 2026-08-09 while investigating two stale test results. When a
+# test binary fails to compile, gcc never touches the output, so the
+# PREVIOUS binary survives — and running it prints a full green pass
+# that describes code which no longer exists. Reproduced directly:
+# introduce a syntax error, `make` exits 2, the old binary is still
+# there and still reports "236/236 passed".
+#
+# .DELETE_ON_ERROR does NOT cover this: it only deletes a target the
+# recipe actually modified, and here the recipe never got that far. So
+# every test-link recipe removes its target FIRST. A failed build then
+# leaves no binary at all, and anyone who runs it gets "No such file or
+# directory" instead of a fabricated pass.
+#
+# The safe way to run a suite remains `make test-<name>`, which will not
+# run the binary if the build failed. Building the artifact path and
+# then invoking it as a separate command defeats that, which is exactly
+# the mistake that produced the stale numbers.
+.DELETE_ON_ERROR:
+
 LIB          = $(BUILD_DIR)/libvirp.a
 SHLIB        = $(BUILD_DIR)/libvirp.so
 TEST_BIN     = $(BUILD_DIR)/test_virp
@@ -270,9 +291,11 @@ $(SHLIB): $(LIB_OBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
 
 $(TEST_BIN): tests/test_virp.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 $(FUZZ_BIN): tests/fuzz_virp.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 # Git hash stamped into virp-tool for `virp --version` (helps catch a
@@ -315,6 +338,7 @@ test-onode: $(TEST_ONODE)
 TEST_SSH_IO = $(BUILD_DIR)/test_ssh_io
 
 $(TEST_SSH_IO): tests/test_ssh_io.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 .PHONY: test-ssh-io
@@ -349,9 +373,11 @@ TEST_CHAIN = $(BUILD_DIR)/test_chain
 TEST_FED   = $(BUILD_DIR)/test_federation
 
 $(TEST_CHAIN): tests/test_chain.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 $(TEST_FED): tests/test_federation.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-chain: $(TEST_CHAIN)
@@ -379,6 +405,7 @@ clean:
 LIVE_TEST = $(BUILD_DIR)/virp-live-test
 
 $(LIVE_TEST): tests/test_live.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-live: $(LIVE_TEST)
@@ -449,6 +476,7 @@ TEST_INTEROP = $(BUILD_DIR)/test_interop_c
 GO_DIR       = implementations/go
 
 $(TEST_INTEROP): tests/test_interop_c.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 # Artifact-based C<->Go interop tests. VIRP_INTEROP_BIN points the Go
@@ -493,6 +521,7 @@ ifndef ASA
 	@echo "       Or:   make test-drivers   (builds every driver and runs all driver suites)"
 	@false
 else
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 endif
 
@@ -509,6 +538,7 @@ ifndef PANOS
 	@echo "       Or:   make test-drivers   (builds every driver and runs all driver suites)"
 	@false
 else
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 endif
 
@@ -527,6 +557,7 @@ ifndef CISCO
 	@echo "       Or:   make test-drivers   (builds every driver and runs all driver suites)"
 	@false
 else
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 endif
 
@@ -544,6 +575,7 @@ ifndef FORTIGATE
 	@echo "       Or:   make test-drivers   (builds every driver and runs all driver suites)"
 	@false
 else
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 endif
 
@@ -560,6 +592,7 @@ ifndef CISCO
 	@echo "       Or:   make test-drivers   (builds every driver and runs all driver suites)"
 	@false
 else
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 endif
 
@@ -576,6 +609,7 @@ ifndef LINUX
 	@echo "       Or:   make test-drivers   (builds every driver and runs all driver suites)"
 	@false
 else
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 endif
 
@@ -595,6 +629,7 @@ test-onode-concurrency: $(TEST_ONODE_CONC)
 TEST_WAZUH = $(BUILD_DIR)/test_driver_wazuh
 
 $(TEST_WAZUH): tests/test_driver_wazuh.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-wazuh: $(TEST_WAZUH)
@@ -605,6 +640,7 @@ test-wazuh: $(TEST_WAZUH)
 TEST_LIBRENMS = $(BUILD_DIR)/test_driver_librenms
 
 $(TEST_LIBRENMS): tests/test_driver_librenms.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-librenms: $(TEST_LIBRENMS)
@@ -617,6 +653,7 @@ test-librenms: $(TEST_LIBRENMS)
 TEST_PBS = $(BUILD_DIR)/test_driver_pbs
 
 $(TEST_PBS): tests/test_driver_pbs.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-pbs: $(TEST_PBS)
@@ -626,6 +663,7 @@ test-pbs: $(TEST_PBS)
 TEST_TYPED_HASH = $(BUILD_DIR)/test_typed_op_hash
 
 $(TEST_TYPED_HASH): tests/test_typed_op_hash.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-typed-hash: $(TEST_TYPED_HASH)
@@ -636,6 +674,7 @@ test-typed-hash: $(TEST_TYPED_HASH)
 TEST_INGRESS_NUL = $(BUILD_DIR)/test_ingress_nul
 
 $(TEST_INGRESS_NUL): tests/test_ingress_nul.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-ingress-nul: $(TEST_INGRESS_NUL)
@@ -646,6 +685,7 @@ test-ingress-nul: $(TEST_INGRESS_NUL)
 TEST_PBS_TRUNC = $(BUILD_DIR)/test_pbs_truncation
 
 $(TEST_PBS_TRUNC): tests/test_pbs_truncation.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-pbs-trunc: $(TEST_PBS_TRUNC)
@@ -654,6 +694,7 @@ test-pbs-trunc: $(TEST_PBS_TRUNC)
 TEST_PBS_GATE = $(BUILD_DIR)/test_driver_pbs_gate
 
 $(TEST_PBS_GATE): tests/test_driver_pbs_gate.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-pbs-gate: $(TEST_PBS_GATE)
@@ -670,6 +711,7 @@ ifndef ZAMMAD
 	@echo "       Or:   make test-drivers   (builds every driver and runs all driver suites)"
 	@false
 else
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 endif
 
@@ -683,6 +725,14 @@ test-autopilot:
 
 test-config-backup:
 	python3 tests/test_config_backup.py
+
+# render-devices.sh: a placeholder the template names but autopilot.env
+# omits must be FATAL, not a literal "${TOKEN}" handed to a device as a
+# credential. Runs the real script against a sandbox via VIRP_RENDER_*;
+# reads no production path and writes none.
+.PHONY: test-render-devices
+test-render-devices:
+	@bash tests/test_render_devices.sh
 
 # Compliance-evidence collector + its control-mapped report. Pure python
 # against fakes: no daemon, no devices, no chain database. The report
@@ -724,6 +774,7 @@ test-virp-report:
 TEST_SESSION_NEG = $(BUILD_DIR)/test_session_negative
 
 $(TEST_SESSION_NEG): tests/test_session_negative.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-session: $(TEST_SESSION_NEG)
@@ -734,6 +785,7 @@ test-session: $(TEST_SESSION_NEG)
 TEST_OBS_V2 = $(BUILD_DIR)/test_obs_v2
 
 $(TEST_OBS_V2): tests/test_obs_v2.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-obs-v2: $(TEST_OBS_V2)
@@ -743,6 +795,7 @@ test-obs-v2: $(TEST_OBS_V2)
 TEST_OBSKEY = $(BUILD_DIR)/test_obskey
 
 $(TEST_OBSKEY): tests/test_obskey.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-obskey: $(TEST_OBSKEY)
@@ -752,6 +805,7 @@ test-obskey: $(TEST_OBSKEY)
 TEST_OBS_ED25519 = $(BUILD_DIR)/test_obs_ed25519
 
 $(TEST_OBS_ED25519): tests/test_obs_ed25519.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-obs-ed25519: $(TEST_OBS_ED25519)
@@ -763,6 +817,7 @@ test-obs-ed25519: $(TEST_OBS_ED25519)
 TEST_OBS_FORGE = $(BUILD_DIR)/test_obs_ed25519_forge
 
 $(TEST_OBS_FORGE): tests/test_obs_ed25519_forge.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-obs-ed25519-forge: $(TEST_OBS_FORGE)
@@ -773,6 +828,7 @@ test-obs-ed25519-forge: $(TEST_OBS_FORGE)
 TEST_OBS_NEG = $(BUILD_DIR)/test_obs_ed25519_neg
 
 $(TEST_OBS_NEG): tests/test_obs_ed25519_neg.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-obs-ed25519-neg: $(TEST_OBS_NEG)
@@ -782,6 +838,7 @@ test-obs-ed25519-neg: $(TEST_OBS_NEG)
 TEST_SESSION_KEY = $(BUILD_DIR)/test_session_key
 
 $(TEST_SESSION_KEY): tests/test_session_key.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-session-key: $(TEST_SESSION_KEY)
@@ -797,6 +854,7 @@ ifndef JUNIPER
 	@echo "       Or:   make test-drivers   (builds every driver and runs all driver suites)"
 	@false
 else
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 endif
 
@@ -1349,6 +1407,7 @@ fuzz-obs-ed25519:
 TEST_APPROVAL = $(BUILD_DIR)/test_approval
 
 $(TEST_APPROVAL): tests/test_approval.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-approval: $(TEST_APPROVAL) $(TOOL_BIN)
@@ -1358,6 +1417,7 @@ test-approval: $(TEST_APPROVAL) $(TOOL_BIN)
 TEST_APPROVERS = $(BUILD_DIR)/test_approver_registry
 
 $(TEST_APPROVERS): tests/test_approver_registry.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-approvers: $(TEST_APPROVERS)
@@ -1396,6 +1456,7 @@ test-pkcs11: $(TEST_PKCS11) $(BUILD_DIR)/mock_pkcs11.so
 TEST_VALIDATOR = $(BUILD_DIR)/test_validator
 
 $(TEST_VALIDATOR): tests/test_validator.c $(LIB)
+	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 test-validator: $(TEST_VALIDATOR)
@@ -1433,4 +1494,4 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-api

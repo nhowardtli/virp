@@ -16,9 +16,14 @@
 
 set -eu
 
-ENV_FILE="/etc/virp/autopilot.env"
-TEMPLATE="/etc/virp/devices.template.json"
-OUT="/run/virp/devices.json"
+# Paths default to the production ones. They are overridable ONLY so the
+# FATAL-on-missing-placeholder behaviour can be exercised against this
+# script in a sandbox instead of against a copy of it — a test of a
+# transcription of the logic proves nothing about the logic that runs.
+# The systemd unit passes no overrides, so production is unchanged.
+ENV_FILE="${VIRP_RENDER_ENV_FILE:-/etc/virp/autopilot.env}"
+TEMPLATE="${VIRP_RENDER_TEMPLATE:-/etc/virp/devices.template.json}"
+OUT="${VIRP_RENDER_OUT:-/run/virp/devices.json}"
 
 umask 027
 
@@ -99,6 +104,15 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             "VIRP_NETCLAW_UID", "VIRP_BROKER_UID",
             "WAZUH_USER", "WAZUH_PASS",
             "LIBRENMS_TOKEN", "PEER_USER", "PEER_PASS",
+            # Zammad carries TWO tokens because it is TWO device entries
+            # on one host: zammad-ro holds a read-only token and names no
+            # write operation, zammad-rw holds a write-capable token and
+            # names exactly ticket.article.create. Splitting the
+            # credential is the point — if one token served both entries,
+            # write_ops_allow would be the only thing standing between a
+            # read-only path and a write, and a single config slip would
+            # remove it.
+            "ZAMMAD_RO_TOKEN", "ZAMMAD_RW_TOKEN",
             # PBS: the token SECRET is the only true credential here, but
             # the token id, host, certificate fingerprint and datastore
             # allowlist are required the same way. A missing FINGERPRINT
@@ -137,6 +151,8 @@ with open(out_path, "w") as f:
     f.write(text)
 PYEOF
 
-chown root:virp "$OUT"
-chmod 0640 "$OUT"
+if [ -z "${VIRP_RENDER_OUT:-}" ]; then
+    chown root:virp "$OUT"
+    chmod 0640 "$OUT"
+fi
 echo "[render-devices] rendered $OUT from $TEMPLATE (secrets from $ENV_FILE, values not logged)"
