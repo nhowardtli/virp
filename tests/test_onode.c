@@ -4217,6 +4217,46 @@ TEST(test_chain_append_still_accepts_json_evidence_item)
 
 /* GUARD: a commitment-only append (no body at all) stays legal — the
  * caller may choose to register a hash commitment without the bytes. */
+/* Federation-bridge provenance (2026-08-09): federated_request and
+ * federated_outcome are externally-submittable commitment types, so the
+ * bridge's three-part record (request → observation → outcome) lands in
+ * full. The reserved daemon type "outcome" stays refused from a socket
+ * client — blessing the federation namespace must not open the daemon's. */
+TEST(test_chain_append_accepts_federated_provenance)
+{
+    const char *req_body = "{\"schema\":\"federated_request/1\",\"peer\":\"netclaw\"}";
+    const char *out_body = "{\"schema\":\"federated_outcome/1\",\"outcome\":\"refused\"}";
+    char hr[65], ho[65];
+    ca_sha256_hex(req_body, hr);
+    ca_sha256_hex(out_body, ho);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n1 = ca_append("ncfed-netclaw-t1", "fed_request",
+                           "ncfed-req-t1", hr, req_body, resp, sizeof(resp));
+    ASSERT_TRUE(n1 > 4);
+    ASSERT_EQ(ca_count_entries("ncfed-req-t1"), 1);
+
+    ssize_t n2 = ca_append("ncfed-netclaw-t1", "fed_outcome",
+                           "ncfed-out-t1", ho, out_body, resp, sizeof(resp));
+    ASSERT_TRUE(n2 > 4);
+    ASSERT_EQ(ca_count_entries("ncfed-out-t1"), 1);
+}
+
+/* GUARD: the reserved daemon type "outcome" is STILL refused from a
+ * socket client — the federation types did not widen the daemon namespace. */
+TEST(test_chain_append_still_refuses_reserved_outcome_type)
+{
+    const char *body = "{\"forged\":\"daemon outcome\"}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ca_append("attack:reserved", "outcome", "forged-outcome-1", h, body,
+              resp, sizeof(resp));
+    /* Refused → no entry lands. */
+    ASSERT_EQ(ca_count_entries("forged-outcome-1"), 0);
+}
+
 TEST(test_chain_append_accepts_commitment_without_body)
 {
     char h[65];
@@ -4404,6 +4444,8 @@ int main(void)
         RUN_TEST(test_previous_okey_loader_refuses_bad_configurations);
         RUN_TEST(test_previous_okey_window_anchors_to_load_time_and_resets);
         RUN_TEST(test_chain_append_still_accepts_json_evidence_item);
+        RUN_TEST(test_chain_append_accepts_federated_provenance);
+        RUN_TEST(test_chain_append_still_refuses_reserved_outcome_type);
         RUN_TEST(test_chain_append_accepts_commitment_without_body);
         ca_stop();
         ca_cleanup_files();
