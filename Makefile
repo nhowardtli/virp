@@ -456,13 +456,13 @@ onode-fi:
 # name works and callers have a single driver-enabled build entry point.
 .PHONY: prod
 prod:
-	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 PBS=1 $(ONODE_PROD)
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 PBS=1 ZAMMAD=1 $(ONODE_PROD)
 
 # Full production build — recursive make ensures all ifdef guards evaluate correctly
 # SSH host key verification is strict: unknown keys are rejected.
 .PHONY: prod-full
 prod-full:
-	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 PBS=1 $(ONODE_PROD)
+	$(MAKE) CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 PBS=1 ZAMMAD=1 $(ONODE_PROD)
 
 # Dev build — all drivers, TOFU enabled by default so lab devices work
 # without pre-populating known_hosts. Do not run dev binaries in production.
@@ -1141,6 +1141,37 @@ install-units: check-deploy-unit
 # Wazuh driver. Only for a lab manager on a trusted segment; the real fix
 # is VIRP_CA_BUNDLE pointing at the CA that signed the manager's cert.
 # -------------------------------------------------------------------------
+# install-devices-template — the device template is the THIRD artifact
+# class (binary, unit, config) and until 2026-08-09 it had no install
+# path at all: /etc/virp/devices.template.json was placed by hand, so
+# the tracked file and the running one could diverge with nothing to
+# notice — the same shape as the virp-onode.service drift found the same
+# day. Explicit, never automatic: rendering happens at daemon start, so
+# installing a template changes what the NEXT restart authenticates as.
+#
+# Refuses on a dirty tree for the reason install-prod does: what gets
+# deployed must be exactly what a commit hash names.
+VIRP_DEVICES_TEMPLATE_SRC = deploy/devices.template.json
+VIRP_DEVICES_TEMPLATE_DST = /etc/virp/devices.template.json
+
+.PHONY: install-devices-template
+install-devices-template:
+	@test -f $(VIRP_DEVICES_TEMPLATE_SRC) || \
+	    { echo "FAIL: $(VIRP_DEVICES_TEMPLATE_SRC) missing"; exit 1; }
+	@st=$$(git status --porcelain 2>/dev/null); \
+	 if [ -n "$$st" ]; then \
+	     echo "FAIL: refusing to install a template from a dirty tree:"; \
+	     echo "$$st"; exit 1; fi
+	@python3 -c "import json,sys; json.load(open('$(VIRP_DEVICES_TEMPLATE_SRC)'.replace(chr(36)+'{','')))" \
+	    2>/dev/null || true
+	install -m 0644 $(VIRP_DEVICES_TEMPLATE_SRC) $(VIRP_DEVICES_TEMPLATE_DST)
+	@echo "  Installed $(VIRP_DEVICES_TEMPLATE_DST)."
+	@echo "  It takes effect at the NEXT virp-onode restart, when"
+	@echo "  render-devices.sh substitutes autopilot.env into it. A"
+	@echo "  placeholder named here and absent there is FATAL at render,"
+	@echo "  so the daemon will refuse to start rather than authenticate"
+	@echo "  as a literal \$${TOKEN}. See tests/test_render_devices.sh."
+
 .PHONY: install-wazuh-lab-dropin
 install-wazuh-lab-dropin:
 	@test -f $(VIRP_WAZUH_DROPIN_SRC) || \
