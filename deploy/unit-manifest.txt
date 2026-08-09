@@ -1,0 +1,67 @@
+# unit-manifest.txt — tracked unit file → the path it is installed to.
+#
+# This is the map scripts/check-unit-drift.sh walks to compare what is
+# TRACKED against what is RUNNING. It exists because `make
+# check-deploy-unit` used to grep only the repo copy, so it passed
+# green for eight days while /etc/systemd/system/virp-onode.service
+# said the opposite of deploy/virp-onode.service (VIRP_WAZUH_INSECURE=1
+# inline in the installed unit, discovered 2026-08-09). A check that
+# reads only the file in git cannot see the file that boots the daemon.
+#
+# Format, one pair per line:
+#   <tracked-path> <installed-path>
+#
+# Rules the checker applies:
+#   - installed file absent           → skipped, reported, not a failure
+#     (nodes have different roles; virp-node2 runs no config-backup)
+#   - installed file present          → must be BYTE-IDENTICAL to tracked,
+#     comments included. A comment that misdescribes the policy is how
+#     this drift stayed invisible; "it's only a comment" is exactly the
+#     argument that would have hidden it.
+#   - installed virp-* file NOT named here → failure, "untracked"
+#     (this is what surfaces a unit that exists only on the host)
+#
+# Host-specific settings do NOT belong here and do NOT belong as edits
+# to a tracked unit. They belong in a DROP-IN, which is itself tracked
+# and listed below. See deploy/unit-drift-allowlist.txt.
+
+# ── core daemon ───────────────────────────────────────────────────────
+deploy/virp-onode.service /etc/systemd/system/virp-onode.service
+
+# ── autopilot battery + its timers ────────────────────────────────────
+deploy/virp-autopilot.service /etc/systemd/system/virp-autopilot.service
+deploy/virp-autopilot.timer /etc/systemd/system/virp-autopilot.timer
+deploy/virp-autopilot-corpus.service /etc/systemd/system/virp-autopilot-corpus.service
+deploy/virp-autopilot-corpus.timer /etc/systemd/system/virp-autopilot-corpus.timer
+deploy/virp-autopilot-comparator.service /etc/systemd/system/virp-autopilot-comparator.service
+deploy/virp-autopilot-comparator.timer /etc/systemd/system/virp-autopilot-comparator.timer
+deploy/virp-autopilot-chainwalk.service /etc/systemd/system/virp-autopilot-chainwalk.service
+deploy/virp-autopilot-chainwalk.timer /etc/systemd/system/virp-autopilot-chainwalk.timer
+
+# ── runbooks ──────────────────────────────────────────────────────────
+deploy/virp-config-backup.service /etc/systemd/system/virp-config-backup.service
+deploy/virp-config-backup.timer /etc/systemd/system/virp-config-backup.timer
+deploy/virp-evidence.service /etc/systemd/system/virp-evidence.service
+deploy/virp-evidence.timer /etc/systemd/system/virp-evidence.timer
+
+# ── Stage 1 intent broker (tracked under broker/, not deploy/) ────────
+broker/virp-broker.service /etc/systemd/system/virp-broker.service
+
+# ── optional integrations ─────────────────────────────────────────────
+# Not installed on virp-lab. Listed so that a node which DOES install it
+# gets the same comparison as everything else — an optional component is
+# still a component, and "optional" is not a reason to stop diffing it.
+integrations/prometheus/virp-prometheus-exporter.service /etc/systemd/system/virp-prometheus-exporter.service
+
+# ── O-Node drop-ins ───────────────────────────────────────────────────
+# The installed NAMES carry a numeric ordering prefix that the tracked
+# filenames do not; the mapping is only meaningful here, which is part
+# of why an automated comparison needed a manifest rather than a glob.
+deploy/virp-onode-runbook.dropin.conf /etc/systemd/system/virp-onode.service.d/50-config-backup.conf
+deploy/virp-onode-evidence.dropin.conf /etc/systemd/system/virp-onode.service.d/51-evidence.conf
+deploy/virp-onode-netclaw.dropin.conf /etc/systemd/system/virp-onode.service.d/52-netclaw.conf
+# Lab-only, opt-in, installed by `make install-wazuh-lab-dropin` and by
+# nothing else. Listed so that IF it is installed it is still compared
+# against its tracked source — being deliberate is not the same as being
+# unmanaged.
+deploy/virp-onode-wazuh-lab.dropin.conf /etc/systemd/system/virp-onode.service.d/60-wazuh-lab.conf

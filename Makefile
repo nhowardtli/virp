@@ -1026,8 +1026,14 @@ deploy-capture:
 # Runs daemon-reload so systemd sees the new unit. Does NOT restart —
 # restarting is a separate, deliberate step.
 # -------------------------------------------------------------------------
+# NOTE the prerequisite is check-deploy-unit-source, NOT check-deploy-unit.
+# The full check now includes check-unit-drift, whose REMEDY is running
+# install-units — depending on it here would mean a drifted host could
+# not be repaired with make until it was already repaired. The source
+# assertions (chain flags, no worktree Exec paths, no build-at-start, no
+# VIRP_WAZUH_INSECURE in the canonical unit) still gate every install.
 .PHONY: install-units
-install-units: check-deploy-unit
+install-units: check-deploy-unit-source
 	@test -f $(VIRP_UNIT_SRC) || { echo "FAIL: $(VIRP_UNIT_SRC) missing"; exit 1; }
 	@st=$$(git status --porcelain 2>/dev/null); \
 	 if [ -n "$$st" ]; then \
@@ -1134,8 +1140,38 @@ check-pbs-pin:
 	      echo "      the operation table did not derive"; exit 1; }
 	@echo "  PASS: pin is mandatory, no env var, no redirect following"
 
+# check-deploy-unit — the SOURCE assertions plus the installed-vs-tracked
+# comparison.
+#
+# It was source-only until 2026-08-09, and that is how the last section
+# below ("no VIRP_WAZUH_INSECURE in the canonical unit") stayed green
+# for eight days while /etc/systemd/system/virp-onode.service carried
+# exactly that line. The assertion was true of the file in git and false
+# of the file that boots the daemon. Reading only the repo cannot detect
+# that, by construction — so the drift comparison is now part of the
+# same target rather than an optional extra somebody remembers to run.
 .PHONY: check-deploy-unit
-check-deploy-unit:
+check-deploy-unit: check-deploy-unit-source check-unit-drift
+
+# Installed vs tracked. Expected to FAIL on virp-lab today: the daemon
+# unit carries VIRP_WAZUH_INSECURE=1 inline and virp-netclaw-egress.service
+# is installed but tracked nowhere. Both are real; neither is silenced by
+# widening deploy/unit-drift-allowlist.txt, which ships empty and says why.
+.PHONY: check-unit-drift
+check-unit-drift:
+	@$(MAKE) --no-print-directory check-unit-drift-selftest
+	@scripts/check-unit-drift.sh
+
+# The checker must be able to fail. A drift checker that always passes is
+# indistinguishable from a clean host — which is the failure mode being
+# fixed here, one level up.
+.PHONY: check-unit-drift-selftest
+check-unit-drift-selftest:
+	@echo "=== self-testing the unit drift checker ==="
+	@scripts/check-unit-drift.sh --selftest
+
+.PHONY: check-deploy-unit-source
+check-deploy-unit-source:
 	@echo "=== checking deploy/virp-onode.service for chain flags ==="
 	@grep -Eq '^[[:space:]]*-c[[:space:]]+[^[:space:]]' deploy/virp-onode.service || \
 	    { echo "FAIL: deploy/virp-onode.service is missing '-c <chain.db>' — approval mode will refuse to start"; exit 1; }

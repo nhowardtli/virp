@@ -1,0 +1,56 @@
+# unit-drift-allowlist.txt — lines that may legitimately differ between
+# a tracked unit and its installed copy.
+#
+# THIS FILE IS DELIBERATELY EMPTY OF ENTRIES.
+#
+# Format: one POSIX extended regular expression per line, matched against
+# a single differing line (the diff marker stripped). A drifted file is
+# forgiven only if EVERY one of its differing lines matches some pattern
+# here. Blank lines and lines starting with '#' are ignored.
+#
+# ── Why it is empty ──────────────────────────────────────────────────
+#
+# There is a mechanism for host-specific configuration already, and it
+# is not "edit the installed unit": it is a DROP-IN under
+# virp-onode.service.d/, which is tracked in deploy/ and compared by
+# this same checker. Anything genuinely per-host can be expressed that
+# way, so the correct number of entries here is zero.
+#
+# The evidence agrees. On virp-lab (2026-08-09), 12 of 13 tracked
+# units and timers, all three installed drop-ins and the broker unit
+# were byte-identical to their tracked sources. Exactly one file had
+# drifted. An allowlist would have bought nothing and hidden that.
+#
+# ── The bar for adding an entry ──────────────────────────────────────
+#
+# Before adding a pattern, answer in a comment above it:
+#   1. Why can this not be a drop-in? (Almost always it can.)
+#   2. What is the security consequence if this line is wrong on a host
+#      and nobody notices, which is precisely what an entry here buys?
+#   3. Which node roles differ, and why is a per-role tracked unit worse
+#      than an unchecked line?
+# Make the pattern as narrow as the line, never a whole directive class.
+# `^Environment=` would be a catastrophe: it forgives every future
+# credential and every future TLS switch in one stroke.
+#
+# ── NEVER add ────────────────────────────────────────────────────────
+#
+# VIRP_WAZUH_INSECURE, in any pattern that would match it.
+#
+# It disables certificate validation for the Wazuh driver
+# (VERIFYPEER=0, VERIFYHOST=0), so a man-in-the-middle on the path to
+# the manager can feed the daemon forged monitoring data that then gets
+# SIGNED as an observation and entered into the chain. The whole point
+# of the chain is that a signed observation means something.
+#
+# It is currently set inline in the installed virp-lab unit, which is
+# the failure this checker exists to report. The fix is NOT an entry
+# here and NOT deleting the flag today — the lab manager is addressed
+# by IP with a self-signed certificate, so deleting it breaks
+# collection outright. The sequenced fix is: issue a certificate with
+# an iPAddress SAN (or use the tls_servername + CURLOPT_RESOLVE
+# mechanism driver_pbs.c already implements), install its CA into the
+# host trust store, verify by hand, then remove the flag in one commit.
+# Until that lands, the honest state of this check is RED, and a red
+# check that tells the truth is worth more than a green one that does
+# not.
