@@ -645,6 +645,29 @@ static bool gate_tier_blocks(virp_trust_tier_t tier, virp_trust_tier_t max_tier)
 }
 
 /*
+ * Effective ceiling for a specific connecting uid. Starts from the
+ * node-wide gate_max_tier and TIGHTENS (never raises) it if that uid has
+ * a per-uid ceiling configured. client_uid == (uid_t)-1 means an
+ * internal / non-socket caller with no per-uid entry: the node-wide
+ * ceiling applies unchanged. Because tiers order GREEN(1) < YELLOW(2) <
+ * RED(3), "tighter" is the numerically smaller value.
+ */
+static virp_trust_tier_t onode_effective_max_tier(const onode_state_t *state,
+                                                  uid_t client_uid)
+{
+    virp_trust_tier_t eff = state->gate_max_tier;
+    if (client_uid == (uid_t)-1) return eff;
+    for (size_t i = 0; i < state->uid_ceiling_count; i++) {
+        if (state->uid_ceiling_uids[i] == client_uid) {
+            if (state->uid_ceiling_tiers[i] < eff)
+                eff = state->uid_ceiling_tiers[i];
+            break;
+        }
+    }
+    return eff;
+}
+
+/*
  * Classify a command via the driver's optional route_command() hook.
  * Drivers without a classifier (NULL hook) yield UNCLASSIFIED, which the
  * gate treats as block-worthy (fail closed).
@@ -799,6 +822,7 @@ virp_error_t onode_execute(onode_state_t *state,
                            size_t *out_len)
 {
     return onode_execute_obs_ex(state, device_name, command, 1, NULL,
+                                (uid_t)-1,
                                 out_buf, out_buf_len, out_len);
 }
 
@@ -810,7 +834,8 @@ virp_error_t onode_execute_obs(onode_state_t *state,
                                size_t *out_len)
 {
     return onode_execute_obs_ex(state, device_name, command, obs_version,
-                                NULL, out_buf, out_buf_len, out_len);
+                                NULL, (uid_t)-1,
+                                out_buf, out_buf_len, out_len);
 }
 
 virp_error_t onode_set_approvers(onode_state_t *state,
@@ -1010,6 +1035,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                   const char *command,
                                   int obs_version,
                                   const char *proposal_id,
+                                  uid_t client_uid,
                                   uint8_t *out_buf, size_t out_buf_len,
                                   size_t *out_len)
 {
@@ -1173,18 +1199,28 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * with it (Phase C truth-fix). */
     {
         onode_gate_mode_t mode = gate_effective_mode(state, drv->name);
-        bool block = gate_tier_blocks(gate_tier, state->gate_max_tier);
+        /* Effective ceiling = node-wide gate_max_tier, tightened by any
+         * per-uid ceiling for the connecting socket client. A remote
+         * requester capped at GREEN thus has YELLOW/RED blocked (and
+         * therefore proposal-only) while local operators keep the
+         * node-wide ceiling. client_uid == (uid_t)-1 (internal callers)
+         * leaves gate_max_tier unchanged. */
+        virp_trust_tier_t eff_max = onode_effective_max_tier(state, client_uid);
+        bool block = gate_tier_blocks(gate_tier, eff_max);
 
         /* ENFORCE states what it did; only SHADOW speaks hypothetically.
          * The old unconditional "would-block"/"would-allow" wording made
-         * an ENFORCE rejection read like a logged-but-executed change. */
+         * an ENFORCE rejection read like a logged-but-executed change.
+         * threshold= reports the EFFECTIVE ceiling (post per-uid tighten)
+         * so the log shows what actually decided this connection. */
         fprintf(stderr,
                 "[GATE] mode=%s device=%s driver=%s tier=%s threshold=%s "
-                "decision=%s command=\"%s\"\n",
+                "uid=%ld decision=%s command=\"%s\"\n",
                 mode == GATE_MODE_ENFORCE ? "ENFORCE" : "SHADOW",
                 device_name, drv->name,
                 gate_tier_name(gate_tier),
-                gate_tier_name(state->gate_max_tier),
+                gate_tier_name(eff_max),
+                (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
                 mode == GATE_MODE_ENFORCE
                     ? (block ? "block" : "allow")
                     : (block ? "would-block" : "would-allow"),
@@ -1245,7 +1281,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                          virp_approval_err_name(aerr), (int)aerr,
                          proposal_id, device_name,
                          gate_tier_name(gate_tier),
-                         gate_tier_name(state->gate_max_tier));
+                         gate_tier_name(eff_max));
                 fprintf(stderr, "[GATE] apply rejected: proposal=%s "
                         "device=%s code=%d (%s)\n",
                         proposal_id, device_name, (int)aerr,
@@ -1268,7 +1304,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                      "ERROR: tier gate blocked '%s' on '%s' "
                      "(tier=%s max=%s)",
                      command, device_name, gate_tier_name(gate_tier),
-                     gate_tier_name(state->gate_max_tier));
+                     gate_tier_name(eff_max));
 
             /* Classifier-supplied instructive reason (optional hook):
              * appended before the proposal_id so the rejection payload
@@ -1785,6 +1821,7 @@ typedef struct {
     char            device[64];
     char            command[1024];
     int             obs_version;    /* 1 = legacy O-Key, 2 = session-bound */
+    uid_t           client_uid;     /* connecting peer, for per-uid ceiling */
     uint8_t         *resp_buf;      /* heap-allocated, VIRP_MAX_MESSAGE_SIZE */
     size_t          resp_len;
     virp_error_t    err;
@@ -1794,10 +1831,15 @@ static void *batch_execute_thread(void *arg)
 {
     batch_thread_arg_t *bta = (batch_thread_arg_t *)arg;
     bta->resp_len = 0;
-    bta->err = onode_execute_obs(bta->state, bta->device, bta->command,
-                                 bta->obs_version,
-                                 bta->resp_buf, VIRP_MAX_MESSAGE_SIZE,
-                                 &bta->resp_len);
+    /* Call _ex directly (not onode_execute_obs) so the connecting uid
+     * reaches the gate on the batch fan-out: these run on child threads
+     * that do NOT inherit the parent, which is exactly why the uid is a
+     * struct field and not a thread-local. proposal_id is not carried on
+     * the batch path (batch APPLY is not offered). */
+    bta->err = onode_execute_obs_ex(bta->state, bta->device, bta->command,
+                                    bta->obs_version, NULL, bta->client_uid,
+                                    bta->resp_buf, VIRP_MAX_MESSAGE_SIZE,
+                                    &bta->resp_len);
     return NULL;
 }
 
@@ -2307,6 +2349,21 @@ static void handle_client(onode_state_t *state, int client_fd)
     struct timeval tv = { .tv_sec = ONODE_RECV_TIMEOUT_SEC, .tv_usec = 0 };
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    /* The connecting peer's uid, for per-uid tier ceilings. Re-read from
+     * this fd (the accept loop already allowlisted it) rather than
+     * threaded through worker_arg, so the uid that decides the gate is
+     * taken from the same socket the request arrives on. Fail closed to
+     * (uid_t)-1 — "no per-uid tighten, node-wide ceiling only" — if the
+     * cred read fails; it cannot loosen the global gate. Carried
+     * explicitly into every execute path, including the batch fan-out. */
+    uid_t client_uid = (uid_t)-1;
+    {
+        struct ucred cred;
+        socklen_t clen = sizeof(cred);
+        if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) == 0)
+            client_uid = cred.uid;
+    }
+
     /* ── v2 framed receive ───────────────────────────────────────────
      * Read 4-byte big-endian length prefix. If the first byte is
      * non-zero, the client is sending raw JSON (v1) — reject cleanly. */
@@ -2390,6 +2447,7 @@ static void handle_client(onode_state_t *state, int client_fd)
         err = onode_execute_obs_ex(state, req.device, req.command,
                                 req.obs_version,
                                 req.proposal_id[0] ? req.proposal_id : NULL,
+                                client_uid,
                                 resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
@@ -2941,6 +2999,10 @@ static void handle_client(onode_state_t *state, int client_fd)
              * batch that asked for session binding must never be
              * silently served master-key v1 observations. */
             args[i].obs_version = req.obs_version;
+            /* Same connecting uid for every item in this batch — one
+             * connection, one peer — so per-uid ceilings apply to batch
+             * items exactly as they do to a single execute. */
+            args[i].client_uid = client_uid;
             args[i].resp_buf = malloc(VIRP_MAX_MESSAGE_SIZE);
             if (!args[i].resp_buf) { alloc_ok = false; break; }
         }
@@ -3873,6 +3935,31 @@ virp_error_t onode_set_allowed_uids(onode_state_t *state,
     return VIRP_OK;
 }
 
+virp_error_t onode_set_uid_ceilings(onode_state_t *state,
+                                    const uid_t *uids,
+                                    const virp_trust_tier_t *tiers,
+                                    size_t count)
+{
+    if (!state || (count > 0 && (!uids || !tiers)))
+        return VIRP_ERR_NULL_PTR;
+    if (count > ONODE_MAX_ALLOWED_UIDS)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+    for (size_t i = 0; i < count; i++) {
+        /* A ceiling entry for a uid NOT on the allowlist can never take
+         * effect (the connection is refused at accept), and a BLACK
+         * "ceiling" would forbid everything — reject both as config
+         * errors rather than store a rule that misleads an auditor. */
+        if (tiers[i] != VIRP_TIER_GREEN &&
+            tiers[i] != VIRP_TIER_YELLOW &&
+            tiers[i] != VIRP_TIER_RED)
+            return VIRP_ERR_INVALID_TYPE;
+        state->uid_ceiling_uids[i]  = uids[i];
+        state->uid_ceiling_tiers[i] = tiers[i];
+    }
+    state->uid_ceiling_count = count;
+    return VIRP_OK;
+}
+
 virp_error_t onode_start(onode_state_t *state)
 {
     if (!state)
@@ -3917,6 +4004,15 @@ virp_error_t onode_start(onode_state_t *state)
         for (size_t i = 0; i < state->socket_allowed_uids_count; i++)
             fprintf(stderr, " %u", (unsigned)state->socket_allowed_uids[i]);
         fprintf(stderr, "\n");
+    }
+
+    if (state->uid_ceiling_count > 0) {
+        fprintf(stderr, "[O-Node] per-uid tier ceilings:");
+        for (size_t i = 0; i < state->uid_ceiling_count; i++)
+            fprintf(stderr, " %u=%s", (unsigned)state->uid_ceiling_uids[i],
+                    gate_tier_name(state->uid_ceiling_tiers[i]));
+        fprintf(stderr, " (node-wide ceiling = %s)\n",
+                gate_tier_name(state->gate_max_tier));
     }
 
     /* Remove stale socket */

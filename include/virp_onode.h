@@ -266,6 +266,23 @@ typedef struct {
     uid_t               socket_allowed_uids[ONODE_MAX_ALLOWED_UIDS];
     size_t              socket_allowed_uids_count;
 
+    /*
+     * Per-uid tier ceiling (optional). A socket client connecting as one
+     * of these uids has its effective gate ceiling lowered to the paired
+     * tier: the gate blocks anything ABOVE min(gate_max_tier, this). It
+     * can only ever TIGHTEN, never raise, the global gate_max_tier.
+     * Parsed from the config's `socket_uid_tier_ceilings` object (uid →
+     * "green"/"yellow"/"red") via json-c. A uid absent here keeps the
+     * global gate_max_tier. Used to hold a remote requester (e.g. the
+     * netclaw tunnel identity) to GREEN reads while local operators keep
+     * the node-wide YELLOW ceiling. The connecting uid is carried
+     * explicitly into onode_execute_obs_ex() — never inferred from a
+     * thread-local — because the batch path fans out onto child threads.
+     */
+    uid_t               uid_ceiling_uids[ONODE_MAX_ALLOWED_UIDS];
+    virp_trust_tier_t   uid_ceiling_tiers[ONODE_MAX_ALLOWED_UIDS];
+    size_t              uid_ceiling_count;
+
     /* Trust chain (Primitive 6) */
     virp_chain_state_t  chain;
     bool                chain_enabled;
@@ -529,11 +546,19 @@ virp_error_t onode_set_approvers(onode_state_t *state,
  *   returns a signed rejection whose payload names the distinct
  *   VIRP_ERR_APPROVAL_* code. BLACK-tier commands are never approvable.
  */
+/*
+ * client_uid — the SO_PEERCRED uid of the connecting socket client, used
+ * to apply a per-uid tier ceiling (onode_effective_max_tier). Pass
+ * (uid_t)-1 for internal / non-socket callers, which then get only the
+ * node-wide gate_max_tier. The socket handler and the batch fan-out both
+ * pass the real peer uid.
+ */
 virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                   const char *device_name,
                                   const char *command,
                                   int obs_version,
                                   const char *proposal_id,
+                                  uid_t client_uid,
                                   uint8_t *out_buf, size_t out_buf_len,
                                   size_t *out_len);
 
@@ -560,6 +585,18 @@ uint32_t onode_next_seq(onode_state_t *state);
  */
 virp_error_t onode_set_allowed_uids(onode_state_t *state,
                                     const uid_t *uids, size_t count);
+
+/*
+ * Set per-uid tier ceilings. `uids[i]` is capped at `tiers[i]`
+ * (GREEN/YELLOW/RED only; BLACK or UNCLASSIFIED is rejected with
+ * VIRP_ERR_INVALID_TYPE). A ceiling can only tighten, never raise, the
+ * node-wide gate_max_tier. Replaces any existing entries. Returns
+ * VIRP_ERR_MESSAGE_TOO_LARGE if `count` exceeds ONODE_MAX_ALLOWED_UIDS.
+ */
+virp_error_t onode_set_uid_ceilings(onode_state_t *state,
+                                    const uid_t *uids,
+                                    const virp_trust_tier_t *tiers,
+                                    size_t count);
 
 /*
  * Decode a hex string to bytes. Only accepts [0-9a-fA-F].

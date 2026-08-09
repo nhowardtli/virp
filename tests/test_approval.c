@@ -158,6 +158,7 @@ static int run_cmd(onode_state_t *st, const char *device, const char *cmd,
     uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
     size_t len = 0;
     if (onode_execute_obs_ex(st, device, cmd, 1, proposal_id,
+                             (uid_t)-1,
                              buf, sizeof(buf), &len) != VIRP_OK)
         return -1;
     virp_header_t hdr;

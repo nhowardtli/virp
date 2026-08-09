@@ -1928,6 +1928,90 @@ static void errobs_teardown(onode_state_t *tmp)
     onode_destroy(tmp);
 }
 
+/* Per-uid tier ceiling (2026-08-09): a uid capped at GREEN has YELLOW
+ * blocked (proposal-only), while the same YELLOW command from an
+ * uncapped caller (client_uid == (uid_t)-1) executes under the node-wide
+ * YELLOW ceiling. Proves the ceiling only TIGHTENS, is keyed on the
+ * passed uid, and reports the effective ceiling in payload + log. */
+static const uid_t CEIL_UID = 4242;
+
+static int ceil_capture(onode_state_t *tmp, const char *cmd, uid_t uid,
+                        uint8_t *buf, size_t bufsz, size_t *len,
+                        char *logbuf, size_t logsz)
+{
+    const char *log_path = "/tmp/virp-onode-uidceil.log";
+    fflush(stderr);
+    int saved_fd = dup(fileno(stderr));
+    if (saved_fd < 0) return -1;
+    int log_fd = open(log_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (log_fd < 0) { close(saved_fd); return -1; }
+    dup2(log_fd, fileno(stderr));
+    close(log_fd);
+
+    virp_error_t err = onode_execute_obs_ex(tmp, "R-CEIL", cmd, 1, NULL,
+                                            uid, buf, bufsz, len);
+
+    fflush(stderr);
+    dup2(saved_fd, fileno(stderr));
+    close(saved_fd);
+
+    FILE *lf = fopen(log_path, "r");
+    if (!lf) return -1;
+    size_t got = fread(logbuf, 1, logsz - 1, lf);
+    fclose(lf);
+    unlink(log_path);
+    logbuf[got] = '\0';
+    return (err == VIRP_OK) ? 0 : -1;
+}
+
+TEST(test_per_uid_ceiling_caps_yellow_but_not_uncapped)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-CEIL", 0xE220000D), 0);
+    /* node-wide ceiling is YELLOW (errobs_setup default); cap CEIL_UID at GREEN */
+    uid_t cu[1] = { CEIL_UID };
+    virp_trust_tier_t ct[1] = { VIRP_TIER_GREEN };
+    ASSERT_OK(onode_set_uid_ceilings(&tmp, cu, ct, 1));
+
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    char logbuf[4096];
+
+    /* 1. YELLOW ("clear counters") from the CAPPED uid → blocked, and the
+     *    effective ceiling reported as GREEN in both payload and log. */
+    ceil_capture(&tmp, "clear counters", CEIL_UID, buf, sizeof(buf), &len,
+                 logbuf, sizeof(logbuf));
+    {
+        virp_observation_t obs; const uint8_t *data; uint16_t dl;
+        ASSERT_OK(virp_parse_observation(buf + VIRP_HEADER_SIZE,
+                                         len - VIRP_HEADER_SIZE, &obs, &data, &dl));
+        ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+        ASSERT_TRUE(strstr((const char *)data, "tier gate blocked") != NULL);
+        ASSERT_TRUE(strstr((const char *)data, "max=GREEN") != NULL);
+    }
+    ASSERT_TRUE(strstr(logbuf, "threshold=GREEN") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=block") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "uid=4242") != NULL);
+
+    /* 2. SAME YELLOW command from an UNCAPPED caller ((uid_t)-1) → allowed
+     *    under the node-wide YELLOW ceiling: not tier-blocked. */
+    len = 0;
+    ceil_capture(&tmp, "clear counters", (uid_t)-1, buf, sizeof(buf), &len,
+                 logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=YELLOW") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=allow") != NULL);
+
+    /* 3. GREEN ("show version") from the capped uid → allowed (reads pass
+     *    any ceiling). */
+    len = 0;
+    ceil_capture(&tmp, "show version", CEIL_UID, buf, sizeof(buf), &len,
+                 logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=GREEN") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=allow") != NULL);
+
+    errobs_teardown(&tmp);
+}
+
 /* (a) Connection failure to an unreachable device, GREEN read: the error
  * observation must be VIRP_OBS_ERROR at tier GREEN (the read's true
  * tier) — not a DEVICE_OUTPUT observation the consumer logs as a change. */
@@ -4286,6 +4370,7 @@ int main(void)
     RUN_TEST(test_unprovable_dispatch_unknown_not_retried);
     RUN_TEST(test_provable_no_dispatch_retry_retained);
     RUN_TEST(test_error_obs_gate_block_logs_as_error_not_change);
+    RUN_TEST(test_per_uid_ceiling_caps_yellow_but_not_uncapped);
 
     printf("\n--- Watchdog / execute serialization (finding N3) ---\n");
     RUN_TEST(test_watchdog_health_check_serialized_with_execute);

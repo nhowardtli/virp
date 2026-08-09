@@ -212,6 +212,84 @@ static void load_socket_allowed_uids(onode_state_t *state,
 }
 
 /*
+ * Parse the optional top-level `socket_uid_tier_ceilings` object and
+ * install per-uid tier ceilings. Shape:
+ *
+ *   "socket_uid_tier_ceilings": { "993": "green", "1002": "yellow" }
+ *
+ * Keys are uid strings (matching how socket_allowed_uids may be given as
+ * strings); values are "green"/"yellow"/"red". Absent object → no
+ * ceilings, every allowed uid keeps the node-wide gate_max_tier. A
+ * ceiling for a uid NOT on the allowlist is warned about and skipped —
+ * it could never take effect (the connection is refused at accept), so
+ * silently keeping it would mislead an auditor reading the config.
+ */
+static void load_uid_tier_ceilings(onode_state_t *state,
+                                   struct json_object *root)
+{
+    struct json_object *obj;
+    if (!json_object_object_get_ex(root, "socket_uid_tier_ceilings", &obj) ||
+        !json_object_is_type(obj, json_type_object)) {
+        return;  /* optional */
+    }
+
+    uid_t uids[ONODE_MAX_ALLOWED_UIDS];
+    virp_trust_tier_t tiers[ONODE_MAX_ALLOWED_UIDS];
+    size_t count = 0;
+
+    json_object_object_foreach(obj, key, val) {
+        if (count >= ONODE_MAX_ALLOWED_UIDS) {
+            fprintf(stderr, "[O-Node] socket_uid_tier_ceilings: too many "
+                            "entries, ignoring '%s' and beyond\n", key);
+            break;
+        }
+        if (!json_object_is_type(val, json_type_string)) {
+            fprintf(stderr, "[O-Node] socket_uid_tier_ceilings['%s']: value "
+                            "is not a tier string — skipping\n", key);
+            continue;
+        }
+        char *end = NULL;
+        unsigned long uidv = strtoul(key, &end, 10);
+        if (!end || *end != '\0') {
+            fprintf(stderr, "[O-Node] socket_uid_tier_ceilings key '%s' is "
+                            "not a numeric uid — skipping\n", key);
+            continue;
+        }
+        const char *s = json_object_get_string(val);
+        virp_trust_tier_t tier;
+        if      (strcasecmp(s, "green")  == 0) tier = VIRP_TIER_GREEN;
+        else if (strcasecmp(s, "yellow") == 0) tier = VIRP_TIER_YELLOW;
+        else if (strcasecmp(s, "red")    == 0) tier = VIRP_TIER_RED;
+        else {
+            fprintf(stderr, "[O-Node] socket_uid_tier_ceilings['%s'] = '%s' "
+                            "unrecognized (want green/yellow/red) — "
+                            "skipping\n", key, s);
+            continue;
+        }
+
+        /* Warn if this uid is not on the allowlist — the ceiling is inert. */
+        bool allowed = false;
+        for (size_t i = 0; i < state->socket_allowed_uids_count; i++)
+            if (state->socket_allowed_uids[i] == (uid_t)uidv) { allowed = true; break; }
+        if (!allowed)
+            fprintf(stderr, "[O-Node] socket_uid_tier_ceilings: uid %lu is "
+                            "not in socket_allowed_uids — ceiling has no "
+                            "effect (connection would be refused)\n", uidv);
+
+        uids[count]  = (uid_t)uidv;
+        tiers[count] = tier;
+        count++;
+    }
+
+    if (count > 0) {
+        virp_error_t err = onode_set_uid_ceilings(state, uids, tiers, count);
+        if (err != VIRP_OK)
+            fprintf(stderr, "[O-Node] onode_set_uid_ceilings failed: %d\n",
+                    (int)err);
+    }
+}
+
+/*
  * Parse the optional top-level `socket_path` override. If present, it
  * takes precedence over the -s CLI argument. This lets operators move
  * the socket (e.g. when redirecting the socat bridge) by editing the
@@ -349,6 +427,11 @@ int load_devices(onode_state_t *state, const char *path)
 
     /* Socket access gate: install allowlist before onode_start(). */
     load_socket_allowed_uids(state, root);
+
+    /* Per-uid tier ceilings (optional). Installed before onode_start(),
+     * after the allowlist so it can warn about a ceiling for a uid that
+     * is not allowed to connect. */
+    load_uid_tier_ceilings(state, root);
 
     /* Tier-enforcement gate (Phase B): override SHADOW/YELLOW defaults
      * from config if present. Installed before onode_start(). */
