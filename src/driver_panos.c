@@ -5,7 +5,7 @@
  * Uses interactive SSH shell with plain-text CLI output.
  *
  * Implements the five virp_driver_t functions:
- *   connect     — Establish SSH session, disable pager
+ *   connect     — Establish SSH session (transport only; no shell reads)
  *   execute     — Send command, read until prompt, scrub output
  *   disconnect  — Tear down SSH session
  *   detect      — Run 'show system info' and look for PAN-OS markers
@@ -15,7 +15,11 @@
  *   - SSH only. PAN-OS XML API is available but CLI is simpler for VIRP.
  *   - Interactive shell (like Cisco driver), NOT exec channels.
  *   - Prompt: username@hostname> (op mode) or username@hostname# (config).
- *   - Paging disabled via "set cli pager off" at connect.
+ *   - Banner settle, strict prompt learn and "set cli pager off" are
+ *     DEFERRED out of connect (pa_ensure_session_ready_locked): they run
+ *     on the keepalive thread or under the first caller's exec mutex,
+ *     never on the watchdog thread. No command executes before the
+ *     two-probe learn has confirmed a prompt.
  *   - No enable mode — PAN-OS op mode has full read access.
  *   - Command routing table maps CLI patterns to VIRP trust tiers.
  *
@@ -239,10 +243,13 @@ struct virp_conn {
     int                 sock_fd;
     LIBSSH2_SESSION     *session;
     LIBSSH2_CHANNEL     *channel;
-    virp_ssh_prompt_t   prompt;      /* learned at connect — see virp_ssh_io.h */
+    virp_ssh_prompt_t   prompt;      /* learned AFTER connect — see warm-up below */
     virp_ssh_io_t       io;          /* shared read path transport adapter */
     bool                connected;
     bool                pager_disabled;
+    time_t              connect_time; /* when the shell opened — bounds how
+                                         long health_check may defer to a
+                                         warm-up that has not reported in */
 
     /* Keepalive — background thread sends periodic newlines to prevent
      * PAN-OS from killing the PTY session during idle periods.
@@ -381,19 +388,140 @@ static bool pa_session_alive(virp_conn_t *conn)
 }
 
 /* =========================================================================
+ * Deferred session warm-up — learn the prompt, then disable paging
+ *
+ * The pa-850 takes ~13 s from shell start to first prompt while it
+ * prints its login banner (observed 2026-08-09), and connect() runs on
+ * the O-Node's single serial watchdog thread. So connect no longer
+ * settles the banner: the session is handed back the moment the shell
+ * opens, and THIS function arms the read path afterwards — normally on
+ * the connection's own keepalive thread, or under the caller's exec
+ * mutex if a command arrives first.
+ *
+ * Learning stays exactly as strict as at-connect learning was: each
+ * attempt below is one unmodified virp_ssh_learn_prompt() call, and
+ * acceptance still requires the same answer to two consecutive probes
+ * (the 2026-07-29 R24/'R25#' cross-learn is why). What retrying adds is
+ * only TIME: an attempt that lands mid-banner gets two different banner
+ * lines, fails, and is re-measured after the drain has paced us past
+ * the chatter. A mismatch is never accepted; it is re-asked.
+ *
+ * On failure the session is marked dead — a channel that cannot produce
+ * a confirmable prompt inside the deadline cannot be read reliably, and
+ * the watchdog rebuilds it with backoff. No command is ever dispatched
+ * without a learned prompt (virp_ssh_exec refuses independently).
+ *
+ * Caller must hold session_mutex.
+ * ========================================================================= */
+
+#define PA_WARMUP_DEADLINE_MS 45000  /* ~3x the observed 13 s settle */
+
+static virp_error_t pa_ensure_session_ready_locked(virp_conn_t *conn)
+{
+    if (conn->prompt.learned && conn->pager_disabled)
+        return VIRP_OK;
+
+    const char *host = conn->device.hostname;
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    long elapsed_ms = 0;
+    int attempts = 0;
+    bool spoken = false;
+
+    while (!conn->prompt.learned) {
+        attempts++;
+
+        /* The drain does double duty: it clears banner/residue bytes so
+         * they cannot become a probe answer, and it paces the retry
+         * loop — while the banner is still streaming, the drain sits on
+         * the channel until a quiescent gap instead of spinning. */
+        size_t drained = virp_ssh_drain(&conn->io, host);
+        spoken = spoken || drained > 0;
+
+        virp_ssh_learn_opts_t lopts = { .channel_has_spoken = spoken };
+        if (virp_ssh_learn_prompt(&conn->io, host, &lopts,
+                                  &conn->prompt) == VIRP_OK)
+            break;
+
+        /* The probes themselves have now been sent; whatever the device
+         * is, it has had bytes on the wire. One long silent budget per
+         * warm-up, never one per attempt (mirrors the per-probe rule in
+         * virp_ssh_io.h). */
+        spoken = true;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsed_ms = (now.tv_sec - t0.tv_sec) * 1000 +
+                     (now.tv_nsec - t0.tv_nsec) / 1000000;
+        if (elapsed_ms >= PA_WARMUP_DEADLINE_MS) {
+            fprintf(stderr, "[PAN-OS] Warm-up failed: no confirmed prompt "
+                    "on %s after %d attempt(s) / %ld ms — marking session "
+                    "dead\n", host, attempts, elapsed_ms);
+            conn->connected = false;
+            return VIRP_ERR_NO_PROMPT;
+        }
+    }
+
+    /* Pager off — now that the prompt is known this reads to the prompt
+     * like any command, so it can leave no residue on the channel. */
+    if (!conn->pager_disabled) {
+        char discard[4096];
+        size_t got = 0;
+        virp_error_t prc = virp_ssh_exec(&conn->io, &conn->prompt,
+                                         "set cli pager off",
+                                         discard, sizeof(discard), &got,
+                                         PA_SSH_READ_TIMEOUT_MS, host);
+        if (prc != VIRP_OK) {
+            fprintf(stderr, "[PAN-OS] Warm-up: pager-off got no prompt on "
+                    "%s — marking session dead\n", host);
+            conn->connected = false;
+            return prc;
+        }
+        conn->pager_disabled = true;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    elapsed_ms = (now.tv_sec - t0.tv_sec) * 1000 +
+                 (now.tv_nsec - t0.tv_nsec) / 1000000;
+    fprintf(stderr, "[PAN-OS] Session ready: %s prompt='%s' (attempts=%d, "
+            "warmup=%ld ms)\n", host, conn->prompt.prompt, attempts,
+            elapsed_ms);
+    return VIRP_OK;
+}
+
+/* =========================================================================
  * Keepalive Thread
  *
  * Sends a newline to the PAN-OS PTY shell every PA_KEEPALIVE_INTERVAL_SEC
  * seconds and drains the prompt echo.  This prevents the PA-850 from
  * killing the SSH session due to idle timeout (~5 minutes default).
  *
- * The session_mutex is held only during the brief write+read, so normal
- * execute calls are not blocked for more than a few milliseconds.
+ * It is also the preferred payer of the deferred warm-up above, first
+ * thing after connect — a per-connection thread can sit through the
+ * banner settle without costing anyone else wall-clock.
+ *
+ * The session_mutex is held only during the brief write+read (and once,
+ * at start, across the warm-up), so normal execute calls are not blocked
+ * for more than a few milliseconds.
  * ========================================================================= */
 
 static void *pa_keepalive_thread(void *arg)
 {
     virp_conn_t *conn = (virp_conn_t *)arg;
+
+    /* Arm the read path off the connect path: the cold-start settle is
+     * paid here, not by the watchdog thread that called connect() and
+     * not (usually) by the first command. If a command beats us to the
+     * mutex, pa_execute runs the same warm-up and this reduces to a
+     * no-op. */
+    pthread_mutex_lock(&conn->session_mutex);
+    if (conn->keepalive_running && conn->connected &&
+        pa_ensure_session_ready_locked(conn) != VIRP_OK) {
+        pthread_mutex_unlock(&conn->session_mutex);
+        fprintf(stderr, "[PAN-OS] Keepalive: warm-up failed, exiting (%s)\n",
+                conn->device.hostname);
+        return NULL;
+    }
+    pthread_mutex_unlock(&conn->session_mutex);
 
     while (1) {
         /* Sleep in 1-second increments so we can check for shutdown quickly */
@@ -613,48 +741,26 @@ static virp_conn_t *pa_connect(const virp_device_t *device)
     libssh2_keepalive_config(conn->session, 1, 60);
 
     /*
-     * Connect-time reads precede any known prompt, so they are
-     * quiescence-based and never signed.
+     * DEFERRED SETTLE (2026-08-09): connect reads nothing from the
+     * shell. The pa-850 spends ~13 s printing its login banner before
+     * the first prompt, and this function runs on the O-Node's single
+     * serial watchdog thread — a settle here is wall-clock every other
+     * device waits behind. The old (pre-34e57a0) driver "solved" this
+     * by ignoring the settle result and connecting with an empty
+     * prompt, which is no check at all; the at-connect strict learn
+     * solved the check and made connect pay the settle. This splits
+     * them: connect is transport-only, and the strict learn runs in
+     * pa_ensure_session_ready_locked() — on the keepalive thread right
+     * below, or under the first caller's exec mutex, whichever comes
+     * first. Until it succeeds, no command can execute.
      */
-    char scratch[4096];
-    size_t setup_bytes =
-        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
-
-    /* Disable paging — PAN-OS uses 'set cli pager off' */
-    if (!conn->pager_disabled) {
-        pa_ssh_write(conn, "set cli pager off\n");
-        setup_bytes += virp_ssh_read_quiescent(&conn->io, scratch,
-                                               sizeof(scratch), 3000);
-        conn->pager_disabled = true;
-    }
-
-    /*
-     * Learn the prompt. PAN-OS is the driver where a stale-residue
-     * mismatch was actually observed in production (2026-07-29), so the
-     * strict path matters most here. No fallback: failure fails connect.
-     */
-    virp_ssh_learn_opts_t lopts = { .channel_has_spoken = setup_bytes > 0 };
-    if (virp_ssh_learn_prompt(&conn->io, device->hostname, &lopts,
-                              &conn->prompt) != VIRP_OK) {
-        fprintf(stderr, "[PAN-OS] Prompt learning failed — refusing connection "
-                "to %s (%s:%u)\n", device->hostname, device->host, port);
-        libssh2_channel_close(conn->channel);
-        libssh2_channel_free(conn->channel);
-        libssh2_session_disconnect(conn->session, "prompt learn failed");
-        libssh2_session_free(conn->session);
-        close(conn->sock_fd);
-        pthread_mutex_destroy(&conn->session_mutex);
-        OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
-        free(conn);
-        return NULL;
-    }
-
     conn->connected = true;
+    conn->connect_time = time(NULL);
 
-    /* Start keepalive thread — sends periodic newlines to prevent
-     * PAN-OS from killing the PTY session during idle periods.
-     * The 15-second cold connect cost is paid once here; the keepalive
-     * thread ensures we never pay it again unless the device reboots. */
+    /* Start keepalive thread — its first act is the deferred warm-up
+     * (banner settle + strict learn + pager-off), then it sends periodic
+     * newlines so PAN-OS never kills the PTY session during idle and the
+     * settle is never paid again unless the device reboots. */
     conn->keepalive_running = true;
     if (pthread_create(&conn->keepalive_tid, NULL,
                         pa_keepalive_thread, conn) == 0) {
@@ -664,12 +770,13 @@ static virp_conn_t *pa_connect(const virp_device_t *device)
     } else {
         conn->keepalive_running = false;
         conn->keepalive_started = false;
-        fprintf(stderr, "[PAN-OS] WARNING: keepalive thread failed to start for %s\n",
+        fprintf(stderr, "[PAN-OS] WARNING: keepalive thread failed to start for %s"
+                " — warm-up falls to the first execute\n",
                 device->hostname);
     }
 
-    fprintf(stderr, "[PAN-OS] Connected: %s@%s:%u prompt='%s'\n",
-            device->username, device->host, port, conn->prompt.prompt);
+    fprintf(stderr, "[PAN-OS] Connected: %s@%s:%u (prompt learn deferred)\n",
+            device->username, device->host, port);
 
     return conn;
 }
@@ -730,6 +837,26 @@ static virp_error_t pa_execute(virp_conn_t *conn,
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Session dead (liveness probe) on %s", conn->device.hostname);
         return VIRP_OK;
+    }
+
+    /*
+     * A command may arrive before the keepalive thread has armed the
+     * read path (or that thread may have failed to start). The strict
+     * two-probe learn then runs here — under the caller's per-device
+     * exec mutex and this session_mutex — before anything is sent.
+     * virp_ssh_exec refuses an unlearned prompt independently, so this
+     * cannot be skipped, only paid earlier by another thread.
+     */
+    if (!conn->prompt.learned || !conn->pager_disabled) {
+        if (pa_ensure_session_ready_locked(conn) != VIRP_OK) {
+            pthread_mutex_unlock(&conn->session_mutex);
+            result->success = false;
+            result->no_dispatch = true;  /* the command was never sent */
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "No confirmed prompt on %s — command refused",
+                     conn->device.hostname);
+            return VIRP_OK;
+        }
     }
 
     struct timespec start, end;
@@ -888,10 +1015,45 @@ static bool pa_detect(virp_conn_t *conn)
  * Driver: health_check
  * ========================================================================= */
 
+/* How long health_check will defer to a warm-up that has not reported
+ * in before probing the session itself (and paying the settle on the
+ * watchdog thread as a last resort). Comfortably past the warm-up
+ * deadline so the two never race. */
+#define PA_WARMUP_GRACE_SEC 60
+
 static virp_error_t pa_health_check(virp_conn_t *conn)
 {
     if (!conn) return VIRP_ERR_NULL_PTR;
     if (!conn->connected) return PA_ERR_NOT_CONNECTED;
+
+    /*
+     * The watchdog calls this from its single serial thread on every
+     * sweep. A blocking probe here would park that thread behind the
+     * deferred warm-up (or a long command) for the whole settle. Busy
+     * IS a health signal: a session another thread is actively driving
+     * is not idle-dead, and a warm-up that ultimately fails reports as
+     * connected=false on the next sweep.
+     */
+    int rc = pthread_mutex_trylock(&conn->session_mutex);
+    if (rc == EBUSY)
+        return VIRP_OK;
+    if (rc != 0)
+        return PA_ERR_NOT_CONNECTED;
+
+    bool warming = !conn->prompt.learned;
+    pthread_mutex_unlock(&conn->session_mutex);
+
+    /*
+     * Not armed yet and nobody holds the lock: normally the keepalive
+     * thread just hasn't got there yet — give it PA_WARMUP_GRACE_SEC
+     * from connect before concluding it will never come. Past the
+     * grace (or if the thread never started), fall through and let the
+     * execute path run the warm-up here; masking a device forever
+     * behind "still warming" would turn this probe into a no-op.
+     */
+    if (warming && conn->keepalive_started &&
+        (time(NULL) - conn->connect_time) < PA_WARMUP_GRACE_SEC)
+        return VIRP_OK;
 
     virp_exec_result_t result;
     virp_error_t err = pa_execute(conn, "show clock", &result);
