@@ -580,8 +580,15 @@ static const cisco_route_t CISCO_GATE_TABLE[] = {
     { "show boot",                    VIRP_TIER_GREEN  },
     { "show file systems",            VIRP_TIER_GREEN  },
 
+    /* Reclassified YELLOW → GREEN (2026-08-10): the config read is
+     * auto-executable ONLY because cisco_execute runs
+     * cisco_scrub_config() on the body before it reaches the signer —
+     * enable secrets, password 7 strings, SNMP communities and friends
+     * never enter the append-only chain. If the scrub wiring is ever
+     * removed, this entry MUST go back to YELLOW. */
+    { "show running-config",          VIRP_TIER_GREEN  },
+
     /* ── YELLOW — config-visibility reads (backups/audits) ────────── */
-    { "show running-config",          VIRP_TIER_YELLOW },
     { "show startup-config",          VIRP_TIER_YELLOW },
     { "show access-lists",            VIRP_TIER_YELLOW },
     { "show ip nat translations",     VIRP_TIER_YELLOW },
@@ -702,6 +709,255 @@ virp_trust_tier_t cisco_gate_tier(const char *command)
     return best ? best->tier : VIRP_TIER_RED;
 }
 
+/* =========================================================================
+ * Credential scrub for config-bearing reads
+ *
+ * IOS `show running-config` (and startup-config / tech-support) carries
+ * the device's credential material inline: `enable secret 5 $1$...`,
+ * `username ... password 7 ...`, SNMP communities, ISAKMP pre-shared
+ * keys, routing-protocol MD5 keys, key-chain key-strings. Observation
+ * bodies are HMAC-signed and appended to a chain that cannot be
+ * trimmed, so a single unscrubbed config read pins that material into
+ * the audit record forever. The scrub therefore runs INSIDE the driver,
+ * on the reply body, BEFORE the result is handed back to the O-Node
+ * signer — never after.
+ *
+ * Same shape as fg_scrub_reply: a pure function over the reply text,
+ * exposed (non-static) so tests can drive it with recorded config
+ * shapes, with a fail-closed contract — if the scrub cannot complete
+ * (output would not fit), the caller reports a typed ERROR instead of
+ * signing an unscrubbed or truncated body.
+ *
+ * Redaction model (RANCID/Oxidized-style, deliberately over-broad —
+ * over-redaction is the fail-closed direction):
+ *   - a line whose token stream contains one of the secret-bearing
+ *     keywords (password, secret, community, key-string, md5,
+ *     authentication-key, pre-shared-key, passphrase) has everything
+ *     AFTER that keyword replaced with "<removed>";
+ *   - `crypto isakmp key [enc] SECRET address ...` redacts only the
+ *     key token so the peer address stays visible;
+ *   - `snmp-server host <ip> ...` redacts everything after the host —
+ *     the trailing community string is positional, not keyword-marked;
+ *   - `standby|vrrp ... authentication ...` redacts after
+ *     `authentication`;
+ *   - a line whose FIRST token is `key` (tacacs/radius server-block
+ *     `key 7 SECRET`) is redacted unless the remainder is purely
+ *     numeric (`key 1` — a key-chain index, not a secret) or the next
+ *     token is `chain` (`key chain NAME` — a block header).
+ * Exact-token matching keeps non-secret lines untouched:
+ * `service password-encryption` and `ip ospf authentication
+ * message-digest` carry no value and are preserved verbatim.
+ * ========================================================================= */
+
+#define CISCO_SCRUB_MARK "<removed>"
+
+/* Longest growth per line: a redaction appends "<removed>" after the
+ * keyword; sizing the output at 3x input + slack makes overflow a
+ * cannot-happen guarded anyway by the fail-closed contract. */
+#define CISCO_SCRUB_CAP(len) (3 * (len) + 64)
+
+static bool tok_eq(const char *tok, size_t len, const char *word)
+{
+    return strlen(word) == len && strncmp(tok, word, len) == 0;
+}
+
+/* Emit helper: append [src, src+n) to out, fail on overflow. */
+static bool scrub_emit(char *out, size_t cap, size_t *pos,
+                       const char *src, size_t n)
+{
+    if (*pos + n >= cap) return false;
+    memcpy(out + *pos, src, n);
+    *pos += n;
+    return true;
+}
+
+/*
+ * Scrub one line [line, line+len) (terminator excluded) into out.
+ * Returns false only on output overflow.
+ */
+static bool scrub_line(const char *line, size_t len,
+                       char *out, size_t cap, size_t *pos)
+{
+    static const char *SECRET_KEYWORDS[] = {
+        "password", "secret", "community", "key-string",
+        "authentication-key", "md5", "pre-shared-key", "passphrase",
+    };
+    static const size_t SECRET_KEYWORD_COUNT =
+        sizeof(SECRET_KEYWORDS) / sizeof(SECRET_KEYWORDS[0]);
+
+    /* Walk tokens; remember where the first secret-bearing keyword
+     * ends so everything after it can be replaced. */
+    size_t i = 0;
+    size_t tok_index = 0;
+    size_t cut = 0;              /* redact from here (0 = no redaction) */
+    bool   first_is_key = false; /* leading token is bare `key` */
+    bool   first_is_aaa = false; /* tacacs-server / radius-server */
+    bool   standby_line = false; /* standby / vrrp line */
+    size_t isakmp_state = 0;     /* tokens matched of crypto/isakmp/key */
+    size_t snmp_host_state = 0;  /* tokens matched of snmp-server/host */
+
+    while (i < len && cut == 0) {
+        while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+        if (i >= len) break;
+        size_t start = i;
+        while (i < len && line[i] != ' ' && line[i] != '\t') i++;
+        const char *tok = line + start;
+        size_t tlen = i - start;
+
+        if (tok_index == 0) {
+            if (tok_eq(tok, tlen, "key"))     first_is_key = true;
+            if (tok_eq(tok, tlen, "crypto"))  isakmp_state = 1;
+            if (tok_eq(tok, tlen, "snmp-server")) snmp_host_state = 1;
+            if (tok_eq(tok, tlen, "standby") || tok_eq(tok, tlen, "vrrp"))
+                standby_line = true;
+            if (tok_eq(tok, tlen, "tacacs-server") ||
+                tok_eq(tok, tlen, "radius-server"))
+                first_is_aaa = true;
+        } else if (tok_index == 1) {
+            if (first_is_key) {
+                /* `key chain NAME` is a block header; `key 1` is a
+                 * key-chain index. Neither carries a secret. */
+                bool numeric = true;
+                for (size_t k = start; k < len; k++)
+                    if (!(line[k] >= '0' && line[k] <= '9') &&
+                        line[k] != ' ' && line[k] != '\t' &&
+                        line[k] != '\r')
+                        { numeric = false; break; }
+                if (!tok_eq(tok, tlen, "chain") && !numeric)
+                    cut = start;
+                first_is_key = false;
+            }
+            if (first_is_aaa && tok_eq(tok, tlen, "key")) {
+                /* `tacacs-server key [7] SECRET` — secret follows */
+                size_t j = i;
+                while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+                if (j < len) cut = j;
+            }
+            if (isakmp_state == 1 && tok_eq(tok, tlen, "isakmp"))
+                isakmp_state = 2;
+            else
+                isakmp_state = 0;
+            if (snmp_host_state == 1 && tok_eq(tok, tlen, "host"))
+                snmp_host_state = 2;
+            else
+                snmp_host_state = 0;
+        } else if (isakmp_state == 2 && tok_eq(tok, tlen, "key")) {
+            /* `crypto isakmp key [0|6|7] SECRET address A.B.C.D`:
+             * redact the key token only, keep the address visible. */
+            size_t j = i;
+            while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+            size_t s2 = j;
+            while (j < len && line[j] != ' ' && line[j] != '\t') j++;
+            if (j - s2 == 1 && (line[s2] == '0' || line[s2] == '6' ||
+                                line[s2] == '7')) {
+                /* encryption-type token — the secret is the NEXT one */
+                while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+                s2 = j;
+                while (j < len && line[j] != ' ' && line[j] != '\t') j++;
+            }
+            if (s2 < len) {
+                if (!scrub_emit(out, cap, pos, line, s2) ||
+                    !scrub_emit(out, cap, pos, CISCO_SCRUB_MARK,
+                                strlen(CISCO_SCRUB_MARK)) ||
+                    !scrub_emit(out, cap, pos, line + j, len - j))
+                    return false;
+                return true;
+            }
+            isakmp_state = 0;
+        } else if (snmp_host_state == 2) {
+            /* Past `snmp-server host <ip>`: the rest is positional and
+             * ends in a community string — redact all of it. */
+            size_t j = i;
+            while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+            if (j < len) cut = j;
+            snmp_host_state = 0;
+        }
+
+        /* `standby [grp] authentication ...` / `vrrp ...` — the value
+         * after `authentication` is the secret (or a md5/key-string
+         * form the generic keywords would also catch). Checked at any
+         * token position: the group number is optional. */
+        if (cut == 0 && standby_line && tok_index >= 1 &&
+            tok_eq(tok, tlen, "authentication")) {
+            size_t j = i;
+            while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+            if (j < len) cut = j;
+        }
+
+        if (cut == 0) {
+            for (size_t k = 0; k < SECRET_KEYWORD_COUNT; k++) {
+                if (tok_eq(tok, tlen, SECRET_KEYWORDS[k])) {
+                    size_t j = i;
+                    while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+                    if (j < len) cut = j;   /* keyword with a value */
+                    break;
+                }
+            }
+        }
+        tok_index++;
+    }
+
+    if (cut == 0)
+        return scrub_emit(out, cap, pos, line, len);
+
+    return scrub_emit(out, cap, pos, line, cut) &&
+           scrub_emit(out, cap, pos, CISCO_SCRUB_MARK,
+                      strlen(CISCO_SCRUB_MARK));
+}
+
+/*
+ * Pure scrub: rewrite config text so no credential material survives.
+ * Exposed (non-static) for the unit suite — see fg_scrub_reply for the
+ * precedent. Fail-closed: VIRP_ERR_BUFFER_TOO_SMALL means the caller
+ * must NOT use (or sign) any partial output.
+ */
+virp_error_t cisco_scrub_config(const char *in, size_t in_len,
+                                char *out, size_t out_cap,
+                                size_t *out_len)
+{
+    if (!in || !out || !out_len) return VIRP_ERR_NULL_PTR;
+    *out_len = 0;
+
+    size_t pos = 0;
+    size_t i = 0;
+    while (i < in_len) {
+        size_t start = i;
+        while (i < in_len && in[i] != '\n') i++;
+        size_t line_end = i;                    /* excl. terminator */
+        size_t content_end = line_end;
+        if (content_end > start && in[content_end - 1] == '\r')
+            content_end--;                      /* keep \r with the terminator */
+
+        if (!scrub_line(in + start, content_end - start, out, out_cap, &pos))
+            return VIRP_ERR_BUFFER_TOO_SMALL;
+        /* terminator bytes verbatim (\r\n, \n, or none at EOF) */
+        if (!scrub_emit(out, out_cap, &pos, in + content_end,
+                        (line_end - content_end) +
+                        ((i < in_len) ? 1 : 0)))
+            return VIRP_ERR_BUFFER_TOO_SMALL;
+        if (i < in_len) i++;                    /* past the \n */
+    }
+
+    out[pos] = '\0';
+    *out_len = pos;
+    return VIRP_OK;
+}
+
+/*
+ * Commands whose reply embeds device configuration (and therefore
+ * credential material). Matches the gate table's literal spellings —
+ * abbreviations never reach GREEN/YELLOW (fail-closed classifier), so
+ * prefix-matching the canonical forms here is exhaustive.
+ */
+bool cisco_command_returns_config(const char *command)
+{
+    if (!command) return false;
+    while (*command == ' ' || *command == '\t') command++;
+    return strncmp(command, "show running-config", 19) == 0 ||
+           strncmp(command, "show startup-config", 19) == 0 ||
+           strncmp(command, "show tech-support",   17) == 0;
+}
+
 static virp_error_t cisco_execute(virp_conn_t *conn,
                                   const char *command,
                                   virp_exec_result_t *result)
@@ -788,6 +1044,37 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
         output_start[--clean_len] = '\0';
     }
 
+    /*
+     * Credential scrub for config-bearing reads. This MUST happen here,
+     * before the body is copied into result->output: what leaves this
+     * function is what the O-Node signs into the append-only chain.
+     * Fail-closed — if the scrub cannot complete, report a typed ERROR
+     * rather than signing an unscrubbed body.
+     */
+    char *scrubbed = NULL;
+    if (cisco_command_returns_config(command)) {
+        size_t cap = CISCO_SCRUB_CAP(clean_len);
+        scrubbed = malloc(cap);
+        size_t scrubbed_len = 0;
+        virp_error_t serr = scrubbed
+            ? cisco_scrub_config(output_start, clean_len,
+                                 scrubbed, cap, &scrubbed_len)
+            : VIRP_ERR_BUFFER_TOO_SMALL;
+        if (serr != VIRP_OK) {
+            free(scrubbed);
+            fprintf(stderr, "[Cisco] Config scrub failed on %s "
+                    "(%zu bytes) — refusing to sign unscrubbed body\n",
+                    conn->device.hostname, clean_len);
+            result->success = false;
+            result->output_len = 0;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Config scrub failed on %s: body withheld from "
+                     "signing", conn->device.hostname);
+            return serr;
+        }
+        output_start = scrubbed;
+    }
+
     /* Format: hostname#command\noutput */
     int written = snprintf(result->output, sizeof(result->output),
                            "%s#%s\n%s",
@@ -806,6 +1093,7 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
                  "IOS error in command: %s", command);
     }
 
+    free(scrubbed);
     return VIRP_OK;
 }
 

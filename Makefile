@@ -368,6 +368,29 @@ $(TEST_FG_SCRUB): tests/test_driver_fortigate_scrub.c \
 test-fg-scrub: $(TEST_FG_SCRUB)
 	./$(TEST_FG_SCRUB)
 
+# Cisco config credential scrubbing (show running-config GREEN gate)
+TEST_CISCO_SCRUB = $(BUILD_DIR)/test_driver_cisco_scrub
+
+# Built with the driver + hostkey objects explicitly, so the suite runs
+# in the default battery even when the library was built without
+# CISCO=1 — same arrangement as the FortiGate scrub suite above.
+$(BUILD_DIR)/cisco_scrub_driver.o: src/drivers/driver_cisco.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_CISCO -c $< -o $@
+
+$(BUILD_DIR)/cisco_scrub_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_CISCO -c $< -o $@
+
+$(TEST_CISCO_SCRUB): tests/test_driver_cisco_scrub.c \
+                     $(BUILD_DIR)/cisco_scrub_driver.o \
+                     $(BUILD_DIR)/cisco_scrub_hostkey.o $(LIB)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_CISCO $< \
+	    $(BUILD_DIR)/cisco_scrub_driver.o $(BUILD_DIR)/cisco_scrub_hostkey.o \
+	    $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+.PHONY: test-cisco-scrub
+test-cisco-scrub: $(TEST_CISCO_SCRUB)
+	./$(TEST_CISCO_SCRUB)
+
 # Chain and Federation tests
 TEST_CHAIN = $(BUILD_DIR)/test_chain
 TEST_FED   = $(BUILD_DIR)/test_federation
@@ -1561,4 +1584,4 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-api

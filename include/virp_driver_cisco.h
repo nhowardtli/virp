@@ -106,6 +106,26 @@ virp_trust_tier_t cisco_gate_tier(const char *command);
  */
 bool cisco_is_black_tier(const char *command);
 
+/*
+ * Credential scrub for config-bearing reads (2026-08-10).
+ *
+ * cisco_scrub_config rewrites IOS config text so credential material
+ * (enable secrets, password 7 strings, SNMP communities, ISAKMP
+ * pre-shared keys, MD5 auth keys, key-strings) is replaced with
+ * "<removed>" BEFORE the observation body reaches the signer. Pure
+ * function, exposed for the unit suite (same precedent as
+ * fg_scrub_reply). Fail-closed: on VIRP_ERR_BUFFER_TOO_SMALL the
+ * caller must not use — and must not sign — any partial output.
+ *
+ * cisco_command_returns_config identifies the commands whose replies
+ * embed configuration; cisco_execute applies the scrub to exactly
+ * those. `show running-config` classifies GREEN only under this scrub.
+ */
+virp_error_t cisco_scrub_config(const char *in, size_t in_len,
+                                char *out, size_t out_cap,
+                                size_t *out_len);
+bool cisco_command_returns_config(const char *command);
+
 #ifdef __cplusplus
 }
 #endif
