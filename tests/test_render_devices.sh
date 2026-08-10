@@ -164,6 +164,84 @@ EOF
 printf 'ZAMMAD_RO_TOKEN=a\nZAMMAD_RW_TOKEN=b\n' > "$T/env"
 check "undeclared placeholder -> FATAL, never rendered literally" 1 "unsubstituted placeholders"
 
+# ── Annotations: keys beginning with "_" are never rendered ────────────
+#
+# The bug this pins down: substitution used to run over the raw template
+# TEXT, comments included, so the pa-850 _comment explaining that
+# ${LAB_ENABLE} must never be loaded rendered WITH the live enable
+# secret spelled out in it — and the render DEMANDED LAB_ENABLE from
+# autopilot.env although no row named it. Comments are prose: never
+# substituted, never scanned for required placeholders, and no secret
+# value may ever appear inside one.
+cat > "$T/tmpl.json" <<'EOF'
+{ "_ironclaw_fleet_note": "fleet shares ${LAB_PASSWORD}; ${LAB_ENABLE} policy note",
+  "devices": [
+  { "_comment": "no enable mode exists, so ${LAB_ENABLE} must NOT be named on this row",
+    "hostname": "pa-850", "host": "198.51.100.10", "vendor": "panos",
+    "username": "aiops-svc", "password": "${LAB_PASSWORD}", "port": 22 }
+]}
+EOF
+
+printf 'LAB_PASSWORD=pw-sandbox-value\n' > "$T/env"
+check "placeholder named only in comments -> not demanded" 0 "rendered"
+
+run=$((run + 1)); printf "  [%d] comments pass through unsubstituted; secret lands only in its field ... " "$run"
+if python3 - "$T/out.json" <<'PY'
+import json, sys
+raw = open(sys.argv[1]).read()
+d = json.loads(raw)
+dev = d["devices"][0]
+assert dev["password"] == "pw-sandbox-value"
+assert "${LAB_ENABLE}" in dev["_comment"], "comment must keep its literal placeholder"
+assert "${LAB_ENABLE}" in d["_ironclaw_fleet_note"]
+assert "${LAB_PASSWORD}" in d["_ironclaw_fleet_note"], \
+    "no substitution in annotations, even for vars that ARE set"
+assert raw.count("pw-sandbox-value") == 1, \
+    "the secret may appear exactly once: in the password field"
+PY
+then pass=$((pass + 1)); printf "PASS\n"; else printf "FAIL\n"; fi
+
+# Placeholders in dict KEYS substitute like values (the live template's
+# socket_uid_tier_ceilings maps "${VIRP_NETCLAW_UID}" — a key — to a
+# tier; a render that only walks values ships the literal key).
+cat > "$T/tmpl.json" <<'EOF'
+{ "socket_uid_tier_ceilings": { "${SWITCH_PASS}": "green" },
+  "devices": [ { "hostname": "x", "vendor": "linux" } ] }
+EOF
+printf 'SWITCH_PASS=993\n' > "$T/env"
+check "placeholder as a dict key -> substituted" 0 "rendered"
+run=$((run + 1)); printf "  [%d] the substituted key is present in the output ... " "$run"
+if python3 - "$T/out.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["socket_uid_tier_ceilings"] == {"993": "green"}
+PY
+then pass=$((pass + 1)); printf "PASS\n"; else printf "FAIL\n"; fi
+
+# Restore the annotations template for the checks below.
+cat > "$T/tmpl.json" <<'EOF'
+{ "_ironclaw_fleet_note": "fleet shares ${LAB_PASSWORD}; ${LAB_ENABLE} policy note",
+  "devices": [
+  { "_comment": "no enable mode exists, so ${LAB_ENABLE} must NOT be named on this row",
+    "hostname": "pa-850", "host": "198.51.100.10", "vendor": "panos",
+    "username": "aiops-svc", "password": "${LAB_PASSWORD}", "port": 22 }
+]}
+EOF
+
+# Even with the variable defined in the env, a comment naming it must
+# not receive the value.
+printf 'LAB_PASSWORD=pw-sandbox-value\nLAB_ENABLE=en-secret-value\n' > "$T/env"
+VIRP_RENDER_ENV_FILE="$T/env" VIRP_RENDER_TEMPLATE="$T/tmpl.json" \
+    VIRP_RENDER_OUT="$T/out.json" bash "$SCRIPT" >/dev/null 2>&1
+run=$((run + 1)); printf "  [%d] defined-but-comment-only secret stays out of the render ... " "$run"
+if python3 - "$T/out.json" <<'PY'
+import json, sys
+raw = open(sys.argv[1]).read()
+assert "en-secret-value" not in raw, "enable secret leaked into the rendered file"
+assert "${LAB_ENABLE}" in json.loads(raw)["devices"][0]["_comment"]
+PY
+then pass=$((pass + 1)); printf "PASS\n"; else printf "FAIL\n"; fi
+
 echo ""
 echo "=== Results: $pass/$run passed ==="
 [ "$pass" = "$run" ]
