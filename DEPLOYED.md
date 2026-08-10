@@ -10,13 +10,13 @@ time it was written and is deliberately *not* corrected in place. Where a fact
 below disagrees with this block, this block wins. A copy of this file without
 this block is stale — check the commit before relying on it.
 
-- **Commit**: `ae016b0d753ccc210a3167c8d082bdfb615186a7` (short `ae016b0d`)
-  — deployed 2026-08-10 01:09 UTC, superseding `793ebfcb` (which itself
-  superseded `32dd710f` on 2026-08-10 00:09 UTC; see the update log).
+- **Commit**: `5bda4deb9d29bb5efc5c715a769d30da6f01df67` (short `5bda4deb`)
+  — deployed 2026-08-10 01:31 UTC (ASA scrub port), superseding `ae016b0d`
+  (01:09 UTC), `793ebfcb` (00:09 UTC) and `32dd710f`; see the update log.
 - **Branch**: `feat/cisco-config-scrub-netclaw-yellow`
 - **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
   socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
-  — binary sha256 `a793ea8544e8acc5212fbedbb903e5848eead211e23cf75dab7087f75ca9972d`
+  — binary sha256 (see /var/backups/virp/20260810T013128Z MANIFEST for the superseded ae016b0d build)
 - **Client**: `/opt/virp/build/virp` — built from `32dd710f`
   (rebuilt 2026-08-09 01:47; see the outage note below — it lives in the
   SOURCE WORKTREE, not an installed path, and that is a known defect).
@@ -79,6 +79,23 @@ restart 01:09:46 UTC, 43/43 reconnected by 01:11:44, reconnects=0).
   reconnects. Needs confirm-prompt handling in the cisco driver before it
   is usable.
 - Rollback capture: `/var/backups/virp/20260810T010456Z`.
+
+### Same night, second deploy (01:31 UTC): ASA scrub port — `5bda4deb`
+
+- asa_scrub_config ported from the cisco scrub; wired into asa_execute
+  the same way (scrub before the signer, fail-closed). ASA tiers
+  UNCHANGED: running/startup-config stay YELLOW; the trigger also covers
+  `more system:running-config` (RED) in case it is ever approved.
+- Suites: test-asa-scrub 9/9, existing test-asa 157/157.
+- Verified live against ASA-5525 as uid 993: 315-line config, 7
+  redactions (enable password, 2 usernames, 4 tunnel-group
+  pre-shared-keys), zero leak-pattern hits; commitment-only
+  chain_append `netclaw-verify-asa-2b3bda…` — commitment hash matches
+  the signed scrubbed bytes. Full-body append of the 12KB observation
+  was correctly REJECTED by the ingestion gate (declared hash vs
+  truncated 8192-byte artifact field), so large bodies register
+  commitment-only, as the config-backup runbook already does.
+- Rollback capture: `/var/backups/virp/20260810T013128Z`.
 
 ## Chain gap 2026-08-09 01:35–01:50 UTC — operator-caused, during deploy
 
