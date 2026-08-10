@@ -13,7 +13,7 @@ this block is stale — check the commit before relying on it.
 - **Commit**: `5bda4deb9d29bb5efc5c715a769d30da6f01df67` (short `5bda4deb`)
   — deployed 2026-08-10 01:31 UTC (ASA scrub port), superseding `ae016b0d`
   (01:09 UTC), `793ebfcb` (00:09 UTC) and `32dd710f`; see the update log.
-- **Branch**: `feat/cisco-config-scrub-netclaw-yellow`
+- **Branch**: `main` (consolidated 2026-08-10: `feat/cisco-config-scrub-netclaw-yellow` merged into main at `b446c3c2`; branch retired to `archive/feat/cisco-config-scrub-netclaw-yellow-2026-08-10`)
 - **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
   socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
   — binary sha256 (see /var/backups/virp/20260810T013128Z MANIFEST for the superseded ae016b0d build)
