@@ -10,12 +10,13 @@ time it was written and is deliberately *not* corrected in place. Where a fact
 below disagrees with this block, this block wins. A copy of this file without
 this block is stale — check the commit before relying on it.
 
-- **Commit**: `32dd710f28300a2fa47ebd44901aa6100d71ccd0` (short `32dd710f`)
-  — deployed 2026-08-09 01:38 UTC, superseding `8a2a6342` (51 commits).
-- **Branch**: `main`
+- **Commit**: `ae016b0d753ccc210a3167c8d082bdfb615186a7` (short `ae016b0d`)
+  — deployed 2026-08-10 01:09 UTC, superseding `793ebfcb` (which itself
+  superseded `32dd710f` on 2026-08-10 00:09 UTC; see the update log).
+- **Branch**: `feat/cisco-config-scrub-netclaw-yellow`
 - **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
   socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
-  — binary sha256 `07b8eec46f12657ddf6df5ece42aa03b82c39893e8100d9b442fd4589ecda82f`
+  — binary sha256 `a793ea8544e8acc5212fbedbb903e5848eead211e23cf75dab7087f75ca9972d`
 - **Client**: `/opt/virp/build/virp` — built from `32dd710f`
   (rebuilt 2026-08-09 01:47; see the outage note below — it lives in the
   SOURCE WORKTREE, not an installed path, and that is a known defect).
@@ -56,6 +57,28 @@ are now stale on two counts:
    classifier it was waiting on has been live ever since.
 2. The deployed commit has advanced through the update log below and is now
    `b6e9602c`, not `0c9c7338`.
+
+## Update 2026-08-10 — cisco config scrub, running-config GREEN, netclaw YELLOW ceiling
+
+Deployed `ae016b0d` (branch `feat/cisco-config-scrub-netclaw-yellow`,
+restart 01:09:46 UTC, 43/43 reconnected by 01:11:44, reconnects=0).
+
+- `show running-config` on cisco_ios/iosxe reclassified YELLOW → GREEN.
+  Safe only because cisco_execute now scrubs credential material
+  (cisco_scrub_config, RANCID-style, fail-closed) out of the body BEFORE
+  signing. startup-config/tech-support stay YELLOW but are scrubbed too.
+  Suite: `make test-cisco-scrub` (9 tests). Verified live: chained R2
+  observation carries `enable secret <removed>` — no hash material.
+- uid 993 (virp-netclaw) ceiling raised GREEN → YELLOW in
+  `/etc/virp/devices.template.json` (+ stage2 copy; .bak-20260810-netclaw-yellow).
+  Re-proven after restart: RED `configure terminal` from uid 993 →
+  decision=block, proposal `b32c0db0…` filed + chained (`approval:R1` seq=1),
+  rejection persisted. YELLOW ping auto-executes.
+- Known gap: `clear counters` (YELLOW) reaches the device but hangs at the
+  IOS `[confirm]` prompt — driver returns a typed ERROR and the watchdog
+  reconnects. Needs confirm-prompt handling in the cisco driver before it
+  is usable.
+- Rollback capture: `/var/backups/virp/20260810T010456Z`.
 
 ## Chain gap 2026-08-09 01:35–01:50 UTC — operator-caused, during deploy
 
