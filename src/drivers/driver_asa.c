@@ -647,6 +647,246 @@ learn_failed:
  *   5. Scrub output (remove echo + trailing prompt)
  * ========================================================================= */
 
+/* =========================================================================
+ * Credential scrub for config-bearing reads
+ *
+ * Port of cisco_scrub_config (driver_cisco.c, 2026-08-10) to the ASA
+ * directive set — same architecture: a pure function over the reply
+ * text, run INSIDE the driver BEFORE the body is copied into the
+ * result the O-Node signs, fail-closed (scrub cannot complete → typed
+ * ERROR, nothing signed). ASA `show running-config` is YELLOW, but an
+ * approval should let a human read a config — not pin the firewall's
+ * credential set into the append-only chain.
+ *
+ * ASA-specific redactions on top of the shared keyword model
+ * (password, secret, community, key-string, authentication-key, md5,
+ * pre-shared-key, passphrase):
+ *   - `passwd <hash> encrypted` and `ldap-login-password <val>`;
+ *   - `failover key ...` — the value after `key` is the secret;
+ *   - aaa-server: both the block form (indented `key <val>`, covered
+ *     by the leading-`key` rule) and the legacy inline form
+ *     `aaa-server G (if) host <ip> <key> [timeout N]` — everything
+ *     after the host IP is redacted, the IP stays visible;
+ *   - `snmp-server host <ifc> <ip> ...` keeps interface + IP, redacts
+ *     the positional remainder (community string included);
+ *   - EIGRP/RIP interface auth `authentication key eigrp <as> <val>
+ *     key-id <n>` — redacted from the value after `key`;
+ *   - `crypto isakmp key [enc] <val> address ...` keeps the peer.
+ * ASA has no HSRP/VRRP, so the cisco standby/vrrp rule is dropped.
+ * Over-redaction (trailing timeout/version/privilege tokens) is
+ * accepted: it is the fail-closed direction.
+ * ========================================================================= */
+
+#define ASA_SCRUB_MARK "<removed>"
+#define ASA_SCRUB_CAP(len) (3 * (len) + 64)
+
+static bool asa_tok_eq(const char *tok, size_t len, const char *word)
+{
+    return strlen(word) == len && strncmp(tok, word, len) == 0;
+}
+
+static bool asa_scrub_emit(char *out, size_t cap, size_t *pos,
+                           const char *src, size_t n)
+{
+    if (*pos + n >= cap) return false;
+    memcpy(out + *pos, src, n);
+    *pos += n;
+    return true;
+}
+
+/* Scrub one line [line, line+len) (terminator excluded) into out.
+ * Returns false only on output overflow. */
+static bool asa_scrub_line(const char *line, size_t len,
+                           char *out, size_t cap, size_t *pos)
+{
+    static const char *SECRET_KEYWORDS[] = {
+        "password", "passwd", "secret", "community", "key-string",
+        "authentication-key", "md5", "pre-shared-key", "passphrase",
+        "ldap-login-password",
+    };
+    static const size_t SECRET_KEYWORD_COUNT =
+        sizeof(SECRET_KEYWORDS) / sizeof(SECRET_KEYWORDS[0]);
+
+    size_t i = 0;
+    size_t tok_index = 0;
+    size_t cut = 0;              /* redact from here (0 = no redaction) */
+    bool   first_is_key = false; /* leading token is bare `key` */
+    bool   first_is_failover = false;
+    bool   prev_is_auth = false; /* previous token was `authentication` */
+    size_t isakmp_state = 0;     /* tokens matched of crypto/isakmp/key */
+    size_t snmp_host_state = 0;  /* snmp-server / host / <ifc> / <ip> */
+    size_t aaa_host_state = 0;   /* aaa-server ... host / <ip> */
+
+    while (i < len && cut == 0) {
+        while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+        if (i >= len) break;
+        size_t start = i;
+        while (i < len && line[i] != ' ' && line[i] != '\t') i++;
+        const char *tok = line + start;
+        size_t tlen = i - start;
+
+        if (tok_index == 0) {
+            if (asa_tok_eq(tok, tlen, "key"))         first_is_key = true;
+            if (asa_tok_eq(tok, tlen, "crypto"))      isakmp_state = 1;
+            if (asa_tok_eq(tok, tlen, "snmp-server")) snmp_host_state = 1;
+            if (asa_tok_eq(tok, tlen, "aaa-server"))  aaa_host_state = 1;
+            if (asa_tok_eq(tok, tlen, "failover"))    first_is_failover = true;
+        } else if (tok_index == 1) {
+            if (first_is_key) {
+                /* `key chain NAME` is a block header; `key 1` is a
+                 * key-chain index. Neither carries a secret. */
+                bool numeric = true;
+                for (size_t k = start; k < len; k++)
+                    if (!(line[k] >= '0' && line[k] <= '9') &&
+                        line[k] != ' ' && line[k] != '\t' &&
+                        line[k] != '\r')
+                        { numeric = false; break; }
+                if (!asa_tok_eq(tok, tlen, "chain") && !numeric)
+                    cut = start;
+                first_is_key = false;
+            }
+            if (first_is_failover && asa_tok_eq(tok, tlen, "key")) {
+                /* `failover key [hex] SECRET` — secret follows */
+                size_t j = i;
+                while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+                if (j < len) cut = j;
+            }
+            if (isakmp_state == 1 && asa_tok_eq(tok, tlen, "isakmp"))
+                isakmp_state = 2;
+            else
+                isakmp_state = 0;
+            if (snmp_host_state == 1 && asa_tok_eq(tok, tlen, "host"))
+                snmp_host_state = 2;   /* next: interface name */
+            else
+                snmp_host_state = 0;
+        } else if (isakmp_state == 2 && asa_tok_eq(tok, tlen, "key")) {
+            /* `crypto isakmp key [0|6|7] SECRET address A.B.C.D` */
+            size_t j = i;
+            while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+            size_t s2 = j;
+            while (j < len && line[j] != ' ' && line[j] != '\t') j++;
+            if (j - s2 == 1 && (line[s2] == '0' || line[s2] == '6' ||
+                                line[s2] == '7')) {
+                while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+                s2 = j;
+                while (j < len && line[j] != ' ' && line[j] != '\t') j++;
+            }
+            if (s2 < len) {
+                if (!asa_scrub_emit(out, cap, pos, line, s2) ||
+                    !asa_scrub_emit(out, cap, pos, ASA_SCRUB_MARK,
+                                    strlen(ASA_SCRUB_MARK)) ||
+                    !asa_scrub_emit(out, cap, pos, line + j, len - j))
+                    return false;
+                return true;
+            }
+            isakmp_state = 0;
+        } else if (snmp_host_state == 2) {
+            snmp_host_state = 3;       /* interface name seen; next: ip */
+        } else if (snmp_host_state == 3) {
+            /* Past `snmp-server host <ifc> <ip>`: positional remainder
+             * carries the community string — redact all of it. */
+            size_t j = i;
+            while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+            if (j < len) cut = j;
+            snmp_host_state = 0;
+        }
+
+        /* aaa-server legacy inline key: `aaa-server G (if) host <ip>
+         * <key> [timeout N]` — keep the IP, redact what follows. The
+         * modern block form prints the key on its own indented `key`
+         * line, which the leading-`key` rule catches. */
+        if (cut == 0 && aaa_host_state >= 1 && tok_index >= 1) {
+            if (aaa_host_state == 2) {
+                /* this token is the host IP — redact from the next */
+                size_t j = i;
+                while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+                if (j < len) cut = j;
+                aaa_host_state = 0;
+            } else if (asa_tok_eq(tok, tlen, "host")) {
+                aaa_host_state = 2;
+            }
+        }
+
+        /* EIGRP/RIP interface auth: `authentication key eigrp <as>
+         * <secret> key-id <n>` — the secret sits after `key`. */
+        if (cut == 0 && prev_is_auth && asa_tok_eq(tok, tlen, "key")) {
+            size_t j = i;
+            while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+            if (j < len) cut = j;
+        }
+        prev_is_auth = asa_tok_eq(tok, tlen, "authentication");
+
+        if (cut == 0) {
+            for (size_t k = 0; k < SECRET_KEYWORD_COUNT; k++) {
+                if (asa_tok_eq(tok, tlen, SECRET_KEYWORDS[k])) {
+                    size_t j = i;
+                    while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+                    if (j < len) cut = j;   /* keyword with a value */
+                    break;
+                }
+            }
+        }
+        tok_index++;
+    }
+
+    if (cut == 0)
+        return asa_scrub_emit(out, cap, pos, line, len);
+
+    return asa_scrub_emit(out, cap, pos, line, cut) &&
+           asa_scrub_emit(out, cap, pos, ASA_SCRUB_MARK,
+                          strlen(ASA_SCRUB_MARK));
+}
+
+virp_error_t asa_scrub_config(const char *in, size_t in_len,
+                              char *out, size_t out_cap,
+                              size_t *out_len)
+{
+    if (!in || !out || !out_len) return VIRP_ERR_NULL_PTR;
+    *out_len = 0;
+
+    size_t pos = 0;
+    size_t i = 0;
+    while (i < in_len) {
+        size_t start = i;
+        while (i < in_len && in[i] != '\n') i++;
+        size_t line_end = i;
+        size_t content_end = line_end;
+        if (content_end > start && in[content_end - 1] == '\r')
+            content_end--;
+
+        if (!asa_scrub_line(in + start, content_end - start,
+                            out, out_cap, &pos))
+            return VIRP_ERR_BUFFER_TOO_SMALL;
+        if (!asa_scrub_emit(out, out_cap, &pos, in + content_end,
+                            (line_end - content_end) +
+                            ((i < in_len) ? 1 : 0)))
+            return VIRP_ERR_BUFFER_TOO_SMALL;
+        if (i < in_len) i++;
+    }
+
+    out[pos] = '\0';
+    *out_len = pos;
+    return VIRP_OK;
+}
+
+/*
+ * Commands whose reply embeds ASA configuration. `more
+ * system:running-config` matters even though it classifies RED
+ * (fail-closed, unlisted): it is the variant that prints tunnel-group
+ * pre-shared-keys UNMASKED, so if it is ever approved through the
+ * proposal path the scrub must still stand between the reply and the
+ * signer.
+ */
+bool asa_command_returns_config(const char *command)
+{
+    if (!command) return false;
+    while (*command == ' ' || *command == '\t') command++;
+    return strncmp(command, "show running-config",        19) == 0 ||
+           strncmp(command, "show startup-config",        19) == 0 ||
+           strncmp(command, "show tech-support",          17) == 0 ||
+           strncmp(command, "more system:running-config", 26) == 0;
+}
+
 static virp_error_t asa_execute(virp_conn_t *conn,
                                 const char *command,
                                 virp_exec_result_t *result)
@@ -735,6 +975,37 @@ static virp_error_t asa_execute(virp_conn_t *conn,
         output_start[--clean_len] = '\0';
     }
 
+    /*
+     * Credential scrub for config-bearing reads — BEFORE the body is
+     * copied into result->output: what leaves this function is what
+     * the O-Node signs into the append-only chain. Fail-closed: if the
+     * scrub cannot complete, report a typed ERROR rather than signing
+     * an unscrubbed body.
+     */
+    char *scrubbed = NULL;
+    if (asa_command_returns_config(command)) {
+        size_t cap = ASA_SCRUB_CAP(clean_len);
+        scrubbed = malloc(cap);
+        size_t scrubbed_len = 0;
+        virp_error_t serr = scrubbed
+            ? asa_scrub_config(output_start, clean_len,
+                               scrubbed, cap, &scrubbed_len)
+            : VIRP_ERR_BUFFER_TOO_SMALL;
+        if (serr != VIRP_OK) {
+            free(scrubbed);
+            fprintf(stderr, "[ASA] Config scrub failed on %s "
+                    "(%zu bytes) — refusing to sign unscrubbed body\n",
+                    conn->device.hostname, clean_len);
+            result->success = false;
+            result->output_len = 0;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Config scrub failed on %s: body withheld from "
+                     "signing", conn->device.hostname);
+            return serr;
+        }
+        output_start = scrubbed;
+    }
+
     /* Format: hostname#command\noutput (compatible with existing format) */
     int written = snprintf(result->output, sizeof(result->output),
                            "%s#%s\n%s",
@@ -755,6 +1026,7 @@ static virp_error_t asa_execute(virp_conn_t *conn,
                  "ASA error in command: %s", command);
     }
 
+    free(scrubbed);
     return VIRP_OK;
 }
 

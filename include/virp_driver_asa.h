@@ -63,6 +63,25 @@ virp_trust_tier_t asa_route_command(const char *command);
  */
 asa_mode_t asa_parse_mode(const char *prompt);
 
+/*
+ * Credential scrub for config-bearing reads (2026-08-10) — port of
+ * cisco_scrub_config to the ASA directive set. asa_scrub_config
+ * rewrites config text so credential material (enable/passwd hashes,
+ * username passwords, aaa-server and failover keys, SNMP communities,
+ * tunnel-group pre-shared-keys, routing-protocol auth keys) is
+ * replaced with "<removed>" BEFORE the observation body reaches the
+ * signer. Pure function, exposed for the unit suite. Fail-closed: on
+ * VIRP_ERR_BUFFER_TOO_SMALL the caller must not use — and must not
+ * sign — any partial output.
+ *
+ * asa_command_returns_config identifies the commands whose replies
+ * embed configuration; asa_execute applies the scrub to exactly those.
+ */
+virp_error_t asa_scrub_config(const char *in, size_t in_len,
+                              char *out, size_t out_cap,
+                              size_t *out_len);
+bool asa_command_returns_config(const char *command);
+
 extern const size_t ASA_ROUTE_TABLE_SIZE;
 extern const asa_command_route_t ASA_ROUTE_TABLE[];
 
