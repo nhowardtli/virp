@@ -734,14 +734,22 @@ static bool asa_scrub_line(const char *line, size_t len,
         } else if (tok_index == 1) {
             if (first_is_key) {
                 /* `key chain NAME` is a block header; `key 1` is a
-                 * key-chain index. Neither carries a secret. */
+                 * key-chain index. Neither carries a secret. A numeric
+                 * token is an index ONLY when it ends the line: the
+                 * scan is bounded at the token end `i`, and anything
+                 * after it (`key 0 12345678`, `key 7 070C285F4D06`)
+                 * is a server-block secret and must be redacted. */
                 bool numeric = true;
-                for (size_t k = start; k < len; k++)
+                for (size_t k = start; k < i; k++)
                     if (!(line[k] >= '0' && line[k] <= '9') &&
-                        line[k] != ' ' && line[k] != '\t' &&
                         line[k] != '\r')
                         { numeric = false; break; }
-                if (!asa_tok_eq(tok, tlen, "chain") && !numeric)
+                size_t rest = i;
+                while (rest < len && (line[rest] == ' ' ||
+                       line[rest] == '\t' || line[rest] == '\r'))
+                    rest++;
+                if (!asa_tok_eq(tok, tlen, "chain") &&
+                    !(numeric && rest >= len))
                     cut = start;
                 first_is_key = false;
             }

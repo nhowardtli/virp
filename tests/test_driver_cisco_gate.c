@@ -39,11 +39,11 @@ static void test_green(void)
 static void test_yellow(void)
 {
     printf("\n=== YELLOW — config-visibility reads ===\n");
-    /* show running-config reclassified YELLOW -> GREEN (2026-08-10):
-     * auto-executable only because cisco_execute scrubs credential
-     * material before the body is signed — see cisco_scrub_config()
-     * and test_driver_cisco_scrub.c. */
-    TEST("show running-config -> GREEN (scrubbed)"); assert(cisco_gate_tier("show running-config") == VIRP_TIER_GREEN); PASS();
+    /* show running-config reverted GREEN -> YELLOW (2026-08-11): the
+     * scrub misses secret classes, so the read is approval-gated
+     * again. The scrub still runs on the YELLOW path — see
+     * cisco_scrub_config() and test_driver_cisco_scrub.c. */
+    TEST("show running-config -> YELLOW (scrubbed)"); assert(cisco_gate_tier("show running-config") == VIRP_TIER_YELLOW); PASS();
     TEST("show startup-config -> YELLOW");       assert(cisco_gate_tier("show startup-config") == VIRP_TIER_YELLOW); PASS();
     TEST("show access-lists -> YELLOW");         assert(cisco_gate_tier("show access-lists") == VIRP_TIER_YELLOW); PASS();
     TEST("show ip nat translations -> YELLOW");  assert(cisco_gate_tier("show ip nat translations") == VIRP_TIER_YELLOW); PASS();
@@ -163,9 +163,9 @@ static void test_prefix_safety(void)
     assert(cisco_gate_tier("show ip ospf neighbor") == VIRP_TIER_GREEN);
     assert(cisco_gate_tier("show ip access-lists") == VIRP_TIER_YELLOW);
     PASS();
-    TEST("show ip bgp -> GREEN; show running-config GREEN only via scrub");
+    TEST("show ip bgp -> GREEN; show running-config stays YELLOW");
     assert(cisco_gate_tier("show ip bgp summary") == VIRP_TIER_GREEN);
-    assert(cisco_gate_tier("show running-config") == VIRP_TIER_GREEN);
+    assert(cisco_gate_tier("show running-config") == VIRP_TIER_YELLOW);
     PASS();
     TEST("show ip eigrp -> GREEN while show startup-config -> YELLOW");
     assert(cisco_gate_tier("show ip eigrp neighbors") == VIRP_TIER_GREEN);

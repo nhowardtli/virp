@@ -1,11 +1,11 @@
 /*
  * test_driver_cisco_scrub.c — IOS config credential scrubbing
  *
- * `show running-config` was reclassified YELLOW → GREEN (2026-08-10) so
- * a GREEN-ceiling requester can read device configs. That is only safe
- * because cisco_execute scrubs credential material out of the body
- * BEFORE it reaches the signer: observation bodies land in an
- * append-only chain, so one unscrubbed config read would pin enable
+ * `show running-config` is YELLOW (approval-gated) — briefly GREEN
+ * 2026-08-10, reverted 2026-08-11 when the scrub was found to miss
+ * secret classes. cisco_execute still scrubs credential material out
+ * of the body BEFORE it reaches the signer: observation bodies land in
+ * an append-only chain, so one unscrubbed config read would pin enable
  * secrets, password 7 strings, SNMP communities and ISAKMP keys into
  * the audit record permanently, across the whole fleet.
  *
@@ -94,6 +94,13 @@ static const char RUN_CFG[] =
     "tacacs-server key 7 30CANARY4tacacs\n"
     "radius-server key CANARY5radius\n"
     "!\n"
+    "radius server RAD1\n"
+    " address ipv4 10.0.0.9 auth-port 1812 acct-port 1813\n"
+    " key 0 12345678\n"
+    "!\n"
+    "tacacs server TAC1\n"
+    " key 7 070C285F4D06\n"
+    "!\n"
     "crypto isakmp key CANARY6isakmp address 203.0.113.7\n"
     "crypto isakmp key 6 CANARY7isakmpenc address 203.0.113.8\n"
     "!\n"
@@ -128,6 +135,9 @@ static const char *PRESERVED_LINES[] = {
     "service password-encryption",
     "hostname R1",
     "tacacs-server host 10.0.0.9",
+    "radius server RAD1",
+    " address ipv4 10.0.0.9 auth-port 1812 acct-port 1813",
+    "tacacs server TAC1",
     "key chain RIPCHAIN",
     " key 1",
     "interface GigabitEthernet0/0",
@@ -278,11 +288,32 @@ TEST(test_trigger_commands)
     CHECK(!cisco_command_returns_config(NULL), "NULL wrongly flagged");
 }
 
+/* Numeric and type-7 server-block keys carry no CANARY letters — a
+ * purely numeric secret is exactly the class the letter-based canary
+ * cannot catch, so these assert on the literal secret values. */
+TEST(test_numeric_server_block_keys_redacted)
+{
+    size_t out_len = 0;
+    CHECK(cisco_scrub_config(RUN_CFG, strlen(RUN_CFG),
+                             OUT, sizeof(OUT), &out_len) == VIRP_OK,
+          "scrub failed");
+    CHECK(strstr(OUT, "12345678") == NULL,
+          "numeric radius key survived: `key 0 12345678`");
+    CHECK(strstr(OUT, "070C285F4D06") == NULL,
+          "type-7 tacacs key survived: `key 7 070C285F4D06`");
+    /* the key-chain index and block header must stay untouched */
+    CHECK(strstr(OUT, " key 1\n") != NULL, "key-chain index damaged");
+    CHECK(strstr(OUT, "key chain RIPCHAIN") != NULL,
+          "key chain header damaged");
+}
+
 TEST(test_gate_tier_alignment)
 {
-    /* GREEN only because the scrub exists — see the gate table note. */
-    CHECK(cisco_gate_tier("show running-config") == VIRP_TIER_GREEN,
-          "show running-config not GREEN");
+    /* Reverted GREEN → YELLOW (2026-08-11): scrub misses secret
+     * classes, so the read is approval-gated again. The scrub stays
+     * wired on the YELLOW path. */
+    CHECK(cisco_gate_tier("show running-config") == VIRP_TIER_YELLOW,
+          "show running-config not YELLOW");
     /* Everything GREEN/YELLOW that returns config must be scrubbed. */
     CHECK(cisco_command_returns_config("show running-config") &&
           cisco_command_returns_config("show startup-config") &&
@@ -306,6 +337,7 @@ int main(void)
     printf("test_driver_cisco_scrub:\n");
 
     RUN_TEST(test_no_canary_survives);
+    RUN_TEST(test_numeric_server_block_keys_redacted);
     RUN_TEST(test_expected_redactions_present);
     RUN_TEST(test_non_secret_lines_preserved);
     RUN_TEST(test_idempotent);

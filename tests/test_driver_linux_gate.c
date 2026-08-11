@@ -209,8 +209,8 @@ static void test_green(void)
     assert(linux_gate_tier("vtysh -c \"show ip ospf neighbor\"") == VIRP_TIER_GREEN);
     PASS();
 
-    TEST("show running-config -> GREEN (explicit row)");
-    assert(linux_gate_tier("vtysh -c \"show running-config\"") == VIRP_TIER_GREEN);
+    TEST("show running-config -> YELLOW (config read, no scrub in this driver)");
+    assert(linux_gate_tier("vtysh -c \"show running-config\"") == VIRP_TIER_YELLOW);
     PASS();
 
     TEST("show ip route 10.0.0.0/8 -> GREEN (charset covers ./-)");

@@ -580,15 +580,13 @@ static const cisco_route_t CISCO_GATE_TABLE[] = {
     { "show boot",                    VIRP_TIER_GREEN  },
     { "show file systems",            VIRP_TIER_GREEN  },
 
-    /* Reclassified YELLOW → GREEN (2026-08-10): the config read is
-     * auto-executable ONLY because cisco_execute runs
-     * cisco_scrub_config() on the body before it reaches the signer —
-     * enable secrets, password 7 strings, SNMP communities and friends
-     * never enter the append-only chain. If the scrub wiring is ever
-     * removed, this entry MUST go back to YELLOW. */
-    { "show running-config",          VIRP_TIER_GREEN  },
-
     /* ── YELLOW — config-visibility reads (backups/audits) ────────── */
+    /* Reverted GREEN → YELLOW (2026-08-11): the scrub misses whole
+     * secret classes (server-block `key 0 <numeric>` among them), so
+     * the GREEN row let a GREEN-ceiling requester auto-sign credential
+     * material into the append-only chain. The scrub stays wired —
+     * approval gates the read, the scrub still cleans the body. */
+    { "show running-config",          VIRP_TIER_YELLOW },
     { "show startup-config",          VIRP_TIER_YELLOW },
     { "show access-lists",            VIRP_TIER_YELLOW },
     { "show ip nat translations",     VIRP_TIER_YELLOW },
@@ -816,14 +814,22 @@ static bool scrub_line(const char *line, size_t len,
         } else if (tok_index == 1) {
             if (first_is_key) {
                 /* `key chain NAME` is a block header; `key 1` is a
-                 * key-chain index. Neither carries a secret. */
+                 * key-chain index. Neither carries a secret. A numeric
+                 * token is an index ONLY when it ends the line: the
+                 * scan is bounded at the token end `i`, and anything
+                 * after it (`key 0 12345678`, `key 7 070C285F4D06`)
+                 * is a server-block secret and must be redacted. */
                 bool numeric = true;
-                for (size_t k = start; k < len; k++)
+                for (size_t k = start; k < i; k++)
                     if (!(line[k] >= '0' && line[k] <= '9') &&
-                        line[k] != ' ' && line[k] != '\t' &&
                         line[k] != '\r')
                         { numeric = false; break; }
-                if (!tok_eq(tok, tlen, "chain") && !numeric)
+                size_t rest = i;
+                while (rest < len && (line[rest] == ' ' ||
+                       line[rest] == '\t' || line[rest] == '\r'))
+                    rest++;
+                if (!tok_eq(tok, tlen, "chain") &&
+                    !(numeric && rest >= len))
                     cut = start;
                 first_is_key = false;
             }

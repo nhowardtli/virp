@@ -80,6 +80,10 @@ static const char RUN_CFG[] =
     " key CANARY5aaakey\n"
     " timeout 10\n"
     "aaa-server LEGACY (inside) host 10.0.0.8 CANARY6inlinekey timeout 10\n"
+    "aaa-server RADSRV2 (inside) host 10.0.0.12\n"
+    " key 0 12345678\n"
+    "aaa-server TACSRV2 (inside) host 10.0.0.13\n"
+    " key 7 070C285F4D06\n"
     "aaa-server LDAPSRV (inside) host 10.0.0.7\n"
     " ldap-login-password CANARY7ldap\n"
     " ldap-login-dn cn=svc,dc=lab\n"
@@ -124,6 +128,8 @@ static const char *PRESERVED_LINES[] = {
     " service-type admin",
     "aaa-server TACSRV protocol tacacs+",
     "aaa-server TACSRV (inside) host 10.0.0.9",
+    "aaa-server RADSRV2 (inside) host 10.0.0.12",
+    "aaa-server TACSRV2 (inside) host 10.0.0.13",
     " timeout 10",
     " ldap-login-dn cn=svc,dc=lab",
     "aaa authentication ssh console TACSRV LOCAL",
@@ -179,6 +185,28 @@ TEST(test_no_canary_survives)
     CHECK(strstr(OUT, "CANARY") == NULL,
           "credential material survived the scrub: ...%.40s",
           strstr(OUT, "CANARY"));
+}
+
+/* Numeric and type-7 server-block keys carry no CANARY letters — a
+ * purely numeric secret is exactly the class the letter-based canary
+ * cannot catch, so these assert on the literal secret values. */
+TEST(test_numeric_server_block_keys_redacted)
+{
+    size_t out_len = 0;
+    CHECK(asa_scrub_config(RUN_CFG, strlen(RUN_CFG),
+                           OUT, sizeof(OUT), &out_len) == VIRP_OK,
+          "scrub failed");
+    /* Assert on the token-in-line form, not the bare secret: the
+     * preserved Cryptochecksum line legitimately contains "12345678"
+     * as a substring of its hex digest. */
+    CHECK(strstr(OUT, "key 0 12345678") == NULL,
+          "numeric aaa-server key survived: `key 0 12345678`");
+    CHECK(strstr(OUT, "key 7 070C285F4D06") == NULL,
+          "type-7 aaa-server key survived: `key 7 070C285F4D06`");
+    /* the key-chain index and block header must stay untouched */
+    CHECK(strstr(OUT, " key 1\n") != NULL, "key-chain index damaged");
+    CHECK(strstr(OUT, "key chain EIGRPCHAIN") != NULL,
+          "key chain header damaged");
 }
 
 TEST(test_expected_redactions_present)
@@ -307,6 +335,7 @@ int main(void)
     printf("test_driver_asa_scrub:\n");
 
     RUN_TEST(test_no_canary_survives);
+    RUN_TEST(test_numeric_server_block_keys_redacted);
     RUN_TEST(test_expected_redactions_present);
     RUN_TEST(test_non_secret_lines_preserved);
     RUN_TEST(test_idempotent);

@@ -820,6 +820,16 @@ virp_trust_tier_t linux_gate_classify(const char *command, const char **reason)
             return VIRP_TIER_RED;
         }
 
+        /* YELLOW — config-visibility read (2026-08-11): FRR's
+         * running-config carries credential material inline (OSPF
+         * message-digest keys, BGP neighbor passwords, key-chain
+         * key-strings) and this driver has NO scrub — the body would
+         * be signed into the append-only chain verbatim. Approval-
+         * gate it ahead of the generic show row. */
+        if (tok_prefix(vcmd, "show running-config") &&
+            rest_charset_ok(tok_rest(vcmd, "show running-config")))
+            return VIRP_TIER_YELLOW;
+
         /* GREEN — reads. "show" must be the full spelled-out token:
          * "sh ip os nei" is not expanded and falls through RED. */
         if (tok_prefix(vcmd, "show") &&

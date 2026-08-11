@@ -119,7 +119,9 @@ bool cisco_is_black_tier(const char *command);
  *
  * cisco_command_returns_config identifies the commands whose replies
  * embed configuration; cisco_execute applies the scrub to exactly
- * those. `show running-config` classifies GREEN only under this scrub.
+ * those. All config-bearing reads classify YELLOW (the 2026-08-10
+ * GREEN reclassification was reverted 2026-08-11 — the scrub misses
+ * secret classes); the scrub still runs on every approved read.
  */
 virp_error_t cisco_scrub_config(const char *in, size_t in_len,
                                 char *out, size_t out_cap,
