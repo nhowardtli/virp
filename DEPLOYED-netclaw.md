@@ -14,10 +14,17 @@
   main = consolidated main `c224596` + netclaw unit-tracking commit;
   clean tree at install)
 - **Rollback**: `sudo make rollback-prod ROLLBACK_FROM=/var/backups/virp/20260811T154642Z`
-- **RUNNING daemon**: STILL the previous binary (ExecMainStartTimestamp
-  2026-08-06 18:32:45 UTC). RESTART PENDING operator approval on
-  timing. Until then every statement below about gates describes the
-  INSTALLED binary, not the running one.
+- **RUNNING daemon**: LIVE on the gated binary as of 2026-08-11
+  17:46:32 UTC (MainPID exe = /usr/local/lib/virp/virp-onode-prod,
+  sha 27c07883; GATE 2/3 reject strings confirmed in the running
+  process image). 3/3 devices connected, chain intact.
+  - Restart also required a render fix (commit a904575): the template
+    named \${VIRP_BRIDGE_UID} in socket_allowed_uids but
+    render-devices.sh had no resolver, latent since the daemon had not
+    re-rendered since 2026-08-06. Fixed; live allowlist is now
+    [999, 1000, 994] — uid 994 (virp-bridge) is an allowed peer of
+    netclaw local O-Node for the first time (declared but never
+    rendered before this restart).
 
 ## Why this deploy exists (provenance finding, 2026-08-11)
 
