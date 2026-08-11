@@ -2,7 +2,7 @@
 
 - **Role**: production reference instance
 
-## Current live state (verified 2026-08-09 01:55 UTC)
+## Current live state (verified 2026-08-11 01:06 UTC)
 
 **This block is authoritative for what is running right now.** Everything below
 it is a chronological, append-only log: each section describes the state at the
@@ -10,16 +10,20 @@ time it was written and is deliberately *not* corrected in place. Where a fact
 below disagrees with this block, this block wins. A copy of this file without
 this block is stale — check the commit before relying on it.
 
-- **Commit**: `5bda4deb9d29bb5efc5c715a769d30da6f01df67` (short `5bda4deb`)
-  — deployed 2026-08-10 01:31 UTC (ASA scrub port), superseding `ae016b0d`
-  (01:09 UTC), `793ebfcb` (00:09 UTC) and `32dd710f`; see the update log.
+- **Commit**: `569bff11517718e0347bdd48f82c9d3a2a7d6375` (short `569bff11`)
+  — deployed 2026-08-11 01:00 UTC (consolidated main: branch consolidation +
+  driver_linux AF_UNSPEC + installed virp-tool), superseding `5bda4deb`
+  (2026-08-10 01:31 UTC); see the update log.
 - **Branch**: `main` (consolidated 2026-08-10: `feat/cisco-config-scrub-netclaw-yellow` merged into main at `b446c3c2`; branch retired to `archive/feat/cisco-config-scrub-netclaw-yellow-2026-08-10`)
 - **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
   socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
-  — binary sha256 (see /var/backups/virp/20260810T013128Z MANIFEST for the superseded ae016b0d build)
-- **Client**: `/opt/virp/build/virp` — built from `32dd710f`
-  (rebuilt 2026-08-09 01:47; see the outage note below — it lives in the
-  SOURCE WORKTREE, not an installed path, and that is a known defect).
+  — binary sha256
+  `27c0788354234cce2e19426b18f9eea70da680ab1c709ac7370516dd7b614bb5`
+- **Client**: `/usr/local/lib/virp/virp-tool` (+ `virp` alias), sha256
+  `8c4005a8628a62ca22ea9dd574357452b0da1df3302ccf00f085b4485028d0aa` —
+  installed by `make install-prod` as the fourth artifact class; the
+  autopilot shells out to this path. The build-tree copy is no longer a
+  production dependency (the "Chain gap 2026-08-09" defect is closed).
 - **Chain ingestion gate**: `chain_append` GATE 3 is LIVE as of this deploy.
   An `artifact_type=observation` submitted WITH a body must now carry a
   valid v1/v2/v3 signature or it is refused. Commitment-only (no body)
@@ -36,10 +40,12 @@ this block is stale — check the commit before relying on it.
   GREEN and are allowed on their own tier, not waved through by a shadow mode.
   Journal evidence: `[GATE] mode=ENFORCE device=clab-frr-ospf-frr1 driver=linux
   tier=GREEN threshold=YELLOW decision=allow`.
-- **Devices**: 7/7 loaded from `/run/virp/devices.json`
+- **Devices**: 43/43 loaded from `/run/virp/devices.json`
   (rendered at daemon start; sha256 of the rendered file
-  `af448c352e0077e6fe28cdfe9ef9e39fc0752ee2329c265788842493c9fd146c`):
-  clab-frr-ospf-frr1..frr4 (linux/FRR), wazuh-lab, librenms-lab, pbs-lab.
+  `c6e5af7bec4d59f5e62891f1ea33bfa24f70a9df7b52b20ebc3050fcbd07d3f3`) —
+  full fleet since the 2026-08-10 import; steady-state connected 38/43
+  (pa-850, ASA-5525, srx-300 and two lab devices unreachable, watchdog
+  cycling — unchanged from before this deploy).
 - **Socket allowlist**: uids 999 (`virp`), 1000 (`nhoward`), 997
   (`virp-backup`), 995 (`virp-evidence`). **uid 0 is deliberately excluded** —
   a client running as root is rejected with
@@ -57,6 +63,32 @@ are now stale on two counts:
    classifier it was waiting on has been live ever since.
 2. The deployed commit has advanced through the update log below and is now
    `b6e9602c`, not `0c9c7338`.
+
+## Update 2026-08-11 — deploy from consolidated main `569bff11`
+
+- The repo was consolidated to a single branch: origin is `main` plus
+  `archive/*` tags only. All branch content was merged, cherry-picked or
+  archived; TODO.md carries the chain-recut re-land ticket as the first
+  post-freeze item. Full battery ran twice, both exit 0; the second run
+  covered test-api via `~/virp-api-venv` on PATH (system python3 lacks
+  fastapi/httpx and the suite silently skips without it).
+- New in this build vs `5bda4deb`:
+  - `89905208` — driver_linux getaddrinfo `AF_UNSPEC` (IPv4-only connect
+    blocked IPv6 device hosts; found live on the netclaw FRR testbed).
+  - `e627ae90` — virp-tool installed to `/usr/local/lib/virp/` as the
+    fourth artifact class; autopilot now uses the installed client.
+    `PEER_CMD_CHAIN_HEAD` deliberately still names the build-tree path
+    (exact-matched by the Linux gate on virp-node2) — see the Makefile.
+- Installed 2026-08-11 00:58 UTC (`make install-prod` from clean main),
+  restarted 01:00:17 UTC immediately after the 01:00 autopilot cycle.
+  Nexus (uid 993) had zero polls in the preceding 8 hours, so no poll
+  window was at risk.
+- Rollback:
+  `sudo make rollback-prod ROLLBACK_FROM=/var/backups/virp/20260811T005802Z`
+- Verified after restart: 43/43 devices loaded, reconnect to the 38/43
+  steady state in ~2 min, comparator pass at 01:02 (16 GREEN allows, no
+  refusals), 01:05 battery `cycle complete: 18 observations, 6 alerts`
+  (exit 1 = alerts present — identical to the pre-deploy cycle).
 
 ## Update 2026-08-10 — cisco config scrub, running-config GREEN, netclaw YELLOW ceiling
 
