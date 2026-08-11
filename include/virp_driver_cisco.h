@@ -123,6 +123,18 @@ bool cisco_is_black_tier(const char *command);
  * GREEN reclassification was reverted 2026-08-11 — the scrub misses
  * secret classes); the scrub still runs on every approved read.
  */
+/*
+ * Compose hostname#command\nbody into result->output with honest
+ * length accounting (Item 5): output_len is the actual stored byte
+ * count; a clamped scrubbed body is withheld typed; a clamped raw
+ * body is marked output_truncated. Exposed for the unit suite.
+ */
+virp_error_t cisco_store_output(virp_exec_result_t *result,
+                                const char *hostname,
+                                const char *command,
+                                const char *body,
+                                bool scrubbed_body);
+
 virp_error_t cisco_scrub_config(const char *in, size_t in_len,
                                 char *out, size_t out_cap,
                                 size_t *out_len);

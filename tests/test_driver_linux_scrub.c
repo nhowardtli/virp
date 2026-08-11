@@ -36,6 +36,7 @@ virp_error_t linux_scrub_config(const char *in, size_t in_len,
                                 size_t *out_len);
 bool linux_command_returns_config(const char *command);
 virp_trust_tier_t linux_gate_tier(const char *command);
+virp_error_t linux_scrub_result(virp_exec_result_t *result);
 
 static int tests_run = 0;
 static int tests_failed = 0;
@@ -243,6 +244,56 @@ TEST(test_null_args)
               == VIRP_ERR_NULL_PTR, "NULL out_len accepted");
 }
 
+/* Item 5 regression pin (2026-08-11): the scrub GROWS the body, so a
+ * reply that fit result->output pre-scrub can exceed it post-scrub.
+ * linux_scrub_result must withhold that body typed
+ * (VIRP_ERR_BUFFER_TOO_SMALL, output zeroed) — never hand back a
+ * clamped body that the O-Node would sign as complete. */
+TEST(test_scrub_growth_overflow_withheld)
+{
+    static virp_exec_result_t res;
+    memset(&res, 0, sizeof(res));
+
+    /* Fill just under the cap with lines that grow when redacted:
+     * "password 1\n" (11 B) -> "password <removed>\n" (19 B). */
+    const char line[] = "password 1\n";
+    size_t pos = 0;
+    while (pos + sizeof(line) < sizeof(res.output))
+        { memcpy(res.output + pos, line, sizeof(line) - 1);
+          pos += sizeof(line) - 1; }
+    res.output[pos] = '\0';
+    res.output_len = pos;
+    res.success = true;
+
+    virp_error_t err = linux_scrub_result(&res);
+    CHECK(err == VIRP_ERR_BUFFER_TOO_SMALL,
+          "scrub-grown overflow not withheld typed (err=%d)", (int)err);
+    CHECK(!res.success && res.output_len == 0 && res.output[0] == '\0',
+          "clamped scrubbed body not withheld from signing");
+}
+
+/* And the fitting case still scrubs in place. */
+TEST(test_scrub_result_fit_scrubs_in_place)
+{
+    static virp_exec_result_t res;
+    memset(&res, 0, sizeof(res));
+    const char body[] =
+        "frr-r1$ vtysh -c \"show running-config\"\n"
+        "hostname frr-r1\n"
+        "password CANARYfit\n"
+        "end";
+    memcpy(res.output, body, sizeof(body));
+    res.output_len = sizeof(body) - 1;
+    res.success = true;
+
+    CHECK(linux_scrub_result(&res) == VIRP_OK, "fitting scrub failed");
+    CHECK(strstr(res.output, "CANARYfit") == NULL, "secret survived");
+    CHECK(strstr(res.output, "password <removed>") != NULL,
+          "redacted form missing");
+    CHECK(res.output_len == strlen(res.output), "output_len wrong");
+    CHECK(res.success, "fitting scrub flipped success");
+}
+
 /* The scrub trigger must cast the same net as the gate's YELLOW
  * config-read row, vtysh prefix expansion included. */
 TEST(test_trigger_commands)
@@ -299,6 +350,8 @@ int main(void)
     RUN_TEST(test_idempotent);
     RUN_TEST(test_overflow_fails_closed);
     RUN_TEST(test_null_args);
+    RUN_TEST(test_scrub_growth_overflow_withheld);
+    RUN_TEST(test_scrub_result_fit_scrubs_in_place);
     RUN_TEST(test_trigger_commands);
     RUN_TEST(test_gate_tier_alignment);
 

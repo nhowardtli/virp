@@ -997,6 +997,47 @@ bool cisco_command_returns_config(const char *command)
            strncmp(command, "show tech-support",   17) == 0;
 }
 
+/*
+ * Compose `hostname#command\nbody` into result->output — the bytes
+ * the O-Node signs. snprintf returns the length it WOULD have
+ * written; storing that as output_len let a clamped body sign with
+ * success=true and truncated=no (Item 5, 2026-08-11). Mirror
+ * driver_fortigate.c: output_len is ALWAYS the actual stored byte
+ * count. A clamp on a SCRUBBED body is withheld typed — the scrub
+ * grew the body past the capture buffer, and signing a prefix as the
+ * config read would be a false attestation (same contract as the
+ * scrub-failure branch). A clamp on a raw body keeps the legacy
+ * clamped copy but is marked output_truncated so it can never sign
+ * as complete. Exposed (non-static) for the unit suite.
+ */
+virp_error_t cisco_store_output(virp_exec_result_t *result,
+                                const char *hostname,
+                                const char *command,
+                                const char *body,
+                                bool scrubbed_body)
+{
+    int written = snprintf(result->output, sizeof(result->output),
+                           "%s#%s\n%s", hostname, command, body);
+    if (written >= 0 && (size_t)written < sizeof(result->output)) {
+        result->output_len = (size_t)written;
+        result->success = true;
+        return VIRP_OK;
+    }
+    if (written < 0 || scrubbed_body) {
+        result->output[0] = '\0';
+        result->output_len = 0;
+        result->success = false;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Scrubbed config exceeds capture buffer on %s: body "
+                 "withheld from signing", hostname);
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+    }
+    result->output_len = sizeof(result->output) - 1;  /* ACTUAL stored */
+    result->output_truncated = true;
+    result->success = true;
+    return VIRP_OK;
+}
+
 static virp_error_t cisco_execute(virp_conn_t *conn,
                                   const char *command,
                                   virp_exec_result_t *result)
@@ -1114,12 +1155,16 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
         output_start = scrubbed;
     }
 
-    /* Format: hostname#command\noutput */
-    int written = snprintf(result->output, sizeof(result->output),
-                           "%s#%s\n%s",
-                           conn->device.hostname, command, output_start);
-    result->output_len = (written > 0) ? (size_t)written : 0;
-    result->success = true;
+    /* Format: hostname#command\noutput — actual-length accounting and
+     * honest truncation/withhold live in cisco_store_output. */
+    virp_error_t werr = cisco_store_output(result, conn->device.hostname,
+                                           command, output_start,
+                                           scrubbed != NULL);
+    if (werr != VIRP_OK) {
+        fprintf(stderr, "[Cisco] %s\n", result->error_msg);
+        free(scrubbed);
+        return werr;
+    }
     result->exit_code = 0;
 
     /* Check for IOS error markers */

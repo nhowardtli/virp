@@ -43,6 +43,11 @@ virp_error_t cisco_scrub_config(const char *in, size_t in_len,
                                 char *out, size_t out_cap,
                                 size_t *out_len);
 bool cisco_command_returns_config(const char *command);
+virp_error_t cisco_store_output(virp_exec_result_t *result,
+                                const char *hostname,
+                                const char *command,
+                                const char *body,
+                                bool scrubbed_body);
 
 static int tests_run = 0;
 static int tests_failed = 0;
@@ -401,6 +406,94 @@ TEST(test_snmpv3_sha_redacted)
           "v3 sha redacted form missing");
 }
 
+/* Item 5 (2026-08-11): the scrub GROWS the body (each redaction can
+ * add bytes), so a config that fit the capture buffer before
+ * scrubbing can exceed it after. output_len used to store the length
+ * snprintf WOULD have written — a clamped body signed with
+ * success=true and truncated=no. cisco_store_output must never
+ * report a clamped body as complete. */
+
+/* A config just under VIRP_OUTPUT_MAX pre-scrub that grows well past
+ * it post-scrub: "password 1\n" (11 B) redacts to
+ * "password <removed>\n" (19 B). */
+static char GROW_CFG[65000];
+static char GROW_SCRUBBED[3 * sizeof(GROW_CFG) + 64];
+
+static size_t build_grow_cfg(void)
+{
+    const char line[] = "password 1\n";
+    size_t pos = 0;
+    while (pos + sizeof(line) <= sizeof(GROW_CFG))
+        { memcpy(GROW_CFG + pos, line, sizeof(line) - 1);
+          pos += sizeof(line) - 1; }
+    GROW_CFG[pos] = '\0';
+    return pos;
+}
+
+TEST(test_scrub_growth_overflow_withheld)
+{
+    size_t cfg_len = build_grow_cfg();
+    CHECK(cfg_len < VIRP_OUTPUT_MAX, "premise: config must fit pre-scrub");
+
+    size_t slen = 0;
+    CHECK(cisco_scrub_config(GROW_CFG, cfg_len, GROW_SCRUBBED,
+                             sizeof(GROW_SCRUBBED), &slen) == VIRP_OK,
+          "scrub failed");
+    CHECK(slen > VIRP_OUTPUT_MAX,
+          "premise: scrub must grow the body past the cap (%zu)", slen);
+
+    static virp_exec_result_t res;
+    memset(&res, 0, sizeof(res));
+    virp_error_t err = cisco_store_output(&res, "R1",
+                                          "show running-config",
+                                          GROW_SCRUBBED, true);
+    CHECK(err == VIRP_ERR_BUFFER_TOO_SMALL,
+          "scrub-grown overflow not withheld typed (err=%d)", (int)err);
+    CHECK(!res.success && res.output_len == 0 && res.output[0] == '\0',
+          "clamped scrubbed body not withheld from signing");
+    CHECK(res.error_msg[0] != '\0', "typed failure carries no reason");
+}
+
+TEST(test_plain_clamp_marked_truncated)
+{
+    /* Same oversized body on the NON-scrub path: the legacy clamped
+     * copy is kept, but output_len must be the ACTUAL stored length
+     * (fortigate precedent) and output_truncated must be set — never
+     * signed as truncated=no. */
+    build_grow_cfg();
+    size_t slen = 0;
+    cisco_scrub_config(GROW_CFG, strlen(GROW_CFG), GROW_SCRUBBED,
+                       sizeof(GROW_SCRUBBED), &slen);
+
+    static virp_exec_result_t res;
+    memset(&res, 0, sizeof(res));
+    virp_error_t err = cisco_store_output(&res, "R1", "show tech-support",
+                                          GROW_SCRUBBED, false);
+    CHECK(err == VIRP_OK, "plain clamp must not fail (err=%d)", (int)err);
+    CHECK(res.output_len == sizeof(res.output) - 1,
+          "output_len %zu is not the actual stored length %zu",
+          res.output_len, sizeof(res.output) - 1);
+    CHECK(res.output_len == strlen(res.output),
+          "output_len does not match the bytes in the buffer");
+    CHECK(res.output_truncated,
+          "clamped body reported truncated=no");
+    CHECK(res.success, "honestly-flagged clamp should still succeed");
+}
+
+TEST(test_store_output_fit_unchanged)
+{
+    static virp_exec_result_t res;
+    memset(&res, 0, sizeof(res));
+    virp_error_t err = cisco_store_output(&res, "R1", "show version",
+                                          "Cisco IOS Software", false);
+    CHECK(err == VIRP_OK, "fitting body failed (err=%d)", (int)err);
+    CHECK(strcmp(res.output, "R1#show version\nCisco IOS Software") == 0,
+          "composed body wrong: '%s'", res.output);
+    CHECK(res.output_len == strlen(res.output), "output_len wrong");
+    CHECK(!res.output_truncated && res.success,
+          "fitting body mis-flagged");
+}
+
 TEST(test_gate_tier_alignment)
 {
     /* Reverted GREEN → YELLOW (2026-08-11): scrub misses secret
@@ -436,6 +529,9 @@ int main(void)
     RUN_TEST(test_numeric_secret_composition);
     RUN_TEST(test_nhrp_authentication_redacted);
     RUN_TEST(test_snmpv3_sha_redacted);
+    RUN_TEST(test_scrub_growth_overflow_withheld);
+    RUN_TEST(test_plain_clamp_marked_truncated);
+    RUN_TEST(test_store_output_fit_unchanged);
     RUN_TEST(test_expected_redactions_present);
     RUN_TEST(test_non_secret_lines_preserved);
     RUN_TEST(test_idempotent);

@@ -33,6 +33,8 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <libssh2.h>
 #include <openssl/crypto.h>
 #include "virp_ssh_hostkey.h"
@@ -62,6 +64,7 @@ virp_error_t linux_scrub_config(const char *in, size_t in_len,
                                 char *out, size_t out_cap,
                                 size_t *out_len);
 bool linux_command_returns_config(const char *command);
+virp_error_t linux_scrub_result(virp_exec_result_t *result);
 
 static uint64_t mono_ms(void)
 {
@@ -104,7 +107,44 @@ struct virp_conn {
  * TCP Connection
  * ========================================================================= */
 
-static int tcp_connect(const char *host, uint16_t port)
+/*
+ * Non-blocking connect with an explicit deadline (Item 6,
+ * 2026-08-11). A blocking connect(2) toward an address whose SYNs
+ * are silently dropped sits in the kernel's retry schedule for
+ * ~130 s — on the single serial watchdog thread that every other
+ * device queues behind. SO_RCVTIMEO/SO_SNDTIMEO do NOT bound
+ * connect(2); only a non-blocking connect polled against a deadline
+ * does. Returns 0 with the socket back in blocking mode, -1 on
+ * error or timeout.
+ */
+static int connect_bounded(int sockfd, const struct sockaddr *addr,
+                           socklen_t addrlen, int timeout_ms)
+{
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags < 0 || fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return -1;
+
+    int rc = connect(sockfd, addr, addrlen);
+    if (rc != 0) {
+        if (errno != EINPROGRESS)
+            return -1;
+        struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
+        rc = poll(&pfd, 1, timeout_ms);
+        if (rc != 1)
+            return -1;                    /* timeout or poll error */
+        int soerr = 0;
+        socklen_t slen = sizeof(soerr);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0 ||
+            soerr != 0)
+            return -1;
+    }
+
+    return (fcntl(sockfd, F_SETFL, flags) < 0) ? -1 : 0;
+}
+
+/* Exposed (non-static) for the unit suite: the time bound is the
+ * property under test. */
+int linux_tcp_connect(const char *host, uint16_t port)
 {
     struct addrinfo hints, *res, *p;
     int sockfd = -1;
@@ -112,6 +152,12 @@ static int tcp_connect(const char *host, uint16_t port)
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    /* AI_ADDRCONFIG: do not return addresses in families this host
+     * has no configured (non-loopback) address for — a v4-only host
+     * never even attempts a AAAA. NOTE: a host with ANY global v6
+     * address (a docker bridge is enough) still gets AAAA results;
+     * connect_bounded is what protects the watchdog there. */
+    hints.ai_flags = AI_ADDRCONFIG;
 
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
@@ -127,7 +173,8 @@ static int tcp_connect(const char *host, uint16_t port)
         setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == 0)
+        if (connect_bounded(sockfd, p->ai_addr, p->ai_addrlen,
+                            SSH_CONNECT_TIMEOUT_SEC * 1000) == 0)
             break;
 
         close(sockfd);
@@ -198,7 +245,7 @@ static virp_conn_t *linux_connect(const virp_device_t *device)
 
     /* TCP connect */
     uint16_t port = device->port ? device->port : 22;
-    conn->sock_fd = tcp_connect(device->host, port);
+    conn->sock_fd = linux_tcp_connect(device->host, port);
     if (conn->sock_fd < 0) {
         fprintf(stderr, "[Linux] TCP connect failed: %s:%u\n",
                 device->host, port);
@@ -518,32 +565,16 @@ static virp_error_t linux_execute(virp_conn_t *conn,
      * Runs on every disposition — even a truncated or unclean body
      * must never carry cleartext secrets onward. */
     if (linux_command_returns_config(command)) {
-        size_t cap = 3 * result->output_len + 64;
-        char *scrubbed = malloc(cap);
-        size_t scrubbed_len = 0;
-        virp_error_t serr = scrubbed
-            ? linux_scrub_config(result->output, result->output_len,
-                                 scrubbed, cap, &scrubbed_len)
-            : VIRP_ERR_BUFFER_TOO_SMALL;
-        if (serr == VIRP_OK && scrubbed_len >= sizeof(result->output))
-            serr = VIRP_ERR_BUFFER_TOO_SMALL;
+        virp_error_t serr = linux_scrub_result(result);
         if (serr != VIRP_OK) {
-            free(scrubbed);
-            fprintf(stderr, "[Linux] Config scrub failed on %s "
-                    "(%zu bytes) — refusing to sign unscrubbed body\n",
-                    conn->device.hostname, result->output_len);
-            result->success = false;
-            result->output[0] = '\0';
-            result->output_len = 0;
+            fprintf(stderr, "[Linux] Config scrub failed on %s — "
+                    "refusing to sign unscrubbed or clamped body\n",
+                    conn->device.hostname);
             snprintf(result->error_msg, sizeof(result->error_msg),
                      "Config scrub failed on %s: body withheld from "
                      "signing", conn->device.hostname);
             return serr;
         }
-        memcpy(result->output, scrubbed, scrubbed_len);
-        result->output[scrubbed_len] = '\0';
-        result->output_len = scrubbed_len;
-        free(scrubbed);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -1063,6 +1094,42 @@ virp_error_t linux_scrub_config(const char *in, size_t in_len,
 
     out[pos] = '\0';
     *out_len = pos;
+    return VIRP_OK;
+}
+
+/*
+ * Scrub a completed exec result in place (Item 5 hardening,
+ * 2026-08-11): the scrub can GROW the body (each redaction can add
+ * bytes), so a reply that fit result->output pre-scrub can exceed it
+ * post-scrub. A grown body that no longer fits is WITHHELD typed
+ * (VIRP_ERR_BUFFER_TOO_SMALL, output zeroed) — never clamped and
+ * handed back, which the O-Node would sign as complete with
+ * truncated=no. Exposed (non-static) for the unit suite.
+ */
+virp_error_t linux_scrub_result(virp_exec_result_t *result)
+{
+    if (!result) return VIRP_ERR_NULL_PTR;
+
+    size_t cap = 3 * result->output_len + 64;
+    char *scrubbed = malloc(cap);
+    size_t scrubbed_len = 0;
+    virp_error_t serr = scrubbed
+        ? linux_scrub_config(result->output, result->output_len,
+                             scrubbed, cap, &scrubbed_len)
+        : VIRP_ERR_BUFFER_TOO_SMALL;
+    if (serr == VIRP_OK && scrubbed_len >= sizeof(result->output))
+        serr = VIRP_ERR_BUFFER_TOO_SMALL;   /* grown past the cap */
+    if (serr != VIRP_OK) {
+        free(scrubbed);
+        result->success = false;
+        result->output[0] = '\0';
+        result->output_len = 0;
+        return serr;
+    }
+    memcpy(result->output, scrubbed, scrubbed_len);
+    result->output[scrubbed_len] = '\0';
+    result->output_len = scrubbed_len;
+    free(scrubbed);
     return VIRP_OK;
 }
 

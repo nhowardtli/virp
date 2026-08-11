@@ -442,6 +442,21 @@ $(TEST_LINUX_SCRUB): tests/test_driver_linux_scrub.c \
 test-linux-scrub: $(TEST_LINUX_SCRUB)
 	./$(TEST_LINUX_SCRUB)
 
+# Linux device-connect time bound (Item 6: blackholed address must not
+# stall the serial watchdog thread for the kernel's SYN-retry horizon)
+TEST_LINUX_CONNECT = $(BUILD_DIR)/test_driver_linux_connect
+
+$(TEST_LINUX_CONNECT): tests/test_driver_linux_connect.c \
+                       $(BUILD_DIR)/linux_scrub_driver.o \
+                       $(BUILD_DIR)/linux_scrub_hostkey.o $(LIB)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_LINUX $< \
+	    $(BUILD_DIR)/linux_scrub_driver.o $(BUILD_DIR)/linux_scrub_hostkey.o \
+	    $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+.PHONY: test-linux-connect
+test-linux-connect: $(TEST_LINUX_CONNECT)
+	./$(TEST_LINUX_CONNECT)
+
 # Chain and Federation tests
 TEST_CHAIN = $(BUILD_DIR)/test_chain
 TEST_FED   = $(BUILD_DIR)/test_federation
@@ -1653,4 +1668,4 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-api
