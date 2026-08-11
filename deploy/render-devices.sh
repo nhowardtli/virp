@@ -139,8 +139,20 @@ if "VIRP_BROKER_UID" in used:
     os.environ.setdefault("VIRP_BROKER_UID",
                           str(pwd.getpwnam("virp-broker").pw_uid))
 
+# VIRP_BRIDGE_UID is the NCFED federation bridge's dedicated identity
+# (virp-bridge; netclaw only — the bridge process Nexus's local calls
+# go through, and the local peer of netclaw's own O-Node). Resolved
+# from the passwd db exactly like the other daemon-principal uids: the
+# tracked template names it in socket_allowed_uids, so the account must
+# exist or the render fails loudly instead of shipping an allowlist
+# that silently drops the bridge.
+if "VIRP_BRIDGE_UID" in used:
+    import pwd
+    os.environ.setdefault("VIRP_BRIDGE_UID",
+                          str(pwd.getpwnam("virp-bridge").pw_uid))
+
 for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
-            "VIRP_NETCLAW_UID", "VIRP_BROKER_UID",
+            "VIRP_NETCLAW_UID", "VIRP_BROKER_UID", "VIRP_BRIDGE_UID",
             "WAZUH_USER", "WAZUH_PASS",
             "LIBRENMS_TOKEN", "PEER_USER", "PEER_PASS",
             # Zammad carries TWO tokens because it is TWO device entries
