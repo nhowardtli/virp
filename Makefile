@@ -419,6 +419,29 @@ $(TEST_ASA_SCRUB): tests/test_driver_asa_scrub.c \
 test-asa-scrub: $(TEST_ASA_SCRUB)
 	./$(TEST_ASA_SCRUB)
 
+# FRR config credential scrubbing (linux driver port of the cisco scrub)
+TEST_LINUX_SCRUB = $(BUILD_DIR)/test_driver_linux_scrub
+
+# Built with the driver + hostkey objects explicitly, so the suite
+# runs in the default battery even when the library was built without
+# LINUX=1 — same arrangement as the cisco/ASA scrub suites.
+$(BUILD_DIR)/linux_scrub_driver.o: src/drivers/driver_linux.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_LINUX -c $< -o $@
+
+$(BUILD_DIR)/linux_scrub_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_LINUX -c $< -o $@
+
+$(TEST_LINUX_SCRUB): tests/test_driver_linux_scrub.c \
+                     $(BUILD_DIR)/linux_scrub_driver.o \
+                     $(BUILD_DIR)/linux_scrub_hostkey.o $(LIB)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_LINUX $< \
+	    $(BUILD_DIR)/linux_scrub_driver.o $(BUILD_DIR)/linux_scrub_hostkey.o \
+	    $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+.PHONY: test-linux-scrub
+test-linux-scrub: $(TEST_LINUX_SCRUB)
+	./$(TEST_LINUX_SCRUB)
+
 # Chain and Federation tests
 TEST_CHAIN = $(BUILD_DIR)/test_chain
 TEST_FED   = $(BUILD_DIR)/test_federation
@@ -1630,4 +1653,4 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-api

@@ -778,7 +778,8 @@ static bool scrub_line(const char *line, size_t len,
 {
     static const char *SECRET_KEYWORDS[] = {
         "password", "secret", "community", "key-string",
-        "authentication-key", "md5", "pre-shared-key", "passphrase",
+        "authentication-key", "md5", "sha", "pre-shared-key",
+        "passphrase",
     };
     static const size_t SECRET_KEYWORD_COUNT =
         sizeof(SECRET_KEYWORDS) / sizeof(SECRET_KEYWORDS[0]);
@@ -793,6 +794,7 @@ static bool scrub_line(const char *line, size_t len,
     bool   standby_line = false; /* standby / vrrp line */
     size_t isakmp_state = 0;     /* tokens matched of crypto/isakmp/key */
     size_t snmp_host_state = 0;  /* tokens matched of snmp-server/host */
+    size_t nhrp_state = 0;       /* tokens matched of ip/nhrp */
 
     while (i < len && cut == 0) {
         while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
@@ -806,6 +808,7 @@ static bool scrub_line(const char *line, size_t len,
             if (tok_eq(tok, tlen, "key"))     first_is_key = true;
             if (tok_eq(tok, tlen, "crypto"))  isakmp_state = 1;
             if (tok_eq(tok, tlen, "snmp-server")) snmp_host_state = 1;
+            if (tok_eq(tok, tlen, "ip"))      nhrp_state = 1;
             if (tok_eq(tok, tlen, "standby") || tok_eq(tok, tlen, "vrrp"))
                 standby_line = true;
             if (tok_eq(tok, tlen, "tacacs-server") ||
@@ -847,6 +850,10 @@ static bool scrub_line(const char *line, size_t len,
                 snmp_host_state = 2;
             else
                 snmp_host_state = 0;
+            if (nhrp_state == 1 && tok_eq(tok, tlen, "nhrp"))
+                nhrp_state = 2;
+            else
+                nhrp_state = 0;
         } else if (isakmp_state == 2 && tok_eq(tok, tlen, "key")) {
             /* `crypto isakmp key [0|6|7] SECRET address A.B.C.D`:
              * redact the key token only, keep the address visible. */
@@ -885,6 +892,32 @@ static bool scrub_line(const char *line, size_t len,
          * token position: the group number is optional. */
         if (cut == 0 && standby_line && tok_index >= 1 &&
             tok_eq(tok, tlen, "authentication")) {
+            size_t j = i;
+            while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+            if (j < len) cut = j;
+        }
+
+        /* `ip nhrp authentication <string>` — the DMVPN auth string
+         * is a secret; same shape as the standby/vrrp rule
+         * (2026-08-11). Other `ip nhrp …` subcommands (map, nhs,
+         * holdtime) carry no secret and pass untouched. */
+        if (cut == 0 && nhrp_state == 2 && tok_index >= 2 &&
+            tok_eq(tok, tlen, "authentication")) {
+            size_t j = i;
+            while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+            if (j < len) cut = j;
+        }
+
+        /* Mid-line `key <value>` (2026-08-11): real IOS puts AAA keys
+         * past token 0 — `tacacs-server host <ip> key 7 …`,
+         * `radius-server host … key …`, `server-private … key 7 …`.
+         * Redact everything after the `key` token. Token-0 `key`
+         * keeps its key-chain handling above (block header / bare
+         * numeric index); mid-line there is no index form, so a
+         * purely numeric value redacts too. `crypto isakmp key`
+         * never reaches here — its branch emits and returns,
+         * keeping the peer address visible. */
+        if (cut == 0 && tok_index >= 1 && tok_eq(tok, tlen, "key")) {
             size_t j = i;
             while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
             if (j < len) cut = j;

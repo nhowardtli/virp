@@ -234,6 +234,49 @@ static void test_yellow(void)
 {
     printf("\n=== YELLOW — bounded operational actions ===\n");
 
+    /* vtysh resolves unambiguous command prefixes, so `show run`
+     * EXECUTES as show running-config. No show argument that could
+     * resolve to running-config or startup-config may reach the
+     * generic GREEN show row — all of them are approval-gated
+     * (2026-08-11, completes the credential-leak break-glass). */
+    TEST("show run -> YELLOW (vtysh expands to running-config)");
+    assert(linux_gate_tier("vtysh -c \"show run\"") == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("show ru -> YELLOW (running-config prefix)");
+    assert(linux_gate_tier("vtysh -c \"show ru\"") == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("show runn -> YELLOW (running-config prefix)");
+    assert(linux_gate_tier("vtysh -c \"show runn\"") == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("show startup-config -> YELLOW (config read)");
+    assert(linux_gate_tier("vtysh -c \"show startup-config\"") == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("show start -> YELLOW (startup-config prefix)");
+    assert(linux_gate_tier("vtysh -c \"show start\"") == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("show star -> YELLOW (startup-config prefix)");
+    assert(linux_gate_tier("vtysh -c \"show star\"") == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("show run json -> YELLOW (prefix + trailing modifier)");
+    assert(linux_gate_tier("vtysh -c \"show run json\"") == VIRP_TIER_YELLOW);
+    PASS();
+
+    /* Neighbouring spellings that do NOT prefix either config word
+     * keep their GREEN read classification. */
+    TEST("show ip route stays GREEN (not a config-word prefix)");
+    assert(linux_gate_tier("vtysh -c \"show ip route\"") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("show rundown stays GREEN (diverges from running-config)");
+    assert(linux_gate_tier("vtysh -c \"show rundown\"") == VIRP_TIER_GREEN);
+    PASS();
+
     TEST("clear ip ospf neighbor -> YELLOW");
     assert(linux_gate_tier("vtysh -c \"clear ip ospf neighbor\"") == VIRP_TIER_YELLOW);
     PASS();

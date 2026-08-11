@@ -101,6 +101,16 @@ static const char RUN_CFG[] =
     "tacacs server TAC1\n"
     " key 7 070C285F4D06\n"
     "!\n"
+    "tacacs-server host 10.0.0.21 key 7 30CANARY16midkey\n"
+    "radius-server host 10.0.0.22 auth-port 1812 acct-port 1813 key CANARY17radhost\n"
+    "server-private 10.0.0.23 key 7 06CANARY18srvpriv\n"
+    "tacacs-server host 10.0.0.24 key 1234509876\n"
+    "!\n"
+    "key chain RIPCHAIN2\n"
+    " key 2\n"
+    "  key-string 24681012\n"
+    "!\n"
+    "snmp-server user v3admin NETGRP v3 auth sha CANARY20sha priv aes 128 CANARY21aes\n"
     "crypto isakmp key CANARY6isakmp address 203.0.113.7\n"
     "crypto isakmp key 6 CANARY7isakmpenc address 203.0.113.8\n"
     "!\n"
@@ -112,6 +122,9 @@ static const char RUN_CFG[] =
     " ip address 10.0.0.50 255.255.255.0\n"
     " ip ospf authentication message-digest\n"
     " ip ospf message-digest-key 1 md5 7 05CANARY9ospf\n"
+    " ip nhrp map 10.0.0.1 203.0.113.9\n"
+    " ip nhrp authentication CANARY19nhrp\n"
+    " ip nhrp holdtime 300\n"
     " standby 1 ip 10.0.0.1\n"
     " standby 1 authentication CANARY10hsrp\n"
     "!\n"
@@ -140,6 +153,10 @@ static const char *PRESERVED_LINES[] = {
     "tacacs server TAC1",
     "key chain RIPCHAIN",
     " key 1",
+    "key chain RIPCHAIN2",
+    " key 2",
+    " ip nhrp map 10.0.0.1 203.0.113.9",
+    " ip nhrp holdtime 300",
     "interface GigabitEthernet0/0",
     " ip address 10.0.0.50 255.255.255.0",
     " ip ospf authentication message-digest",
@@ -164,6 +181,12 @@ static const char *EXPECTED_REDACTIONS[] = {
     "snmp-server community <removed>",
     "snmp-server host 10.0.0.99 <removed>",
     " password <removed>",
+    "tacacs-server host 10.0.0.21 key <removed>",
+    "acct-port 1813 key <removed>",
+    "server-private 10.0.0.23 key <removed>",
+    "tacacs-server host 10.0.0.24 key <removed>",
+    " ip nhrp authentication <removed>",
+    " auth sha <removed>",
 };
 
 static size_t count_lines(const char *s)
@@ -307,6 +330,77 @@ TEST(test_numeric_server_block_keys_redacted)
           "key chain header damaged");
 }
 
+/* Mid-line `key` (2026-08-11): real IOS puts AAA keys mid-line —
+ * `tacacs-server host <ip> key 7 …`, `radius-server host … key …`,
+ * `server-private … key 7 …`. The value after ANY `key` token past
+ * token 0 must be redacted; the host/address stays visible. */
+TEST(test_midline_key_redacted)
+{
+    size_t out_len = 0;
+    CHECK(cisco_scrub_config(RUN_CFG, strlen(RUN_CFG),
+                             OUT, sizeof(OUT), &out_len) == VIRP_OK,
+          "scrub failed");
+    CHECK(strstr(OUT, "CANARY16midkey") == NULL,
+          "tacacs-server host mid-line key survived");
+    CHECK(strstr(OUT, "CANARY17radhost") == NULL,
+          "radius-server host mid-line key survived");
+    CHECK(strstr(OUT, "CANARY18srvpriv") == NULL,
+          "server-private mid-line key survived");
+    CHECK(strstr(OUT, "tacacs-server host 10.0.0.21 key <removed>") != NULL,
+          "host address not preserved on mid-line key redaction");
+}
+
+/* Composition with the Item 2 rule: token-0 `key <numeric-EOL>` is a
+ * key-chain index and stays; mid-line `key <numeric>` has NO index
+ * form and must redact; a numeric key-string value is caught by the
+ * key-string keyword. No numeric-secret gap between the rules. */
+TEST(test_numeric_secret_composition)
+{
+    size_t out_len = 0;
+    CHECK(cisco_scrub_config(RUN_CFG, strlen(RUN_CFG),
+                             OUT, sizeof(OUT), &out_len) == VIRP_OK,
+          "scrub failed");
+    CHECK(strstr(OUT, "key 1234509876") == NULL,
+          "numeric mid-line key survived: `... key 1234509876`");
+    CHECK(strstr(OUT, "24681012") == NULL,
+          "numeric key-string value survived: `key-string 24681012`");
+    CHECK(strstr(OUT, " key 1\n") != NULL &&
+          strstr(OUT, " key 2\n") != NULL,
+          "key-chain numeric index damaged");
+}
+
+/* `ip nhrp authentication <string>` — DMVPN auth string (2026-08-11).
+ * The bare-authentication redaction was gated on standby/vrrp only. */
+TEST(test_nhrp_authentication_redacted)
+{
+    size_t out_len = 0;
+    CHECK(cisco_scrub_config(RUN_CFG, strlen(RUN_CFG),
+                             OUT, sizeof(OUT), &out_len) == VIRP_OK,
+          "scrub failed");
+    CHECK(strstr(OUT, "CANARY19nhrp") == NULL,
+          "NHRP authentication string survived");
+    CHECK(strstr(OUT, " ip nhrp authentication <removed>") != NULL,
+          "NHRP redacted form missing");
+    CHECK(strstr(OUT, " ip nhrp map 10.0.0.1 203.0.113.9") != NULL &&
+          strstr(OUT, " ip nhrp holdtime 300") != NULL,
+          "non-secret NHRP lines damaged");
+}
+
+/* SNMPv3 `auth sha` (2026-08-11): SECRET_KEYWORDS had md5 but not
+ * sha, the modern v3 default. Everything after `sha` (including the
+ * trailing priv secret) is redacted. */
+TEST(test_snmpv3_sha_redacted)
+{
+    size_t out_len = 0;
+    CHECK(cisco_scrub_config(RUN_CFG, strlen(RUN_CFG),
+                             OUT, sizeof(OUT), &out_len) == VIRP_OK,
+          "scrub failed");
+    CHECK(strstr(OUT, "CANARY20sha") == NULL, "v3 sha auth secret survived");
+    CHECK(strstr(OUT, "CANARY21aes") == NULL, "v3 priv secret survived");
+    CHECK(strstr(OUT, " auth sha <removed>") != NULL,
+          "v3 sha redacted form missing");
+}
+
 TEST(test_gate_tier_alignment)
 {
     /* Reverted GREEN → YELLOW (2026-08-11): scrub misses secret
@@ -338,6 +432,10 @@ int main(void)
 
     RUN_TEST(test_no_canary_survives);
     RUN_TEST(test_numeric_server_block_keys_redacted);
+    RUN_TEST(test_midline_key_redacted);
+    RUN_TEST(test_numeric_secret_composition);
+    RUN_TEST(test_nhrp_authentication_redacted);
+    RUN_TEST(test_snmpv3_sha_redacted);
     RUN_TEST(test_expected_redactions_present);
     RUN_TEST(test_non_secret_lines_preserved);
     RUN_TEST(test_idempotent);

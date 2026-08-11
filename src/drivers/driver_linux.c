@@ -55,6 +55,14 @@
  */
 #define SSH_EXEC_DEADLINE_MS    40000
 
+/* Credential scrub for FRR config reads — defined with the gate
+ * helpers below, needed by linux_execute above them. Exposed
+ * (non-static) for the unit suite, same as cisco_scrub_config. */
+virp_error_t linux_scrub_config(const char *in, size_t in_len,
+                                char *out, size_t out_cap,
+                                size_t *out_len);
+bool linux_command_returns_config(const char *command);
+
 static uint64_t mono_ms(void)
 {
     struct timespec ts;
@@ -501,6 +509,43 @@ static virp_error_t linux_execute(virp_conn_t *conn,
 
     libssh2_channel_free(channel);
 
+    /* Config-bearing reads are scrubbed BEFORE the body leaves the
+     * driver (2026-08-11): FRR configs carry credential material
+     * (passwords, OSPF md5 keys, key-strings) and observation bodies
+     * are signed into an append-only chain. Fail-closed, same
+     * contract as cisco_scrub_config: if the scrub cannot complete,
+     * the body is withheld from signing and a typed error returned.
+     * Runs on every disposition — even a truncated or unclean body
+     * must never carry cleartext secrets onward. */
+    if (linux_command_returns_config(command)) {
+        size_t cap = 3 * result->output_len + 64;
+        char *scrubbed = malloc(cap);
+        size_t scrubbed_len = 0;
+        virp_error_t serr = scrubbed
+            ? linux_scrub_config(result->output, result->output_len,
+                                 scrubbed, cap, &scrubbed_len)
+            : VIRP_ERR_BUFFER_TOO_SMALL;
+        if (serr == VIRP_OK && scrubbed_len >= sizeof(result->output))
+            serr = VIRP_ERR_BUFFER_TOO_SMALL;
+        if (serr != VIRP_OK) {
+            free(scrubbed);
+            fprintf(stderr, "[Linux] Config scrub failed on %s "
+                    "(%zu bytes) — refusing to sign unscrubbed body\n",
+                    conn->device.hostname, result->output_len);
+            result->success = false;
+            result->output[0] = '\0';
+            result->output_len = 0;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "Config scrub failed on %s: body withheld from "
+                     "signing", conn->device.hostname);
+            return serr;
+        }
+        memcpy(result->output, scrubbed, scrubbed_len);
+        result->output[scrubbed_len] = '\0';
+        result->output_len = scrubbed_len;
+        free(scrubbed);
+    }
+
     clock_gettime(CLOCK_MONOTONIC, &end);
     result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
                                        (end.tv_nsec - start.tv_nsec) / 1000000);
@@ -667,6 +712,18 @@ static bool rest_charset_ok(const char *rest)
     return true;
 }
 
+/* Is the first word of `rest` a non-empty prefix of `full`? vtysh
+ * resolves unambiguous command prefixes, so `run`, `ru`, `runn`, …
+ * all EXECUTE as `running-config`. Deliberately broader than vtysh's
+ * own ambiguity resolution: any word that COULD resolve to `full`
+ * matches, and the caller errs toward the stricter tier. */
+static bool word_prefixes(const char *rest, const char *full)
+{
+    size_t n = 0;
+    while (rest[n] && rest[n] != ' ') n++;
+    return n > 0 && n <= strlen(full) && strncmp(rest, full, n) == 0;
+}
+
 /* Skip a matched token and the space after it (if any). */
 static const char *tok_rest(const char *canon, const char *tok)
 {
@@ -820,15 +877,22 @@ virp_trust_tier_t linux_gate_classify(const char *command, const char **reason)
             return VIRP_TIER_RED;
         }
 
-        /* YELLOW — config-visibility read (2026-08-11): FRR's
-         * running-config carries credential material inline (OSPF
-         * message-digest keys, BGP neighbor passwords, key-chain
-         * key-strings) and this driver has NO scrub — the body would
-         * be signed into the append-only chain verbatim. Approval-
-         * gate it ahead of the generic show row. */
-        if (tok_prefix(vcmd, "show running-config") &&
-            rest_charset_ok(tok_rest(vcmd, "show running-config")))
-            return VIRP_TIER_YELLOW;
+        /* YELLOW — config-visibility reads (2026-08-11): FRR's
+         * running-config (and startup-config) carries credential
+         * material inline (OSPF message-digest keys, BGP neighbor
+         * passwords, key-chain key-strings). Because vtysh resolves
+         * command prefixes, `show run` and `show start` execute as
+         * the full config reads — so ANY show argument that could
+         * resolve to running-config or startup-config is trapped
+         * here, before the generic GREEN show row. `show` itself
+         * must still be the full spelled-out token. */
+        if (tok_prefix(vcmd, "show")) {
+            const char *arg = tok_rest(vcmd, "show");
+            if ((word_prefixes(arg, "running-config") ||
+                 word_prefixes(arg, "startup-config")) &&
+                rest_charset_ok(arg))
+                return VIRP_TIER_YELLOW;
+        }
 
         /* GREEN — reads. "show" must be the full spelled-out token:
          * "sh ip os nei" is not expanded and falls through RED. */
@@ -881,6 +945,163 @@ virp_trust_tier_t linux_gate_tier(const char *command)
 
 /* route_reason hook — static instructive string, or NULL for rows that
  * take the daemon's generic rejection message. */
+/* =========================================================================
+ * Credential scrub for FRR config reads (2026-08-11)
+ *
+ * FRR's running-config (and startup-config) carries credential
+ * material inline: `password`, `enable password`, `neighbor <ip>
+ * password`, `ip ospf message-digest-key <n> md5`, key-chain
+ * `key-string`, `ip ospf authentication-key`. Observation bodies are
+ * HMAC-signed and appended to a chain that cannot be trimmed, so the
+ * scrub runs INSIDE the driver, on the reply body, BEFORE the result
+ * is handed to the signer — never after.
+ *
+ * Same shape and contract as cisco_scrub_config: a pure function
+ * over the reply text, exposed (non-static) so tests can drive it
+ * with recorded config shapes, fail-closed — if the scrub cannot
+ * complete (output would not fit), the caller reports a typed ERROR
+ * instead of signing an unscrubbed or truncated body.
+ *
+ * Redaction model (keyword-anchored, deliberately over-broad —
+ * over-redaction is the fail-closed direction): a line whose token
+ * stream contains one of the secret-bearing keywords (password, md5,
+ * key-string, authentication-key) has everything AFTER that keyword
+ * replaced with "<removed>". Exact-token matching keeps non-secret
+ * lines untouched: `ip ospf authentication message-digest` carries
+ * no value and is preserved verbatim.
+ * ========================================================================= */
+
+#define LINUX_SCRUB_MARK "<removed>"
+
+static bool linux_scrub_tok_eq(const char *tok, size_t len,
+                               const char *word)
+{
+    return strlen(word) == len && strncmp(tok, word, len) == 0;
+}
+
+static bool linux_scrub_emit(char *out, size_t cap, size_t *pos,
+                             const char *src, size_t n)
+{
+    if (*pos + n >= cap) return false;
+    memcpy(out + *pos, src, n);
+    *pos += n;
+    return true;
+}
+
+/* Scrub one line [line, line+len) (terminator excluded) into out.
+ * Returns false only on output overflow. */
+static bool linux_scrub_line(const char *line, size_t len,
+                             char *out, size_t cap, size_t *pos)
+{
+    static const char *const SECRET_KEYWORDS[] = {
+        "password", "md5", "key-string", "authentication-key",
+    };
+    static const size_t SECRET_KEYWORD_COUNT =
+        sizeof(SECRET_KEYWORDS) / sizeof(SECRET_KEYWORDS[0]);
+
+    size_t i = 0;
+    size_t cut = 0;              /* redact from here (0 = no redaction) */
+
+    while (i < len && cut == 0) {
+        while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+        if (i >= len) break;
+        size_t start = i;
+        while (i < len && line[i] != ' ' && line[i] != '\t') i++;
+        const char *tok = line + start;
+        size_t tlen = i - start;
+
+        for (size_t k = 0; k < SECRET_KEYWORD_COUNT; k++) {
+            if (linux_scrub_tok_eq(tok, tlen, SECRET_KEYWORDS[k])) {
+                size_t j = i;
+                while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+                if (j < len) cut = j;   /* keyword with a value */
+                break;
+            }
+        }
+    }
+
+    if (cut == 0)
+        return linux_scrub_emit(out, cap, pos, line, len);
+
+    return linux_scrub_emit(out, cap, pos, line, cut) &&
+           linux_scrub_emit(out, cap, pos, LINUX_SCRUB_MARK,
+                            strlen(LINUX_SCRUB_MARK));
+}
+
+/*
+ * Pure scrub: rewrite FRR config text so no credential material
+ * survives. Fail-closed: VIRP_ERR_BUFFER_TOO_SMALL means the caller
+ * must NOT use (or sign) any partial output.
+ */
+virp_error_t linux_scrub_config(const char *in, size_t in_len,
+                                char *out, size_t out_cap,
+                                size_t *out_len)
+{
+    if (!in || !out || !out_len) return VIRP_ERR_NULL_PTR;
+    *out_len = 0;
+
+    size_t pos = 0;
+    size_t i = 0;
+    while (i < in_len) {
+        size_t start = i;
+        while (i < in_len && in[i] != '\n') i++;
+        size_t line_end = i;                    /* excl. terminator */
+        size_t content_end = line_end;
+        if (content_end > start && in[content_end - 1] == '\r')
+            content_end--;                      /* keep \r with the terminator */
+
+        if (!linux_scrub_line(in + start, content_end - start,
+                              out, out_cap, &pos))
+            return VIRP_ERR_BUFFER_TOO_SMALL;
+        /* terminator bytes verbatim (\r\n, \n, or none at EOF) */
+        if (!linux_scrub_emit(out, out_cap, &pos, in + content_end,
+                              (line_end - content_end) +
+                              ((i < in_len) ? 1 : 0)))
+            return VIRP_ERR_BUFFER_TOO_SMALL;
+        if (i < in_len) i++;                    /* past the \n */
+    }
+
+    out[pos] = '\0';
+    *out_len = pos;
+    return VIRP_OK;
+}
+
+/*
+ * Commands whose reply embeds FRR configuration (and therefore
+ * credential material). Casts the same net as the gate's YELLOW
+ * config-read row: `vtysh -c "show <arg> …"` where <arg> could
+ * resolve, via vtysh prefix expansion, to running-config or
+ * startup-config. Malformed or out-of-charset forms never pass the
+ * gate, so returning false for them cannot leak an executed body.
+ */
+bool linux_command_returns_config(const char *command)
+{
+    if (!command) return false;
+
+    char canon[LINUX_GATE_CANON_MAX];
+    if (linux_gate_canon(command, canon, sizeof(canon)) < 0)
+        return false;   /* over-long: RED at the gate, never executes */
+
+    static const char SCAFFOLD[] = "vtysh -c \"";
+    if (strncmp(canon, SCAFFOLD, sizeof(SCAFFOLD) - 1) != 0)
+        return false;
+    const char *arg = canon + sizeof(SCAFFOLD) - 1;
+    const char *close = strchr(arg, '"');
+    if (!close || close == arg || close[1] != '\0')
+        return false;   /* malformed: RED at the gate */
+
+    char vcmd[LINUX_GATE_CANON_MAX];
+    size_t vlen = (size_t)(close - arg);
+    if (vlen >= sizeof(vcmd)) return false;
+    memcpy(vcmd, arg, vlen);
+    vcmd[vlen] = '\0';
+
+    if (!tok_prefix(vcmd, "show")) return false;
+    const char *rest = tok_rest(vcmd, "show");
+    return word_prefixes(rest, "running-config") ||
+           word_prefixes(rest, "startup-config");
+}
+
 const char *linux_gate_reason(const char *command)
 {
     const char *reason = NULL;

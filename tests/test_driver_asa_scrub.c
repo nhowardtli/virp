@@ -106,10 +106,19 @@ static const char RUN_CFG[] =
     "failover lan unit primary\n"
     "failover key CANARY14failover\n"
     "!\n"
+    "vpn load-balancing\n"
+    " cluster key 1234509876\n"
+    " cluster ip address 203.0.113.20\n"
+    "!\n"
+    "snmp-server user v3admin NETGRP v3 auth sha CANARY17sha priv aes 256 CANARY18aes\n"
+    "!\n"
     "ntp authentication-key 1 md5 CANARY15ntp\n"
     "key chain EIGRPCHAIN\n"
     " key 1\n"
     "  key-string CANARY16chain\n"
+    "key chain EIGRPCHAIN2\n"
+    " key 2\n"
+    "  key-string 24681012\n"
     "!\n"
     "Cryptochecksum:0123456789abcdef0123456789abcdef\n"
     ": end";
@@ -138,8 +147,12 @@ static const char *PRESERVED_LINES[] = {
     " authentication pre-share",
     "tunnel-group 198.51.100.9 type ipsec-l2l",
     "failover lan unit primary",
+    "vpn load-balancing",
+    " cluster ip address 203.0.113.20",
     "key chain EIGRPCHAIN",
     " key 1",
+    "key chain EIGRPCHAIN2",
+    " key 2",
     "Cryptochecksum:0123456789abcdef0123456789abcdef",
     ": end",
 };
@@ -163,6 +176,8 @@ static const char *EXPECTED_REDACTIONS[] = {
     "failover key <removed>",
     "ntp authentication-key <removed>",
     "  key-string <removed>",
+    " cluster key <removed>",
+    " auth sha <removed>",
 };
 
 static size_t count_lines(const char *s)
@@ -207,6 +222,43 @@ TEST(test_numeric_server_block_keys_redacted)
     CHECK(strstr(OUT, " key 1\n") != NULL, "key-chain index damaged");
     CHECK(strstr(OUT, "key chain EIGRPCHAIN") != NULL,
           "key chain header damaged");
+}
+
+/* Mid-line `key` + numeric composition (2026-08-11): `cluster key`
+ * in a vpn load-balancing block sits past token 0, where the Item 2
+ * numeric-index exemption must NOT apply — a purely numeric secret
+ * there must still redact. A numeric key-string value is caught by
+ * the key-string keyword; key-chain numeric indexes stay. */
+TEST(test_midline_key_and_numeric_composition)
+{
+    size_t out_len = 0;
+    CHECK(asa_scrub_config(RUN_CFG, strlen(RUN_CFG),
+                           OUT, sizeof(OUT), &out_len) == VIRP_OK,
+          "scrub failed");
+    CHECK(strstr(OUT, "1234509876") == NULL,
+          "numeric mid-line key survived: ` cluster key 1234509876`");
+    CHECK(strstr(OUT, " cluster key <removed>") != NULL,
+          "cluster key redacted form missing");
+    CHECK(strstr(OUT, "24681012") == NULL,
+          "numeric key-string value survived: `key-string 24681012`");
+    CHECK(strstr(OUT, " key 1\n") != NULL &&
+          strstr(OUT, " key 2\n") != NULL,
+          "key-chain numeric index damaged");
+}
+
+/* SNMPv3 `auth sha` (2026-08-11): SECRET_KEYWORDS had md5 but not
+ * sha, the modern v3 default. Everything after `sha` (including the
+ * trailing priv secret) is redacted. */
+TEST(test_snmpv3_sha_redacted)
+{
+    size_t out_len = 0;
+    CHECK(asa_scrub_config(RUN_CFG, strlen(RUN_CFG),
+                           OUT, sizeof(OUT), &out_len) == VIRP_OK,
+          "scrub failed");
+    CHECK(strstr(OUT, "CANARY17sha") == NULL, "v3 sha auth secret survived");
+    CHECK(strstr(OUT, "CANARY18aes") == NULL, "v3 priv secret survived");
+    CHECK(strstr(OUT, " auth sha <removed>") != NULL,
+          "v3 sha redacted form missing");
 }
 
 TEST(test_expected_redactions_present)
@@ -336,6 +388,8 @@ int main(void)
 
     RUN_TEST(test_no_canary_survives);
     RUN_TEST(test_numeric_server_block_keys_redacted);
+    RUN_TEST(test_midline_key_and_numeric_composition);
+    RUN_TEST(test_snmpv3_sha_redacted);
     RUN_TEST(test_expected_redactions_present);
     RUN_TEST(test_non_secret_lines_preserved);
     RUN_TEST(test_idempotent);

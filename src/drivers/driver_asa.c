@@ -701,8 +701,8 @@ static bool asa_scrub_line(const char *line, size_t len,
 {
     static const char *SECRET_KEYWORDS[] = {
         "password", "passwd", "secret", "community", "key-string",
-        "authentication-key", "md5", "pre-shared-key", "passphrase",
-        "ldap-login-password",
+        "authentication-key", "md5", "sha", "pre-shared-key",
+        "passphrase", "ldap-login-password",
     };
     static const size_t SECRET_KEYWORD_COUNT =
         sizeof(SECRET_KEYWORDS) / sizeof(SECRET_KEYWORDS[0]);
@@ -823,6 +823,20 @@ static bool asa_scrub_line(const char *line, size_t len,
             if (j < len) cut = j;
         }
         prev_is_auth = asa_tok_eq(tok, tlen, "authentication");
+
+        /* Mid-line `key <value>` (2026-08-11): ASA also carries keys
+         * past token 0 — `cluster key <secret>` in vpn load-balancing
+         * blocks, legacy inline aaa forms. Redact everything after
+         * the `key` token. Token-0 `key` keeps its key-chain handling
+         * above (block header / bare numeric index); mid-line there
+         * is no index form, so a purely numeric value redacts too.
+         * `crypto isakmp key` never reaches here — its branch emits
+         * and returns, keeping the peer address visible. */
+        if (cut == 0 && tok_index >= 1 && asa_tok_eq(tok, tlen, "key")) {
+            size_t j = i;
+            while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+            if (j < len) cut = j;
+        }
 
         if (cut == 0) {
             for (size_t k = 0; k < SECRET_KEYWORD_COUNT; k++) {

@@ -44,6 +44,11 @@ static void test_yellow(void)
      * again. The scrub still runs on the YELLOW path — see
      * cisco_scrub_config() and test_driver_cisco_scrub.c. */
     TEST("show running-config -> YELLOW (scrubbed)"); assert(cisco_gate_tier("show running-config") == VIRP_TIER_YELLOW); PASS();
+    /* Driver asymmetry pinned (2026-08-11): FRR/vtysh expands command
+     * prefixes so its gate must trap `show run` at YELLOW; the cisco
+     * table does NOT expand abbreviations and `show run` stays RED by
+     * absence. See test_driver_linux_gate.c. */
+    TEST("show run -> RED (no abbreviation rows; FRR asymmetry)"); assert(cisco_gate_tier("show run") == VIRP_TIER_RED); PASS();
     TEST("show startup-config -> YELLOW");       assert(cisco_gate_tier("show startup-config") == VIRP_TIER_YELLOW); PASS();
     TEST("show access-lists -> YELLOW");         assert(cisco_gate_tier("show access-lists") == VIRP_TIER_YELLOW); PASS();
     TEST("show ip nat translations -> YELLOW");  assert(cisco_gate_tier("show ip nat translations") == VIRP_TIER_YELLOW); PASS();
