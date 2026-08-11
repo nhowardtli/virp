@@ -43,6 +43,8 @@
 #define ONODE_RECV_TIMEOUT_SEC  5
 #define ONODE_MAX_REQUEST_SIZE  24576
 #define ONODE_MAX_ALLOWED_UIDS  16
+#define ONODE_MAX_UID_ACTIONS   8   /* max actions per uid in the
+                                       socket_uid_action_allow map */
 #define ONODE_MAX_GATE_OVERRIDES 16   /* per-driver gate mode overrides */
 
 /*
@@ -119,6 +121,7 @@ typedef enum {
     ONODE_ACTION_APPROVAL_CHALLENGE = 14, /* Return canonical bytes to sign for a proposal */
     ONODE_ACTION_APPROVAL_SUBMIT    = 15, /* Submit a signature; daemon appends APPROVAL */
     ONODE_ACTION_CHAIN_VERIFY_SESSION = 16, /* Verify whole session vs signed head */
+    ONODE_ACTION_LIST_FLEET = 17,   /* Enumerate fleet: names + status ONLY */
     ONODE_ACTION_SESSION_HELLO = 20, /* Client SESSION_HELLO handshake */
     ONODE_ACTION_SESSION_BIND  = 21, /* Client SESSION_BIND confirmation */
     ONODE_ACTION_SESSION_CLOSE = 22, /* Either peer closes session */
@@ -282,6 +285,27 @@ typedef struct {
     uid_t               uid_ceiling_uids[ONODE_MAX_ALLOWED_UIDS];
     virp_trust_tier_t   uid_ceiling_tiers[ONODE_MAX_ALLOWED_UIDS];
     size_t              uid_ceiling_count;
+
+    /*
+     * Per-uid ACTION allowlist (Item 8, optional). Parsed from the
+     * config's `socket_uid_action_allow` object (uid → array of action
+     * names), parallel to socket_uid_tier_ceilings. A uid present here
+     * may request ONLY the listed actions — anything else is refused
+     * with VIRP_ERR_ACTION_FORBIDDEN before the dispatch switch. A uid
+     * ABSENT from this map is completely unchanged: no new restriction
+     * on existing principals. An entry with zero actions is a valid
+     * deny-all — the fail-closed representation the config loader
+     * installs for a malformed set. A mapped uid is additionally
+     * type-narrowed on chain_append to the federation provenance pair
+     * (fed_request / fed_outcome). Used to hold the netclaw tunnel
+     * identity (uid 993) to fleet enumeration, health, chain reads and
+     * provenance appends — and, pointedly, away from shutdown.
+     */
+    uid_t               uid_action_uids[ONODE_MAX_ALLOWED_UIDS];
+    onode_action_t      uid_action_sets[ONODE_MAX_ALLOWED_UIDS]
+                                       [ONODE_MAX_UID_ACTIONS];
+    size_t              uid_action_set_counts[ONODE_MAX_ALLOWED_UIDS];
+    size_t              uid_action_count;
 
     /* Trust chain (Primitive 6) */
     virp_chain_state_t  chain;
@@ -597,6 +621,31 @@ virp_error_t onode_set_uid_ceilings(onode_state_t *state,
                                     const uid_t *uids,
                                     const virp_trust_tier_t *tiers,
                                     size_t count);
+
+/*
+ * Install (or replace) the per-uid action allowlist entry for `uid`
+ * (Item 8). `actions`/`count` name the ONLY actions that uid may
+ * request; count == 0 installs a valid deny-all entry (the fail-closed
+ * form for a malformed config set). Returns VIRP_ERR_MESSAGE_TOO_LARGE
+ * when count exceeds ONODE_MAX_UID_ACTIONS or the uid table is full,
+ * VIRP_ERR_INVALID_TYPE for an action value that is not a known
+ * onode_action_t. A uid never passed here is completely unrestricted
+ * by this map.
+ */
+virp_error_t onode_set_uid_actions(onode_state_t *state, uid_t uid,
+                                   const onode_action_t *actions,
+                                   size_t count);
+
+/* Drop every per-uid action allowlist entry (tests / config reload). */
+void onode_clear_uid_actions(onode_state_t *state);
+
+/*
+ * Map an action name from the wire ("list_fleet", "shutdown", …) to
+ * its onode_action_t. Returns 0 (no such action) for unknown names —
+ * the same names parse_request accepts, kept in ONE table so the
+ * dispatch and the config loader can never disagree.
+ */
+onode_action_t onode_action_from_name(const char *name);
 
 /*
  * Decode a hex string to bytes. Only accepts [0-9a-fA-F].

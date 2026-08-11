@@ -1074,6 +1074,7 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_CHAIN_READONLY:    return "Write refused on read-only verifier chain handle";
     case VIRP_ERR_OUTCOME_UNKNOWN:   return "Outcome unknown: response absent after possible dispatch; not retried";
     case VIRP_ERR_OBS_SIG_INVALID:   return "Ed25519 observation signature invalid";
+    case VIRP_ERR_ACTION_FORBIDDEN:  return "Action not in the caller uid's allowed set";
     default:                         return "Unknown error";
     }
 }

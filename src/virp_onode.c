@@ -242,6 +242,56 @@ static bool json_has_nul_escape(const char *json)
     return false;
 }
 
+/*
+ * The wire name ↔ action table — the ONE list parse_request and the
+ * socket_uid_action_allow config loader both read, so the dispatch and
+ * the policy can never disagree about what an action is called.
+ */
+static const struct { const char *name; onode_action_t action; }
+ONODE_ACTION_NAMES[] = {
+    { "execute",              ONODE_ACTION_EXECUTE },
+    { "health",               ONODE_ACTION_HEALTH },
+    { "heartbeat",            ONODE_ACTION_HEARTBEAT },
+    { "list_devices",         ONODE_ACTION_LIST },
+    { "list_fleet",           ONODE_ACTION_LIST_FLEET },
+    { "sign_intent",          ONODE_ACTION_SIGN_INTENT },
+    { "sign_outcome",         ONODE_ACTION_SIGN_OUTCOME },
+    { "chain_append",         ONODE_ACTION_CHAIN_APPEND },
+    { "chain_verify",         ONODE_ACTION_CHAIN_VERIFY },
+    { "chain_verify_session", ONODE_ACTION_CHAIN_VERIFY_SESSION },
+    { "intent_store",         ONODE_ACTION_INTENT_STORE },
+    { "intent_get",           ONODE_ACTION_INTENT_GET },
+    { "intent_execute",       ONODE_ACTION_INTENT_EXECUTE },
+    { "batch_execute",        ONODE_ACTION_BATCH_EXECUTE },
+    { "validate_turn",        ONODE_ACTION_VALIDATE_TURN },
+    { "approval_challenge",   ONODE_ACTION_APPROVAL_CHALLENGE },
+    { "approval_submit",      ONODE_ACTION_APPROVAL_SUBMIT },
+    { "session_hello",        ONODE_ACTION_SESSION_HELLO },
+    { "session_bind",         ONODE_ACTION_SESSION_BIND },
+    { "session_close",        ONODE_ACTION_SESSION_CLOSE },
+    { "shutdown",             ONODE_ACTION_SHUTDOWN },
+};
+
+onode_action_t onode_action_from_name(const char *name)
+{
+    if (!name) return (onode_action_t)0;
+    for (size_t i = 0;
+         i < sizeof(ONODE_ACTION_NAMES) / sizeof(ONODE_ACTION_NAMES[0]); i++)
+        if (strcmp(name, ONODE_ACTION_NAMES[i].name) == 0)
+            return ONODE_ACTION_NAMES[i].action;
+    return (onode_action_t)0;
+}
+
+/* Reverse lookup for log lines. Never returns NULL. */
+static const char *onode_action_name(onode_action_t action)
+{
+    for (size_t i = 0;
+         i < sizeof(ONODE_ACTION_NAMES) / sizeof(ONODE_ACTION_NAMES[0]); i++)
+        if (ONODE_ACTION_NAMES[i].action == action)
+            return ONODE_ACTION_NAMES[i].name;
+    return "unknown";
+}
+
 static bool parse_request(const char *json, onode_request_t *req)
 {
     if (!json || !req) return false;
@@ -279,47 +329,8 @@ static bool parse_request(const char *json, onode_request_t *req)
     }
     if (action_str[0] == '\0') { cJSON_Delete(root); return false; }
 
-    if (strcmp(action_str, "execute") == 0)
-        req->action = ONODE_ACTION_EXECUTE;
-    else if (strcmp(action_str, "health") == 0)
-        req->action = ONODE_ACTION_HEALTH;
-    else if (strcmp(action_str, "heartbeat") == 0)
-        req->action = ONODE_ACTION_HEARTBEAT;
-    else if (strcmp(action_str, "list_devices") == 0)
-        req->action = ONODE_ACTION_LIST;
-    else if (strcmp(action_str, "sign_intent") == 0)
-        req->action = ONODE_ACTION_SIGN_INTENT;
-    else if (strcmp(action_str, "sign_outcome") == 0)
-        req->action = ONODE_ACTION_SIGN_OUTCOME;
-    else if (strcmp(action_str, "chain_append") == 0)
-        req->action = ONODE_ACTION_CHAIN_APPEND;
-    else if (strcmp(action_str, "chain_verify") == 0)
-        req->action = ONODE_ACTION_CHAIN_VERIFY;
-    else if (strcmp(action_str, "chain_verify_session") == 0)
-        req->action = ONODE_ACTION_CHAIN_VERIFY_SESSION;
-    else if (strcmp(action_str, "intent_store") == 0)
-        req->action = ONODE_ACTION_INTENT_STORE;
-    else if (strcmp(action_str, "intent_get") == 0)
-        req->action = ONODE_ACTION_INTENT_GET;
-    else if (strcmp(action_str, "intent_execute") == 0)
-        req->action = ONODE_ACTION_INTENT_EXECUTE;
-    else if (strcmp(action_str, "batch_execute") == 0)
-        req->action = ONODE_ACTION_BATCH_EXECUTE;
-    else if (strcmp(action_str, "validate_turn") == 0)
-        req->action = ONODE_ACTION_VALIDATE_TURN;
-    else if (strcmp(action_str, "approval_challenge") == 0)
-        req->action = ONODE_ACTION_APPROVAL_CHALLENGE;
-    else if (strcmp(action_str, "approval_submit") == 0)
-        req->action = ONODE_ACTION_APPROVAL_SUBMIT;
-    else if (strcmp(action_str, "session_hello") == 0)
-        req->action = ONODE_ACTION_SESSION_HELLO;
-    else if (strcmp(action_str, "session_bind") == 0)
-        req->action = ONODE_ACTION_SESSION_BIND;
-    else if (strcmp(action_str, "session_close") == 0)
-        req->action = ONODE_ACTION_SESSION_CLOSE;
-    else if (strcmp(action_str, "shutdown") == 0)
-        req->action = ONODE_ACTION_SHUTDOWN;
-    else {
+    req->action = onode_action_from_name(action_str);
+    if ((int)req->action == 0) {
         cJSON_Delete(root);
         return false;
     }
@@ -1808,6 +1819,54 @@ static virp_error_t onode_list_devices(onode_state_t *state,
                                   &state->okey);
 }
 
+/*
+ * list_fleet (Item 8): fleet ENUMERATION only — device names and their
+ * connection status. Deliberately narrower than list_devices: no host
+ * addresses, no node ids, no vendor detail, no config bodies. This is
+ * the read a restricted federated principal keeps, so its content is
+ * pinned by test to never quietly widen.
+ */
+static virp_error_t onode_list_fleet(onode_state_t *state,
+                                     uint8_t *out_buf, size_t out_buf_len,
+                                     size_t *out_len)
+{
+    char listing[VIRP_OUTPUT_MAX];
+    size_t offset = 0;
+
+    int hw = snprintf(listing, sizeof(listing),
+                      "VIRP Fleet (%d devices)\n"
+                      "%-24s %s\n"
+                      "----------------------------------------\n",
+                      state->device_count, "Name", "Status");
+    if (hw < 0 || (size_t)hw >= sizeof(listing))
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+    offset = (size_t)hw;
+
+    for (int i = 0; i < state->device_count && offset < sizeof(listing); i++) {
+        const char *status;
+        if (!state->devices[i].enabled) {
+            status = "disabled";
+        } else {
+            pthread_mutex_lock(&state->conn_mutex);
+            status = state->connections[i] ? "connected" : "unconnected";
+            pthread_mutex_unlock(&state->conn_mutex);
+        }
+
+        int rw = snprintf(listing + offset, sizeof(listing) - offset,
+                          "%-24s %s\n",
+                          state->devices[i].hostname, status);
+        if (rw < 0 || (size_t)rw >= sizeof(listing) - offset)
+            break;                 /* row truncated — stop, keep offset sane */
+        offset += (size_t)rw;
+    }
+
+    return virp_build_observation(out_buf, out_buf_len, out_len,
+                                  state->node_id, onode_next_seq(state),
+                                  VIRP_OBS_RESOURCE_STATE, VIRP_SCOPE_LOCAL,
+                                  (const uint8_t *)listing, (uint16_t)offset,
+                                  &state->okey);
+}
+
 /* =========================================================================
  * Batch Parallel Execution (pthread-based)
  *
@@ -2438,6 +2497,45 @@ static void handle_client(onode_state_t *state, int client_fd)
 
     virp_error_t err;
 
+    /*
+     * Per-uid action allowlist (Item 8) — checked ONCE, here, before
+     * the dispatch switch. A uid present in socket_uid_action_allow
+     * may request only its listed actions; the refusal is a typed
+     * policy error and the daemon carries on. A uid absent from the
+     * map takes the switch exactly as before — no new restriction on
+     * existing principals. An entry with zero actions (the loader's
+     * fail-closed form for a malformed set) refuses everything.
+     */
+    {
+        ssize_t map_idx = -1;
+        for (size_t i = 0; i < state->uid_action_count; i++) {
+            if (state->uid_action_uids[i] == client_uid) {
+                map_idx = (ssize_t)i;
+                break;
+            }
+        }
+        if (map_idx >= 0) {
+            bool action_ok = false;
+            for (size_t k = 0;
+                 k < state->uid_action_set_counts[map_idx]; k++) {
+                if (state->uid_action_sets[map_idx][k] == req.action) {
+                    action_ok = true;
+                    break;
+                }
+            }
+            if (!action_ok) {
+                fprintf(stderr, "[O-Node] POLICY REFUSAL: uid %u "
+                        "action '%s' is not in its "
+                        "socket_uid_action_allow set\n",
+                        (unsigned)client_uid,
+                        onode_action_name(req.action));
+                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+                close(client_fd);
+                return;
+            }
+        }
+    }
+
     switch (req.action) {
     case ONODE_ACTION_EXECUTE:
         if (req.device[0] == '\0' || req.command[0] == '\0') {
@@ -2480,6 +2578,12 @@ static void handle_client(onode_state_t *state, int client_fd)
 
     case ONODE_ACTION_LIST:
         err = onode_list_devices(state, resp_buf, sizeof(resp_buf), &resp_len);
+        if (err == VIRP_OK && resp_len > 0)
+            send_framed(client_fd, resp_buf, resp_len);
+        break;
+
+    case ONODE_ACTION_LIST_FLEET:
+        err = onode_list_fleet(state, resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
         break;
@@ -2549,6 +2653,36 @@ static void handle_client(onode_state_t *state, int client_fd)
         if (!state->chain_enabled) {
             send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
             break;
+        }
+        /*
+         * Item 8 type-narrowing: a uid in the action allowlist map is
+         * a restricted federated principal — its chain_append reach is
+         * the two federation provenance types and NOTHING else. Even
+         * types every other client may submit (observation,
+         * evidence_item, …) are refused here; the action allowlist
+         * above already admitted the chain_append ACTION, this guard
+         * narrows the TYPE. Uids absent from the map are untouched.
+         */
+        {
+            bool uid_restricted = false;
+            for (size_t i = 0; i < state->uid_action_count; i++) {
+                if (state->uid_action_uids[i] == client_uid) {
+                    uid_restricted = true;
+                    break;
+                }
+            }
+            if (uid_restricted &&
+                strcmp(req.artifact_type, "fed_request") != 0 &&
+                strcmp(req.artifact_type, "fed_outcome") != 0) {
+                fprintf(stderr, "[O-Node] POLICY REFUSAL: uid %u "
+                        "chain_append artifact_type '%s' — a restricted "
+                        "principal may append only fed_request/"
+                        "fed_outcome (session=%s id=%s)\n",
+                        (unsigned)client_uid, req.artifact_type,
+                        req.session_id, req.artifact_id);
+                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+                break;
+            }
         }
         if (req.session_id[0] == '\0' || req.artifact_type[0] == '\0' ||
             req.artifact_id[0] == '\0' || req.artifact_hash[0] == '\0') {
@@ -3958,6 +4092,43 @@ virp_error_t onode_set_uid_ceilings(onode_state_t *state,
     }
     state->uid_ceiling_count = count;
     return VIRP_OK;
+}
+
+virp_error_t onode_set_uid_actions(onode_state_t *state, uid_t uid,
+                                   const onode_action_t *actions,
+                                   size_t count)
+{
+    if (!state || (count > 0 && !actions))
+        return VIRP_ERR_NULL_PTR;
+    if (count > ONODE_MAX_UID_ACTIONS)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+    for (size_t i = 0; i < count; i++) {
+        /* Only actions the wire can name — an unknown value would be a
+         * rule nobody can match, misleading an auditor. */
+        if (strcmp(onode_action_name(actions[i]), "unknown") == 0)
+            return VIRP_ERR_INVALID_TYPE;
+    }
+
+    /* Replace an existing entry for this uid, else append. */
+    ssize_t idx = -1;
+    for (size_t i = 0; i < state->uid_action_count; i++)
+        if (state->uid_action_uids[i] == uid) { idx = (ssize_t)i; break; }
+    if (idx < 0) {
+        if (state->uid_action_count >= ONODE_MAX_ALLOWED_UIDS)
+            return VIRP_ERR_MESSAGE_TOO_LARGE;
+        idx = (ssize_t)state->uid_action_count++;
+        state->uid_action_uids[idx] = uid;
+    }
+    for (size_t i = 0; i < count; i++)
+        state->uid_action_sets[idx][i] = actions[i];
+    state->uid_action_set_counts[idx] = count;   /* 0 = deny-all */
+    return VIRP_OK;
+}
+
+void onode_clear_uid_actions(onode_state_t *state)
+{
+    if (!state) return;
+    state->uid_action_count = 0;
 }
 
 virp_error_t onode_start(onode_state_t *state)

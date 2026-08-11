@@ -781,6 +781,37 @@ TEST(test_list_devices)
     ASSERT_TRUE(strstr((const char *)data, "4 devices") != NULL);
 }
 
+/* Item 8: list_fleet is enumeration ONLY — names and status. No host
+ * addresses, no node ids, no config bodies. Pinned so the fleet view a
+ * restricted principal gets can never quietly widen. */
+TEST(test_list_fleet_names_and_status_only)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request(
+        "{\"action\": \"list_fleet\"}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+
+    virp_header_t hdr;
+    virp_error_t err = virp_validate_message(resp, (size_t)n, &g_state.okey, &hdr);
+    ASSERT_OK(err);
+
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                           (size_t)n - VIRP_HEADER_SIZE,
+                           &obs, &data, &data_len);
+    ASSERT_TRUE(strstr((const char *)data, "R5") != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "R6") != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "R7") != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "R8") != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "4 devices") != NULL);
+    /* names and status only */
+    ASSERT_TRUE(strstr((const char *)data, "10.0.0.5") == NULL);
+    ASSERT_TRUE(strstr((const char *)data, "05050505") == NULL);
+}
+
 TEST(test_sequence_numbers_increment)
 {
     uint8_t resp1[VIRP_MAX_MESSAGE_SIZE];
@@ -4271,6 +4302,217 @@ TEST(test_chain_append_accepts_commitment_without_body)
 }
 
 /* =========================================================================
+ * Item 8 (2026-08-11): per-uid action allowlist + list_fleet
+ *
+ * socket_uid_action_allow maps a SO_PEERCRED uid to the ONLY actions it
+ * may request. A uid absent from the map is completely unchanged. A uid
+ * present in the map is additionally type-narrowed on chain_append to
+ * the two federation provenance types. The tests set the map for the
+ * test process's OWN uid (SO_PEERCRED on the test socket) to stand in
+ * for the federated identity, then clear it.
+ * ========================================================================= */
+
+static int32_t typed_error_of(const uint8_t *resp, ssize_t n)
+{
+    if (n != 4) return 0;
+    uint32_t v = ((uint32_t)resp[0] << 24) | ((uint32_t)resp[1] << 16) |
+                 ((uint32_t)resp[2] << 8) | (uint32_t)resp[3];
+    return (int32_t)v;
+}
+
+static const onode_action_t FED_ACTIONS[4] = {
+    ONODE_ACTION_LIST_FLEET, ONODE_ACTION_HEALTH,
+    ONODE_ACTION_CHAIN_VERIFY, ONODE_ACTION_CHAIN_APPEND,
+};
+
+TEST(test_uid_action_allowlist_blocks_unlisted_actions)
+{
+    ASSERT_OK(onode_set_uid_actions(&ca_state, getuid(), FED_ACTIONS, 4));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+
+    /* shutdown → policy refusal, and the daemon STAYS UP */
+    ssize_t n = ca_request("{\"action\": \"shutdown\"}", resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    n = ca_request("{\"action\": \"list_fleet\"}", resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);   /* alive — the refusal did not kill it */
+
+    /* health is IN the allowed set: it must pass the policy gate and
+     * reach its handler. This daemon has no devices, so the handler
+     * answers with a SIGNED ERROR OBSERVATION (device not found) —
+     * anything but the 4-byte policy refusal proves the gate admitted
+     * the action. */
+    n = ca_request("{\"action\": \"health\", \"device\": \"R5\"}",
+                   resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+
+    /* unlisted actions are refused with the same typed policy error */
+    n = ca_request("{\"action\": \"execute\", \"device\": \"R5\","
+                   " \"command\": \"show clock\"}", resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    n = ca_request("{\"action\": \"list_devices\"}", resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    n = ca_request("{\"action\": \"sign_intent\", \"command\":"
+                   " \"0000000000000000000000000000000000000000000000000000000000000000\"}",
+                   resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+
+    /* the allowed set answers: list_fleet, chain_verify (health above).
+     * chain_verify reaches its handler and returns a JSON verify result
+     * — never the 4-byte policy refusal. */
+    n = ca_request("{\"action\": \"list_fleet\"}", resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    n = ca_request("{\"action\": \"chain_verify\","
+                   " \"session_id\": \"evidence:2026\"}", resp, sizeof(resp));
+    ASSERT_TRUE(typed_error_of(resp, n) != (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+
+    onode_clear_uid_actions(&ca_state);
+}
+
+TEST(test_uid_action_allowlist_narrows_chain_append_types)
+{
+    ASSERT_OK(onode_set_uid_actions(&ca_state, getuid(), FED_ACTIONS, 4));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+
+    /* the federation provenance path stays open */
+    const char *req_body = "{\"schema\":\"federated_request/1\",\"peer\":\"netclaw\"}";
+    const char *out_body = "{\"schema\":\"federated_outcome/1\",\"outcome\":\"ok\"}";
+    char hr[65], ho[65];
+    ca_sha256_hex(req_body, hr);
+    ca_sha256_hex(out_body, ho);
+    ssize_t n = ca_append("ncfed-item8-t1", "fed_request",
+                          "item8-fed-req-1", hr, req_body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("item8-fed-req-1"), 1);
+    n = ca_append("ncfed-item8-t1", "fed_outcome",
+                  "item8-fed-out-1", ho, out_body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("item8-fed-out-1"), 1);
+
+    /* any OTHER type from the restricted uid is refused — including the
+     * commitment-only observation form that is legal for everyone else */
+    char h[65];
+    ca_sha256_hex("bytes the chain will not hold", h);
+    n = ca_append("ncfed-item8-t1", "observation",
+                  "item8-obs-refused-1", h, NULL, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("item8-obs-refused-1"), 0);
+
+    const char *evi = "{\"item\":\"pkg-list\",\"sha\":\"abc\"}";
+    char he[65];
+    ca_sha256_hex(evi, he);
+    n = ca_append("evidence:item8", "evidence_item",
+                  "item8-evi-refused-1", he, evi, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("item8-evi-refused-1"), 0);
+
+    onode_clear_uid_actions(&ca_state);
+
+    /* map cleared → the same observation commitment lands again */
+    n = ca_append("autopilot:item8", "observation",
+                  "item8-obs-unrestricted-1", h, NULL, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("item8-obs-unrestricted-1"), 1);
+}
+
+TEST(test_uid_action_map_absent_uid_fully_unchanged)
+{
+    /* A DIFFERENT uid is mapped; ours is absent — nothing may change.
+     * This is the assertion that the allowlist cannot silently lock
+     * out an existing principal (operator, autopilot). */
+    ASSERT_OK(onode_set_uid_actions(&ca_state, getuid() + 40001,
+                                    FED_ACTIONS, 4));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    /* health reaches its handler (device-not-found here, never the
+     * policy refusal — this daemon has no devices) */
+    ssize_t n = ca_request("{\"action\": \"health\", \"device\": \"R5\"}",
+                           resp, sizeof(resp));
+    ASSERT_TRUE(typed_error_of(resp, n) != (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    n = ca_request("{\"action\": \"list_devices\"}", resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    n = ca_request("{\"action\": \"sign_intent\", \"command\":"
+                   " \"1111111111111111111111111111111111111111111111111111111111111111\"}",
+                   resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+
+    /* full chain_append reach retained, observation type included */
+    char h[65];
+    ca_sha256_hex("absent uid keeps full append reach", h);
+    n = ca_append("autopilot:item8b", "observation",
+                  "item8-absent-obs-1", h, NULL, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("item8-absent-obs-1"), 1);
+
+    onode_clear_uid_actions(&ca_state);
+}
+
+/* Shutdown for an absent uid must still work — proven on a dedicated
+ * daemon instance whose map names only a foreign uid, so the socket
+ * shutdown below exercises the exact absent-uid dispatch path. */
+#define SD_SOCKET "/tmp/virp-onode-test-item8-sd.sock"
+
+static onode_state_t sd_state;
+
+static void *sd_thread(void *arg)
+{
+    (void)arg;
+    onode_start(&sd_state);
+    return NULL;
+}
+
+TEST(test_uid_action_map_foreign_uid_keeps_shutdown)
+{
+    unlink(SD_SOCKET);
+    ASSERT_OK(onode_init(&sd_state, 0x00000043, NULL, SD_SOCKET));
+    ASSERT_OK(onode_set_uid_actions(&sd_state, getuid() + 40001,
+                                    FED_ACTIONS, 4));
+    pthread_t th;
+    ASSERT_EQ(pthread_create(&th, NULL, sd_thread, NULL), 0);
+    usleep(200000);
+
+    /* our (absent) uid asks for shutdown — must be honored */
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    ASSERT_TRUE(fd >= 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SD_SOCKET);
+    ASSERT_EQ(connect(fd, (struct sockaddr *)&addr, sizeof(addr)), 0);
+    const char *json = "{\"action\": \"shutdown\"}";
+    uint32_t fl = htonl((uint32_t)(1 + strlen(json)));
+    send(fd, &fl, 4, 0);
+    uint8_t ver = VIRP_FRAME_VERSION;
+    send(fd, &ver, 1, 0);
+    send(fd, json, strlen(json), 0);
+    usleep(200000);
+    close(fd);
+
+    /* The accept loop re-checks `running` on select() activity or the
+     * 30 s heartbeat tick — poke it with one throwaway connection so
+     * the test does not wait out a heartbeat interval. */
+    int poke = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (poke >= 0) {
+        (void)connect(poke, (struct sockaddr *)&addr, sizeof(addr));
+        close(poke);
+    }
+
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 15;
+    ASSERT_EQ(pthread_timedjoin_np(th, NULL, &dl), 0);  /* it shut down */
+    onode_destroy(&sd_state);
+    unlink(SD_SOCKET);
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -4374,6 +4616,7 @@ int main(void)
     RUN_TEST(test_device_not_found);
     RUN_TEST(test_heartbeat);
     RUN_TEST(test_list_devices);
+    RUN_TEST(test_list_fleet_names_and_status_only);
     RUN_TEST(test_sequence_numbers_increment);
     RUN_TEST(test_tampered_response_fails_verify);
     RUN_TEST(test_wrong_key_fails_verify);
@@ -4447,6 +4690,12 @@ int main(void)
         RUN_TEST(test_chain_append_accepts_federated_provenance);
         RUN_TEST(test_chain_append_still_refuses_reserved_outcome_type);
         RUN_TEST(test_chain_append_accepts_commitment_without_body);
+
+        printf("\n  -- Item 8: per-uid action allowlist --\n");
+        RUN_TEST(test_uid_action_allowlist_blocks_unlisted_actions);
+        RUN_TEST(test_uid_action_allowlist_narrows_chain_append_types);
+        RUN_TEST(test_uid_action_map_absent_uid_fully_unchanged);
+        RUN_TEST(test_uid_action_map_foreign_uid_keeps_shutdown);
         ca_stop();
         ca_cleanup_files();
     } else {

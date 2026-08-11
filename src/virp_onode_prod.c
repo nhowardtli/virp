@@ -298,6 +298,109 @@ static void load_uid_tier_ceilings(onode_state_t *state,
 }
 
 /*
+ * Parse the optional top-level `socket_uid_action_allow` object (Item
+ * 8) and install per-uid action allowlists. Shape:
+ *
+ *   "socket_uid_action_allow": {
+ *       "993": ["list_fleet", "health", "chain_verify", "chain_append"]
+ *   }
+ *
+ * Keys are uid strings; values are arrays of wire action names (the
+ * same names the request parser accepts — one shared table). A uid
+ * absent from the object is completely unrestricted by this map, so a
+ * malformed entry must NEVER fall back to "skip" the way the ceilings
+ * parser does: skipping would leave the uid the operator meant to
+ * restrict fully unrestricted. Fail-closed instead — any malformed
+ * value or unknown action name installs a DENY-ALL entry for that uid
+ * and logs loudly; the uid keeps connecting but can do nothing until
+ * the config is fixed. A non-numeric key names no uid to restrict and
+ * is logged as an ERROR.
+ */
+static void load_uid_action_allow(onode_state_t *state,
+                                  struct json_object *root)
+{
+    struct json_object *obj;
+    if (!json_object_object_get_ex(root, "socket_uid_action_allow", &obj) ||
+        !json_object_is_type(obj, json_type_object)) {
+        return;  /* optional */
+    }
+
+    json_object_object_foreach(obj, key, val) {
+        char *end = NULL;
+        unsigned long uidv = strtoul(key, &end, 10);
+        if (!end || *end != '\0') {
+            fprintf(stderr, "[O-Node] ERROR: socket_uid_action_allow key "
+                            "'%s' is not a numeric uid — this entry "
+                            "restricts NOBODY; fix the config\n", key);
+            continue;
+        }
+
+        onode_action_t actions[ONODE_MAX_UID_ACTIONS];
+        size_t count = 0;
+        bool malformed = false;
+
+        if (!json_object_is_type(val, json_type_array)) {
+            malformed = true;
+        } else {
+            size_t alen = (size_t)json_object_array_length(val);
+            if (alen > ONODE_MAX_UID_ACTIONS) {
+                malformed = true;
+            } else {
+                for (size_t i = 0; i < alen; i++) {
+                    struct json_object *a =
+                        json_object_array_get_idx(val, i);
+                    const char *name =
+                        json_object_is_type(a, json_type_string)
+                            ? json_object_get_string(a) : NULL;
+                    onode_action_t act =
+                        name ? onode_action_from_name(name)
+                             : (onode_action_t)0;
+                    if ((int)act == 0) {
+                        fprintf(stderr, "[O-Node] socket_uid_action_allow"
+                                "['%s']: '%s' is not an action name\n",
+                                key, name ? name : "(not a string)");
+                        malformed = true;
+                        break;
+                    }
+                    actions[count++] = act;
+                }
+            }
+        }
+
+        if (malformed) {
+            fprintf(stderr, "[O-Node] ERROR: socket_uid_action_allow['%s'] "
+                            "is malformed — installing DENY-ALL for uid "
+                            "%lu (fail closed) until the config is "
+                            "fixed\n", key, uidv);
+            count = 0;
+        }
+
+        virp_error_t err = onode_set_uid_actions(state, (uid_t)uidv,
+                                                 actions, count);
+        if (err != VIRP_OK) {
+            fprintf(stderr, "[O-Node] onode_set_uid_actions(uid %lu) "
+                            "failed: %d\n", uidv, (int)err);
+            continue;
+        }
+        fprintf(stderr, "[O-Node] uid %lu action allowlist: %zu "
+                        "action(s)%s\n", uidv, count,
+                count == 0 ? " (DENY-ALL)" : "");
+
+        /* Same audit courtesy as the ceilings: an entry for a uid the
+         * socket allowlist refuses at accept() is inert. */
+        bool allowed = false;
+        for (size_t i = 0; i < state->socket_allowed_uids_count; i++)
+            if (state->socket_allowed_uids[i] == (uid_t)uidv)
+                { allowed = true; break; }
+        if (!allowed)
+            fprintf(stderr, "[O-Node] socket_uid_action_allow: uid %lu is "
+                            "not in socket_allowed_uids — allowlist has "
+                            "no effect (connection would be refused)\n",
+                    uidv);
+    }
+}
+
+/*
  * Parse the optional top-level `socket_path` override. If present, it
  * takes precedence over the -s CLI argument. This lets operators move
  * the socket (e.g. when redirecting the socat bridge) by editing the
@@ -440,6 +543,7 @@ int load_devices(onode_state_t *state, const char *path)
      * after the allowlist so it can warn about a ceiling for a uid that
      * is not allowed to connect. */
     load_uid_tier_ceilings(state, root);
+    load_uid_action_allow(state, root);
 
     /* Tier-enforcement gate (Phase B): override SHADOW/YELLOW defaults
      * from config if present. Installed before onode_start(). */

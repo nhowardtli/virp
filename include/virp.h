@@ -517,6 +517,16 @@ typedef enum {
     VIRP_ERR_OBS_SIG_INVALID          = -49,  /* Ed25519 observation
                                                  signature invalid */
 
+    /* Per-uid action allowlist (Item 8): the connecting SO_PEERCRED
+     * uid is present in socket_uid_action_allow and asked for an
+     * action outside its allowed set (or, for a restricted uid, a
+     * chain_append artifact_type outside the federation provenance
+     * pair). A policy refusal, not a protocol error: the request was
+     * well-formed and would have been served for an unmapped uid. */
+    VIRP_ERR_ACTION_FORBIDDEN         = -50,  /* action not in the
+                                                 caller uid's allowed
+                                                 set */
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency
