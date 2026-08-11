@@ -1,0 +1,55 @@
+[Unit]
+Description=VIRP remote O-Node tunnel (SSH-forwarded socket to 10.0.10.211)
+Documentation=https://github.com/nhowardtli/netclaw-virp-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as the socket CONSUMER identity: StreamLocalBindMask 0177 makes
+# the forwarded socket 0600, connectable by its owner only, so the ssh
+# process must share a uid with virp-bridge-mcp. The key lives under
+# this identity (StateDirectory), not in a human home. The remote
+# account (virp-netclaw on .211) is restrict+port-forwarding only; the
+# .211 daemon still gates by SO_PEERCRED uid and tier.
+User=virp-bridge
+Group=virp-bridge
+UMask=0077
+RuntimeDirectory=virp-remote
+RuntimeDirectoryMode=0700
+StateDirectory=virp-remote
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/virp-remote
+ExecStart=/usr/bin/ssh -N \
+    -o BatchMode=yes \
+    -o IdentitiesOnly=yes \
+    -o IdentityFile=/var/lib/virp-remote/id_ed25519 \
+    -o UserKnownHostsFile=/etc/virp-remote/known_hosts \
+    -o StrictHostKeyChecking=yes \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o StreamLocalBindMask=0177 \
+    -o StreamLocalBindUnlink=yes \
+    -L /run/virp-remote/onode.sock:/run/virp/onode.sock \
+    virp-netclaw@10.0.10.211
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

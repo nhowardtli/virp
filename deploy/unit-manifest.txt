@@ -80,3 +80,14 @@ deploy/virp-onode-netclaw.dropin.conf /etc/systemd/system/virp-onode.service.d/5
 # against its tracked source — being deliberate is not the same as being
 # unmanaged.
 deploy/virp-onode-wazuh-lab.dropin.conf /etc/systemd/system/virp-onode.service.d/60-wazuh-lab.conf
+
+# ── netclaw federation bridge (2026-08-11): the socket-activated MCP
+# bridge Nexus talks to, the SSH tunnel that carries it to the .211
+# O-Node, the obs-version pin, and the per-host O-Node drop-in that
+# grants uid virp-bridge socket reach. Until today all four ran
+# untracked on netclaw.
+deploy/virp-bridge-mcp.socket /etc/systemd/system/virp-bridge-mcp.socket
+deploy/virp-bridge-mcp@.service /etc/systemd/system/virp-bridge-mcp@.service
+deploy/virp-remote-tunnel.service /etc/systemd/system/virp-remote-tunnel.service
+deploy/virp-bridge-obs-version.dropin.conf /etc/systemd/system/virp-bridge-mcp@.service.d/50-obs-version.conf
+deploy/virp-onode-bridge-access.dropin.conf /etc/systemd/system/virp-onode.service.d/53-bridge-access.conf

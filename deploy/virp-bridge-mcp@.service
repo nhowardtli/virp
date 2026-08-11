@@ -1,0 +1,42 @@
+[Unit]
+Description=VIRP federation bridge MCP session (%i)
+Documentation=https://github.com/nhowardtli/netclaw-virp-bridge
+Requires=virp-remote-tunnel.service
+After=virp-remote-tunnel.service
+
+[Service]
+# One bridge process per accepted connection (Accept=yes on the socket):
+# systemd hands the connection as stdin/stdout, which is exactly the
+# stdio JSON-RPC transport the bridge already speaks — so the bridge code
+# is UNCHANGED. Runs as virp-bridge (uid 994): the identity the bridge's
+# own assert_identity() requires, and the uid that owns the forwarded
+# O-Node socket. No sudo anywhere, so container no_new_privileges is a
+# non-issue.
+Type=simple
+User=virp-bridge
+Group=virp-bridge
+UMask=0077
+Environment=VIRP_ONODE_SOCKET=/run/virp-remote/onode.sock
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+ExecStart=/usr/bin/python3 -u /usr/local/lib/virp/virp-bridge-mcp.py
+
+# Sandbox — the bridge holds no keys and self-checks it cannot read any;
+# this enforces the same at the OS layer. AF_UNIX only (onode.sock); the
+# tunnel key and every credential store are made inaccessible.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+InaccessiblePaths=-/etc/virp/keys -/etc/virp/autopilot.env -/var/lib/virp -/var/lib/virp-remote

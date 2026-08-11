@@ -1,0 +1,24 @@
+[Unit]
+Description=VIRP federation bridge MCP endpoint (socket-activated, for Nexus)
+Documentation=https://github.com/nhowardtli/netclaw-virp-bridge
+# The bridge reaches the .211 O-Node over the SSH-forwarded socket the
+# tunnel maintains; no point accepting connections before it exists.
+After=virp-remote-tunnel.service
+
+[Socket]
+# Unix socket Nexus (OpenClaw, uid 995) connects to via `nc -U`. Nexus
+# never touches /run/virp-remote/onode.sock (0600 virp-bridge) — only
+# the socket-activated bridge (uid 994) does — so every request still
+# goes THROUGH the bridge (action allowlist + provenance), never around.
+ListenStream=/run/virp-bridge-mcp.sock
+Accept=yes
+SocketUser=virp-bridge
+SocketGroup=virp-bridge
+SocketMode=0660
+# nexus is not in the virp-bridge group (credential separation), so grant
+# connect() reach by ACL, re-applied each start because the socket is
+# recreated. This is the ONLY new reach nexus gets.
+ExecStartPost=/usr/bin/setfacl -m u:nexus:rw /run/virp-bridge-mcp.sock
+
+[Install]
+WantedBy=sockets.target
