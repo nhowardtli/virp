@@ -836,6 +836,539 @@ static bool is_mutating_tool(const char *canon)
     return false;
 }
 
+/* =========================================================================
+ * Gate classifier — Proxmox VE table (linux driver only)
+ *
+ * pve-lab is registered as a `linux` device: Proxmox VE is Debian, the
+ * transport is the same SSH exec channel, so the same classifier runs.
+ * Everything here is ADDITIVE — no vtysh/FRR row changes, and a command
+ * that is not one of the enumerated Proxmox tools never enters this
+ * branch at all.
+ *
+ * Order inside the branch is load-bearing, top to bottom:
+ *
+ *   1. RAW metacharacter scan, on the ORIGINAL bytes, before tokenizing
+ *      or matching anything: ; | & $( ${ ` > < and every control byte
+ *      (newline included). `qm list; rm -rf /` starts with a GREEN row's
+ *      exact spelling, so a prefix match that ran first would classify
+ *      the whole compound string GREEN. This scan can never move below
+ *      the rows.
+ *
+ *      The daemon's ingress filter and Guard 1 above already refuse most
+ *      of that set, and `>` / `<` are in NEITHER of them
+ *      (virp_command_check_separators covers separators and command
+ *      substitution, not redirection). The scan is repeated here IN FULL
+ *      rather than only for the two missing bytes, so this table is
+ *      correct on its own terms instead of on a neighbour's — a caller
+ *      that reaches linux_gate_classify() directly, as the tests do, gets
+ *      the same answer as one that came through the daemon.
+ *
+ *   2. Argument charset — [A-Za-z0-9 ._/:=,-]. Everything a Proxmox read
+ *      needs (API paths, node names, option values) and nothing that
+ *      composes a shell word. Quotes, backslash, parens, braces, glob
+ *      bytes and ~ are all absent, so there is no second layer of shell
+ *      syntax left to reason about after step 1.
+ *
+ *   3. SELF-PROTECTION — see linux_prox_self_protect(). Runs BEFORE any
+ *      tier is assigned, and its RED is final.
+ *
+ *   4. Verb tiers, RED rows first, then GREEN, then YELLOW, then RED by
+ *      absence. Case is matched exactly, as in the FRR table: `QM LIST`
+ *      is not a spelling of `qm list` (see the classified≠executed note
+ *      in the FRR table header — the bytes classified are the bytes that
+ *      execute, and this table must never launder a case difference).
+ *
+ * Tier table (on the canonicalized command):
+ *   GREEN  — qm list, pct list, pveversion, pvecm status, pvecm nodes,
+ *            pvesm status, qm|pct status <vmid>, qm|pct config <vmid>,
+ *            pvesh get <path> where <path> is not under /access
+ *   YELLOW — qm|pct start|stop|shutdown|reboot|suspend|resume|create|
+ *            set|clone|migrate <vmid> …, pvesh create|set <path> …,
+ *            vzdump …, pvesh get /access…
+ *   RED    — qm|pct destroy, pvesh delete, qm guest …, and everything
+ *            else by absence
+ * Never BLACK — every RED here stays approvable, same as the FRR table.
+ * ========================================================================= */
+
+/* Protected VMIDs — a guest this gate may not touch at ANY tier.
+ *
+ * Sourced from devices.json ("protected_vmids": [313]) and registered by
+ * the device loader at startup via linux_gate_set_protected_vmids(); it
+ * is deliberately NOT a constant in this file. The set is a property of
+ * the deployment (which VM is this node), not of the code, and a
+ * hardcoded 313 would be silently wrong on the next node.
+ *
+ * The route_command() hook is handed a command and nothing else — no
+ * device, no connection (see the write_ops_allow note in virp_driver.h,
+ * which is the same problem solved the other way). So the registry here
+ * is the UNION of every linux/proxmox device's protected_vmids. Union is
+ * the fail-closed direction: with two Proxmox hosts, a VMID protected on
+ * either is refused on both. Over-refusal is an operator inconvenience;
+ * under-refusal is the loop switching off its own gate.
+ *
+ * Written once at startup, before the daemon serves, and read-only
+ * afterwards — no locking, same lifetime discipline as the device table.
+ */
+#define LINUX_PROTECTED_VMID_MAX  64
+#define LINUX_PROX_MAX_TOK        64
+
+static uint32_t linux_protected_vmids[LINUX_PROTECTED_VMID_MAX];
+static size_t   linux_protected_vmid_count;
+/*
+ * Has ANY device declared the field? Distinct from count > 0: an
+ * operator who has not configured this yet, and one who configured an
+ * empty list, are not the same claim, and the first must not classify
+ * `qm stop 313` as an ordinary YELLOW action just because nobody said
+ * 313 was special. Unconfigured + a VMID in the command = RED.
+ */
+static bool     linux_protected_vmids_configured;
+
+static const char *const REASON_PROX_METACHAR =
+    "shell metacharacter refused — one plain command per request";
+static const char *const REASON_PROX_CHARSET =
+    "illegal byte in Proxmox argument — refused";
+static const char *const REASON_PROX_VMID_FORM =
+    "VMID expected and unparseable — refused rather than classified by verb";
+static const char *const REASON_PROX_PROTECTED =
+    "protected VMID — this guest runs a VIRP gate and is refused at every tier";
+static const char *const REASON_PROX_NO_SET =
+    "protected_vmids is not configured for this device — VMID-bearing "
+    "Proxmox commands are refused until it is";
+static const char *const REASON_PROX_DESTROY =
+    "guest destruction — use propose/approve/apply";
+static const char *const REASON_PROX_GUEST_EXEC =
+    "qm guest exec runs arbitrary commands inside a guest — a classifier "
+    "bypass by proxy";
+
+/*
+ * Register protected VMIDs from one device's config. `csv` is a
+ * comma-separated decimal list ("313" / "313,400"); empty or NULL
+ * declares nothing and leaves the registry untouched.
+ *
+ * Returns 0 on success, -1 if the list is unparseable or overflows, in
+ * which case `configured` is NOT set — a config the loader could not
+ * understand must not be mistaken for a config that protects nothing.
+ * Every VMID-bearing Proxmox command then classifies RED.
+ *
+ * Non-static: called by the device loader (virp_onode_prod.c) and by
+ * tests/test_driver_linux_gate.c.
+ */
+int linux_gate_set_protected_vmids(const char *csv)
+{
+    if (!csv || !*csv) return 0;
+
+    /* Parse into a scratch list first: a list that fails halfway must
+     * not leave half of itself registered. */
+    uint32_t parsed[LINUX_PROTECTED_VMID_MAX];
+    size_t   n = 0;
+
+    for (const char *p = csv; *p; ) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+
+        uint64_t v = 0;
+        size_t digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (uint64_t)(*p - '0');
+            if (v > 0xFFFFFFFFull) return -1;   /* not a VMID */
+            digits++;
+            p++;
+        }
+        if (digits == 0) return -1;             /* non-numeric entry */
+        while (*p == ' ') p++;
+        if (*p && *p != ',') return -1;         /* trailing junk */
+
+        if (n >= LINUX_PROTECTED_VMID_MAX) return -1;
+        parsed[n++] = (uint32_t)v;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        bool dup = false;
+        for (size_t j = 0; j < linux_protected_vmid_count; j++)
+            if (linux_protected_vmids[j] == parsed[i]) { dup = true; break; }
+        if (dup) continue;
+        if (linux_protected_vmid_count >= LINUX_PROTECTED_VMID_MAX) return -1;
+        linux_protected_vmids[linux_protected_vmid_count++] = parsed[i];
+    }
+
+    linux_protected_vmids_configured = true;
+    return 0;
+}
+
+/* Test-only reset — the daemon never calls this. */
+void linux_gate_clear_protected_vmids(void)
+{
+    linux_protected_vmid_count = 0;
+    linux_protected_vmids_configured = false;
+}
+
+static bool linux_prox_is_protected(uint32_t vmid)
+{
+    for (size_t i = 0; i < linux_protected_vmid_count; i++)
+        if (linux_protected_vmids[i] == vmid) return true;
+    return false;
+}
+
+/* Step 1 — raw metacharacter scan. See the branch header: this runs on
+ * the ORIGINAL bytes, before tokenizing, and is the reason a compound
+ * command can never prefix-match a GREEN row. */
+static bool linux_prox_has_metachar(const char *raw)
+{
+    for (const unsigned char *p = (const unsigned char *)raw; *p; p++) {
+        if (*p < 0x20 || *p == 0x7F) return true;   /* newline, all controls */
+        if (*p == ';' || *p == '|' || *p == '&' || *p == '`' ||
+            *p == '>' || *p == '<')
+            return true;
+        if (*p == '$' && (p[1] == '(' || p[1] == '{')) return true;
+    }
+    return false;
+}
+
+/* Step 2 — argument charset. */
+static bool linux_prox_charset_ok(const char *canon)
+{
+    for (const char *p = canon; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') ||
+            *p == ' ' || *p == '.' || *p == '_' || *p == '/' ||
+            *p == ':' || *p == '=' || *p == ',' || *p == '-')
+            continue;
+        return false;
+    }
+    return true;
+}
+
+typedef struct {
+    const char *p;
+    size_t      len;
+} prox_tok_t;
+
+/* Split the space-normalized canon into tokens. Returns the count, or
+ * (size_t)-1 if the command carries more tokens than the table will
+ * consider (RED — an argument vector that long is not a read). */
+static size_t linux_prox_split(const char *canon, prox_tok_t *out, size_t max)
+{
+    size_t n = 0;
+    const char *p = canon;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != ' ') p++;
+        if (n >= max) return (size_t)-1;
+        out[n].p = start;
+        out[n].len = (size_t)(p - start);
+        n++;
+    }
+    return n;
+}
+
+static bool prox_tok_eq(const prox_tok_t *t, const char *s)
+{
+    return strlen(s) == t->len && strncmp(t->p, s, t->len) == 0;
+}
+
+static bool prox_tok_in(const prox_tok_t *t, const char *const *set, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        if (prox_tok_eq(t, set[i])) return true;
+    return false;
+}
+
+/* A VMID is a non-empty run of decimal digits and NOTHING else — no
+ * sign, no whitespace, no name. "313x", "0x139", "-1" and "" all fail,
+ * and a failure at an expected position is RED, never a fall-through. */
+static bool prox_parse_vmid(const prox_tok_t *t, uint32_t *out)
+{
+    if (t->len == 0 || t->len > 9) return false;
+    uint32_t v = 0;
+    for (size_t i = 0; i < t->len; i++) {
+        if (t->p[i] < '0' || t->p[i] > '9') return false;
+        v = v * 10 + (uint32_t)(t->p[i] - '0');
+    }
+    *out = v;
+    return true;
+}
+
+typedef enum {
+    PROX_VMID_NONE = 0,     /* no VMID involved — nothing to protect */
+    PROX_VMID_CLEAR,        /* VMID(s) parsed, none protected */
+    PROX_VMID_PROTECTED,    /* a protected VMID is a target */
+    PROX_VMID_BAD,          /* a VMID was expected here and did not parse */
+    PROX_VMID_UNCONFIGURED, /* a VMID is present, no protected set declared */
+} prox_vmid_verdict_t;
+
+/*
+ * Step 3 — SELF-PROTECTION, before any tier is assigned.
+ *
+ * `qm stop 313` is, on any other guest, an ordinary bounded YELLOW
+ * action. On 313 it is the gate powering itself off, and no tier
+ * arithmetic downstream can distinguish the two — so the VMID is judged
+ * first, and its RED is not a tier that something else can outrank.
+ *
+ * VMID positions recognised:
+ *   qm|pct <verb> <vmid>                verb != list, argv position 2
+ *   pvesh <m> /nodes/<node>/qemu/<vmid> segment after qemu/ or lxc/
+ *   pvesh <m> /nodes/<node>/lxc/<vmid>
+ *
+ * Two deliberate over-reaches, both in the refusing direction:
+ *
+ *   - EVERY purely-numeric token after a qm/pct verb is checked, not
+ *     just argv[2]. `qm clone 100 313` names its destination in argv[3]
+ *     and `qm migrate` names targets further right; a rule that only
+ *     looked at the documented position would let the protected VMID
+ *     through as an argument. The cost is that `qm set 100 --memory 313`
+ *     also refuses. That is the correct trade — a wrong refusal is a
+ *     config edit, a wrong permit is the gate.
+ *   - vzdump's numeric arguments are checked the same way even though
+ *     vzdump is not a per-VMID verb in the requirement, because
+ *     `vzdump 313` does name the protected guest.
+ *
+ * An EXPECTED-but-unparseable VMID is PROX_VMID_BAD → RED. It never
+ * falls through to the verb tier: `qm stop notanumber` must not become
+ * "well, the verb is YELLOW".
+ */
+static prox_vmid_verdict_t linux_prox_self_protect(const prox_tok_t *tok,
+                                                   size_t ntok)
+{
+    if (ntok == 0) return PROX_VMID_NONE;
+
+    bool saw_vmid = false;
+
+    if (prox_tok_eq(&tok[0], "qm") || prox_tok_eq(&tok[0], "pct")) {
+        if (ntok < 2) return PROX_VMID_NONE;        /* bare `qm` — RED later */
+        if (prox_tok_eq(&tok[1], "list")) return PROX_VMID_NONE;
+
+        /* Every qm/pct verb takes the VMID at argv position 2, except
+         * the guest-agent subtree, which spells it one further right
+         * (`qm guest exec <vmid> …`, `qm guest cmd <vmid> …`). That
+         * subtree is RED on its own row below; the position is still
+         * resolved here so a protected VMID is named as such rather
+         * than reported as a malformed argument. */
+        size_t vpos = (prox_tok_eq(&tok[0], "qm") &&
+                       prox_tok_eq(&tok[1], "guest")) ? 3 : 2;
+        if (ntok <= vpos) return PROX_VMID_BAD;
+        uint32_t vmid;
+        if (!prox_parse_vmid(&tok[vpos], &vmid)) return PROX_VMID_BAD;
+        saw_vmid = true;
+
+        for (size_t i = vpos; i < ntok; i++) {
+            uint32_t v;
+            if (!prox_parse_vmid(&tok[i], &v)) continue;
+            if (linux_protected_vmids_configured && linux_prox_is_protected(v))
+                return PROX_VMID_PROTECTED;
+        }
+    } else if (prox_tok_eq(&tok[0], "pvesh")) {
+        if (ntok < 3) return PROX_VMID_NONE;        /* malformed — RED later */
+
+        /* Walk the path segment by segment; the segment following a
+         * `qemu` or `lxc` segment is the VMID. Anchoring on the parent
+         * segment rather than on a fixed offset keeps this correct for
+         * both /nodes/<node>/qemu/<vmid> and any longer path that
+         * carries the same pair (…/qemu/<vmid>/status/stop). */
+        const char *path = tok[2].p;
+        size_t plen = tok[2].len;
+        size_t i = 0;
+        while (i < plen) {
+            while (i < plen && path[i] == '/') i++;
+            size_t start = i;
+            while (i < plen && path[i] != '/') i++;
+            size_t seglen = i - start;
+            bool is_qemu = (seglen == 4 && strncmp(path + start, "qemu", 4) == 0);
+            bool is_lxc  = (seglen == 3 && strncmp(path + start, "lxc", 3) == 0);
+            if (!is_qemu && !is_lxc) continue;
+
+            /* Next segment must be the VMID. */
+            while (i < plen && path[i] == '/') i++;
+            size_t vstart = i;
+            while (i < plen && path[i] != '/') i++;
+            prox_tok_t vt = { path + vstart, i - vstart };
+            uint32_t vmid;
+            if (!prox_parse_vmid(&vt, &vmid)) return PROX_VMID_BAD;
+            saw_vmid = true;
+            if (linux_protected_vmids_configured && linux_prox_is_protected(vmid))
+                return PROX_VMID_PROTECTED;
+        }
+    } else if (prox_tok_eq(&tok[0], "vzdump")) {
+        for (size_t i = 1; i < ntok; i++) {
+            uint32_t v;
+            if (!prox_parse_vmid(&tok[i], &v)) continue;
+            saw_vmid = true;
+            if (linux_protected_vmids_configured && linux_prox_is_protected(v))
+                return PROX_VMID_PROTECTED;
+        }
+    }
+
+    if (!saw_vmid) return PROX_VMID_NONE;
+    if (!linux_protected_vmids_configured) return PROX_VMID_UNCONFIGURED;
+    return PROX_VMID_CLEAR;
+}
+
+/* Is `canon`'s first word one of the Proxmox tools this table covers?
+ * Anything else is not a Proxmox command and never enters the branch. */
+static bool linux_prox_is_tool(const char *canon)
+{
+    static const char *const TOOLS[] = {
+        "qm", "pct", "pvesh", "pveversion", "pvecm", "pvesm", "vzdump",
+    };
+    for (size_t i = 0; i < sizeof(TOOLS) / sizeof(TOOLS[0]); i++)
+        if (tok_prefix(canon, TOOLS[i])) return true;
+    return false;
+}
+
+/* qm/pct verbs that mutate a guest but stay bounded and reversible. */
+static const char *const PROX_GUEST_YELLOW_VERBS[] = {
+    "start", "stop", "shutdown", "reboot", "suspend", "resume",
+    "create", "set", "clone", "migrate",
+};
+/* qm/pct verbs that only read one guest's state. */
+static const char *const PROX_GUEST_GREEN_VERBS[] = { "status", "config" };
+
+/*
+ * Proxmox branch of linux_gate_classify(). `command` is the raw request
+ * bytes, `canon` the whitespace-collapsed copy the FRR table also uses.
+ */
+static virp_trust_tier_t linux_prox_classify(const char *command,
+                                             const char *canon,
+                                             const char **reason)
+{
+    /* 1 — raw metacharacters, before anything is tokenized or matched. */
+    if (linux_prox_has_metachar(command)) {
+        if (reason) *reason = REASON_PROX_METACHAR;
+        return VIRP_TIER_RED;
+    }
+
+    /* 2 — argument charset. */
+    if (!linux_prox_charset_ok(canon)) {
+        if (reason) *reason = REASON_PROX_CHARSET;
+        return VIRP_TIER_RED;
+    }
+
+    prox_tok_t tok[LINUX_PROX_MAX_TOK];
+    size_t ntok = linux_prox_split(canon, tok, LINUX_PROX_MAX_TOK);
+    if (ntok == (size_t)-1 || ntok == 0)
+        return VIRP_TIER_RED;
+
+    /* 3 — self-protection, ahead of every tier row. */
+    switch (linux_prox_self_protect(tok, ntok)) {
+    case PROX_VMID_PROTECTED:
+        if (reason) *reason = REASON_PROX_PROTECTED;
+        return VIRP_TIER_RED;
+    case PROX_VMID_BAD:
+        if (reason) *reason = REASON_PROX_VMID_FORM;
+        return VIRP_TIER_RED;
+    case PROX_VMID_UNCONFIGURED:
+        if (reason) *reason = REASON_PROX_NO_SET;
+        return VIRP_TIER_RED;
+    case PROX_VMID_NONE:
+    case PROX_VMID_CLEAR:
+        break;
+    }
+
+    bool is_qm  = prox_tok_eq(&tok[0], "qm");
+    bool is_pct = prox_tok_eq(&tok[0], "pct");
+
+    /* 4a — RED rows, with the teaching reason, before any permit. */
+    if ((is_qm || is_pct) && ntok >= 2) {
+        if (prox_tok_eq(&tok[1], "destroy")) {
+            if (reason) *reason = REASON_PROX_DESTROY;
+            return VIRP_TIER_RED;
+        }
+        /* `qm guest exec` is arbitrary execution inside the guest: it
+         * would carry an unclassified command through a classified one,
+         * so the gate would be signing "ran a classified command" over a
+         * payload it never saw. The whole `guest` subtree is refused
+         * rather than just `exec` — the bypass is the subtree's purpose,
+         * not one verb's.
+         *
+         * pct's container equivalents (`pct exec`, `pct enter`) are the
+         * same bypass and were already RED by absence; naming them here
+         * only changes which reason the signed refusal carries, never
+         * the tier. */
+        if (is_qm && prox_tok_eq(&tok[1], "guest")) {
+            if (reason) *reason = REASON_PROX_GUEST_EXEC;
+            return VIRP_TIER_RED;
+        }
+        if (is_pct && (prox_tok_eq(&tok[1], "exec") ||
+                       prox_tok_eq(&tok[1], "enter"))) {
+            if (reason) *reason = REASON_PROX_GUEST_EXEC;
+            return VIRP_TIER_RED;
+        }
+    }
+    if (prox_tok_eq(&tok[0], "pvesh") && ntok >= 2 &&
+        prox_tok_eq(&tok[1], "delete")) {
+        if (reason) *reason = REASON_PROX_DESTROY;
+        return VIRP_TIER_RED;
+    }
+
+    /* 4b — GREEN reads. Each is an exact shape, not a prefix: a trailing
+     * argument the table has not reasoned about drops to RED by absence
+     * rather than riding a permitted verb. */
+    if (ntok == 1 && prox_tok_eq(&tok[0], "pveversion"))
+        return VIRP_TIER_GREEN;
+    if (ntok == 2 && (is_qm || is_pct) && prox_tok_eq(&tok[1], "list"))
+        return VIRP_TIER_GREEN;
+    if (ntok == 2 && prox_tok_eq(&tok[0], "pvecm") &&
+        (prox_tok_eq(&tok[1], "status") || prox_tok_eq(&tok[1], "nodes")))
+        return VIRP_TIER_GREEN;
+    if (ntok == 2 && prox_tok_eq(&tok[0], "pvesm") &&
+        prox_tok_eq(&tok[1], "status"))
+        return VIRP_TIER_GREEN;
+    /* <vmid> already parsed and cleared by self-protection above. */
+    if (ntok == 3 && (is_qm || is_pct) &&
+        prox_tok_in(&tok[1], PROX_GUEST_GREEN_VERBS,
+                    sizeof(PROX_GUEST_GREEN_VERBS) /
+                    sizeof(PROX_GUEST_GREEN_VERBS[0])))
+        return VIRP_TIER_GREEN;
+
+    if (prox_tok_eq(&tok[0], "pvesh") && ntok >= 2) {
+        bool path_ok = ntok >= 3 && tok[2].len > 0 && tok[2].p[0] == '/';
+
+        if (prox_tok_eq(&tok[1], "get") && ntok == 3 && path_ok) {
+            /*
+             * The access tree is a read that returns credential
+             * material — user records, token ids, ACLs, realm
+             * configuration. An observation body is HMAC-signed and
+             * appended to a chain that cannot be trimmed, so a GREEN
+             * `pvesh get /access/users` would durably commit that
+             * material into the chain on the strength of it being
+             * "a read". YELLOW instead: still reachable, but through
+             * propose/approve/apply where a human sees what is about
+             * to be signed.
+             *
+             * Matched as a plain "/access" prefix rather than segment-
+             * wise on purpose — a hypothetical /accessfoo classifying
+             * YELLOW is a stricter answer, and stricter is the side to
+             * be wrong on.
+             */
+            if (strncmp(tok[2].p, "/access", 7) == 0 && tok[2].len >= 7)
+                return VIRP_TIER_YELLOW;
+            return VIRP_TIER_GREEN;
+        }
+
+        /* 4c — pvesh writes. Trailing parameters are expected here (a
+         * create/set carries its arguments), so the shape is a minimum
+         * rather than an exact token count. */
+        if ((prox_tok_eq(&tok[1], "create") || prox_tok_eq(&tok[1], "set")) &&
+            path_ok)
+            return VIRP_TIER_YELLOW;
+
+        return VIRP_TIER_RED;   /* unlisted pvesh method — fail closed */
+    }
+
+    /* 4c (cont.) — bounded guest actions. */
+    if (ntok >= 3 && (is_qm || is_pct) &&
+        prox_tok_in(&tok[1], PROX_GUEST_YELLOW_VERBS,
+                    sizeof(PROX_GUEST_YELLOW_VERBS) /
+                    sizeof(PROX_GUEST_YELLOW_VERBS[0])))
+        return VIRP_TIER_YELLOW;
+
+    if (prox_tok_eq(&tok[0], "vzdump"))
+        return VIRP_TIER_YELLOW;
+
+    return VIRP_TIER_RED;   /* unlisted Proxmox command — fail closed */
+}
+
 /*
  * Core classification. `reason` (optional) receives a static string for
  * rows that carry an instructive rejection reason, NULL otherwise.
@@ -947,6 +1480,13 @@ virp_trust_tier_t linux_gate_classify(const char *command, const char **reason)
 
         return VIRP_TIER_RED;   /* unlisted vtysh command — fail closed */
     }
+
+    /* Proxmox VE rows — entered only when the first word is one of the
+     * enumerated Proxmox tools, so no FRR or bare-shell command reaches
+     * this table. Every path out of it returns; nothing falls through to
+     * the rows below. */
+    if (linux_prox_is_tool(canon))
+        return linux_prox_classify(command, canon, reason);
 
     /* Peer-health reads — exact match, checked before the bare-shell RED
      * rows so an enumerated peer probe classifies GREEN while every

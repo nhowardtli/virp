@@ -22,6 +22,8 @@
 virp_trust_tier_t linux_gate_classify(const char *command, const char **reason);
 virp_trust_tier_t linux_gate_tier(const char *command);
 const char *linux_gate_reason(const char *command);
+int  linux_gate_set_protected_vmids(const char *csv);
+void linux_gate_clear_protected_vmids(void);
 
 static int tests_run = 0, tests_passed = 0;
 #define TEST(name) do { tests_run++; printf("  [%d] %s ... ", tests_run, name); } while(0)
@@ -441,6 +443,439 @@ static void test_peer_health_rows(void)
     PASS();
 }
 
+/* =========================================================================
+ * Proxmox VE rows
+ *
+ * pve-lab is a `linux` device, so the Proxmox table lives behind the same
+ * classifier. The protected-VMID set is NOT a constant in the driver — it
+ * arrives from devices.json via linux_gate_set_protected_vmids() — so
+ * every Proxmox test here declares it first, the way the daemon's device
+ * loader does at startup. 313 is this node's own VM.
+ * ========================================================================= */
+
+static void prox_setup(void)
+{
+    linux_gate_clear_protected_vmids();
+    assert(linux_gate_set_protected_vmids("313") == 0);
+}
+
+static void test_prox_metachar_guard(void)
+{
+    printf("\n=== Proxmox — raw metacharacter scan runs before any row ===\n");
+    prox_setup();
+
+    /* The whole reason the scan is first: "qm list" IS a GREEN row, so a
+     * prefix match that ran ahead of the scan would classify the compound
+     * string on the strength of its first two words. */
+    TEST("qm list; rm -rf / -> RED (never prefix-matches the GREEN row)");
+    assert_red_blocked("qm list; rm -rf /");
+    {
+        const char *why = linux_gate_reason("qm list; rm -rf /");
+        assert(why != NULL && strstr(why, "metacharacter") != NULL);
+    }
+    PASS();
+
+    TEST("pipe -> RED");
+    assert_red_blocked("qm list | sh");
+    PASS();
+
+    TEST("ampersand -> RED");
+    assert_red_blocked("qm list & wget evil");
+    PASS();
+
+    TEST("command substitution $( -> RED");
+    assert_red_blocked("qm status $(id)");
+    PASS();
+
+    TEST("backtick -> RED");
+    assert_red_blocked("qm status `id`");
+    PASS();
+
+    /* > and < are NOT in virp_command_check_separators — this row is the
+     * only thing refusing them, which is why the scan is repeated in full
+     * inside the Proxmox branch rather than delegated. */
+    TEST("output redirection -> RED");
+    assert_red_blocked("qm list > /etc/cron.d/pwn");
+    PASS();
+
+    TEST("input redirection -> RED");
+    assert_red_blocked("qm list < /etc/shadow");
+    PASS();
+
+    TEST("newline -> RED");
+    assert_red_blocked("qm list\nrm -rf /");
+    PASS();
+
+    TEST("illegal byte in argument -> RED (charset)");
+    assert_red_blocked("qm config 100 --name a*b");
+    PASS();
+}
+
+static void test_prox_green(void)
+{
+    printf("\n=== Proxmox GREEN — reads ===\n");
+    prox_setup();
+
+    TEST("qm list -> GREEN");
+    assert(linux_gate_tier("qm list") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("pct list -> GREEN");
+    assert(linux_gate_tier("pct list") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("pveversion -> GREEN");
+    assert(linux_gate_tier("pveversion") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("pvecm status / pvecm nodes -> GREEN");
+    assert(linux_gate_tier("pvecm status") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvecm nodes") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("pvesm status -> GREEN");
+    assert(linux_gate_tier("pvesm status") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("qm status / qm config <vmid> -> GREEN");
+    assert(linux_gate_tier("qm status 100") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("qm config 100") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("pct status / pct config <vmid> -> GREEN");
+    assert(linux_gate_tier("pct status 200") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pct config 200") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("pvesh get <path> -> GREEN");
+    assert(linux_gate_tier("pvesh get /nodes/pve-lab/qemu/100/config")
+           == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesh get /cluster/resources") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("GREEN rows carry no teaching reason");
+    assert(linux_gate_reason("qm list") == NULL);
+    assert(linux_gate_reason("pvesh get /cluster/resources") == NULL);
+    PASS();
+
+    /* Exact shapes, not prefixes: an argument the table has not reasoned
+     * about must not ride a permitted verb. */
+    TEST("trailing argument on a GREEN row -> RED by absence");
+    assert_red_blocked("qm list --full");
+    assert_red_blocked("pvecm status extra");
+    assert_red_blocked("pvesh get /cluster/resources --output-format json");
+    PASS();
+
+    TEST("uppercase spelling -> RED (no case folding, as in the FRR table)");
+    assert_red_blocked("QM LIST");
+    assert_red_blocked("qm LIST");
+    PASS();
+}
+
+static void test_prox_yellow(void)
+{
+    printf("\n=== Proxmox YELLOW — bounded actions ===\n");
+    prox_setup();
+
+    TEST("qm start|stop|shutdown|reboot|suspend|resume <vmid> -> YELLOW");
+    assert(linux_gate_tier("qm start 100") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm stop 100") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm shutdown 100") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm reboot 100") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm suspend 100") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm resume 100") == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("qm create|set|clone|migrate -> YELLOW");
+    assert(linux_gate_tier("qm create 150 --memory 2048") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm set 100 --onboot 1") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm clone 100 101") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm migrate 100 pve2") == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("pct equivalents -> YELLOW");
+    assert(linux_gate_tier("pct start 200") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pct shutdown 200") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pct migrate 200 pve2") == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("pvesh create|set -> YELLOW");
+    assert(linux_gate_tier("pvesh create /nodes/pve-lab/qemu/100/status/start")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pvesh set /nodes/pve-lab/qemu/100/config --onboot 1")
+           == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("vzdump -> YELLOW");
+    assert(linux_gate_tier("vzdump 100 --storage local") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("vzdump --all") == VIRP_TIER_YELLOW);
+    PASS();
+
+    /*
+     * The access tree is a READ that returns credential material, and an
+     * observation body is signed into a chain that cannot be trimmed —
+     * so it is deliberately not GREEN. Asserted as "not GREEN" as well as
+     * "== YELLOW": the requirement is that it never rides the read row,
+     * and that half must survive any future retiering.
+     */
+    TEST("pvesh get /access/... -> YELLOW, and never GREEN");
+    assert(linux_gate_tier("pvesh get /access/users") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pvesh get /access/users") != VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesh get /access") != VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesh get /access/roles") != VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesh get /access/users/root@pam/token")
+           != VIRP_TIER_GREEN);
+    PASS();
+}
+
+static void test_prox_red(void)
+{
+    printf("\n=== Proxmox RED — destruction and execution-by-proxy ===\n");
+    prox_setup();
+
+    TEST("qm destroy / pct destroy -> RED");
+    assert_red_blocked("qm destroy 100");
+    assert_red_blocked("pct destroy 200");
+    {
+        const char *why = linux_gate_reason("qm destroy 100");
+        assert(why != NULL && strstr(why, "destruction") != NULL);
+    }
+    PASS();
+
+    TEST("pvesh delete -> RED");
+    assert_red_blocked("pvesh delete /nodes/pve-lab/qemu/100");
+    PASS();
+
+    /* Arbitrary execution inside a guest is a classifier bypass by
+     * proxy: the gate would sign "ran a classified command" over a
+     * payload it never classified. */
+    TEST("qm guest exec -> RED");
+    assert_red_blocked("qm guest exec 100 rm -rf /");
+    {
+        const char *why = linux_gate_reason("qm guest exec 100 ls");
+        assert(why != NULL && strstr(why, "bypass") != NULL);
+    }
+    PASS();
+
+    TEST("pct exec / pct enter (the container equivalents) -> RED");
+    assert_red_blocked("pct exec 200 rm -rf /");
+    assert_red_blocked("pct enter 200");
+    PASS();
+
+    TEST("unlisted pvesh method -> RED by absence");
+    assert_red_blocked("pvesh ls /nodes");
+    assert_red_blocked("pvesh usage /nodes");
+    PASS();
+
+    TEST("unlisted Proxmox verb -> RED by absence");
+    assert_red_blocked("qm rescan");
+    assert_red_blocked("qm unlock 100");
+    assert_red_blocked("pveceph status");
+    PASS();
+
+    TEST("bare tool with no verb -> RED");
+    assert_red_blocked("qm");
+    assert_red_blocked("pvesh");
+    assert_red_blocked("pvesh get");
+    PASS();
+
+    TEST("pvesh path that is not a path -> RED");
+    assert_red_blocked("pvesh get nodes");
+    PASS();
+}
+
+/*
+ * SELF-PROTECTION — the row this classifier exists for.
+ *
+ * `qm stop 313` is an ordinary bounded YELLOW action on any other guest
+ * and is this gate powering itself off on 313. Nothing downstream can
+ * tell the two apart, so the VMID is judged before a tier exists, and
+ * its RED cannot be outranked by a permitted verb.
+ */
+static void test_prox_self_protection(void)
+{
+    printf("\n=== Proxmox SELF-PROTECTION — protected VMIDs ===\n");
+    prox_setup();
+
+    TEST("qm stop 313 -> RED (the requirement, stated plainly)");
+    assert_red_blocked("qm stop 313");
+    {
+        const char *why = linux_gate_reason("qm stop 313");
+        assert(why != NULL && strstr(why, "protected VMID") != NULL);
+    }
+    PASS();
+
+    TEST("protected VMID is RED at every verb, including the GREEN reads");
+    assert_red_blocked("qm status 313");
+    assert_red_blocked("qm config 313");
+    assert_red_blocked("qm start 313");
+    assert_red_blocked("qm shutdown 313");
+    assert_red_blocked("qm destroy 313");
+    assert_red_blocked("qm migrate 313 pve2");
+    PASS();
+
+    TEST("pct rows honour the same set");
+    assert_red_blocked("pct stop 313");
+    assert_red_blocked("pct status 313");
+    PASS();
+
+    TEST("pvesh /nodes/*/qemu/313 -> RED");
+    assert_red_blocked("pvesh get /nodes/pve-lab/qemu/313/config");
+    assert_red_blocked("pvesh create /nodes/pve-lab/qemu/313/status/stop");
+    assert_red_blocked("pvesh delete /nodes/pve-lab/qemu/313");
+    PASS();
+
+    TEST("pvesh /nodes/*/lxc/313 -> RED");
+    assert_red_blocked("pvesh get /nodes/pve-lab/lxc/313/config");
+    PASS();
+
+    /* argv[2] is the documented VMID position, but `qm clone 100 313`
+     * names the protected id in argv[3] and `vzdump 313` names it with no
+     * verb at all. Every numeric argument is checked. */
+    TEST("protected VMID in a non-leading argument -> RED");
+    assert_red_blocked("qm clone 100 313");
+    assert_red_blocked("vzdump 313");
+    PASS();
+
+    TEST("qm guest exec against the protected VMID -> RED");
+    assert_red_blocked("qm guest exec 313 poweroff");
+    PASS();
+
+    TEST("unprotected VMIDs are unaffected (control)");
+    assert(linux_gate_tier("qm stop 100") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm status 100") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesh get /nodes/pve-lab/qemu/3130/config")
+           == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("the set is config-driven, not a constant — add 400, 400 goes RED");
+    assert(linux_gate_tier("qm stop 400") == VIRP_TIER_YELLOW);
+    assert(linux_gate_set_protected_vmids("400") == 0);
+    assert_red_blocked("qm stop 400");
+    assert_red_blocked("qm stop 313");        /* union, not replacement */
+    prox_setup();
+    PASS();
+
+    TEST("unparseable protected_vmids is refused, and protects nothing");
+    linux_gate_clear_protected_vmids();
+    assert(linux_gate_set_protected_vmids("313,notanumber") != 0);
+    assert(linux_gate_set_protected_vmids("313 400") != 0);
+    prox_setup();
+    PASS();
+}
+
+/*
+ * A VMID position that is EXPECTED but does not parse is RED — it never
+ * falls through to "well, the verb is YELLOW". Without this, an argument
+ * the classifier could not read would be judged by the only part of the
+ * command it could.
+ */
+static void test_prox_unparseable_vmid(void)
+{
+    printf("\n=== Proxmox — expected-but-unparseable VMID -> RED ===\n");
+    prox_setup();
+
+    TEST("qm stop notanumber -> RED (not YELLOW on the verb)");
+    assert(linux_gate_tier("qm stop notanumber") == VIRP_TIER_RED);
+    {
+        const char *why = linux_gate_reason("qm stop notanumber");
+        assert(why != NULL && strstr(why, "VMID") != NULL);
+    }
+    PASS();
+
+    TEST("qm stop with no VMID at all -> RED");
+    assert_red_blocked("qm stop");
+    PASS();
+
+    TEST("partially-numeric VMID -> RED");
+    assert_red_blocked("qm status 31x");
+    assert_red_blocked("qm status 3.13");
+    assert_red_blocked("qm status -313");
+    PASS();
+
+    TEST("pvesh qemu/lxc path with an unparseable VMID -> RED");
+    assert_red_blocked("pvesh get /nodes/pve-lab/qemu/all/config");
+    assert_red_blocked("pvesh get /nodes/pve-lab/lxc//config");
+    assert_red_blocked("pvesh get /nodes/pve-lab/qemu");
+    PASS();
+
+    TEST("GREEN read of a well-formed VMID still works (control)");
+    assert(linux_gate_tier("qm status 100") == VIRP_TIER_GREEN);
+    PASS();
+}
+
+/*
+ * The set is configuration, so "not configured yet" is a real state and
+ * it must not read as "nothing is protected". An operator who has not
+ * added the field and one who added an empty list are making different
+ * claims; only the second one is a claim at all.
+ *
+ * Runs LAST among the Proxmox suites and restores the set on the way
+ * out, so it cannot leave the registry cleared under a later test.
+ */
+static void test_prox_unconfigured_is_closed(void)
+{
+    printf("\n=== Proxmox — unconfigured protected_vmids fails closed ===\n");
+    linux_gate_clear_protected_vmids();
+
+    TEST("VMID-bearing commands are RED with no protected set");
+    assert_red_blocked("qm stop 313");
+    assert_red_blocked("qm status 100");
+    assert_red_blocked("pvesh get /nodes/pve-lab/qemu/100/config");
+    {
+        const char *why = linux_gate_reason("qm stop 313");
+        assert(why != NULL && strstr(why, "protected_vmids") != NULL);
+    }
+    PASS();
+
+    TEST("commands with no VMID are unaffected");
+    assert(linux_gate_tier("qm list") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pveversion") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesm status") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesh get /cluster/resources") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("configuring the set restores the VMID rows");
+    prox_setup();
+    assert(linux_gate_tier("qm status 100") == VIRP_TIER_GREEN);
+    assert_red_blocked("qm stop 313");
+    PASS();
+}
+
+/*
+ * The Proxmox table is additive. The FRR rows, the peer rows and
+ * RED-by-absence for everything else must read exactly as they did
+ * before it existed.
+ */
+static void test_prox_does_not_broaden_frr(void)
+{
+    printf("\n=== Proxmox rows do not touch the FRR/peer/shell rows ===\n");
+    prox_setup();
+
+    TEST("FRR rows unchanged");
+    assert(linux_gate_tier("vtysh -c \"show ip ospf neighbor\"") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("vtysh -c \"show running-config\"") == VIRP_TIER_YELLOW);
+    assert_red_blocked("vtysh -c \"configure terminal\"");
+    PASS();
+
+    TEST("peer rows unchanged");
+    assert(linux_gate_tier("systemctl is-active virp-onode") == VIRP_TIER_GREEN);
+    PASS();
+
+    TEST("bare shell still RED by absence");
+    assert_red_blocked("uptime");
+    assert_red_blocked("cat /etc/passwd");
+    PASS();
+
+    /* Words that merely CONTAIN a tool name are not that tool: the
+     * branch is entered on a whole first word only. */
+    TEST("lookalike first words do not enter the Proxmox branch");
+    assert_red_blocked("qmrestore 100");
+    assert_red_blocked("pvesh-wrapper get /cluster/resources");
+    assert_red_blocked("nice qm list");
+    PASS();
+}
+
 /*
  * INVARIANT: this table never returns BLACK.
  *
@@ -481,6 +916,20 @@ static void test_never_returns_black(void)
         "systemctl stop virp-onode",
         "cat /var/lib/virp/autopilot/published.json",
         "cat /etc/virp/keys/onode.key",
+        /* Proxmox rows, across all three tiers */
+        "qm list",
+        "qm status 100",
+        "pvesh get /cluster/resources",
+        "pvesh get /access/users",
+        "qm stop 100",
+        "vzdump 100 --storage local",
+        "qm destroy 100",
+        "pvesh delete /nodes/pve-lab/qemu/100",
+        "qm guest exec 100 rm -rf /",
+        "qm stop 313",
+        "pvesh get /nodes/pve-lab/qemu/313/config",
+        "qm list; rm -rf /",
+        "qm stop notanumber",
         /* BLACK bait — destructive things a contributor might reach for */
         "rm -rf /",
         "dd if=/dev/zero of=/dev/sda",
@@ -535,6 +984,18 @@ static void test_gate_decisions(void)
     assert(gate_blocks_at_yellow(linux_gate_tier(
         "vtysh -c \"show ip ospf neighbor\"; rm -rf /etc/frr")));
     PASS();
+
+    /* The deployed threshold is YELLOW, so a Proxmox action tier passes
+     * and self-protection is the ONLY thing standing between the loop
+     * and its own gate. Asserted as a gate decision, not just a tier. */
+    TEST("Proxmox read and action pass, self-protected VMID blocks");
+    prox_setup();
+    assert(!gate_blocks_at_yellow(linux_gate_tier("qm list")));
+    assert(!gate_blocks_at_yellow(linux_gate_tier("qm stop 100")));
+    assert(gate_blocks_at_yellow(linux_gate_tier("qm stop 313")));
+    assert(gate_blocks_at_yellow(linux_gate_tier("qm destroy 100")));
+    assert(gate_blocks_at_yellow(linux_gate_tier("qm list; rm -rf /")));
+    PASS();
 }
 
 int main(void)
@@ -550,6 +1011,14 @@ int main(void)
     test_red_teaching_rows();
     test_red_by_absence();
     test_peer_health_rows();
+    test_prox_metachar_guard();
+    test_prox_green();
+    test_prox_yellow();
+    test_prox_red();
+    test_prox_self_protection();
+    test_prox_unparseable_vmid();
+    test_prox_unconfigured_is_closed();
+    test_prox_does_not_broaden_frr();
     test_never_returns_black();
     test_gate_decisions();
 

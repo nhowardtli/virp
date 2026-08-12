@@ -145,6 +145,29 @@ typedef struct {
      * around the mismatch. Empty = use `host` unchanged.
      */
     char            tls_servername[256];
+    /*
+     * Vendor-optional (Proxmox-on-linux) — zero-initialized elsewhere.
+     *
+     * protected_vmids: comma-separated decimal VMIDs on THIS host that
+     * the gate refuses to touch at any tier — in practice, the guest the
+     * O-Node itself runs in. `qm stop 313` is an ordinary bounded action
+     * on any other guest and is the gate switching itself off on that
+     * one, and no tier arithmetic downstream can tell the two apart.
+     *
+     * Loaded from devices.json as a JSON array ("protected_vmids":
+     * [313]) or as an equivalent comma-separated string, and normalized
+     * to CSV here to match datastore_allow / write_ops_allow. Absent →
+     * empty → the linux classifier refuses every VMID-bearing Proxmox
+     * command rather than treating "nobody said 313 was special" as
+     * "313 is not special" (see driver_linux.c's Proxmox table).
+     *
+     * Unlike write_ops_allow this cannot be enforced from the device
+     * struct at execute time: the refusal has to happen in the
+     * classifier, before a tier exists to be outranked. The loader
+     * therefore registers the value into the linux gate's union registry
+     * at startup — see linux_gate_set_protected_vmids().
+     */
+    char            protected_vmids[256];
 } virp_device_t;
 
 /* =========================================================================
