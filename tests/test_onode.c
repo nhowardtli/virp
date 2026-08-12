@@ -2828,6 +2828,484 @@ TEST(test_gate_rejection_reason_body_is_retained_and_matches_commitment)
 }
 
 /* =========================================================================
+ * GREEN auto-execution RECORDS (2026-08-12)
+ *
+ * The chain used to be a complete record of what the gate REFUSED and a
+ * blank on what it ALLOWED. GREEN executes with no human in the loop, so
+ * that blank covered exactly the actions nobody approved. The daemon now
+ * writes a gate_execution entry for every auto-executed action, in the
+ * same chain and the same "gate-enforce:<device>" session as the
+ * rejections, so executions and refusals interleave under one continuous
+ * prev-hash linkage.
+ *
+ * The entry commits to a DIGEST of the device response, never the
+ * response itself: GREEN output can carry credential material and the
+ * chain is tamper-evident and therefore not scrubbable, so storing bodies
+ * would make the ledger a secret store. These tests assert that property
+ * directly rather than trusting the code comment — a device response
+ * carrying a token-shaped string must reach the caller and must not reach
+ * the chain, while its digest must.
+ *
+ * As in the gate-reason test above, readback goes through SQLite: a
+ * reader is exactly what an evidence report is.
+ * ========================================================================= */
+
+#define GX_CHAIN_DB  "/tmp/virp-onode-test-gxchain.db"
+#define GX_CHAIN_KEY "/tmp/virp-onode-test-gxchain.key"
+#define GX_SESSION   "gate-enforce:PVE-LAB"
+#define GX_MAX_ROWS  12
+
+extern void virp_driver_mock_set_output(const char *text);
+
+static void gx_cleanup(void)
+{
+    unlink(GX_CHAIN_DB);
+    unlink(GX_CHAIN_DB "-wal");
+    unlink(GX_CHAIN_DB "-shm");
+    unlink(GX_CHAIN_KEY);
+}
+
+typedef struct {
+    long long seq;
+    char type[24];
+    char id[80];
+    char ahash[65];      /* entry's commitment            */
+    char ehash[65];      /* this entry's hash             */
+    char prev[65];       /* previous entry's hash         */
+    char body[4096];     /* stored artifact body, if any  */
+    int  have_body;
+} gx_row_t;
+
+static void gx_copy(char *dst, size_t cap, const unsigned char *src)
+{
+    snprintf(dst, cap, "%s", src ? (const char *)src : "");
+}
+
+/* Every entry of a session in sequence order, joined to its stored body.
+ * The join is on (artifact_id, artifact_hash) — the artifacts table's real
+ * key — so a row can never pick up a body belonging to a different
+ * commitment that happens to share an id. */
+static int gx_read_session(const char *session, gx_row_t *rows, int max)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open(GX_CHAIN_DB, &db) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT e.sequence, e.artifact_type, e.artifact_id, "
+            "       e.artifact_hash, e.chain_entry_hash, "
+            "       e.previous_entry_hash, a.artifact_content "
+            "FROM chain_entries e "
+            "LEFT JOIN artifacts a "
+            "       ON a.artifact_id = e.artifact_id "
+            "      AND a.artifact_hash = e.artifact_hash "
+            "WHERE e.session_id = ? "
+            "ORDER BY e.sequence ASC", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, session, -1, SQLITE_TRANSIENT);
+
+    int n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW) {
+        gx_row_t *r = &rows[n];
+        memset(r, 0, sizeof(*r));
+        r->seq = sqlite3_column_int64(st, 0);
+        gx_copy(r->type,  sizeof(r->type),  sqlite3_column_text(st, 1));
+        gx_copy(r->id,    sizeof(r->id),    sqlite3_column_text(st, 2));
+        gx_copy(r->ahash, sizeof(r->ahash), sqlite3_column_text(st, 3));
+        gx_copy(r->ehash, sizeof(r->ehash), sqlite3_column_text(st, 4));
+        gx_copy(r->prev,  sizeof(r->prev),  sqlite3_column_text(st, 5));
+        const unsigned char *b = sqlite3_column_text(st, 6);
+        if (b) {
+            r->have_body = 1;
+            gx_copy(r->body, sizeof(r->body), b);
+        }
+        n++;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+
+static int gx_bytes_contain(const void *hay, size_t hlen, const char *needle)
+{
+    return memmem(hay, hlen, needle, strlen(needle)) != NULL;
+}
+
+/* 1 = present, 0 = absent, -1 = file too big to scan. The -1 matters: a
+ * secret-absence assertion must never pass because the scan quietly gave
+ * up. */
+static int gx_file_contains(const char *path, const char *needle)
+{
+    static char buf[1 << 20];
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;                    /* -wal/-shm may not exist */
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    int overflow = !feof(f);
+    fclose(f);
+    if (overflow) return -1;
+    return (n > 0 && memmem(buf, n, needle, strlen(needle)) != NULL) ? 1 : 0;
+}
+
+/* ENFORCE at GREEN with the chain on and approvals off — the pve-lab
+ * posture. The approver registry path does not exist, so zero keys enroll,
+ * approval_dir stays empty and no proposals are filed: the session holds
+ * gate verdicts and nothing else. */
+static virp_error_t gx_setup(onode_state_t *st)
+{
+    gx_cleanup();
+
+    virp_signing_key_t ck;
+    virp_error_t e = virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN);
+    if (e != VIRP_OK) return e;
+    e = virp_key_save_file(&ck, GX_CHAIN_KEY);
+    virp_key_destroy(&ck);
+    if (e != VIRP_OK) return e;
+
+    e = onode_init(st, 0xDEAD0008, NULL, "/tmp/virp-onode-gxchain.sock");
+    if (e != VIRP_OK) return e;
+    st->ctx = virp_context_new();
+    if (!st->ctx) return VIRP_ERR_NULL_PTR;
+    st->gate_default_mode = GATE_MODE_ENFORCE;
+    st->gate_max_tier = VIRP_TIER_GREEN;
+
+    e = onode_setup_chain_and_approvals(st, 0xDEAD0008,
+                                        GX_CHAIN_DB, GX_CHAIN_KEY,
+                                        "/tmp/virp-onode-test-gxapprovals",
+                                        "/tmp/virp-onode-test-no-registry");
+    if (e != VIRP_OK) return e;
+    if (!st->chain_enabled) return VIRP_ERR_CHAIN_DB;
+    if (st->approvers_loaded) return VIRP_ERR_INVALID_TYPE;
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "PVE-LAB");
+    snprintf(dev.host, sizeof(dev.host), "10.0.0.98");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0BADCAFE;
+    dev.enabled = true;
+    return onode_add_device(st, &dev);
+}
+
+static void gx_teardown(onode_state_t *st)
+{
+    virp_context_t *ctx = st->ctx;
+    onode_destroy(st);              /* flush + close the chain */
+    virp_context_destroy(ctx);
+}
+
+/*
+ * A GREEN auto-execution leaves a signed, chained, prev-hash-linked
+ * gate_execution entry — the thing that was missing. The rejection filed
+ * first is what the execution must link to: same chain, same session.
+ */
+TEST(test_green_execution_chains_signed_observation)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+
+    /* Refused RED command, so the execution below has a prior entry. */
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "reload now",
+                            obs, sizeof(obs), &olen));
+
+    /* The GREEN auto-execution under test. */
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+
+    /* The caller still gets its O-Key-signed observation, unchanged. */
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    /* The whole session verifies: per-entry HMAC, continuous linkage, and
+     * the signed head record. */
+    virp_chain_verify_result_t vr;
+    ASSERT_OK(virp_chain_verify_session(&st.chain, GX_SESSION, &vr));
+    ASSERT_TRUE(vr.valid);
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+    ASSERT_EQ(n, 2);
+
+    ASSERT_EQ(strcmp(rows[0].type, "gate_rejection"), 0);
+    ASSERT_EQ(strcmp(rows[1].type, "gate_execution"), 0);
+
+    /* Interleaved in one chain with unbroken linkage. */
+    ASSERT_EQ((int)rows[1].seq, (int)rows[0].seq + 1);
+    ASSERT_EQ(strcmp(rows[1].prev, rows[0].ehash), 0);
+
+    /* Body retained and bound to the entry's commitment. */
+    ASSERT_TRUE(rows[1].have_body);
+    ASSERT_TRUE(rows[1].body[0] != '\0');
+    char recomputed[65];
+    gr_sha256_hex(rows[1].body, recomputed);
+    ASSERT_EQ(strcmp(recomputed, rows[1].ahash), 0);
+
+    ASSERT_TRUE(strncmp(rows[1].id, "gateexec-", 9) == 0);
+    ASSERT_TRUE(strstr(rows[1].body,
+                       "\"schema\":\"gate_execution/1\"") != NULL);
+    ASSERT_TRUE(strstr(rows[1].body, "\"device\":\"PVE-LAB\"") != NULL);
+    ASSERT_TRUE(strstr(rows[1].body, "\"driver\":\"mock\"") != NULL);
+    ASSERT_TRUE(strstr(rows[1].body,
+                       "\"command\":\"show version\"") != NULL);
+    ASSERT_TRUE(strstr(rows[1].body,
+                       "\"classified_tier\":\"GREEN\"") != NULL);
+    ASSERT_TRUE(strstr(rows[1].body,
+                       "\"decision\":\"auto-execute\"") != NULL);
+    ASSERT_TRUE(strstr(rows[1].body, "\"gate_mode\":\"ENFORCE\"") != NULL);
+    ASSERT_TRUE(strstr(rows[1].body, "\"executed\":true") != NULL);
+    ASSERT_TRUE(strstr(rows[1].body, "\"success\":true") != NULL);
+    ASSERT_TRUE(strstr(rows[1].body, "\"response_sha256\":\"") != NULL);
+
+    gx_cleanup();
+}
+
+/*
+ * THE SECRET-SAFETY PROPERTY, asserted directly.
+ *
+ * A GREEN device response carrying a token-shaped string goes back to the
+ * caller in full, and does NOT appear anywhere in the chain — not in the
+ * entry, not in the artifact body, not anywhere in the database file. Its
+ * sha256 does. That is the whole redaction posture in one test: the chain
+ * proves an output with this digest was produced at this position without
+ * becoming the place that output is stored.
+ */
+TEST(test_execution_record_commits_to_digest_not_response_body)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+
+    static const char TOKEN[] = "sk-live-DEADBEEFCAFEBABE0123456789";
+    char response[512];
+    snprintf(response, sizeof(response),
+             "root@pve-lab:~# qm status 100\n"
+             "status: stopped\n"
+             "PVE_API_TOKEN=%s\n", TOKEN);
+    virp_driver_mock_set_output(response);
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show status",
+                            obs, sizeof(obs), &olen));
+    virp_driver_mock_set_output(NULL);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    /* The caller DID receive the secret. Without this the test could pass
+     * because the response never carried the token in the first place. */
+    ASSERT_TRUE(gx_bytes_contain(obs, olen, TOKEN));
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(strcmp(rows[0].type, "gate_execution"), 0);
+    ASSERT_TRUE(rows[0].have_body);
+
+    /* The token is absent from every field of the chained entry… */
+    ASSERT_TRUE(strstr(rows[0].body,  TOKEN) == NULL);
+    ASSERT_TRUE(strstr(rows[0].id,    TOKEN) == NULL);
+    ASSERT_TRUE(strstr(rows[0].ahash, TOKEN) == NULL);
+
+    /* …and so is the rest of the response body: the entry does not store
+     * a scrubbed response, it stores no response. */
+    ASSERT_TRUE(strstr(rows[0].body, "status: stopped") == NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "PVE_API_TOKEN") == NULL);
+
+    /* …and it is nowhere in the database at all. */
+    ASSERT_EQ(gx_file_contains(GX_CHAIN_DB, TOKEN), 0);
+    ASSERT_EQ(gx_file_contains(GX_CHAIN_DB "-wal", TOKEN), 0);
+
+    /* What IS committed is the digest of the full raw response. */
+    char digest[65];
+    gr_sha256_hex(response, digest);
+    char want[128];
+    snprintf(want, sizeof(want), "\"response_sha256\":\"%s\"", digest);
+    ASSERT_TRUE(strstr(rows[0].body, want) != NULL);
+
+    /* …along with the length of the bytes that digest covers. */
+    char want_len[64];
+    snprintf(want_len, sizeof(want_len), "\"response_len\":%zu",
+             strlen(response));
+    ASSERT_TRUE(strstr(rows[0].body, want_len) != NULL);
+
+    /* The command IS retained — an execution record that omits what was
+     * executed is not a record. */
+    ASSERT_TRUE(strstr(rows[0].body, "\"command\":\"show status\"") != NULL);
+
+    /* And the body still binds to its commitment. */
+    char recomputed[65];
+    gr_sha256_hex(rows[0].body, recomputed);
+    ASSERT_EQ(strcmp(recomputed, rows[0].ahash), 0);
+
+    gx_cleanup();
+}
+
+/*
+ * An executed action that ERRORED still lands in the chain. A gap here
+ * would be the worst kind: the actions most worth auditing are the ones
+ * that went wrong, and a driver error is no proof the command never
+ * reached the device — so the record says executed=true and flags that
+ * the driver could not report what happened.
+ */
+TEST(test_errored_execution_still_chains_no_gap)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+
+    virp_driver_mock_set_forced_error(VIRP_ERR_CRYPTO);
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    virp_driver_mock_set_forced_error(VIRP_OK);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    virp_chain_verify_result_t vr;
+    ASSERT_OK(virp_chain_verify_session(&st.chain, GX_SESSION, &vr));
+    ASSERT_TRUE(vr.valid);
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+    ASSERT_EQ(n, 1);                     /* the failure IS recorded */
+    ASSERT_EQ(strcmp(rows[0].type, "gate_execution"), 0);
+    ASSERT_TRUE(rows[0].have_body);
+
+    ASSERT_TRUE(strstr(rows[0].body, "\"success\":false") != NULL);
+    /* No proof of non-dispatch: the record must not claim nothing ran. */
+    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":true") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"executed_reported\":false") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "driver execute failed") != NULL);
+    /* A digest is still committed — of the empty capture. */
+    ASSERT_TRUE(strstr(rows[0].body, "\"response_sha256\":\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"response_len\":0") != NULL);
+
+    char recomputed[65];
+    gr_sha256_hex(rows[0].body, recomputed);
+    ASSERT_EQ(strcmp(recomputed, rows[0].ahash), 0);
+
+    gx_cleanup();
+}
+
+/*
+ * REGRESSION: a refused action still chains a gate_rejection, exactly as
+ * before — same type, same artifact_id prefix, same schema, same
+ * executed=false — and mints no execution record.
+ */
+TEST(test_refused_action_still_chains_gate_rejection)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "reload now",
+                            obs, sizeof(obs), &olen));
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(strcmp(rows[0].type, "gate_rejection"), 0);
+    ASSERT_TRUE(strncmp(rows[0].id, "gatereject-", 11) == 0);
+    ASSERT_TRUE(rows[0].have_body);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"schema\":\"gate_rejection/1\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"command\":\"reload now\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"classified_tier\":\"RED\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":false") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "tier gate blocked") != NULL);
+    /* A refusal carries no execution fields. */
+    ASSERT_TRUE(strstr(rows[0].body, "response_sha256") == NULL);
+
+    char recomputed[65];
+    gr_sha256_hex(rows[0].body, recomputed);
+    ASSERT_EQ(strcmp(recomputed, rows[0].ahash), 0);
+
+    gx_cleanup();
+}
+
+/*
+ * The mixed run: executions and refusals interleaved in one session,
+ * every sequence present, every link intact, every body bound.
+ */
+TEST(test_chain_verify_over_mixed_executions_and_rejections)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "reload now",
+                            obs, sizeof(obs), &olen));
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show interfaces brief",
+                            obs, sizeof(obs), &olen));
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "erase startup-config",
+                            obs, sizeof(obs), &olen));
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "get status",
+                            obs, sizeof(obs), &olen));
+
+    virp_chain_verify_result_t vr;
+    ASSERT_OK(virp_chain_verify_session(&st.chain, GX_SESSION, &vr));
+    ASSERT_TRUE(vr.valid);
+    ASSERT_EQ((int)vr.entries_checked, 5);
+    ASSERT_EQ((int)vr.first_broken, -1);
+    /* Every entry retains a body that hashes to its commitment — no
+     * execution record is unverifiable. */
+    ASSERT_EQ((int)vr.artifacts_bound, 5);
+    ASSERT_EQ((int)vr.artifacts_unverifiable, 0);
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+    ASSERT_EQ(n, 5);
+
+    static const char *const want[5] = {
+        "gate_execution",   /* show version          — GREEN, executed */
+        "gate_rejection",   /* reload now            — RED, refused    */
+        "gate_execution",   /* show interfaces brief — GREEN, executed */
+        "gate_rejection",   /* erase startup-config  — RED, refused    */
+        "gate_execution",   /* get status            — GREEN, executed */
+    };
+    for (int i = 0; i < 5; i++) {
+        ASSERT_EQ(strcmp(rows[i].type, want[i]), 0);
+        ASSERT_EQ((int)rows[i].seq, i);
+        ASSERT_TRUE(rows[i].have_body);
+        char recomputed[65];
+        gr_sha256_hex(rows[i].body, recomputed);
+        ASSERT_EQ(strcmp(recomputed, rows[i].ahash), 0);
+        if (i > 0)
+            ASSERT_EQ(strcmp(rows[i].prev, rows[i - 1].ehash), 0);
+    }
+
+    gx_cleanup();
+}
+
+/* =========================================================================
  * hex_decode unit tests
  * ========================================================================= */
 
@@ -4573,6 +5051,13 @@ int main(void)
 
     printf("\n[Gate-reason retention (chain body recoverable)]\n");
     RUN_TEST(test_gate_rejection_reason_body_is_retained_and_matches_commitment);
+
+    printf("\n[GREEN auto-execution records (chain covers what was allowed)]\n");
+    RUN_TEST(test_green_execution_chains_signed_observation);
+    RUN_TEST(test_execution_record_commits_to_digest_not_response_body);
+    RUN_TEST(test_errored_execution_still_chains_no_gap);
+    RUN_TEST(test_refused_action_still_chains_gate_rejection);
+    RUN_TEST(test_chain_verify_over_mixed_executions_and_rejections);
 
     printf("\n[Gate observation-tier honesty (Item 1 hardening)]\n");
     RUN_TEST(test_gate_obs_tier_honesty);

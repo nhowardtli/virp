@@ -1018,9 +1018,27 @@ static void test_cli_exec_red_rejected_with_proposal(void)
 static void test_cli_chain_tail_format(void)
 {
     TEST("CLI: virp chain tail shows linked entries, oldest first");
-    char out[16384], cmd[512];
+    /*
+     * WINDOW (2026-08-12): -n was 50 with a 16 KiB buffer, which fit the
+     * suite's chain only while the daemon chained refusals and nothing
+     * else. Now that GREEN auto-executions are chained too (gate_execution
+     * — see gate_emit_execution in src/virp_onode.c), the suite's own
+     * `virp exec` calls put enough entries after the e2e proposal to push
+     * it out of a 50-row tail, and this test failed on a missing proposal
+     * that was present and correctly linked all along.
+     *
+     * Fixed by asking for the whole chain (-n 1000, the CLI maximum)
+     * rather than by picking a new number that today's entry count
+     * happens to clear: the assertion is about linkage and ordering, and
+     * it should never again fail because the ledger records more. The
+     * buffer is sized for 1000 rows at ~120 bytes each with headroom —
+     * run_cli truncates silently at out_len, so a short buffer would
+     * reintroduce exactly this failure in a harder-to-read form.
+     */
+    static char out[262144];
+    char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             CLI_BIN " chain tail -n 50 --db %s", CHAIN_DB);
+             CLI_BIN " chain tail -n 1000 --db %s", CHAIN_DB);
     int rc = run_cli(cmd, out, sizeof(out));
     ASSERT(rc == 0, "exit code should be 0");
     /* Column header */

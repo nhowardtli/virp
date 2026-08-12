@@ -826,6 +826,188 @@ static void approval_emit_outcome(onode_state_t *state,
     }
 }
 
+/* =========================================================================
+ * Auto-execution RECORD (2026-08-12)
+ *
+ * The counterpart to the gate_rejection write below. Until now the chain
+ * was a complete record of what was REFUSED and a blank on what was
+ * ALLOWED: a gate-permitted command executed on the device and its result
+ * went back to the caller without ever being signed or chained. GREEN is
+ * the one tier that executes with no human in the loop, so it is exactly
+ * the tier where "what did the agent do, and what did the device return"
+ * has to be captured.
+ *
+ * SCOPE: every execution the GATE admitted on its own — i.e. not via an
+ * approval. An approved apply is already recorded by the OUTCOME entry
+ * above (proposal -> approval -> outcome), so chaining here too would
+ * double-record it; callers pass approved==true to skip. The record
+ * carries the command's real classified tier rather than a hardcoded
+ * GREEN: under a higher ceiling, or under SHADOW, something other than
+ * GREEN can reach the device, and a record that called it GREEN would be
+ * a lie in precisely the case that matters most.
+ *
+ * REDACTION. The body deliberately does NOT contain the device's response.
+ * GREEN output can carry credential material, and the chain is
+ * tamper-evident and therefore not scrubbable — durably embedding response
+ * bodies would turn the ledger into a secret store. The entry commits to
+ * sha256 of the response instead: that is enough for non-repudiation ("an
+ * output with this digest was produced at this chain position") without
+ * persisting the content. The raw body still goes back to the caller in
+ * the signed observation, unchanged.
+ *
+ * The digest is over the FULL response the driver captured
+ * (result->output_len bytes), which is not always what the caller
+ * receives: the observation payload is clamped to 65530 bytes, and
+ * output_truncated says whether the DRIVER already cut the device's
+ * output short. Both lengths are recorded so a reader can tell which
+ * bytes the digest covers instead of guessing.
+ *
+ * result == NULL means the driver never returned one (execute() itself
+ * errored). That still gets an entry — an executed-but-errored action
+ * must not leave a gap — with executed_reported=false marking that the
+ * driver could not say what reached the device.
+ *
+ * Best-effort, like every other gate chain write: a chain failure is
+ * logged and never alters the result already in hand.
+ * ========================================================================= */
+static void gate_emit_execution(onode_state_t *state,
+                                const char *device_name,
+                                const virp_driver_t *drv,
+                                const char *command,
+                                virp_trust_tier_t gate_tier,
+                                virp_trust_tier_t eff_max,
+                                onode_gate_mode_t mode,
+                                uid_t client_uid,
+                                const virp_exec_result_t *result,
+                                const char *failure_msg)
+{
+    if (!state->chain_enabled)
+        return;
+
+    /* Same chain and same session as the rejections, so executions and
+     * refusals interleave under one continuous prev-hash linkage and a
+     * reader sees the whole gate story in sequence order. */
+    char session_id[96];
+    snprintf(session_id, sizeof(session_id),
+             "gate-enforce:%s", device_name);
+
+    /* The commitment to the response body. Computed over the captured
+     * bytes with the codebase's existing digest helper — the same one the
+     * rejection path commits its body with. A driver that returned no
+     * result digests the empty string, which is still a well-defined
+     * commitment ("nothing was captured"), not a missing field. */
+    char response_digest[65];
+    size_t response_len = result ? result->output_len : 0;
+    gate_sha256_hex(result ? (const void *)result->output : "",
+                    response_len, response_digest);
+
+    /* cJSON does the escaping: command text and driver error strings are
+     * arbitrary and must never be pasted into JSON by hand. */
+    char *body = NULL;
+    cJSON *o = cJSON_CreateObject();
+    if (o) {
+        cJSON_AddStringToObject(o, "schema", "gate_execution/1");
+        cJSON_AddStringToObject(o, "device", device_name);
+        cJSON_AddStringToObject(o, "driver", drv->name);
+        cJSON_AddStringToObject(o, "command", command);
+        cJSON_AddStringToObject(o, "classified_tier",
+                                gate_tier_name(gate_tier));
+        /* Both ceilings: the node-wide one (what gate_rejection/1 records
+         * under this name) and the per-uid-tightened one that actually
+         * decided this execution. */
+        cJSON_AddStringToObject(o, "gate_max_tier",
+                                gate_tier_name(state->gate_max_tier));
+        cJSON_AddStringToObject(o, "effective_max_tier",
+                                gate_tier_name(eff_max));
+        cJSON_AddStringToObject(o, "gate_mode",
+                                mode == GATE_MODE_ENFORCE ? "ENFORCE"
+                                                          : "SHADOW");
+        cJSON_AddStringToObject(o, "decision", "auto-execute");
+        /* (uid_t)-1 is the internal caller, not a real uid — null, so a
+         * reader never renders it as 4294967295. */
+        if (client_uid == (uid_t)-1)
+            cJSON_AddNullToObject(o, "uid");
+        else
+            cJSON_AddNumberToObject(o, "uid", (double)client_uid);
+
+        /* "executed" uses the codebase's own proof standard: assume the
+         * command reached the device UNLESS the driver proved it did not
+         * (no_dispatch) — the same test the retry logic turns on, and for
+         * the same reason (absence of a response is not absence of a side
+         * effect). A driver that errored outright proved nothing, so it
+         * counts as executed and executed_reported=false says the driver
+         * could not tell us what happened. */
+        cJSON_AddBoolToObject(o, "executed",
+                              !(result && result->no_dispatch));
+        cJSON_AddBoolToObject(o, "executed_reported", result != NULL);
+        cJSON_AddBoolToObject(o, "success", result ? result->success : false);
+        if (result) {
+            cJSON_AddNumberToObject(o, "exit_code", (double)result->exit_code);
+            cJSON_AddBoolToObject(o, "exit_code_trusted",
+                                  result->exit_code_trusted);
+            cJSON_AddStringToObject(o, "disposition",
+                                    virp_disposition_str(result->disposition));
+            cJSON_AddBoolToObject(o, "response_truncated",
+                                  result->output_truncated);
+        } else {
+            cJSON_AddNullToObject(o, "exit_code");
+            cJSON_AddBoolToObject(o, "exit_code_trusted", false);
+            cJSON_AddStringToObject(o, "disposition", "DRIVER_ERROR");
+            cJSON_AddBoolToObject(o, "response_truncated", false);
+        }
+
+        /* The commitment, NOT the content. Nothing below may become the
+         * response body itself — see REDACTION above. */
+        cJSON_AddStringToObject(o, "response_sha256", response_digest);
+        cJSON_AddNumberToObject(o, "response_len", (double)response_len);
+
+        if (failure_msg && failure_msg[0])
+            cJSON_AddStringToObject(o, "error", failure_msg);
+        else if (result && result->error_msg[0])
+            cJSON_AddStringToObject(o, "error", result->error_msg);
+        else
+            cJSON_AddNullToObject(o, "error");
+
+        body = cJSON_PrintUnformatted(o);
+        cJSON_Delete(o);
+    }
+
+    /* Commit to the body actually stored. If the body could not be built,
+     * commit to the response digest alone rather than losing the entry —
+     * an execution must always be recorded, exactly as a rejection must. */
+    char artifact_hash[65];
+    if (body)
+        gate_sha256_hex(body, strlen(body), artifact_hash);
+    else
+        memcpy(artifact_hash, response_digest, sizeof(artifact_hash));
+    char artifact_id[64];
+    snprintf(artifact_id, sizeof(artifact_id),
+             "gateexec-%.16s", artifact_hash);
+
+    virp_chain_entry_t ce;
+    virp_error_t cerr = virp_chain_append_with_artifact(
+                            &state->chain, session_id,
+                            "gate_execution", artifact_id,
+                            artifact_hash, body, &ce);
+    if (cerr == VIRP_OK) {
+        if (!body)
+            fprintf(stderr, "[GATE] execution record body could not be "
+                    "built; entry %s retains only the commitment\n",
+                    artifact_id);
+        fprintf(stderr, "[GATE] execution persisted: session=%s seq=%lld "
+                "hash=%.16s tier=%s success=%s response_sha256=%.16s\n",
+                session_id, (long long)ce.sequence, ce.chain_entry_hash,
+                gate_tier_name(gate_tier),
+                (result && result->success) ? "true" : "false",
+                response_digest);
+    } else {
+        fprintf(stderr, "[GATE] execution chain append+store failed: %s\n",
+                virp_error_str(cerr));
+    }
+
+    if (body) free(body);
+}
+
 virp_error_t onode_execute(onode_state_t *state,
                            const char *device_name,
                            const char *command,
@@ -1177,6 +1359,13 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     virp_approval_rec_t apr;
     memset(&apr, 0, sizeof(apr));
 
+    /* Gate decision, hoisted to function scope so the post-execution paths
+     * can record what admitted this command in the gate_execution chain
+     * entry. Both are set inside the gate block below, which is
+     * unconditional and runs before anything can execute. */
+    onode_gate_mode_t gate_mode = GATE_MODE_SHADOW;
+    virp_trust_tier_t gate_eff_max = VIRP_TIER_UNCLASSIFIED;
+
     /*
      * Per-device execution lock — serializes all command execution on
      * this connection so that batch_execute threads targeting the same
@@ -1218,6 +1407,9 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
          * leaves gate_max_tier unchanged. */
         virp_trust_tier_t eff_max = onode_effective_max_tier(state, client_uid);
         bool block = gate_tier_blocks(gate_tier, eff_max);
+
+        gate_mode = mode;
+        gate_eff_max = eff_max;
 
         /* ENFORCE states what it did; only SHADOW speaks hypothetically.
          * The old unconditional "would-block"/"would-allow" wording made
@@ -1512,6 +1704,13 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         snprintf(err_msg, sizeof(err_msg),
                  "ERROR: driver execute failed on '%s': %s",
                  device_name, virp_error_str(err));
+        /* Executed-but-errored: no result to report, and no proof the
+         * command never reached the device. Chain it rather than leave a
+         * gap. result=NULL — the driver told us nothing. */
+        if (!approved)
+            gate_emit_execution(state, device_name, drv, command, gate_tier,
+                                gate_eff_max, gate_mode, client_uid,
+                                NULL, err_msg);
         if (approved)
             approval_emit_outcome(state, proposal_id, &apr,
                                   device_name, false);
@@ -1552,6 +1751,13 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                 snprintf(err_msg, sizeof(err_msg),
                          "ERROR: driver execute failed on '%s' (retry): %s",
                          device_name, virp_error_str(err));
+                /* One entry per admitted action, not per dispatch attempt:
+                 * the first attempt proved non-dispatch, so this retry IS
+                 * the execution and this is its only record. */
+                if (!approved)
+                    gate_emit_execution(state, device_name, drv, command,
+                                        gate_tier, gate_eff_max, gate_mode,
+                                        client_uid, NULL, err_msg);
                 if (approved)
                     approval_emit_outcome(state, proposal_id, &apr,
                                           device_name, false);
@@ -1604,6 +1810,13 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                  device_name,
                  result.error_msg[0] ? result.error_msg
                                      : virp_error_str(VIRP_ERR_OUTCOME_UNKNOWN));
+        /* The command may well have run — that is what UNKNOWN means. An
+         * unknown outcome is the last thing that should be missing from
+         * the ledger. */
+        if (!approved)
+            gate_emit_execution(state, device_name, drv, command, gate_tier,
+                                gate_eff_max, gate_mode, client_uid,
+                                &result, err_msg);
         if (approved)
             approval_emit_outcome(state, proposal_id, &apr,
                                   device_name, false);
@@ -1636,6 +1849,14 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         snprintf(err_msg, sizeof(err_msg),
                  "ERROR: driver refused '%s': %s",
                  device_name, result.error_msg);
+        /* Recorded even though nothing ran: the gate ADMITTED this action,
+         * and "admitted then refused by the driver" is a distinct fact
+         * from "never admitted". no_dispatch is proven here, so the entry
+         * says executed=false rather than claiming an execution. */
+        if (!approved)
+            gate_emit_execution(state, device_name, drv, command, gate_tier,
+                                gate_eff_max, gate_mode, client_uid,
+                                &result, err_msg);
         if (approved)
             approval_emit_outcome(state, proposal_id, &apr,
                                   device_name, false);
@@ -1659,6 +1880,17 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             result.exit_code_trusted ? "yes" : "no",
             result.output_truncated ? "yes" : "no",
             result.error_msg[0] ? result.error_msg : "-");
+
+    /* SIGN-ORDERING: the device has returned and the chain entry is
+     * written HERE — before the observation is built, signed and framed,
+     * and therefore before anything is sent back to the caller. A dropped
+     * send, a signing failure, or a dead v2 session must never be able to
+     * leave an executed action with no ledger entry; the only orderings
+     * that guarantee that put the append first. */
+    if (!approved)
+        gate_emit_execution(state, device_name, drv, command, gate_tier,
+                            gate_eff_max, gate_mode, client_uid,
+                            &result, NULL);
 
     const uint8_t *obs_data = (const uint8_t *)result.output;
     uint16_t data_len = (result.output_len > 65530) ?

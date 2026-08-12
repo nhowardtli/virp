@@ -1401,3 +1401,130 @@ to v2 is deleting the drop-in once dual-signing lands.
 - One shared session context: any allowlisted uid's HELLO races
   another's session (fail-closed, but racy). Both belong with the
   dual-signing design.
+
+---
+
+# virp-onode-home — separate node, separate record
+
+Everything above this line describes **virp-lab** (the production reference
+instance, 7 devices, virp-node2 peer). What follows describes a DIFFERENT
+machine: `virp-onode-home`, node_id `0x0000000D`, a fresh home O-node whose
+only device is `pve-lab` (10.0.0.35).
+
+The "Current live state" block at the top of this file is authoritative for
+virp-lab and was deliberately NOT edited by these entries — a fact recorded
+here does not describe, correct, or supersede anything above. If these two
+nodes keep diverging, this section should become its own file
+(`DEPLOYED-home.md`); it is appended here only because that is where the
+deploy record convention lives today.
+
+## 2026-08-12 23:53 UTC — Proxmox classifier widening + BLACK never-class
+
+- **Commit**: `2cb196d157bca34bab9aed00347dc915d3975db1` (short `2cb196d`)
+- **Branch**: `feat/proxmox-classifier-widening` (merged to `main` immediately
+  after this record was written)
+- **Tree at install**: clean (`git status --porcelain` empty)
+- **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
+  socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
+  — binary sha256
+  `2cfa3e2251698b62c4cce6cbe5eca3939b794223dfd106a40ecc051bc2aaa8e6`
+- **Client**: `/usr/local/lib/virp/virp-tool` (+ `virp` alias), sha256
+  `9cf9455d2251873ba2fba0360d610dd9fdfce9b04384d9a1d2a588cb7888b45f`
+- **Installed via** `make install-prod`; restarted 23:54:10 UTC.
+- **Rollback to the exact prior state**:
+  `sudo make rollback-prod ROLLBACK_FROM=/var/backups/virp/20260812T235334Z`
+- **Driver surface UNCHANGED**: 13 registered before and after. The deploy
+  changed classifier rows only, not which drivers exist.
+- **Gate**: `default=ENFORCE max_tier=YELLOW`, 1/1 devices connected.
+
+### Approval flow went live in the same window (earlier the same evening)
+
+Before this evening `/etc/virp/approvers.json` did not exist, so approval mode
+was OFF and every gate-blocked command was a dead end. Now enrolled:
+
+- key_id `ead98d807804c85e9e43c446d90dcec0`, `ed25519`, operator
+  `nhoward-laptop`, ENABLED. Daemon holds the PUBLIC key only.
+- The Ed25519 SECRET was generated in tmpfs (`/dev/shm`), moved off-box, and
+  `shred`ed. It has never been written to persistent storage on this host.
+  Consequence worth knowing: **no approval can be signed from this VM.**
+- Proven end to end against pve-lab before the classifier deploy:
+  propose → approve → apply executed `qm list --full`; a second apply was
+  refused `approval_reused (-37)`; re-approving the consumed proposal was
+  refused `approval_proposal_consumed (-42)`. Chain:
+  `proposal → approval → outcome`, `65341a8c → 668a9adb → d65a147e`.
+
+### What changed in the classifier
+
+Added host-health GREEN reads (`df -h`, `uptime`, `uname -a`, exact match
+only — the first non-RED rows on the bare-shell surface), `qm|pct snapshot`
+at YELLOW, and **BLACK** for a never-class.
+
+BLACK is a deliberate REVERSAL of this table's original "never BLACK, every
+RED stays approvable" rule, and the two changes above are why. That rule was
+sound while no approval key existed: RED cost nothing because nobody could
+unlock it. With a key enrolled, RED is exactly as strong as the key holder's
+judgement, and a key that can approve `systemctl stop virp-onode` can approve
+away the gate. The never-class is:
+
+- `qm|pct destroy`, `pvesh delete`, `pvesm remove|free|wipedisk`
+- `vzdump --delete|--remove|--prune-backups`
+- ANY command naming a protected VMID (`protected_vmids: [313]` — 313 is
+  `virp-onode-home` itself, i.e. this VM)
+- host halt (`shutdown`, `reboot`, `poweroff`, `halt`, `init`, `telinit`,
+  `systemctl poweroff|reboot|halt`)
+- gate takedown (`systemctl stop|disable|mask|kill|restart virp-*`,
+  `pkill|killall virp-*`)
+
+`PROX_VMID_BAD` and `PROX_VMID_UNCONFIGURED` stay RED on purpose — malformed
+input and a missing config are things a human should be able to look at and
+escalate, not permanent walls.
+
+The never-tier scan runs BEFORE the separator guard. It issues no permits, so
+running it first can only tighten. It has to run first: `qm list; shutdown -h
+now` trips the separator guard and would otherwise classify as approvable RED,
+and an approved apply re-submits the raw bytes, separator included.
+
+### Verified live on the running daemon after restart
+
+| Command | Tier | Proposal filed |
+|---|---|---|
+| `uptime`, `df -h` | GREEN, executed | — |
+| `qm list --full` | RED | yes — `e70f08f1…` |
+| `qm destroy 999` | BLACK | **none** |
+| `systemctl stop virp-onode` | BLACK | **none** |
+| `shutdown -h now` | BLACK | **none** |
+| `qm stop 313` | BLACK | **none** |
+| `vzdump 999 --delete 1` | BLACK | **none** |
+
+Five BLACK attempts spooled ZERO proposals; the one RED command spooled one.
+That absence is the enforcement — `virp_onode.c` files no proposal for BLACK
+and refuses apply with `VIRP_ERR_TIER_VIOLATION` before any signature check.
+
+**Reading the wire tier correctly**: a BLACK command reports
+`trust_tier=RED (0x03)` in the observation header. That is pre-existing design,
+not a defect introduced here — `virp_message.c` refuses to transmit 0xFF
+("never transmitted"), so the header is mapped down. The true tier is in the
+payload (`tier=BLACK max=YELLOW`) and in the absent proposal_id. Anyone
+grepping wire tiers to audit BLACK will get the wrong answer.
+
+### Tests
+- `test-linux-gate`: **147/147** (baseline before this change: 136/136).
+- `make -k LINUX=1 all-tests`: 21 suites green.
+- The two invariant tests asserting the table never returns BLACK were
+  REPLACED by a two-sided invariant: the never-class is BLACK, and everything
+  else that blocks stays RED. The second half is what stops the never-class
+  quietly growing until escalation is useless.
+- **Known-failing, pre-existing, NOT caused by this change**: `check-unit-drift`.
+  This host has only a subset of virp units installed and its
+  `virp-onode.service` lacks `RuntimeDirectoryMode`. Confirmed identical with
+  the change stashed. Remedy is `make install-units`, deliberately not run here.
+
+### Known-open after this deploy
+- The installed `virp-onode.service` still drifts from `deploy/virp-onode.service`
+  (see above). Approval mode works regardless: the unit passes `-c`/`-C`, and
+  `-A` defaults to `/etc/virp/approvers.json`.
+- Only ONE approver key is enrolled. APPROVAL-FLOW.md recommends a primary and
+  a disabled backup so a lost key cannot lock out approvals; the backup is not
+  enrolled yet.
+- `qm|pct delsnapshot` is RED, not BLACK. It destroys a restore point, but it
+  was not in the enumerated never-class — flagged rather than decided.

@@ -882,8 +882,15 @@ static void test_artifact_type_policy(void)
     ASSERT(virp_chain_type_is_daemon_reserved("proposal"), "proposal");
     ASSERT(virp_chain_type_is_daemon_reserved("outcome"), "outcome");
     ASSERT(virp_chain_type_is_daemon_reserved("gate_rejection"), "gate_rej");
+    ASSERT(virp_chain_type_is_daemon_reserved("gate_execution"), "gate_exec");
     ASSERT(virp_chain_type_is_daemon_reserved("validation"), "validation");
     ASSERT(!virp_chain_type_is_daemon_reserved("observation"), "observation");
+    /* Both gate verdict names must survive the 16-byte artifact_type field
+     * intact — a truncated spelling would slip past the reserved check and
+     * let a socket client forge the record. */
+    ASSERT(strlen("gate_execution") < 16, "gate_execution fits untruncated");
+    ASSERT(!virp_chain_type_is_external_allowed("gate_execution"),
+           "gate_execution is not externally submittable");
 
     /* The 16-byte artifact_type field truncates both indirect names, so
      * the truncated spellings are the ones that actually arrive. */

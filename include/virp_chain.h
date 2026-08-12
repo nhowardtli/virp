@@ -83,10 +83,17 @@ typedef struct {
 /*
  * Types the DAEMON mints on internal paths and an external socket client
  * may never claim: "approval" and "proposal" (src/virp_approval.c),
- * "outcome" and "gate_rejection" (src/virp_onode.c), "validation"
- * (src/virp_validator.c). A chain reader treats these as semantic
- * records of the approval/gate/validation flows, so accepting one from a
- * socket client makes a forged record indistinguishable from a minted one.
+ * "outcome", "gate_rejection" and "gate_execution" (src/virp_onode.c),
+ * "validation" (src/virp_validator.c). A chain reader treats these as
+ * semantic records of the approval/gate/validation flows, so accepting one
+ * from a socket client makes a forged record indistinguishable from a
+ * minted one.
+ *
+ * "gate_execution" is reserved for the same reason as "gate_rejection",
+ * and more sharply: it is the record that an action WAS executed and what
+ * the device returned (by digest). A client able to mint one could
+ * manufacture evidence of an execution that never happened, or of a
+ * response body it chooses the digest for.
  */
 bool virp_chain_type_is_daemon_reserved(const char *artifact_type);
 

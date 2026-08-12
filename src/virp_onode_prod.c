@@ -53,6 +53,14 @@ extern void virp_driver_fortinet_init(void);
 #endif
 #ifdef VIRP_DRIVER_LINUX
 extern void virp_driver_linux_init(void);
+/*
+ * Register a device's protected VMIDs with the linux gate classifier.
+ * The route_command() hook receives a command and no device, so the
+ * classifier cannot look this up per-device at decision time — the
+ * loader pushes it in at startup instead, and the classifier holds the
+ * union across devices. Returns -1 on an unparseable list.
+ */
+extern int linux_gate_set_protected_vmids(const char *csv);
 #endif
 #ifdef VIRP_DRIVER_PALOALTO
 extern void virp_driver_paloalto_init(void);
@@ -673,6 +681,51 @@ int load_devices(onode_state_t *state, const char *path)
         json_get_string(dev_obj, "tls_servername", device.tls_servername,
                         sizeof(device.tls_servername));
 
+        /*
+         * protected_vmids (Proxmox-on-linux): guests this gate may not
+         * touch at any tier. Accepts the natural JSON spelling —
+         * "protected_vmids": [313] — and an equivalent CSV string, and
+         * normalizes to CSV. A malformed entry sets nothing: the
+         * classifier then refuses every VMID-bearing Proxmox command,
+         * which is the fail-closed reading of "this config did not
+         * parse" and is loud at the first request rather than silent
+         * forever.
+         */
+        struct json_object *pv_val;
+        if (json_object_object_get_ex(dev_obj, "protected_vmids", &pv_val)) {
+            if (json_object_is_type(pv_val, json_type_array)) {
+                size_t used = 0;
+                int n_vm = (int)json_object_array_length(pv_val);
+                for (int v = 0; v < n_vm; v++) {
+                    struct json_object *e = json_object_array_get_idx(pv_val, v);
+                    if (!e || !json_object_is_type(e, json_type_int)) {
+                        fprintf(stderr, "[O-Node] %s: protected_vmids entry %d "
+                                "is not an integer — ignoring the whole list\n",
+                                device.hostname, v);
+                        used = 0;
+                        break;
+                    }
+                    int written = snprintf(device.protected_vmids + used,
+                                           sizeof(device.protected_vmids) - used,
+                                           "%s%lld", used ? "," : "",
+                                           (long long)json_object_get_int64(e));
+                    if (written < 0 ||
+                        (size_t)written >= sizeof(device.protected_vmids) - used) {
+                        fprintf(stderr, "[O-Node] %s: protected_vmids too long "
+                                "— ignoring the whole list\n", device.hostname);
+                        used = 0;
+                        break;
+                    }
+                    used += (size_t)written;
+                }
+                device.protected_vmids[used] = '\0';
+            } else if (json_object_is_type(pv_val, json_type_string)) {
+                json_get_string(dev_obj, "protected_vmids",
+                                device.protected_vmids,
+                                sizeof(device.protected_vmids));
+            }
+        }
+
         if (device.hostname[0] == '\0' || device.host[0] == '\0') {
             fprintf(stderr, "[O-Node] Skipping device %d: missing hostname/host\n", i);
             continue;
@@ -699,6 +752,34 @@ int load_devices(onode_state_t *state, const char *path)
                     device.hostname);
             continue;
         }
+
+#ifdef VIRP_DRIVER_LINUX
+        /*
+         * Push this device's protected VMIDs into the linux gate before
+         * the device becomes reachable. Registration must complete at
+         * load time, not at connect time: gate_classify() runs before
+         * the driver ever connects, so a set populated on connect would
+         * be empty for exactly the first request that needed it.
+         *
+         * A list that does not parse is a FATAL config error, not a
+         * device to load without its protection. The whole point of the
+         * field is that the guest behind it cannot be touched, and
+         * loading the host anyway would leave the operator believing a
+         * protection that is not in force.
+         */
+        if ((device.vendor == VIRP_VENDOR_LINUX ||
+             device.vendor == VIRP_VENDOR_PROXMOX) &&
+            device.protected_vmids[0] != '\0') {
+            if (linux_gate_set_protected_vmids(device.protected_vmids) != 0) {
+                fprintf(stderr, "[O-Node] FATAL: %s: unparseable "
+                        "protected_vmids \"%s\" — refusing the config rather "
+                        "than running without the protection it declares\n",
+                        device.hostname, device.protected_vmids);
+                json_object_put(root);
+                return -1;
+            }
+        }
+#endif
 
         /* device_id == 0 (absent/unparseable) is derived from the
          * hostname inside onode_add_device — the single choke point. */
