@@ -812,6 +812,41 @@ static const char *const LINUX_PEER_GREEN_EXACT[] = {
     "cat /var/lib/virp/autopilot/published.json",
 };
 
+/* =========================================================================
+ * Host-health reads (2026-08-12)
+ *
+ * EXACT-match, same discipline as the peer rows above, and for the same
+ * reason: these are the first rows that make any part of the bare-shell
+ * surface non-RED, so they are enumerated spellings or they are nothing.
+ *
+ * Exactness is also what makes them metacharacter-proof without a
+ * separate scan — `uptime > /tmp/x` and `df -h; rm -rf /` are not equal
+ * to any row, so they fall through to RED by absence rather than needing
+ * the Proxmox branch's raw-byte scan to catch them.
+ *
+ * `df -h` (not bare `df`) and `uname -a` (not bare `uname`) are the
+ * spellings the requirement names; a neighbouring spelling such as
+ * `df -h /var` carries an argument this table has not reasoned about and
+ * stays RED.
+ * ========================================================================= */
+
+static const char *const LINUX_HOST_GREEN_EXACT[] = {
+    "df -h",
+    "uptime",
+    "uname -a",
+};
+
+static bool is_host_green_exact(const char *canon)
+{
+    for (size_t i = 0;
+         i < sizeof(LINUX_HOST_GREEN_EXACT) / sizeof(LINUX_HOST_GREEN_EXACT[0]);
+         i++) {
+        if (strcmp(canon, LINUX_HOST_GREEN_EXACT[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
 static bool is_peer_green_exact(const char *canon)
 {
     for (size_t i = 0;
@@ -883,11 +918,20 @@ static bool is_mutating_tool(const char *canon)
  *            pvesm status, qm|pct status <vmid>, qm|pct config <vmid>,
  *            pvesh get <path> where <path> is not under /access
  *   YELLOW — qm|pct start|stop|shutdown|reboot|suspend|resume|create|
- *            set|clone|migrate <vmid> …, pvesh create|set <path> …,
- *            vzdump …, pvesh get /access…
- *   RED    — qm|pct destroy, pvesh delete, qm guest …, and everything
- *            else by absence
- * Never BLACK — every RED here stays approvable, same as the FRR table.
+ *            set|clone|migrate|snapshot <vmid> …, pvesh create|set
+ *            <path> …, vzdump … (without a deletion flag),
+ *            pvesh get /access…
+ *   RED    — qm guest …, pct exec|enter, qm|pct delsnapshot, a
+ *            malformed or unconfigured VMID, and everything else by
+ *            absence. Blocked, but approvable.
+ *   BLACK  — qm|pct destroy, pvesh delete, pvesm remove|free|wipedisk,
+ *            vzdump --delete|--remove|--prune-backups, and ANY command
+ *            naming a protected VMID.
+ *
+ * BLACK is new as of 2026-08-12 and is a deliberate reversal of this
+ * table's original "never BLACK, every RED stays approvable" rule. The
+ * reasoning, and why it applies to exactly these rows and no others,
+ * is in the NEVER-tier section header further down this file.
  * ========================================================================= */
 
 /* Protected VMIDs — a guest this gate may not touch at ANY tier.
@@ -930,12 +974,17 @@ static const char *const REASON_PROX_CHARSET =
 static const char *const REASON_PROX_VMID_FORM =
     "VMID expected and unparseable — refused rather than classified by verb";
 static const char *const REASON_PROX_PROTECTED =
-    "protected VMID — this guest runs a VIRP gate and is refused at every tier";
+    "protected VMID — this guest runs a VIRP gate; never transmitted at "
+    "any tier and deliberately not approvable";
 static const char *const REASON_PROX_NO_SET =
     "protected_vmids is not configured for this device — VMID-bearing "
     "Proxmox commands are refused until it is";
 static const char *const REASON_PROX_DESTROY =
-    "guest destruction — use propose/approve/apply";
+    "irreversible guest or storage destruction — never transmitted, and "
+    "deliberately not approvable; do it deliberately outside VIRP";
+static const char *const REASON_PROX_BACKUP_DELETE =
+    "removes existing backups — the restore path is what makes a YELLOW "
+    "action reversible; never transmitted, not approvable";
 static const char *const REASON_PROX_GUEST_EXEC =
     "qm guest exec runs arbitrary commands inside a guest — a classifier "
     "bypass by proxy";
@@ -1216,13 +1265,32 @@ static bool linux_prox_is_tool(const char *canon)
     return false;
 }
 
-/* qm/pct verbs that mutate a guest but stay bounded and reversible. */
+/* qm/pct verbs that mutate a guest but stay bounded and reversible.
+ *
+ * `snapshot` joins them (2026-08-12): taking a snapshot is additive and
+ * is the thing an operator does BEFORE a risky change, so gating it
+ * harder than the change it protects would be backwards. Note the
+ * asymmetry with `delsnapshot`, which destroys a restore point and is
+ * deliberately NOT listed — it stays RED by absence. */
 static const char *const PROX_GUEST_YELLOW_VERBS[] = {
     "start", "stop", "shutdown", "reboot", "suspend", "resume",
-    "create", "set", "clone", "migrate",
+    "create", "set", "clone", "migrate", "snapshot",
 };
 /* qm/pct verbs that only read one guest's state. */
 static const char *const PROX_GUEST_GREEN_VERBS[] = { "status", "config" };
+
+/* pvesm verbs that destroy storage or the volumes on it. RED by absence
+ * already refused these; naming them promotes the refusal to BLACK so an
+ * enrolled approval key cannot authorize a wipe. */
+static const char *const PROX_STORAGE_BLACK_VERBS[] = {
+    "remove", "free", "wipedisk", "zfsscan-destroy", "destroy",
+};
+
+/* vzdump flags that turn a backup into a deletion. Bare `vzdump <vmid>`
+ * writes a new archive and stays YELLOW; these remove existing ones. */
+static const char *const PROX_VZDUMP_BLACK_FLAGS[] = {
+    "--delete", "--remove", "--prune-backups", "-delete", "-remove",
+};
 
 /*
  * Proxmox branch of linux_gate_classify(). `command` is the raw request
@@ -1252,8 +1320,15 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
     /* 3 — self-protection, ahead of every tier row. */
     switch (linux_prox_self_protect(tok, ntok)) {
     case PROX_VMID_PROTECTED:
+        /* BLACK, not RED (2026-08-12). A protected VMID is the guest
+         * running this gate; an approval key that could unlock
+         * `qm stop 313` would be a key that switches off the thing
+         * checking the key. PROX_VMID_BAD and PROX_VMID_UNCONFIGURED
+         * below stay RED on purpose — those are malformed input and a
+         * missing config, both of which a human should be able to look
+         * at and escalate, not permanent refusals. */
         if (reason) *reason = REASON_PROX_PROTECTED;
-        return VIRP_TIER_RED;
+        return VIRP_TIER_BLACK;
     case PROX_VMID_BAD:
         if (reason) *reason = REASON_PROX_VMID_FORM;
         return VIRP_TIER_RED;
@@ -1268,11 +1343,14 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
     bool is_qm  = prox_tok_eq(&tok[0], "qm");
     bool is_pct = prox_tok_eq(&tok[0], "pct");
 
-    /* 4a — RED rows, with the teaching reason, before any permit. */
+    /* 4a — refusal rows, with the teaching reason, before any permit.
+     * `destroy` is BLACK (2026-08-12): a destroyed guest has no restore
+     * path inside VIRP, so an approval would be authorizing something
+     * the chain can record but not undo. */
     if ((is_qm || is_pct) && ntok >= 2) {
         if (prox_tok_eq(&tok[1], "destroy")) {
             if (reason) *reason = REASON_PROX_DESTROY;
-            return VIRP_TIER_RED;
+            return VIRP_TIER_BLACK;
         }
         /* `qm guest exec` is arbitrary execution inside the guest: it
          * would carry an unclassified command through a classified one,
@@ -1298,7 +1376,32 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
     if (prox_tok_eq(&tok[0], "pvesh") && ntok >= 2 &&
         prox_tok_eq(&tok[1], "delete")) {
         if (reason) *reason = REASON_PROX_DESTROY;
-        return VIRP_TIER_RED;
+        return VIRP_TIER_BLACK;
+    }
+
+    /* Storage destruction. `pvesm status` is GREEN below; every other
+     * pvesm verb was already RED by absence, and the destructive ones
+     * are named here so the refusal is BLACK and carries a reason. */
+    if (prox_tok_eq(&tok[0], "pvesm") && ntok >= 2 &&
+        prox_tok_in(&tok[1], PROX_STORAGE_BLACK_VERBS,
+                    sizeof(PROX_STORAGE_BLACK_VERBS) /
+                    sizeof(PROX_STORAGE_BLACK_VERBS[0]))) {
+        if (reason) *reason = REASON_PROX_DESTROY;
+        return VIRP_TIER_BLACK;
+    }
+
+    /* Backup deletion — checked across the whole argument vector, since
+     * the flag's position varies and `vzdump 100 --remove 1` names it
+     * after the VMID. */
+    if (prox_tok_eq(&tok[0], "vzdump")) {
+        for (size_t i = 1; i < ntok; i++) {
+            if (prox_tok_in(&tok[i], PROX_VZDUMP_BLACK_FLAGS,
+                            sizeof(PROX_VZDUMP_BLACK_FLAGS) /
+                            sizeof(PROX_VZDUMP_BLACK_FLAGS[0]))) {
+                if (reason) *reason = REASON_PROX_BACKUP_DELETE;
+                return VIRP_TIER_BLACK;
+            }
+        }
     }
 
     /* 4b — GREEN reads. Each is an exact shape, not a prefix: a trailing
@@ -1369,6 +1472,201 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
     return VIRP_TIER_RED;   /* unlisted Proxmox command — fail closed */
 }
 
+/* =========================================================================
+ * NEVER tier (BLACK) — gate self-preservation and host destruction
+ * (2026-08-12)
+ *
+ * POLICY CHANGE. Until now this table topped out at RED and carried an
+ * invariant test saying so: RED is blocked-but-approvable, so every
+ * refusal kept a propose→approve→apply escape hatch for a human. That
+ * remains true for almost everything here.
+ *
+ * It is NOT true for the rows below. BLACK is refused by virp_onode.c
+ * twice over — no proposal is ever filed (`gate_tier != VIRP_TIER_BLACK`
+ * guards the propose branch) and the apply path returns
+ * VIRP_ERR_TIER_VIOLATION before any signature is checked — so these
+ * commands have no approval path at all, by design and on request.
+ *
+ * What earns BLACK is a single property: executing it would remove the
+ * gate's own ability to refuse anything afterwards. An operator with an
+ * enrolled approval key is exactly who this protects against, because
+ * that operator can otherwise approve `systemctl stop virp-onode` and
+ * the next command is ungated. A tier that a key can unlock is not a
+ * defence against the holder of the key.
+ *
+ * The cost is real and deliberate: nobody can halt this host or stop
+ * this daemon THROUGH VIRP. Both remain available on the host console
+ * and over ordinary SSH — VIRP is not the only way in, and it should not
+ * be the thing that decides whether the machine can be rebooted.
+ *
+ * ORDERING — this scan runs BEFORE the separator guard and before the
+ * Proxmox raw-byte metacharacter scan. That is not a weakening of the
+ * "metachars in front of all tiers" rule, which exists so no GREEN or
+ * YELLOW permit can be reached through a compound string. This scan
+ * issues no permits: its only possible outcomes are BLACK and
+ * fall-through. Running it first strictly tightens, never loosens.
+ *
+ * It has to run first, too. `qm list; shutdown -h now` trips the
+ * separator guard and would classify RED — approvable — and an approved
+ * apply re-submits the raw bytes, separator included. Judging command
+ * positions across separators before the guard closes that hole: the
+ * segment after the `;` is judged on its own merits.
+ *
+ * A "command position" is the start of the string or the first token
+ * after a `;`, `|` or `&`. Position matters because the same word is
+ * innocent elsewhere: `reboot` at a command position halts this host,
+ * while `qm reboot 100` reboots a guest and is an ordinary YELLOW
+ * action. Matching the bare word anywhere would have collapsed the two.
+ *
+ * Path spellings are folded to their basename — `/sbin/shutdown` is
+ * `shutdown`. Case is matched exactly, as everywhere else in this file:
+ * `SHUTDOWN` is not a spelling of `shutdown`, it is a command that does
+ * not exist, and it stays RED by absence.
+ * ========================================================================= */
+
+static const char *const REASON_BLACK_HOST_HALT =
+    "halts or reboots the host running this gate — never transmitted, "
+    "and deliberately not approvable; use the host console";
+static const char *const REASON_BLACK_GATE_SERVICE =
+    "stops or disables the VIRP gate daemon — a gate that can be asked "
+    "to switch itself off is not a gate; never transmitted, not approvable";
+
+/* Host-halting commands, judged at a command position only. */
+static const char *const LINUX_BLACK_HALT_CMDS[] = {
+    "shutdown", "poweroff", "halt", "reboot", "telinit", "init",
+};
+/* `systemctl <verb>` verbs that halt the host outright. */
+static const char *const LINUX_BLACK_SYSTEMCTL_HOST[] = {
+    "poweroff", "reboot", "halt", "kexec", "emergency", "rescue",
+};
+/* `systemctl <verb> <unit>` verbs that take a unit down; BLACK only when
+ * the unit named is VIRP's own. */
+static const char *const LINUX_BLACK_SYSTEMCTL_UNIT[] = {
+    "stop", "disable", "mask", "kill", "restart", "reload-or-restart",
+};
+/* Signal-senders that can take the daemon down without systemd. */
+static const char *const LINUX_BLACK_KILLERS[] = {
+    "pkill", "killall",
+};
+
+/* Fold a token to its basename: `/sbin/shutdown` -> `shutdown`. */
+static prox_tok_t linux_tok_basename(const prox_tok_t *t)
+{
+    prox_tok_t out = *t;
+    for (size_t i = 0; i < t->len; i++) {
+        if (t->p[i] == '/') {
+            out.p   = t->p + i + 1;
+            out.len = t->len - (i + 1);
+        }
+    }
+    return out;
+}
+
+/* Does this token name a VIRP unit/process? Substring, not exact:
+ * `virp-onode`, `virp-onode.service` and `virp-onode@1` are all the same
+ * target, and over-matching here only ever adds BLACK. */
+static bool linux_tok_names_virp(const prox_tok_t *t)
+{
+    if (t->len < 4) return false;
+    for (size_t i = 0; i + 4 <= t->len; i++)
+        if (strncmp(t->p + i, "virp", 4) == 0) return true;
+    return false;
+}
+
+/*
+ * Judge ONE command segment (already split on separators). `tok[0]` is
+ * at a command position by construction.
+ */
+static bool linux_black_segment(const prox_tok_t *tok, size_t n,
+                                const char **reason)
+{
+    if (n == 0) return false;
+
+    prox_tok_t cmd = linux_tok_basename(&tok[0]);
+
+    if (prox_tok_in(&cmd, LINUX_BLACK_HALT_CMDS,
+                    sizeof(LINUX_BLACK_HALT_CMDS) /
+                    sizeof(LINUX_BLACK_HALT_CMDS[0]))) {
+        if (reason) *reason = REASON_BLACK_HOST_HALT;
+        return true;
+    }
+
+    if (prox_tok_eq(&cmd, "systemctl") && n >= 2) {
+        /* Host-halting verbs need no unit — `systemctl poweroff`. */
+        for (size_t i = 1; i < n; i++) {
+            if (prox_tok_in(&tok[i], LINUX_BLACK_SYSTEMCTL_HOST,
+                            sizeof(LINUX_BLACK_SYSTEMCTL_HOST) /
+                            sizeof(LINUX_BLACK_SYSTEMCTL_HOST[0]))) {
+                if (reason) *reason = REASON_BLACK_HOST_HALT;
+                return true;
+            }
+        }
+        /* Unit-stopping verbs are BLACK only against a VIRP unit; the
+         * verb and the unit may be separated by flags, so both are
+         * searched across the whole segment rather than at fixed
+         * offsets. `systemctl restart frr` keeps its existing RED. */
+        bool takedown = false, names_virp = false;
+        for (size_t i = 1; i < n; i++) {
+            if (prox_tok_in(&tok[i], LINUX_BLACK_SYSTEMCTL_UNIT,
+                            sizeof(LINUX_BLACK_SYSTEMCTL_UNIT) /
+                            sizeof(LINUX_BLACK_SYSTEMCTL_UNIT[0])))
+                takedown = true;
+            if (linux_tok_names_virp(&tok[i]))
+                names_virp = true;
+        }
+        if (takedown && names_virp) {
+            if (reason) *reason = REASON_BLACK_GATE_SERVICE;
+            return true;
+        }
+    }
+
+    if (prox_tok_in(&cmd, LINUX_BLACK_KILLERS,
+                    sizeof(LINUX_BLACK_KILLERS) /
+                    sizeof(LINUX_BLACK_KILLERS[0]))) {
+        for (size_t i = 1; i < n; i++) {
+            if (linux_tok_names_virp(&tok[i])) {
+                if (reason) *reason = REASON_BLACK_GATE_SERVICE;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Walk the RAW request bytes as a sequence of separator-delimited
+ * segments and judge each one. Returns true (with `reason` set) if any
+ * segment is a never-tier command.
+ */
+static bool linux_black_self_harm(const char *raw, const char **reason)
+{
+    prox_tok_t tok[LINUX_PROX_MAX_TOK];
+    size_t n = 0;
+    const char *p = raw;
+
+    for (;;) {
+        if (*p == '\0' || *p == ';' || *p == '|' || *p == '&') {
+            if (linux_black_segment(tok, n, reason)) return true;
+            if (*p == '\0') return false;
+            n = 0;
+            p++;
+            continue;
+        }
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') { p++; continue; }
+
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
+               *p != ';' && *p != '|' && *p != '&')
+            p++;
+        if (n < LINUX_PROX_MAX_TOK) {
+            tok[n].p   = start;
+            tok[n].len = (size_t)(p - start);
+            n++;
+        }
+    }
+}
+
 /*
  * Core classification. `reason` (optional) receives a static string for
  * rows that carry an instructive rejection reason, NULL otherwise.
@@ -1378,6 +1676,14 @@ virp_trust_tier_t linux_gate_classify(const char *command, const char **reason)
 {
     if (reason) *reason = NULL;
     if (!command) return VIRP_TIER_RED;
+
+    /* Guard 0 — NEVER tier. Runs ahead of the separator guard on
+     * purpose (see the BLACK section header): it issues no permits, so
+     * running it first can only tighten, and it is the only thing that
+     * judges the segment AFTER a separator rather than refusing the
+     * whole string as an approvable RED. */
+    if (linux_black_self_harm(command, reason))
+        return VIRP_TIER_BLACK;
 
     /* Guard 1 — separator policy on the RAW string: ; | & ` $( ${ and
      * control bytes (newlines) are refused everywhere, even inside the
@@ -1492,6 +1798,11 @@ virp_trust_tier_t linux_gate_classify(const char *command, const char **reason)
      * rows so an enumerated peer probe classifies GREEN while every
      * neighbouring spelling of it stays RED by absence. */
     if (is_peer_green_exact(canon))
+        return VIRP_TIER_GREEN;
+
+    /* Host-health reads — same exact-match discipline, same position in
+     * the order, for the same reason. */
+    if (is_host_green_exact(canon))
         return VIRP_TIER_GREEN;
 
     /* Bare shell. Everything is RED; these two rows carry teaching

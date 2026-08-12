@@ -33,18 +33,57 @@ Load-bearing, top to bottom. Each step's refusal is final.
 
 3. **Self-protection** (below) — before any tier is assigned.
 
-4. **Verb tiers** — RED rows, then GREEN, then YELLOW, then RED by
+4. **Verb tiers** — BLACK/RED rows, then GREEN, then YELLOW, then RED by
    absence. Case-sensitive, as in the FRR table: `QM LIST` is not a
-   spelling of `qm list`. The table never returns BLACK, so every RED
-   stays approvable through propose/approve/apply.
+   spelling of `qm list`.
+
+Step 0, ahead of all of the above, is the **never-tier scan** (see
+"BLACK" below). It runs before the separator guard because it issues no
+permits — only BLACK or fall-through — so running it first can only
+tighten. It has to run first: `qm list; shutdown -h now` trips the
+separator guard and would otherwise classify as approvable RED, and an
+approved apply re-submits the raw bytes, separator included.
 
 ## Tier table
 
+Updated 2026-08-12 — added host-health GREEN reads, `snapshot`, and the
+BLACK never-class.
+
 | Tier | Commands |
 |---|---|
-| GREEN | `qm list`, `pct list`, `pveversion`, `pvecm status`, `pvecm nodes`, `pvesm status`, `qm status <vmid>`, `qm config <vmid>`, `pct status <vmid>`, `pct config <vmid>`, `pvesh get <path>` where `<path>` is not under `/access` |
-| YELLOW | `qm`/`pct` `start`, `stop`, `shutdown`, `reboot`, `suspend`, `resume`, `create`, `set`, `clone`, `migrate`; `pvesh create`, `pvesh set`; `vzdump …`; `pvesh get /access…` |
-| RED | `qm destroy`, `pct destroy`, `pvesh delete`, `qm guest …`, `pct exec`, `pct enter`, and everything else by absence |
+| GREEN | `qm list`, `pct list`, `pveversion`, `pvecm status`, `pvecm nodes`, `pvesm status`, `qm status <vmid>`, `qm config <vmid>`, `pct status <vmid>`, `pct config <vmid>`, `pvesh get <path>` where `<path>` is not under `/access`; host reads `df -h`, `uptime`, `uname -a` (exact match only) |
+| YELLOW | `qm`/`pct` `start`, `stop`, `shutdown`, `reboot`, `suspend`, `resume`, `create`, `set`, `clone`, `migrate`, `snapshot`; `pvesh create`, `pvesh set`; `vzdump …` without a deletion flag; `pvesh get /access…` |
+| RED | `qm guest …`, `pct exec`, `pct enter`, `qm delsnapshot`, a malformed or unconfigured VMID, and everything else by absence. Blocked, but approvable. |
+| BLACK | `qm destroy`, `pct destroy`, `pvesh delete`, `pvesm remove\|free\|wipedisk`, `vzdump --delete\|--remove\|--prune-backups`, any command naming a **protected VMID**, host halt (`shutdown`, `reboot`, `poweroff`, `halt`, `init`, `telinit`, `systemctl poweroff\|reboot\|halt`), and gate takedown (`systemctl stop\|disable\|mask\|kill\|restart virp-*`, `pkill\|killall virp-*`). |
+
+## BLACK — the never-class
+
+This reverses the table's original rule that every refusal stays
+approvable. That rule was sound while no approval key was enrolled: RED
+cost nothing because nobody could unlock it. Once an operator key exists,
+RED is exactly as strong as the key holder's judgement, and a key that
+can approve `systemctl stop virp-onode` can approve away the gate.
+
+BLACK is refused twice in `virp_onode.c`: no proposal is filed
+(`gate_tier != VIRP_TIER_BLACK` guards the propose branch) and the apply
+path returns `VIRP_ERR_TIER_VIOLATION` before any signature is checked.
+There is no flag that re-enables it.
+
+What earns BLACK is one property: executing it would remove the gate's
+own ability to refuse anything afterwards. The cost is deliberate —
+nobody can halt this host or stop this daemon *through VIRP*. Both remain
+available on the host console and over ordinary SSH.
+
+Position matters for the host-halt words: `reboot` at a command position
+halts the host and is BLACK, while `qm reboot 100` reboots a guest and is
+an ordinary YELLOW action. Path spellings fold to their basename, so
+`/sbin/shutdown` is `shutdown`.
+
+`PROX_VMID_BAD` (a VMID that was expected and did not parse) and
+`PROX_VMID_UNCONFIGURED` (a VMID present with no `protected_vmids`
+declared) stay **RED**, not BLACK — those are malformed input and a
+missing config, both of which a human should be able to look at and
+escalate rather than hit a permanent wall.
 
 The GREEN rows are exact shapes, not prefixes — `qm list --full` and
 `pvesh get /cluster/resources --output-format json` drop to RED by
