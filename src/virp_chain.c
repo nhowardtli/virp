@@ -344,6 +344,7 @@ bool virp_chain_type_is_daemon_reserved(const char *artifact_type)
         "proposal",        /* src/virp_approval.c  (file)     */
         "outcome",         /* src/virp_onode.c     (gate)     */
         "gate_rejection",  /* src/virp_onode.c     (gate)     */
+        "gate_execution",  /* src/virp_onode.c     (gate)     */
         "validation",      /* src/virp_validator.c            */
     };
     return type_in(artifact_type, RESERVED,

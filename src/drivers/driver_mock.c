@@ -43,6 +43,13 @@ void virp_driver_mock_set_soft_fail(const char *msg) { mock_soft_fail_msg = msg;
 static const char *mock_unknown_fail_msg = NULL;
 void virp_driver_mock_set_unknown_fail(const char *msg) { mock_unknown_fail_msg = msg; }
 
+/* Test hook: execute() succeeds and returns EXACTLY this text as the
+ * device response body. Lets a test put chosen bytes — credential-shaped
+ * material in particular — into a GREEN device response and then assert
+ * what does and does not reach the chain. NULL disables. */
+static const char *mock_output_override = NULL;
+void virp_driver_mock_set_output(const char *text) { mock_output_override = text; }
+
 /*
  * Test hook: simulate a single shared SSH channel per connection.
  *
@@ -274,6 +281,22 @@ static virp_error_t mock_execute(virp_conn_t *conn,
     /* Optional delay for parallel execution testing */
     if (mock_delay_ms > 0)
         usleep((unsigned)(mock_delay_ms * 1000));
+
+    /* Test hook: caller-chosen response body, returned verbatim. Length is
+     * clamped to what the buffer actually holds — snprintf reports the
+     * would-be length, and output_len must never describe bytes that are
+     * not there. */
+    if (mock_output_override) {
+        int n = snprintf(result->output, sizeof(result->output), "%s",
+                         mock_output_override);
+        size_t cap = sizeof(result->output) - 1;
+        result->output_len = (n > 0) ? (((size_t)n > cap) ? cap : (size_t)n)
+                                     : 0;
+        result->success = true;
+        result->exit_code = 0;
+        result->exec_time_ms = 5;
+        return VIRP_OK;
+    }
 
     /* Look up simulated response */
     const char *response = mock_find_response(command);
