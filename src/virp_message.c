@@ -1067,6 +1067,8 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_APPROVAL_DEVICE_MISMATCH: return "Approval bound to a different device";
     case VIRP_ERR_APPROVAL_BAD_SIGNATURE:   return "Approval signature invalid";
     case VIRP_ERR_APPROVAL_NOT_FOUND:       return "Proposal or approval not found";
+    case VIRP_ERR_APPROVAL_STORE_UNREADABLE:
+        return "Approval store is not readable by this user";
     case VIRP_ERR_APPROVAL_CONSUMED:        return "Proposal already has an outcome";
     case VIRP_ERR_APPROVAL_KEY_UNENROLLED:  return "Approver key_id not enrolled";
     case VIRP_ERR_APPROVAL_KEY_DISABLED:    return "Approver key disabled";

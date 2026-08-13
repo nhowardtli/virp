@@ -1080,6 +1080,54 @@ static virp_error_t onode_approval_challenge(onode_state_t *state,
     if (!state->approval_dir[0] || !state->approvers_loaded)
         return VIRP_ERR_KEY_NOT_LOADED;
 
+    /*
+     * APPLIABILITY, before a signature is collected.
+     *
+     * apply re-classifies the command and refuses BLACK with
+     * TIER_VIOLATION before any signature work. If that is going to be
+     * the answer, the operator must learn it HERE — otherwise approve
+     * collects a real signature, writes a real approval record, and the
+     * flow dead-ends at apply on a command that was never appliable.
+     *
+     * The proposal's stored `tier` field is NOT consulted: it records
+     * what the classifier said at propose time, which is history, not a
+     * prediction. A table change between propose and approve can turn a
+     * RED proposal BLACK, and this check must reflect the table that
+     * apply will actually run — the same reason apply re-classifies
+     * rather than trusting the record.
+     *
+     * Loaded and judged BEFORE virp_approval_challenge() so a BLACK
+     * proposal never gets a challenge record written for it at all.
+     */
+    {
+        virp_proposal_rec_t prop;
+        virp_error_t perr = virp_approval_load_proposal(state->approval_dir,
+                                                        proposal_id, &prop);
+        if (perr != VIRP_OK) {
+            fprintf(stderr, "[APPROVAL] challenge rejected: proposal=%s "
+                    "code=%d (%s)\n", proposal_id, (int)perr,
+                    virp_approval_err_name(perr));
+            return perr;
+        }
+
+        int didx = find_device(state, prop.device);
+        if (didx < 0) {
+            fprintf(stderr, "[APPROVAL] challenge refused: proposal=%s names "
+                    "device '%s', which this node does not serve\n",
+                    proposal_id, prop.device);
+            return VIRP_ERR_APPROVAL_DEVICE_MISMATCH;
+        }
+
+        const virp_driver_t *drv =
+            virp_driver_lookup(state->devices[didx].vendor);
+        if (gate_classify(drv, prop.command) == VIRP_TIER_BLACK) {
+            fprintf(stderr, "[APPROVAL] challenge refused: proposal=%s "
+                    "command is BLACK — not appliable at any tier\n",
+                    proposal_id);
+            return VIRP_ERR_TIER_VIOLATION;
+        }
+    }
+
     virp_approval_challenge_t ch;
     virp_error_t err = virp_approval_challenge(
             state->approval_dir,

@@ -527,6 +527,17 @@ typedef enum {
                                                  caller uid's allowed
                                                  set */
 
+    /* The approval store exists but this caller cannot read it. Distinct
+     * from APPROVAL_NOT_FOUND on purpose: "no such proposal" and "you are
+     * not the daemon uid / not on the O-Node host" are different operator
+     * problems with different fixes, and collapsing them sent operators
+     * hunting for a proposal that was present the whole time. `virp
+     * approve` reaches the store through the daemon socket while `virp
+     * apply` reads it directly, so this is reachable on the apply half of
+     * a flow whose approve half just succeeded. */
+    VIRP_ERR_APPROVAL_STORE_UNREADABLE = -51, /* store present, not
+                                                 readable by this uid */
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency

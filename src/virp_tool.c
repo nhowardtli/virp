@@ -1065,6 +1065,18 @@ static int cmd_apply(int argc, char **argv)
     virp_proposal_rec_t prop;
     virp_error_t err = virp_approval_load_proposal(dir, proposal_id, &prop);
     if (err != VIRP_OK) {
+        if (err == VIRP_ERR_APPROVAL_STORE_UNREADABLE) {
+            fprintf(stderr,
+                "Error: approval store %s is not readable by uid %u.\n"
+                "  The proposal may well exist — this is a permissions\n"
+                "  problem, not a missing proposal. `virp approve` reaches\n"
+                "  the store through the daemon socket; `virp apply` reads\n"
+                "  the directory directly, so approve can succeed where\n"
+                "  apply cannot. Run apply on the O-Node host as the daemon\n"
+                "  uid (or via sudo).\n",
+                dir, (unsigned)getuid());
+            return 1;
+        }
         fprintf(stderr, "Error: cannot load proposal %s from %s: %s\n",
                 proposal_id, dir, virp_error_str(err));
         return 1;

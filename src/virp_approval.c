@@ -49,6 +49,8 @@ const char *virp_approval_err_name(virp_error_t err)
     case VIRP_ERR_APPROVAL_DEVICE_MISMATCH: return "approval_device_mismatch";
     case VIRP_ERR_APPROVAL_BAD_SIGNATURE:   return "approval_bad_signature";
     case VIRP_ERR_APPROVAL_NOT_FOUND:       return "approval_not_found";
+    case VIRP_ERR_APPROVAL_STORE_UNREADABLE:
+                                            return "approval_store_unreadable";
     case VIRP_ERR_APPROVAL_CONSUMED:        return "approval_proposal_consumed";
     case VIRP_ERR_APPROVAL_KEY_UNENROLLED:  return "approval_key_unenrolled";
     case VIRP_ERR_APPROVAL_KEY_DISABLED:    return "approval_key_disabled";
@@ -412,8 +414,17 @@ virp_error_t virp_approval_load_proposal(const char *dir,
     proposal_path(dir, proposal_id, path, sizeof(path));
 
     char buf[4096];
-    if (read_file(path, buf, sizeof(buf)) < 0)
+    errno = 0;
+    if (read_file(path, buf, sizeof(buf)) < 0) {
+        /* errno is fopen's, untouched by read_file's failure path. A
+         * permission failure is NOT a missing proposal — see the note on
+         * VIRP_ERR_APPROVAL_STORE_UNREADABLE in virp.h. ENOENT and every
+         * other errno keep the original code, so no existing caller and
+         * no existing test changes. */
+        if (errno == EACCES || errno == EPERM)
+            return VIRP_ERR_APPROVAL_STORE_UNREADABLE;
         return VIRP_ERR_APPROVAL_NOT_FOUND;
+    }
 
     char *lines[3];
     split_lines(buf, lines);
