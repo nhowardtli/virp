@@ -2191,11 +2191,75 @@ static prox_tok_t linux_tok_basename(const prox_tok_t *t)
 /* Does this token name a VIRP unit/process? Substring, not exact:
  * `virp-onode`, `virp-onode.service` and `virp-onode@1` are all the same
  * target, and over-matching here only ever adds BLACK. */
+/*
+ * Shell quoting bytes — the ones the remote shell REMOVES before the
+ * command runs, so the never-class scanner must ignore them too.
+ *
+ * `"shutdown" -h now`, `'shutdown' -h now`, `\shutdown -h now` and
+ * `/sbin/"shutdown"` all execute shutdown. Judged byte-for-byte, none of
+ * them matched the halt row, and the never-class command fell through to
+ * RED — which is APPROVABLE. An enrolled key could then unlock the one
+ * thing BLACK exists to keep locked, which is the entire point of the
+ * tier. Same defect the Proxmox tokenizer fixed by stripping quotes
+ * before denylist matching; this is that rule for the scanner running
+ * ahead of it.
+ *
+ * Backslash is included alongside the quote characters. It is a
+ * different shell mechanism, but it removes bytes the same way and
+ * leaving it open while closing quotes would just relocate the bypass.
+ */
+static bool linux_black_is_shell_quote(char c)
+{
+    return c == '"' || c == '\'' || c == '\\';
+}
+
+/*
+ * Compare a raw-scanner token to an enumerated word, ignoring quoting
+ * bytes.
+ *
+ * STREAMING on purpose. The segment scanner below deliberately carries
+ * flags rather than a token buffer, because a fixed buffer would have to
+ * decide what to do when a token overruns it and every answer is wrong
+ * (see the black_seg_t header). Normalizing into a scratch buffer here
+ * would reintroduce exactly that bound, so this walks both strings at
+ * once and allocates nothing.
+ */
+static bool linux_black_word_eq(const prox_tok_t *t, const char *word)
+{
+    size_t wi = 0;
+    for (size_t i = 0; i < t->len; i++) {
+        char c = t->p[i];
+        if (linux_black_is_shell_quote(c)) continue;
+        if (word[wi] == '\0' || c != word[wi]) return false;
+        wi++;
+    }
+    return word[wi] == '\0';
+}
+
+static bool linux_black_word_in(const prox_tok_t *t,
+                                const char *const *set, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        if (linux_black_word_eq(t, set[i])) return true;
+    return false;
+}
+
 static bool linux_tok_names_virp(const prox_tok_t *t)
 {
-    if (t->len < 4) return false;
-    for (size_t i = 0; i + 4 <= t->len; i++)
-        if (strncmp(t->p + i, "virp", 4) == 0) return true;
+    /* Substring, skipping quoting bytes, so `"virp-onode"` and
+     * `v\irp-onode` still name the unit. Over-matching here only ever
+     * adds BLACK, exactly as before. */
+    static const char V[] = "virp";
+    size_t m = 0;
+    for (size_t i = 0; i < t->len; i++) {
+        char c = t->p[i];
+        if (linux_black_is_shell_quote(c)) continue;
+        if (c == V[m]) {
+            if (++m == 4) return true;
+        } else {
+            m = (c == V[0]) ? 1 : 0;
+        }
+    }
     return false;
 }
 
@@ -2232,11 +2296,11 @@ static void linux_black_seg_token(black_seg_t *s, const prox_tok_t *t)
         /* First token of the segment — the command position. */
         prox_tok_t cmd = linux_tok_basename(t);
         s->have_cmd = true;
-        s->halt_cmd = prox_tok_in(&cmd, LINUX_BLACK_HALT_CMDS,
+        s->halt_cmd = linux_black_word_in(&cmd, LINUX_BLACK_HALT_CMDS,
                                   sizeof(LINUX_BLACK_HALT_CMDS) /
                                   sizeof(LINUX_BLACK_HALT_CMDS[0]));
-        s->is_systemctl = prox_tok_eq(&cmd, "systemctl");
-        s->is_killer = prox_tok_in(&cmd, LINUX_BLACK_KILLERS,
+        s->is_systemctl = linux_black_word_eq(&cmd, "systemctl");
+        s->is_killer = linux_black_word_in(&cmd, LINUX_BLACK_KILLERS,
                                    sizeof(LINUX_BLACK_KILLERS) /
                                    sizeof(LINUX_BLACK_KILLERS[0]));
         return;
@@ -2246,11 +2310,11 @@ static void linux_black_seg_token(black_seg_t *s, const prox_tok_t *t)
      * flags, so both are looked for anywhere in the segment rather than
      * at fixed offsets. */
     if (s->is_systemctl) {
-        if (prox_tok_in(t, LINUX_BLACK_SYSTEMCTL_HOST,
+        if (linux_black_word_in(t, LINUX_BLACK_SYSTEMCTL_HOST,
                         sizeof(LINUX_BLACK_SYSTEMCTL_HOST) /
                         sizeof(LINUX_BLACK_SYSTEMCTL_HOST[0])))
             s->systemctl_host_verb = true;
-        if (prox_tok_in(t, LINUX_BLACK_SYSTEMCTL_UNIT,
+        if (linux_black_word_in(t, LINUX_BLACK_SYSTEMCTL_UNIT,
                         sizeof(LINUX_BLACK_SYSTEMCTL_UNIT) /
                         sizeof(LINUX_BLACK_SYSTEMCTL_UNIT[0])))
             s->takedown_verb = true;

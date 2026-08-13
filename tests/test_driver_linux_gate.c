@@ -1489,6 +1489,57 @@ static void test_prox_self_protection_sid_forms(void)
     PASS();
 }
 
+/*
+ * =========================================================================
+ * Never-class normalization: quoting must not downgrade BLACK to RED.
+ *
+ * RED is approvable. A never-class command that falls through to RED can
+ * be unlocked by an enrolled key, which is the one outcome BLACK exists
+ * to prevent — so a spelling the scanner cannot read is not a cosmetic
+ * miss, it is the tier failing open.
+ * ========================================================================= */
+static void test_black_survives_quoting(void)
+{
+    TEST("quoted halt commands stay BLACK");
+    assert_black_blocked("\"shutdown\" -h now");
+    assert_black_blocked("'shutdown' -h now");
+    assert_black_blocked("\"reboot\"");
+    assert_black_blocked("\"poweroff\"");
+    assert_black_blocked("\\shutdown -h now");
+    PASS();
+
+    TEST("quoting inside a path spelling stays BLACK");
+    assert_black_blocked("\"/sbin/shutdown\" -h now");
+    assert_black_blocked("/sbin/\"shutdown\" -h now");
+    assert_black_blocked("/sbin/'shutdown' -h now");
+    PASS();
+
+    TEST("quoted systemctl takedowns of the gate stay BLACK");
+    assert_black_blocked("systemctl \"stop\" virp-onode");
+    assert_black_blocked("systemctl stop \"virp-onode\"");
+    assert_black_blocked("\"systemctl\" stop virp-onode");
+    assert_black_blocked("systemctl \"poweroff\"");
+    assert_black_blocked("\"pkill\" virp-onode");
+    assert_black_blocked("pkill \"virp-onode\"");
+    PASS();
+
+    /* The normalization must not start refusing innocent commands. Halt
+     * words are judged at COMMAND POSITION only, so they stay ordinary
+     * words everywhere else — including inside a quoted Proxmox value,
+     * which F6 now admits. */
+    TEST("normalization does not over-refuse innocent commands");
+    assert(linux_gate_tier("qm set 100 --description \"reboot the box\"")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm set 100 --description \"shutdown notes\"")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("vtysh -c \"show ip ospf neighbor\"")
+           == VIRP_TIER_GREEN);
+    assert_red_blocked("echo reboot");
+    assert_red_blocked("systemctl restart frr");   /* not a VIRP unit */
+    assert_red_blocked("systemctl stop nginx");
+    PASS();
+}
+
 static void test_gate_decisions(void)
 {
     printf("\n=== Gate-level decisions at threshold YELLOW ===\n");
@@ -1546,6 +1597,7 @@ int main(void)
     test_prox_does_not_broaden_frr();
     test_prox_quoted_values();
     test_prox_self_protection_sid_forms();
+    test_black_survives_quoting();
     test_host_health_reads();
     test_black_is_the_never_class();
     test_gate_decisions();
