@@ -1697,3 +1697,174 @@ Chain after verification: `gate-enforce:pve-lab` seq 152,
   `deploy/virp-onode.service`; only one approver key is enrolled, and its secret
   is off-box, so no approval can be signed from this VM; `qm|pct delsnapshot`
   is RED rather than BLACK.
+
+## 2026-08-13 20:44 UTC — protected-VMID spellings, never-class quoting, /access writes, quoted values, approve/apply
+
+- **Commit**: `e71196019c8e2910b9f07b08f7da058338cdff4c` (short `e711960`)
+- **Branch**: `fix/proxmox-gate-hardening-aug13` (merged to `main` immediately
+  after this record was written), superseding `7a4e327` (2026-08-13 00:50 UTC)
+- **Tree at install**: clean (`git status --porcelain` empty)
+- **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
+  socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
+  — binary sha256
+  `ebe4697de91d2b21f3ef39bcffe3bd4bb42d6e5f4fe35f8bc23311b9cdd82488`
+- **Client**: `/usr/local/lib/virp/virp-tool` (+ `virp` alias), sha256
+  `abbbed31334792568eca8e55a73e7a60b784816d4147c2b2e9fad10dc18d0c55`
+  (reports `virp-tool e711960`)
+- **Installed via** `sudo make install-prod`; restarted 20:44:00 UTC.
+- **Rollback to the exact prior state**:
+  `sudo make rollback-prod ROLLBACK_FROM=/var/backups/virp/20260813T204311Z`
+- **Driver surface UNCHANGED**: 13 registered before and after. Classifier rows,
+  one tokenizer, and the approval-flow error path only.
+- **Gate**: `default=ENFORCE max_tier=GREEN overrides=0`, per-uid ceilings
+  `997=GREEN 999=GREEN 1000=GREEN 1001=GREEN`, 1/1 devices connected.
+- **Unit NOT touched.** No `install-units`, no `daemon-reload`.
+
+### Config change earlier the same session (separate from this commit)
+
+`/etc/virp/devices.json` moved `gate_max_tier` from `yellow` to `green` and
+added explicit per-uid ceilings for 999/1000/1001, applied 19:40:46 UTC
+(backup `/etc/virp/devices.json.bak.20260813-193934`). This is why the gate
+line above reads `max_tier=GREEN` where the `7a4e327` stanza read `YELLOW`.
+
+It matters for reading the rest of this record. Under the old ceiling every
+YELLOW command **auto-executed on submission**: the journal for 18:26–19:04
+shows `qm start 100`, `pct start 200`, `pct stop 210` and
+`pvesh create /nodes/pve-lab/network --iface vmbr1 --type bridge` all
+`decision=allow`, executed, chained. That was not a classifier fault — those
+rows were correctly YELLOW — it was the node-wide ceiling sitting one tier
+above the read/write split. Every YELLOW write is now proposal-only.
+
+### What this deploy changes
+
+Found by enumerating the Proxmox command surface against the classifier source
+offline, rather than executing against the live box.
+
+1. **Protected-VMID spellings (the reason this deploy exists).** Self-protection
+   anchored on `qemu`/`lxc` path segments and bare numeric tokens. Three other
+   ways of naming the same guest walked past it, and the first was **live on
+   this box**:
+   - `vm:<id>` / `ct:<id>` — the typed sid the HA and pool APIs use.
+     `pvesh create /cluster/ha/resources --sid vm:313` then
+     `pvesh set /cluster/ha/resources/vm:313 --state stopped` were two YELLOW
+     commands that hand the HA stack an order to power off the guest running
+     this gate.
+   - Comma lists — `--vms 100,313`, `--vmid 100,313`. Older and wider than the
+     HA bypass: `vzdump --vmid 313` was BLACK while `vzdump --vmid 100,313` was
+     YELLOW, naming the same guest.
+   - Bare numerics on cluster/pool paths, where `--vms 313` lives.
+
+   Verified reachable before writing the guard, by reads only: 313 is
+   `virp-onode-home`, running on pve-lab; `pve-ha-crm` and `pve-ha-lrm` are
+   active and enabled; HA reports `quorum OK`, `quorate=1` despite the node
+   being standalone and not clustered. The final link — the LRM actually
+   stopping 313 — was deliberately NOT executed.
+
+2. **Never-class quoting.** `"shutdown" -h now` classified RED. RED is
+   *approvable*, so an enrolled key could unlock the one command BLACK exists
+   to keep locked. `'shutdown'`, `\shutdown`, `"/sbin/shutdown"`,
+   `/sbin/"shutdown"` and `systemctl "stop" virp-onode` were all affected.
+   The scanner now matches ignoring `"`, `'` and `\` — the bytes the remote
+   shell removes before the command runs.
+
+3. **`pvesh create|set /access/…` is RED, was YELLOW.** The tree was
+   special-cased for GET only; writes fell through the generic create/set row.
+   A credential minted there outlives the approval that authorized it and works
+   outside VIRP entirely.
+
+4. **`vzdump --script` / `--stdout` is RED, was YELLOW.** `--script` runs an
+   operator-named program as root at each backup phase.
+
+5. **Flag denylists match what the tool parses.** `vzdump 100 --delete=1` was
+   YELLOW against a row whose whole purpose is making deletion unapprovable.
+   Matching now uses the flag head before the first `=`.
+
+6. **Quoted argument values admitted** — `--description "text with spaces"` was
+   RED on the charset. One shared quote-aware tokenizer replaces the separate
+   charset scan and splitter, because two tokenizers that disagree about token
+   boundaries is the classified-vs-executed split this table forbids. Quotes are
+   stripped from stored tokens so denylists see what the shell sees; the raw
+   metacharacter scan is unchanged and still runs first; structural rows demand
+   bare words while the protection *scans* stay quote-agnostic. Quoted interiors
+   may not contain a tab or double space, because `linux_gate_canon()` would
+   rewrite them and the device executes the raw bytes.
+
+7. **approve/apply no longer disagree.** `virp_approval_load_proposal()` returned
+   `APPROVAL_NOT_FOUND` for any read failure including `EACCES`. `virp approve`
+   reaches the store through the daemon socket, `virp apply` reads the directory
+   directly, so on a 0700 store approve succeeded and apply reported a missing
+   proposal that was present the whole time. New
+   `VIRP_ERR_APPROVAL_STORE_UNREADABLE` (-51) separates them. The challenge path
+   also re-classifies before collecting a signature and refuses BLACK up front.
+
+### Live verification after restart (uid 1001, journal 20:44:23–20:44:41)
+
+Every probe is a command the gate must refuse, so none executed. Under the GREEN
+ceiling even a failed fix would have filed a proposal rather than run.
+
+| Command | Before | After |
+| --- | --- | --- |
+| `pvesh set /cluster/ha/resources/vm:313 --state stopped` | YELLOW | **BLACK**, protected-VMID reason |
+| `pvesh create /cluster/ha/resources --sid vm:313` | YELLOW | **BLACK** |
+| `pvesh set /pools/testpool --vms 100,313` | YELLOW | **BLACK** |
+| `pvesh create /access/users --userid … --password …` | YELLOW | **RED**, proposal `f08d8ad5…` |
+| `vzdump 100 --script /tmp/hook.sh` | YELLOW | **RED**, proposal `c13e5d93…` |
+| `vzdump 100 --delete=1` | YELLOW | **BLACK** |
+| `"shutdown" -h now` | RED (approvable) | **BLACK** |
+| `qm set 999999 --description "text with spaces"` | RED (charset) | **YELLOW**, blocked + proposal |
+| `qm stop 313` / `qm status 313` / `pvesh …/qemu/313/config` | BLACK | **BLACK** (regression) |
+| `systemctl stop virp-onode` | BLACK | **BLACK** (regression) |
+| `pveversion` | GREEN | **GREEN**, executed |
+
+Chain after verification: `gate-enforce:pve-lab` seq 223–225.
+
+### Tests
+- `test-linux-gate`: **177/177** (baseline before this work: 157/157).
+- `test-onode` 113/113, `test-chain` 33/33, `test-approval` 23/23.
+- New coverage: the denylist trap (`vzdump 100 "--delete"` must stay BLACK — the
+  bypass the quoting fix would itself have introduced), the `=value` spelling,
+  metachar ordering under quoting, bare-word requirements on every structural
+  row, quoted protected VMIDs, the canonicalization rule, cluster/HA/pool sid
+  forms, comma lists, and every quoted never-class spelling.
+- A standing guard harness asserts 15 pre-existing protected-VMID guards, 8 new
+  spellings, 15 never-class cases and 15 controls that must NOT be BLACK.
+- One test expectation was corrected rather than the code: `qm list "; shutdown
+  -h now"` is BLACK, not RED — Guard 0 runs ahead of even the metachar scan and
+  judges the segment after a separator.
+
+### Known-open after this deploy
+
+- **`pvesh get /nodes/<node>/qemu` is still a false RED.** Carried forward
+  unchanged from the `7a4e327` stanza; still asserted RED at
+  `tests/test_driver_linux_gate.c:983`. The fix was drafted alongside this work
+  and deliberately not applied — it must land together with the sid/numeric
+  scanning above, which is what keeps
+  `pvesh create /nodes/<n>/qemu --vmid 313` refused once the walk stops
+  returning `PROX_VMID_BAD` for a path ending at `qemu`.
+- **`pvesh create /nodes/<n>/{termproxy,vncshell,spiceshell,execute}` is
+  YELLOW.** `termproxy`/`vncshell` mint an interactive root shell on the node
+  and `execute` batch-dispatches an array of API calls — the same
+  classifier-bypass-by-proxy the `agent` subtree is RED for. Proposal-only under
+  the GREEN ceiling, but a single self-approval still reaches a root shell. The
+  guard was drafted and deferred by decision, not oversight. Note the
+  2026-08-13 schema review that justified `pvesh get` as a whole verb enumerated
+  the 341 GET endpoints only; the POST/PUT side has never had the equivalent
+  reasoning.
+- **Not dual control.** uid 1001 holds `approval_challenge`, `approval_submit`
+  and `execute`, and must keep `execute` because apply re-submits an EXECUTE
+  carrying the approval reference. The same human proposes, approves and
+  applies. The GREEN ceiling makes every write a signed, chained, human-
+  acknowledged event; it does not make it two-person.
+- **`make LINUX=1 test-onode` does not build** — `linux_gate_set_protected_vmids`
+  is referenced in a `virp_driver.h` comment but declared in no header, so
+  `virp_onode_prod.c:773` fails `-Werror=implicit-function-declaration` under
+  `-DVIRP_DRIVER_LINUX`. Plain `make test-onode` builds and passes; that is the
+  invocation used above. Pre-existing, unrelated to these changes.
+- **`challenge_load()` and `approval_load_raw()`** still fold `EACCES` into
+  `APPROVAL_NOT_FOUND`. Only `virp_approval_load_proposal()` was fixed — the one
+  that produces the reported symptom.
+- **`devices.json` `_comment` is stale**, and now doubly so: it still says
+  pve-lab has no Proxmox classifier and that uid 1001 has no tier ceiling.
+- Unchanged from `7a4e327`: trailing flags on GREEN reads stay RED by design;
+  the installed unit still drifts from `deploy/virp-onode.service`; one approver
+  key is enrolled with its secret off-box; `qm|pct delsnapshot` is RED not BLACK.
