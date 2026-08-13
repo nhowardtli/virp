@@ -1442,6 +1442,83 @@ static bool prox_vmid_digits(const prox_tok_t *t, uint32_t *out)
     return true;
 }
 
+/* A guest id as the HA and pool APIs spell it: `vm:313`, `ct:313`.
+ *
+ * This is a THIRD spelling of the same thing. /nodes/<n>/qemu/<vmid>
+ * names a guest positionally, `qm stop <vmid>` names it as an argument,
+ * and the cluster-scoped APIs name it as a typed sid. Self-protection
+ * has to recognize all three, or the guard is only as good as the
+ * spelling an operator happens to use. */
+static bool prox_sid_vmid(const char *p, size_t len, uint32_t *out)
+{
+    if (len <= 3 || p[2] != ':') return false;
+    if (!((p[0] == 'v' && p[1] == 'm') || (p[0] == 'c' && p[1] == 't')))
+        return false;
+    prox_tok_t idt = { p + 3, len - 3, false };
+    return prox_vmid_digits(&idt, out);
+}
+
+typedef enum {
+    PROX_ID_NONE = 0,      /* no field in this token named a guest */
+    PROX_ID_CLEAR,         /* named one or more, none protected */
+    PROX_ID_PROTECTED,     /* named a protected guest */
+} prox_id_scan_t;
+
+/*
+ * Scan ONE token for guest ids, splitting on commas.
+ *
+ * The comma split is not cosmetic. `--vms 100,313` is how the pool API
+ * takes a list and `--vmid 100,313` is how vzdump takes one, and a scan
+ * that judged whole tokens saw neither: `vzdump --vmid 313` was BLACK
+ * while `vzdump --vmid 100,313` was YELLOW, naming the same guest. That
+ * is the same defect as the vm:313 spelling — a way of writing the
+ * protected id that self-protection could not read — so both are fixed
+ * here, in one place used by every branch.
+ *
+ * `numeric_ok` is the caller's judgement about whether a BARE number
+ * names a guest in this context. It does after a qm/pct verb and in a
+ * vzdump argument vector; it does not in an arbitrary pvesh argument,
+ * where a number is usually a size or a flag value, so pvesh passes
+ * true only for cluster- and pool-scoped paths.
+ *
+ * *saw_sid reports whether a field used the unambiguous vm:/ct: form,
+ * which is what lets a caller distinguish "this names a guest" from
+ * "this contains a number".
+ */
+static prox_id_scan_t prox_scan_token_ids(const prox_tok_t *t, bool numeric_ok,
+                                          bool *saw_sid)
+{
+    prox_id_scan_t res = PROX_ID_NONE;
+    size_t f = 0;
+
+    while (f < t->len) {
+        while (f < t->len && t->p[f] == ',') f++;
+        size_t fs = f;
+        while (f < t->len && t->p[f] != ',') f++;
+        size_t flen = f - fs;
+        if (flen == 0) continue;
+
+        uint32_t v;
+        bool named = false;
+        if (prox_sid_vmid(t->p + fs, flen, &v)) {
+            named = true;
+            if (saw_sid) *saw_sid = true;
+        } else if (numeric_ok) {
+            /* `quoted` is deliberately false on the field view: a scan
+             * hunting a protected id must read "313" the same as 313,
+             * exactly as prox_vmid_digits() does for whole tokens. */
+            prox_tok_t ft = { t->p + fs, flen, false };
+            named = prox_vmid_digits(&ft, &v);
+        }
+        if (!named) continue;
+
+        if (linux_protected_vmids_configured && linux_prox_is_protected(v))
+            return PROX_ID_PROTECTED;
+        res = PROX_ID_CLEAR;
+    }
+    return res;
+}
+
 /*
  * A VMID in a position where the table EXPECTS one. Quoted is refused:
  * `qm stop "313"` is not a spelling of `qm stop 313` for this table, and
@@ -1586,9 +1663,7 @@ static prox_vmid_verdict_t linux_prox_self_protect(const prox_tok_t *tok,
          * quoted tokens would make quoting a second protected-VMID
          * bypass — the same shape of hole as the `vm:313` spelling. */
         for (size_t i = vpos; i < ntok; i++) {
-            uint32_t v;
-            if (!prox_vmid_digits(&tok[i], &v)) continue;
-            if (linux_protected_vmids_configured && linux_prox_is_protected(v))
+            if (prox_scan_token_ids(&tok[i], true, NULL) == PROX_ID_PROTECTED)
                 return PROX_VMID_PROTECTED;
         }
     } else if (prox_tok_eq_bare(&tok[0], "pvesh")) {
@@ -1627,15 +1702,70 @@ static prox_vmid_verdict_t linux_prox_self_protect(const prox_tok_t *tok,
             if (linux_protected_vmids_configured && linux_prox_is_protected(vmid))
                 return PROX_VMID_PROTECTED;
         }
+
+        /*
+         * The walk above anchors on `qemu`/`lxc`, which is how the
+         * PER-GUEST API spells a VMID. The cluster-scoped APIs spell the
+         * same guest differently, and reached YELLOW because the walk
+         * found nothing to judge:
+         *
+         *   pvesh set    /cluster/ha/resources/vm:313 --state stopped
+         *   pvesh create /cluster/ha/resources --sid vm:313
+         *   pvesh set    /pools/<pool> --vms 313
+         *
+         * VERIFIED REACHABLE on pve-lab (2026-08-13): 313 is a running
+         * guest there, pve-ha-crm and pve-ha-lrm are active and enabled,
+         * and HA reports quorum OK / quorate=1 even standalone. Two
+         * YELLOW commands — enroll, then set state stopped — power off
+         * the guest running this gate, which is the exact outcome BLACK
+         * exists to make unreachable.
+         *
+         * Two rules, deliberately different in strength:
+         *
+         *   - `vm:<n>` / `ct:<n>` ANYWHERE, path segment or argument.
+         *     Unambiguously names a guest, so it also sets saw_vmid and
+         *     an unconfigured protected set refuses, exactly as a
+         *     positional VMID does.
+         *   - Every bare numeric, but ONLY when the path is cluster- or
+         *     pool-scoped, which is where `--vms 313` lives. This one
+         *     does NOT set saw_vmid: `--migration-unsecure 1` is a
+         *     numeric that names no guest, and treating it as one would
+         *     turn an unconfigured deployment's ordinary cluster edits
+         *     into refusals.
+         */
+        bool cluster_scope =
+            (plen >= 8 && strncmp(path, "/cluster", 8) == 0) ||
+            (plen >= 6 && strncmp(path, "/pools", 6) == 0);
+
+        i = 0;
+        while (i < plen) {                        /* path segments */
+            while (i < plen && path[i] == '/') i++;
+            size_t sstart = i;
+            while (i < plen && path[i] != '/') i++;
+            uint32_t sv;
+            if (prox_sid_vmid(path + sstart, i - sstart, &sv)) {
+                saw_vmid = true;
+                if (linux_protected_vmids_configured &&
+                    linux_prox_is_protected(sv))
+                    return PROX_VMID_PROTECTED;
+            }
+        }
+
+        for (size_t t = 1; t < ntok; t++) {       /* argument tokens */
+            bool sid = false;
+            prox_id_scan_t r = prox_scan_token_ids(&tok[t], cluster_scope, &sid);
+            if (sid) saw_vmid = true;
+            if (r == PROX_ID_PROTECTED) return PROX_VMID_PROTECTED;
+        }
     } else if (prox_tok_eq_bare(&tok[0], "vzdump")) {
-        /* Scan, not an expected position — prox_vmid_digits() for the
-         * same reason as the qm/pct scan above. */
+        /* Scan, not an expected position — quote- and comma-agnostic for
+         * the same reason as the qm/pct scan above. `vzdump --vmid
+         * 100,313` names the protected guest just as `vzdump --vmid 313`
+         * does, and only the comma split sees it. */
         for (size_t i = 1; i < ntok; i++) {
-            uint32_t v;
-            if (!prox_vmid_digits(&tok[i], &v)) continue;
-            saw_vmid = true;
-            if (linux_protected_vmids_configured && linux_prox_is_protected(v))
-                return PROX_VMID_PROTECTED;
+            prox_id_scan_t r = prox_scan_token_ids(&tok[i], true, NULL);
+            if (r != PROX_ID_NONE) saw_vmid = true;
+            if (r == PROX_ID_PROTECTED) return PROX_VMID_PROTECTED;
         }
     }
 

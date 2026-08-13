@@ -1437,6 +1437,58 @@ static void test_prox_quoted_values(void)
     PASS();
 }
 
+/*
+ * =========================================================================
+ * F3 — the cluster-scoped spellings of a protected VMID.
+ *
+ * /nodes/<n>/qemu/313 was guarded; /cluster/ha/resources/vm:313 was not,
+ * and on this deployment that path is live: 313 is a running guest,
+ * pve-ha-crm/lrm are active, HA reports quorum OK. Enroll-then-stop is
+ * two YELLOW commands that power off the gate's own guest.
+ * ========================================================================= */
+static void test_prox_self_protection_sid_forms(void)
+{
+    TEST("HA resource path names the protected guest -> BLACK");
+    assert_black_blocked("pvesh set /cluster/ha/resources/vm:313 --state stopped");
+    assert_black_blocked("pvesh set /cluster/ha/resources/ct:313 --state stopped");
+    assert_black_blocked("pvesh get /cluster/ha/resources/vm:313");
+    PASS();
+
+    TEST("HA enrollment of the protected guest -> BLACK (the first step)");
+    assert_black_blocked("pvesh create /cluster/ha/resources --sid vm:313");
+    assert_black_blocked("pvesh create /cluster/ha/resources --sid ct:313");
+    PASS();
+
+    TEST("pool membership names the protected guest -> BLACK");
+    assert_black_blocked("pvesh set /pools/testpool --vms 313");
+    assert_black_blocked("pvesh set /pools/testpool --vms 100,313");
+    /* Comma lists are the documented shape of these APIs, and the same
+     * gap existed in vzdump long before F3: `vzdump --vmid 313` was
+     * BLACK while `vzdump --vmid 100,313` was YELLOW. */
+    assert_black_blocked("vzdump --vmid 100,313");
+    assert_black_blocked("vzdump --vmid 313,400");
+    PASS();
+
+    /* Quoting must not re-open what F3 closes — the two normalizations
+     * have to compose, since each was a bypass on its own. */
+    TEST("quoted sid spellings are caught too");
+    assert_black_blocked("pvesh set /cluster/ha/resources \"--sid\" vm:313");
+    assert_black_blocked("pvesh create /cluster/ha/resources --sid \"vm:313\"");
+    PASS();
+
+    /* The sid rule must not swallow unrelated guests or ordinary edits. */
+    TEST("unprotected sids and non-guest numerics are unaffected (control)");
+    assert(linux_gate_tier("pvesh create /cluster/ha/resources --sid vm:100")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pvesh set /cluster/ha/resources/vm:100 --state started")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pvesh set /cluster/options --migration-unsecure 1")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pvesh set /pools/testpool --vms 100")
+           == VIRP_TIER_YELLOW);
+    PASS();
+}
+
 static void test_gate_decisions(void)
 {
     printf("\n=== Gate-level decisions at threshold YELLOW ===\n");
@@ -1493,6 +1545,7 @@ int main(void)
     test_prox_unconfigured_is_closed();
     test_prox_does_not_broaden_frr();
     test_prox_quoted_values();
+    test_prox_self_protection_sid_forms();
     test_host_health_reads();
     test_black_is_the_never_class();
     test_gate_decisions();
