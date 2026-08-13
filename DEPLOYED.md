@@ -1868,3 +1868,92 @@ Chain after verification: `gate-enforce:pve-lab` seq 223–225.
 - Unchanged from `7a4e327`: trailing flags on GREEN reads stay RED by design;
   the installed unit still drifts from `deploy/virp-onode.service`; one approver
   key is enrolled with its secret off-box; `qm|pct delsnapshot` is RED not BLACK.
+
+## 2026-08-13 20:56 UTC — node-shell and batch-dispatch API paths closed (F1)
+
+- **Commit**: `491c1b6352781f9655df3c6a45d0aaa3119b9619` (short `491c1b6`)
+- **Branch**: `main` (committed directly; the branch it follows was merged
+  minutes earlier), superseding `e711960` (2026-08-13 20:44 UTC)
+- **Tree at install**: clean (`git status --porcelain` empty)
+- **Daemon**: `/usr/local/lib/virp/virp-onode-prod` — binary sha256
+  `7ae0f2b35bdd2c18c945e07766b227ae9a1f51d52d44d5a77d3af34abc9798be`
+- **Client**: `/usr/local/lib/virp/virp-tool` (+ `virp` alias), sha256
+  `d38fcc302f79c9199153964b2800ee6e1688f1846d30391e6002d0b1b908c39b`
+- **Installed via** `sudo make install-prod`; restarted 20:56:14 UTC.
+- **Rollback to the exact prior state**:
+  `sudo make rollback-prod ROLLBACK_FROM=/var/backups/virp/20260813T205446Z`
+- **Driver surface UNCHANGED**: 13 registered. One classifier row and a
+  generalized path walker.
+- **Gate**: `default=ENFORCE max_tier=GREEN overrides=0`, ceilings unchanged,
+  1/1 devices connected.
+- **Unit NOT touched.**
+
+### Why this deploy exists
+
+It closes the first "Known-open" item from the `e711960` stanza above, and it
+was pulled forward for a specific reason: that stanza was about to be pushed to
+a **public** repository, and it documented — in working detail — a live path to
+a root shell on this host. Publishing an unfixed weakness of that shape is a
+disclosure decision, and the choice made was to fix it rather than publish it as
+open. The record above is left intact: the deploy it describes really happened,
+and rewriting it to hide the window would be the wrong kind of tidy.
+
+### What changed
+
+`pvesh create /nodes/<n>/termproxy` is a root shell on the guest running this
+gate. It classified YELLOW through the whole-verb `pvesh create` row, because no
+path reasoning had ever been applied to the write half of the API. Six segments
+are now RED for **every** pvesh method:
+
+| segment | what it does |
+| --- | --- |
+| `execute` | POST runs an ARRAY of API calls in one request |
+| `termproxy` | terminal proxy on the node — a root shell |
+| `vncshell` | VNC shell on the node — a root shell |
+| `spiceshell` | SPICE shell on the node — a root shell |
+| `vncproxy` | guest console; keystrokes are the same unclassified payload |
+| `spiceproxy` | that `qm terminal` is already RED by absence for |
+
+Refused for the read half too: the read half mints the ticket the write half
+consumes, so splitting them leaves the bypass assembled out of two permitted
+requests. Same reasoning as the `agent` subtree, which now shares the walker
+(`prox_path_has_agent_seg` generalized to `prox_path_has_seg_in`).
+
+RED, not BLACK — opening a console is legitimate operator work and a human
+reading the request is the missing check. A protected VMID still outranks it:
+`pvesh create /nodes/pve-lab/qemu/313/vncproxy` is BLACK, verified live.
+
+### Live verification after restart (uid 1001, 20:56 UTC)
+
+| Command | Before | After |
+| --- | --- | --- |
+| `pvesh create /nodes/pve-lab/termproxy` | YELLOW | **RED**, proposal `57a7e203…` |
+| `pvesh create /nodes/pve-lab/execute --commands x` | YELLOW | **RED**, proposal `76bee392…` |
+| `pvesh create /nodes/pve-lab/qemu/313/vncproxy` | YELLOW | **BLACK**, protected-VMID reason |
+
+### Tests
+- `test-linux-gate`: **182/182** (was 177 at `e711960`).
+- `test-onode` 113/113, `test-chain` 33/33, `test-approval` 23/23.
+- Standing guard harness: all four groups clean, 0 failing.
+- New coverage includes segment-not-prefix (`/termproxyfoo` stays GREEN) and
+  protected-VMID precedence over the shell row.
+
+### Known-open after this deploy
+
+The `e711960` list, minus the host-shell item, which this deploy closes:
+
+- **`pvesh get /nodes/<node>/qemu` is still a false RED** — unchanged, still
+  asserted at `tests/test_driver_linux_gate.c`. Must land together with the
+  sid/numeric scanning from `808d38f`.
+- **The POST/PUT side of the API still has no systematic review.** This deploy
+  named six endpoints found by reasoning about what the write verbs can reach;
+  it is not the equivalent of the 341-endpoint GET review. Treat the row as
+  incomplete until that review is done.
+- **Not dual control** — unchanged. uid 1001 proposes, approves and applies.
+- **`make LINUX=1 test-onode` does not build** — unchanged, pre-existing.
+- **`challenge_load()` and `approval_load_raw()`** still fold `EACCES` into
+  `APPROVAL_NOT_FOUND`.
+- **`devices.json` `_comment` is stale.**
+- Unchanged from `7a4e327`: trailing flags on GREEN reads stay RED by design;
+  installed unit drifts from `deploy/virp-onode.service`; one approver key with
+  its secret off-box; `qm|pct delsnapshot` is RED not BLACK.
