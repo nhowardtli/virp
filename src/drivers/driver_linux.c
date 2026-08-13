@@ -828,6 +828,33 @@ static const char *const LINUX_PEER_GREEN_EXACT[] = {
  * spellings the requirement names; a neighbouring spelling such as
  * `df -h /var` carries an argument this table has not reasoned about and
  * stays RED.
+ *
+ * THE LIST IS NOT GROWING. A DELIBERATE HOLD (2026-08-13)
+ *
+ * A live probing session widened the Proxmox rows and kept `cat`, `ip`,
+ * `ss`, `pvs`, `vgs`, `lvdisplay` and `lsblk` RED. That was not an
+ * oversight or a to-do, and the argument is not "those commands are
+ * dangerous" — `ip addr` is as harmless a read as `uptime`.
+ *
+ * The argument is about what the gate would then have to be able to do.
+ * Every read the session actually needed had a Proxmox API answer:
+ * `pvesh get /nodes/<node>/network` for `ip`, `pvesm status` and
+ * `pvesm list <storage>` for `pvs`/`vgs`/`lvdisplay`,
+ * `pvesh get /nodes/<node>/disks/list` for `lsblk`, and the config and
+ * status endpoints for anything `cat` would have been pointed at. Those
+ * arrive as a bounded verb over a structured path — `pvesh get` is one
+ * decision this table can make correctly and completely, and the
+ * enumerated `qm`/`pct`/`pvesm` rows are finite sets.
+ *
+ * Adding generic host shell changes the job description. `cat <path>`
+ * means the gate must decide which of a filesystem's paths are reads
+ * worth signing (`cat /etc/shadow`? `cat /root/.ssh/id_ed25519`?), and
+ * `ip`/`ss` bring subcommand trees where `ip addr` and `ip route add`
+ * differ by one word. That is no longer "know the Proxmox API"; it is
+ * "police arbitrary Linux", which is an open-ended surface with no
+ * schema behind it and no natural place to stop. The three rows here are
+ * exact spellings precisely because they are the exception to that, and
+ * a fourth is only earned by a read the API genuinely cannot answer.
  * ========================================================================= */
 
 static const char *const LINUX_HOST_GREEN_EXACT[] = {
@@ -915,15 +942,17 @@ static bool is_mutating_tool(const char *canon)
  *
  * Tier table (on the canonicalized command):
  *   GREEN  — qm list, pct list, pveversion, pvecm status, pvecm nodes,
- *            pvesm status, qm|pct status <vmid>, qm|pct config <vmid>,
- *            pvesh get <path> where <path> is not under /access
+ *            pvesm status, pvesm list <storage>, qm|pct status <vmid>,
+ *            qm|pct config <vmid>, pvesh get <path> where <path> is not
+ *            under /access and carries no `agent` segment
  *   YELLOW — qm|pct start|stop|shutdown|reboot|suspend|resume|create|
  *            set|clone|migrate|snapshot <vmid> …, pvesh create|set
  *            <path> …, vzdump … (without a deletion flag),
  *            pvesh get /access…
- *   RED    — qm guest …, pct exec|enter, qm|pct delsnapshot, a
- *            malformed or unconfigured VMID, and everything else by
- *            absence. Blocked, but approvable.
+ *   RED    — qm guest …, qm|pct agent …, pct exec|enter,
+ *            pvesh <any method> on a path with an `agent` segment,
+ *            qm|pct delsnapshot, a malformed or unconfigured VMID, and
+ *            everything else by absence. Blocked, but approvable.
  *   BLACK  — qm|pct destroy, pvesh delete, pvesm remove|free|wipedisk,
  *            vzdump --delete|--remove|--prune-backups, and ANY command
  *            naming a protected VMID.
@@ -932,6 +961,60 @@ static bool is_mutating_tool(const char *canon)
  * table's original "never BLACK, every RED stays approvable" rule. The
  * reasoning, and why it applies to exactly these rows and no others,
  * is in the NEVER-tier section header further down this file.
+ *
+ * ----------------------------------------------------------------------
+ * Why `pvesh get` is GREEN as a whole VERB, not as a path allowlist
+ * (2026-08-13)
+ *
+ * `get` is read-only by construction in the Proxmox REST API: the four
+ * methods are the tier boundary, so the verb is already the bounded,
+ * structured surface a per-path allowlist would be trying to approximate.
+ * An allowlist of paths approximates it badly — the API has 341 GET
+ * endpoints, an operator question arrives as whichever one answers it,
+ * and every path nobody thought to enumerate is a false RED on a pure
+ * read. The verb is the row; the path is an argument to it.
+ *
+ * That claim was checked against the published API schema rather than
+ * assumed (pve-docs api-viewer apidoc.js, 678 endpoints, read
+ * 2026-08-13). Two results are what this row rests on:
+ *
+ *   - NO GET endpoint returns a UPID. A Proxmox endpoint that starts a
+ *     background worker returns one, so zero UPID-returning GETs means
+ *     no GET spawns a task. Every mutation in the schema is POST, PUT or
+ *     DELETE, including the pairs where the GET is the read half of the
+ *     same path (`GET /nodes/<n>/apt/update` lists pending updates;
+ *     POST on the same path is the `apt-get update` that fetches them).
+ *
+ *   - ONE subtree is the exception, and it is excluded below:
+ *     the /nodes/<node>/qemu/<vmid>/agent subtree. Those GETs are
+ *     described as "Execute get-osinfo", "Execute get-users" …, and
+ *     that is literal — they dispatch a command to the QEMU guest agent
+ *     INSIDE the guest. Read-only as far as the guest is concerned, but
+ *     the boundary crossed is the one `qm guest` is already RED for: a
+ *     command running somewhere this gate did not classify. The whole
+ *     `agent` segment is refused, for every pvesh method, because the
+ *     same subtree also holds exec, file-write and set-user-password —
+ *     refusing only the GET half would leave those approvable at YELLOW
+ *     through the `pvesh create` row.
+ *
+ * Three further GET classes DO act on the world, and all three are
+ * already unreachable because a GREEN row is an EXACT shape: each needs
+ * at least one --flag, and a fourth token drops the command to RED by
+ * absence. They are recorded here so a future widening of the shape does
+ * not reopen them silently:
+ *
+ *   - /nodes/<node>/scan/{nfs,cifs,iscsi,pbs} — connects OUT to an
+ *     operator-named server; the pbs variant takes --password, which
+ *     would put a credential in the signed command bytes.
+ *   - /nodes/<node>/{qemu,lxc}/<vmid>/vncwebsocket, mtunnelwebsocket —
+ *     upgrades the connection to a websocket. Needs a ticket that only
+ *     a POST can mint, so it is inert on its own.
+ *   - /nodes/<node>/storage/<s>/file-restore/download — materializes a
+ *     zip of a file extracted from a PBS backup.
+ *
+ * 35 of the 341 GET endpoints need a flag like this. The other 306 are
+ * reachable as a clean three-token `pvesh get <path>`, which is the
+ * surface this row deliberately opens.
  * ========================================================================= */
 
 /* Protected VMIDs — a guest this gate may not touch at ANY tier.
@@ -988,6 +1071,9 @@ static const char *const REASON_PROX_BACKUP_DELETE =
 static const char *const REASON_PROX_GUEST_EXEC =
     "qm guest exec runs arbitrary commands inside a guest — a classifier "
     "bypass by proxy";
+static const char *const REASON_PROX_AGENT_PATH =
+    "the guest-agent API subtree executes inside the guest — read or "
+    "write, the payload is a command this gate never classified";
 
 /*
  * Register protected VMIDs from one device's config. `csv` is a
@@ -1137,6 +1223,59 @@ static bool prox_parse_vmid(const prox_tok_t *t, uint32_t *out)
     }
     *out = v;
     return true;
+}
+
+/* A storage ID as Proxmox spells it (pve-storage-id): alphanumeric first
+ * byte, then [A-Za-z0-9._-].
+ *
+ * The leading-alphanumeric requirement is the load-bearing half. The
+ * `pvesm list <storage>` row is an exact three-token shape, and the
+ * branch-wide charset permits `-`, so `pvesm list --content` is also
+ * three tokens: a row that only counted tokens would classify a flag as
+ * a storage name. Requiring the shape of the argument, not just its
+ * position, is what keeps the row as narrow as it reads.
+ *
+ * `local:100/vm-100-disk-0` is rejected too — `:` and `/` are absent
+ * here. That is a volume ID, not a storage ID, and the narrower answer
+ * is the one to be wrong with. */
+static bool prox_is_storage_id(const prox_tok_t *t)
+{
+    if (t->len == 0 || t->len > 64) return false;
+    char c = t->p[0];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9')))
+        return false;
+    for (size_t i = 1; i < t->len; i++) {
+        char b = t->p[i];
+        if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+            (b >= '0' && b <= '9') || b == '.' || b == '_' || b == '-')
+            continue;
+        return false;
+    }
+    return true;
+}
+
+/* Does an API path carry an `agent` segment? See the whole-verb note in
+ * the branch header: that subtree runs commands inside the guest, so it
+ * is refused for every pvesh method rather than tiered by method.
+ *
+ * Matched segment-wise, and checked at ANY depth rather than only at the
+ * documented /nodes/<node>/qemu/<vmid>/agent position. The schema has the
+ * segment nowhere else (26 endpoints, all under that one subtree), so a
+ * depth-agnostic match costs nothing today and stays correct if Proxmox
+ * grows a second one. */
+static bool prox_path_has_agent_seg(const prox_tok_t *t)
+{
+    const char *p = t->p;
+    size_t plen = t->len, i = 0;
+    while (i < plen) {
+        while (i < plen && p[i] == '/') i++;
+        size_t start = i;
+        while (i < plen && p[i] != '/') i++;
+        if (i - start == 5 && strncmp(p + start, "agent", 5) == 0)
+            return true;
+    }
+    return false;
 }
 
 typedef enum {
@@ -1372,11 +1511,33 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
             if (reason) *reason = REASON_PROX_GUEST_EXEC;
             return VIRP_TIER_RED;
         }
+        /* `qm agent <vmid> <cmd>` is the same guest-agent dispatch as the
+         * API subtree below, spelled shorter. It was already RED by
+         * absence; naming it changes only which reason the signed refusal
+         * carries. (pct has no agent verb — the row costs nothing there
+         * and is not worth a separate condition.) */
+        if (prox_tok_eq(&tok[1], "agent")) {
+            if (reason) *reason = REASON_PROX_AGENT_PATH;
+            return VIRP_TIER_RED;
+        }
     }
     if (prox_tok_eq(&tok[0], "pvesh") && ntok >= 2 &&
         prox_tok_eq(&tok[1], "delete")) {
         if (reason) *reason = REASON_PROX_DESTROY;
         return VIRP_TIER_BLACK;
+    }
+
+    /* The guest-agent API subtree, for EVERY pvesh method. This is the
+     * one carve-out from "get is read-only by construction" (branch
+     * header): `pvesh get …/agent/get-users` executes get-users inside
+     * the guest, and the same subtree's exec, file-write and
+     * set-user-password would otherwise be approvable YELLOW through the
+     * `pvesh create` row. Refused as a subtree because the bypass is the
+     * subtree's purpose, exactly as with `qm guest`. */
+    if (prox_tok_eq(&tok[0], "pvesh") && ntok >= 3 &&
+        prox_path_has_agent_seg(&tok[2])) {
+        if (reason) *reason = REASON_PROX_AGENT_PATH;
+        return VIRP_TIER_RED;
     }
 
     /* Storage destruction. `pvesm status` is GREEN below; every other
@@ -1416,6 +1577,15 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
         return VIRP_TIER_GREEN;
     if (ntok == 2 && prox_tok_eq(&tok[0], "pvesm") &&
         prox_tok_eq(&tok[1], "status"))
+        return VIRP_TIER_GREEN;
+    /* `pvesm list <storage>` — the volumes on one storage. `pvesm status`
+     * above answers "how full is it"; this answers "what is on it", which
+     * is the question that follows it, and there is no way to reach the
+     * second one through the first. The destructive pvesm verbs are BLACK
+     * on their own rows above, so `list` is not riding a permissive tool:
+     * every other pvesm verb is still RED by absence. */
+    if (ntok == 3 && prox_tok_eq(&tok[0], "pvesm") &&
+        prox_tok_eq(&tok[1], "list") && prox_is_storage_id(&tok[2]))
         return VIRP_TIER_GREEN;
     /* <vmid> already parsed and cleared by self-protection above. */
     if (ntok == 3 && (is_qm || is_pct) &&

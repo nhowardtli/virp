@@ -571,6 +571,53 @@ static void test_prox_green(void)
     assert(linux_gate_tier("pvesm status") == VIRP_TIER_GREEN);
     PASS();
 
+    /* `pvesm status` answers "how full is it"; `pvesm list <storage>`
+     * answers "what is on it", and nothing in the table reached the
+     * second question before 2026-08-13. */
+    TEST("pvesm list <storage> -> GREEN");
+    assert(linux_gate_tier("pvesm list local") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesm list local-lvm") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesm list pbs.store_1") == VIRP_TIER_GREEN);
+    assert(linux_gate_reason("pvesm list local") == NULL);
+    PASS();
+
+    /*
+     * The row is a storage ID in argv[2], not "any third token". The
+     * branch charset permits `-`, so a flag is also three tokens and a
+     * token-counting row would have called it a storage name.
+     */
+    TEST("pvesm list: a flag is not a storage name -> RED");
+    assert_red_blocked("pvesm list --content images");
+    assert_red_blocked("pvesm list -storage local");
+    PASS();
+
+    TEST("pvesm list: exact shape only -> RED");
+    assert_red_blocked("pvesm list");                       /* no storage */
+    assert_red_blocked("pvesm list local --content images"); /* trailing */
+    assert_red_blocked("pvesm list local extra");
+    /* A volume ID is not a storage ID — `:` and `/` are not in the shape. */
+    assert_red_blocked("pvesm list local:100/vm-100-disk-0.qcow2");
+    PASS();
+
+    /* Step 1 and step 2 run IN FRONT of this row, as they do for every
+     * other GREEN row: the new read is GREEN only as a clean single
+     * command. */
+    TEST("pvesm list: metachars and charset still refuse first");
+    assert_red_blocked("pvesm list local; rm -rf /");
+    assert_red_blocked("pvesm list local | tee /etc/cron.d/pwn");
+    assert_red_blocked("pvesm list local && rm -rf /");
+    /* …and where the second segment IS never-class, the BLACK scan in
+     * front of everything wins, as it does for `qm list | reboot`. */
+    assert_black_blocked("pvesm list local && reboot");
+    assert_red_blocked("pvesm list $(cat /etc/hostname)");
+    assert_red_blocked("pvesm list local > /root/x");
+    assert_red_blocked("pvesm list loc*al");
+    {
+        const char *why = linux_gate_reason("pvesm list local; rm -rf /");
+        assert(why != NULL && strstr(why, "metacharacter") != NULL);
+    }
+    PASS();
+
     TEST("qm status / qm config <vmid> -> GREEN");
     assert(linux_gate_tier("qm status 100") == VIRP_TIER_GREEN);
     assert(linux_gate_tier("qm config 100") == VIRP_TIER_GREEN);
@@ -598,6 +645,18 @@ static void test_prox_green(void)
     assert_red_blocked("qm list --full");
     assert_red_blocked("pvecm status extra");
     assert_red_blocked("pvesh get /cluster/resources --output-format json");
+    assert_red_blocked("qm config 100 --extra");
+    assert_red_blocked("qm config 100 --current 1");
+    assert_red_blocked("pvesm status --storage local");
+    PASS();
+
+    /* The raw metacharacter scan runs in FRONT of every row above, so a
+     * GREEN read is GREEN only as a clean single command. */
+    TEST("GREEN reads are GREEN only as clean single commands");
+    assert_red_blocked("qm config 100; rm -rf /");
+    assert_red_blocked("pvesh get /cluster/resources | tee /root/x");
+    assert_red_blocked("pvesh get /cluster/resources > /etc/cron.d/pwn");
+    assert_red_blocked("qm config $(id -u)");
     PASS();
 
     TEST("uppercase spelling -> RED (no case folding, as in the FRR table)");
@@ -707,6 +766,62 @@ static void test_prox_red(void)
     assert_red_blocked("pct enter 200");
     PASS();
 
+    /*
+     * The guest-agent API subtree — the one carve-out from "pvesh get is
+     * read-only by construction". The API schema describes these GETs as
+     * "Execute get-osinfo", "Execute get-users" …, and that is literal:
+     * the command runs inside the guest. Same boundary as `qm guest`,
+     * so the same tier, even though the method is get.
+     */
+    TEST("pvesh get on the guest-agent subtree -> RED, not GREEN");
+    assert_red_blocked("pvesh get /nodes/pve-lab/qemu/100/agent/get-users");
+    assert_red_blocked("pvesh get /nodes/pve-lab/qemu/100/agent/get-osinfo");
+    assert_red_blocked("pvesh get /nodes/pve-lab/qemu/100/agent/get-fsinfo");
+    assert_red_blocked(
+        "pvesh get /nodes/pve-lab/qemu/100/agent/network-get-interfaces");
+    assert_red_blocked("pvesh get /nodes/pve-lab/qemu/100/agent");
+    {
+        const char *why =
+            linux_gate_reason("pvesh get /nodes/pve-lab/qemu/100/agent/info");
+        assert(why != NULL && strstr(why, "guest-agent") != NULL);
+    }
+    PASS();
+
+    /*
+     * Refused for EVERY method, not just get. The same subtree holds
+     * exec, file-write and set-user-password, which the `pvesh create`
+     * row would otherwise carry at approvable YELLOW — arbitrary
+     * execution inside a guest, reachable with one signature.
+     */
+    TEST("pvesh create|set on the guest-agent subtree -> RED, never YELLOW");
+    assert_red_blocked("pvesh create /nodes/pve-lab/qemu/100/agent/exec");
+    assert_red_blocked(
+        "pvesh create /nodes/pve-lab/qemu/100/agent/set-user-password");
+    assert_red_blocked("pvesh create /nodes/pve-lab/qemu/100/agent/file-write");
+    assert_red_blocked("pvesh set /nodes/pve-lab/qemu/100/agent/fsfreeze-freeze");
+    assert(linux_gate_tier("pvesh create /nodes/pve-lab/qemu/100/agent/exec")
+           != VIRP_TIER_YELLOW);
+    PASS();
+
+    /* Matched segment-wise at any depth, and a lookalike segment is not
+     * the subtree. */
+    TEST("agent is matched as a path SEGMENT");
+    assert_red_blocked("pvesh get /nodes/pve-lab/qemu/100/agent/");
+    assert(linux_gate_tier("pvesh get /nodes/pve-lab/qemu/100/agentfoo")
+           == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesh get /cluster/resources") == VIRP_TIER_GREEN);
+    PASS();
+
+    /* `qm agent 100 get-osinfo` is the same dispatch, spelled shorter.
+     * Already RED by absence; the row exists so the refusal teaches. */
+    TEST("qm agent <vmid> <cmd> -> RED with the guest-agent reason");
+    assert_red_blocked("qm agent 100 get-osinfo");
+    {
+        const char *why = linux_gate_reason("qm agent 100 get-osinfo");
+        assert(why != NULL && strstr(why, "guest-agent") != NULL);
+    }
+    PASS();
+
     TEST("unlisted pvesh method -> RED by absence");
     assert_red_blocked("pvesh ls /nodes");
     assert_red_blocked("pvesh usage /nodes");
@@ -770,6 +885,19 @@ static void test_prox_self_protection(void)
     assert_black_blocked("pvesh get /nodes/pve-lab/qemu/313/config");
     assert_black_blocked("pvesh create /nodes/pve-lab/qemu/313/status/stop");
     assert_black_blocked("pvesh delete /nodes/pve-lab/qemu/313");
+    PASS();
+
+    /* Self-protection still runs in front of the guest-agent refusal:
+     * on the protected guest the answer is the stronger tier, and the
+     * reason names the VMID rather than the subtree. */
+    TEST("guest-agent path on the protected VMID -> BLACK, not RED");
+    assert_black_blocked("pvesh get /nodes/pve-lab/qemu/313/agent/get-users");
+    {
+        const char *why =
+            linux_gate_reason("pvesh get /nodes/pve-lab/qemu/313/agent/info");
+        assert(why != NULL && strstr(why, "protected VMID") != NULL);
+    }
+    assert_black_blocked("qm agent 313 get-osinfo");
     PASS();
 
     TEST("pvesh /nodes/*/lxc/313 -> BLACK");
@@ -1070,6 +1198,10 @@ static void test_black_is_the_never_class(void)
         "qm status 100",
         "pvesh get /cluster/resources",
         "pvesh get /access/users",
+        "pvesm list local",
+        "pvesh get /nodes/pve-lab/qemu/100/agent/get-users",
+        "pvesh create /nodes/pve-lab/qemu/100/agent/exec",
+        "qm agent 100 get-osinfo",
         "qm stop 100",
         "qm snapshot 100 pre-change",
         "vzdump 100 --storage local",
