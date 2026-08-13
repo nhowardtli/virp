@@ -46,14 +46,16 @@ approved apply re-submits the raw bytes, separator included.
 
 ## Tier table
 
-Updated 2026-08-12 — added host-health GREEN reads, `snapshot`, and the
-BLACK never-class.
+Updated 2026-08-13 — added `pvesm list <storage>` to GREEN and excluded the
+guest-agent API subtree from every `pvesh` method (see "Reads the API
+answers" below). Previously updated 2026-08-12 — host-health GREEN reads,
+`snapshot`, and the BLACK never-class.
 
 | Tier | Commands |
 |---|---|
-| GREEN | `qm list`, `pct list`, `pveversion`, `pvecm status`, `pvecm nodes`, `pvesm status`, `qm status <vmid>`, `qm config <vmid>`, `pct status <vmid>`, `pct config <vmid>`, `pvesh get <path>` where `<path>` is not under `/access`; host reads `df -h`, `uptime`, `uname -a` (exact match only) |
+| GREEN | `qm list`, `pct list`, `pveversion`, `pvecm status`, `pvecm nodes`, `pvesm status`, `pvesm list <storage>`, `qm status <vmid>`, `qm config <vmid>`, `pct status <vmid>`, `pct config <vmid>`, `pvesh get <path>` where `<path>` is not under `/access` and carries no `agent` segment; host reads `df -h`, `uptime`, `uname -a` (exact match only) |
 | YELLOW | `qm`/`pct` `start`, `stop`, `shutdown`, `reboot`, `suspend`, `resume`, `create`, `set`, `clone`, `migrate`, `snapshot`; `pvesh create`, `pvesh set`; `vzdump …` without a deletion flag; `pvesh get /access…` |
-| RED | `qm guest …`, `pct exec`, `pct enter`, `qm delsnapshot`, a malformed or unconfigured VMID, and everything else by absence. Blocked, but approvable. |
+| RED | `qm guest …`, `qm agent …`, `pct exec`, `pct enter`, `pvesh <any method>` on a path with an `agent` segment, `qm delsnapshot`, a malformed or unconfigured VMID, and everything else by absence. Blocked, but approvable. |
 | BLACK | `qm destroy`, `pct destroy`, `pvesh delete`, `pvesm remove\|free\|wipedisk`, `vzdump --delete\|--remove\|--prune-backups`, any command naming a **protected VMID**, host halt (`shutdown`, `reboot`, `poweroff`, `halt`, `init`, `telinit`, `systemctl poweroff\|reboot\|halt`), and gate takedown (`systemctl stop\|disable\|mask\|kill\|restart virp-*`, `pkill\|killall virp-*`). |
 
 ## BLACK — the never-class
@@ -101,6 +103,69 @@ The whole `guest` subtree is refused, not just `exec` — the bypass is the
 subtree's purpose. `pct exec` / `pct enter` are the container equivalents
 and were already RED by absence; naming them changes only which reason
 the signed refusal carries.
+
+## Reads the API answers (2026-08-13)
+
+`pvesh get` is GREEN as a **whole verb**, not as a list of allowed paths.
+`get` is read-only by construction in the Proxmox REST API, so the method
+is already the boundary a path allowlist would be approximating — and
+approximating badly: the API has 341 GET endpoints, an operator question
+arrives as whichever one answers it, and every path nobody enumerated
+would be a false RED on a pure read.
+
+Checked against the published schema (`pve-docs` api-viewer `apidoc.js`,
+678 endpoints, read 2026-08-13) rather than assumed:
+
+- **No GET endpoint returns a UPID.** A Proxmox endpoint that starts a
+  background worker returns one, so zero UPID-returning GETs means no GET
+  spawns a task. Every mutation is POST/PUT/DELETE — including paths
+  where GET is the read half of the same URL (`GET …/apt/update` lists
+  pending updates; `POST` on that path runs the `apt-get update`).
+- **One subtree is excluded:** `/nodes/<node>/qemu/<vmid>/agent/…`. Those
+  GETs are described as "Execute get-osinfo", "Execute get-users" …, and
+  that is literal — they dispatch a command to the QEMU guest agent
+  *inside the guest*. Same boundary `qm guest` is RED for. The exclusion
+  covers **every** `pvesh` method, because the same subtree holds `exec`,
+  `file-write` and `set-user-password`, which would otherwise be
+  approvable YELLOW through the `pvesh create` row. `qm agent <vmid>
+  <cmd>` is the short spelling and is RED with the same reason.
+
+Three further GET classes do act on the world and are already unreachable
+because GREEN rows are exact shapes — each needs at least one `--flag`,
+and a fourth token is RED by absence. Recorded so a future widening of
+the shape does not reopen them silently:
+
+- `…/scan/{nfs,cifs,iscsi,pbs}` — connects **out** to an operator-named
+  server; the `pbs` variant takes `--password`, which would put a
+  credential in the signed command bytes.
+- `…/{qemu,lxc}/<vmid>/vncwebsocket`, `mtunnelwebsocket` — websocket
+  upgrade; needs a ticket only a POST can mint, so it is inert alone.
+- `…/storage/<s>/file-restore/download` — materializes a zip extracted
+  from a PBS backup.
+
+35 of the 341 GETs need a flag like that; the other 306 are reachable as
+a clean three-token `pvesh get <path>`, which is the surface this row
+deliberately opens.
+
+### Raw host shell stays RED — a deliberate hold
+
+`cat`, `ip`, `ss`, `pvs`, `vgs`, `lvdisplay` and `lsblk` remain RED. Not
+because they are dangerous — `ip addr` is as harmless as `uptime` — but
+because of what the gate would then have to know. Every read the probing
+session needed had an API answer: `pvesh get /nodes/<node>/network` for
+`ip`, `pvesm status` + `pvesm list <storage>` for `pvs`/`vgs`/`lvdisplay`,
+`pvesh get /nodes/<node>/disks/list` for `lsblk`, config and status
+endpoints for anything `cat` was aimed at. Those arrive as a bounded verb
+over a structured path.
+
+Generic host shell changes the job description. `cat <path>` makes the
+gate decide which of a filesystem's paths are reads worth signing
+(`cat /etc/shadow`?), and `ip`/`ss` bring subcommand trees where
+`ip addr` and `ip route add` differ by one word. That is no longer "know
+the Proxmox API"; it is "police arbitrary Linux" — open-ended, with no
+schema behind it and no natural place to stop. The three host-health rows
+are exact spellings precisely because they are the exception; a fourth is
+earned only by a read the API genuinely cannot answer.
 
 ## Self-protection: `protected_vmids`
 
