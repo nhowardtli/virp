@@ -1528,3 +1528,172 @@ grepping wire tiers to audit BLACK will get the wrong answer.
   enrolled yet.
 - `qm|pct delsnapshot` is RED, not BLACK. It destroys a restore point, but it
   was not in the enumerated never-class — flagged rather than decided.
+
+## 2026-08-13 00:50 UTC — Proxmox GREEN read widening + guest-agent exclusion
+
+- **Commit**: `7a4e327c59d8758783478ffc6fae0888279600da` (short `7a4e327`)
+- **Branch**: `feat/proxmox-green-read-widening` (merged to `main` immediately
+  after this record was written), superseding `2cb196d` (2026-08-12 23:53 UTC)
+- **Tree at install**: clean (`git status --porcelain` empty)
+- **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
+  socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
+  — binary sha256
+  `66deb33af285aa28b124f43b14c91cf34cfc447b9d338fd1762df97e648464d7`
+- **Client**: `/usr/local/lib/virp/virp-tool` (+ `virp` alias), sha256
+  `15945e2135a314a7011d9fef3abf75a3f8adc66f3bcab56a30dd93d8d69d50d7`
+  (reports `virp-tool 7a4e327`)
+- **Installed via** `sudo make install-prod`; restarted 00:50:25 UTC.
+- **Rollback to the exact prior state**:
+  `sudo make rollback-prod ROLLBACK_FROM=/var/backups/virp/20260813T005008Z`
+- **Driver surface UNCHANGED**: 13 registered before and after. Classifier rows
+  only.
+- **Gate**: `default=ENFORCE max_tier=YELLOW overrides=0`, 1/1 devices
+  connected, pve-lab reconnected at 00:50:25.
+- **Unit NOT touched** (still the pre-`ef6cfa6c` unit, same as the `2cb196d`
+  deploy). No `install-units`, no `daemon-reload`.
+
+### What the probing session actually showed
+
+Worth recording, because the request that produced this change was written from
+a partly-wrong recollection. The journal from the 2026-08-12/13 session is the
+authority, and under the `2cb196d` binary it shows:
+
+- `qm config 100` and `qm config 102` — **allowed GREEN and executed** (00:28).
+- `pvesh get` on `/nodes/pve-lab/network`, `/firewall/rules`,
+  `/firewall/options`, `/storage/local-lvm/status`, `/storage/local-lvm/content`
+  — **all allowed GREEN**. `pvesh get` has been GREEN as a whole verb since
+  `2cb196d`; there has never been a per-path allowlist in this classifier.
+
+So two of the three widenings in the request were already deployed. The reads
+that genuinely RED'd fall into three groups:
+
+1. `pvesm list local-lvm` — genuinely had no row. **Fixed by this deploy.**
+2. Trailing flags on a GREEN shape: `qm list --full`,
+   `qm list --status running`, `pveversion -v`,
+   `pvesh get /cluster/resources --type vm`. These are the exact-shape rule
+   working as designed and are **deliberately still RED**.
+3. `pvesh get /nodes/pve-lab/qemu` — a false RED, **still present after this
+   deploy**. See "Known-open" below.
+
+The RED entries for `qm list`, `qm status 100`, `df -h`, `uptime` and `uname -a`
+in the same journal predate the `2cb196d` binary; they are from earlier boots,
+not from the build being replaced here.
+
+### What changed in the classifier
+
+**GREEN, added:** `pvesm list <storage>`, exact three-token shape. argv[2] must
+have the *shape* of a storage ID (leading alphanumeric, then
+`[A-Za-z0-9._-]`), not merely the position of one — the branch charset permits
+`-`, so `pvesm list --content` is three tokens too and a token-counting row
+would have classified a flag as a storage name. A volume ID
+(`local:100/vm-100-disk-0`) is refused as well: `:` and `/` are not in the
+shape.
+
+**RED, added (a tightening, not a widening):** the
+`/nodes/<node>/qemu/<vmid>/agent` subtree, for **every** `pvesh` method, plus
+`qm agent <vmid> <cmd>`.
+
+This came out of verifying — not assuming — that `pvesh get` has no
+side-effecting paths. Checked against the published schema (`pve-docs`
+api-viewer `apidoc.js`, 678 endpoints, 341 GET, read 2026-08-13):
+
+- **No GET endpoint returns a UPID.** A Proxmox endpoint that starts a
+  background worker task returns one, so zero UPID-returning GETs means no GET
+  spawns work. Every mutation is POST/PUT/DELETE — including same-path pairs:
+  `GET /nodes/<n>/apt/update` lists pending updates, `POST` on that same path
+  runs the `apt-get update`.
+- **One subtree is the exception.** Those GETs are described in the schema as
+  "Execute get-osinfo", "Execute get-users", "Execute
+  network-get-interfaces" …, and that is literal — they dispatch a command to
+  the QEMU guest agent *inside the guest*. Same boundary `qm guest` has been
+  RED for since `46ea70b`.
+- The exclusion covers every method, not just `get`, because the same subtree
+  holds `exec` ("Executes the given command in the vm"), `file-write` and
+  `set-user-password`. Those were sitting at **approvable YELLOW** via the
+  `pvesh create` row — arbitrary execution inside a guest, one signature away.
+  Refusing only the GET half would have been incoherent.
+
+Three further GET classes do act on the world and are already unreachable,
+because a GREEN row is an exact shape and each needs at least one `--flag`:
+`…/scan/{nfs,cifs,iscsi,pbs}` (connects out to an operator-named server; the
+pbs variant takes `--password`, which would put a credential in the signed
+command bytes), `…/vncwebsocket` and `…/mtunnelwebsocket` (websocket upgrade,
+needs a ticket only a POST can mint), and
+`…/storage/<s>/file-restore/download` (materializes a zip from a PBS backup).
+Recorded in the classifier header so a future widening of the *shape* does not
+reopen them silently. 35 of the 341 GETs need a flag like that; the other 306
+are reachable as a clean three-token `pvesh get <path>`.
+
+**No write tier was widened.** The raw metacharacter and charset scans still run
+in front of every row, so each new read is GREEN only as a clean single
+command.
+
+### Raw host shell stays RED — recorded as a deliberate hold
+
+`cat`, `ip`, `ss`, `pvs`, `vgs`, `lvdisplay`, `lsblk` remain RED, and the
+classifier now carries a comment saying so on purpose rather than as an
+oversight. Not because they are dangerous — `ip addr` is as harmless as
+`uptime` — but because of what the gate would then have to know. Every read the
+session needed had an API answer: `pvesh get /nodes/<node>/network` for `ip`,
+`pvesm status` + `pvesm list <storage>` for `pvs`/`vgs`/`lvdisplay`,
+`pvesh get /nodes/<node>/disks/list` for `lsblk`, config and status endpoints
+for anything `cat` was aimed at. Generic host shell changes the job description
+from "know the Proxmox API" to "police arbitrary Linux" — `cat <path>` makes
+the gate decide which of a filesystem's paths are reads worth signing, and
+`ip addr` differs from `ip route add` by one word. The three host-health rows
+(`df -h`, `uptime`, `uname -a`) are exact spellings precisely because they are
+the exception.
+
+### Verified live on the running daemon after restart
+
+| Command | Tier | Result |
+|---|---|---|
+| `pvesm list local` | GREEN | executed — 9 volumes returned |
+| `pvesm list local-lvm` | GREEN | executed (the command that RED'd pre-deploy) |
+| `pvesm list --content images` | RED | blocked, proposal `2d6cdb4c…` |
+| `pvesh get /nodes/pve-lab/qemu/100/agent/get-users` | RED | blocked, proposal `e55ef822…` |
+| `pvesh create /nodes/pve-lab/qemu/100/agent/exec` | RED | blocked, proposal `c5511c22…` (was YELLOW pre-deploy) |
+| `qm agent 100 get-osinfo` | RED | blocked, proposal `2052e79c…` |
+| `qm config 100` | GREEN | executed (regression check) |
+| `pvesh get /cluster/resources` | GREEN | executed (regression check) |
+
+All three guest-agent refusals carry the teaching reason in the signed
+rejection: *"the guest-agent API subtree executes inside the guest — read or
+write, the payload is a command this gate never classified"*.
+`pvesm list --content images` blocks with no reason, which is correct — it is
+RED by absence, not by a named row.
+
+Chain after verification: `gate-enforce:pve-lab` seq 152,
+`0e5c9a6f7c9d7143 → 922bfd2f18601b22 → 57909eb2c62f225c`.
+
+### Tests
+- `test-linux-gate`: **157/157** (baseline before this change: 147/147).
+- `make test-drivers`: all 16 driver suites green.
+- `make test`: 59/59.
+- New coverage: `pvesm list` shape/flag/trailing-token/metachar refusals; the
+  agent subtree across `get`/`create`/`set` including the reason string; `agent`
+  matched as a path *segment* (`…/100/agentfoo` stays GREEN); protected VMID on
+  an agent path still BLACK with the VMID reason, not the subtree reason; and
+  the four new rows added to the BLACK-invariant corpus, so "nothing outside the
+  never-class is BLACK" and "every other blocked command stays RED" now cover
+  them.
+
+### Known-open after this deploy
+
+- **`pvesh get /nodes/<node>/qemu` is a false RED.** Listing the guests on a
+  node is a pure read, but the self-protection walk requires the segment after
+  `qemu`/`lxc` to parse as a VMID, and a path that *ends* at `qemu` yields
+  `PROX_VMID_BAD` → RED. It is asserted as RED in
+  `tests/test_driver_linux_gate.c`, so changing it is a decision, not a
+  bugfix — the distinction it needs is "collection listing, no VMID present"
+  (nothing to protect) versus "empty VMID between slashes"
+  (`…/lxc//config`, which must stay BAD). Not touched here: it was found while
+  reading the deploy journal, after the change had been reviewed.
+- Trailing flags on GREEN reads stay RED by design
+  (`pvesh get <path> --output-format json`, `qm config <id> --current`). If that
+  is the real friction rather than missing paths, it is a separate decision
+  about the shape rule, not about which rows exist.
+- Unchanged from the `2cb196d` deploy: the installed unit still drifts from
+  `deploy/virp-onode.service`; only one approver key is enrolled, and its secret
+  is off-box, so no approval can be signed from this VM; `qm|pct delsnapshot`
+  is RED rather than BLACK.
