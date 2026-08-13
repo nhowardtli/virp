@@ -1074,6 +1074,17 @@ static const char *const REASON_PROX_GUEST_EXEC =
 static const char *const REASON_PROX_AGENT_PATH =
     "the guest-agent API subtree executes inside the guest — read or "
     "write, the payload is a command this gate never classified";
+static const char *const REASON_PROX_ACCESS_WRITE =
+    "writes to the /access tree mint or re-grant identity — the "
+    "credential outlives the approval and works outside VIRP; reachable "
+    "only through propose/approve/apply";
+static const char *const REASON_PROX_QUOTE_FORM =
+    "quoted argument refused — a quote may only open a whole token, must "
+    "close, and may not contain a tab or a double space";
+static const char *const REASON_PROX_VZDUMP_HOOK =
+    "--script runs an operator-named program as root during the backup "
+    "and --stdout redirects the archive off its storage — neither "
+    "payload is classified by this gate";
 
 /*
  * Register protected VMIDs from one device's config. `csv` is a
@@ -1159,61 +1170,267 @@ static bool linux_prox_has_metachar(const char *raw)
     return false;
 }
 
-/* Step 2 — argument charset. */
-static bool linux_prox_charset_ok(const char *canon)
+/*
+ * Step 1b — quote shape, on the RAW bytes, before canonicalization.
+ *
+ * This has to see the raw string, because what it refuses is precisely
+ * what canonicalization would erase. linux_gate_canon() collapses every
+ * run of spaces and turns tabs into spaces, with no idea that quotes
+ * exist. The device executes the RAW command (libssh2_channel_exec gets
+ * the request bytes, not the canon), so once a quoted value may contain
+ * a space, `--description "a    b"` would be CLASSIFIED as "a b" and
+ * EXECUTED as "a    b" — different bytes, and the chain would record a
+ * signature over a command that is not the one that ran.
+ *
+ * Rather than teach canonicalization about quotes — which would change a
+ * function the vtysh/FRR table also depends on — the interior is
+ * required to be something canonicalization cannot alter: no tabs, and
+ * no run of two or more spaces. Single interior spaces survive canon
+ * byte-for-byte, so after this check the canon's quoted regions are
+ * identical to the raw's, and the tokenizer may walk the canon safely.
+ *
+ * An operator who genuinely needs a double space in a description is
+ * refused. That is the trade: a false refusal is a config edit, a
+ * classified-vs-executed split is the gate signing something it did not
+ * read.
+ */
+static bool linux_prox_quotes_raw_ok(const char *raw)
 {
-    for (const char *p = canon; *p; p++) {
-        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-            (*p >= '0' && *p <= '9') ||
-            *p == ' ' || *p == '.' || *p == '_' || *p == '/' ||
-            *p == ':' || *p == '=' || *p == ',' || *p == '-')
-            continue;
-        return false;
+    bool in_quote = false;
+    for (const char *p = raw; *p; p++) {
+        if (*p == '"') { in_quote = !in_quote; continue; }
+        if (!in_quote) continue;
+        if (*p == '\t') return false;                  /* canon would fold */
+        if (*p == ' ' && p[1] == ' ') return false;    /* canon would fold */
     }
-    return true;
+    return !in_quote;                                  /* unbalanced */
+}
+
+/* Bytes legal in a BARE (unquoted) token. Unchanged from the original
+ * row: everything a Proxmox path, node name or option value needs, and
+ * nothing that composes a shell word. */
+static bool prox_byte_bare_ok(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == ' ' || c == '.' || c == '_' || c == '/' ||
+           c == ':' || c == '=' || c == ',' || c == '-';
+}
+
+/*
+ * Bytes legal INSIDE a quoted value.
+ *
+ * The quoted region reaches the device intact — libssh2_channel_exec()
+ * hands the RAW request bytes to the remote login shell, so the very
+ * quotes classified here are the quotes that shell parses, and the
+ * region becomes exactly one argv element. What has to be excluded is
+ * therefore precisely what is still active INSIDE double quotes:
+ *
+ *   "   would close the region early and start a new word
+ *   \   escapes the next byte, including the closing quote
+ *   $   parameter expansion — note step 1 refuses only `$(` and `${`,
+ *       so a bare `$HOME` would otherwise survive it and expand here
+ *   `   command substitution (step 1 refuses it too; excluded again
+ *       here so this function is correct on its own terms)
+ *
+ * ; | & < > are already refused by step 1 for the whole raw string,
+ * quoted region included. They are excluded again below for the same
+ * reason: a neighbour's guarantee is not this function's.
+ *
+ * Glob and brace bytes (* ? [ ] { } ~) are LITERAL inside double quotes
+ * and are allowed — a description or a tag legitimately contains them,
+ * and the region can never be split into a second word for them to act
+ * on. Single quote is allowed as ordinary punctuation (an apostrophe);
+ * it has no meaning inside a double-quoted region.
+ */
+static bool prox_byte_quoted_ok(char c)
+{
+    if (prox_byte_bare_ok(c)) return true;
+    switch (c) {
+    case '"': case '\\': case '$': case '`':
+    case ';':  case '|':  case '&': case '<': case '>':
+        return false;
+    default:
+        /* Printable ASCII only — no control bytes (step 1 refuses those
+         * too), no high-bit bytes. */
+        return c >= 0x20 && c <= 0x7E;
+    }
 }
 
 typedef struct {
     const char *p;
     size_t      len;
+    bool        quoted;   /* value came from inside a "..." region */
 } prox_tok_t;
 
-/* Split the space-normalized canon into tokens. Returns the count, or
- * (size_t)-1 if the command carries more tokens than the table will
- * consider (RED — an argument vector that long is not a read). */
-static size_t linux_prox_split(const char *canon, prox_tok_t *out, size_t max)
+typedef enum {
+    PROX_TOK_OK = 0,
+    PROX_TOK_BAD_CHARSET,   /* illegal byte for its context */
+    PROX_TOK_BAD_QUOTE,     /* unbalanced, misplaced or nested quote */
+    PROX_TOK_TOO_MANY,      /* more tokens than the table will consider */
+} prox_tok_status_t;
+
+/*
+ * Steps 2 + 3 — ONE quote-aware tokenizer, charset-validating as it
+ * goes. Both jobs live here on purpose: the old code had a charset scan
+ * and a separate splitter, and once a quoted value can contain a space
+ * the two would disagree about where tokens end. Two tokenizers that
+ * disagree is the classified-vs-executed split this file's header
+ * forbids, so there is exactly one.
+ *
+ * QUOTES ARE STRIPPED from the stored token. This is load-bearing, not
+ * cosmetic: the remote shell strips them too, so `vzdump 100 "--delete"`
+ * arrives at vzdump as --delete. A token stored WITH its quotes would
+ * not match the BLACK deletion row, and the fix admitting quoted values
+ * would itself have opened a never-class bypass. Every tier row matches
+ * what the device will see; `quoted` records where the bytes came from
+ * so rows that need a bare word can still insist on one.
+ *
+ * Accepted token shapes — deliberately narrow, so the result is
+ * auditable rather than merely parseable:
+ *
+ *   bare        qm, /nodes/x, --memory, 4096
+ *   "quoted"    an ENTIRE token, quotes stripped
+ *
+ * A quote may only open at the start of a token. `--flag="a b"` is
+ * refused, and that is a deliberate choice rather than an oversight:
+ * the shell yields `--flag=a b` for it, which is not a contiguous run
+ * in this buffer, so the stored token could not be byte-identical to
+ * what executes. Rather than store a token that only mostly matches —
+ * the exact class of near-miss that turns into a bypass — the shape is
+ * refused. `--flag "a b"`, two tokens, expresses the same thing and is
+ * what an operator writes anyway.
+ *
+ * Anything else — a quote opening mid-word, text after a closing quote,
+ * a second quoted region in one token — is BAD_QUOTE.
+ *
+ * Interior whitespace is NOT re-examined here. linux_prox_quotes_raw_ok()
+ * has already refused any quoted region containing a tab or a run of two
+ * or more spaces, on the RAW bytes, which is what makes canonicalization
+ * a provable no-op inside quotes and lets this walk the canon safely.
+ */
+static prox_tok_status_t linux_prox_tokenize(const char *canon,
+                                             prox_tok_t *out, size_t max,
+                                             size_t *out_n)
 {
     size_t n = 0;
     const char *p = canon;
+
     while (*p) {
         while (*p == ' ') p++;
         if (!*p) break;
+        if (n >= max) return PROX_TOK_TOO_MANY;
+
         const char *start = p;
-        while (*p && *p != ' ') p++;
-        if (n >= max) return (size_t)-1;
+
+        if (*p == '"') {
+            /* Quoted token: the whole token is one quoted region, and
+             * the stored span is the INTERIOR — quotes stripped, exactly
+             * the bytes the remote shell will produce. */
+            p++;
+            start = p;
+            while (*p && *p != '"') {
+                if (!prox_byte_quoted_ok(*p)) return PROX_TOK_BAD_CHARSET;
+                p++;
+            }
+            if (*p != '"') return PROX_TOK_BAD_QUOTE;   /* unbalanced */
+            out[n].p = start;
+            out[n].len = (size_t)(p - start);
+            p++;                                        /* past closing " */
+            if (*p && *p != ' ') return PROX_TOK_BAD_QUOTE; /* trailing junk */
+            out[n].quoted = true;
+            n++;
+            continue;
+        }
+
+        /* Bare run. A quote anywhere inside it is refused — see the
+         * shape note above. */
+        while (*p && *p != ' ') {
+            if (*p == '"') return PROX_TOK_BAD_QUOTE;
+            if (!prox_byte_bare_ok(*p)) return PROX_TOK_BAD_CHARSET;
+            p++;
+        }
+
         out[n].p = start;
         out[n].len = (size_t)(p - start);
+        out[n].quoted = false;
         n++;
     }
-    return n;
+
+    *out_n = n;
+    return PROX_TOK_OK;
 }
 
+/*
+ * Content equality — quotes already stripped, so this compares what the
+ * device will see. It does NOT consider `quoted`: use prox_tok_eq_bare()
+ * wherever a row needs an actual bare word.
+ */
 static bool prox_tok_eq(const prox_tok_t *t, const char *s)
 {
     return strlen(s) == t->len && strncmp(t->p, s, t->len) == 0;
 }
 
+/*
+ * Equality that also insists the token was NOT quoted.
+ *
+ * Every row naming a structural element — the tool, a verb, an API
+ * method — uses this. `"qm" list` and `qm "list"` are not spellings of
+ * `qm list`: they reach the shell as the same argv, but a table that
+ * accepted them would be reasoning about a quoted string in a position
+ * where it enumerated bare words, and the enumeration is the whole
+ * safety argument. Refused (RED by absence), which is the safe
+ * direction and keeps the row set exactly as narrow as it reads.
+ */
+static bool prox_tok_eq_bare(const prox_tok_t *t, const char *s)
+{
+    return !t->quoted && prox_tok_eq(t, s);
+}
+
 static bool prox_tok_in(const prox_tok_t *t, const char *const *set, size_t n)
 {
+    if (t->quoted) return false;
     for (size_t i = 0; i < n; i++)
         if (prox_tok_eq(t, set[i])) return true;
+    return false;
+}
+
+/*
+ * Flag-denylist matching, normalized to what the TOOL will parse.
+ *
+ * Two spellings reach the same flag and neither may evade a never-class
+ * row:
+ *
+ *   vzdump 100 "--delete"    quotes stripped by the shell -> --delete
+ *   vzdump 100 --delete=1    Proxmox CLI accepts --flag=value
+ *
+ * The first is why the tokenizer stores stripped content; without it,
+ * admitting quoted values would have opened a BLACK bypass. The second
+ * predates quoting entirely — `vzdump 100 --delete=1` classified YELLOW
+ * against a row that exists to make deletion unapprovable — and is why
+ * this compares the HEAD, the span before the first '=', rather than the
+ * whole token.
+ *
+ * Quote-agnostic on purpose: a denylist must match the bytes the tool
+ * acts on, wherever they came from. That is the opposite of the bare-word
+ * rows above, and deliberately so — one asks "is this the word I
+ * enumerated", the other asks "will this do the thing I refuse".
+ */
+static bool prox_flag_in(const prox_tok_t *t, const char *const *set, size_t n)
+{
+    size_t head = 0;
+    while (head < t->len && t->p[head] != '=') head++;
+    for (size_t i = 0; i < n; i++) {
+        if (strlen(set[i]) == head && strncmp(t->p, set[i], head) == 0)
+            return true;
+    }
     return false;
 }
 
 /* A VMID is a non-empty run of decimal digits and NOTHING else — no
  * sign, no whitespace, no name. "313x", "0x139", "-1" and "" all fail,
  * and a failure at an expected position is RED, never a fall-through. */
-static bool prox_parse_vmid(const prox_tok_t *t, uint32_t *out)
+static bool prox_vmid_digits(const prox_tok_t *t, uint32_t *out)
 {
     if (t->len == 0 || t->len > 9) return false;
     uint32_t v = 0;
@@ -1223,6 +1440,105 @@ static bool prox_parse_vmid(const prox_tok_t *t, uint32_t *out)
     }
     *out = v;
     return true;
+}
+
+/* A guest id as the HA and pool APIs spell it: `vm:313`, `ct:313`.
+ *
+ * This is a THIRD spelling of the same thing. /nodes/<n>/qemu/<vmid>
+ * names a guest positionally, `qm stop <vmid>` names it as an argument,
+ * and the cluster-scoped APIs name it as a typed sid. Self-protection
+ * has to recognize all three, or the guard is only as good as the
+ * spelling an operator happens to use. */
+static bool prox_sid_vmid(const char *p, size_t len, uint32_t *out)
+{
+    if (len <= 3 || p[2] != ':') return false;
+    if (!((p[0] == 'v' && p[1] == 'm') || (p[0] == 'c' && p[1] == 't')))
+        return false;
+    prox_tok_t idt = { p + 3, len - 3, false };
+    return prox_vmid_digits(&idt, out);
+}
+
+typedef enum {
+    PROX_ID_NONE = 0,      /* no field in this token named a guest */
+    PROX_ID_CLEAR,         /* named one or more, none protected */
+    PROX_ID_PROTECTED,     /* named a protected guest */
+} prox_id_scan_t;
+
+/*
+ * Scan ONE token for guest ids, splitting on commas.
+ *
+ * The comma split is not cosmetic. `--vms 100,313` is how the pool API
+ * takes a list and `--vmid 100,313` is how vzdump takes one, and a scan
+ * that judged whole tokens saw neither: `vzdump --vmid 313` was BLACK
+ * while `vzdump --vmid 100,313` was YELLOW, naming the same guest. That
+ * is the same defect as the vm:313 spelling — a way of writing the
+ * protected id that self-protection could not read — so both are fixed
+ * here, in one place used by every branch.
+ *
+ * `numeric_ok` is the caller's judgement about whether a BARE number
+ * names a guest in this context. It does after a qm/pct verb and in a
+ * vzdump argument vector; it does not in an arbitrary pvesh argument,
+ * where a number is usually a size or a flag value, so pvesh passes
+ * true only for cluster- and pool-scoped paths.
+ *
+ * *saw_sid reports whether a field used the unambiguous vm:/ct: form,
+ * which is what lets a caller distinguish "this names a guest" from
+ * "this contains a number".
+ */
+static prox_id_scan_t prox_scan_token_ids(const prox_tok_t *t, bool numeric_ok,
+                                          bool *saw_sid)
+{
+    prox_id_scan_t res = PROX_ID_NONE;
+    size_t f = 0;
+
+    while (f < t->len) {
+        while (f < t->len && t->p[f] == ',') f++;
+        size_t fs = f;
+        while (f < t->len && t->p[f] != ',') f++;
+        size_t flen = f - fs;
+        if (flen == 0) continue;
+
+        uint32_t v;
+        bool named = false;
+        if (prox_sid_vmid(t->p + fs, flen, &v)) {
+            named = true;
+            if (saw_sid) *saw_sid = true;
+        } else if (numeric_ok) {
+            /* `quoted` is deliberately false on the field view: a scan
+             * hunting a protected id must read "313" the same as 313,
+             * exactly as prox_vmid_digits() does for whole tokens. */
+            prox_tok_t ft = { t->p + fs, flen, false };
+            named = prox_vmid_digits(&ft, &v);
+        }
+        if (!named) continue;
+
+        if (linux_protected_vmids_configured && linux_prox_is_protected(v))
+            return PROX_ID_PROTECTED;
+        res = PROX_ID_CLEAR;
+    }
+    return res;
+}
+
+/*
+ * A VMID in a position where the table EXPECTS one. Quoted is refused:
+ * `qm stop "313"` is not a spelling of `qm stop 313` for this table, and
+ * the refusal is PROX_VMID_BAD -> RED, never a fall-through to the verb
+ * tier.
+ *
+ * Note the asymmetry with prox_vmid_digits() above, which ignores
+ * `quoted` and is what the self-protection SCANS use. That is the
+ * important half: a scan looking for a protected id must find `"313"`
+ * too, because the shell hands the device 313 either way. If the scan
+ * used this function, a quoted id would simply fail to parse, the loop
+ * would skip it, and quoting would become a second protected-VMID
+ * bypass alongside the `vm:313` spelling. One function refuses a
+ * malformed argument; the other hunts for a dangerous value. They must
+ * not be the same function.
+ */
+static bool prox_parse_vmid(const prox_tok_t *t, uint32_t *out)
+{
+    if (t->quoted) return false;
+    return prox_vmid_digits(t, out);
 }
 
 /* A storage ID as Proxmox spells it (pve-storage-id): alphanumeric first
@@ -1240,6 +1556,7 @@ static bool prox_parse_vmid(const prox_tok_t *t, uint32_t *out)
  * is the one to be wrong with. */
 static bool prox_is_storage_id(const prox_tok_t *t)
 {
+    if (t->quoted) return false;   /* structural argument — bare only */
     if (t->len == 0 || t->len > 64) return false;
     char c = t->p[0];
     if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -1323,9 +1640,9 @@ static prox_vmid_verdict_t linux_prox_self_protect(const prox_tok_t *tok,
 
     bool saw_vmid = false;
 
-    if (prox_tok_eq(&tok[0], "qm") || prox_tok_eq(&tok[0], "pct")) {
+    if (prox_tok_eq_bare(&tok[0], "qm") || prox_tok_eq_bare(&tok[0], "pct")) {
         if (ntok < 2) return PROX_VMID_NONE;        /* bare `qm` — RED later */
-        if (prox_tok_eq(&tok[1], "list")) return PROX_VMID_NONE;
+        if (prox_tok_eq_bare(&tok[1], "list")) return PROX_VMID_NONE;
 
         /* Every qm/pct verb takes the VMID at argv position 2, except
          * the guest-agent subtree, which spells it one further right
@@ -1333,20 +1650,23 @@ static prox_vmid_verdict_t linux_prox_self_protect(const prox_tok_t *tok,
          * subtree is RED on its own row below; the position is still
          * resolved here so a protected VMID is named as such rather
          * than reported as a malformed argument. */
-        size_t vpos = (prox_tok_eq(&tok[0], "qm") &&
-                       prox_tok_eq(&tok[1], "guest")) ? 3 : 2;
+        size_t vpos = (prox_tok_eq_bare(&tok[0], "qm") &&
+                       prox_tok_eq_bare(&tok[1], "guest")) ? 3 : 2;
         if (ntok <= vpos) return PROX_VMID_BAD;
         uint32_t vmid;
         if (!prox_parse_vmid(&tok[vpos], &vmid)) return PROX_VMID_BAD;
         saw_vmid = true;
 
+        /* prox_vmid_digits(), NOT prox_parse_vmid(): this is the SCAN,
+         * and it must find a protected id however it was spelled. A
+         * quoted "313" reaches the device as 313, so a scan that skipped
+         * quoted tokens would make quoting a second protected-VMID
+         * bypass — the same shape of hole as the `vm:313` spelling. */
         for (size_t i = vpos; i < ntok; i++) {
-            uint32_t v;
-            if (!prox_parse_vmid(&tok[i], &v)) continue;
-            if (linux_protected_vmids_configured && linux_prox_is_protected(v))
+            if (prox_scan_token_ids(&tok[i], true, NULL) == PROX_ID_PROTECTED)
                 return PROX_VMID_PROTECTED;
         }
-    } else if (prox_tok_eq(&tok[0], "pvesh")) {
+    } else if (prox_tok_eq_bare(&tok[0], "pvesh")) {
         if (ntok < 3) return PROX_VMID_NONE;        /* malformed — RED later */
 
         /* Walk the path segment by segment; the segment following a
@@ -1370,20 +1690,82 @@ static prox_vmid_verdict_t linux_prox_self_protect(const prox_tok_t *tok,
             while (i < plen && path[i] == '/') i++;
             size_t vstart = i;
             while (i < plen && path[i] != '/') i++;
-            prox_tok_t vt = { path + vstart, i - vstart };
+            /* A span carved out of a path token. Its bytes are content,
+             * never a quoted region of their own, so `quoted` is false
+             * and prox_parse_vmid() applies normally — including when
+             * the enclosing path token was itself quoted, which is what
+             * keeps `pvesh set "/nodes/x/qemu/313/config"` protected. */
+            prox_tok_t vt = { path + vstart, i - vstart, false };
             uint32_t vmid;
             if (!prox_parse_vmid(&vt, &vmid)) return PROX_VMID_BAD;
             saw_vmid = true;
             if (linux_protected_vmids_configured && linux_prox_is_protected(vmid))
                 return PROX_VMID_PROTECTED;
         }
-    } else if (prox_tok_eq(&tok[0], "vzdump")) {
+
+        /*
+         * The walk above anchors on `qemu`/`lxc`, which is how the
+         * PER-GUEST API spells a VMID. The cluster-scoped APIs spell the
+         * same guest differently, and reached YELLOW because the walk
+         * found nothing to judge:
+         *
+         *   pvesh set    /cluster/ha/resources/vm:313 --state stopped
+         *   pvesh create /cluster/ha/resources --sid vm:313
+         *   pvesh set    /pools/<pool> --vms 313
+         *
+         * VERIFIED REACHABLE on pve-lab (2026-08-13): 313 is a running
+         * guest there, pve-ha-crm and pve-ha-lrm are active and enabled,
+         * and HA reports quorum OK / quorate=1 even standalone. Two
+         * YELLOW commands — enroll, then set state stopped — power off
+         * the guest running this gate, which is the exact outcome BLACK
+         * exists to make unreachable.
+         *
+         * Two rules, deliberately different in strength:
+         *
+         *   - `vm:<n>` / `ct:<n>` ANYWHERE, path segment or argument.
+         *     Unambiguously names a guest, so it also sets saw_vmid and
+         *     an unconfigured protected set refuses, exactly as a
+         *     positional VMID does.
+         *   - Every bare numeric, but ONLY when the path is cluster- or
+         *     pool-scoped, which is where `--vms 313` lives. This one
+         *     does NOT set saw_vmid: `--migration-unsecure 1` is a
+         *     numeric that names no guest, and treating it as one would
+         *     turn an unconfigured deployment's ordinary cluster edits
+         *     into refusals.
+         */
+        bool cluster_scope =
+            (plen >= 8 && strncmp(path, "/cluster", 8) == 0) ||
+            (plen >= 6 && strncmp(path, "/pools", 6) == 0);
+
+        i = 0;
+        while (i < plen) {                        /* path segments */
+            while (i < plen && path[i] == '/') i++;
+            size_t sstart = i;
+            while (i < plen && path[i] != '/') i++;
+            uint32_t sv;
+            if (prox_sid_vmid(path + sstart, i - sstart, &sv)) {
+                saw_vmid = true;
+                if (linux_protected_vmids_configured &&
+                    linux_prox_is_protected(sv))
+                    return PROX_VMID_PROTECTED;
+            }
+        }
+
+        for (size_t t = 1; t < ntok; t++) {       /* argument tokens */
+            bool sid = false;
+            prox_id_scan_t r = prox_scan_token_ids(&tok[t], cluster_scope, &sid);
+            if (sid) saw_vmid = true;
+            if (r == PROX_ID_PROTECTED) return PROX_VMID_PROTECTED;
+        }
+    } else if (prox_tok_eq_bare(&tok[0], "vzdump")) {
+        /* Scan, not an expected position — quote- and comma-agnostic for
+         * the same reason as the qm/pct scan above. `vzdump --vmid
+         * 100,313` names the protected guest just as `vzdump --vmid 313`
+         * does, and only the comma split sees it. */
         for (size_t i = 1; i < ntok; i++) {
-            uint32_t v;
-            if (!prox_parse_vmid(&tok[i], &v)) continue;
-            saw_vmid = true;
-            if (linux_protected_vmids_configured && linux_prox_is_protected(v))
-                return PROX_VMID_PROTECTED;
+            prox_id_scan_t r = prox_scan_token_ids(&tok[i], true, NULL);
+            if (r != PROX_ID_NONE) saw_vmid = true;
+            if (r == PROX_ID_PROTECTED) return PROX_VMID_PROTECTED;
         }
     }
 
@@ -1431,6 +1813,18 @@ static const char *const PROX_VZDUMP_BLACK_FLAGS[] = {
     "--delete", "--remove", "--prune-backups", "-delete", "-remove",
 };
 
+/* vzdump flags whose payload this gate never sees. `--script` runs an
+ * operator-named program as root at each backup phase, which is the
+ * `qm guest exec` problem wearing a backup flag; `--stdout` sends the
+ * archive to the channel instead of to its storage, so the backup this
+ * gate authorized is not the artifact that results.
+ *
+ * RED, not BLACK: the command is legitimate and reversible, and a human
+ * reading the script path is exactly the check that is missing. */
+static const char *const PROX_VZDUMP_RED_FLAGS[] = {
+    "--script", "-script", "--stdout", "-stdout",
+};
+
 /*
  * Proxmox branch of linux_gate_classify(). `command` is the raw request
  * bytes, `canon` the whitespace-collapsed copy the FRR table also uses.
@@ -1439,21 +1833,41 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
                                              const char *canon,
                                              const char **reason)
 {
-    /* 1 — raw metacharacters, before anything is tokenized or matched. */
+    /* 1 — raw metacharacters, before anything is tokenized or matched.
+     * UNCHANGED and still first: quoting must never become a container
+     * that shields a metacharacter from this scan. It runs on the raw
+     * bytes with no notion of quotes, so ` and $( inside a quoted region
+     * are refused exactly as they are outside one. The ordering — raw
+     * metachars, then quote/charset rules, then tiers — is what makes
+     * admitting quoted values safe at all. */
     if (linux_prox_has_metachar(command)) {
         if (reason) *reason = REASON_PROX_METACHAR;
         return VIRP_TIER_RED;
     }
 
-    /* 2 — argument charset. */
-    if (!linux_prox_charset_ok(canon)) {
-        if (reason) *reason = REASON_PROX_CHARSET;
+    /* 1b — quote shape, also on the raw bytes: balanced, and carrying
+     * nothing canonicalization would rewrite. See the function. */
+    if (!linux_prox_quotes_raw_ok(command)) {
+        if (reason) *reason = REASON_PROX_QUOTE_FORM;
         return VIRP_TIER_RED;
     }
 
+    /* 2 — tokenize and charset-validate in one pass, quote-aware. */
     prox_tok_t tok[LINUX_PROX_MAX_TOK];
-    size_t ntok = linux_prox_split(canon, tok, LINUX_PROX_MAX_TOK);
-    if (ntok == (size_t)-1 || ntok == 0)
+    size_t ntok = 0;
+    switch (linux_prox_tokenize(canon, tok, LINUX_PROX_MAX_TOK, &ntok)) {
+    case PROX_TOK_BAD_CHARSET:
+        if (reason) *reason = REASON_PROX_CHARSET;
+        return VIRP_TIER_RED;
+    case PROX_TOK_BAD_QUOTE:
+        if (reason) *reason = REASON_PROX_QUOTE_FORM;
+        return VIRP_TIER_RED;
+    case PROX_TOK_TOO_MANY:
+        return VIRP_TIER_RED;
+    case PROX_TOK_OK:
+        break;
+    }
+    if (ntok == 0)
         return VIRP_TIER_RED;
 
     /* 3 — self-protection, ahead of every tier row. */
@@ -1479,15 +1893,15 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
         break;
     }
 
-    bool is_qm  = prox_tok_eq(&tok[0], "qm");
-    bool is_pct = prox_tok_eq(&tok[0], "pct");
+    bool is_qm  = prox_tok_eq_bare(&tok[0], "qm");
+    bool is_pct = prox_tok_eq_bare(&tok[0], "pct");
 
     /* 4a — refusal rows, with the teaching reason, before any permit.
      * `destroy` is BLACK (2026-08-12): a destroyed guest has no restore
      * path inside VIRP, so an approval would be authorizing something
      * the chain can record but not undo. */
     if ((is_qm || is_pct) && ntok >= 2) {
-        if (prox_tok_eq(&tok[1], "destroy")) {
+        if (prox_tok_eq_bare(&tok[1], "destroy")) {
             if (reason) *reason = REASON_PROX_DESTROY;
             return VIRP_TIER_BLACK;
         }
@@ -1502,12 +1916,12 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
          * same bypass and were already RED by absence; naming them here
          * only changes which reason the signed refusal carries, never
          * the tier. */
-        if (is_qm && prox_tok_eq(&tok[1], "guest")) {
+        if (is_qm && prox_tok_eq_bare(&tok[1], "guest")) {
             if (reason) *reason = REASON_PROX_GUEST_EXEC;
             return VIRP_TIER_RED;
         }
-        if (is_pct && (prox_tok_eq(&tok[1], "exec") ||
-                       prox_tok_eq(&tok[1], "enter"))) {
+        if (is_pct && (prox_tok_eq_bare(&tok[1], "exec") ||
+                       prox_tok_eq_bare(&tok[1], "enter"))) {
             if (reason) *reason = REASON_PROX_GUEST_EXEC;
             return VIRP_TIER_RED;
         }
@@ -1516,13 +1930,13 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
          * absence; naming it changes only which reason the signed refusal
          * carries. (pct has no agent verb — the row costs nothing there
          * and is not worth a separate condition.) */
-        if (prox_tok_eq(&tok[1], "agent")) {
+        if (prox_tok_eq_bare(&tok[1], "agent")) {
             if (reason) *reason = REASON_PROX_AGENT_PATH;
             return VIRP_TIER_RED;
         }
     }
-    if (prox_tok_eq(&tok[0], "pvesh") && ntok >= 2 &&
-        prox_tok_eq(&tok[1], "delete")) {
+    if (prox_tok_eq_bare(&tok[0], "pvesh") && ntok >= 2 &&
+        prox_tok_eq_bare(&tok[1], "delete")) {
         if (reason) *reason = REASON_PROX_DESTROY;
         return VIRP_TIER_BLACK;
     }
@@ -1534,7 +1948,7 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
      * set-user-password would otherwise be approvable YELLOW through the
      * `pvesh create` row. Refused as a subtree because the bypass is the
      * subtree's purpose, exactly as with `qm guest`. */
-    if (prox_tok_eq(&tok[0], "pvesh") && ntok >= 3 &&
+    if (prox_tok_eq_bare(&tok[0], "pvesh") && ntok >= 3 &&
         prox_path_has_agent_seg(&tok[2])) {
         if (reason) *reason = REASON_PROX_AGENT_PATH;
         return VIRP_TIER_RED;
@@ -1543,7 +1957,7 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
     /* Storage destruction. `pvesm status` is GREEN below; every other
      * pvesm verb was already RED by absence, and the destructive ones
      * are named here so the refusal is BLACK and carries a reason. */
-    if (prox_tok_eq(&tok[0], "pvesm") && ntok >= 2 &&
+    if (prox_tok_eq_bare(&tok[0], "pvesm") && ntok >= 2 &&
         prox_tok_in(&tok[1], PROX_STORAGE_BLACK_VERBS,
                     sizeof(PROX_STORAGE_BLACK_VERBS) /
                     sizeof(PROX_STORAGE_BLACK_VERBS[0]))) {
@@ -1554,13 +1968,27 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
     /* Backup deletion — checked across the whole argument vector, since
      * the flag's position varies and `vzdump 100 --remove 1` names it
      * after the VMID. */
-    if (prox_tok_eq(&tok[0], "vzdump")) {
+    if (prox_tok_eq_bare(&tok[0], "vzdump")) {
         for (size_t i = 1; i < ntok; i++) {
-            if (prox_tok_in(&tok[i], PROX_VZDUMP_BLACK_FLAGS,
-                            sizeof(PROX_VZDUMP_BLACK_FLAGS) /
-                            sizeof(PROX_VZDUMP_BLACK_FLAGS[0]))) {
+            if (prox_flag_in(&tok[i], PROX_VZDUMP_BLACK_FLAGS,
+                             sizeof(PROX_VZDUMP_BLACK_FLAGS) /
+                             sizeof(PROX_VZDUMP_BLACK_FLAGS[0]))) {
                 if (reason) *reason = REASON_PROX_BACKUP_DELETE;
                 return VIRP_TIER_BLACK;
+            }
+        }
+    }
+
+    /* Backup hooks and redirection. Checked AFTER the BLACK loop above so
+     * `vzdump 100 --script x --delete` keeps the stronger answer, and
+     * across the whole vector for the same position-independence reason. */
+    if (prox_tok_eq_bare(&tok[0], "vzdump")) {
+        for (size_t i = 1; i < ntok; i++) {
+            if (prox_flag_in(&tok[i], PROX_VZDUMP_RED_FLAGS,
+                             sizeof(PROX_VZDUMP_RED_FLAGS) /
+                             sizeof(PROX_VZDUMP_RED_FLAGS[0]))) {
+                if (reason) *reason = REASON_PROX_VZDUMP_HOOK;
+                return VIRP_TIER_RED;
             }
         }
     }
@@ -1568,15 +1996,15 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
     /* 4b — GREEN reads. Each is an exact shape, not a prefix: a trailing
      * argument the table has not reasoned about drops to RED by absence
      * rather than riding a permitted verb. */
-    if (ntok == 1 && prox_tok_eq(&tok[0], "pveversion"))
+    if (ntok == 1 && prox_tok_eq_bare(&tok[0], "pveversion"))
         return VIRP_TIER_GREEN;
-    if (ntok == 2 && (is_qm || is_pct) && prox_tok_eq(&tok[1], "list"))
+    if (ntok == 2 && (is_qm || is_pct) && prox_tok_eq_bare(&tok[1], "list"))
         return VIRP_TIER_GREEN;
-    if (ntok == 2 && prox_tok_eq(&tok[0], "pvecm") &&
-        (prox_tok_eq(&tok[1], "status") || prox_tok_eq(&tok[1], "nodes")))
+    if (ntok == 2 && prox_tok_eq_bare(&tok[0], "pvecm") &&
+        (prox_tok_eq_bare(&tok[1], "status") || prox_tok_eq_bare(&tok[1], "nodes")))
         return VIRP_TIER_GREEN;
-    if (ntok == 2 && prox_tok_eq(&tok[0], "pvesm") &&
-        prox_tok_eq(&tok[1], "status"))
+    if (ntok == 2 && prox_tok_eq_bare(&tok[0], "pvesm") &&
+        prox_tok_eq_bare(&tok[1], "status"))
         return VIRP_TIER_GREEN;
     /* `pvesm list <storage>` — the volumes on one storage. `pvesm status`
      * above answers "how full is it"; this answers "what is on it", which
@@ -1584,8 +2012,8 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
      * second one through the first. The destructive pvesm verbs are BLACK
      * on their own rows above, so `list` is not riding a permissive tool:
      * every other pvesm verb is still RED by absence. */
-    if (ntok == 3 && prox_tok_eq(&tok[0], "pvesm") &&
-        prox_tok_eq(&tok[1], "list") && prox_is_storage_id(&tok[2]))
+    if (ntok == 3 && prox_tok_eq_bare(&tok[0], "pvesm") &&
+        prox_tok_eq_bare(&tok[1], "list") && prox_is_storage_id(&tok[2]))
         return VIRP_TIER_GREEN;
     /* <vmid> already parsed and cleared by self-protection above. */
     if (ntok == 3 && (is_qm || is_pct) &&
@@ -1594,10 +2022,19 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
                     sizeof(PROX_GUEST_GREEN_VERBS[0])))
         return VIRP_TIER_GREEN;
 
-    if (prox_tok_eq(&tok[0], "pvesh") && ntok >= 2) {
-        bool path_ok = ntok >= 3 && tok[2].len > 0 && tok[2].p[0] == '/';
+    if (prox_tok_eq_bare(&tok[0], "pvesh") && ntok >= 2) {
+        /* The API path is a structural argument, so it must be a bare
+         * word: `pvesh get "/nodes/x"` reaches the device as the same
+         * path, but this table reasons about path SHAPE — leading '/',
+         * `agent` segments, the /access prefix — and it enumerates those
+         * over bare words. A quoted path falls through to RED by
+         * absence, the safe direction. (The self-protection walker above
+         * still inspects it either way: a scan hunting a protected VMID
+         * must not care how the path was spelled.) */
+        bool path_ok = ntok >= 3 && !tok[2].quoted &&
+                       tok[2].len > 0 && tok[2].p[0] == '/';
 
-        if (prox_tok_eq(&tok[1], "get") && ntok == 3 && path_ok) {
+        if (prox_tok_eq_bare(&tok[1], "get") && ntok == 3 && path_ok) {
             /*
              * The access tree is a read that returns credential
              * material — user records, token ids, ACLs, realm
@@ -1622,9 +2059,28 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
         /* 4c — pvesh writes. Trailing parameters are expected here (a
          * create/set carries its arguments), so the shape is a minimum
          * rather than an exact token count. */
-        if ((prox_tok_eq(&tok[1], "create") || prox_tok_eq(&tok[1], "set")) &&
-            path_ok)
+        if ((prox_tok_eq_bare(&tok[1], "create") || prox_tok_eq_bare(&tok[1], "set")) &&
+            path_ok) {
+            /* /access WRITES mint and re-grant identity: users, tokens,
+             * roles, ACLs and the root password. The GET half of this
+             * tree is YELLOW above for chain-hygiene reasons — the bytes
+             * it RETURNS get signed into a chain that cannot be trimmed.
+             * The write half is a different problem: a credential created
+             * here OUTLIVES the approval that authorized it and works
+             * outside VIRP entirely, so a one-time YELLOW permit buys
+             * standing access. RED — still reachable, but only through
+             * propose/approve/apply, where a human reads the userid
+             * before it exists.
+             *
+             * Prefix-matched rather than segment-wise, exactly as the GET
+             * row above: /accessfoo classifying stricter is the safe
+             * direction to be wrong in. */
+            if (tok[2].len >= 7 && strncmp(tok[2].p, "/access", 7) == 0) {
+                if (reason) *reason = REASON_PROX_ACCESS_WRITE;
+                return VIRP_TIER_RED;
+            }
             return VIRP_TIER_YELLOW;
+        }
 
         return VIRP_TIER_RED;   /* unlisted pvesh method — fail closed */
     }
@@ -1636,7 +2092,7 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
                     sizeof(PROX_GUEST_YELLOW_VERBS[0])))
         return VIRP_TIER_YELLOW;
 
-    if (prox_tok_eq(&tok[0], "vzdump"))
+    if (prox_tok_eq_bare(&tok[0], "vzdump"))
         return VIRP_TIER_YELLOW;
 
     return VIRP_TIER_RED;   /* unlisted Proxmox command — fail closed */
@@ -1735,11 +2191,75 @@ static prox_tok_t linux_tok_basename(const prox_tok_t *t)
 /* Does this token name a VIRP unit/process? Substring, not exact:
  * `virp-onode`, `virp-onode.service` and `virp-onode@1` are all the same
  * target, and over-matching here only ever adds BLACK. */
+/*
+ * Shell quoting bytes — the ones the remote shell REMOVES before the
+ * command runs, so the never-class scanner must ignore them too.
+ *
+ * `"shutdown" -h now`, `'shutdown' -h now`, `\shutdown -h now` and
+ * `/sbin/"shutdown"` all execute shutdown. Judged byte-for-byte, none of
+ * them matched the halt row, and the never-class command fell through to
+ * RED — which is APPROVABLE. An enrolled key could then unlock the one
+ * thing BLACK exists to keep locked, which is the entire point of the
+ * tier. Same defect the Proxmox tokenizer fixed by stripping quotes
+ * before denylist matching; this is that rule for the scanner running
+ * ahead of it.
+ *
+ * Backslash is included alongside the quote characters. It is a
+ * different shell mechanism, but it removes bytes the same way and
+ * leaving it open while closing quotes would just relocate the bypass.
+ */
+static bool linux_black_is_shell_quote(char c)
+{
+    return c == '"' || c == '\'' || c == '\\';
+}
+
+/*
+ * Compare a raw-scanner token to an enumerated word, ignoring quoting
+ * bytes.
+ *
+ * STREAMING on purpose. The segment scanner below deliberately carries
+ * flags rather than a token buffer, because a fixed buffer would have to
+ * decide what to do when a token overruns it and every answer is wrong
+ * (see the black_seg_t header). Normalizing into a scratch buffer here
+ * would reintroduce exactly that bound, so this walks both strings at
+ * once and allocates nothing.
+ */
+static bool linux_black_word_eq(const prox_tok_t *t, const char *word)
+{
+    size_t wi = 0;
+    for (size_t i = 0; i < t->len; i++) {
+        char c = t->p[i];
+        if (linux_black_is_shell_quote(c)) continue;
+        if (word[wi] == '\0' || c != word[wi]) return false;
+        wi++;
+    }
+    return word[wi] == '\0';
+}
+
+static bool linux_black_word_in(const prox_tok_t *t,
+                                const char *const *set, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        if (linux_black_word_eq(t, set[i])) return true;
+    return false;
+}
+
 static bool linux_tok_names_virp(const prox_tok_t *t)
 {
-    if (t->len < 4) return false;
-    for (size_t i = 0; i + 4 <= t->len; i++)
-        if (strncmp(t->p + i, "virp", 4) == 0) return true;
+    /* Substring, skipping quoting bytes, so `"virp-onode"` and
+     * `v\irp-onode` still name the unit. Over-matching here only ever
+     * adds BLACK, exactly as before. */
+    static const char V[] = "virp";
+    size_t m = 0;
+    for (size_t i = 0; i < t->len; i++) {
+        char c = t->p[i];
+        if (linux_black_is_shell_quote(c)) continue;
+        if (c == V[m]) {
+            if (++m == 4) return true;
+        } else {
+            m = (c == V[0]) ? 1 : 0;
+        }
+    }
     return false;
 }
 
@@ -1776,11 +2296,11 @@ static void linux_black_seg_token(black_seg_t *s, const prox_tok_t *t)
         /* First token of the segment — the command position. */
         prox_tok_t cmd = linux_tok_basename(t);
         s->have_cmd = true;
-        s->halt_cmd = prox_tok_in(&cmd, LINUX_BLACK_HALT_CMDS,
+        s->halt_cmd = linux_black_word_in(&cmd, LINUX_BLACK_HALT_CMDS,
                                   sizeof(LINUX_BLACK_HALT_CMDS) /
                                   sizeof(LINUX_BLACK_HALT_CMDS[0]));
-        s->is_systemctl = prox_tok_eq(&cmd, "systemctl");
-        s->is_killer = prox_tok_in(&cmd, LINUX_BLACK_KILLERS,
+        s->is_systemctl = linux_black_word_eq(&cmd, "systemctl");
+        s->is_killer = linux_black_word_in(&cmd, LINUX_BLACK_KILLERS,
                                    sizeof(LINUX_BLACK_KILLERS) /
                                    sizeof(LINUX_BLACK_KILLERS[0]));
         return;
@@ -1790,11 +2310,11 @@ static void linux_black_seg_token(black_seg_t *s, const prox_tok_t *t)
      * flags, so both are looked for anywhere in the segment rather than
      * at fixed offsets. */
     if (s->is_systemctl) {
-        if (prox_tok_in(t, LINUX_BLACK_SYSTEMCTL_HOST,
+        if (linux_black_word_in(t, LINUX_BLACK_SYSTEMCTL_HOST,
                         sizeof(LINUX_BLACK_SYSTEMCTL_HOST) /
                         sizeof(LINUX_BLACK_SYSTEMCTL_HOST[0])))
             s->systemctl_host_verb = true;
-        if (prox_tok_in(t, LINUX_BLACK_SYSTEMCTL_UNIT,
+        if (linux_black_word_in(t, LINUX_BLACK_SYSTEMCTL_UNIT,
                         sizeof(LINUX_BLACK_SYSTEMCTL_UNIT) /
                         sizeof(LINUX_BLACK_SYSTEMCTL_UNIT[0])))
             s->takedown_verb = true;
@@ -1850,7 +2370,10 @@ static bool linux_black_self_harm(const char *raw, const char **reason)
         while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
                *p != ';' && *p != '|' && *p != '&')
             p++;
-        prox_tok_t t = { start, (size_t)(p - start) };
+        /* The never-class scanner runs on RAW bytes and does its own
+         * whitespace splitting; it has no quote handling and needs none
+         * (it only ever adds BLACK, and substring-matches `virp`). */
+        prox_tok_t t = { start, (size_t)(p - start), false };
         linux_black_seg_token(&seg, &t);
     }
 }

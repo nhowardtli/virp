@@ -1292,6 +1292,254 @@ static void test_host_health_reads(void)
     PASS();
 }
 
+/*
+ * =========================================================================
+ * Quoted argument values (F6) — the shared quote-aware tokenizer.
+ *
+ * The classifier admits `--description "text with spaces"` as ONE token.
+ * Everything below is a way that admission could have gone wrong, and
+ * each was a real hazard identified before the code was written rather
+ * than a test written to match it afterwards.
+ * ========================================================================= */
+static void test_prox_quoted_values(void)
+{
+    /* ---- The point of the change: a quoted value is one token. ---- */
+    TEST("quoted value with spaces is admitted as one token");
+    assert(linux_gate_tier("qm set 100 --description \"text with spaces\"")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pct set 200 --description \"web server one\"")
+           == VIRP_TIER_YELLOW);
+    /* Token count is what GREEN's exact shapes rest on: a quoted value
+     * must not inflate it, or the shape rows silently stop matching. */
+    assert(linux_gate_tier("pvesh get /nodes/pve-lab/network")
+           == VIRP_TIER_GREEN);
+    PASS();
+
+    /*
+     * ---- THE DENYLIST TRAP ----
+     * The tokenizer stores quotes STRIPPED, because the remote shell
+     * strips them too. Stored with quotes, `"--delete"` would not match
+     * the BLACK deletion row and the fix admitting quoted values would
+     * itself have opened a never-class bypass.
+     */
+    TEST("quoted flag cannot walk past a BLACK denylist row");
+    assert_black_blocked("vzdump 100 \"--delete\"");
+    assert_black_blocked("vzdump 100 \"--remove\" 1");
+    assert_black_blocked("vzdump \"--prune-backups\" keep-last=1");
+    PASS();
+
+    /*
+     * The =value spelling is the same trap by a different route, and it
+     * predates quoting: the Proxmox CLI accepts `--flag=value`, so a row
+     * matching whole tokens missed `--delete=1` entirely. Denylists match
+     * the flag HEAD, before the first '='.
+     */
+    TEST("=value spelling cannot walk past a BLACK denylist row");
+    assert_black_blocked("vzdump 100 --delete=1");
+    assert_black_blocked("vzdump 100 --remove=1");
+    assert_black_blocked("vzdump 100 --prune-backups=keep-last=1");
+    assert_black_blocked("vzdump 100 \"--delete=1\"");   /* both at once */
+    PASS();
+
+    TEST("=value and quoting cannot walk past the RED backup-hook row");
+    assert_red_blocked("vzdump 100 --script=/tmp/hook.sh");
+    assert_red_blocked("vzdump 100 \"--script\" /tmp/hook.sh");
+    assert_red_blocked("vzdump 100 --stdout=1");
+    PASS();
+
+    /*
+     * ---- ORDERING: the raw metachar scan stays first ----
+     * Quotes must not become a container that shields a metacharacter.
+     * The step-1 scan runs on raw bytes and has no notion of quotes, so
+     * these are refused for the metachar, never reached as values.
+     */
+    TEST("quotes do not shield metacharacters from the step-1 raw scan");
+    assert_red_blocked("qm set 100 --description \"a; rm -rf /\"");
+    assert_red_blocked("qm set 100 --description \"$(id)\"");
+    assert_red_blocked("qm set 100 --description \"`id`\"");
+    assert_red_blocked("qm set 100 --description \"a | tee /tmp/x\"");
+    assert_red_blocked("qm set 100 --description \"a > /etc/passwd\"");
+    /* Quoting does not hide a never-class command either, and this one
+     * is BLACK rather than RED: Guard 0 runs ahead of even the metachar
+     * scan and judges the segment AFTER a separator, so the quotes buy
+     * nothing at any layer. Asserting BLACK here pins that ordering. */
+    assert_black_blocked("qm list \"; shutdown -h now\"");
+    assert_black_blocked("qm list \"; systemctl stop virp-onode\"");
+    PASS();
+
+    /* $ and \ survive step 1 when not spelled $( or ${, so the quoted
+     * charset refuses them in its own right — expansion inside double
+     * quotes is real, and a neighbour's guarantee is not this row's. */
+    TEST("quoted charset refuses expansion and escape bytes itself");
+    assert_red_blocked("qm set 100 --description \"$HOME\"");
+    assert_red_blocked("qm set 100 --description \"a\\\\b\"");
+    PASS();
+
+    /*
+     * ---- !quoted on every structural row ----
+     * Quoting reaches the device as the same argv, but these rows
+     * enumerate BARE words and the enumeration is the safety argument.
+     */
+    TEST("quoted tool, verb, method and path do not satisfy a row");
+    assert_red_blocked("\"qm\" list");
+    assert_red_blocked("qm \"list\"");
+    assert_red_blocked("\"pveversion\"");
+    assert_red_blocked("pvesh \"get\" /version");
+    assert_red_blocked("pvesh get \"/nodes/pve-lab/network\"");
+    assert_red_blocked("pvesm list \"local\"");
+    assert_red_blocked("qm \"status\" 100");
+    PASS();
+
+    /*
+     * ---- THE F3-ADJACENT EDGE ----
+     * The self-protection SCANS are quote-agnostic on purpose. A quoted
+     * "313" reaches the device as 313, so a scan that skipped quoted
+     * tokens would make quoting a second protected-VMID bypass beside
+     * the vm:313 spelling. Structural VMID positions still refuse
+     * quoting (RED), but a protected id is caught either way.
+     */
+    TEST("a quoted protected VMID does not slide past self-protection");
+    assert_black_blocked("qm set 100 --memory \"313\"");
+    assert_black_blocked("qm clone 100 \"313\"");
+    assert_black_blocked("vzdump \"313\"");
+    assert_black_blocked("pvesh set \"/nodes/pve-lab/qemu/313/config\"");
+    PASS();
+
+    TEST("a quoted VMID in an EXPECTED position is refused, not tiered");
+    assert_red_blocked("qm stop \"313\"");    /* refused before protection */
+    assert_red_blocked("qm stop \"100\"");
+    assert_red_blocked("qm status \"100\"");
+    PASS();
+
+    /*
+     * ---- DESIGN B: canonicalization must be a no-op inside quotes ----
+     * linux_gate_canon() folds runs of spaces and turns tabs into spaces
+     * with no quote awareness, and the DEVICE executes the raw bytes. A
+     * quoted region canon would rewrite is refused, so the bytes
+     * classified are always the bytes that execute.
+     */
+    TEST("quoted interior that canonicalization would rewrite is refused");
+    assert_red_blocked("qm set 100 --description \"a  b\"");      /* 2 spaces */
+    assert_red_blocked("qm set 100 --description \"a     b\"");   /* many */
+    assert_red_blocked("qm set 100 --description \"a\tb\"");      /* tab */
+    /* A single interior space survives canon byte-for-byte. */
+    assert(linux_gate_tier("qm set 100 --description \"a b\"")
+           == VIRP_TIER_YELLOW);
+    PASS();
+
+    /* ---- Quote shape ---- */
+    TEST("malformed quote shapes are refused");
+    assert_red_blocked("qm set 100 --description \"unterminated");
+    assert_red_blocked("qm set 100 --description trailing\"");
+    assert_red_blocked("qm set 100 --description mid\"word\"");
+    assert_red_blocked("qm set 100 --description \"a\"b");
+    assert_red_blocked("qm set 100 --description=\"a b\""); /* shape refused */
+    PASS();
+}
+
+/*
+ * =========================================================================
+ * F3 — the cluster-scoped spellings of a protected VMID.
+ *
+ * /nodes/<n>/qemu/313 was guarded; /cluster/ha/resources/vm:313 was not,
+ * and on this deployment that path is live: 313 is a running guest,
+ * pve-ha-crm/lrm are active, HA reports quorum OK. Enroll-then-stop is
+ * two YELLOW commands that power off the gate's own guest.
+ * ========================================================================= */
+static void test_prox_self_protection_sid_forms(void)
+{
+    TEST("HA resource path names the protected guest -> BLACK");
+    assert_black_blocked("pvesh set /cluster/ha/resources/vm:313 --state stopped");
+    assert_black_blocked("pvesh set /cluster/ha/resources/ct:313 --state stopped");
+    assert_black_blocked("pvesh get /cluster/ha/resources/vm:313");
+    PASS();
+
+    TEST("HA enrollment of the protected guest -> BLACK (the first step)");
+    assert_black_blocked("pvesh create /cluster/ha/resources --sid vm:313");
+    assert_black_blocked("pvesh create /cluster/ha/resources --sid ct:313");
+    PASS();
+
+    TEST("pool membership names the protected guest -> BLACK");
+    assert_black_blocked("pvesh set /pools/testpool --vms 313");
+    assert_black_blocked("pvesh set /pools/testpool --vms 100,313");
+    /* Comma lists are the documented shape of these APIs, and the same
+     * gap existed in vzdump long before F3: `vzdump --vmid 313` was
+     * BLACK while `vzdump --vmid 100,313` was YELLOW. */
+    assert_black_blocked("vzdump --vmid 100,313");
+    assert_black_blocked("vzdump --vmid 313,400");
+    PASS();
+
+    /* Quoting must not re-open what F3 closes — the two normalizations
+     * have to compose, since each was a bypass on its own. */
+    TEST("quoted sid spellings are caught too");
+    assert_black_blocked("pvesh set /cluster/ha/resources \"--sid\" vm:313");
+    assert_black_blocked("pvesh create /cluster/ha/resources --sid \"vm:313\"");
+    PASS();
+
+    /* The sid rule must not swallow unrelated guests or ordinary edits. */
+    TEST("unprotected sids and non-guest numerics are unaffected (control)");
+    assert(linux_gate_tier("pvesh create /cluster/ha/resources --sid vm:100")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pvesh set /cluster/ha/resources/vm:100 --state started")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pvesh set /cluster/options --migration-unsecure 1")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pvesh set /pools/testpool --vms 100")
+           == VIRP_TIER_YELLOW);
+    PASS();
+}
+
+/*
+ * =========================================================================
+ * Never-class normalization: quoting must not downgrade BLACK to RED.
+ *
+ * RED is approvable. A never-class command that falls through to RED can
+ * be unlocked by an enrolled key, which is the one outcome BLACK exists
+ * to prevent — so a spelling the scanner cannot read is not a cosmetic
+ * miss, it is the tier failing open.
+ * ========================================================================= */
+static void test_black_survives_quoting(void)
+{
+    TEST("quoted halt commands stay BLACK");
+    assert_black_blocked("\"shutdown\" -h now");
+    assert_black_blocked("'shutdown' -h now");
+    assert_black_blocked("\"reboot\"");
+    assert_black_blocked("\"poweroff\"");
+    assert_black_blocked("\\shutdown -h now");
+    PASS();
+
+    TEST("quoting inside a path spelling stays BLACK");
+    assert_black_blocked("\"/sbin/shutdown\" -h now");
+    assert_black_blocked("/sbin/\"shutdown\" -h now");
+    assert_black_blocked("/sbin/'shutdown' -h now");
+    PASS();
+
+    TEST("quoted systemctl takedowns of the gate stay BLACK");
+    assert_black_blocked("systemctl \"stop\" virp-onode");
+    assert_black_blocked("systemctl stop \"virp-onode\"");
+    assert_black_blocked("\"systemctl\" stop virp-onode");
+    assert_black_blocked("systemctl \"poweroff\"");
+    assert_black_blocked("\"pkill\" virp-onode");
+    assert_black_blocked("pkill \"virp-onode\"");
+    PASS();
+
+    /* The normalization must not start refusing innocent commands. Halt
+     * words are judged at COMMAND POSITION only, so they stay ordinary
+     * words everywhere else — including inside a quoted Proxmox value,
+     * which F6 now admits. */
+    TEST("normalization does not over-refuse innocent commands");
+    assert(linux_gate_tier("qm set 100 --description \"reboot the box\"")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("qm set 100 --description \"shutdown notes\"")
+           == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("vtysh -c \"show ip ospf neighbor\"")
+           == VIRP_TIER_GREEN);
+    assert_red_blocked("echo reboot");
+    assert_red_blocked("systemctl restart frr");   /* not a VIRP unit */
+    assert_red_blocked("systemctl stop nginx");
+    PASS();
+}
+
 static void test_gate_decisions(void)
 {
     printf("\n=== Gate-level decisions at threshold YELLOW ===\n");
@@ -1347,6 +1595,9 @@ int main(void)
     test_prox_unparseable_vmid();
     test_prox_unconfigured_is_closed();
     test_prox_does_not_broaden_frr();
+    test_prox_quoted_values();
+    test_prox_self_protection_sid_forms();
+    test_black_survives_quoting();
     test_host_health_reads();
     test_black_is_the_never_class();
     test_gate_decisions();
