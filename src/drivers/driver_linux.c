@@ -1081,6 +1081,9 @@ static const char *const REASON_PROX_ACCESS_WRITE =
 static const char *const REASON_PROX_QUOTE_FORM =
     "quoted argument refused — a quote may only open a whole token, must "
     "close, and may not contain a tab or a double space";
+static const char *const REASON_PROX_SHELL_PATH =
+    "this API path opens a shell on the node or dispatches a batch of "
+    "API calls — the payload is a command this gate never classified";
 static const char *const REASON_PROX_VZDUMP_HOOK =
     "--script runs an operator-named program as root during the backup "
     "and --stdout redirects the archive off its storage — neither "
@@ -1581,7 +1584,8 @@ static bool prox_is_storage_id(const prox_tok_t *t)
  * segment nowhere else (26 endpoints, all under that one subtree), so a
  * depth-agnostic match costs nothing today and stays correct if Proxmox
  * grows a second one. */
-static bool prox_path_has_agent_seg(const prox_tok_t *t)
+static bool prox_path_has_seg_in(const prox_tok_t *t,
+                                 const char *const *set, size_t n)
 {
     const char *p = t->p;
     size_t plen = t->len, i = 0;
@@ -1589,11 +1593,41 @@ static bool prox_path_has_agent_seg(const prox_tok_t *t)
         while (i < plen && p[i] == '/') i++;
         size_t start = i;
         while (i < plen && p[i] != '/') i++;
-        if (i - start == 5 && strncmp(p + start, "agent", 5) == 0)
-            return true;
+        prox_tok_t seg = { p + start, i - start, false };
+        if (seg.len && prox_tok_in(&seg, set, n)) return true;
     }
     return false;
 }
+
+static const char *const PROX_AGENT_SEGS[] = { "agent" };
+
+/*
+ * API path segments that hand out a shell on the NODE, or dispatch a
+ * batch of API calls this gate never saw. Same reasoning as the `agent`
+ * subtree and `qm guest exec`: one classified command carrying an
+ * unclassified payload.
+ *
+ *   execute      POST runs an ARRAY of API calls in one request
+ *   termproxy    terminal proxy on the node — a root shell
+ *   vncshell     VNC shell on the node — a root shell
+ *   spiceshell   SPICE shell on the node — a root shell
+ *   vncproxy     the guest-console equivalents; console keystrokes are
+ *   spiceproxy   the same unclassified-payload problem `qm terminal` is
+ *                already RED by absence for
+ *
+ * Refused for EVERY pvesh method, not just the write half: the read half
+ * is what mints the ticket the write half consumes, and splitting them
+ * would leave the bypass assembled out of two permitted requests.
+ *
+ * These were YELLOW through the whole-verb `pvesh create` row. Note that
+ * the 2026-08-13 schema review justifying `pvesh get` as a whole verb
+ * enumerated the 341 GET endpoints only — the POST/PUT side never had
+ * the equivalent reasoning, and these six are why that gap mattered.
+ */
+static const char *const PROX_PVESH_SHELL_SEGS[] = {
+    "execute", "termproxy", "vncshell", "spiceshell",
+    "vncproxy", "spiceproxy",
+};
 
 typedef enum {
     PROX_VMID_NONE = 0,     /* no VMID involved — nothing to protect */
@@ -1949,8 +1983,19 @@ static virp_trust_tier_t linux_prox_classify(const char *command,
      * `pvesh create` row. Refused as a subtree because the bypass is the
      * subtree's purpose, exactly as with `qm guest`. */
     if (prox_tok_eq_bare(&tok[0], "pvesh") && ntok >= 3 &&
-        prox_path_has_agent_seg(&tok[2])) {
+        prox_path_has_seg_in(&tok[2], PROX_AGENT_SEGS, 1)) {
         if (reason) *reason = REASON_PROX_AGENT_PATH;
+        return VIRP_TIER_RED;
+    }
+
+    /* Host-shell and batch-dispatch endpoints — see PROX_PVESH_SHELL_SEGS.
+     * `pvesh create /nodes/<n>/termproxy` is a root shell on the guest
+     * running this gate, and was reachable at YELLOW. */
+    if (prox_tok_eq_bare(&tok[0], "pvesh") && ntok >= 3 &&
+        prox_path_has_seg_in(&tok[2], PROX_PVESH_SHELL_SEGS,
+                             sizeof(PROX_PVESH_SHELL_SEGS) /
+                             sizeof(PROX_PVESH_SHELL_SEGS[0]))) {
+        if (reason) *reason = REASON_PROX_SHELL_PATH;
         return VIRP_TIER_RED;
     }
 

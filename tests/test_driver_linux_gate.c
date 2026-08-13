@@ -1540,6 +1540,50 @@ static void test_black_survives_quoting(void)
     PASS();
 }
 
+/*
+ * =========================================================================
+ * F1 — node-shell and batch-dispatch API paths.
+ *
+ * `pvesh create /nodes/<n>/termproxy` is a root shell on the host running
+ * this gate, and `/execute` dispatches an array of API calls the gate
+ * never classified. Both were YELLOW through the whole-verb create row.
+ * ========================================================================= */
+static void test_prox_shell_paths(void)
+{
+    TEST("node-shell API paths -> RED for every pvesh method");
+    assert_red_blocked("pvesh create /nodes/pve-lab/termproxy");
+    assert_red_blocked("pvesh create /nodes/pve-lab/vncshell");
+    assert_red_blocked("pvesh create /nodes/pve-lab/spiceshell");
+    assert_red_blocked("pvesh get /nodes/pve-lab/termproxy");
+    assert_red_blocked("pvesh set /nodes/pve-lab/vncshell --x 1");
+    PASS();
+
+    TEST("batch API dispatch -> RED");
+    assert_red_blocked("pvesh create /nodes/pve-lab/execute --commands x");
+    assert_red_blocked("pvesh get /nodes/pve-lab/execute");
+    PASS();
+
+    TEST("guest console proxies -> RED");
+    assert_red_blocked("pvesh create /nodes/pve-lab/qemu/100/vncproxy");
+    assert_red_blocked("pvesh create /nodes/pve-lab/qemu/100/spiceproxy");
+    PASS();
+
+    /* Segment-wise, exactly as the agent row: a path that merely starts
+     * with the same letters is not the subtree. */
+    TEST("shell paths are matched as SEGMENTS, not prefixes");
+    assert(linux_gate_tier("pvesh get /nodes/pve-lab/termproxyfoo")
+           == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesh get /nodes/pve-lab/executed")
+           == VIRP_TIER_GREEN);
+    PASS();
+
+    /* A protected VMID still outranks the shell row — the guest is the
+     * stronger fact, and its refusal is BLACK, not merely RED. */
+    TEST("protected VMID on a console path stays BLACK, not RED");
+    assert_black_blocked("pvesh create /nodes/pve-lab/qemu/313/vncproxy");
+    PASS();
+}
+
 static void test_gate_decisions(void)
 {
     printf("\n=== Gate-level decisions at threshold YELLOW ===\n");
@@ -1598,6 +1642,7 @@ int main(void)
     test_prox_quoted_values();
     test_prox_self_protection_sid_forms();
     test_black_survives_quoting();
+    test_prox_shell_paths();
     test_host_health_reads();
     test_black_is_the_never_class();
     test_gate_decisions();
