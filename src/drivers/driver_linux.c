@@ -1747,12 +1747,28 @@ static prox_vmid_verdict_t linux_prox_self_protect(const prox_tok_t *tok,
          *   pvesh create /cluster/ha/resources --sid vm:313
          *   pvesh set    /pools/<pool> --vms 313
          *
-         * VERIFIED REACHABLE on pve-lab (2026-08-13): 313 is a running
-         * guest there, pve-ha-crm and pve-ha-lrm are active and enabled,
-         * and HA reports quorum OK / quorate=1 even standalone. Two
-         * YELLOW commands — enroll, then set state stopped — power off
-         * the guest running this gate, which is the exact outcome BLACK
-         * exists to make unreachable.
+         * DEFENCE IN DEPTH, not a live-hole fix. Corrected 2026-08-13
+         * after the first write of this comment overstated it.
+         *
+         * What was actually measured on pve-lab, by reads only: 313 is a
+         * running guest there, pve-ha-crm and pve-ha-lrm are active and
+         * enabled, and /cluster/ha/status/current reports quorum OK,
+         * quorate=1. Those are PRECONDITIONS, and they were mistakenly
+         * written up as proof of reachability.
+         *
+         * What the same read does NOT show is the part that matters:
+         * there is no `master` row and no `lrm` row, only the quorum row.
+         * No CRM master has been elected and no LRM has registered, so
+         * the HA stack is idle rather than managing, and no HA resources
+         * are configured. On this single standalone node the enroll-then-
+         * stop sequence is very likely INERT today. It was never executed
+         * to find out — the target is the guest running this gate.
+         *
+         * The classifier gap is real and unconditional regardless: the
+         * self-protection walk could not read `vm:313`, so the guard's
+         * coverage depended on which spelling an operator happened to
+         * use. That is worth closing on its own terms. It should not be
+         * described as closing a live bypass on this box.
          *
          * Two rules, deliberately different in strength:
          *

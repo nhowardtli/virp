@@ -1957,3 +1957,51 @@ The `e711960` list, minus the host-shell item, which this deploy closes:
 - Unchanged from `7a4e327`: trailing flags on GREEN reads stay RED by design;
   installed unit drifts from `deploy/virp-onode.service`; one approver key with
   its secret off-box; `qm|pct delsnapshot` is RED not BLACK.
+
+## Correction 2026-08-13 21:0x UTC — F3 was overclaimed as a live bypass
+
+The `e711960` stanza above, and the commit message of `808d38f`, describe the
+`vm:313` HA path as a bypass that was **live on this box**. That goes further
+than the evidence, and this note corrects it. The stanza itself is left as
+written — annotating a wrong claim is honest; quietly editing it out is not.
+
+**What was measured**, on pve-lab, by GREEN reads only:
+
+- 313 is `virp-onode-home`, a running guest on pve-lab.
+- `pve-ha-crm` and `pve-ha-lrm` are `active` / `running` / `enabled`.
+- `/cluster/ha/status/current` reports `quorum OK`, `quorate=1`.
+- `/cluster/ha/resources` is empty.
+
+Those are **preconditions**, and they were written up as if they were proof of
+reachability. They are not.
+
+**What the same read shows and was not weighed at the time**:
+`/cluster/ha/status/current` returns ONLY a `quorum` row. There is no `master`
+row and no `lrm` row. On an HA stack that is actually managing resources both
+appear (`master pve-lab (active, …)`, `lrm pve-lab (active/idle, …)`). Their
+absence means no CRM master has been elected and no LRM has registered — the
+daemons are running but idle, which is the default state of a standalone PVE
+node with no HA resources configured.
+
+So on this single non-clustered node, `pvesh create /cluster/ha/resources --sid
+vm:313` followed by `--state stopped` is very likely **inert today**. It was
+never executed to find out, and should not be: the target is the guest running
+this gate.
+
+**What remains true.** The classifier gap was real and unconditional — the
+self-protection walk could not read `vm:313`, `ct:313` or a comma list, so the
+guard's coverage depended on which spelling an operator happened to use.
+Closing that is worth doing on its own terms, and `808d38f` does. It is
+**defence in depth**, not the closing of a live hole, and the earlier wording
+should be read with this correction attached.
+
+**Unaffected by this correction**: the never-class quoting bypass fixed in
+`e711960` (`"shutdown" -h now` falling to approvable RED) was live on this box
+regardless of HA, and so was the `vzdump --delete=1` denylist evasion. Those
+two were real, present-tense, and are closed. The comma-list gap
+(`vzdump --vmid 100,313` YELLOW while `--vmid 313` was BLACK) was also real and
+had nothing to do with HA.
+
+`808d38f`'s commit message cannot be edited without rewriting pushed history and
+is left alone; this note is the correction of record. The source comment in
+`driver_linux.c` has been corrected in place.
