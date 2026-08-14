@@ -75,9 +75,50 @@ const asa_command_route_t ASA_ROUTE_TABLE[] = {
     { "show environment",           VIRP_TIER_GREEN  },
     { "show process",               VIRP_TIER_GREEN  },
     { "show nameif",                VIRP_TIER_GREEN  },
+    /* Read-only operational state, promoted from RED-by-absence
+     * 2026-08-14. These carry no credential or policy content: they are
+     * counters, tables and inventory. Singular and plural are SEPARATE
+     * rows because the matcher requires a token boundary — "show
+     * interface" does not cover "show interfaces", and "show process"
+     * does not cover "show processes". Deliberately NOT promoted, and
+     * still RED by absence: show tech-support and
+     * more system:running-config (both bundle the config, which is
+     * YELLOW), the show run/running/conf abbreviations (the device
+     * would expand them into a config read), show ssh, show username,
+     * show user-identity and show crypto key mypubkey rsa. */
+    { "show interface",             VIRP_TIER_GREEN  },
+    { "show interfaces",            VIRP_TIER_GREEN  },
+    { "show ip address",            VIRP_TIER_GREEN  },
+    { "show ipv6 interface brief",  VIRP_TIER_GREEN  },
+    { "show arp",                   VIRP_TIER_GREEN  },
+    { "show mac-address-table",     VIRP_TIER_GREEN  },
+    { "show switch vlan",           VIRP_TIER_GREEN  },
+    { "show xlate",                 VIRP_TIER_GREEN  },
+    { "show local-host",            VIRP_TIER_GREEN  },
+    { "show uptime",                VIRP_TIER_GREEN  },
+    { "show blocks",                VIRP_TIER_GREEN  },
+    { "show traffic",               VIRP_TIER_GREEN  },
+    { "show perfmon",               VIRP_TIER_GREEN  },
+    { "show resource usage",        VIRP_TIER_GREEN  },
+    { "show processes",             VIRP_TIER_GREEN  },
+    { "show flash",                 VIRP_TIER_GREEN  },
+    { "show disk0",                 VIRP_TIER_GREEN  },
+    { "show file system",           VIRP_TIER_GREEN  },
+    { "show ospf",                  VIRP_TIER_GREEN  },
+    { "show bgp",                   VIRP_TIER_GREEN  },
+    { "show eigrp",                 VIRP_TIER_GREEN  },
 
     /* ── Tier 2: YELLOW — Security posture reads (single approval) */
     { "show access-list",           VIRP_TIER_YELLOW },
+    /* Spelling-variant closure, 2026-08-14. "show access-lists" does not
+     * match the singular row (token boundary), so it was RED by absence
+     * — i.e. refused, but for the wrong reason and one promotion away
+     * from being LOOSER than its sibling. Pinned YELLOW so a variant can
+     * never out-permit the row it varies. "show access-group" is the
+     * ACL-to-interface binding, i.e. where enforcement is applied; it
+     * belongs with access-list, not in the operational GREEN set. */
+    { "show access-lists",          VIRP_TIER_YELLOW },
+    { "show access-group",          VIRP_TIER_YELLOW },
     { "show running-config access-list", VIRP_TIER_YELLOW },
     { "show crypto isakmp sa",      VIRP_TIER_YELLOW },
     { "show crypto ipsec sa",       VIRP_TIER_YELLOW },
