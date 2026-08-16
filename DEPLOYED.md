@@ -64,6 +64,103 @@ are now stale on two counts:
 2. The deployed commit has advanced through the update log below and is now
    `b6e9602c`, not `0c9c7338`.
 
+## Update 2026-08-16 — `a3752e18` INSTALLED, NOT RESTARTED (fed evidence link + GATE 5 + fleet node_ids)
+
+**Status: installed 21:14 UTC, awaiting operator-timed restart** (between
+Nexus polls). The RUNNING daemon is still the 2026-08-14 build, sha256
+`f52ff1c69c2c8654…`, process start 2026-08-14 23:42:55 UTC, unrestarted.
+(The "Current live state" block above predates the 2026-08-14 deploy and
+is stale on the binary hash; this entry records the running hash.)
+
+- **Commit**: `a3752e181dca4ebec20d3950b20e67146a75f81f`
+- **Branch**: `fix/fed-observation-link`
+  (= main `309ae4e8` + `fc31a050` fed_observation/GATE 4 + `2ee9220c`
+  GATE 5/report join/FRR node_ids + `c9b919a3` fleet node_ids +
+  `a3752e18` bridge doc rev 2 corrected)
+- **Tree at install**: clean (`git status --porcelain` empty)
+- **Installed binary**: `/usr/local/lib/virp/virp-onode-prod`
+- **sha256**: `3daf9ce3e83869d6fa2ff89ed0d39f3ebacdc899e6409a59db452ac2d0985aba`
+- **sha256** `/usr/local/lib/virp/virp-tool`: `8c6e107ee6db783f135ac5a18318c4ac6d0b04d555d9a1354c176123df76c52e`
+- Pre-install state captured: `/var/backups/virp/20260816T211456Z`
+  (manifest verified; holds the running `f52ff1c6` build —
+  `sudo make rollback-prod ROLLBACK_FROM=` that path restores it).
+  An earlier capture `20260816T030116Z` from the same running build also
+  exists and was manifest-verified today.
+
+### What the restart lands (all at once)
+1. **`fed_observation`** externally-submittable type + Item 8 narrowing
+   widened to the federation trio (`fc31a050`).
+2. **GATE 4**: a `fed_outcome` citing an unstored or null observation is
+   refused (`-50`). Fails closed.
+3. **GATE 5**: a federation `artifact_id` reused with a different body
+   hash is refused with the NEW code `-51 VIRP_ERR_DUPLICATE_MISMATCH`;
+   byte-identical resubmission is accepted (store no-op, fresh entry).
+   Scoped to the fed trio; non-fed colliding ids keep side-by-side
+   storage per the 2026-08-03 audit.
+4. **`idx_artifacts_hash`** gets created at daemon open (GATE 4's
+   lookup index; SCHEMA_SQL `CREATE INDEX IF NOT EXISTS`).
+5. **node_id cutover, whole fleet**: all 43 devices in
+   `/etc/virp/devices.template{,.stage2}.json` now carry distinct
+   nonzero `node_id`s (backups `.bak-20260816-device-nodeids`).
+   Convention: hex of the mgmt IP (librenms/wazuh precedent).
+   - frr1..4: `AC141405`/`AC141402`/`AC141404`/`AC141403` (172.20.20.x)
+   - R1–R35: `0A0000xx` per 10.0.0.49+n; pa-850 `0A0000FA`;
+     ASA-5525 `0A0000FD`; srx-300 `0A0000FE`
+   - zammad-ro `0A002814`; zammad-rw `8A002814` — the second principal
+     on a shared host takes hex-of-IP with the TOP BIT set
+   - pbs-lab `0A0014C7` (literal hex of what `${PBS_HOST}` renders to)
+   **Cutover correlation**: chain entries signed BEFORE this restart
+   carry `signer_node_id` 0 for all devices except librenms-lab
+   (`0A000A0C`) and wazuh-lab (`0A00140A`); entries after it carry the
+   ids above. The restart timestamp (to be recorded below when it
+   happens) is the correlation boundary. Approvals: at cutover time the
+   5 unconsumed approval records all targeted `clab-frr-ospf-frr1` with
+   `device_node_id: 0` and had been expired since 2026-08-03 (300 s
+   TTLs) — nothing usable was stranded.
+
+### Findings this deploy records (the honest history)
+- The 2026-08-16 report's "50 FAILED ENTRIES" were a **verifier defect**
+  — `report/verify.py` joined bodies by `artifact_id` alone instead of
+  `(artifact_id, artifact_hash)`. All 81 colliding-id entries on the
+  live chain bind cleanly on the pair join; the chain was never
+  damaged. Fixed in `2ee9220c`; the root-run live report now shows
+  103,228 entries with **zero** failures on every check.
+- The multi-body correlations (32 ids) came from the bridge's unsalted
+  correlation hash — `peer`/`request_id` constant `"unknown"`, so every
+  repeat of the same read minted the same id — not from a requeue.
+  They stay as healthy side-by-side storage.
+- **Unbacked `fed_outcome` count is 55**, not 54: one more zammad-ro
+  read landed via the old bridge at 20:17:34 UTC, minutes before the
+  bridge was patched. The 55 (16 of them null-citing) are append-only
+  history and stay; scope audits with `VIRP_FED_SINCE`.
+
+### Bridge side (netclaw), same event window
+`/usr/local/lib/virp/virp-bridge-mcp.py` patched 20:36 UTC (backup
+`.bak-20260816-rev2`): per-invocation salted correlation (nonce +
+timestamp), middle append as `fed_observation`, wait-on-success
+withholding the outcome on a refused body append, error outcomes
+withheld entirely (the null-citation path is unreachable). See
+docs/BRIDGE-FED-OBSERVATION.md rev 2. **Ordering: the salted bridge
+must be live (process restarted) before this daemon restart** — the
+unsalted scheme + GATE 5 would refuse every routine repeated read.
+
+### Battery at `c9b919a3`+docs (2026-08-16 20:28–21:07 UTC)
+Every suite green in the canonical environment: all C batteries 100%
+(including the four new GATE 5 tests), test-virp-report 47/47
+(1 benign root-only skip), evidence/config-backup/autopilot green,
+API suite 86/86 (via the review venv — root python lacks fastapi, a
+standing coverage note). The live fed audit passes scoped
+`VIRP_FED_SINCE=2026-08-17` and, unscoped, correctly reports the 55
+pre-deploy unbacked outcomes — it becomes the post-restart acceptance
+check with `VIRP_FED_SINCE=<restart date>`.
+
+### Acceptance test after restart (planned)
+One real GREEN federated read from netclaw: all three appends land;
+the outcome's `observation_sha256` resolves in `artifacts`; GATE 4
+refusal proof (outcome citing an absent body → `-50`); deliberate
+resubmission drill → byte-identical or refused, never
+same-id-different-hash (SQL in docs/BRIDGE-FED-OBSERVATION.md).
+
 ## Update 2026-08-11 — deploy from consolidated main `569bff11`
 
 - The repo was consolidated to a single branch: origin is `main` plus
