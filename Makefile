@@ -841,6 +841,18 @@ test-commitment-grading:
 	@echo "=== commitment-only observation grading ==="
 	python3 tests/test_commitment_only_grading.py
 
+# Every fed_outcome must cite an observation body that is actually in the
+# artifacts table. The bridge appends the signed observation and the
+# outcome that names its hash as two separate chain_appends; if the first
+# is refused and the second is not, the chain keeps recording evidence it
+# cannot produce. Audits the live chain read-only and self-skips when
+# /var/lib/virp/chain.db is absent, so it is safe on a build host.
+# Override with VIRP_CHAIN_DB; narrow with VIRP_FED_SINCE=YYYY-MM-DD.
+.PHONY: test-fed-outcome-observation
+test-fed-outcome-observation:
+	@echo "=== fed_outcome -> observation pointer audit ==="
+	python3 tests/test_fed_outcome_observation.py
+
 # virp report — consumer-side chain PDF generator. Synthetic-chain tests run
 # anywhere; the live-chain tests self-skip when /var/lib/virp/chain.db is
 # absent, so this target is safe on a build host. Requires reportlab
@@ -1668,4 +1680,4 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api

@@ -4726,18 +4726,30 @@ TEST(test_chain_append_still_accepts_json_evidence_item)
 
 /* GUARD: a commitment-only append (no body at all) stays legal — the
  * caller may choose to register a hash commitment without the bytes. */
+/* Defined with the Item 8 battery further down; the GATE 4 tests below
+ * assert on the typed error, not merely on the absence of an entry, so
+ * they need it here. */
+static int32_t typed_error_of(const uint8_t *resp, ssize_t n);
+
 /* Federation-bridge provenance (2026-08-09): federated_request and
  * federated_outcome are externally-submittable commitment types, so the
  * bridge's three-part record (request → observation → outcome) lands in
  * full. The reserved daemon type "outcome" stays refused from a socket
- * client — blessing the federation namespace must not open the daemon's. */
+ * client — blessing the federation namespace must not open the daemon's.
+ *
+ * Rewritten 2026-08-16. This test used to append fed_request and then
+ * fed_outcome with a stub body carrying no observation_sha256, which
+ * meant the suite's idea of "the three-part record lands in full" never
+ * exercised the middle part at all. That blind spot is why the live
+ * regression ran five days unseen: the outcome landing was checked, the
+ * body it cites was not. The middle append is now real — a genuinely
+ * signed observation stored as fed_observation — and the outcome cites
+ * its hash, so the assertion covers the link rather than assuming it. */
 TEST(test_chain_append_accepts_federated_provenance)
 {
     const char *req_body = "{\"schema\":\"federated_request/1\",\"peer\":\"netclaw\"}";
-    const char *out_body = "{\"schema\":\"federated_outcome/1\",\"outcome\":\"refused\"}";
-    char hr[65], ho[65];
+    char hr[65];
     ca_sha256_hex(req_body, hr);
-    ca_sha256_hex(out_body, ho);
 
     uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
     ssize_t n1 = ca_append("ncfed-netclaw-t1", "fed_request",
@@ -4745,10 +4757,100 @@ TEST(test_chain_append_accepts_federated_provenance)
     ASSERT_TRUE(n1 > 4);
     ASSERT_EQ(ca_count_entries("ncfed-req-t1"), 1);
 
-    ssize_t n2 = ca_append("ncfed-netclaw-t1", "fed_outcome",
-                           "ncfed-out-t1", ho, out_body, resp, sizeof(resp));
+    /* the signed body the outcome will point at */
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9101);
+    ASSERT_TRUE(olen > 0);
+    char hobs[65];   ca_sha256_hex_bin(obs, olen, hobs);
+    char obs_body[2048]; ca_b64_body(obs, olen, obs_body, sizeof(obs_body));
+
+    ssize_t n2 = ca_append("ncfed-netclaw-t1", "fed_observation",
+                           "ncfed-obs-t1", hobs, obs_body, resp, sizeof(resp));
     ASSERT_TRUE(n2 > 4);
+    ASSERT_EQ(ca_count_entries("ncfed-obs-t1"), 1);
+
+    char out_body[512];
+    snprintf(out_body, sizeof(out_body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"refused\","
+             "\"observation_sha256\":\"%s\"}", hobs);
+    char ho[65];
+    ca_sha256_hex(out_body, ho);
+
+    ssize_t n3 = ca_append("ncfed-netclaw-t1", "fed_outcome",
+                           "ncfed-out-t1", ho, out_body, resp, sizeof(resp));
+    ASSERT_TRUE(n3 > 4);
     ASSERT_EQ(ca_count_entries("ncfed-out-t1"), 1);
+}
+
+/* GATE 4: an outcome citing a body the chain does not hold is refused.
+ * This is the exact live failure — the fed_observation append is skipped
+ * (as the Item 8 narrowing used to force) and the outcome names a hash
+ * nothing resolves. Before GATE 4 the outcome landed and the chain
+ * recorded evidence it could not produce. */
+TEST(test_chain_append_refuses_fed_outcome_citing_unstored_observation)
+{
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9102);
+    ASSERT_TRUE(olen > 0);
+    char hobs[65];  ca_sha256_hex_bin(obs, olen, hobs);
+    /* deliberately NOT appended */
+
+    char out_body[512];
+    snprintf(out_body, sizeof(out_body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"executed\","
+             "\"observation_sha256\":\"%s\"}", hobs);
+    char ho[65];
+    ca_sha256_hex(out_body, ho);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("ncfed-dangling-t1", "fed_outcome",
+                          "ncfed-out-dangling-1", ho, out_body,
+                          resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("ncfed-out-dangling-1"), 0);
+}
+
+/* GATE 4: citing nothing is refused too. Sixteen rows on the live chain
+ * carry observation_sha256: null — an outcome asserting a result while
+ * naming no evidence at all is the unbacked claim in its purest form. */
+TEST(test_chain_append_refuses_fed_outcome_without_observation_hash)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+
+    const char *no_field = "{\"schema\":\"federated_outcome/1\",\"outcome\":\"ok\"}";
+    char h1[65];  ca_sha256_hex(no_field, h1);
+    ssize_t n = ca_append("ncfed-nocite-t1", "fed_outcome",
+                          "ncfed-out-nocite-1", h1, no_field,
+                          resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("ncfed-out-nocite-1"), 0);
+
+    const char *null_field = "{\"schema\":\"federated_outcome/1\","
+                             "\"observation_sha256\":null}";
+    char h2[65];  ca_sha256_hex(null_field, h2);
+    n = ca_append("ncfed-nocite-t1", "fed_outcome",
+                  "ncfed-out-null-1", h2, null_field, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("ncfed-out-null-1"), 0);
+}
+
+/* GATE 3 covers fed_observation exactly as it covers observation. The
+ * new type is a namespace for a restricted principal, not an exemption:
+ * arbitrary JSON that hashes to its own commitment is still not a signed
+ * observation and must not be storable as evidence under any name. */
+TEST(test_chain_append_fed_observation_must_be_signed)
+{
+    const char *forged = "{\"device\":\"R1\",\"output\":\"all clear\"}";
+    char h[65];
+    ca_sha256_hex(forged, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ca_append("ncfed-forge-t1", "fed_observation",
+              "ncfed-obs-forged-1", h, forged, resp, sizeof(resp));
+    ASSERT_EQ(ca_count_entries("ncfed-obs-forged-1"), 0);
 }
 
 /* GUARD: the reserved daemon type "outcome" is STILL refused from a
@@ -4785,7 +4887,7 @@ TEST(test_chain_append_accepts_commitment_without_body)
  * socket_uid_action_allow maps a SO_PEERCRED uid to the ONLY actions it
  * may request. A uid absent from the map is completely unchanged. A uid
  * present in the map is additionally type-narrowed on chain_append to
- * the two federation provenance types. The tests set the map for the
+ * the three federation types. The tests set the map for the
  * test process's OWN uid (SO_PEERCRED on the test socket) to stand in
  * for the federated identity, then clear it.
  * ========================================================================= */
@@ -4857,16 +4959,34 @@ TEST(test_uid_action_allowlist_narrows_chain_append_types)
 
     uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
 
-    /* the federation provenance path stays open */
+    /* the federation provenance path stays open — all THREE appends.
+     * fed_observation is in the restricted set as of 2026-08-16; while
+     * it was not, this uid could file an outcome but not the body that
+     * outcome cited, which is precisely the regression. */
     const char *req_body = "{\"schema\":\"federated_request/1\",\"peer\":\"netclaw\"}";
-    const char *out_body = "{\"schema\":\"federated_outcome/1\",\"outcome\":\"ok\"}";
-    char hr[65], ho[65];
+    char hr[65];
     ca_sha256_hex(req_body, hr);
-    ca_sha256_hex(out_body, ho);
     ssize_t n = ca_append("ncfed-item8-t1", "fed_request",
                           "item8-fed-req-1", hr, req_body, resp, sizeof(resp));
     ASSERT_TRUE(n > 4);
     ASSERT_EQ(ca_count_entries("item8-fed-req-1"), 1);
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9103);
+    ASSERT_TRUE(olen > 0);
+    char hobs[65];   ca_sha256_hex_bin(obs, olen, hobs);
+    char obs_body[2048]; ca_b64_body(obs, olen, obs_body, sizeof(obs_body));
+    n = ca_append("ncfed-item8-t1", "fed_observation",
+                  "item8-fed-obs-1", hobs, obs_body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("item8-fed-obs-1"), 1);
+
+    char out_body[512];
+    snprintf(out_body, sizeof(out_body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"ok\","
+             "\"observation_sha256\":\"%s\"}", hobs);
+    char ho[65];
+    ca_sha256_hex(out_body, ho);
     n = ca_append("ncfed-item8-t1", "fed_outcome",
                   "item8-fed-out-1", ho, out_body, resp, sizeof(resp));
     ASSERT_TRUE(n > 4);
@@ -5173,6 +5293,9 @@ int main(void)
         RUN_TEST(test_previous_okey_window_anchors_to_load_time_and_resets);
         RUN_TEST(test_chain_append_still_accepts_json_evidence_item);
         RUN_TEST(test_chain_append_accepts_federated_provenance);
+        RUN_TEST(test_chain_append_refuses_fed_outcome_citing_unstored_observation);
+        RUN_TEST(test_chain_append_refuses_fed_outcome_without_observation_hash);
+        RUN_TEST(test_chain_append_fed_observation_must_be_signed);
         RUN_TEST(test_chain_append_still_refuses_reserved_outcome_type);
         RUN_TEST(test_chain_append_accepts_commitment_without_body);
 

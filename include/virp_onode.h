@@ -296,10 +296,14 @@ typedef struct {
      * on existing principals. An entry with zero actions is a valid
      * deny-all — the fail-closed representation the config loader
      * installs for a malformed set. A mapped uid is additionally
-     * type-narrowed on chain_append to the federation provenance pair
-     * (fed_request / fed_outcome). Used to hold the netclaw tunnel
-     * identity (uid 993) to fleet enumeration, health, chain reads and
-     * provenance appends — and, pointedly, away from shutdown.
+     * type-narrowed on chain_append to the federation triple
+     * (fed_request / fed_observation / fed_outcome). Used to hold the
+     * netclaw tunnel identity (uid 993) to fleet enumeration, health,
+     * chain reads and provenance appends — and, pointedly, away from
+     * shutdown. fed_observation joined the set 2026-08-16: without it
+     * the narrowing admitted the outcome but not the signed body that
+     * outcome cites, so the bridge recorded pointers to evidence the
+     * chain had refused to store.
      */
     uid_t               uid_action_uids[ONODE_MAX_ALLOWED_UIDS];
     onode_action_t      uid_action_sets[ONODE_MAX_ALLOWED_UIDS]

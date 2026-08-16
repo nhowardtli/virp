@@ -2558,6 +2558,49 @@ static bool peer_uid_allowed(onode_state_t *state, int client_fd,
  * still register an arbitrary hash; what it cannot do is obtain an
  * entry that any verifier will report as authentic.
  */
+
+/*
+ * Extract a fed_outcome's "observation_sha256" into out_hex.
+ *
+ * Deliberately a narrow scanner, not a JSON parser: the only thing
+ * GATE 4 needs is one 64-hex-character string under one known key, and
+ * pulling a parser onto the append path to get it would be a far larger
+ * surface than the question justifies. Anything that is not a quoted
+ * 64-char lowercase-hex value — key absent, JSON null, wrong length,
+ * non-hex byte — returns false, and the caller treats false as a
+ * refusal. Fail-closed: a body this cannot read is a body whose citation
+ * cannot be checked, which is the case the gate exists to stop.
+ *
+ * Scans the literal body bytes. fed_outcome bodies are plain JSON (the
+ * base64: form is for signed wire messages), so no decode step is needed
+ * and none is done — a decoder here could disagree with the one GATE 2
+ * hashed with, and then the field checked would not be the field stored.
+ */
+static bool fed_outcome_observation_hash(const char *body, char out_hex[65])
+{
+    static const char KEY[] = "\"observation_sha256\"";
+    const char *p = strstr(body, KEY);
+    if (!p) return false;
+    p += sizeof(KEY) - 1;
+
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != ':') return false;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '"') return false;   /* null, or anything not a string */
+    p++;
+
+    for (int i = 0; i < 64; i++) {
+        char c = p[i];
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!hex) return false;
+        out_hex[i] = c;
+    }
+    if (p[64] != '"') return false;  /* longer than 64 — not a SHA-256 hex */
+    out_hex[64] = '\0';
+    return true;
+}
+
 /*
  * WHAT artifact_hash COMMITS TO — decided, not incidental (F2 follow-up).
  *
@@ -2937,11 +2980,24 @@ static void handle_client(onode_state_t *state, int client_fd)
         /*
          * Item 8 type-narrowing: a uid in the action allowlist map is
          * a restricted federated principal — its chain_append reach is
-         * the two federation provenance types and NOTHING else. Even
-         * types every other client may submit (observation,
-         * evidence_item, …) are refused here; the action allowlist
-         * above already admitted the chain_append ACTION, this guard
-         * narrows the TYPE. Uids absent from the map are untouched.
+         * the three federation types and NOTHING else. Even types every
+         * other client may submit (observation, evidence_item, …) are
+         * refused here; the action allowlist above already admitted the
+         * chain_append ACTION, this guard narrows the TYPE. Uids absent
+         * from the map are untouched.
+         *
+         * fed_observation was added 2026-08-16. The original narrowing
+         * admitted only fed_request/fed_outcome, which cut the middle
+         * append out of the bridge's three-step protocol (request →
+         * body → outcome): the daemon refused the signed observation
+         * while still accepting the outcome whose observation_sha256
+         * named it, so from 2026-08-11 17:44 UTC every federated read
+         * recorded a pointer to a body that was never stored. Naming
+         * the body fed_observation rather than readmitting the reserved
+         * "observation" keeps Item 8's actual point — a restricted
+         * principal cannot submit a daemon-minted semantic type — while
+         * letting the evidence land. GATE 3 below verifies its
+         * signature, so the name is a namespace, not a waiver.
          */
         {
             bool uid_restricted = false;
@@ -2953,11 +3009,12 @@ static void handle_client(onode_state_t *state, int client_fd)
             }
             if (uid_restricted &&
                 strcmp(req.artifact_type, "fed_request") != 0 &&
+                strcmp(req.artifact_type, "fed_observation") != 0 &&
                 strcmp(req.artifact_type, "fed_outcome") != 0) {
                 fprintf(stderr, "[O-Node] POLICY REFUSAL: uid %u "
                         "chain_append artifact_type '%s' — a restricted "
                         "principal may append only fed_request/"
-                        "fed_outcome (session=%s id=%s)\n",
+                        "fed_observation/fed_outcome (session=%s id=%s)\n",
                         (unsigned)client_uid, req.artifact_type,
                         req.session_id, req.artifact_id);
                 send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
@@ -3045,8 +3102,16 @@ static void handle_client(onode_state_t *state, int client_fd)
                 /* GATE 3 — an "observation" must actually be a signed
                  * observation. Runs only once GATE 2 has proved the body
                  * is the one the commitment names, so what gets verified
-                 * is exactly what gets recorded. */
-                if (strcmp(req.artifact_type, "observation") == 0) {
+                 * is exactly what gets recorded.
+                 *
+                 * fed_observation is held to the identical standard. It
+                 * carries the same signed wire message under a name a
+                 * restricted principal is allowed to use; if it could
+                 * skip this gate, the rename would have converted a
+                 * verified type into an unverified one and handed the
+                 * bridge a way to store arbitrary bytes as evidence. */
+                if (strcmp(req.artifact_type, "observation") == 0 ||
+                    strcmp(req.artifact_type, "fed_observation") == 0) {
                     const char *why = "unspecified";
                     virp_error_t verr = chain_append_verify_observation(
                                             state, req.artifact_content, &why);
@@ -3068,6 +3133,65 @@ static void handle_client(onode_state_t *state, int client_fd)
                     req.artifact_type, req.session_id, req.artifact_id);
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
+        }
+
+        /* GATE 4 — a fed_outcome may not cite evidence the chain cannot
+         * produce. The outcome's observation_sha256 is the single link
+         * from "this command ran and here is what came back" to the
+         * signed bytes that prove it; an outcome whose cited body is not
+         * in artifacts is an unbacked claim that still reads, to every
+         * downstream consumer, exactly like a backed one.
+         *
+         * This is the fail-closed half of the 2026-08-16 fix. The Item 8
+         * narrowing above silently removed the bridge's ability to store
+         * that body while leaving its ability to cite it intact, and the
+         * mismatch ran for five days because nothing on the write path
+         * checked. Refusing here means the same class of breakage stops
+         * the outcome instead of recording a dangling pointer.
+         *
+         * ORDERING CONTRACT: the body must be appended BEFORE the
+         * outcome that names it. That is already the bridge's protocol
+         * (fed_request → fed_observation → fed_outcome); this gate makes
+         * it enforced rather than assumed. A bridge that reversed the
+         * two would now be told so on the second append.
+         *
+         * Scoped to fed_outcome. Other types are unaffected, and an
+         * outcome with no body at all is refused too: an outcome that
+         * cites nothing is the unbacked claim in its purest form (16
+         * such rows exist on the live chain, all inside the window). */
+        if (strcmp(req.artifact_type, "fed_outcome") == 0) {
+            char cited[65];
+            if (req.artifact_content[0] == '\0' ||
+                !fed_outcome_observation_hash(req.artifact_content, cited)) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: fed_outcome "
+                        "carries no readable observation_sha256 — an outcome "
+                        "must cite the signed body it reports on "
+                        "(session=%s id=%s)\n",
+                        req.session_id, req.artifact_id);
+                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+                break;
+            }
+            bool body_stored = false;
+            virp_error_t cerr = virp_chain_artifact_body_exists(
+                                    &state->chain, cited, &body_stored);
+            if (cerr != VIRP_OK) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: could not "
+                        "check whether fed_outcome's cited observation %s is "
+                        "stored (session=%s id=%s err=%s)\n",
+                        cited, req.session_id, req.artifact_id,
+                        virp_error_str(cerr));
+                send_framed_error(client_fd, cerr);
+                break;
+            }
+            if (!body_stored) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: fed_outcome "
+                        "cites observation %s, which is not stored in "
+                        "artifacts — append the fed_observation body before "
+                        "the outcome that names it (session=%s id=%s)\n",
+                        cited, req.session_id, req.artifact_id);
+                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+                break;
+            }
         }
         {
             /* Entry and (optional) raw content commit in one transaction.

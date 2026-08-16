@@ -268,6 +268,42 @@ virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
     return rc;
 }
 
+virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,
+                                             const char *artifact_hash,
+                                             bool *exists)
+{
+    if (!state || !artifact_hash || !exists) return VIRP_ERR_NULL_PTR;
+    *exists = false;
+
+    pthread_mutex_lock(&state->lock);
+    /* Same one-off-statement discipline as virp_chain_artifact_exists()
+     * above: a read-only probe on the append path must not contend with
+     * the shared prepared statements the append itself uses.
+     *
+     * artifacts, NOT chain_entries. A chain entry proves an append was
+     * ACCEPTED; only an artifacts row proves the BODY was retained. The
+     * two came apart on this very path — the entry landed and the body
+     * did not — so asking the entries table here would answer the wrong
+     * question and pass exactly the case this exists to catch. */
+    sqlite3_stmt *st = NULL;
+    virp_error_t rc = VIRP_OK;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT 1 FROM artifacts WHERE artifact_hash = ? LIMIT 1",
+            -1, &st, NULL) != SQLITE_OK) {
+        rc = VIRP_ERR_CHAIN_DB;
+    } else {
+        sqlite3_bind_text(st, 1, artifact_hash, -1, SQLITE_TRANSIENT);
+        int step = sqlite3_step(st);
+        if (step == SQLITE_ROW)
+            *exists = true;
+        else if (step != SQLITE_DONE)
+            rc = VIRP_ERR_CHAIN_DB;
+    }
+    if (st) sqlite3_finalize(st);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
 virp_error_t virp_chain_intent_store(virp_chain_state_t *state,
                                      virp_intent_entry_t *entry)
 {
@@ -380,8 +416,24 @@ bool virp_chain_type_is_external_allowed(const char *artifact_type)
          * them here does not let a socket client forge a daemon-minted
          * semantic type. The signed observation stays separate (GATE 3).
          * Names kept <=15 chars so they survive artifact_type[16] intact
-         * (unlike the INDIRECT entries, which need truncated aliases). */
+         * (unlike the INDIRECT entries, which need truncated aliases).
+         *
+         * "fed_observation" is the odd one out and is NOT a commitment:
+         * its body is the signed observation wire message itself, the
+         * evidence a fed_outcome's observation_sha256 points at. It
+         * exists because the Item 8 narrowing in virp_onode.c reduces a
+         * restricted principal's chain_append to this federation set,
+         * which left the bridge unable to store the very body its
+         * outcome cited — every federated read from 2026-08-11 17:44
+         * UTC to 2026-08-16 recorded a hash resolving to nothing. Giving
+         * the bridge its own name for the body, rather than readmitting
+         * the reserved "observation", keeps a client-submitted body
+         * distinguishable from a daemon-minted one while restoring the
+         * link. It carries a real signature and GATE 3 verifies it here
+         * exactly as it verifies "observation" — being externally
+         * submittable buys it no exemption from proving what it is. */
         "fed_request",     /* broker/virp_bridge_mcp.py (request provenance) */
+        "fed_observation", /* broker/virp_bridge_mcp.py (the signed body)    */
         "fed_outcome",     /* broker/virp_bridge_mcp.py (outcome record)     */
     };
     if (virp_chain_type_is_indirect(artifact_type)) return true;
@@ -577,7 +629,13 @@ static const char *SCHEMA_SQL =
     "  created_at_ns INTEGER NOT NULL,"
     "  UNIQUE(artifact_id, artifact_hash)"
     ");"
-    "CREATE INDEX IF NOT EXISTS idx_artifacts_id ON artifacts(artifact_id);";
+    "CREATE INDEX IF NOT EXISTS idx_artifacts_id ON artifacts(artifact_id);"
+    /* Lookup by hash alone: chain_append's fed_outcome gate asks "is the
+     * body this outcome cites actually stored?", and it knows only the
+     * hash — the citing outcome carries no artifact_id for it. Without
+     * this index that question is a full scan of a table that reaches
+     * six figures of rows on a live node, on the append path. */
+    "CREATE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(artifact_hash);";
 
 /* =========================================================================
  * Prepared Statement SQL
