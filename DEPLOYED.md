@@ -154,12 +154,58 @@ standing coverage note). The live fed audit passes scoped
 pre-deploy unbacked outcomes — it becomes the post-restart acceptance
 check with `VIRP_FED_SINCE=<restart date>`.
 
-### Acceptance test after restart (planned)
-One real GREEN federated read from netclaw: all three appends land;
-the outcome's `observation_sha256` resolves in `artifacts`; GATE 4
-refusal proof (outcome citing an absent body → `-50`); deliberate
-resubmission drill → byte-identical or refused, never
-same-id-different-hash (SQL in docs/BRIDGE-FED-OBSERVATION.md).
+### RESTARTED 2026-08-16 21:22:53 UTC — acceptance PASSED
+
+Restart window 21:21:22–21:22:53 UTC (graceful stop of the old process
+dominated), between autopilot cycles, with the netclaw bridge confirmed
+not running (it spawns fresh from the patched file on Nexus's next
+call). New process PID 3528166; `/proc/<pid>/exe` sha256 =
+`3daf9ce3…` (the installed build). Startup clean: 43 devices loaded,
+every one logging its new node_id (`node_id=0xac141405` … `0x8a002814`
+… `0x0a0014c7`), chain enabled, approvals keys=1, uid allowlist and
+993=GREEN ceiling unchanged, `idx_artifacts_hash` present after open.
+Autopilot's next cycle (21:25) ran GREEN on the new daemon.
+
+**This timestamp — 2026-08-16 21:22:53 UTC — is the node_id cutover
+boundary** for correlating pre-restart (`signer_node_id` 0) entries to
+post-restart ones.
+
+Acceptance, run live over the daemon socket (session
+`ncfed-acceptance-20260816`), replicating the patched bridge's exact
+flow:
+- **GREEN three-append** (correlation `bda35148…`): a real
+  `vtysh -c "show ip ospf neighbor"` on clab-frr-ospf-frr1 came back
+  tier GREEN, obs_type 0x07, **header node_id `0xac141405`** (the new
+  device id, live in signed headers), signature `✓ VALID` under the
+  real O-Key via `virp-tool inspect`. All three appends landed
+  (`fed_request` → `fed_observation` → `fed_outcome`), and the doc's
+  link SQL resolves the outcome's `observation_sha256` to exactly one
+  row: the `fed_observation`.
+- **GATE 4 refusal proof**: a `fed_outcome` citing an absent body was
+  refused with `-50`; journal line logged verbatim.
+- **GATE 5 drill** (correlation `39636a6b…`): same artifact_id
+  resubmitted with different bytes → refused with `-51`, journal line
+  logged; chain untouched by the refusal.
+- **Byte-identical retry**: accepted with a full success frame —
+  2 chain entries, 1 body row, exactly the designed no-op-plus-honest-
+  retry-trace.
+- **No same-id-different-hash pair has been minted since the restart**
+  (the doc's post-deploy SQL returns zero rows).
+
+Two honest harness notes: (1) the first acceptance correlation
+(`94cc37a7…`) used the bare command form, which FRR classifies RED —
+the gate blocked it, filed proposal `ad637ddb…`, and persisted its own
+rejection (enforcement intact on the new build); the harness's own
+`fed_outcome` for it mislabels that refusal `executed: true` —
+append-only, left as-is, superseded by `bda35148…`. (2) The remaining
+end-to-end leg — the same flow arriving over the netclaw tunnel from
+Nexus — occurs on Nexus's next call, which spawns the patched bridge;
+verify it with the same link SQL and
+`VIRP_FED_SINCE=2026-08-17 make test-fed-outcome-observation`.
+
+Branch `fix/fed-observation-link` pushed to
+`github.com:nhowardtli/virp` after acceptance. Merge review is a
+separate, pending step; main is untouched.
 
 ## Update 2026-08-11 — deploy from consolidated main `569bff11`
 
