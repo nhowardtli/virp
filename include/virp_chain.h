@@ -335,6 +335,19 @@ virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
                                         bool *exists);
 
 /*
+ * Set *exists to true iff a BODY with the given artifact_hash is stored
+ * in the artifacts table. Distinct from virp_chain_artifact_exists()
+ * above in both the table it reads and the question it answers: that one
+ * asks whether an entry was appended, this one whether the bytes it
+ * committed to were retained. Used by chain_append's fed_outcome gate to
+ * refuse an outcome citing an observation the chain cannot produce.
+ * Returns VIRP_OK on a successful query (whether or not it matched).
+ */
+virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,
+                                             const char *artifact_hash,
+                                             bool *exists);
+
+/*
  * Clean up all resources.
  */
 void virp_chain_destroy(virp_chain_state_t *state);

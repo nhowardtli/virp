@@ -165,6 +165,18 @@ INDIRECT_COMMITMENT_TYPES = frozenset((
 #    and must not be reported as tampering.
 NO_BODY_TYPES = frozenset(("gate_rejection",))
 
+# Types whose body IS a signed observation wire message and must therefore
+# have its signature graded, not merely its hash binding checked.
+#
+# "fed_observation" (2026-08-16) is the federation bridge's name for the
+# same bytes: the daemon narrows a restricted principal's chain_append to
+# the federation types, so the bridge stores the signed body under a name
+# it is allowed to use. It is the identical message — chain_append GATE 3
+# verifies its signature on the way in — and if this reader did not treat
+# it as one, the bridge's evidence would bind by hash and never be checked
+# for a signature at all, which is the weaker claim of the two.
+OBSERVATION_TYPES = frozenset(("observation", "fed_observation"))
+
 RETENTION_TRUNCATED = (
     "artifact body was truncated at the daemon's %d-byte storage limit; the "
     "entry commits to the full message, only a prefix was retained"
@@ -596,7 +608,7 @@ def verify_entry(entry, artifact_content, okey, chain_key, expected_prev):
 
     v.device = device_from_artifact_id(entry["artifact_id"])
 
-    if atype == "observation":
+    if atype in OBSERVATION_TYPES:
         if raw is None:
             v.obs_hmac = UNVERIFIABLE
             v.obs_hmac_detail = "no signed message body is stored"
@@ -929,7 +941,7 @@ def summarize(verifications):
         "obs_hmac": _tally(verifications, "obs_hmac"),
         "v2_journal": _tally(verifications, "v2_journal"),
         "observations": sum(1 for v in verifications
-                            if v.entry["artifact_type"] == "observation"),
+                            if v.entry["artifact_type"] in OBSERVATION_TYPES),
         "obs_v2": sum(1 for v in verifications
                       if v.obs_hmac == V2_SESSION),
         "failed_entries": [v for v in verifications if not v.ok],
