@@ -304,6 +304,40 @@ virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,
     return rc;
 }
 
+virp_error_t virp_chain_artifact_id_conflict(virp_chain_state_t *state,
+                                             const char *artifact_id,
+                                             const char *artifact_hash,
+                                             bool *conflict)
+{
+    if (!state || !artifact_id || !artifact_hash || !conflict)
+        return VIRP_ERR_NULL_PTR;
+    *conflict = false;
+
+    pthread_mutex_lock(&state->lock);
+    /* One-off statement, same discipline as the probes above. The
+     * id-equality half of the predicate rides idx_artifacts_id, so this
+     * is a point lookup, not a scan, on the append path. */
+    sqlite3_stmt *st = NULL;
+    virp_error_t rc = VIRP_OK;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT 1 FROM artifacts "
+            "WHERE artifact_id = ? AND artifact_hash <> ? LIMIT 1",
+            -1, &st, NULL) != SQLITE_OK) {
+        rc = VIRP_ERR_CHAIN_DB;
+    } else {
+        sqlite3_bind_text(st, 1, artifact_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, artifact_hash, -1, SQLITE_TRANSIENT);
+        int step = sqlite3_step(st);
+        if (step == SQLITE_ROW)
+            *conflict = true;
+        else if (step != SQLITE_DONE)
+            rc = VIRP_ERR_CHAIN_DB;
+    }
+    if (st) sqlite3_finalize(st);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
 virp_error_t virp_chain_intent_store(virp_chain_state_t *state,
                                      virp_intent_entry_t *entry)
 {

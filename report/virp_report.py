@@ -151,9 +151,15 @@ def load_evidence(reader, session=None, since_ns=None, until_ns=None):
     sql += " ORDER BY session_id, sequence"
 
     entries = [dict(r) for r in reader.conn.execute(sql, params)]
-    artifacts = {r["artifact_id"]: r["artifact_content"]
+    # Keyed by (artifact_id, artifact_hash) — the pair the entry commits
+    # to and the artifacts table is keyed by. An id-only key silently
+    # keeps one body per colliding id and grades every sibling entry
+    # against it: on 2026-08-16 that misreported 50 healthy federation
+    # entries (the bridge's re-serialized retries) as FAILED.
+    artifacts = {(r["artifact_id"], r["artifact_hash"]): r["artifact_content"]
                  for r in reader.conn.execute(
-                     "SELECT artifact_id, artifact_content FROM artifacts")}
+                     "SELECT artifact_id, artifact_hash, artifact_content "
+                     "FROM artifacts")}
     return entries, artifacts
 
 

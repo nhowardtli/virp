@@ -3991,6 +3991,27 @@ static int ca_count_entries(const char *artifact_id)
     return n;
 }
 
+/* Count artifact BODY rows for an artifact_id. Distinct from
+ * ca_count_entries: an entry proves an append was accepted, a body row
+ * proves bytes were retained — GATE 5's subject is the latter. */
+static int ca_count_artifact_rows(const char *artifact_id)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open(CA_CHAIN_DB, &db) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*) FROM artifacts WHERE artifact_id = ?",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, artifact_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+
 /* ATTACK 1: the declared hash is not sha256(the submitted body). The
  * daemon must recompute over the received bytes and refuse. */
 TEST(test_chain_append_rejects_body_hash_mismatch)
@@ -4853,6 +4874,137 @@ TEST(test_chain_append_fed_observation_must_be_signed)
     ASSERT_EQ(ca_count_entries("ncfed-obs-forged-1"), 0);
 }
 
+/* GATE 5: a federation append may not reuse an artifact_id the store
+ * already holds under a DIFFERENT body hash. The live signature this
+ * closes: the bridge requeued unacknowledged submissions daily and
+ * re-serialized the body each attempt (fresh timestamp → new hash), so
+ * one correlation accumulated up to seven distinct "request" bodies —
+ * self-consistent pairs GATE 2 rightly passed, provenance nobody can
+ * read back as one event. A correlation id names ONE request, ONE
+ * observation, ONE outcome; a retry that cannot resend the identical
+ * bytes must mint a new correlation instead. */
+TEST(test_chain_append_refuses_fed_retry_with_different_bytes)
+{
+    const char *b1 = "{\"schema\":\"federated_request/1\",\"attempt\":1}";
+    char h1[65];
+    ca_sha256_hex(b1, h1);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("ncfed-g5-t1", "fed_request", "ncfed-req-g5-1",
+                          h1, b1, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+
+    /* The retry signature: same correlation id, re-serialized body. The
+     * pair is self-consistent, so GATE 2 passes it — only GATE 5 can
+     * tell it apart from a first submission. */
+    const char *b2 = "{\"schema\":\"federated_request/1\",\"attempt\":2}";
+    char h2[65];
+    ca_sha256_hex(b2, h2);
+    n = ca_append("ncfed-g5-t1", "fed_request", "ncfed-req-g5-1",
+                  h2, b2, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_DUPLICATE_MISMATCH);
+    ASSERT_EQ(ca_count_entries("ncfed-req-g5-1"), 1);
+    ASSERT_EQ(ca_count_artifact_rows("ncfed-req-g5-1"), 1);
+}
+
+/* GATE 5 covers fed_outcome too — and the refusal must be its own code,
+ * not GATE 4's: the outcome below cites a body that IS stored, so GATE 4
+ * has nothing to say, yet the outcome's own bytes changed under a reused
+ * correlation. */
+TEST(test_chain_append_refuses_fed_outcome_retry_with_different_bytes)
+{
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9105);
+    ASSERT_TRUE(olen > 0);
+    char hobs[65];   ca_sha256_hex_bin(obs, olen, hobs);
+    char obs_body[2048]; ca_b64_body(obs, olen, obs_body, sizeof(obs_body));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("ncfed-g5-t2", "fed_observation",
+                          "ncfed-obs-g5-2", hobs, obs_body,
+                          resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+
+    char out1[512];
+    snprintf(out1, sizeof(out1),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"executed\","
+             "\"observation_sha256\":\"%s\"}", hobs);
+    char ho1[65];
+    ca_sha256_hex(out1, ho1);
+    n = ca_append("ncfed-g5-t2", "fed_outcome", "ncfed-out-g5-2",
+                  ho1, out1, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+
+    /* Re-serialized outcome (field order shifted), same correlation,
+     * same VALID citation — GATE 4 passes it, GATE 5 must not. */
+    char out2[512];
+    snprintf(out2, sizeof(out2),
+             "{\"observation_sha256\":\"%s\","
+             "\"schema\":\"federated_outcome/1\",\"outcome\":\"executed\"}",
+             hobs);
+    char ho2[65];
+    ca_sha256_hex(out2, ho2);
+    n = ca_append("ncfed-g5-t2", "fed_outcome", "ncfed-out-g5-2",
+                  ho2, out2, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_DUPLICATE_MISMATCH);
+    ASSERT_EQ(ca_count_entries("ncfed-out-g5-2"), 1);
+    ASSERT_EQ(ca_count_artifact_rows("ncfed-out-g5-2"), 1);
+}
+
+/* GATE 5, positive half: a BYTE-IDENTICAL resubmission is a legitimate
+ * retry — the bridge resends because the success frame was lost, and
+ * its retry loop needs that frame, not an error to special-case as
+ * success. The store is a no-op (ON CONFLICT DO NOTHING keeps one body
+ * row); the chain records a second entry, the honest trace that a retry
+ * happened; the caller gets a normal success reply. */
+TEST(test_chain_append_accepts_byte_identical_fed_retry)
+{
+    const char *body = "{\"schema\":\"federated_request/1\",\"held\":true}";
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("ncfed-g5-t3", "fed_request", "ncfed-req-g5-3",
+                          h, body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+
+    n = ca_append("ncfed-g5-t3", "fed_request", "ncfed-req-g5-3",
+                  h, body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("ncfed-req-g5-3"), 2);
+    ASSERT_EQ(ca_count_artifact_rows("ncfed-req-g5-3"), 1);
+}
+
+/* GUARD: GATE 5 is scoped to the federation types. For everything else
+ * a colliding artifact_id with distinct bodies stays side-by-side
+ * storage BY DESIGN — the 2026-08-03 production audit: two distinct
+ * observations minted the same second-resolution id in one second, and
+ * losing either body would have destroyed evidence. Daemon-minted and
+ * autopilot types keep that tolerance; only correlation-keyed
+ * federation ids promise one-id-one-body. */
+TEST(test_chain_append_non_fed_colliding_id_still_stores_both)
+{
+    const char *b1 = "{\"item\":\"pkg-list\",\"epoch\":1}";
+    char h1[65];
+    ca_sha256_hex(b1, h1);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("evidence:2026", "evidence_item",
+                          "evi-collide-1", h1, b1, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+
+    const char *b2 = "{\"item\":\"pkg-list\",\"epoch\":2}";
+    char h2[65];
+    ca_sha256_hex(b2, h2);
+    n = ca_append("evidence:2026", "evidence_item",
+                  "evi-collide-1", h2, b2, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("evi-collide-1"), 2);
+    ASSERT_EQ(ca_count_artifact_rows("evi-collide-1"), 2);
+}
+
 /* GUARD: the reserved daemon type "outcome" is STILL refused from a
  * socket client — the federation types did not widen the daemon namespace. */
 TEST(test_chain_append_still_refuses_reserved_outcome_type)
@@ -5296,6 +5448,10 @@ int main(void)
         RUN_TEST(test_chain_append_refuses_fed_outcome_citing_unstored_observation);
         RUN_TEST(test_chain_append_refuses_fed_outcome_without_observation_hash);
         RUN_TEST(test_chain_append_fed_observation_must_be_signed);
+        RUN_TEST(test_chain_append_refuses_fed_retry_with_different_bytes);
+        RUN_TEST(test_chain_append_refuses_fed_outcome_retry_with_different_bytes);
+        RUN_TEST(test_chain_append_accepts_byte_identical_fed_retry);
+        RUN_TEST(test_chain_append_non_fed_colliding_id_still_stores_both);
         RUN_TEST(test_chain_append_still_refuses_reserved_outcome_type);
         RUN_TEST(test_chain_append_accepts_commitment_without_body);
 

@@ -1794,7 +1794,7 @@ offline, rather than executing against the live box.
    reaches the store through the daemon socket, `virp apply` reads the directory
    directly, so on a 0700 store approve succeeded and apply reported a missing
    proposal that was present the whole time. New
-   `VIRP_ERR_APPROVAL_STORE_UNREADABLE` (-51) separates them. The challenge path
+   `VIRP_ERR_APPROVAL_STORE_UNREADABLE` (-52) separates them. The challenge path
    also re-classifies before collecting a signature and refuses BLACK up front.
 
 ### Live verification after restart (uid 1001, journal 20:44:23–20:44:41)

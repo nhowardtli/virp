@@ -527,6 +527,20 @@ typedef enum {
                                                  caller uid's allowed
                                                  set */
 
+    /* GATE 5 (2026-08-16): a federation chain_append reused an
+     * artifact_id the store already holds under a DIFFERENT body hash.
+     * Distinct from VIRP_ERR_CHAIN_BROKEN (-18: the submission is
+     * inconsistent with ITSELF — fix the client's hashing) and from
+     * VIRP_ERR_ACTION_FORBIDDEN (-50: policy refusal): this submission
+     * is well-formed and self-consistent, but the correlation id it
+     * reuses already names other bytes. The correct client response is
+     * to stop retrying this correlation and mint a new one — never to
+     * re-serialize under the same id. Byte-identical resubmission does
+     * NOT raise this; it is a legitimate retry and succeeds. */
+    VIRP_ERR_DUPLICATE_MISMATCH       = -51,  /* fed artifact_id reused
+                                                 with different body
+                                                 bytes */
+
     /* The approval store exists but this caller cannot read it. Distinct
      * from APPROVAL_NOT_FOUND on purpose: "no such proposal" and "you are
      * not the daemon uid / not on the O-Node host" are different operator
@@ -535,7 +549,7 @@ typedef enum {
      * approve` reaches the store through the daemon socket while `virp
      * apply` reads it directly, so this is reachable on the apply half of
      * a flow whose approve half just succeeded. */
-    VIRP_ERR_APPROVAL_STORE_UNREADABLE = -51, /* store present, not
+    VIRP_ERR_APPROVAL_STORE_UNREADABLE = -52, /* store present, not
                                                  readable by this uid */
 
     /* Success-class status codes (> 0). Not errors: the operation's

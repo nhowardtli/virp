@@ -683,7 +683,10 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None,
                  heads=None, selection_complete=False, v2_journal=None):
     """Verify a list of chain entries (dicts) in session/sequence order.
 
-    `artifacts` maps artifact_id -> artifact_content (or is missing the key).
+    `artifacts` maps (artifact_id, artifact_hash) -> artifact_content (or
+    is missing the key). The pair, not the id: the store keeps colliding
+    ids side by side, and each entry must be graded against the body it
+    commits to, exactly as the daemon's own verifier joins.
 
     `v2_journal` supplies the daemon journal's HELLO_ACK session ids for
     corroborating v2 (session-key-signed) observations — see
@@ -726,7 +729,8 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None,
             else:
                 # First row we have for this session, and it is not seq 0.
                 expected = None
-            v = verify_entry(e, artifacts.get(e["artifact_id"]),
+            v = verify_entry(e, artifacts.get((e["artifact_id"],
+                                               e["artifact_hash"])),
                              okey, chain_key, expected)
             if expected is None and prev_seq is not None:
                 v.link = FAIL
