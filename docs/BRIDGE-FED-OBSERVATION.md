@@ -16,20 +16,27 @@ the bridge's actual append helper looks like.
 ## Rev 2 — what changed since rev 1
 
 Rev 1 had two requirements (the type change and wait-on-success). Rev 2
-adds a third, **retry idempotency**, after the 2026-08-16 live-chain
-audit found 32 federation correlations carrying multiple *distinct*
-stored bodies — the bridge requeues an unacknowledged submission and
-re-serializes it each attempt (fresh timestamp → new hash → new
-self-consistent body under the same correlation id; one `fed_request`
-accumulated seven). Nothing was corrupted — GATE 2 passed each pair
-honestly and the store keeps colliding ids side by side — but a
-correlation that names seven different "requests" is provenance nobody
-can read back as one event.
+adds a third, **correlation uniqueness**, after the 2026-08-16
+live-chain audit found 32 federation correlations carrying multiple
+*distinct* stored bodies. The mechanism — read from the real bridge
+code, correcting this document's earlier requeue theory — is that
+`corr = sha256(peer|request_id|device|command)` with `peer` and
+`request_id` both `"unknown"` on every call, so **every repeat of the
+same command on the same device, ever, minted the SAME correlation id**;
+each invocation's body then differed by its `submitted_at` timestamp.
+Six days of one Nexus poll landed as six distinct "request" bodies
+under one artifact_id. Nothing was corrupted — GATE 2 passed each
+self-consistent pair honestly and the store keeps colliding ids side by
+side — but a correlation that names six different "requests" is
+provenance nobody can read back as one event.
 
 (The "50 FAILED entries" the 2026-08-16 report showed for these were a
 verifier bug — it joined bodies by `artifact_id` alone instead of
 `(artifact_id, artifact_hash)` — fixed on the same branch. The daemon
-now also refuses the pattern at append time: **GATE 5**, error `-51`.)
+now also refuses the pattern at append time: **GATE 5**, error `-51`.
+Consequence that makes the bridge fix MANDATORY before the daemon
+deploy: under the unsalted scheme, every routine repeated read would
+draw `-51` and federation would quietly break for repeat commands.)
 
 ## Why (rev 1 recap)
 
@@ -84,92 +91,80 @@ outcome whose cited body is not yet stored — so a bridge that fires the
 two concurrently, or that submits the outcome regardless, will lose the
 outcome.
 
-### 3. Serialize once, hash once, hold the bytes
+### 3. One correlation per invocation
 
-Every string the three appends send must be built **exactly once per
-correlation**, at build time, and held. A retry — in-process or from the
-requeue — resends the held byte-identical buffers. It never
-re-serializes a dict, never refreshes a timestamp, never recomputes a
-hash from anything but the held bytes.
-
-**Where to hold them:** at the same scope and lifetime as the
-correlation id itself. The moment the device read returns and the
-correlation is minted, build the complete per-correlation record and
-make *it* the thing the send path and the requeue both consume:
+The correlation hash gains per-invocation entropy, so each call to
+`submit_federated_command` is its own correlation and a repeat of the
+same read tomorrow is a *different* one (as applied on netclaw
+2026-08-16):
 
 ```python
-rec = {
-    "correlation": correlation,
-    "session_id":  session_id,
-    "req_json":    req_json,                                  # built once
-    "obs_raw":     obs_raw,                                   # signed wire bytes
-    "obs_sha":     hashlib.sha256(obs_raw).hexdigest(),       # hashed once
-    "obs_b64":     "base64:" + base64.b64encode(obs_raw).decode(),
-    "out_json":    None,                                      # filled below
-}
-rec["out_json"] = json.dumps({..., "observation_sha256": rec["obs_sha"]})
+nonce = os.urandom(16).hex()
+corr = hashlib.sha256(
+    ("%s|%s|%s|%s|%.9f|%s" % (provenance["peer"],
+                              provenance["request_id"],
+                              device, command, now, nonce)).encode()
+).hexdigest()
 ```
 
-If the requeue persists to disk, it persists these strings — not the
-inputs they were built from. If a rebuild is ever unavoidable (the held
-record is gone), the rebuilt submission **mints a NEW correlation id and
-abandons the old one**. Same correlation + different bytes must be
-impossible in the fixed bridge; the daemon's GATE 5 now refuses it with
-`-51` as a backstop, and `-51` in the bridge log means this requirement
-has been violated (or a legacy pre-fix correlation is being requeued —
-drop it).
+Within one invocation the three bodies are each built exactly once (the
+existing code already does this — `chain_append` serializes its dict
+argument once per call, deterministically). A transport-level resend of
+the SAME invocation reuses `corr` with byte-identical content, which
+the daemon accepts. If anything ever rebuilds a submission outside its
+original invocation, the rebuild **mints a NEW correlation and abandons
+the old one**. Same correlation + different bytes must be impossible in
+the fixed bridge; GATE 5 refuses it with `-51` as a backstop, so `-51`
+in the bridge log means the salting failed or a legacy pre-fix
+correlation id was reused — either way stop, don't resubmit.
 
-**The null path must be unreachable.** 16 of the 54 unbacked outcomes
-carry `"observation_sha256": null`. Find what currently produces that —
-almost certainly a fallback of the shape `obs_sha if append_ok else
-None`, or an outcome built before the observation exists — and delete
-it. In the fixed flow `out_json` is built once from the held `obs_sha`
-string, and an outcome is only ever submitted after the observation
-append succeeded, so there is no state in which a null could be emitted.
-GATE 4 refuses null citations anyway; the point is the bridge should
-have no code path that tries.
+**The null path is closed by withholding, not by a new outcome form.**
+16 of the 54 unbacked outcomes carry `"observation_sha256": null`,
+produced by the error branch: when `gate_execute` returned
+`error_code`, no observation existed, but step 4 still filed a
+`fed_outcome` whose `result.get("observation_sha256")` was None. The
+fix: on a transport/typed error the bridge records the outcome entry as
+withheld in its return value and **returns before step 4** — no outcome
+entry at all. A citation-free "transport error" outcome form was
+considered and rejected: the deployed GATE 4 scanner deliberately
+requires a quoted 64-hex citation, and defining a legal citation-free
+outcome would re-open the exact hole GATE 4 closes. Nothing is lost:
+the step-1 `fed_request` keeps the attempt request_id-correlated, the
+caller sees `outcome: "error"` live, and the daemon journal holds the
+typed error.
 
-### The full fixed flow
+### The full fixed flow — as applied to `submit_federated_command`
+
+Three changed regions, applied to the installed copy on netclaw
+2026-08-16 (backup `virp-bridge-mcp.py.bak-20260816-rev2`):
+
+1. **Correlation minting** — the nonce+timestamp salt above.
+2. **Error branch** — on `error_code` from `gate_execute`, record the
+   outcome entry as `withheld` in the returned `result["chain"]` and
+   `return result` before step 4. Step 1's `fed_request` has already
+   landed, so the errored attempt stays request_id-correlated.
+3. **Step 3** — `artifact_type` becomes `"fed_observation"` (nothing
+   else about the append moves), and after it:
 
 ```python
-# 1/3 — request provenance
-if not append_ok(chain_append(artifact_type="fed_request",
-                              artifact_id=f"ncfed-req-{correlation[:32]}",
-                              artifact_hash=sha256_hex(rec["req_json"]),
-                              artifact_content=rec["req_json"], ...)):
-    log.warning("fed_request append failed; continuing")   # non-fatal
-
-# 2/3 — the signed body. FATAL: the outcome cites this.
-resp = chain_append(
-    session_id       = rec["session_id"],
-    artifact_type    = "fed_observation",
-    artifact_id      = f"ncfed-obs-{rec['correlation'][:32]}",
-    artifact_hash    = rec["obs_sha"],
-    artifact_content = rec["obs_b64"],
-)
-if not append_ok(resp):
-    # Do NOT file an outcome citing a body that is not stored. That is
-    # exactly the defect this change exists to end: an outcome that
-    # reads like evidence and resolves to nothing.
-    log.error("fed_observation append refused (%s) — withholding "
-              "fed_outcome for correlation %s",
-              append_err(resp), rec["correlation"])
-    return   # the device read already happened and still returns to the
-             # caller; only the provenance record is skipped
-
-# 3/3 — the outcome, citing a body now known to be stored
-chain_append(
-    session_id       = rec["session_id"],
-    artifact_type    = "fed_outcome",
-    artifact_id      = f"ncfed-out-{rec['correlation'][:32]}",
-    artifact_hash    = sha256_hex(rec["out_json"]),
-    artifact_content = rec["out_json"],       # plain JSON, NOT base64
-)
+        if not ok:
+            result["chain"]["outcome_entry"] = {
+                "ok": False, "artifact_id": "ncfed-out-%s" % corr[:32],
+                "withheld": "fed_observation append refused; an outcome "
+                            "may not cite an unstored body",
+                "observation_error": (receipt.get("error_code")
+                                      if isinstance(receipt, dict)
+                                      else None),
+            }
+            return result
 ```
 
-`rec["out_json"]` carries `"observation_sha256": rec["obs_sha"]` — the
-same value passed as the middle append's `artifact_hash`. Those two must
-be the identical string; that identity is the whole link.
+Step 4 is unchanged: with regions 2 and 3 in place it is only reachable
+when a stored observation exists, so `outcome_body["observation_sha256"]`
+is always the real digest — the identical string passed as step 3's
+`artifact_hash`. That identity is the whole link. `chain_append` itself
+needed no changes: it already computes `sha256` over the exact bytes it
+sends and already returns an `ok` flag distinguishing error frames.
 
 ## Reading the daemon's reply
 
@@ -187,24 +182,14 @@ Errors worth distinguishing:
 | `-4` | `VIRP_ERR_INVALID_TYPE` | unknown `artifact_type` — **what today's daemon returns for `fed_observation`, until the daemon side is deployed** | withhold outcome; retry later (byte-identical) |
 | `-50` | `VIRP_ERR_ACTION_FORBIDDEN` | Item 8 narrowing, or GATE 4 refusing an unbacked/null-citing outcome | withhold outcome; do not retry until fixed |
 | `-18` | `VIRP_ERR_CHAIN_BROKEN` | GATE 2 — declared `artifact_hash` != sha256 of the submitted body | bug in the bridge's own hashing; do not retry |
-| `-51` | `VIRP_ERR_DUPLICATE_MISMATCH` | **GATE 5 — this correlation id is already stored with different bytes.** A retry re-serialized (requirement 3 violated), or a legacy pre-fix correlation was requeued | stop retrying this correlation; mint a new one or drop it. Never resubmit the same id with the same non-identical bytes |
+| `-51` | `VIRP_ERR_DUPLICATE_MISMATCH` | **GATE 5 — this correlation id is already stored with different bytes.** With per-invocation salting this should never fire; if it does, the salting failed or a legacy pre-fix correlation id was reused | stop; never resubmit this correlation with different bytes. A fresh invocation mints its own correlation anyway |
 
-If the bridge currently treats "any 4-byte reply" as success, or ignores
-the reply, that must change — the wait-on-success in step 2 depends on
-reading it. A byte-identical resubmission of something already stored
-**succeeds** (fresh success frame, second chain entry recording the
-retry, no second body row) — the retry loop needs no special case for
-"it actually landed last time."
-
-```python
-def append_ok(resp):
-    return resp is not None and len(resp) > 4
-
-def append_err(resp):
-    if resp is None:            return "no reply"
-    if len(resp) != 4:          return "ok"
-    return int.from_bytes(resp[:4], "big", signed=True)
-```
+The installed bridge's `chain_append` already reads the reply: its `ok`
+flag is false on a typed-error frame and the error code is in the
+returned receipt dict — the withhold logic keys off exactly that. A
+byte-identical resubmission of something already stored **succeeds**
+(fresh success frame, second chain entry recording the retry, no second
+body row) — no special case needed for "it actually landed last time."
 
 ## Deploy ordering
 
@@ -219,12 +204,10 @@ read still executes and still returns to the caller; only the provenance
 record is skipped. That is a cleaner failure than a dangling pointer, but
 it is a change — keep the window short.
 
-After the daemon deploy, any **legacy** correlation still sitting in
-netclaw's requeue from before the fix will draw `-51` (its id is already
-stored under the old bytes). Expected once per legacy item: log it,
-drop the item. It must not loop.
-
-Daemon-first would hard-break federation and must not be done.
+Daemon-first would break federation twice over: `fed_observation` never
+landing is the rev-1 problem, and — with the unsalted bridge — every
+routine repeat of a previously-run command would draw `-51` at step 1.
+The salted bridge must be live before the daemon restarts.
 
 ## Verifying, after both sides are live
 
@@ -264,8 +247,11 @@ HAVING count(DISTINCT artifact_hash) > 1
 
 Then `make test-fed-outcome-observation` with
 `VIRP_FED_SINCE=<deploy date>`, which scopes the audit to what the fixed
-daemon wrote. The 54 pre-existing unbacked outcomes are **not** repaired —
-the chain is append-only and those bodies were never stored, so they stay
-as the honest record. The 32 pre-existing multi-body correlations
-likewise stay; they are healthy side-by-side storage, correctly graded
-once the verifier joins on `(artifact_id, artifact_hash)`.
+daemon wrote. The pre-existing unbacked outcomes (55 by the time both
+sides were patched: the original 54 plus one zammad-ro read that landed
+through the old bridge at 2026-08-16 20:17 UTC, minutes before the
+bridge edit) are **not** repaired — the chain is append-only and those
+bodies were never stored, so they stay as the honest record. The 32
+pre-existing multi-body correlations likewise stay; they are healthy
+side-by-side storage, correctly graded once the verifier joins on
+`(artifact_id, artifact_hash)`.
