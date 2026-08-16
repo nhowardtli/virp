@@ -348,6 +348,21 @@ virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,
                                              bool *exists);
 
 /*
+ * Set *conflict to true iff the artifacts table already holds a body
+ * under the given artifact_id whose artifact_hash DIFFERS from the one
+ * supplied. Used by chain_append's GATE 5 to refuse a federation
+ * correlation id being reused with different bytes; a byte-identical
+ * resubmission (same id, same hash) is NOT a conflict. Reads only the
+ * artifacts table: a commitment-only append stores no body row and so
+ * does not arm the gate. Returns VIRP_OK on a successful query
+ * (whether or not it matched).
+ */
+virp_error_t virp_chain_artifact_id_conflict(virp_chain_state_t *state,
+                                             const char *artifact_id,
+                                             const char *artifact_hash,
+                                             bool *conflict);
+
+/*
  * Clean up all resources.
  */
 void virp_chain_destroy(virp_chain_state_t *state);

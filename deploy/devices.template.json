@@ -22,6 +22,7 @@
   "devices": [
     {
       "hostname": "clab-frr-ospf-frr1",
+      "node_id": "AC141405",
       "host": "172.20.20.5",
       "vendor": "linux",
       "username": "root",
@@ -30,6 +31,7 @@
     },
     {
       "hostname": "clab-frr-ospf-frr2",
+      "node_id": "AC141402",
       "host": "172.20.20.2",
       "vendor": "linux",
       "username": "root",
@@ -38,6 +40,7 @@
     },
     {
       "hostname": "clab-frr-ospf-frr3",
+      "node_id": "AC141404",
       "host": "172.20.20.4",
       "vendor": "linux",
       "username": "root",
@@ -46,6 +49,7 @@
     },
     {
       "hostname": "clab-frr-ospf-frr4",
+      "node_id": "AC141403",
       "host": "172.20.20.3",
       "vendor": "linux",
       "username": "root",

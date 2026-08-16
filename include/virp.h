@@ -527,6 +527,20 @@ typedef enum {
                                                  caller uid's allowed
                                                  set */
 
+    /* GATE 5 (2026-08-16): a federation chain_append reused an
+     * artifact_id the store already holds under a DIFFERENT body hash.
+     * Distinct from VIRP_ERR_CHAIN_BROKEN (-18: the submission is
+     * inconsistent with ITSELF — fix the client's hashing) and from
+     * VIRP_ERR_ACTION_FORBIDDEN (-50: policy refusal): this submission
+     * is well-formed and self-consistent, but the correlation id it
+     * reuses already names other bytes. The correct client response is
+     * to stop retrying this correlation and mint a new one — never to
+     * re-serialize under the same id. Byte-identical resubmission does
+     * NOT raise this; it is a legitimate retry and succeeds. */
+    VIRP_ERR_DUPLICATE_MISMATCH       = -51,  /* fed artifact_id reused
+                                                 with different body
+                                                 bytes */
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency

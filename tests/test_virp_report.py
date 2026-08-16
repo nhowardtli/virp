@@ -62,7 +62,7 @@ CREATE TABLE artifacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, artifact_id TEXT NOT NULL,
   artifact_type TEXT NOT NULL, artifact_content TEXT NOT NULL,
   artifact_hash TEXT NOT NULL, session_id TEXT NOT NULL,
-  created_at_ns INTEGER NOT NULL, UNIQUE(artifact_id));
+  created_at_ns INTEGER NOT NULL, UNIQUE(artifact_id, artifact_hash));
 """
 
 
@@ -248,9 +248,10 @@ def independent_counts(db_path):
     conn.row_factory = sqlite3.Row
     rows = list(conn.execute(
         "SELECT * FROM chain_entries ORDER BY session_id, sequence"))
-    arts = {r["artifact_id"]: r["artifact_content"]
+    arts = {(r["artifact_id"], r["artifact_hash"]): r["artifact_content"]
             for r in conn.execute(
-                "SELECT artifact_id, artifact_content FROM artifacts")}
+                "SELECT artifact_id, artifact_hash, artifact_content "
+                "FROM artifacts")}
     conn.close()
 
     total = len(rows)
@@ -356,6 +357,53 @@ def analyse(db, okey=TEST_OKEY, chain_key=TEST_CHAIN_KEY):
 
 
 # ── synthetic-chain tests ─────────────────────────────────────────────────
+
+class TestCollidingArtifactIds(unittest.TestCase):
+    """One artifact_id, several self-consistent bodies. The store keys
+    bodies by (artifact_id, artifact_hash) precisely so a colliding id
+    keeps every body (2026-08-03 audit); the verifier must join on the
+    same pair. Binding by artifact_id alone grades an entry against a
+    sibling's bytes — on 2026-08-16 that misreported 50 healthy live
+    entries (the bridge's re-serialized federation retries) as FAILED."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="virp-report-collide-")
+        self.db = os.path.join(self.tmp, "chain.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_each_entry_binds_against_its_own_body(self):
+        b = ChainBuilder(self.db)
+        b.add_json("fed:test", "fed_request", "ncfed-req-collide",
+                   {"cmd": "show version", "attempt": 1})
+        b.add_json("fed:test", "fed_request", "ncfed-req-collide",
+                   {"cmd": "show version", "attempt": 2})
+        b.close()
+
+        vs, summary = analyse(self.db)
+        self.assertEqual(summary["artifact_bind"][verify.FAIL], 0,
+                         [v.artifact_bind_detail for v in vs
+                          if v.artifact_bind == verify.FAIL])
+        self.assertEqual(summary["artifact_bind"][verify.PASS], 2)
+
+    def test_missing_pair_is_unverifiable_not_a_siblings_failure(self):
+        """An entry whose exact (id, hash) body is absent must grade
+        UNVERIFIABLE — the C verifier's verdict for a missing row — not
+        FAIL against whatever sibling body shares the id."""
+        b = ChainBuilder(self.db)
+        b.add_json("fed:test", "fed_request", "ncfed-req-halfgone",
+                   {"cmd": "show version", "attempt": 1})
+        missing = hashlib.sha256(b"never stored").hexdigest()
+        b.append("fed:test", "fed_request", "ncfed-req-halfgone", missing,
+                 artifact_content=None)
+        b.close()
+
+        vs, summary = analyse(self.db)
+        self.assertEqual(summary["artifact_bind"][verify.FAIL], 0)
+        self.assertEqual(summary["artifact_bind"][verify.PASS], 1)
+        self.assertEqual(summary["artifact_bind"][verify.UNVERIFIABLE], 1)
+
 
 class TestChainReadHelper(unittest.TestCase):
     """The read-only access helper and its documented method ordering."""
@@ -637,13 +685,20 @@ class TestTamperDetection(unittest.TestCase):
 
     def test_flipped_artifact_hash_breaks_hash_hmac_and_binding(self):
         """Tampering with a field inside the canonical JSON must be caught by
-        the entry hash, the chain HMAC and the artifact binding at once."""
+        the entry hash and the chain HMAC. The artifact binding grades the
+        entry UNVERIFIABLE, not FAIL: the verifier joins bodies on
+        (artifact_id, artifact_hash) — the daemon verifier's join — so a
+        forged hash names a commitment for which no body is stored, and no
+        stored body exists to be "broken". The forgery itself cannot hide:
+        artifact_hash is inside the canonical JSON both hash and HMAC
+        cover."""
         self._flip_one_byte_of("artifact_type='observation' LIMIT 1",
                                column="artifact_hash")
         _, summary = analyse(self.db)
         self.assertGreater(summary["entry_hash"][verify.FAIL], 0)
         self.assertGreater(summary["chain_hmac"][verify.FAIL], 0)
-        self.assertGreater(summary["artifact_bind"][verify.FAIL], 0)
+        self.assertGreater(summary["artifact_bind"][verify.UNVERIFIABLE], 0)
+        self.assertEqual(summary["artifact_bind"][verify.FAIL], 0)
 
     def test_tampered_observation_body_fails_the_okey_hmac(self):
         """Rewriting a signed observation's payload must fail the O-Key HMAC

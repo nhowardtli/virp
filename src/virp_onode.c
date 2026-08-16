@@ -2913,6 +2913,56 @@ static void handle_client(onode_state_t *state, int client_fd)
                 break;
             }
         }
+
+        /* GATE 5 — federation retry idempotency. A federation
+         * artifact_id embeds the bridge's correlation and names ONE
+         * request, ONE observation body, ONE outcome; an append that
+         * reuses such an id with DIFFERENT bytes is refused with its own
+         * code, distinct from -18 (the submission disagreeing with
+         * itself) and -50 (policy). The live signature this closes: the
+         * bridge requeued unacknowledged submissions and re-serialized
+         * the body each attempt (fresh timestamp → new hash), so one
+         * correlation accumulated up to seven self-consistent "request"
+         * bodies — GATE 2 rightly passed each pair, and nothing asked
+         * whether the id already meant something else. A byte-identical
+         * resubmission is NOT a conflict: the retry exists because the
+         * success frame was lost, and it must be able to obtain one —
+         * the store is a no-op, the chain honestly records that a retry
+         * happened, the caller gets a normal success reply.
+         *
+         * Scoped to the three federation types. For every other type a
+         * colliding id with distinct bodies is side-by-side storage BY
+         * DESIGN (2026-08-03 audit: two observations minted the same
+         * second-resolution id; losing either body would have destroyed
+         * evidence). Reads the artifacts table only, so a commitment-only
+         * append does not arm the gate — the bridge protocol always
+         * carries bodies. Fail closed on a store that cannot answer. */
+        if (strcmp(req.artifact_type, "fed_request") == 0 ||
+            strcmp(req.artifact_type, "fed_observation") == 0 ||
+            strcmp(req.artifact_type, "fed_outcome") == 0) {
+            bool id_conflict = false;
+            virp_error_t gerr = virp_chain_artifact_id_conflict(
+                                    &state->chain, req.artifact_id,
+                                    req.artifact_hash, &id_conflict);
+            if (gerr != VIRP_OK) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: could not "
+                        "check artifact_id '%s' for a conflicting stored "
+                        "body (session=%s err=%s)\n",
+                        req.artifact_id, req.session_id,
+                        virp_error_str(gerr));
+                send_framed_error(client_fd, gerr);
+                break;
+            }
+            if (id_conflict) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: federation "
+                        "artifact_id '%s' is already stored with a different "
+                        "body hash — a retry must resend identical bytes, or "
+                        "mint a new correlation (session=%s type=%s)\n",
+                        req.artifact_id, req.session_id, req.artifact_type);
+                send_framed_error(client_fd, VIRP_ERR_DUPLICATE_MISMATCH);
+                break;
+            }
+        }
         {
             /* Entry and (optional) raw content commit in one transaction.
              * A content-store failure now fails the whole request with a
