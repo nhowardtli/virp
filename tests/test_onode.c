@@ -5034,6 +5034,402 @@ TEST(test_chain_append_accepts_commitment_without_body)
 }
 
 /* =========================================================================
+ * Concurrency regressions (external review 2026-08-17)
+ *
+ * Two findings, both in the evidence path, both only reachable when
+ * more than one connection worker is inside CHAIN_APPEND at once —
+ * which is exactly how the daemon runs (thread-per-connection, up to
+ * ONODE_MAX_WORKERS). A serial test cannot catch either; these drive
+ * real concurrent requests through real sockets.
+ * ========================================================================= */
+
+/* Same framing as ca_request(), minus its 50ms settling sleep: these
+ * tests need requests IN FLIGHT together, and recv() blocks until the
+ * daemon replies anyway. */
+static ssize_t car_request(const char *json, uint8_t *resp, size_t resp_cap)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", CA_SOCKET);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    size_t json_len = strlen(json);
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+    send(fd, &frame_len, 4, 0);
+    uint8_t version = VIRP_FRAME_VERSION;
+    send(fd, &version, 1, 0);
+    send(fd, json, json_len, 0);
+
+    uint32_t net_rlen;
+    if (recv(fd, &net_rlen, 4, 0) != 4) { close(fd); return -1; }
+    uint32_t rlen = ntohl(net_rlen);
+    if (rlen > resp_cap) { close(fd); return -1; }
+    size_t got = 0;
+    while (got < rlen) {
+        ssize_t n = recv(fd, resp + got, rlen - got, 0);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    return (ssize_t)got;
+}
+
+/* -------------------------------------------------------------------------
+ * Regression 1: GATE 3 must verify each request's OWN bytes.
+ *
+ * chain_append_verify_observation() decoded every submitted body into
+ * ONE function-static 64KB buffer. Two workers in the gate at once and
+ * worker A's signature check runs over whatever worker B last decoded:
+ * a tampered body gets accepted because a concurrent VALID body
+ * overwrote it between decode and verify, and a valid body gets
+ * refused because concurrent bytes tore under its HMAC. Both directions
+ * are asserted here: every genuinely signed submission must be
+ * accepted, every tampered one refused, under sustained concurrency.
+ *
+ * The payload is large (4KB) on purpose — it widens the window between
+ * "decoded into the buffer" and "verified out of the buffer" that the
+ * shared static leaves open.
+ * ------------------------------------------------------------------------- */
+
+#define RACE_THREADS  10
+#define RACE_ITERS    120
+#define RACE_PAYLOAD  4096
+
+typedef struct {
+    int tid;
+    int valid_rejected;     /* genuinely signed, refused — must stay 0 */
+    int tampered_accepted;  /* tampered, accepted       — must stay 0 */
+    int transport_errors;   /* connect/frame failures   — must stay 0 */
+} race_arg_t;
+
+static size_t race_mint_obs(uint8_t *buf, size_t cap, int tid, int iter)
+{
+    /* Distinct payload bytes per (thread, iteration): if verification
+     * ever runs over another request's bytes, they are NEVER the same
+     * bytes this request submitted. */
+    uint8_t payload[RACE_PAYLOAD];
+    int hdr = snprintf((char *)payload, sizeof(payload),
+                       "{\"race\":\"t%02d-i%03d\",\"fill\":\"", tid, iter);
+    for (size_t i = (size_t)hdr; i < sizeof(payload); i++)
+        payload[i] = (uint8_t)('a' + ((i + (size_t)tid * 7u
+                                         + (size_t)iter * 13u) % 26u));
+
+    size_t len = 0;
+    virp_error_t e = virp_build_observation_tiered(
+        buf, cap, &len, 0x00000042u,
+        200000u + (uint32_t)tid * 1000u + (uint32_t)iter,
+        VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL, VIRP_TIER_GREEN,
+        payload, (uint16_t)sizeof(payload), &ca_state.okey);
+    return (e == VIRP_OK) ? len : 0;
+}
+
+static void *race_worker(void *p)
+{
+    race_arg_t *a = (race_arg_t *)p;
+
+    for (int i = 0; i < RACE_ITERS; i++) {
+        uint8_t obs[8192];
+        size_t olen = race_mint_obs(obs, sizeof(obs), a->tid, i);
+        if (olen == 0) { a->transport_errors++; continue; }
+
+        int tamper = (i & 1);
+        if (tamper)
+            obs[olen - 1] ^= 0x01;   /* break the signature, not the hash */
+
+        /* Honest hash over the bytes actually sent, tampered or not:
+         * GATE 2 must pass so GATE 3 — the gate under test — decides. */
+        char h[65];
+        ca_sha256_hex_bin(obs, olen, h);
+        char body[12288];
+        ca_b64_body(obs, olen, body, sizeof(body));
+
+        char id[64];
+        snprintf(id, sizeof(id), "race-t%02d-i%03d-%s",
+                 a->tid, i, tamper ? "bad" : "ok");
+
+        char json[16384];
+        snprintf(json, sizeof(json),
+                 "{\"action\":\"chain_append\",\"session_id\":\"race:%02d\","
+                 "\"artifact_type\":\"observation\",\"artifact_id\":\"%s\","
+                 "\"artifact_hash\":\"%s\",\"artifact_content\":\"%s\"}",
+                 a->tid, id, h, body);
+
+        uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+        ssize_t n = car_request(json, resp, sizeof(resp));
+        if (n < 4)            a->transport_errors++;
+        else if (tamper && n > 4)   a->tampered_accepted++;
+        else if (!tamper && n == 4) a->valid_rejected++;
+    }
+    return NULL;
+}
+
+TEST(test_chain_append_concurrent_verify_uses_own_bytes)
+{
+    pthread_t th[RACE_THREADS];
+    race_arg_t args[RACE_THREADS];
+    memset(args, 0, sizeof(args));
+
+    for (int i = 0; i < RACE_THREADS; i++) {
+        args[i].tid = i;
+        ASSERT_EQ(pthread_create(&th[i], NULL, race_worker, &args[i]), 0);
+    }
+
+    int valid_rejected = 0, tampered_accepted = 0, transport = 0;
+    for (int i = 0; i < RACE_THREADS; i++) {
+        pthread_join(th[i], NULL);
+        valid_rejected    += args[i].valid_rejected;
+        tampered_accepted += args[i].tampered_accepted;
+        transport         += args[i].transport_errors;
+    }
+
+    ASSERT_EQ(transport, 0);
+    ASSERT_EQ(tampered_accepted, 0);
+    ASSERT_EQ(valid_rejected, 0);
+}
+
+/* -------------------------------------------------------------------------
+ * Regression 2 (F4): GATE 5 is check-then-act across the transaction
+ * boundary.
+ *
+ * The conflict probe ran OUTSIDE the append transaction: N concurrent
+ * submissions of the SAME federation artifact_id with DIFFERENT bytes
+ * could all pass the probe before the first append committed, then all
+ * commit — one correlation id stored under several hashes, the exact
+ * bridge-requeue corruption GATE 5 exists to refuse. The check must run
+ * inside the same BEGIN IMMEDIATE transaction as the append.
+ *
+ * Two tests. The first drives the daemon's exact call sequence —
+ * virp_chain_artifact_id_conflict() then
+ * virp_chain_append_with_artifact() — from N threads with a barrier
+ * BETWEEN the probe and the append, the adversarial schedule the
+ * daemon does nothing to forbid: every thread passes the probe before
+ * any thread appends. It is deterministic in both directions — the
+ * old code stores all N bodies every time; with the check inside the
+ * append's own transaction exactly one wins, no matter the schedule.
+ * (This runs against ca_state.chain in-process, the same store the
+ * daemon threads use; the chain mutex makes that legal.)
+ *
+ * The second releases rounds of pre-connected socket clients through
+ * a barrier: end-to-end confirmation that under real concurrent
+ * submissions exactly ONE body wins and every loser is refused with
+ * VIRP_ERR_DUPLICATE_MISMATCH, nothing else.
+ * ------------------------------------------------------------------------- */
+
+#define G5_THREADS  8
+#define G5_ROUNDS   20
+
+typedef struct {
+    int tid;
+    pthread_barrier_t *start;    /* everyone probes together            */
+    pthread_barrier_t *checked;  /* nobody appends until ALL have probed */
+    virp_error_t probe_rc;
+    int probe_conflict;
+    virp_error_t append_rc;      /* VIRP_OK only for the one winner     */
+} g5lib_arg_t;
+
+static void *g5lib_worker(void *p)
+{
+    g5lib_arg_t *a = (g5lib_arg_t *)p;
+
+    char body[96];
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_request/1\",\"writer\":%d}", a->tid);
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    pthread_barrier_wait(a->start);
+
+    bool conflict = false;
+    a->probe_rc = virp_chain_artifact_id_conflict(&ca_state.chain,
+                                                  "g5lib-race-1", h,
+                                                  &conflict);
+    a->probe_conflict = conflict;
+
+    /* The daemon holds no lock across this boundary — any schedule is
+     * fair game, including this worst case. */
+    pthread_barrier_wait(a->checked);
+
+    if (a->probe_rc == VIRP_OK && !conflict) {
+        virp_chain_entry_t e;
+        a->append_rc = virp_chain_append_with_artifact(
+                           &ca_state.chain, "g5lib:race", "fed_request",
+                           "g5lib-race-1", h, body, &e);
+    } else {
+        a->append_rc = VIRP_ERR_DUPLICATE_MISMATCH; /* refused pre-append */
+    }
+    return NULL;
+}
+
+TEST(test_chain_fed_id_conflict_check_is_inside_append_txn)
+{
+    pthread_barrier_t start, checked;
+    ASSERT_EQ(pthread_barrier_init(&start, NULL, G5_THREADS), 0);
+    ASSERT_EQ(pthread_barrier_init(&checked, NULL, G5_THREADS), 0);
+
+    pthread_t th[G5_THREADS];
+    g5lib_arg_t args[G5_THREADS];
+    memset(args, 0, sizeof(args));
+    for (int i = 0; i < G5_THREADS; i++) {
+        args[i].tid = i;
+        args[i].start = &start;
+        args[i].checked = &checked;
+        ASSERT_EQ(pthread_create(&th[i], NULL, g5lib_worker, &args[i]), 0);
+    }
+
+    int winners = 0, losers_wrong_code = 0;
+    for (int i = 0; i < G5_THREADS; i++) {
+        pthread_join(th[i], NULL);
+        if (args[i].append_rc == VIRP_OK)
+            winners++;
+        else if (args[i].append_rc != VIRP_ERR_DUPLICATE_MISMATCH)
+            losers_wrong_code++;
+    }
+    pthread_barrier_destroy(&start);
+    pthread_barrier_destroy(&checked);
+
+    ASSERT_EQ(winners, 1);
+    ASSERT_EQ(losers_wrong_code, 0);
+    ASSERT_EQ(ca_count_artifact_rows("g5lib-race-1"), 1);
+    ASSERT_EQ(ca_count_entries("g5lib-race-1"), 1);
+}
+
+typedef struct {
+    int round;
+    int tid;
+    pthread_barrier_t *barrier;
+    int success;       /* append accepted */
+    int wrong_error;   /* refused with anything but DUPLICATE_MISMATCH */
+    int transport;
+} g5_arg_t;
+
+static void *g5_worker(void *p)
+{
+    g5_arg_t *a = (g5_arg_t *)p;
+
+    char body[128];
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_request/1\",\"round\":%d,"
+             "\"writer\":%d}", a->round, a->tid);
+    char h[65];
+    ca_sha256_hex(body, h);
+
+    /* Escape the body into the request, same as ca_append(): an
+     * unescaped quote makes the REQUEST malformed and the daemon
+     * refuses the parse — the test would then pass without ever
+     * reaching the gate under attack. */
+    char esc[256];
+    size_t o = 0;
+    for (const char *p = body; *p && o + 2 < sizeof(esc); p++) {
+        if (*p == '"' || *p == '\\') esc[o++] = '\\';
+        esc[o++] = *p;
+    }
+    esc[o] = '\0';
+
+    char json[768];
+    snprintf(json, sizeof(json),
+             "{\"action\":\"chain_append\",\"session_id\":\"g5race:%d\","
+             "\"artifact_type\":\"fed_request\","
+             "\"artifact_id\":\"g5race-r%03d\","
+             "\"artifact_hash\":\"%s\",\"artifact_content\":\"%s\"}",
+             a->round, a->round, h, esc);
+
+    /* Connect first, THEN barrier, THEN send: the daemon's worker is
+     * already blocked in its frame read, so the sends land as close to
+     * simultaneously as the scheduler allows. */
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { a->transport++; return NULL; }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", CA_SOCKET);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        a->transport++;
+        pthread_barrier_wait(a->barrier);
+        return NULL;
+    }
+
+    pthread_barrier_wait(a->barrier);
+
+    size_t json_len = strlen(json);
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+    send(fd, &frame_len, 4, 0);
+    uint8_t version = VIRP_FRAME_VERSION;
+    send(fd, &version, 1, 0);
+    send(fd, json, json_len, 0);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    uint32_t net_rlen;
+    if (recv(fd, &net_rlen, 4, 0) != 4) {
+        close(fd);
+        a->transport++;
+        return NULL;
+    }
+    uint32_t rlen = ntohl(net_rlen);
+    if (rlen > sizeof(resp)) { close(fd); a->transport++; return NULL; }
+    size_t got = 0;
+    while (got < rlen) {
+        ssize_t n = recv(fd, resp + got, rlen - got, 0);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+
+    if (got != rlen) {
+        a->transport++;
+    } else if (rlen > 4) {
+        a->success = 1;
+    } else if (typed_error_of(resp, (ssize_t)rlen)
+               != (int32_t)VIRP_ERR_DUPLICATE_MISMATCH) {
+        a->wrong_error = 1;
+    }
+    return NULL;
+}
+
+TEST(test_chain_append_concurrent_fed_id_conflict_is_atomic)
+{
+    for (int round = 0; round < G5_ROUNDS; round++) {
+        pthread_barrier_t barrier;
+        ASSERT_EQ(pthread_barrier_init(&barrier, NULL, G5_THREADS), 0);
+
+        pthread_t th[G5_THREADS];
+        g5_arg_t args[G5_THREADS];
+        memset(args, 0, sizeof(args));
+        for (int i = 0; i < G5_THREADS; i++) {
+            args[i].round = round;
+            args[i].tid = i;
+            args[i].barrier = &barrier;
+            ASSERT_EQ(pthread_create(&th[i], NULL, g5_worker, &args[i]), 0);
+        }
+
+        int successes = 0, wrong_error = 0, transport = 0;
+        for (int i = 0; i < G5_THREADS; i++) {
+            pthread_join(th[i], NULL);
+            successes   += args[i].success;
+            wrong_error += args[i].wrong_error;
+            transport   += args[i].transport;
+        }
+        pthread_barrier_destroy(&barrier);
+
+        char id[64];
+        snprintf(id, sizeof(id), "g5race-r%03d", round);
+
+        ASSERT_EQ(transport, 0);
+        ASSERT_EQ(wrong_error, 0);
+        /* ONE winner. All bodies differ, so a second success would have
+         * stored a second row — the store itself is the ground truth. */
+        ASSERT_EQ(successes, 1);
+        ASSERT_EQ(ca_count_artifact_rows(id), 1);
+        ASSERT_EQ(ca_count_entries(id), 1);
+    }
+}
+
+/* =========================================================================
  * Item 8 (2026-08-11): per-uid action allowlist + list_fleet
  *
  * socket_uid_action_allow maps a SO_PEERCRED uid to the ONLY actions it
@@ -5454,6 +5850,11 @@ int main(void)
         RUN_TEST(test_chain_append_non_fed_colliding_id_still_stores_both);
         RUN_TEST(test_chain_append_still_refuses_reserved_outcome_type);
         RUN_TEST(test_chain_append_accepts_commitment_without_body);
+
+        printf("\n  -- Concurrency regressions (external review 2026-08-17) --\n");
+        RUN_TEST(test_chain_append_concurrent_verify_uses_own_bytes);
+        RUN_TEST(test_chain_fed_id_conflict_check_is_inside_append_txn);
+        RUN_TEST(test_chain_append_concurrent_fed_id_conflict_is_atomic);
 
         printf("\n  -- Item 8: per-uid action allowlist --\n");
         RUN_TEST(test_uid_action_allowlist_blocks_unlisted_actions);
