@@ -66,9 +66,10 @@ are now stale on two counts:
 
 ## Update 2026-08-17 — `85b3d9e2` INSTALLED, NOT RESTARTED (chain_append concurrency: verify buffer + GATE 5 in-txn)
 
-**Status: installed 02:28 UTC, awaiting operator-timed restart.** The
-RUNNING daemon is still the `a3752e18` build, sha256 `3daf9ce3e83869d6…`,
-process start 2026-08-16 21:22:53 UTC, unrestarted.
+**Status: installed 02:28 UTC; RESTARTED 23:42:11 UTC — acceptance
+PASSED (see the restart stanza at the end of this entry).** Before the
+restart the RUNNING daemon was the `a3752e18` build, sha256
+`3daf9ce3e83869d6…`, process start 2026-08-16 21:22:53 UTC.
 
 - **Commit**: `85b3d9e24e7958f30e103565cd9e02db7f9a39ee`
 - **Branch**: `fix/concurrency-evidence-path`
@@ -136,6 +137,42 @@ alone, runs strictly sequential with no stale sockets:
 Baseline `38938761` without the test commit: 120/120 — the two
 failures are attributable to the new tests alone. `e377f7e9` is pushed
 history and is left unedited; this note is the correction of record.
+
+### RESTARTED 2026-08-17 23:42:11 UTC — acceptance PASSED
+
+Restart window 23:42:05–23:42:11 UTC (graceful stop took 6s), issued
+immediately after the 23:42:00 comparator cycle completed, with zero
+Nexus activity in the preceding 12h (`journalctl _UID=993` empty, no
+fed_*/chain_append lines) and the netclaw bridge not running. New
+process PID 3812148; `/proc/<pid>/exe` sha256 = `af37e517cd4b97d0…` —
+the installed `85b3d9e2` build. **The running daemon now carries both
+concurrency fixes** (per-call verify buffer; GATE 5 inside the append
+transaction). Startup clean: devices loaded with their node_ids, chain
+enabled, uid 993 action allowlist 5 actions. Autopilot's next cycle
+(23:45:04) on the new daemon: `cycle complete: 18 observations, 5
+alerts` — byte-for-byte the same alert set as the pre-restart 23:40:07
+cycle (the standing virp-node2-peer / baseline items).
+
+Acceptance, run live over the daemon socket as uid 1000 (session
+`ncfed-acceptance-20260817`, correlation `ncfed-drill-20260817T2348Z`),
+exercising the NEW in-transaction GATE 5:
+- **First append** (`fed_request`, drill-labeled body): full success
+  frame with its chain_entry_hash.
+- **GATE 5 drill**: same artifact_id resubmitted with different bytes →
+  typed error `-51 VIRP_ERR_DUPLICATE_MISMATCH`; the operator journal
+  line ("already stored with a different body hash — a retry must
+  resend identical bytes, or mint a new correlation") logged verbatim
+  at 23:47:44; chain untouched by the refusal.
+- **Byte-identical retry**: accepted with a fresh success frame and a
+  distinct chain_entry_hash — retry honestly recorded, and the store
+  still holds exactly 1 body row under 1 hash for the correlation.
+- **Doc SQL**: zero same-id-different-hash federation pairs with
+  `max(created_at_ns)` after the restart.
+
+One fail-closed observation from the drill itself: a first attempt run
+as root was dropped at accept (connection reset, no reply) — uid 0 is
+not in `socket_allowed_uids`, and the SO_PEERCRED gate refused it
+exactly as designed. The drill was rerun as uid 1000, which is.
 
 ## Update 2026-08-16 — `a3752e18` INSTALLED, NOT RESTARTED (fed evidence link + GATE 5 + fleet node_ids)
 
