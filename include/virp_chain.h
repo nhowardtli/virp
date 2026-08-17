@@ -119,6 +119,15 @@ bool virp_chain_type_is_indirect(const char *artifact_type);
 bool virp_chain_type_is_external_allowed(const char *artifact_type);
 
 /*
+ * The federation-bridge provenance types (fed_request / fed_observation /
+ * fed_outcome), whose correlation-keyed artifact_ids promise
+ * one-id-one-body. For these — and only these — the append path refuses
+ * an id reuse with different bytes (GATE 5), enforced inside the append
+ * transaction itself.
+ */
+bool virp_chain_type_is_federation(const char *artifact_type);
+
+/*
  * SHA-256 hex of the bytes an artifact_hash commits to. Bodies are stored
  * either as "base64:<b64>" (signed wire messages) or as literal text, and
  * the commitment is over the DECODED bytes in the first case — the same
@@ -357,12 +366,17 @@ virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,
 /*
  * Set *conflict to true iff the artifacts table already holds a body
  * under the given artifact_id whose artifact_hash DIFFERS from the one
- * supplied. Used by chain_append's GATE 5 to refuse a federation
- * correlation id being reused with different bytes; a byte-identical
- * resubmission (same id, same hash) is NOT a conflict. Reads only the
- * artifacts table: a commitment-only append stores no body row and so
- * does not arm the gate. Returns VIRP_OK on a successful query
- * (whether or not it matched).
+ * supplied; a byte-identical resubmission (same id, same hash) is NOT a
+ * conflict. Reads only the artifacts table: a commitment-only append
+ * stores no body row and so does not arm the gate. Returns VIRP_OK on a
+ * successful query (whether or not it matched).
+ *
+ * READ-ONLY PROBE, NOT ENFORCEMENT (F4, 2026-08-17): an answer obtained
+ * here is stale the moment the call returns — nothing stops a concurrent
+ * append committing between this check and any act taken on it, which is
+ * exactly what happened when GATE 5 relied on it. The enforcing copy of
+ * this query runs INSIDE the append transaction (chain_append_locked),
+ * where the answer and the act commit atomically.
  */
 virp_error_t virp_chain_artifact_id_conflict(virp_chain_state_t *state,
                                              const char *artifact_id,

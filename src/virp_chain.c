@@ -475,6 +475,15 @@ bool virp_chain_type_is_external_allowed(const char *artifact_type)
                    sizeof(EXTERNAL) / sizeof(EXTERNAL[0]));
 }
 
+bool virp_chain_type_is_federation(const char *artifact_type)
+{
+    static const char *const FEDERATION[] = {
+        "fed_request", "fed_observation", "fed_outcome",
+    };
+    return type_in(artifact_type, FEDERATION,
+                   sizeof(FEDERATION) / sizeof(FEDERATION[0]));
+}
+
 /* Standard base64 decode (RFC 4648, '=' padding). Returns decoded length
  * or -1. Local to this file; the approver registry has its own copy for
  * SPKI decoding and the two must not become entangled. */
@@ -1378,6 +1387,43 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
     int rc = sqlite3_exec(state->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
     if (rc != SQLITE_OK)
         return VIRP_ERR_CHAIN_DB;
+
+    /* GATE 5 — federation retry idempotency (enforcement; F4, external
+     * review 2026-08-17). A federation artifact_id embeds the bridge's
+     * correlation and names ONE request, ONE observation body, ONE
+     * outcome; reusing such an id with DIFFERENT bytes is refused with
+     * its own code. A byte-identical resubmission is NOT a conflict: the
+     * retry exists because the success frame was lost, and it must be
+     * able to obtain one — the store below is a no-op, the chain
+     * honestly records that a retry happened. Scoped to the federation
+     * types: for every other type a colliding id with distinct bodies
+     * is side-by-side storage BY DESIGN (2026-08-03 audit).
+     *
+     * The check lives HERE, inside the append's own transaction, because
+     * anywhere else it is check-then-act: the daemon used to probe via
+     * virp_chain_artifact_id_conflict() before calling append, and two
+     * concurrent submissions could both pass the probe and both store —
+     * one correlation under two hashes, the exact corruption the gate
+     * exists to refuse. Fail closed on a store that cannot answer. */
+    if (virp_chain_type_is_federation(artifact_type)) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(state->db,
+                "SELECT 1 FROM artifacts "
+                "WHERE artifact_id = ? AND artifact_hash <> ? LIMIT 1",
+                -1, &st, NULL) != SQLITE_OK) {
+            sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+            return VIRP_ERR_CHAIN_DB;
+        }
+        sqlite3_bind_text(st, 1, artifact_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, artifact_hash, -1, SQLITE_TRANSIENT);
+        int step = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (step != SQLITE_DONE) {
+            sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+            return (step == SQLITE_ROW) ? VIRP_ERR_DUPLICATE_MISMATCH
+                                        : VIRP_ERR_CHAIN_DB;
+        }
+    }
 
     /* Get max sequence for this session */
     int64_t next_seq = 0;
