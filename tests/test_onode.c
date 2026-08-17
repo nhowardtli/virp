@@ -5217,7 +5217,14 @@ TEST(test_chain_append_concurrent_verify_uses_own_bytes)
  * The second releases rounds of pre-connected socket clients through
  * a barrier: end-to-end confirmation that under real concurrent
  * submissions exactly ONE body wins and every loser is refused with
- * VIRP_ERR_DUPLICATE_MISMATCH, nothing else.
+ * VIRP_ERR_DUPLICATE_MISMATCH, nothing else. It is a REGRESSION GUARD,
+ * not a race detector: it cannot force the daemon's internal
+ * probe->append interleaving, and measured on pre-fix 38938761
+ * (2026-08-17, two clean sequential runs, 40 rounds total) it never
+ * caught the race — the old out-of-txn probe happened to win every
+ * schedule and the test passed. Only the barrier test above goes red
+ * on the old code. If THIS test fails, the one-winner/-51 contract is
+ * broken outright; do not read a pass as TOCTOU coverage.
  * ------------------------------------------------------------------------- */
 
 #define G5_THREADS  8

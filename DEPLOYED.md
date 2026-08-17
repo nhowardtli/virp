@@ -104,7 +104,8 @@ restart, the RUNNING daemon still carries both races.
 
 ### Test evidence at install
 - `make test-onode` 123/123, including the three new concurrency
-  regressions (all three fail on `38938761`).
+  regressions (all three fail on `38938761` — CORRECTED below: two do,
+  deterministically; the third does not).
 - Full `make all-tests` C suite green. Python green except the
   pre-existing `test_fed_outcome_observation.py` live-chain audit
   (39 outage-era dangling citations, 16 pointer-less rows, and two
@@ -112,6 +113,29 @@ restart, the RUNNING daemon still carries both races.
   to `fed_observation` while the audit still expects `observation` —
   that audit update belongs to the pending a3752e18 verification, not
   this branch). `make test-api` in the review venv: 86 passed.
+
+**Correction 2026-08-17 ~23:30 UTC (pre-merge re-verification):** the
+bullet above and `e377f7e9`'s commit message ("run test-onode to see
+all three fail") overstate the red-on-old evidence. Re-measured before
+the merge, twice, on clean worktrees of `38938761` + the test commit
+alone, runs strictly sequential with no stale sockets:
+- `test_chain_append_concurrent_verify_uses_own_bytes` — FAILED both
+  runs (59 and 63 tampered bodies accepted). Reliable detector for the
+  static-buffer race.
+- `test_chain_fed_id_conflict_check_is_inside_append_txn` — FAILED both
+  runs, identically (`Expected 1, got 8`; 8 rows stored under one
+  federation id). Deterministic by construction — a barrier forces
+  every probe to complete before any append — so this test alone is
+  the TOCTOU proof.
+- `test_chain_append_concurrent_fed_id_conflict_is_atomic` — PASSED on
+  the pre-fix code in both runs (40 barrier-released rounds, race never
+  triggered): it cannot force the daemon's internal probe→append
+  interleaving. It is an end-to-end regression guard for the
+  one-winner/`-51` contract WITH the fix, not a pre-fix race detector;
+  its comment block now says so.
+Baseline `38938761` without the test commit: 120/120 — the two
+failures are attributable to the new tests alone. `e377f7e9` is pushed
+history and is left unedited; this note is the correction of record.
 
 ## Update 2026-08-16 — `a3752e18` INSTALLED, NOT RESTARTED (fed evidence link + GATE 5 + fleet node_ids)
 
