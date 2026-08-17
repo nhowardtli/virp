@@ -64,6 +64,55 @@ are now stale on two counts:
 2. The deployed commit has advanced through the update log below and is now
    `b6e9602c`, not `0c9c7338`.
 
+## Update 2026-08-17 — `85b3d9e2` INSTALLED, NOT RESTARTED (chain_append concurrency: verify buffer + GATE 5 in-txn)
+
+**Status: installed 02:28 UTC, awaiting operator-timed restart.** The
+RUNNING daemon is still the `a3752e18` build, sha256 `3daf9ce3e83869d6…`,
+process start 2026-08-16 21:22:53 UTC, unrestarted.
+
+- **Commit**: `85b3d9e24e7958f30e103565cd9e02db7f9a39ee`
+- **Branch**: `fix/concurrency-evidence-path`
+  (= main `38938761` + `e377f7e9` concurrency regression tests +
+  `79bdce26` both fixes + `85b3d9e2` TODO.md reconcile)
+- **Tree at install**: clean (`git status --porcelain` empty)
+- **Installed binary**: `/usr/local/lib/virp/virp-onode-prod`
+- **sha256**: `af37e517cd4b97d0ebe9902adc1f71a8d433f1cc58eec0ebcb48a385fe8e6c94`
+- **sha256** `/usr/local/lib/virp/virp-tool`: `947cdecb2570b70c72e49d617639f78ef375692434617e1ec5a6937ccddee4f9`
+- Pre-install state captured: `/var/backups/virp/20260817T022847Z`
+  (manifest verified; holds the running `3daf9ce3…` build —
+  `sudo make rollback-prod ROLLBACK_FROM=` that path restores it).
+
+### What the restart lands (external review 2026-08-17, both confirmed on `38938761`)
+1. **HIGH — chain_append verify buffer**: `chain_append_verify_observation()`
+   decoded every submitted body into one function-static 64KB buffer
+   shared across connection-worker threads. Under concurrent
+   CHAIN_APPENDs one request's GATE 3 signature check could run over
+   another request's decoded bytes — the regression test caught
+   49–71 TAMPERED BODIES ACCEPTED per run pre-fix, plus valid bodies
+   spuriously refused. The buffer is per-call now.
+2. **F4 — GATE 5 TOCTOU**: the federation id-conflict probe ran outside
+   the append transaction, so N concurrent same-id-different-bytes
+   submissions could all pass it and all store (deterministically
+   reproduced: 8/8 stored). The enforcing query now runs inside
+   `chain_append_locked`'s own BEGIN IMMEDIATE, fails closed, returns
+   `-51 VIRP_ERR_DUPLICATE_MISMATCH`. Byte-identical fed retries still
+   succeed; non-fed colliding ids keep side-by-side storage.
+
+Neither change touches wire formats, storage schema, gate policy, or any
+read path — refusal semantics only become correctly atomic. Until the
+restart, the RUNNING daemon still carries both races.
+
+### Test evidence at install
+- `make test-onode` 123/123, including the three new concurrency
+  regressions (all three fail on `38938761`).
+- Full `make all-tests` C suite green. Python green except the
+  pre-existing `test_fed_outcome_observation.py` live-chain audit
+  (39 outage-era dangling citations, 16 pointer-less rows, and two
+  post-restart entries at 2026-08-16T21:24/26Z whose pointers resolve
+  to `fed_observation` while the audit still expects `observation` —
+  that audit update belongs to the pending a3752e18 verification, not
+  this branch). `make test-api` in the review venv: 86 passed.
+
 ## Update 2026-08-16 — `a3752e18` INSTALLED, NOT RESTARTED (fed evidence link + GATE 5 + fleet node_ids)
 
 **Status: installed 21:14 UTC, awaiting operator-timed restart** (between
