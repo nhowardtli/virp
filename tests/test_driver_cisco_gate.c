@@ -372,11 +372,50 @@ static void test_table_driven_all_entries(void)
            total - skipped, skipped);
 }
 
+/*
+ * Read-spelling coverage (2026-08-18). Each command below classified RED via
+ * the fail-closed default BEFORE this batch — an empirical sweep proved it
+ * (the live Nexus reconciliation: "show bgp summary" etc. were refused because
+ * only "show ip bgp" was listed). RED-BEFORE-GREEN: on the pre-batch table
+ * every assert here would fail (returned RED). Each added form is a clear read
+ * with a direct GREEN precedent. Guards below confirm the additions did NOT
+ * widen the allow-list to writes or to unrelated unlisted commands.
+ */
+static void test_read_spelling_coverage(void)
+{
+    printf("\n=== Read-spelling coverage (was RED-by-default before 2026-08-18) ===\n");
+    /* BGP namespace without "ip" (IOS-XE / NX-OS spelling). */
+    TEST("show bgp -> GREEN");            assert(cisco_gate_tier("show bgp") == VIRP_TIER_GREEN); PASS();
+    TEST("show bgp summary -> GREEN");    assert(cisco_gate_tier("show bgp summary") == VIRP_TIER_GREEN); PASS();
+    TEST("show bgp neighbors -> GREEN");  assert(cisco_gate_tier("show bgp neighbors") == VIRP_TIER_GREEN); PASS();
+    TEST("show bgp ipv4 unicast summary -> GREEN (namespace)");
+        assert(cisco_gate_tier("show bgp ipv4 unicast summary") == VIRP_TIER_GREEN); PASS();
+    /* Singular interface; the plural must remain reachable and GREEN. */
+    TEST("show interface Gi0/0 -> GREEN"); assert(cisco_gate_tier("show interface GigabitEthernet0/0") == VIRP_TIER_GREEN); PASS();
+    TEST("show interfaces (plural) still GREEN"); assert(cisco_gate_tier("show interfaces status") == VIRP_TIER_GREEN); PASS();
+    /* Older hyphenated mac table spelling. */
+    TEST("show mac-address-table -> GREEN"); assert(cisco_gate_tier("show mac-address-table") == VIRP_TIER_GREEN); PASS();
+    /* IPv6 parallels of the GREEN v4 reads. */
+    TEST("show ipv6 route -> GREEN");           assert(cisco_gate_tier("show ipv6 route") == VIRP_TIER_GREEN); PASS();
+    TEST("show ipv6 interface brief -> GREEN"); assert(cisco_gate_tier("show ipv6 interface brief") == VIRP_TIER_GREEN); PASS();
+    TEST("show ipv6 ospf -> GREEN");            assert(cisco_gate_tier("show ipv6 ospf neighbor") == VIRP_TIER_GREEN); PASS();
+    TEST("show ipv6 bgp -> GREEN");             assert(cisco_gate_tier("show ipv6 bgp summary") == VIRP_TIER_GREEN); PASS();
+    TEST("show ipv6 neighbors -> GREEN");       assert(cisco_gate_tier("show ipv6 neighbors") == VIRP_TIER_GREEN); PASS();
+
+    /* GUARDS — the additions must not have widened the allow-list. */
+    TEST("show ipv6 interface Gi0/0 stays RED (detailed, like v4)");
+        assert(cisco_gate_tier("show ipv6 interface GigabitEthernet0/0") == VIRP_TIER_RED); PASS();
+    TEST("show snmp stays RED (not added)");   assert(cisco_gate_tier("show snmp") == VIRP_TIER_RED); PASS();
+    TEST("show route stays RED (non-IOS syntax)"); assert(cisco_gate_tier("show route") == VIRP_TIER_RED); PASS();
+    TEST("router bgp still RED (write, not a show)"); assert(cisco_gate_tier("router bgp 65000") == VIRP_TIER_RED); PASS();
+}
+
 int main(void)
 {
     printf("VIRP Cisco IOS/IOS-XE Gate Classifier — Unit Tests\n");
     printf("==================================================\n");
     test_green();
+    test_read_spelling_coverage();
     test_yellow();
     test_red_config_writes();
     test_red_credential_writes();

@@ -579,6 +579,30 @@ static const cisco_route_t CISCO_GATE_TABLE[] = {
     { "show bootvar",                 VIRP_TIER_GREEN  },
     { "show boot",                    VIRP_TIER_GREEN  },
     { "show file systems",            VIRP_TIER_GREEN  },
+    /* Read-spelling coverage (2026-08-18): forms that fell through to the
+     * fail-closed RED default because only one spelling was listed. Each has
+     * a direct GREEN precedent above and is unambiguously read-only. Found by
+     * an empirical sweep of the compiled table (see test_driver_cisco_gate).
+     *   - IOS-XE/NX-OS drop "ip" from the BGP namespace ("show ip bgp" GREEN
+     *     above covers only the IOS spelling). "show bgp" is the namespace,
+     *     the two explicit forms are listed for audit clarity (subsumed by it,
+     *     like "configure"/"configure terminal" in the RED block). */
+    { "show bgp",                     VIRP_TIER_GREEN  },
+    { "show bgp summary",             VIRP_TIER_GREEN  },
+    { "show bgp neighbors",           VIRP_TIER_GREEN  },
+    /*   - singular "interface" (plural "show interfaces" is GREEN above; the
+     *     token-boundary match keeps this from standing in for the plural). */
+    { "show interface",               VIRP_TIER_GREEN  },
+    /*   - older hyphenated spelling of "show mac address-table" (GREEN above). */
+    { "show mac-address-table",       VIRP_TIER_GREEN  },
+    /*   - IPv6 parallels of the GREEN v4 routing/neighbor reads. Detailed
+     *     "show ipv6 interface <if>" stays RED exactly as "show ip interface
+     *     <if>" does — only the "brief" form is allow-listed on both sides. */
+    { "show ipv6 route",              VIRP_TIER_GREEN  },
+    { "show ipv6 interface brief",    VIRP_TIER_GREEN  },
+    { "show ipv6 ospf",               VIRP_TIER_GREEN  },
+    { "show ipv6 bgp",                VIRP_TIER_GREEN  },
+    { "show ipv6 neighbors",          VIRP_TIER_GREEN  },
 
     /* ── YELLOW — config-visibility reads (backups/audits) ────────── */
     /* Reverted GREEN → YELLOW (2026-08-11): the scrub misses whole
