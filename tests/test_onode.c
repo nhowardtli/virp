@@ -229,6 +229,88 @@ TEST(test_gate_enforce_blocks_unclassified)
     ASSERT_TRUE(strstr((const char *)data, "tier gate blocked") != NULL);
 }
 
+/*
+ * L1 (2026-08-18): an over-tier command under ENFORCE must be refused by
+ * the gate BEFORE any device connection — no auth attempt, no session, no
+ * connect audit noise. Arm the mock to FAIL every connect: pre-L1 the
+ * daemon connected first, so the refused command would come back "cannot
+ * connect"; refusing first yields "tier gate blocked" with the connect
+ * never attempted. The control shows an ADMITTED (GREEN) command DOES
+ * still connect — the reorder does not change admitted behaviour.
+ */
+extern void virp_driver_mock_set_connect_fail(int fail);   /* driver_mock.c */
+
+TEST(test_over_tier_enforce_refused_without_connecting)
+{
+    /* Isolated LOCAL daemon state + a FRESH mock device: no other test's
+     * cached connection can mask (or fake) the connect attempt, and the
+     * global mock connect-fail is reset before any assertion can return
+     * early. Drive onode_execute() directly — the same gate/connect path a
+     * socket request takes. */
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD00A1, NULL,
+                         "/tmp/virp-onode-l1gate.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+    tmp.gate_default_mode = GATE_MODE_ENFORCE;   /* default; max_tier=YELLOW */
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "R-L1G");
+    snprintf(dev.host, sizeof(dev.host), "10.0.0.201");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0A0000C9;   /* unique, non-zero (see node_id-0 reject) */
+    dev.enabled = true;
+    ASSERT_OK(onode_add_device(&tmp, &dev));
+
+    uint8_t over[VIRP_MAX_MESSAGE_SIZE];
+    uint8_t adm[VIRP_MAX_MESSAGE_SIZE];
+    size_t over_len = 0, adm_len = 0;
+
+    virp_driver_mock_set_connect_fail(1);   /* every connect now fails */
+    /* Over-tier: UNCLASSIFIED under the YELLOW ceiling, ENFORCE. */
+    virp_error_t e_over = onode_execute(&tmp, "R-L1G",
+                            "frobnicate the flux capacitor",
+                            over, sizeof(over), &over_len);
+    /* Control: an ADMITTED (GREEN) command must still reach the device. */
+    virp_error_t e_adm = onode_execute(&tmp, "R-L1G", "show version",
+                            adm, sizeof(adm), &adm_len);
+    virp_driver_mock_set_connect_fail(0);   /* reset before asserting */
+
+    virp_header_t hdr;
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+
+    /* THE FIX: over-tier is refused at the gate BEFORE any connect — the
+     * response is a tier-block, NOT a connect failure. Pre-L1 the daemon
+     * connected first, so an armed-to-fail connect produced "cannot
+     * connect" instead. */
+    ASSERT_OK(e_over);
+    ASSERT_OK(virp_validate_message(over, over_len, &tmp.okey, &hdr));
+    ASSERT_OK(virp_parse_observation(over + VIRP_HEADER_SIZE,
+                                     over_len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr((const char *)data, "tier gate blocked") != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "cannot connect") == NULL);
+
+    /* Control: the admitted GREEN command DID try to connect (armed to
+     * fail) — "cannot connect", proving admitted requests still reach the
+     * device exactly as before the reorder. */
+    ASSERT_OK(e_adm);
+    ASSERT_OK(virp_validate_message(adm, adm_len, &tmp.okey, &hdr));
+    ASSERT_OK(virp_parse_observation(adm + VIRP_HEADER_SIZE,
+                                     adm_len - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr((const char *)data, "cannot connect") != NULL);
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+}
+
 /* =========================================================================
  * Multi-command gate bypass (REPRODUCTION — expected to FAIL pre-fix)
  *
@@ -5544,6 +5626,44 @@ static const onode_action_t FED_ACTIONS[4] = {
     ONODE_ACTION_CHAIN_VERIFY, ONODE_ACTION_CHAIN_APPEND,
 };
 
+/* M1 (2026-08-18): a failed second SO_PEERCRED read in the worker used to
+ * yield (uid_t)-1, which is absent from socket_uid_action_allow and so
+ * SKIPPED the per-uid map — the request then took the node-wide ceiling
+ * and the full action switch. That was fail-OPEN relative to per-uid
+ * controls. The uid is now threaded from accept (no second read) and an
+ * unknown identity is REFUSED outright by onode_uid_request_refused().
+ * A real getsockopt(SO_PEERCRED) failure cannot be forced on a connected
+ * socket, so the regression drives the decision function directly. */
+TEST(test_uid_request_refused_rejects_unknown_identity)
+{
+    onode_clear_uid_actions(&ca_state);
+    /* A restricted principal (like virp-netclaw uid 993): federation
+     * actions only. */
+    ASSERT_OK(onode_set_uid_actions(&ca_state, 993, FED_ACTIONS, 4));
+
+    /* THE FIX: unknown identity (uid == -1) is refused for ANY action,
+     * never the node-wide fall-through. Pre-fix this returned false and the
+     * request reached node-wide policy plus the whole action switch. */
+    ASSERT_TRUE(onode_uid_request_refused(&ca_state, (uid_t)-1,
+                                          ONODE_ACTION_EXECUTE));
+    ASSERT_TRUE(onode_uid_request_refused(&ca_state, (uid_t)-1,
+                                          ONODE_ACTION_SHUTDOWN));
+
+    /* The restricted uid: a listed action is allowed, an unlisted one is
+     * refused (unchanged behaviour, proves the map still applies). */
+    ASSERT_TRUE(!onode_uid_request_refused(&ca_state, 993,
+                                           ONODE_ACTION_HEALTH));   /* listed */
+    ASSERT_TRUE(onode_uid_request_refused(&ca_state, 993,
+                                          ONODE_ACTION_EXECUTE));   /* unlisted */
+
+    /* A uid absent from the map is unrestricted — existing principals are
+     * not newly restricted. */
+    ASSERT_TRUE(!onode_uid_request_refused(&ca_state, 4242,
+                                           ONODE_ACTION_EXECUTE));
+
+    onode_clear_uid_actions(&ca_state);
+}
+
 TEST(test_uid_action_allowlist_blocks_unlisted_actions)
 {
     ASSERT_OK(onode_set_uid_actions(&ca_state, getuid(), FED_ACTIONS, 4));
@@ -5844,6 +5964,7 @@ int main(void)
     printf("\n[O-Node Pipeline Tests]\n");
     RUN_TEST(test_execute_show_ip_route);
     RUN_TEST(test_gate_enforce_blocks_unclassified);
+    RUN_TEST(test_over_tier_enforce_refused_without_connecting);
 
     printf("\n[Multi-Command Gate Bypass (layer 1)]\n");
     RUN_TEST(test_separator_policy_accepts_single_commands);
@@ -5950,6 +6071,7 @@ int main(void)
         RUN_TEST(test_chain_append_concurrent_fed_id_conflict_is_atomic);
 
         printf("\n  -- Item 8: per-uid action allowlist --\n");
+        RUN_TEST(test_uid_request_refused_rejects_unknown_identity);
         RUN_TEST(test_uid_action_allowlist_blocks_unlisted_actions);
         RUN_TEST(test_uid_action_allowlist_narrows_chain_append_types);
         RUN_TEST(test_uid_action_map_absent_uid_fully_unchanged);

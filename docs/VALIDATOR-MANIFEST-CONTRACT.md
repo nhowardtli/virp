@@ -4,6 +4,16 @@ Author: Third Level IT
 Last revised: 2026-04-23
 Status: locked — changes require re-review of `src/virp_validator.c`
 
+> **EXPERIMENTAL — NOT FOR PRODUCTION ENFORCEMENT (M2).** The Python
+> client `api/validator/__init__.py` `validate_turn()` returns a decision
+> **even when the signed observation is unverified** — no verification
+> bridge supplied, or the bridge's HMAC check failed/raised. In that case
+> `ValidationResult.verified` is `False` and a WARNING is logged. A caller
+> MUST NOT treat an unverified decision as authoritative. Making
+> verification mandatory (pinned verifier, raise on absent/failed
+> verification, key-rotation trust policy) is a roadmap item — see the
+> design-proposals doc, item M2.
+
 This document specifies the **AI-layer obligation** that makes the CT 211
 response validator's trust boundary actually work. It is a policy
 document. The code that enforces these rules lives in

@@ -644,6 +644,17 @@ virp_error_t onode_set_uid_actions(onode_state_t *state, uid_t uid,
 void onode_clear_uid_actions(onode_state_t *state);
 
 /*
+ * Per-uid action-allowlist decision for a SOCKET request: true iff the
+ * request MUST be refused — an unknown identity (client_uid == (uid_t)-1,
+ * which must never fall through to node-wide policy) or a uid present in
+ * socket_uid_action_allow whose set does not list `action`. A uid absent
+ * from the map is unrestricted. Exposed so the fail-open regression can
+ * drive the decision directly.
+ */
+bool onode_uid_request_refused(const onode_state_t *state,
+                               uid_t client_uid, onode_action_t action);
+
+/*
  * Map an action name from the wire ("list_fleet", "shutdown", …) to
  * its onode_action_t. Returns 0 (no such action) for unknown names —
  * the same names parse_request accepts, kept in ONE table so the

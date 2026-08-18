@@ -569,8 +569,16 @@ static virp_error_t challenge_load(const char *dir, const char *proposal_id,
     char path[VIRP_APPROVAL_DIR_MAX + 64];
     challenge_path(dir, proposal_id, path, sizeof(path));
     char buf[2048];
-    if (read_file(path, buf, sizeof(buf)) < 0)
-        return VIRP_ERR_APPROVAL_NOT_FOUND;
+    errno = 0;
+    if (read_file(path, buf, sizeof(buf)) < 0) {
+        /* ENOENT is genuinely-missing state — fail closed as not-found.
+         * EACCES / EIO / any other open failure is a store that EXISTS
+         * but cannot be read; surface it as store-unreadable (-52) rather
+         * than laundering a broken store into "no such challenge", the
+         * same discipline as virp_approval_load_proposal(). */
+        return (errno == ENOENT) ? VIRP_ERR_APPROVAL_NOT_FOUND
+                                 : VIRP_ERR_APPROVAL_STORE_UNREADABLE;
+    }
 
     cJSON *o = cJSON_Parse(buf);
     if (!o || !cJSON_IsObject(o)) {
@@ -782,8 +790,16 @@ static virp_error_t approval_load_raw(const char *dir,
     approval_path(dir, proposal_id, path, sizeof(path));
 
     char buf[4096];
-    if (read_file(path, buf, sizeof(buf)) < 0)
-        return VIRP_ERR_APPROVAL_NOT_FOUND;
+    errno = 0;
+    if (read_file(path, buf, sizeof(buf)) < 0) {
+        /* ENOENT — genuinely no approval record (fail closed as
+         * not-found). EACCES / EIO / any other open failure is a store
+         * that EXISTS but cannot be read; surface store-unreadable (-52)
+         * rather than a permission/IO error masquerading as missing
+         * state. Same discipline as virp_approval_load_proposal(). */
+        return (errno == ENOENT) ? VIRP_ERR_APPROVAL_NOT_FOUND
+                                 : VIRP_ERR_APPROVAL_STORE_UNREADABLE;
+    }
 
     char *lines[3];
     split_lines(buf, lines);

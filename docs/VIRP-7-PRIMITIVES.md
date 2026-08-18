@@ -61,7 +61,7 @@ Every command is classified into one of four trust tiers, enforced at the O-Node
 
 - **GREEN** — Passive observation. No state change. Auto-executes. `show ip bgp summary`, `get system status`, `Get-Service`. The AI can look at anything, anytime, without asking permission.
 - **YELLOW** — Active diagnostics. Minimal state change. Requires one human approval. `ping`, `traceroute`, `debug` commands. The AI can test, but a human must agree first.
-- **RED** — Configuration changes. State modification. Requires m-of-n human approval with impact analysis. `interface shutdown`, `ip route`, `write memory`. The AI can propose, but cannot execute without multiple humans agreeing.
+- **RED** — Configuration changes. State modification. Requires one enrolled approver's signature — the SAME single-approval mechanism as YELLOW — with impact analysis. `interface shutdown`, `ip route`, `write memory`. The AI can propose, but cannot execute without a human's approval. (m-of-n / quorum approval for RED is a documented roadmap item, **not implemented**: the apply path verifies exactly one approval record with one signature.)
 - **BLACK** — Destructive, irreversible, or trust-breaking. Does not exist in the protocol. There is no message type for factory reset. There is no approval workflow for disabling the observation channel. There is no override. The absence is structural, not procedural.
 
 The AI can request `erase startup-config` all day. The O-Node has no code path to execute it. You cannot bypass a rule that was never written.
