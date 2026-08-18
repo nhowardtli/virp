@@ -1523,8 +1523,13 @@ check-shared-readpath:
 	  if ! grep -q 'virp_ssh_io.h' $$f; then \
 	    echo "  FAIL: $$f does not include virp_ssh_io.h"; fail=1; \
 	  fi; \
-	  if grep -qE 'libssh2_channel_read' $$f | grep -v io_read; then \
-	    :; \
+	  verdict=$$(awk '/_io_read\(/{inio=1} /^\}/{inio=0} \
+	      /libssh2_channel_read/{t++; if(inio)i++} \
+	      END{print (t>0 && t==i)?"ok":"bad"}' $$f); \
+	  if [ "$$verdict" != "ok" ]; then \
+	    echo "  FAIL: $$f calls libssh2_channel_read outside its *_io_read"; \
+	    echo "        adapter — a direct read bypasses the shared read path."; \
+	    fail=1; \
 	  fi; \
 	done; \
 	if [ $$fail -eq 0 ]; then echo "  OK: all four SSH drivers use the shared read path"; \
