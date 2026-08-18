@@ -208,12 +208,28 @@ verifier holds no secret of any kind.
   signing private key because the O-Node is the attester; a compromised
   O-Node forges v3 observations exactly as it forges HMAC ones. The
   win is independent verifiability, nothing more.
-- **NOT yet enforced.** v3 is additive and coexists with v1/v2; nothing
-  that produces or verifies HMAC observations changed behavior, no
-  client default changed, and chain append does not yet require or
-  check Ed25519 signatures — that enforcement is the observation
-  re-cut phase. Until then, v3 observations are only as load-bearing
-  as the verifier a consumer actually runs.
+- **Verified when presented, not required — three facts, not one**
+  (corrected 2026-08-18; the earlier "chain append does not check
+  Ed25519" was wrong):
+  1. **v3 IS verified at registration.** When a v3 observation is
+     chain-appended, the daemon verifies its Ed25519 signature against the
+     loaded observation-signing public key and refuses the append on
+     failure (`chain_append_verify_observation`, the `VIRP_VERSION_3` arm →
+     `virp_verify_observation_ed25519`). A v3 body with a bad signature
+     never enters the chain.
+  2. **v1/v2 remain permitted.** Chain append verifies whatever wire
+     version the body declares — v1 (O-Key HMAC) and v2 (session HMAC) are
+     still accepted and verified under their own keys. v3 is additive, not
+     a replacement; nothing that produces or verifies HMAC observations
+     changed behavior and no client default changed.
+  3. **v3 is NOT universally required, and downgrade resistance is NOT
+     enforced.** Nothing compels a producer to use v3: a v3-capable signer
+     may present the same observation as v1/v2 and it is accepted. The
+     daemon does not reject a lower version in favour of an expected v3, so
+     an adversary who can produce a valid v1/v2 observation is never forced
+     onto the public-key path. Requiring v3 and refusing downgrades is the
+     observation re-cut phase. Until then, v3 observations are only as
+     load-bearing as the verifier a consumer actually runs.
 - The public-key verifier checks authenticity and integrity of the
   signed bytes only. Replay, staleness and session acceptance remain
   the accepting endpoint's checks (v2 verify semantics).
@@ -859,8 +875,17 @@ loss of power or a lying disk".
 
 ## Verifier Limitations
 
-Three verifiers ship in this tree. The gaps below are from the static
-review at `hardening-2026-07-29`. One is fixed; two are not.
+Two verifiers ship in **this** tree — the Python claim verifier and the C
+chain verifier — and both are now fixed. A third, the bridge chain
+verifier, runs **consumer-side** on the CT 210 dashboard (`virp-bridge.py`,
+the separate consumer repo — see §"Federation bridge" and the `chain_verify`
+note under Chain database tampering); it is not in this tree and its gap is
+unfixed. The gaps below are from the static review at
+`hardening-2026-07-29`. (Corrected 2026-08-18: this section previously said
+"three verifiers ship in this tree", which wrongly located the bridge
+verifier here — this tree's bridge module is `api/virp_bridge.py`, which
+exposes `verify_observation`/`parse_observation` and contains no
+`chain_verify`.)
 
 **The Python claim verifier trusted unsigned fields. Fixed.**
 `api/virp_verify.py:verify_evidence` HMAC-verified `obs["raw_message"]`
@@ -887,8 +912,10 @@ relabeled `obs_id`, mismatched `node_id`, and a stale timestamp inside
 the signed bytes. Each was confirmed failing against the previous
 code.]*
 
-**The bridge chain verifier is unkeyed. NOT fixed.** `virp-bridge.py:
-chain_verify()` checks only that each row's `previous_entry_hash`
+**The bridge chain verifier is unkeyed. NOT fixed (and lives consumer-side,
+not in this tree).** The CT 210 dashboard's `virp-bridge.py:
+chain_verify()` — a separate consumer repo, not `api/virp_bridge.py` here —
+checks only that each row's `previous_entry_hash`
 equals the prior row's stored `chain_entry_hash`. It never verifies
 `chain_hmac` — the keyed value — and never recomputes
 `chain_entry_hash` from row contents. A keyless attacker with DB write
