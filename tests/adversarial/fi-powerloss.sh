@@ -81,8 +81,13 @@ CHAIN="$MNT/chain.db"; KEY="$MNT/chain.key"
 
 # ---- isolated daemon on the disposable fs -------------------------------
 # Chain key is a raw 32-byte HMAC key (as demo/run.sh:138); O-Key via keygen.
-head -c 32 /dev/urandom > "$KEY"
+# BOTH must be mode 0600 or the daemon refuses to load them and never binds the
+# socket (learned the hard way: the first run created the key at umask 0664, the
+# daemon failed to start, zero appends landed, and the verdict then read a
+# never-populated chain as "loss detected" — a false pass).
+head -c 32 /dev/urandom > "$KEY"; chmod 600 "$KEY"
 "$CLI" keygen okey "$MNT/onode.key" >/dev/null 2>&1 || { echo "keygen okey failed"; exit 1; }
+chmod 600 "$MNT/onode.key"
 printf '[]' > "$MNT/devices.json"; printf '[]' > "$MNT/approvers.json"
 start_daemon() {
   "$D" -k "$MNT/onode.key" -s "$MNT/onode.sock" -d "$MNT/devices.json" \
@@ -90,6 +95,11 @@ start_daemon() {
        >>"$SCRATCH/daemon.log" 2>&1 &
   DPID=$!
   for _ in $(seq 1 40); do [ -S "$MNT/onode.sock" ] && break; sleep 0.25; done
+  if [ ! -S "$MNT/onode.sock" ]; then
+    echo "SETUP FAILURE: daemon did not bind $MNT/onode.sock. Daemon log:"
+    sed 's/^/    /' "$SCRATCH/daemon.log" 2>/dev/null | tail -20
+    exit 3
+  fi
 }
 
 # Commitment-only fed_observation appends (the oversized shape: no body, so no
@@ -119,6 +129,13 @@ for i in $(seq 1 "$APPENDS_PRESYNC"); do append "$i" >/dev/null || echo "presync
 sync; sudo blockdev --flushbufs "$LOOPDEV"
 PRE=$("$CLI" chain tail -n 100000 --db "$CHAIN" 2>/dev/null | grep -c 'pl-obs-')
 echo "durable prefix: $PRE entries, synced to the image"
+# A power-loss test with nothing durable to lose proves nothing. Abort BEFORE
+# the cut so a setup failure can never masquerade as "loss detected".
+if [ "$PRE" -eq 0 ]; then
+  echo "SETUP FAILURE: no durable prefix landed (daemon/append path broken)."
+  echo "Daemon log:"; sed 's/^/    /' "$SCRATCH/daemon.log" 2>/dev/null | tail -20
+  exit 3
+fi
 
 # ---- phase 2: THE CUT ---------------------------------------------------
 if [ "$MODE" = flakey ]; then
@@ -152,25 +169,43 @@ sudo mount "$DMPATH" "$MNT"
 POST=$("$CLI" chain tail -n 100000 --db "$CHAIN" 2>/dev/null | grep -c 'pl-obs-')
 echo "entries surviving on the image after the cut: $POST"
 
+# The signed head is the completeness authority: it records the last sequence
+# the chain COMMITTED to. A silent truncation is head.last_sequence claiming
+# more than actually survived, with verify none the wiser.
+HEADSEQ=$(sqlite3 "file:$CHAIN?mode=ro" \
+  "SELECT last_sequence FROM chain_heads WHERE session_id='powerloss:1';" 2>/dev/null)
+HEADSEQ=${HEADSEQ:--1}
+
 echo "--- virp chain verify over the recovered chain ---"
 "$CLI" chain verify --db "$CHAIN" --key "$KEY" --session powerloss:1
 VERIFY=$?
 
 # ---- verdict ------------------------------------------------------------
 echo "================================================================"
-echo "durable prefix=$PRE  survived=$POST  post-cut-refused=$refused  verify_exit=$VERIFY"
-if [ "$MODE" = flakey ]; then
-  if [ "$POST" -lt "$((PRE+APPENDS_POSTCUT))" ] && [ "$VERIFY" -ne 0 ]; then
-    echo "PASS: the storage cut lost the tail AND verify FAILED — loss detected."
-  elif [ "$POST" -lt "$((PRE+APPENDS_POSTCUT))" ] && [ "$VERIFY" -eq 0 ]; then
-    echo "FINDING: entries were lost to the cut but verify reported VALID —"
-    echo "         a silently shortened chain. This is the SIGKILL-vs-power-loss gap."
-  else
-    echo "INCONCLUSIVE: no tail was actually lost (drop_writes did not straddle a"
-    echo "              flush boundary as intended) — retune the sync timing."
-  fi
-else
+echo "durable prefix=$PRE  survived=$POST  post-cut-refused=$refused"
+echo "signed head last_sequence=$HEADSEQ  verify_exit=$VERIFY  (survived seqs 0..$((POST-1)))"
+if [ "$MODE" != flakey ]; then
   echo "L2 (dm-error): the writer should have REFUSED post-cut appends (refused=$refused);"
   echo "               a nonzero refused count with a still-valid pre-cut chain is fail-closed."
+elif [ "$PRE" -eq 0 ]; then
+  echo "INVALID: no durable prefix (should have aborted in phase 1)."
+elif [ "$POST" -lt "$PRE" ]; then
+  echo "ANOMALY (not a chain finding): the pre-cut SYNCED prefix did not survive"
+  echo "  (survived=$POST < durable=$PRE) — fsync/flushbufs did not persist before"
+  echo "  the cut. Retune the sync boundary; the chain layer is not implicated."
+elif [ "$POST" -ge "$((PRE+APPENDS_POSTCUT))" ]; then
+  echo "INCONCLUSIVE: no tail was lost — drop_writes did not straddle a flush"
+  echo "  boundary (all post-cut writes reached the image). Retune sync timing."
+elif [ "$HEADSEQ" -ge "$POST" ] && [ "$VERIFY" -eq 0 ]; then
+  echo "FINDING: the signed head claims seq $HEADSEQ but only $POST entries survived,"
+  echo "  and verify reported VALID — a SILENTLY shortened chain. This is exactly the"
+  echo "  SIGKILL-vs-power-loss gap the caveat concedes."
+elif [ "$VERIFY" -ne 0 ]; then
+  echo "PASS: the storage cut lost the tail and verify FAILED — the truncation is"
+  echo "  DETECTED, never silently accepted (head/entry completeness caught it)."
+else
+  echo "PASS (atomic loss): head and entries reverted together (head=$HEADSEQ,"
+  echo "  survived=$POST) — the chain is honestly shorter, verify VALID, and it makes"
+  echo "  NO claim to the lost tail. No dangling commitment."
 fi
 echo "================================================================"
