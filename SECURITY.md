@@ -825,6 +825,38 @@ request is issued. Fail-closed still holds, and the refusal is still
 pre-network — but a reader of gate decisions alone should not conclude
 that GREEN meant the datastore was permitted.
 
+## Execution Durability — "recorded-happened-once", not "happened-was-recorded"
+
+VIRP's crash-safety supports a precise and LIMITED claim, established by the
+adversarial test program (test #2, crash around execution; see
+`tests/adversarial/transcripts/02-crash-around-execution.md`):
+
+> VIRP can prove that a **recorded** execution happened **at most once**. It
+> **cannot** prove that everything that **happened** was recorded.
+
+The gap is real and by construction. An approved apply consumes its
+authorization, contacts the device, then records an OUTCOME. A crash after
+the device executed but before the OUTCOME commits leaves an APPROVAL entry,
+a consumed-once marker, and NO OUTCOME — the device **was** changed, yet the
+chain reads "approved, never applied". That state is **indistinguishable**
+from a crash where the device was never contacted. The `chain_append`
+atomicity fix (entry/head/body in one transaction) does **not** close this:
+the missing record is of a step **between** two chain appends, across device
+I/O, not within one append. The EXECUTION_INTENT proposal
+(`docs/virp-audit-design-proposals.md`) is what would let VIRP say "attempted,
+disposition unknown"; until then an unresolved apply is genuinely ambiguous
+and must be reconciled out-of-band against the target.
+
+**Crash-test caveat — SIGKILL, not power loss.** The fault-injection harness
+(`tests/adversarial/fi-run.sh`, `VIRP_FI` → `SIGKILL`) models a **process
+crash**: the kernel destroys the process without running atexit / stdio
+flush, so what survives is exactly what was already durable at that instant.
+It does **not** model a full power loss or disk failure — SQLite's durability
+under power loss depends on fsync/WAL behaviour and the storage honouring
+flushes, which SIGKILL does not exercise. So a claim of the form "survives a
+crash" means "survives a SIGKILL of the daemon process", **not** "survives
+loss of power or a lying disk".
+
 ## Verifier Limitations
 
 Three verifiers ship in this tree. The gaps below are from the static
