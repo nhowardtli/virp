@@ -493,8 +493,15 @@ Table of Contents
        ──────────────────────────────────────────────────
        GREEN    0x01    Passive      None (auto-execute)
        YELLOW   0x02    Active       Single operator
-       RED      0x03    Critical     m-of-n operators
+       RED      0x03    Critical     Single operator (see note)
        BLACK    0xFF    Forbidden    Structurally impossible
+
+   IMPLEMENTATION STATUS: RED currently requires ONE enrolled
+   approver's signature — the identical single-record, single-
+   signature mechanism as YELLOW (the apply path verifies exactly
+   one approval record with one key). m-of-n / quorum approval for
+   RED is a documented roadmap item, NOT implemented; this table
+   describes the current mechanism, not a stronger one.
 
 6.2.  Tier Assignment
 
@@ -570,10 +577,12 @@ Table of Contents
        may be GREEN; on a production border router, YELLOW.
    (b) TIME OF DAY: Configuration changes during maintenance
        windows may be RED; outside maintenance windows, they
-       require additional approval (m-of-n with higher m).
+       require additional approval (roadmap: m-of-n with higher m
+       — NOT implemented; the current gate has a single ceiling and
+       a single-approver check).
    (c) CUMULATIVE IMPACT: The first "interface shutdown" in a
        session may be RED; the tenth may escalate to require
-       additional approval.
+       additional approval (roadmap; not implemented).
 
    Context-dependent tier assignment MUST be documented in the
    deployment's configuration and MUST NOT reduce a tier below
@@ -1688,8 +1697,10 @@ Table of Contents
        proposals that technically reference valid observations
        but lead to harmful outcomes.
        Mitigation: Approver training, proposal review tools,
-       impact analysis requirements, m-of-n approval for
-       critical operations.
+       impact analysis requirements, and (roadmap, NOT implemented)
+       m-of-n approval for critical operations. As implemented, a
+       RED operation is gated by a single enrolled approver's
+       signature — the same mechanism as YELLOW.
 
 19.5.  Trust Assumptions
 

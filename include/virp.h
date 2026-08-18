@@ -50,14 +50,16 @@
  * Mapped from TLI Ops Center command tiers:
  *   GREEN  → Tier 1 (passive, no approval)
  *   YELLOW → Tier 2 (active, single approval)
- *   RED    → Tier 3 (critical, multi-human approval)
+ *   RED    → Tier 3 (critical) — currently ONE enrolled approver's
+ *            signature, the SAME mechanism as YELLOW. m-of-n quorum
+ *            approval is a roadmap item, not implemented.
  *   BLACK  → Tier 0 (impossible — not in message format)
  * ========================================================================= */
 
 #define VIRP_TIER_UNCLASSIFIED  0x00    /* No classifier table matched — gate fails closed */
 #define VIRP_TIER_GREEN         0x01    /* Passive — no approval required */
 #define VIRP_TIER_YELLOW        0x02    /* Active — single approval required */
-#define VIRP_TIER_RED           0x03    /* Critical — multi-human approval */
+#define VIRP_TIER_RED           0x03    /* Critical — single enrolled-approver signature (same mechanism as YELLOW); m-of-n quorum is roadmap, not implemented */
 #define VIRP_TIER_BLACK         0xFF    /* Forbidden — never transmitted */
 
 /* =========================================================================

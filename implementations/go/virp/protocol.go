@@ -30,7 +30,7 @@ const (
 const (
 	TierGreen  uint8 = 0x01 // Passive -- no approval required
 	TierYellow uint8 = 0x02 // Active -- single approval required
-	TierRed    uint8 = 0x03 // Critical -- multi-human approval
+	TierRed    uint8 = 0x03 // Critical -- single enrolled-approver signature (same mechanism as YELLOW); m-of-n quorum is roadmap, not implemented
 	TierBlack  uint8 = 0xFF // Forbidden -- never transmitted
 )
 

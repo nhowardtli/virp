@@ -31,7 +31,7 @@ class Transport(IntEnum):
 class TrustTier(IntEnum):
     GREEN = 0x01   # VIRP_TIER_GREEN — passive, no approval
     YELLOW = 0x02  # VIRP_TIER_YELLOW — active, single approval
-    RED = 0x03     # VIRP_TIER_RED — critical, multi-human approval
+    RED = 0x03     # VIRP_TIER_RED — critical; single enrolled-approver signature (same mechanism as YELLOW); m-of-n quorum is roadmap, not implemented
     BLACK = 0xFF   # VIRP_TIER_BLACK — forbidden
 
 class KeyType(IntEnum):

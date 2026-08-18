@@ -137,7 +137,9 @@ const asa_command_route_t ASA_ROUTE_TABLE[] = {
     { "show running-config",        VIRP_TIER_YELLOW },
     { "show startup-config",        VIRP_TIER_YELLOW },
 
-    /* ── Tier 3: RED — Sensitive credential/session reads (multi-approval) */
+    /* ── Tier 3: RED — Sensitive credential/session reads (single
+     *    enrolled-approver signature, same mechanism as YELLOW; m-of-n
+     *    quorum is roadmap, not implemented) */
     { "show aaa-server",            VIRP_TIER_RED    },
     { "show ssh sessions",          VIRP_TIER_RED    },
 
