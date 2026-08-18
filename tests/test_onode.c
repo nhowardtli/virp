@@ -2947,6 +2947,90 @@ TEST(test_gate_rejection_reason_body_is_retained_and_matches_commitment)
     gr_cleanup();
 }
 
+/* Regression (2026-08-18): a gate_rejection/1 body must record the ceiling
+ * that ACTUALLY fired, not only the node-wide max. The live Nexus
+ * reconciliation found a YELLOW-classified command (show running-config)
+ * refused under uid 993's per-uid GREEN ceiling while the chain body recorded
+ * only gate_max_tier=YELLOW — which misreads as "should have passed". Here a
+ * YELLOW command ("clear counters" — YELLOW in both the mock and the real
+ * cisco classifier, the same YELLOW-under-GREEN decision shape as
+ * running-config) is refused under a per-uid GREEN ceiling; the body must now
+ * carry effective_max_tier=GREEN and ceiling_source=per-uid, with the
+ * node-wide gate_max_tier=YELLOW retained for continuity. */
+TEST(test_gate_rejection_records_per_uid_effective_ceiling)
+{
+    gr_cleanup();
+
+    virp_signing_key_t ck;
+    ASSERT_OK(virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN));
+    ASSERT_OK(virp_key_save_file(&ck, GR_CHAIN_KEY));
+    virp_key_destroy(&ck);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0008, NULL, "/tmp/virp-onode-grceil.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+    tmp.gate_default_mode = GATE_MODE_ENFORCE;
+    tmp.gate_max_tier = VIRP_TIER_YELLOW;              /* node-wide */
+
+    ASSERT_OK(onode_setup_chain_and_approvals(&tmp, 0xDEAD0008,
+                                              GR_CHAIN_DB, GR_CHAIN_KEY,
+                                              "/tmp/virp-onode-test-grceilappr",
+                                              "/tmp/virp-onode-test-no-registry"));
+    ASSERT_EQ((int)tmp.chain_enabled, 1);
+
+    /* Cap a uid at GREEN, below the node-wide YELLOW (the netclaw shape). */
+    const uid_t capped = 4993;
+    uid_t cu[1] = { capped };
+    virp_trust_tier_t ct[1] = { VIRP_TIER_GREEN };
+    ASSERT_OK(onode_set_uid_ceilings(&tmp, cu, ct, 1));
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "R-CEIL-REC");
+    snprintf(dev.host, sizeof(dev.host), "10.0.0.98");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0BADCEE1;
+    dev.enabled = true;
+    ASSERT_OK(onode_add_device(&tmp, &dev));
+
+    uint8_t obs_buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t obs_len = 0;
+    ASSERT_OK(onode_execute_obs_ex(&tmp, "R-CEIL-REC", "clear counters",
+                                   1, NULL, capped,
+                                   obs_buf, sizeof(obs_buf), &obs_len));
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs_buf, obs_len, &tmp.okey, &hdr));
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(GR_CHAIN_DB, &db), SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT a.artifact_content FROM chain_entries e "
+        "LEFT JOIN artifacts a ON a.artifact_id = e.artifact_id "
+        "WHERE e.artifact_type = 'gate_rejection' "
+        "ORDER BY e.id DESC LIMIT 1", -1, &st, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    const char *body = (const char *)sqlite3_column_text(st, 0);
+    ASSERT_TRUE(body != NULL && body[0] != '\0');
+
+    /* The command is YELLOW and the node-wide max is YELLOW — so gate_max_tier
+     * alone would say "allow". The refusal is only explained by the per-uid
+     * GREEN ceiling, which the record must now name as the binding one. */
+    ASSERT_TRUE(strstr(body, "\"classified_tier\":\"YELLOW\"") != NULL);
+    ASSERT_TRUE(strstr(body, "\"gate_max_tier\":\"YELLOW\"") != NULL);
+    ASSERT_TRUE(strstr(body, "\"effective_max_tier\":\"GREEN\"") != NULL);
+    ASSERT_TRUE(strstr(body, "\"ceiling_source\":\"per-uid\"") != NULL);
+
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    gr_cleanup();
+}
+
 /* =========================================================================
  * GREEN auto-execution RECORDS (2026-08-12)
  *
@@ -6130,6 +6214,7 @@ int main(void)
 
     printf("\n[Gate-reason retention (chain body recoverable)]\n");
     RUN_TEST(test_gate_rejection_reason_body_is_retained_and_matches_commitment);
+    RUN_TEST(test_gate_rejection_records_per_uid_effective_ceiling);
 
     printf("\n[GREEN auto-execution records (chain covers what was allowed)]\n");
     RUN_TEST(test_green_execution_chains_signed_observation);

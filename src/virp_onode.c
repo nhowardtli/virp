@@ -679,6 +679,28 @@ static virp_trust_tier_t onode_effective_max_tier(const onode_state_t *state,
 }
 
 /*
+ * Where the effective ceiling that onode_effective_max_tier() returned came
+ * from, for the audit record. "per-uid" only when this uid has a per-uid
+ * entry AND that entry is at least as tight as the node-wide ceiling — a
+ * LOOSER per-uid entry never binds, because the effective-ceiling helper
+ * only tightens, so the node-wide ceiling is what actually decided. Mirrors
+ * that helper's logic exactly so the recorded source can never disagree with
+ * the recorded effective ceiling.
+ */
+static const char *onode_ceiling_source(const onode_state_t *state,
+                                        uid_t client_uid)
+{
+    if (client_uid == (uid_t)-1) return "node-wide";
+    for (size_t i = 0; i < state->uid_ceiling_count; i++) {
+        if (state->uid_ceiling_uids[i] == client_uid) {
+            return (state->uid_ceiling_tiers[i] <= state->gate_max_tier)
+                       ? "per-uid" : "node-wide";
+        }
+    }
+    return "node-wide";
+}
+
+/*
  * Classify a command via the driver's optional route_command() hook.
  * Drivers without a classifier (NULL hook) yield UNCLASSIFIED, which the
  * gate treats as block-worthy (fail closed).
@@ -919,6 +941,8 @@ static void gate_emit_execution(onode_state_t *state,
                                 gate_tier_name(state->gate_max_tier));
         cJSON_AddStringToObject(o, "effective_max_tier",
                                 gate_tier_name(eff_max));
+        cJSON_AddStringToObject(o, "ceiling_source",
+                                onode_ceiling_source(state, client_uid));
         cJSON_AddStringToObject(o, "gate_mode",
                                 mode == GATE_MODE_ENFORCE ? "ENFORCE"
                                                           : "SHADOW");
@@ -1665,8 +1689,19 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                     cJSON_AddStringToObject(o, "command", command);
                     cJSON_AddStringToObject(o, "classified_tier",
                                             gate_tier_name(gate_tier));
+                    /* gate_max_tier is the NODE-WIDE ceiling; on its own it
+                     * misreads a per-uid refusal (a YELLOW-classified command
+                     * refused under a GREEN per-uid ceiling looks like it
+                     * should have passed a YELLOW node-wide max). Record the
+                     * ceiling that ACTUALLY fired (gate_eff_max) and where it
+                     * came from, so the chain body explains the decision by
+                     * itself. */
                     cJSON_AddStringToObject(o, "gate_max_tier",
                                             gate_tier_name(state->gate_max_tier));
+                    cJSON_AddStringToObject(o, "effective_max_tier",
+                                            gate_tier_name(gate_eff_max));
+                    cJSON_AddStringToObject(o, "ceiling_source",
+                                            onode_ceiling_source(state, client_uid));
                     if (matched)
                         cJSON_AddStringToObject(o, "matched_rule", matched);
                     else
