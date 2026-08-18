@@ -38,6 +38,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>   /* chmod — L2 unreadable-store regression */
 #include <sqlite3.h>
 
 static int tests_passed = 0;
@@ -1219,6 +1220,53 @@ static void test_registry_zero_keys_disables_flow(void)
  * Main
  * ========================================================================= */
 
+/* L2 (2026-08-18): challenge_load()/approval_load_raw() collapsed EVERY
+ * read failure (EACCES, EIO, ...) into APPROVAL_NOT_FOUND — a store that
+ * exists but cannot be read read as "no such approval". Now ENOENT stays
+ * NOT_FOUND and any other open failure is STORE_UNREADABLE (-52), matching
+ * the hardened proposal loader. Drives the apply-path loader
+ * (approval_load_raw via verify_consume) with an unreadable record. */
+static void test_unreadable_store_is_minus52_not_notfound(void)
+{
+    TEST("L2: unreadable approval record -> store_unreadable (-52), not not-found");
+    if (geteuid() == 0) {
+        /* root bypasses chmod 000, so the EACCES path cannot be forced. */
+        PASS();
+        return;
+    }
+
+    /* The fix is in the record LOADER (approval_load_raw), which fails on
+     * open before any parse — so a record whose bytes are arbitrary but
+     * whose FILE is unreadable is enough. Create one directly. */
+    const char *pid = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+    char adir[512], rec_path[600];
+    snprintf(adir, sizeof(adir), "%s/approvals", DIR);
+    mkdir(adir, 0700);   /* ensure the subdir exists (ignore EEXIST) */
+    snprintf(rec_path, sizeof(rec_path), "%s/%s.rec", adir, pid);
+    FILE *rf = fopen(rec_path, "w");
+    ASSERT(rf != NULL, "could not create test approval record");
+    fputs("approval-record-bytes\n", rf);
+    fclose(rf);
+
+    virp_approval_rec_t out;
+    /* Unreadable record: EACCES on open -> STORE_UNREADABLE, not NOT_FOUND. */
+    ASSERT(chmod(rec_path, 0000) == 0, "chmod 000 failed");
+    virp_error_t e = virp_approval_verify_consume(DIR, &g.approvers, pid,
+                        "R-APP", 0xA0A0A0A1, "reload", NULL, 0, &out);
+    chmod(rec_path, 0644);   /* restore before asserting, for teardown */
+    unlink(rec_path);
+    ASSERT(e == VIRP_ERR_APPROVAL_STORE_UNREADABLE,
+           "an unreadable record must be -52 store_unreadable, not not-found");
+
+    /* Control: a genuinely MISSING record (ENOENT) stays NOT_FOUND. */
+    e = virp_approval_verify_consume(DIR, &g.approvers,
+                        "6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b",
+                        "R-APP", 0xA0A0A0A1, "reload", NULL, 0, &out);
+    ASSERT(e == VIRP_ERR_APPROVAL_NOT_FOUND,
+           "a missing record must stay NOT_FOUND (ENOENT)");
+    PASS();
+}
+
 int main(void)
 {
     printf("\n=== VIRP Approval Flow (propose -> approve -> apply) Tests ===\n");
@@ -1265,6 +1313,7 @@ int main(void)
     test_challenge_and_submit_consumed_refused();
     test_wrong_algorithm_rejected();
     test_no_approval_plain_block();
+    test_unreadable_store_is_minus52_not_notfound();
     test_reuse_survives_restart();
     test_concurrent_submit_one_entry();
     test_concurrent_submit_attribution_two_approvers();
