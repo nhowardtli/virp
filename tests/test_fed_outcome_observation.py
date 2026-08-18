@@ -39,6 +39,15 @@ import unittest
 
 DEFAULT_DB = "/var/lib/virp/chain.db"
 
+# The observation artifact types a fed_outcome may legitimately cite. Kept in
+# lockstep with report/verify.py:OBSERVATION_TYPES, the chain layer
+# (src/virp_chain.c: artifact_type IN ('observation','fed_observation')) and
+# this file's own load_committed_observation_hashes(). "fed_observation" is the
+# federation bridge's name for a signed observation (2026-08-16); a fed_outcome
+# from the ncfed bridge cites one by design (tests/test_onode.c appends the
+# cited body as 'fed_observation' under artifact_id ncfed-obs-*).
+OBSERVATION_TYPES = frozenset(("observation", "fed_observation"))
+
 
 def chain_db_path():
     return os.environ.get("VIRP_CHAIN_DB", DEFAULT_DB)
@@ -103,9 +112,11 @@ def load_committed_observation_hashes(conn):
     is not retrievable (the reader grades that entry UNVERIFIABLE, not PASS).
     This mirrors the daemon's fed_outcome gate (virp_chain_entry_commits_to).
     """
+    placeholders = ",".join("?" * len(OBSERVATION_TYPES))
     return {h for (h,) in conn.execute(
         "SELECT artifact_hash FROM chain_entries "
-        "WHERE artifact_type IN ('observation','fed_observation')")}
+        "WHERE artifact_type IN (%s)" % placeholders,
+        tuple(sorted(OBSERVATION_TYPES)))}
 
 
 class TestFedOutcomeObservationResolves(unittest.TestCase):
@@ -189,8 +200,11 @@ class TestFedOutcomeObservationResolves(unittest.TestCase):
             self.fail("\n".join(lines))
 
     def test_cited_hash_names_an_observation(self):
-        """A resolving pointer must resolve to an observation, not to
-        some other artifact that happens to share the hash."""
+        """A resolving pointer must resolve to an observation type
+        (observation or fed_observation), not to some other artifact that
+        happens to share the hash. fed_observation counts: it is the
+        federation bridge's signed observation and the designed citation
+        target — see OBSERVATION_TYPES."""
         wrong = []
         for rowid, body in self.outcomes:
             if body is None:
@@ -198,7 +212,7 @@ class TestFedOutcomeObservationResolves(unittest.TestCase):
             h = body.get("observation_sha256")
             if not isinstance(h, str) or h not in self.hash_types:
                 continue          # absent is the previous test's failure
-            if "observation" not in self.hash_types[h]:
+            if not (OBSERVATION_TYPES & self.hash_types[h]):
                 wrong.append((body.get("completed_at"), h,
                               sorted(self.hash_types[h])))
         self.assertEqual(
