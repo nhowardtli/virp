@@ -3188,13 +3188,40 @@ static void handle_client(onode_state_t *state, int client_fd)
                 break;
             }
             if (!body_stored) {
-                fprintf(stderr, "[O-Node] chain_append REJECTED: fed_outcome "
-                        "cites observation %s, which is not stored in "
-                        "artifacts — append the fed_observation body before "
-                        "the outcome that names it (session=%s id=%s)\n",
-                        cited, req.session_id, req.artifact_id);
-                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
-                break;
+                /* The cited body is not in artifacts. That is LEGITIMATE for
+                 * an oversized observation: a GREEN output past the daemon's
+                 * 8192-byte inline field is chained commitment-only (the
+                 * bridge / autopilot omits artifact_content). It is only an
+                 * UNBACKED claim if no observation entry commits to the cited
+                 * hash at all. If one does, the outcome is backed by the
+                 * chain and the un-retained body is graded UNVERIFIABLE (not
+                 * PASS) by every reader — an honest record, not a dangling
+                 * pointer. (2026-08-18 regression: requiring the body here
+                 * left oversized GREEN observations' outcomes unappendable —
+                 * correlations 42b7b9dc / c5373129.) */
+                bool committed = false;
+                virp_error_t eerr = virp_chain_entry_commits_to(
+                                        &state->chain, cited, &committed);
+                if (eerr != VIRP_OK) {
+                    fprintf(stderr, "[O-Node] chain_append REJECTED: could "
+                            "not check whether the chain commits to "
+                            "fed_outcome's cited observation %s (session=%s "
+                            "id=%s err=%s)\n", cited, req.session_id,
+                            req.artifact_id, virp_error_str(eerr));
+                    send_framed_error(client_fd, eerr);
+                    break;
+                }
+                if (!committed) {
+                    fprintf(stderr, "[O-Node] chain_append REJECTED: "
+                            "fed_outcome cites observation %s, which no chain "
+                            "entry commits to — append the fed_observation "
+                            "before the outcome that names it (session=%s "
+                            "id=%s)\n",
+                            cited, req.session_id, req.artifact_id);
+                    send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+                    break;
+                }
+                /* commitment-only observation, backed by the chain: accept */
             }
         }
 

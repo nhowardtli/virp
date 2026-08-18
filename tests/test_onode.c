@@ -4870,6 +4870,52 @@ TEST(test_chain_append_refuses_fed_outcome_citing_unstored_observation)
     ASSERT_EQ(ca_count_entries("ncfed-out-dangling-1"), 0);
 }
 
+/* GATE 4: an outcome citing a COMMITMENT-ONLY observation must LAND.
+ *
+ * This is the 2026-08-18 live-federation regression. A GREEN command whose
+ * observation exceeds the daemon's 8192-byte inline body field is chained
+ * commitment-only (the bridge omits artifact_content, exactly as the
+ * autopilot oversized path does — see
+ * test_chain_append_commitment_only_observation_accepted). The chain DOES
+ * commit to that observation: a signed fed_observation entry whose
+ * artifact_hash equals the cited observation_sha256 exists. It is NOT an
+ * unbacked claim — only the body bytes were not retained, which every
+ * reader already grades UNVERIFIABLE, not PASS. GATE 4 required the BODY to
+ * be in artifacts, so it wrongly refused the outcome and left request +
+ * observation chained with no outcome (correlations 42b7b9dc / c5373129).
+ * The gate must accept when the chain commits to the observation, and
+ * still refuse a truly dangling cite (the test above). */
+TEST(test_chain_append_accepts_fed_outcome_for_commitment_only_observation)
+{
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9103);
+    ASSERT_TRUE(olen > 0);
+    char hobs[65];  ca_sha256_hex_bin(obs, olen, hobs);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    /* Commitment-only: NULL artifact_content — the oversized-observation
+     * path. Entry lands, body is NOT stored in artifacts. */
+    ssize_t n2 = ca_append("ncfed-oversized-t1", "fed_observation",
+                           "ncfed-obs-oversized-1", hobs, NULL,
+                           resp, sizeof(resp));
+    ASSERT_TRUE(n2 > 4);
+    ASSERT_EQ(ca_count_entries("ncfed-obs-oversized-1"), 1);
+
+    /* The outcome cites the commitment-only observation. The chain commits
+     * to it, so the outcome must be accepted and the triple completed. */
+    char out_body[512];
+    snprintf(out_body, sizeof(out_body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"executed\","
+             "\"observation_sha256\":\"%s\"}", hobs);
+    char ho[65];  ca_sha256_hex(out_body, ho);
+
+    ssize_t n3 = ca_append("ncfed-oversized-t1", "fed_outcome",
+                           "ncfed-out-oversized-1", ho, out_body,
+                           resp, sizeof(resp));
+    ASSERT_TRUE(n3 > 4);
+    ASSERT_EQ(ca_count_entries("ncfed-out-oversized-1"), 1);
+}
+
 /* GATE 4: citing nothing is refused too. Sixteen rows on the live chain
  * carry observation_sha256: null — an outcome asserting a result while
  * naming no evidence at all is the unbacked claim in its purest form. */
@@ -5888,6 +5934,7 @@ int main(void)
         RUN_TEST(test_chain_append_still_accepts_json_evidence_item);
         RUN_TEST(test_chain_append_accepts_federated_provenance);
         RUN_TEST(test_chain_append_refuses_fed_outcome_citing_unstored_observation);
+        RUN_TEST(test_chain_append_accepts_fed_outcome_for_commitment_only_observation);
         RUN_TEST(test_chain_append_refuses_fed_outcome_without_observation_hash);
         RUN_TEST(test_chain_append_fed_observation_must_be_signed);
         RUN_TEST(test_chain_append_refuses_fed_retry_with_different_bytes);
