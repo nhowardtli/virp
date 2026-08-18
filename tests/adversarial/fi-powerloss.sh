@@ -1,0 +1,176 @@
+#!/bin/bash
+# fi-powerloss.sh — adversarial test #3. Take the chain writer past the SIGKILL
+# ceiling to a real storage cut, on a DISPOSABLE loop-backed filesystem we own
+# end to end, and ask the one question SIGKILL-on-tmpfs cannot:
+#
+#   when writes the daemon believed were durable never reached the platter
+#   (power loss / lying disk), does the chain DETECT the lost tail — or does
+#   virp chain verify report VALID on a silently shortened chain?
+#
+# The pass condition is NOT "no data lost". Power loss loses data. It is
+# "loss is DETECTED, never silently accepted": the signed per-session head
+# asserts a length the surviving entries no longer reach, so verification MUST
+# fail. A VALID verdict over a short chain is the finding.
+#
+# Two rungs (see MEMO-disposable-fs-ceiling.md), selected by $MODE:
+#   flakey  (L3, default) dm-flakey drop_writes — writes ack at the syscall,
+#           never hit the image. The true power-loss case.
+#   error   (L2)          dm-error — every I/O errors. The writer must fail
+#           CLOSED (refuse the append) rather than ack a write it cannot persist.
+#
+# =====================================================================
+# HELD FOR REVIEW. This script is destructive at the block layer and is NOT
+# run unattended. It requires root (loop/dm/mount/modprobe) via scoped sudo.
+# Same contract as include/virp_fault_inject.h, extended to the device:
+# dedicated scratch only, unique device names, trap-guaranteed teardown,
+# NEVER /var/lib or /run or the production socket. Base commit pinned in the
+# transcript per CONVENTIONS.md.
+# =====================================================================
+
+set -uo pipefail
+
+MODE="${1:-flakey}"                     # flakey (L3) | error (L2)
+SCRATCH="${SCRATCH:-/tmp/claude-powerloss}"   # MUST be disk-backed, not tmpfs
+IMG="$SCRATCH/chain-fs.img"
+IMG_MB=256                              # ceiling per memo (corpus is single-MB)
+MNT="$SCRATCH/mnt"
+DM="virp-adv3-flakey-$$"                # unique; never a fixed /dev/mapper name
+DMPATH="/dev/mapper/$DM"
+D=/opt/virp/build/virp-onode-prod       # prod daemon (built from merged main)
+CLI=/opt/virp/build/virp
+APPENDS_PRESYNC=200                     # land + fsync before the cut
+APPENDS_POSTCUT=200                     # issued after the cut — the lost tail
+LOOPDEV=""
+
+# ---- safety fence: refuse to operate anywhere production lives -----------
+case "$(readlink -m "$SCRATCH")" in
+  /var/*|/run/*|/etc/*|/opt/virp/*|/home/*)
+    echo "REFUSING: SCRATCH=$SCRATCH resolves under a protected path"; exit 2;;
+esac
+mountpoint -q "$(df --output=target "$(dirname "$SCRATCH")" 2>/dev/null | tail -1)" 2>/dev/null
+if findmnt -no FSTYPE --target "$(dirname "$SCRATCH")" 2>/dev/null | grep -q tmpfs; then
+  echo "REFUSING: $(dirname "$SCRATCH") is tmpfs — fsync there is a formality; use a disk-backed path"; exit 2
+fi
+
+# ---- teardown: single trap, idempotent, unwinds in reverse order --------
+DPID=""
+teardown() {
+  [ -n "$DPID" ] && { sudo kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; }
+  sudo umount "$MNT" 2>/dev/null
+  sudo dmsetup remove "$DM" 2>/dev/null
+  [ -n "$LOOPDEV" ] && sudo losetup -d "$LOOPDEV" 2>/dev/null
+  rm -rf "$SCRATCH"
+}
+trap teardown EXIT INT TERM
+
+# ---- build the disposable block stack -----------------------------------
+echo "################ POWER-LOSS RUN: mode=$MODE ################"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH" "$MNT"
+[ "$MODE" = flakey ] && sudo modprobe dm-flakey
+truncate -s "${IMG_MB}M" "$IMG"
+LOOPDEV=$(sudo losetup --find --show "$IMG")
+echo "loop: $LOOPDEV  image: $IMG (${IMG_MB} MB)"
+SECTORS=$(sudo blockdev --getsz "$LOOPDEV")
+
+# Start in a clean pass-through (linear) so mkfs + the pre-sync appends land.
+sudo dmsetup create "$DM" --table "0 $SECTORS linear $LOOPDEV 0"
+sudo mkfs.ext4 -q -F "$DMPATH"
+sudo mount "$DMPATH" "$MNT"
+sudo chown "$(id -u):$(id -g)" "$MNT"
+CHAIN="$MNT/chain.db"; KEY="$MNT/chain.key"
+
+# ---- isolated daemon on the disposable fs -------------------------------
+# Chain key is a raw 32-byte HMAC key (as demo/run.sh:138); O-Key via keygen.
+head -c 32 /dev/urandom > "$KEY"
+"$CLI" keygen okey "$MNT/onode.key" >/dev/null 2>&1 || { echo "keygen okey failed"; exit 1; }
+printf '[]' > "$MNT/devices.json"; printf '[]' > "$MNT/approvers.json"
+start_daemon() {
+  "$D" -k "$MNT/onode.key" -s "$MNT/onode.sock" -d "$MNT/devices.json" \
+       -c "$CHAIN" -C "$KEY" -a "$MNT/approvals" -A "$MNT/approvers.json" \
+       >>"$SCRATCH/daemon.log" 2>&1 &
+  DPID=$!
+  for _ in $(seq 1 40); do [ -S "$MNT/onode.sock" ] && break; sleep 0.25; done
+}
+
+# Commitment-only fed_observation appends (the oversized shape: no body, so no
+# artifacts row — the daemon accepts the bare commitment). Distinct synthetic
+# 64-hex hash per index; SESSION fixed so the signed head tracks a length.
+append() {  # $1 = index
+  local h; h=$(printf '%064x' "$1")
+  python3 - "$MNT/onode.sock" "$h" "$1" <<'PY'
+import socket,struct,sys
+sock,h,i=sys.argv[1],sys.argv[2],sys.argv[3]
+j=('{"action":"chain_append","session_id":"powerloss:1",'
+   '"artifact_type":"fed_observation","artifact_id":"pl-obs-%s",'
+   '"artifact_hash":"%s"}'%(i,h)).encode()
+s=socket.socket(socket.AF_UNIX); s.connect(sock)
+s.sendall(struct.pack(">I",1+len(j))+b"\x02"+j)
+hdr=s.recv(4); n=struct.unpack(">I",hdr)[0]; b=b""
+while len(b)<n: b+=s.recv(n-len(b))
+sys.exit(0 if n>4 else 1)
+PY
+}
+
+start_daemon
+echo "daemon pid=$DPID on $CHAIN"
+
+# ---- phase 1: land + fsync a durable prefix -----------------------------
+for i in $(seq 1 "$APPENDS_PRESYNC"); do append "$i" >/dev/null || echo "presync append $i refused"; done
+sync; sudo blockdev --flushbufs "$LOOPDEV"
+PRE=$("$CLI" chain tail -n 100000 --db "$CHAIN" 2>/dev/null | grep -c 'pl-obs-')
+echo "durable prefix: $PRE entries, synced to the image"
+
+# ---- phase 2: THE CUT ---------------------------------------------------
+if [ "$MODE" = flakey ]; then
+  # drop_writes: subsequent writes ack but never reach the image (power loss).
+  sudo dmsetup suspend "$DM"
+  sudo dmsetup reload "$DM" --table "0 $SECTORS flakey $LOOPDEV 0 0 60 1 drop_writes"
+  sudo dmsetup resume "$DM"
+  echo "CUT: dm-flakey drop_writes armed — writes now vanish"
+else
+  sudo dmsetup suspend "$DM"
+  sudo dmsetup reload "$DM" --table "0 $SECTORS error"
+  sudo dmsetup resume "$DM"
+  echo "CUT: dm-error armed — every I/O now errors"
+fi
+
+# ---- phase 3: appends into the void, then a hard crash ------------------
+refused=0
+for i in $(seq $((APPENDS_PRESYNC+1)) $((APPENDS_PRESYNC+APPENDS_POSTCUT))); do
+  append "$i" >/dev/null || refused=$((refused+1))
+done
+echo "post-cut appends refused by the writer: $refused / $APPENDS_POSTCUT"
+sudo kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; DPID=""
+
+# ---- phase 4: reopen from the IMAGE with cold cache, then verify --------
+sudo umount "$MNT" 2>/dev/null
+sudo dmsetup remove "$DM" 2>/dev/null
+sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null   # forget cached writes
+# Re-expose the underlying image straight (no flakey): what actually persisted.
+sudo dmsetup create "$DM" --table "0 $SECTORS linear $LOOPDEV 0"
+sudo mount "$DMPATH" "$MNT"
+POST=$("$CLI" chain tail -n 100000 --db "$CHAIN" 2>/dev/null | grep -c 'pl-obs-')
+echo "entries surviving on the image after the cut: $POST"
+
+echo "--- virp chain verify over the recovered chain ---"
+"$CLI" chain verify --db "$CHAIN" --key "$KEY" --session powerloss:1
+VERIFY=$?
+
+# ---- verdict ------------------------------------------------------------
+echo "================================================================"
+echo "durable prefix=$PRE  survived=$POST  post-cut-refused=$refused  verify_exit=$VERIFY"
+if [ "$MODE" = flakey ]; then
+  if [ "$POST" -lt "$((PRE+APPENDS_POSTCUT))" ] && [ "$VERIFY" -ne 0 ]; then
+    echo "PASS: the storage cut lost the tail AND verify FAILED — loss detected."
+  elif [ "$POST" -lt "$((PRE+APPENDS_POSTCUT))" ] && [ "$VERIFY" -eq 0 ]; then
+    echo "FINDING: entries were lost to the cut but verify reported VALID —"
+    echo "         a silently shortened chain. This is the SIGKILL-vs-power-loss gap."
+  else
+    echo "INCONCLUSIVE: no tail was actually lost (drop_writes did not straddle a"
+    echo "              flush boundary as intended) — retune the sync timing."
+  fi
+else
+  echo "L2 (dm-error): the writer should have REFUSED post-cut appends (refused=$refused);"
+  echo "               a nonzero refused count with a still-valid pre-cut chain is fail-closed."
+fi
+echo "================================================================"
