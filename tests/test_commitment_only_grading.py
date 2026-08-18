@@ -89,32 +89,24 @@ class TestCommitmentOnlyGrading(unittest.TestCase):
             verify.canonical_json(e).encode()).hexdigest()
         return e
 
-    @unittest.expectedFailure
-    def test_KNOWN_GAP_bodyless_entry_still_rolls_up_as_ok(self):
-        """DOCUMENTS A KNOWN GAP. Expected to FAIL until the roll-up
-        gains a tri-state.
+    def test_bodyless_entry_does_not_roll_up_as_ok(self):
+        """ENFORCED INVARIANT (was a KNOWN GAP until Batch 1).
 
-        `EntryVerification.ok` is `FAIL not in (...)`, so UNVERIFIABLE
-        and UNCHECKED both pass through as "not a failure". A
-        commitment-only observation therefore reports ok=True, is left
-        out of summarize()'s failed_entries, and is rendered as the
-        literal string PASS in the generated PDF — for an observation
-        whose signature was never checked, because there were no bytes
-        to check.
+        `EntryVerification.ok` must NOT report a commitment-only entry as
+        a clean pass. A bodyless observation has obs_hmac == UNVERIFIABLE
+        — its signature can never be checked because no bytes were
+        retained — so it must roll up as .ok == False and land in
+        summarize()'s failed_entries, never rendered as the literal
+        string PASS. UNVERIFIABLE is a permanent, rerun-proof condition;
+        an observation we can never verify must never read as verified.
 
         Reproduced against a real production entry
-        (obs:librenms-lab:1786029902471700439) on 2026-08-09, not only
-        this synthetic one.
+        (obs:librenms-lab:1786029902471700439) on 2026-08-09.
 
-        This is the PASS/UNCHECKED tri-state item from the 2026-08-07
-        review. Fixing it changes operator-facing verdicts on tens of
-        thousands of existing entries and is deliberately NOT bundled
-        into an unrelated deploy payload.
-
-        WHEN THAT IS FIXED this test will report an unexpected success,
-        which unittest treats as a failing run — that is the point. Drop
-        the decorator then, and tighten the SECURITY.md rationale, which
-        currently has to say the report renders PASS.
+        Before the fix `.ok` was `FAIL not in (...)`, so UNVERIFIABLE
+        passed through as "not a failure" and the entry read ok=True.
+        This test was @expectedFailure documenting that gap; the decorator
+        was dropped when the roll-up gained a tri-state (see .rollup).
         """
         okey = bytes(range(32))
         e = self._well_formed_bodyless_entry()

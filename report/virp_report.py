@@ -546,10 +546,23 @@ def section_integrity(story, ss, summary, verifications):
         ]))
         story.append(t)
     else:
-        story.append(Paragraph(
-            '<font color="%s"><b>No entry failed verification.</b></font> '
-            "Every check that could be run, passed."
-            % vhex(verify.PASS), ss["Note"]))
+        unverifiable = summary.get("unverifiable_entries", [])
+        if unverifiable:
+            story.append(Paragraph(
+                '<font color="%s"><b>No entry failed verification.</b></font> '
+                "Every check that could be run, passed — but "
+                '<font color="%s"><b>%d entr%s could not be verified</b></font> '
+                "(commitment-only: the evidence needed was never retained). "
+                "These are graded UNVERIFIABLE, never PASS; see the "
+                "per-session breakdown and the retention-limits summary."
+                % (vhex(verify.PASS), vhex(verify.UNVERIFIABLE),
+                   len(unverifiable),
+                   "y" if len(unverifiable) == 1 else "ies"), ss["Note"]))
+        else:
+            story.append(Paragraph(
+                '<font color="%s"><b>No entry failed verification.</b></font> '
+                "Every check that could be run, passed."
+                % vhex(verify.PASS), ss["Note"]))
 
     story.append(Spacer(1, 6))
     if broken is not None:
@@ -803,7 +816,7 @@ def section_lifecycles(story, ss, lifecycles):
                 Paragraph("<b>%s</b>" % stage, ss["MonoSmall"]),
                 Paragraph(ts, ss["MonoSmall"]),
                 Paragraph(detail, ss["MonoSmall"]),
-                verdict_para(verify.FAIL if not v.ok else verify.PASS, ss)])
+                verdict_para(v.rollup, ss)])
             if not v.ok:
                 style.append(("BACKGROUND", (0, len(data) - 1),
                               (-1, len(data) - 1), FAIL_BG))

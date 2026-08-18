@@ -504,16 +504,56 @@ class EntryVerification:
         self.artifact_content = None
         self.device = ""
 
+    # The six verdicts that bear on whether this entry verified. V2-SESSION
+    # and N/A are acceptable by design and are absent from the deny sets.
+    _INTEGRITY_VERDICTS = (
+        "entry_hash", "link", "chain_hmac", "artifact_bind",
+        "obs_hmac", "v2_journal")
+
+    @property
+    def rollup(self):
+        """Tri-state roll-up verdict for the whole entry, in precedence
+        order:
+
+          FAIL          some check recomputed and mismatched — tampering.
+          UNVERIFIABLE  no FAIL, but a check that bears on integrity can
+                        NEVER run from this chain because the evidence was
+                        never retained (a commitment-only / bodyless
+                        observation). No key and no rerun fixes it, so it
+                        must not read as a pass.
+          UNCHECKED     no FAIL and no UNVERIFIABLE, but a check the
+                        operator can rerun (a missing key) did not run.
+                        Recoverable, and reported honestly rather than as
+                        PASS.
+          PASS          everything that bears on integrity conclusively
+                        passed (V2-SESSION and N/A are acceptable by
+                        design).
+        """
+        verdicts = tuple(getattr(self, a) for a in self._INTEGRITY_VERDICTS)
+        if FAIL in verdicts:
+            return FAIL
+        if UNVERIFIABLE in verdicts:
+            return UNVERIFIABLE
+        if UNCHECKED in verdicts:
+            return UNCHECKED
+        return PASS
+
     @property
     def ok(self):
-        """True only if nothing that ran came back FAIL."""
-        return FAIL not in (self.entry_hash, self.link, self.chain_hmac,
-                            self.artifact_bind, self.obs_hmac,
-                            self.v2_journal)
+        """A clean pass. FAIL (tamper) and UNVERIFIABLE (evidence never
+        retained) both deny it: an observation whose signature can never
+        be checked must never roll up as verified. UNCHECKED is reported
+        by .rollup and rendered honestly, but — being recoverable by
+        rerunning with the key — is not counted a failure here."""
+        return self.rollup not in (FAIL, UNVERIFIABLE)
 
     @property
     def failures(self):
-        """List of (check_name, detail) for every FAIL on this entry."""
+        """List of (check_name, detail) for every FAIL on this entry.
+        FAIL means a check recomputed and mismatched — tampering. An
+        UNVERIFIABLE entry is not a clean pass (see .ok / .rollup) but is
+        not a failure here; it is surfaced separately as
+        unverifiable_entries, never in the FAILED-verification table."""
         out = []
         for name, verdict, detail in (
                 ("entry_hash", self.entry_hash, self.entry_hash_detail),
@@ -948,7 +988,19 @@ def summarize(verifications):
                             if v.entry["artifact_type"] in OBSERVATION_TYPES),
         "obs_v2": sum(1 for v in verifications
                       if v.obs_hmac == V2_SESSION),
-        "failed_entries": [v for v in verifications if not v.ok],
+        # failed_entries: tampering only (rollup FAIL) — this drives the
+        # non-zero exit status and the "FAILED VERIFICATION" table. Head
+        # FAILs are folded in later (verify_chain) via HeadFailure, which
+        # has no .rollup, hence the FAIL default.
+        "failed_entries": [v for v in verifications
+                           if getattr(v, "rollup", FAIL) == FAIL],
+        # unverifiable_entries: not a clean pass, but not tampering — an
+        # observation whose signature can never be checked because the
+        # body was never retained. Surfaced distinctly so it is never
+        # rendered as PASS (the P3 tri-state fix) without turning every
+        # commitment-only chain into a non-zero exit.
+        "unverifiable_entries": [v for v in verifications
+                                 if getattr(v, "rollup", None) == UNVERIFIABLE],
         "first_broken_link": first_broken,
         "sessions": len({v.entry["session_id"] for v in verifications}),
         "retention_reasons": retention_reasons(verifications),

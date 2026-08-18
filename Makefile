@@ -1460,7 +1460,11 @@ check-deploy-unit-source:
 	     echo "      lab-only opt-in via deploy/virp-onode-wazuh-lab.dropin.conf."; \
 	     exit 1; \
 	 fi
-	@echo "  PASS: no VIRP_WAZUH_INSECURE in canonical virp-onode.service (drop-in exempt)"
+	@echo "  PASS: no VIRP_WAZUH_INSECURE in canonical virp-onode.service"
+	@echo "=== checking no drop-in disables Wazuh TLS (except the lab drop-in) ==="
+	@scripts/check-wazuh-dropins.sh --selftest >/dev/null || \
+	    { echo "FAIL: check-wazuh-dropins.sh selftest failed — the guard is broken"; exit 1; }
+	@scripts/check-wazuh-dropins.sh deploy
 
 # Lint: fail build if sprintf( appears in src/ (use snprintf instead)
 .PHONY: lint-sprintf
@@ -1681,3 +1685,18 @@ test-api:
 	fi
 
 all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
+	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
+	@$(MAKE) --no-print-directory check-test-deps
+
+# check-test-deps — a whole suite that SKIPS (test-api without fastapi/httpx,
+# test-virp-report without reportlab) still returns 0, so `make all-tests`
+# printed a green pass line while the API auth + bind-safety guards and the
+# report generator were never exercised. This gate runs LAST — every suite
+# above still runs — and fails the aggregate if any required dependency is
+# absent, so a skip can never masquerade as clean success. Installing the
+# deps is the fix; the message names them.
+.PHONY: check-test-deps
+check-test-deps:
+	@scripts/check-test-deps.sh --selftest >/dev/null || \
+	    { echo "FAIL: check-test-deps.sh selftest failed — the guard is broken"; exit 1; }
+	@scripts/check-test-deps.sh fastapi httpx reportlab
