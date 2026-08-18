@@ -5171,6 +5171,205 @@ TEST(test_chain_append_non_fed_colliding_id_still_stores_both)
     ASSERT_EQ(ca_count_artifact_rows("evi-collide-1"), 2);
 }
 
+/* ==========================================================================
+ * GATE 5 — the COMMITMENT-ONLY blind spot (external review of 9bd54e53).
+ *
+ * GATE 5's conflict query read the artifacts table (body storage). A
+ * commitment-only fed_observation — a GREEN observation past the 8192-byte
+ * inline limit, which the bridge chains as a hash commitment with NO body
+ * (the common oversized path) — inserts no artifacts row. So the same
+ * correlation id resubmitted with a DIFFERENT hash found nothing in
+ * artifacts and appended a second entry: one correlation, two committed
+ * observations, exactly what GATE 5 exists to refuse. The fix makes the
+ * query's authority the chain (chain_entries), where every append lands
+ * regardless of body retention. Same body-stored-vs-chain-committed
+ * conflation as the GATE 4 (-50) fix, in the opposite direction.
+ *
+ * Tests 1-2 are RED before the fix (the second hash lands); tests 3-4 are
+ * retention/no-regression guards (green both ways).
+ * ========================================================================== */
+
+/* 1. Sequential: same correlation id, two commitment-only observations with
+ * DIFFERENT hashes → the second is refused VIRP_ERR_DUPLICATE_MISMATCH and
+ * the chain keeps exactly one. */
+TEST(test_chain_append_refuses_commitment_only_fed_retry_with_different_bytes)
+{
+    char h1[65]; ca_sha256_hex("g5c-observation-alpha", h1);
+    char h2[65]; ca_sha256_hex("g5c-observation-beta",  h2);
+    ASSERT_TRUE(strcmp(h1, h2) != 0);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    /* Commitment-only: NULL artifact_content, so no artifacts row lands and
+     * (per onode GATE 2/3, gated on body presence) no signature is required
+     * of the bare commitment. */
+    ssize_t n = ca_append("ncfed-g5c-1", "fed_observation",
+                          "ncfed-obs-g5c-1", h1, NULL, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("ncfed-obs-g5c-1"), 1);
+    ASSERT_EQ(ca_count_artifact_rows("ncfed-obs-g5c-1"), 0);   /* no body */
+
+    n = ca_append("ncfed-g5c-1", "fed_observation",
+                  "ncfed-obs-g5c-1", h2, NULL, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_DUPLICATE_MISMATCH);
+    ASSERT_EQ(ca_count_entries("ncfed-obs-g5c-1"), 1);         /* still ONE */
+}
+
+/* 2. Concurrent barrier: N writers race the same correlation id, each a
+ * commitment-only observation with a DISTINCT hash. Exactly one wins; the
+ * chain holds exactly one entry. The bodies are absent, so the entry count
+ * — not an artifacts-row count — is the ground truth here. */
+#define G5C_THREADS  8
+#define G5C_ROUNDS   20
+
+typedef struct {
+    int round;
+    int tid;
+    pthread_barrier_t *barrier;
+    int success;
+    int wrong_error;
+    int transport;
+} g5c_arg_t;
+
+static void *g5c_worker(void *p)
+{
+    g5c_arg_t *a = (g5c_arg_t *)p;
+
+    /* Distinct, valid 64-hex commitment per (round,tid); no body sent. */
+    char h[65];
+    snprintf(h, sizeof(h), "%064x", (unsigned)(a->round * 1000 + a->tid + 1));
+
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\"action\":\"chain_append\",\"session_id\":\"g5crace:%d\","
+             "\"artifact_type\":\"fed_observation\","
+             "\"artifact_id\":\"g5crace-r%03d\","
+             "\"artifact_hash\":\"%s\"}",
+             a->round, a->round, h);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { a->transport++; return NULL; }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", CA_SOCKET);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd); a->transport++;
+        pthread_barrier_wait(a->barrier);
+        return NULL;
+    }
+
+    pthread_barrier_wait(a->barrier);
+
+    size_t json_len = strlen(json);
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+    send(fd, &frame_len, 4, 0);
+    uint8_t version = VIRP_FRAME_VERSION;
+    send(fd, &version, 1, 0);
+    send(fd, json, json_len, 0);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    uint32_t net_rlen;
+    if (recv(fd, &net_rlen, 4, 0) != 4) { close(fd); a->transport++; return NULL; }
+    uint32_t rlen = ntohl(net_rlen);
+    if (rlen > sizeof(resp)) { close(fd); a->transport++; return NULL; }
+    size_t got = 0;
+    while (got < rlen) {
+        ssize_t n = recv(fd, resp + got, rlen - got, 0);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+
+    if (got != rlen) {
+        a->transport++;
+    } else if (rlen > 4) {
+        a->success = 1;
+    } else if (typed_error_of(resp, (ssize_t)rlen)
+               != (int32_t)VIRP_ERR_DUPLICATE_MISMATCH) {
+        a->wrong_error = 1;
+    }
+    return NULL;
+}
+
+TEST(test_chain_append_concurrent_commitment_only_fed_conflict_is_atomic)
+{
+    for (int round = 0; round < G5C_ROUNDS; round++) {
+        pthread_barrier_t barrier;
+        ASSERT_EQ(pthread_barrier_init(&barrier, NULL, G5C_THREADS), 0);
+
+        pthread_t th[G5C_THREADS];
+        g5c_arg_t args[G5C_THREADS];
+        memset(args, 0, sizeof(args));
+        for (int i = 0; i < G5C_THREADS; i++) {
+            args[i].round = round;
+            args[i].tid = i;
+            args[i].barrier = &barrier;
+            ASSERT_EQ(pthread_create(&th[i], NULL, g5c_worker, &args[i]), 0);
+        }
+
+        int successes = 0, wrong_error = 0, transport = 0;
+        for (int i = 0; i < G5C_THREADS; i++) {
+            pthread_join(th[i], NULL);
+            successes   += args[i].success;
+            wrong_error += args[i].wrong_error;
+            transport   += args[i].transport;
+        }
+        pthread_barrier_destroy(&barrier);
+
+        char id[64];
+        snprintf(id, sizeof(id), "g5crace-r%03d", round);
+
+        ASSERT_EQ(transport, 0);
+        ASSERT_EQ(wrong_error, 0);
+        /* Commitment-only: no artifacts rows exist, so the ENTRY count is the
+         * ground truth. A second success would be a second entry. */
+        ASSERT_EQ(successes, 1);
+        ASSERT_EQ(ca_count_entries(id), 1);
+        ASSERT_EQ(ca_count_artifact_rows(id), 0);
+    }
+}
+
+/* 3. GUARD (retention): a BYTE-IDENTICAL commitment-only retry — same id,
+ * same hash — is a legitimate lost-ack retry and must still be accepted,
+ * recording a second entry (the honest trace). Green before and after; the
+ * fix must not turn same-hash retries into a conflict. */
+TEST(test_chain_append_accepts_commitment_only_byte_identical_fed_retry)
+{
+    char h[65]; ca_sha256_hex("g5c-identical-retry", h);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("ncfed-g5c-2", "fed_observation",
+                          "ncfed-obs-g5c-2", h, NULL, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    n = ca_append("ncfed-g5c-2", "fed_observation",
+                  "ncfed-obs-g5c-2", h, NULL, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);                                        /* accepted */
+    ASSERT_EQ(ca_count_entries("ncfed-obs-g5c-2"), 2);        /* retry trace */
+    ASSERT_EQ(ca_count_artifact_rows("ncfed-obs-g5c-2"), 0);
+}
+
+/* 4. GUARD (scope): GATE 5 is federation-only. A NON-federation commitment-
+ * only append with a colliding id and different hashes must STILL store both
+ * — the 2026-08-03 side-by-side tolerance. Green before and after; proves the
+ * chain_entries query did not widen the gate to non-federation types (which
+ * also write chain_entries rows). */
+TEST(test_chain_append_non_fed_commitment_only_colliding_id_stores_both)
+{
+    char h1[65]; ca_sha256_hex("g5c-nonfed-one", h1);
+    char h2[65]; ca_sha256_hex("g5c-nonfed-two", h2);
+    ASSERT_TRUE(strcmp(h1, h2) != 0);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("evidence:2026", "observation",
+                          "obs-collide-g5c", h1, NULL, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    n = ca_append("evidence:2026", "observation",
+                  "obs-collide-g5c", h2, NULL, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);                                        /* NOT refused */
+    ASSERT_EQ(ca_count_entries("obs-collide-g5c"), 2);        /* both land */
+}
+
 /* GUARD: the reserved daemon type "outcome" is STILL refused from a
  * socket client — the federation types did not widen the daemon namespace. */
 TEST(test_chain_append_still_refuses_reserved_outcome_type)
@@ -6062,6 +6261,10 @@ int main(void)
         RUN_TEST(test_chain_append_refuses_fed_outcome_retry_with_different_bytes);
         RUN_TEST(test_chain_append_accepts_byte_identical_fed_retry);
         RUN_TEST(test_chain_append_non_fed_colliding_id_still_stores_both);
+        RUN_TEST(test_chain_append_refuses_commitment_only_fed_retry_with_different_bytes);
+        RUN_TEST(test_chain_append_concurrent_commitment_only_fed_conflict_is_atomic);
+        RUN_TEST(test_chain_append_accepts_commitment_only_byte_identical_fed_retry);
+        RUN_TEST(test_chain_append_non_fed_commitment_only_colliding_id_stores_both);
         RUN_TEST(test_chain_append_still_refuses_reserved_outcome_type);
         RUN_TEST(test_chain_append_accepts_commitment_without_body);
 
