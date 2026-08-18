@@ -1,6 +1,6 @@
 {
   "_comment": "Evidence item set for virp-evidence (autopilot/virp_evidence.py). Each item is ONE named read-only command whose signed output is evidence for a control. This file is DATA: adding, removing or re-wording an item is a config edit, never a code change. Installed at /etc/virp/evidence-items.json; the collector falls back to this tracked copy and records which path it used, and that file's sha256, in every result it writes.",
-  "_command_policy": "Every command MUST classify GREEN at the gate. The collector re-derives the linux driver's GREEN row locally and REFUSES to submit anything that is not exactly `vtysh -c \"show <rest>\"` with rest limited to [a-z0-9 ./-] (see src/drivers/driver_linux.c, linux_gate_classify). That local guard exists because this file is operator-editable: an edit must not be able to turn a read-only collector into something that mutates a device. The gate remains the authority — the guard only stops the collector from ever asking.",
+  "_command_policy": "Every command MUST classify GREEN at the gate. The collector re-derives the linux driver's GREEN row locally and REFUSES to submit anything that is not exactly `vtysh -c \"show <rest>\"` with rest limited to [a-z0-9 ./-] (see src/drivers/driver_linux.c, linux_gate_classify). That local guard exists because this file is operator-editable: an edit must not be able to turn a read-only collector into something that mutates a device. The gate remains the authority \u2014 the guard only stops the collector from ever asking.",
   "_caveat_policy": "proves / does_not_prove are rendered verbatim into the report next to the signed result. Write them honestly: an evidence collector that overstates what a read demonstrates is worse than no collector at all. Where FRR genuinely cannot evidence a control, say so in evidence_gap and the report marks that control UNEVIDENCED instead of showing a weak read as if it had passed.",
   "schema": "virp_evidence_items/1",
   "items": [
@@ -9,8 +9,9 @@
       "title": "Configured user accounts and access lines",
       "command": "vtysh -c \"show running-config\"",
       "proves": "The FRR configuration exactly as the device reports it, including any `username`, `line vty` or `access-class` stanzas that are configured. On a device carrying none of them, this is positive evidence that FRR itself defines no local accounts and no vty access list.",
-      "does_not_prove": "FRR exposes no dedicated account or access-line read — `show users`, `show line` and `show vty` are all rejected as unknown commands by FRR 10.2 — so this is the running-config and the operator must read the account stanzas out of it. It does NOT show the host or container OS accounts (/etc/passwd), SSH authorized keys, sudo policy or PAM configuration, and those are what actually govern who can reach vtysh at all; none of them is reachable from any GREEN gate read. An empty result means no FRR-level user stanza exists, NOT that nobody can log in.",
-      "evidence_gap": null
+      "does_not_prove": "FRR exposes no dedicated account or access-line read \u2014 `show users`, `show line` and `show vty` are all rejected as unknown commands by FRR 10.2 \u2014 so this is the running-config and the operator must read the account stanzas out of it. It does NOT show the host or container OS accounts (/etc/passwd), SSH authorized keys, sudo policy or PAM configuration, and those are what actually govern who can reach vtysh at all; none of them is reachable from any GREEN gate read. An empty result means no FRR-level user stanza exists, NOT that nobody can log in.",
+      "evidence_gap": null,
+      "coverage_gap": "running-config is YELLOW on FRR since the 2026-08-11 gate hardening (commit 30017c77). `show running-config` is the ONLY FRR source for this control (show users/line/vty are rejected as unknown commands), so there is no GREEN substitute. Recorded as a documented coverage gap rather than collected: a read-only, no-approval collector cannot obtain it at GREEN. Closing it needs an approved YELLOW read path (tracked enhancement), NOT a silent re-GREENing of running-config."
     },
     {
       "name": "logging_config",
@@ -24,8 +25,8 @@
       "name": "time_sync",
       "title": "Time synchronisation configuration",
       "command": "vtysh -c \"show zebra\"",
-      "proves": "The zebra daemon's own reported wall-clock timestamps (daemon start time and last RIB sweep) — that is, what the device believes the time is.",
-      "does_not_prove": "FRR has no time-synchronisation subsystem and exposes no NTP read at all: `show ntp status`, `show ntp associations` and `show clock` are all unknown commands in FRR 10.2 (verified live against frr1 on 2026-07-30). This read therefore CANNOT evidence a time-sync control. It is a device-reported clock value and nothing more — it does not name a time source, prove synchronisation happened, or bound clock offset. Time sync on these nodes is a host/container concern (chrony, ntpd or systemd-timesyncd) and reading it needs a shell command that the linux gate classifies RED by absence.",
+      "proves": "The zebra daemon's own reported wall-clock timestamps (daemon start time and last RIB sweep) \u2014 that is, what the device believes the time is.",
+      "does_not_prove": "FRR has no time-synchronisation subsystem and exposes no NTP read at all: `show ntp status`, `show ntp associations` and `show clock` are all unknown commands in FRR 10.2 (verified live against frr1 on 2026-07-30). This read therefore CANNOT evidence a time-sync control. It is a device-reported clock value and nothing more \u2014 it does not name a time source, prove synchronisation happened, or bound clock offset. Time sync on these nodes is a host/container concern (chrony, ntpd or systemd-timesyncd) and reading it needs a shell command that the linux gate classifies RED by absence.",
       "evidence_gap": "FRR exposes no NTP or time-synchronisation configuration through any GREEN vtysh read. This control is UNEVIDENCED by this collector and needs a host-level collector that does not yet exist."
     },
     {
@@ -33,15 +34,16 @@
       "title": "Running-configuration snapshot for baseline conformance",
       "command": "vtysh -c \"show running-config\"",
       "proves": "A point-in-time snapshot of the complete running configuration, signed and chain-registered, suitable for later comparison against an approved baseline.",
-      "does_not_prove": "Does not by itself prove baseline conformance: this collector records the configuration, it does not compare it. Baseline comparison and drift alerting are the config-backup runbook's job (docs/RUNBOOK-CONFIG-BACKUP.md). It is also the RUNNING configuration, not the startup configuration — `show startup-config` returns empty on these nodes — so it does not prove what the device would load after a restart. It shares a collection method with the access-accounts item; the two controls are evidenced by the same read, collected and signed independently.",
-      "evidence_gap": null
+      "does_not_prove": "Does not by itself prove baseline conformance: this collector records the configuration, it does not compare it. Baseline comparison and drift alerting are the config-backup runbook's job (docs/RUNBOOK-CONFIG-BACKUP.md). It is also the RUNNING configuration, not the startup configuration \u2014 `show startup-config` returns empty on these nodes \u2014 so it does not prove what the device would load after a restart. It shares a collection method with the access-accounts item; the two controls are evidenced by the same read, collected and signed independently.",
+      "evidence_gap": null,
+      "coverage_gap": "running-config is YELLOW on FRR since the 2026-08-11 gate hardening (commit 30017c77). `show running-config` is the ONLY FRR source for this control (show users/line/vty are rejected as unknown commands), so there is no GREEN substitute. Recorded as a documented coverage gap rather than collected: a read-only, no-approval collector cannot obtain it at GREEN. Closing it needs an approved YELLOW read path (tracked enhancement), NOT a silent re-GREENing of running-config."
     },
     {
       "name": "management_services",
       "title": "Enabled management services and insecure-protocol posture",
       "command": "vtysh -c \"show daemons\"",
       "proves": "Which FRR daemons are actually running on the device at collection time, as reported by the running vtysh.",
-      "does_not_prove": "Does not enumerate the host's listening network services or open ports, and therefore does not prove that insecure management protocols (telnet, cleartext HTTP, SNMPv1/v2c) are disabled. The container's sshd — the actual management path VIRP itself uses to reach this device — is not an FRR daemon and does not appear here. A real insecure-protocol posture check needs a host-level port/service read, which no GREEN vtysh row can perform.",
+      "does_not_prove": "Does not enumerate the host's listening network services or open ports, and therefore does not prove that insecure management protocols (telnet, cleartext HTTP, SNMPv1/v2c) are disabled. The container's sshd \u2014 the actual management path VIRP itself uses to reach this device \u2014 is not an FRR daemon and does not appear here. A real insecure-protocol posture check needs a host-level port/service read, which no GREEN vtysh row can perform.",
       "evidence_gap": null
     }
   ]

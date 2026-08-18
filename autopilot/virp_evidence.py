@@ -266,6 +266,13 @@ def load_items(paths=ITEMS_PATHS):
             "proves": item.get("proves") or "",
             "does_not_prove": item.get("does_not_prove") or "",
             "evidence_gap": item.get("evidence_gap") or None,
+            # A control whose only source read is no longer GREEN after a
+            # deliberate gate hardening (and has no GREEN substitute). When
+            # set, a non-GREEN observation is recorded as a documented gap
+            # instead of alerted — see collect_item. Distinct from the
+            # descriptive evidence_gap: this one changes collection
+            # behaviour, so it is carried explicitly.
+            "coverage_gap": item.get("coverage_gap") or None,
         })
     return out, path, sha
 
@@ -459,6 +466,20 @@ def collect_item(device, item, session_id, controls, provenance,
 
     tier = obs.get("tier_name")
     if tier != "GREEN":
+        if item.get("coverage_gap"):
+            # A KNOWN, documented coverage gap: this control's only source
+            # read is no longer a GREEN read after a deliberate gate
+            # hardening, and there is no GREEN substitute. Record it as a
+            # gap — visible in the evidence set, but NOT an alert and NOT
+            # stored as GREEN evidence it never was. The run stays clean.
+            # If the gap ever closes (the read comes back GREEN) control
+            # falls through below and it is collected normally again, so
+            # this never masks a re-GREENing. See the item's coverage_gap
+            # note; closing it deliberately needs an approved read.
+            rec["status"] = "documented_coverage_gap"
+            rec["observed_tier"] = tier
+            rec["coverage_gap"] = item["coverage_gap"]
+            return rec
         # The gate executed something this collector is only ever allowed
         # to submit as a GREEN read. Say so loudly: that is a gate or
         # classifier problem, not a collection success.

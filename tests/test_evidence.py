@@ -22,6 +22,7 @@ import base64
 import hashlib
 import hmac as hmac_mod
 import json
+import glob
 import os
 import re
 import sqlite3
@@ -601,6 +602,41 @@ class TestDegradedResults(CollectorCase):
         self.assertEqual(rc, 1)
         self.assertIn("non_green_tier", self.alert_kinds())
         self.assertEqual(send.chain_appends("evidence_item"), [])
+
+    def test_coverage_gap_item_is_documented_not_alerted(self):
+        """An item flagged `coverage_gap` whose only source read is no
+        longer GREEN after a deliberate gate hardening (FRR
+        `show running-config` -> YELLOW since 2026-08-11 / commit 30017c77,
+        with no GREEN substitute) must be recorded as a DOCUMENTED GAP,
+        not alerted as a failure — the run stays clean and the gap stays
+        visible. Non-gap items are unaffected. A plain non-GREEN result on
+        an UNflagged item is still a loud alert (the test above)."""
+        class TieredSend(FakeSend):
+            def __call__(self, req):
+                if (req.get("action") == "execute"
+                        and "running-config" in req["command"]):
+                    self.requests.append(req)
+                    echo = "%s$ %s\n" % (req["device"], req["command"])
+                    return fake_obs(echo + self.default, tier=0x02)  # YELLOW
+                return super().__call__(req)
+
+        send = TieredSend()
+        rc = self.run_cycle(send)
+        self.assertEqual(rc, 0, "a documented coverage gap must not fail the run")
+        self.assertNotIn("non_green_tier", self.alert_kinds())
+
+        mpath = sorted(glob.glob(os.path.join(self.root, "*", "manifest.json")))[-1]
+        results = json.load(open(mpath))["results"]
+        gapped = {r["item"] for r in results
+                  if r.get("status") == "documented_coverage_gap"}
+        self.assertEqual(gapped, {"access_accounts", "running_config_baseline"})
+        # A documented gap is NOT stored as evidence (it was never a GREEN
+        # read); the three genuinely-GREEN items still are.
+        stored = {json.loads(r["artifact_content"])["item"]
+                  for r in send.chain_appends("evidence_item")}
+        self.assertNotIn("access_accounts", stored)
+        self.assertNotIn("running_config_baseline", stored)
+        self.assertIn("logging_config", stored)
 
     def test_gate_error_observation_is_alerted(self):
         class ErrSend(FakeSend):
