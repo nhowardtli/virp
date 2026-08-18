@@ -141,7 +141,7 @@ echo "daemon pid=$DPID on $CHAIN"
 # ---- phase 1: land + fsync a durable prefix -----------------------------
 for i in $(seq 1 "$APPENDS_PRESYNC"); do append "$i" >/dev/null || echo "presync append $i refused"; done
 sync; sudo blockdev --flushbufs "$LOOPDEV"
-PRE=$("$CLI" chain tail -n 100000 --db "$CHAIN" 2>/dev/null | grep -c 'pl-obs-')
+PRE=$(sqlite3 "file:$CHAIN?mode=ro" "SELECT COUNT(*) FROM chain_entries WHERE artifact_id LIKE 'pl-obs-%';" 2>/dev/null)
 echo "durable prefix: $PRE entries, synced to the image"
 # A power-loss test with nothing durable to lose proves nothing. Abort BEFORE
 # the cut so a setup failure can never masquerade as "loss detected".
@@ -180,7 +180,7 @@ sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null   # forget cached wr
 # Re-expose the underlying image straight (no flakey): what actually persisted.
 sudo dmsetup create "$DM" --table "0 $SECTORS linear $LOOPDEV 0"
 sudo mount "$DMPATH" "$MNT"
-POST=$("$CLI" chain tail -n 100000 --db "$CHAIN" 2>/dev/null | grep -c 'pl-obs-')
+POST=$(sqlite3 "file:$CHAIN?mode=ro" "SELECT COUNT(*) FROM chain_entries WHERE artifact_id LIKE 'pl-obs-%';" 2>/dev/null)
 echo "entries surviving on the image after the cut: $POST"
 
 # The signed head is the completeness authority: it records the last sequence
