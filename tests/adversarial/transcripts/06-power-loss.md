@@ -61,12 +61,38 @@ update through, or error a specific sector range mid-commit (dm-flakey
 `error_writes` on an offset, or dm-error scoped to part of the device). That
 is the L3+ escalation this run motivates but did not perform.
 
-## Companion not yet run
+## L2 (dm-error) — run 2
 
-L2 (dm-error, whole-device I/O failure → the writer must fail CLOSED, refusing
-the append rather than acking an unpersistable write) is the approved
-companion and has not been run. Under L3 the writer acked (drop_writes is
-silent at the syscall); L2 is the test of whether a HARD error is caught.
+Same setup, cut = dm-error (every chain-device I/O errors) instead of
+drop_writes. Question: does the writer fail closed on a hard I/O error, or ack
+a write it cannot persist?
+
+```
+durable prefix = 200
+post-cut replies:  ACK=0   ERR=200   FAIL=0   (of 200)
+entries surviving on the image = 200
+signed head last_sequence = 199    verify -> VALID  entries=200  broken=0
+```
+
+**PASS (fail-closed).** Every one of the 200 post-cut appends returned a typed
+error / signed ERROR observation — **zero acks**. The writer never returned
+success for a write the storage rejected, and none of the errored writes
+persisted (survived=200=durable). SQLite surfaced the `SQLITE_IOERR`, the
+chain_append handler propagated it, and the daemon refused cleanly.
+
+## The boundary this establishes (L2 vs L3)
+
+The two rungs bracket exactly where VIRP's durability guarantee ends:
+
+| Cut | Storage behaviour | Writer | Result |
+|-----|-------------------|--------|--------|
+| L2 dm-error | returns a hard I/O error | **refuses** (ERR=200, 0 acks) | fail-closed ✓ |
+| L3 drop_writes | silently discards the write | **acks** (ACK=200) | ack-before-durability |
+
+VIRP fails closed on any **detectable** write failure. It cannot detect a
+**silent** write-drop — the power-loss / lying-disk case where the syscall
+returns success but the bytes never reach the platter. That is the precise
+edge of the durability claim, now measured from both sides.
 
 ## Conclusion — the finding of this run
 
