@@ -2725,7 +2725,45 @@ static virp_error_t chain_append_verify_observation(
     }
 }
 
-static void handle_client(onode_state_t *state, int client_fd)
+/*
+ * Per-uid action-allowlist decision for a SOCKET request. Returns true if
+ * the request MUST be refused (the caller then sends a typed error and
+ * closes — zero dispatch). Non-static so the fail-open regression can
+ * drive it directly. Two fail-CLOSED refusal reasons:
+ *
+ *   1. UNKNOWN IDENTITY — client_uid == (uid_t)-1. The daemon has no peer
+ *      credential for this socket. This must NEVER fall through to
+ *      node-wide policy: the earlier bug re-read SO_PEERCRED in the worker
+ *      and, on a failed read, set (uid_t)-1, which is absent from the
+ *      per-uid map and so simply SKIPPED it — handing the node-wide
+ *      ceiling and the full action switch to an unidentified caller. The
+ *      accept path validates a real uid and it is now threaded in, so this
+ *      cannot arise in normal flow; if it ever does, unknown identity
+ *      means NO action.
+ *   2. ACTION NOT ALLOWED — a uid present in socket_uid_action_allow may
+ *      request only its listed actions. A uid ABSENT from the map is
+ *      unrestricted (existing principals are unchanged).
+ */
+bool onode_uid_request_refused(const onode_state_t *state,
+                               uid_t client_uid, onode_action_t action)
+{
+    if (!state)
+        return true;
+    if (client_uid == (uid_t)-1)
+        return true;                    /* unknown identity — no action */
+    for (size_t i = 0; i < state->uid_action_count; i++) {
+        if (state->uid_action_uids[i] != client_uid)
+            continue;
+        for (size_t k = 0; k < state->uid_action_set_counts[i]; k++)
+            if (state->uid_action_sets[i][k] == action)
+                return false;           /* listed — allowed */
+        return true;                    /* in map, action not listed — refuse */
+    }
+    return false;                       /* uid not in map — unrestricted */
+}
+
+static void handle_client(onode_state_t *state, int client_fd,
+                          uid_t client_uid)
 {
     char recv_buf[ONODE_MAX_REQUEST_SIZE];
     uint8_t resp_buf[VIRP_MAX_MESSAGE_SIZE];
@@ -2735,20 +2773,18 @@ static void handle_client(onode_state_t *state, int client_fd)
     struct timeval tv = { .tv_sec = ONODE_RECV_TIMEOUT_SEC, .tv_usec = 0 };
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    /* The connecting peer's uid, for per-uid tier ceilings. Re-read from
-     * this fd (the accept loop already allowlisted it) rather than
-     * threaded through worker_arg, so the uid that decides the gate is
-     * taken from the same socket the request arrives on. Fail closed to
-     * (uid_t)-1 — "no per-uid tighten, node-wide ceiling only" — if the
-     * cred read fails; it cannot loosen the global gate. Carried
-     * explicitly into every execute path, including the batch fan-out. */
-    uid_t client_uid = (uid_t)-1;
-    {
-        struct ucred cred;
-        socklen_t clen = sizeof(cred);
-        if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) == 0)
-            client_uid = cred.uid;
-    }
+    /* client_uid is the peer uid the ACCEPT loop validated via SO_PEERCRED
+     * (peer_uid_allowed) and threaded in through worker_arg. There is
+     * deliberately NO second SO_PEERCRED read here: the previous code
+     * re-read it and, on a failed read, fell back to (uid_t)-1 — which is
+     * absent from socket_uid_action_allow and so SKIPPED the per-uid map,
+     * handing the request the node-wide ceiling and the full action switch.
+     * That was fail-OPEN relative to per-uid controls, not fail-closed as
+     * its comment claimed. With the uid threaded there is no read to fail;
+     * and an unknown identity (client_uid == (uid_t)-1) is refused by
+     * onode_uid_request_refused() below rather than defaulting to node-wide
+     * policy. Carried explicitly into every execute path, including the
+     * batch fan-out. */
 
     /* ── v2 framed receive ───────────────────────────────────────────
      * Read 4-byte big-endian length prefix. If the first byte is
@@ -2825,42 +2861,23 @@ static void handle_client(onode_state_t *state, int client_fd)
     virp_error_t err;
 
     /*
-     * Per-uid action allowlist (Item 8) — checked ONCE, here, before
-     * the dispatch switch. A uid present in socket_uid_action_allow
-     * may request only its listed actions; the refusal is a typed
-     * policy error and the daemon carries on. A uid absent from the
-     * map takes the switch exactly as before — no new restriction on
-     * existing principals. An entry with zero actions (the loader's
-     * fail-closed form for a malformed set) refuses everything.
+     * Per-uid action allowlist (Item 8) — checked ONCE, here, before the
+     * dispatch switch, via onode_uid_request_refused(). It refuses an
+     * unknown identity (uid == (uid_t)-1) and a uid whose
+     * socket_uid_action_allow set does not list req.action; a uid absent
+     * from the map takes the switch exactly as before. The refusal is a
+     * typed policy error and the daemon carries on. Zero dispatch: the
+     * action switch below never runs for a refused request.
      */
-    {
-        ssize_t map_idx = -1;
-        for (size_t i = 0; i < state->uid_action_count; i++) {
-            if (state->uid_action_uids[i] == client_uid) {
-                map_idx = (ssize_t)i;
-                break;
-            }
-        }
-        if (map_idx >= 0) {
-            bool action_ok = false;
-            for (size_t k = 0;
-                 k < state->uid_action_set_counts[map_idx]; k++) {
-                if (state->uid_action_sets[map_idx][k] == req.action) {
-                    action_ok = true;
-                    break;
-                }
-            }
-            if (!action_ok) {
-                fprintf(stderr, "[O-Node] POLICY REFUSAL: uid %u "
-                        "action '%s' is not in its "
-                        "socket_uid_action_allow set\n",
-                        (unsigned)client_uid,
-                        onode_action_name(req.action));
-                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
-                close(client_fd);
-                return;
-            }
-        }
+    if (onode_uid_request_refused(state, client_uid, req.action)) {
+        fprintf(stderr, "[O-Node] POLICY REFUSAL: uid %ld action '%s' "
+                "refused — unknown identity or not in the uid's "
+                "socket_uid_action_allow set\n",
+                (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
+                onode_action_name(req.action));
+        send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+        close(client_fd);
+        return;
     }
 
     switch (req.action) {
@@ -4243,6 +4260,10 @@ virp_error_t onode_watchdog_start(onode_state_t *state)
 typedef struct {
     onode_state_t *state;
     int            client_fd;
+    uid_t          client_uid;  /* peer uid validated at accept, threaded to
+                                   handle_client so it never re-reads (and
+                                   never has a second SO_PEERCRED read to
+                                   fail open on) */
     int            slot;        /* index into state->worker_fds, -1 if none */
 } worker_arg_t;
 
@@ -4272,10 +4293,11 @@ static void *connection_worker(void *raw_arg)
     onode_state_t *state = arg->state;
     int fd = arg->client_fd;
     int slot = arg->slot;
+    uid_t client_uid = arg->client_uid;
     free(arg);
 
     /* handle_client() closes the fd on every return path. */
-    handle_client(state, fd);
+    handle_client(state, fd, client_uid);
 
     /* Clear the drain-registration slot (closing our dup of the client
      * fd), release the worker slot, and update the live counter. The
@@ -4797,6 +4819,8 @@ virp_error_t onode_start(onode_state_t *state)
             }
             arg->state = state;
             arg->client_fd = client_fd;
+            arg->client_uid = peer_uid;   /* validated above; threaded so the
+                                             worker needs no second cred read */
 
             /* Register a dup() of the client fd so the shutdown drain
              * can shutdown(SHUT_RDWR) the socket and unblock this

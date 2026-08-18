@@ -5544,6 +5544,44 @@ static const onode_action_t FED_ACTIONS[4] = {
     ONODE_ACTION_CHAIN_VERIFY, ONODE_ACTION_CHAIN_APPEND,
 };
 
+/* M1 (2026-08-18): a failed second SO_PEERCRED read in the worker used to
+ * yield (uid_t)-1, which is absent from socket_uid_action_allow and so
+ * SKIPPED the per-uid map — the request then took the node-wide ceiling
+ * and the full action switch. That was fail-OPEN relative to per-uid
+ * controls. The uid is now threaded from accept (no second read) and an
+ * unknown identity is REFUSED outright by onode_uid_request_refused().
+ * A real getsockopt(SO_PEERCRED) failure cannot be forced on a connected
+ * socket, so the regression drives the decision function directly. */
+TEST(test_uid_request_refused_rejects_unknown_identity)
+{
+    onode_clear_uid_actions(&ca_state);
+    /* A restricted principal (like virp-netclaw uid 993): federation
+     * actions only. */
+    ASSERT_OK(onode_set_uid_actions(&ca_state, 993, FED_ACTIONS, 4));
+
+    /* THE FIX: unknown identity (uid == -1) is refused for ANY action,
+     * never the node-wide fall-through. Pre-fix this returned false and the
+     * request reached node-wide policy plus the whole action switch. */
+    ASSERT_TRUE(onode_uid_request_refused(&ca_state, (uid_t)-1,
+                                          ONODE_ACTION_EXECUTE));
+    ASSERT_TRUE(onode_uid_request_refused(&ca_state, (uid_t)-1,
+                                          ONODE_ACTION_SHUTDOWN));
+
+    /* The restricted uid: a listed action is allowed, an unlisted one is
+     * refused (unchanged behaviour, proves the map still applies). */
+    ASSERT_TRUE(!onode_uid_request_refused(&ca_state, 993,
+                                           ONODE_ACTION_HEALTH));   /* listed */
+    ASSERT_TRUE(onode_uid_request_refused(&ca_state, 993,
+                                          ONODE_ACTION_EXECUTE));   /* unlisted */
+
+    /* A uid absent from the map is unrestricted — existing principals are
+     * not newly restricted. */
+    ASSERT_TRUE(!onode_uid_request_refused(&ca_state, 4242,
+                                           ONODE_ACTION_EXECUTE));
+
+    onode_clear_uid_actions(&ca_state);
+}
+
 TEST(test_uid_action_allowlist_blocks_unlisted_actions)
 {
     ASSERT_OK(onode_set_uid_actions(&ca_state, getuid(), FED_ACTIONS, 4));
@@ -5950,6 +5988,7 @@ int main(void)
         RUN_TEST(test_chain_append_concurrent_fed_id_conflict_is_atomic);
 
         printf("\n  -- Item 8: per-uid action allowlist --\n");
+        RUN_TEST(test_uid_request_refused_rejects_unknown_identity);
         RUN_TEST(test_uid_action_allowlist_blocks_unlisted_actions);
         RUN_TEST(test_uid_action_allowlist_narrows_chain_append_types);
         RUN_TEST(test_uid_action_map_absent_uid_fully_unchanged);
