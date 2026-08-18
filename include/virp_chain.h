@@ -390,7 +390,9 @@ virp_error_t virp_chain_entry_commits_to(virp_chain_state_t *state,
  * append committing between this check and any act taken on it, which is
  * exactly what happened when GATE 5 relied on it. The enforcing copy of
  * this query runs INSIDE the append transaction (chain_append_locked),
- * where the answer and the act commit atomically.
+ * where the answer and the act commit atomically. Both read chain_entries,
+ * not artifacts: the chain is the authority on what a correlation id
+ * committed to, so a commitment-only prior (no body row) is still seen.
  */
 virp_error_t virp_chain_artifact_id_conflict(virp_chain_state_t *state,
                                              const char *artifact_id,

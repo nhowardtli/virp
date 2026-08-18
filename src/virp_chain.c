@@ -359,13 +359,17 @@ virp_error_t virp_chain_artifact_id_conflict(virp_chain_state_t *state,
     *conflict = false;
 
     pthread_mutex_lock(&state->lock);
-    /* One-off statement, same discipline as the probes above. The
-     * id-equality half of the predicate rides idx_artifacts_id, so this
-     * is a point lookup, not a scan, on the append path. */
+    /* Same authority as GATE 5 in chain_append_locked: the CHAIN, not body
+     * storage. Reads chain_entries so a commitment-only prior (no artifacts
+     * row) is seen; the id-equality half rides idx_chain_artifact_id, so
+     * this stays a lookup, not a scan. NOTE: this exported probe is no
+     * longer on the enforcement path — GATE 5 now runs inside the append's
+     * own transaction (a probe here would be check-then-act). It is kept
+     * correct for any external caller and covered by its own test. */
     sqlite3_stmt *st = NULL;
     virp_error_t rc = VIRP_OK;
     if (sqlite3_prepare_v2(state->db,
-            "SELECT 1 FROM artifacts "
+            "SELECT 1 FROM chain_entries "
             "WHERE artifact_id = ? AND artifact_hash <> ? LIMIT 1",
             -1, &st, NULL) != SQLITE_OK) {
         rc = VIRP_ERR_CHAIN_DB;
@@ -670,6 +674,14 @@ static const char *SCHEMA_SQL =
     ");"
     "CREATE INDEX IF NOT EXISTS idx_chain_session_seq "
     "  ON chain_entries(session_id, sequence);"
+    /* GATE 5's federation idempotency check queries chain_entries by
+     * artifact_id (a commitment-only observation has no artifacts row, so
+     * the chain is the only authority on what a correlation id committed
+     * to). Without this index that predicate is a full scan on every
+     * federation append. IF NOT EXISTS so an existing chain.db gains it on
+     * next open — no migration step. */
+    "CREATE INDEX IF NOT EXISTS idx_chain_artifact_id "
+    "  ON chain_entries(artifact_id);"
     /* Signed per-session head: authenticates chain LENGTH, not just links.
      * Updated in the same transaction as every append. A DB writer without
      * K_chain can neither forge a head for a truncated chain nor delete it
@@ -1451,9 +1463,22 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
      * one correlation under two hashes, the exact corruption the gate
      * exists to refuse. Fail closed on a store that cannot answer. */
     if (virp_chain_type_is_federation(artifact_type)) {
+        /* AUTHORITY IS THE CHAIN, NOT BODY STORAGE. The conflict query must
+         * read chain_entries, not artifacts. An oversized (commitment-only)
+         * fed_observation lands as a chain entry committing to its hash but
+         * stores NO artifacts row; querying artifacts here found nothing, so
+         * the same correlation id resubmitted with a DIFFERENT hash sailed
+         * past the gate and the chain committed one correlation to two
+         * observations — the very corruption GATE 5 exists to refuse, on the
+         * exact path (oversized) that is common in production. This is the
+         * body-stored-vs-chain-committed conflation the GATE 4 (-50) fix
+         * corrected in the opposite direction; here the check was too lax
+         * because the body it keyed on was legitimately absent. Every append
+         * writes a chain_entries row, so the chain sees both the retained and
+         * the commitment-only prior; idx_chain_artifact_id keeps it a lookup. */
         sqlite3_stmt *st = NULL;
         if (sqlite3_prepare_v2(state->db,
-                "SELECT 1 FROM artifacts "
+                "SELECT 1 FROM chain_entries "
                 "WHERE artifact_id = ? AND artifact_hash <> ? LIMIT 1",
                 -1, &st, NULL) != SQLITE_OK) {
             sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
