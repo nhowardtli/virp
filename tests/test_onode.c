@@ -2404,7 +2404,7 @@ TEST(test_load_devices_wrong_type_does_not_crash)
         "      \"username\":   \"u\",\n"
         "      \"password\":   \"p\",\n"
         "      \"enable\":     0,\n"
-        "      \"node_id\":    null,\n"
+        "      \"node_id\":    \"0A0000FF\",\n"
         "      \"api_token\":  true,\n"
         "      \"vdom\":       1234,\n"
         "      \"verify_tls\": \"yes\"\n"
@@ -2436,12 +2436,47 @@ TEST(test_load_devices_wrong_type_does_not_crash)
     ASSERT_EQ(strcmp(tmp.devices[0].username, "u"), 0);
     ASSERT_EQ(strcmp(tmp.devices[0].password, "p"), 0);
 
+    /* A valid node_id is REQUIRED (0 is refused, see
+     * test_load_devices_refuses_absent_node_id), so this device carries a
+     * real one; it must be parsed from the hex string. */
+    ASSERT_EQ(tmp.devices[0].node_id, 0x0A0000FFu);
     /* Wrong-type fields must be treated as absent — zeroed by memset. */
     ASSERT_EQ((int)tmp.devices[0].enable_password[0], 0);  /* "enable": int */
-    ASSERT_EQ((int)tmp.devices[0].node_id, 0);             /* "node_id": null */
     ASSERT_EQ((int)tmp.devices[0].api_token[0], 0);        /* "api_token": bool */
     ASSERT_EQ((int)tmp.devices[0].vdom[0], 0);             /* "vdom": int */
     ASSERT_EQ((int)tmp.devices[0].verify_tls, 0);          /* "verify_tls": str */
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(WRONG_TYPE_CFG);
+}
+
+/* A device whose node_id is absent/null/unparseable resolves to 0, which
+ * onode_add_device refuses: node_id is the SIGNED identity an approval
+ * binds to and 0 is not unique. The WHOLE config is refused (fail closed),
+ * not the device silently dropped, and the null value must not crash the
+ * loader. */
+TEST(test_load_devices_refuses_absent_node_id)
+{
+    FILE *f = fopen(WRONG_TYPE_CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"R-NONODE\", \"host\": \"10.0.0.77\",\n"
+        "      \"vendor\": \"mock\", \"node_id\": null }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0007, NULL,
+                         "/tmp/virp-onode-nonode.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    ASSERT_EQ(load_devices(&tmp, WRONG_TYPE_CFG), -1);   /* refused, no crash */
+    ASSERT_EQ(tmp.device_count, 0);
 
     onode_destroy(&tmp);
     virp_context_destroy(tmp.ctx);
@@ -2530,13 +2565,16 @@ TEST(test_add_device_rejects_duplicate_identities)
     ASSERT_OK(onode_add_device(&tmp, &d));
     ASSERT_EQ(tmp.device_count, 2);
 
-    /* Two devices with ABSENT node_id (0 = never routed) do not
-     * collide with each other on node_id. */
+    /* A device with node_id 0 (absent/empty/unparseable config value) is
+     * REJECTED. node_id is the SIGNED identity an approval binds to and 0
+     * is not unique: historically two node_id-0 devices were allowed to
+     * coexist, which — with the unsigned hostname in the approval record —
+     * made an approval fungible between them. Fail closed at load. */
     dup_dev(&d, "R-DUP5", 0, 0);
-    ASSERT_OK(onode_add_device(&tmp, &d));
+    ASSERT_EQ(onode_add_device(&tmp, &d), VIRP_ERR_DUPLICATE_DEVICE);
     dup_dev(&d, "R-DUP6", 0, 0);
-    ASSERT_OK(onode_add_device(&tmp, &d));
-    ASSERT_EQ(tmp.device_count, 4);
+    ASSERT_EQ(onode_add_device(&tmp, &d), VIRP_ERR_DUPLICATE_DEVICE);
+    ASSERT_EQ(tmp.device_count, 2);   /* both rejected, count unchanged */
 
     onode_destroy(&tmp);
 }
@@ -2658,8 +2696,8 @@ TEST(test_load_devices_allows_neighbor_addresses)
     fprintf(f,
         "{\n"
         "  \"devices\": [\n"
-        "    { \"hostname\": \"librenms\", \"host\": \"10.0.10.12\", \"vendor\": \"mock\" },\n"
-        "    { \"hostname\": \"far-host\", \"host\": \"10.0.10.100\", \"vendor\": \"mock\" }\n"
+        "    { \"hostname\": \"librenms\", \"host\": \"10.0.10.12\", \"vendor\": \"mock\", \"node_id\": \"0A000A0C\" },\n"
+        "    { \"hostname\": \"far-host\", \"host\": \"10.0.10.100\", \"vendor\": \"mock\", \"node_id\": \"0A000A64\" }\n"
         "  ]\n"
         "}\n");
     fclose(f);
@@ -5715,6 +5753,7 @@ int main(void)
 
     printf("[Device Config Parser Robustness (issue #7)]\n");
     RUN_TEST(test_load_devices_wrong_type_does_not_crash);
+    RUN_TEST(test_load_devices_refuses_absent_node_id);
     RUN_TEST(test_load_devices_skips_missing_required_fields);
     RUN_TEST(test_add_device_rejects_duplicate_identities);
     RUN_TEST(test_load_devices_duplicate_identities_fatal);

@@ -81,8 +81,30 @@ int main(void)
           r.error_msg);
     if (failures == before) printf(" [PASS]\n");
 
+    /* 3. #6: the proxmox driver must CLASSIFY commands, not leave them all
+     *    UNCLASSIFIED. A NULL route_command means gate_classify() returns
+     *    UNCLASSIFIED for everything — fail-closed under ENFORCE, but
+     *    fail-OPEN under a SHADOW override. proxmox must share the linux
+     *    vendor's Proxmox-aware classifier and reason hook. */
+    before = failures;
+    printf("  test_proxmox_driver_has_a_classifier");
+    CHECK(proxmox_driver.route_command != NULL,
+          "proxmox_driver.route_command is NULL — every command is UNCLASSIFIED");
+    CHECK(proxmox_driver.route_command == linux_gate_tier,
+          "proxmox must use the Proxmox-aware classifier (linux_gate_tier)");
+    CHECK(proxmox_driver.route_reason == linux_gate_reason,
+          "proxmox must use the Proxmox-aware reason hook (linux_gate_reason)");
+    if (proxmox_driver.route_command) {
+        CHECK(proxmox_driver.route_command("pvesm wipedisk local")
+              == VIRP_TIER_BLACK,
+              "a proxmox destructive verb must be BLACK, not UNCLASSIFIED");
+        CHECK(proxmox_driver.route_command("qm list") == VIRP_TIER_GREEN,
+              "a proxmox read must be GREEN, not UNCLASSIFIED");
+    }
+    if (failures == before) printf(" [PASS]\n");
+
     printf("\n%s\n", failures
            ? "FAILED"
-           : "  PASS: linux/proxmox driver refuses BLACK regardless of gate mode");
+           : "  PASS: linux/proxmox driver refuses BLACK and proxmox classifies");
     return failures ? 1 : 0;
 }
