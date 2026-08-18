@@ -1,6 +1,23 @@
 """
 Response validator client — CT 210 side.
 
+===========================================================================
+EXPERIMENTAL — NOT FOR PRODUCTION ENFORCEMENT (M2).
+
+validate_turn() RETURNS A DECISION EVEN WHEN THE SIGNED OBSERVATION IS
+UNVERIFIED — when no verification bridge is supplied, or when the bridge's
+HMAC check fails or raises. In that case ValidationResult.verified is
+False and a WARNING is logged on the returning call. A caller MUST NOT
+treat an unverified decision as authoritative: verify the observation
+(bridge with the O-Key) or re-verify it against the chain before acting.
+
+Making verification MANDATORY — a pinned verifier, raising on absent or
+failed verification, and a key-rotation trust policy — is a roadmap item;
+see the design-proposals doc (M2). Until then this module is an advisory
+client, not an enforcement point.
+===========================================================================
+
+
 Talks to virp-onode over the Unix socket (or the virp-socat TCP proxy at
 10.0.0.211:9999) and invokes the validate_turn action implemented in
 src/virp_onode.c. The validator itself (src/virp_validator.c) runs on
@@ -59,9 +76,12 @@ Copyright 2026 Third Level IT LLC.
 
 import hashlib
 import json
+import logging
 import os
 import socket
 import struct
+
+_log = logging.getLogger(__name__)
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional
@@ -289,6 +309,18 @@ def validate_turn(session_id: str,
         (Decision[a["decision"].upper()], Violation(int(a["violation"])))
         for a in decision.get("assertions", [])
     ]
+
+    if verified is not True:
+        # M2: a decision is being returned WITHOUT a good signature check.
+        # Log loudly so an unverified decision can never be mistaken for an
+        # authoritative one. verified stays False on the result too.
+        _log.warning(
+            "validate_turn: returning an UNVERIFIED decision=%s "
+            "(verification bridge %s, verified=%s) — EXPERIMENTAL, NOT for "
+            "enforcement; the caller MUST NOT treat this as authoritative "
+            "(verify the observation or re-check it against the chain)",
+            decision.get("decision"),
+            "absent" if bridge is None else "present/failed", verified)
 
     return ValidationResult(
         decision=Decision[decision["decision"].upper()],
