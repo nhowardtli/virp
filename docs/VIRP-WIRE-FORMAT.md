@@ -68,7 +68,7 @@ All VIRP messages share a common binary header followed by a variable-length pay
 | version | 1 byte | uint8 | Protocol version. Current: `0x01` |
 | msg_type | 1 byte | uint8 | Message type (see Section 3) |
 | channel | 1 byte | uint8 | `0x01` = OBSERVATION, `0x02` = INTENT |
-| trust_tier | 1 byte | uint8 | `0x00`=GREEN, `0x01`=YELLOW, `0x02`=RED, `0x03`=BLACK |
+| trust_tier | 1 byte | uint8 | `0x01`=GREEN, `0x02`=YELLOW, `0x03`=RED, `0xFF`=BLACK |
 | sequence | 4 bytes | uint32 BE | Monotonic sequence number, per node, no gaps |
 | node_id | 4 bytes | uint32 BE | O-Node identifier |
 | timestamp_ns | 8 bytes | uint64 BE | Unix nanosecond timestamp at collection time |
@@ -116,10 +116,10 @@ Where `||` denotes concatenation.
 
 | Tier | Value | Meaning | Default Action |
 |------|-------|---------|----------------|
-| GREEN | 0x00 | Read-only, non-destructive | Auto-execute |
-| YELLOW | 0x01 | Potentially impactful | Require acknowledgment |
-| RED | 0x02 | Configuration change | Require approval + change record |
-| BLACK | 0x03 | Destructive / irreversible | No execution path exists |
+| GREEN | 0x01 | Read-only, non-destructive | Auto-execute |
+| YELLOW | 0x02 | Potentially impactful | Require acknowledgment |
+| RED | 0x03 | Configuration change | Require approval + change record |
+| BLACK | 0xFF | Destructive / irreversible | No execution path exists |
 
 BLACK tier operations are structurally absent. There is no code path that executes a BLACK-tier message. The tier exists only to classify and reject.
 
@@ -187,7 +187,7 @@ def send_sign_request(sock_path, payload: bytes) -> bytes:
             0x01,        # version
             0x05,        # msg_type: SIGN_REQUEST
             0x01,        # channel: OBSERVATION
-            0x00,        # trust_tier: GREEN
+            0x01,        # trust_tier: GREEN
             0,           # sequence (O-Node assigns)
             0,           # node_id (O-Node assigns)
         )
@@ -276,7 +276,7 @@ Payload:      "show ip interface brief\nGigabitEthernet0/0 is up"
 version:      0x01
 msg_type:     0x01 (OBSERVATION)
 channel:      0x01 (OBSERVATION)
-trust_tier:   0x00 (GREEN)
+trust_tier:   0x01 (GREEN)
 sequence:     0x00000001
 node_id:      0x00000001
 timestamp_ns: 0x0000000000000000 (use 0 for test vector)
