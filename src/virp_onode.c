@@ -1421,22 +1421,11 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      */
     pthread_mutex_lock(&state->exec_mutex[dev_idx]);
 
-    /* Get or create connection */
-    virp_conn_t *conn = get_connection(state, dev_idx);
-    if (!conn) {
-        pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
-        char err_msg[256];
-        snprintf(err_msg, sizeof(err_msg),
-                 "ERROR: cannot connect to '%s'", device_name);
-        log_error_obs(device_name, gate_tier, err_msg);
-        return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
-                                      state->devices[dev_idx].node_id,
-                                      onode_next_seq(state),
-                                      VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
-                                      gate_obs_tier(gate_tier),
-                                      (const uint8_t *)err_msg, (uint16_t)strlen(err_msg),
-                                      &state->okey);
-    }
+    /* L1: the device is deliberately NOT connected yet. The gate below
+     * decides admit/refuse FIRST; only an admitted request connects (just
+     * before drv->execute). An over-tier command under ENFORCE is now
+     * refused with no connection attempt, no auth, no session allocation
+     * and no connect audit noise — the classification alone decides it. */
 
     /* ── Tier-enforcement gate (Phase B/C) ────────────────────────────
      * Classify at the boundary, decide allow/block against the configured
@@ -1737,6 +1726,27 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                           (uint16_t)strlen(err_msg),
                                           &state->okey);
         }
+    }
+
+    /* Admitted by the gate above — allowed, an approved apply, or a
+     * SHADOW would-block that proceeds. ONLY NOW connect (L1): the gate
+     * decision above never touched the device, so a refused request cost
+     * nothing on the wire. */
+    virp_conn_t *conn = get_connection(state, dev_idx);
+    if (!conn) {
+        pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+        char err_msg[256];
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: cannot connect to '%s'", device_name);
+        log_error_obs(device_name, gate_tier, err_msg);
+        return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                      state->devices[dev_idx].node_id,
+                                      onode_next_seq(state),
+                                      VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                      gate_obs_tier(gate_tier),
+                                      (const uint8_t *)err_msg,
+                                      (uint16_t)strlen(err_msg),
+                                      &state->okey);
     }
 
     virp_exec_result_t result;
