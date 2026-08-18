@@ -311,6 +311,10 @@ This section is included deliberately to prevent scope creep and misrepresentati
 
 **Completeness of coverage:** A signed observation corpus covers only what was collected. Absence of a signed observation does not prove absence of a network condition.
 
+**Recorded-happened-once, not happened-was-recorded:** VIRP proves that a *recorded* execution happened **at most once** (single-use approvals + hash-linked OUTCOME). It does **not** prove that everything that *happened* was recorded. An approved apply consumes its authorization, contacts the device, then records an OUTCOME; a crash after the device executed but before the OUTCOME commits leaves "approved, no outcome" — the device changed, yet the chain cannot say so, and that state is indistinguishable from "never contacted". The `chain_append` atomicity fix does not close this (the missing record is *between* appends, across device I/O). See `SECURITY.md` §Execution Durability and the EXECUTION_INTENT proposal in `docs/virp-audit-design-proposals.md`, which is what would let VIRP say "attempted, disposition unknown".
+
+**Crash-safety is SIGKILL, not power loss:** Where crash-safety is claimed, it was established against a `SIGKILL` of the daemon process (fault-injection harness `tests/adversarial/fi-run.sh`), which models a process crash — not a power loss or disk failure. Durability under power loss depends on fsync/WAL and the storage honouring flushes, which `SIGKILL` does not exercise.
+
 -----
 
 ## 9. Relationship to VIRP Core

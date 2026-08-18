@@ -420,6 +420,7 @@ fi
 printf '%s/9 security behaviors observed\n' "$PASS"
 printf 'Evidence bundle: %s\n' "$OUT_DIR"
 printf 'Chain replay:    ./build/virp-tool chain tail --db %s\n' "$RUN_DIR/chain.db"
+printf 'Chain VERIFY:    ./build/virp-tool chain verify --db %s --key %s   (tail replays; verify checks the keyed chain_hmac + completeness)\n' "$RUN_DIR/chain.db" "$RUN_DIR/chain.key"
 printf 'Daemon log:      %s\n' "$LOG"
 printf '%s\n' "$(c_dim 'The target was simulated. This shows protocol behavior, not that')"
 printf '%s\n' "$(c_dim 'any real device was reached or told the truth.')"

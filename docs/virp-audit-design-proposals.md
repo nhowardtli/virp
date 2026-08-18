@@ -212,5 +212,90 @@ advisory client clearly marked EXPERIMENTAL (done in M2) until it lands.
 - A decision signed under the previous key within the window verifies;
   outside the window it raises.
 
+## EXECUTION_INTENT — durable "attempted, disposition unknown" record (-07 material)
+
+Origin: the adversarial test program, test #2 (crash around execution); see
+`tests/adversarial/MEMO-execution-intent.md`.
+
+### Problem — the five-realities collapse, and why it SURVIVES the atomicity fix
+Test #2 crashed the daemon at each boundary of an approved apply and asked a
+single question: after the crash, does the target's record of what happened
+agree with VIRP's? It does not. Today the chain (and the spool) cannot
+distinguish:
+  - `post_consume` — authorization burned, **device never contacted**, from
+  - `post_exec` — authorization burned, **device executed**.
+
+Both leave: an APPROVAL entry, a consumed-once marker, and NO OUTCOME. To
+every reader they are identical, yet in one the device changed and in the
+other it did not. This is the same limit as the claims-hygiene item:
+VIRP supports "a recorded execution happened at most once", not "everything
+that happened was recorded".
+
+**Crucially, this ambiguity is NOT the `chain_append`/`artifact_store`
+non-atomicity — that is a separate, already-shipped fix** (entry, head and
+body now commit or roll back together inside one transaction, see
+`src/virp_chain.c` `chain_append_locked`). The five-realities gap lives
+**between `consume_once()` and the OUTCOME append** — i.e. *between* two
+chain operations, across the device I/O, not *within* one append. No
+amount of per-append atomicity closes it, because the missing record is a
+record of a step that happens between appends.
+
+### Proposal
+A new chain artifact type committed at the ONE instant that separates "not
+attempted" from "attempted, disposition unknown":
+
+```
+EXECUTION_INTENT { proposal_id, approval_entry_hash, device, device_node_id,
+                   command_hash, attempt_at_ns, daemon_build_id }
+```
+
+Chain semantics gain the middle row VIRP currently cannot say:
+
+| chain state | meaning |
+|---|---|
+| approval, no intent, no outcome | authorization spent or lost; **device never contacted** |
+| approval, **intent**, no outcome | **authorized execution attempted; disposition unknown** |
+| approval, intent, outcome | executed, result recorded |
+
+### NORMATIVE placement constraint
+The intent record MUST be committed **after `consume_once()` and immediately
+before `drv->execute()`** — the single line that separates "not attempted"
+from "attempted". Two corollaries, both normative:
+  1. The intent commit MUST NOT be atomic with the consume. They must be
+     separable, because the gap between them is the exact distinction being
+     bought; coupling them reproduces today's ambiguity and buys nothing.
+  2. The intent is its own `BEGIN IMMEDIATE`→`COMMIT`, before device I/O.
+
+### Cost
+- **Storage/schema:** none — a new `artifact_type` on the existing
+  `virp_chain_append()`. No migration. (Do NOT reuse the unused `intents`
+  table — different, AI-intent-shaped concept; its columns would misdescribe
+  this.)
+- **Latency:** one extra `BEGIN IMMEDIATE`→`COMMIT` per privileged apply,
+  on the critical path before device I/O — single-digit ms against SSH
+  connect + exec. Applies only to approved RED/YELLOW applies, never GREEN
+  reads (the autopilot's per-minute load is untouched).
+- **Wire:** none — a local durable record; nothing new crosses the socket.
+- **Operational (the real cost):** an intent with no outcome is a permanent
+  "unknown" that someone must **reconcile**. Today those cases are invisible
+  and therefore free; afterwards they are visible and demand a monitoring
+  surface, a runbook, and an agreed answer to "what do we do with an
+  unresolved intent". That visibility is the point, but it is not zero.
+
+### Spec status
+-07 material, and small: it adds an artifact type to the
+PROPOSAL → APPROVAL → OUTCOME vocabulary (C21), so any spec text enumerating
+chain artifact types changes. It does not touch the wire format, the
+observation header, canonicalization, or any signature construction. If -07
+is open, fold it in; not worth opening a revision for on its own.
+
+### Test strategy
+- A crash injected at the new intent boundary leaves `approval + intent, no
+  outcome`; the verifier reports "attempted, disposition unknown", never
+  "never contacted".
+- A crash BEFORE the intent commit leaves `approval, no intent, no outcome`;
+  the verifier reports "never contacted" — the two are now distinguishable.
+- Reconciliation: an unresolved intent surfaces to the monitoring runbook.
+
 ## Out of this set (tracked separately)
 - **Evidence option-1:** an approved-YELLOW collection path so AC-1/CM-2 stay *covered* (not just gap-documented). A collector + approval-flow design change; larger than the option-2 gap fix already merged.
