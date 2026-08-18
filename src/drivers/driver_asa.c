@@ -1009,6 +1009,14 @@ static virp_error_t asa_execute(virp_conn_t *conn,
     }
 
     /* ── BLACK tier safety: never execute destructive commands ── */
+    /* NOTE (2026-08-18): this refusal sits AFTER the connected check, so
+     * a BLACK command on a disconnected device returns "Not connected"
+     * rather than a BLACK refusal. The linux/proxmox driver places the
+     * same backstop BEFORE its connected check (driver_linux.c,
+     * linux_execute) — refusing a destructive command is a policy
+     * decision independent of reachability, which is the stronger
+     * invariant. Consider moving this one before asa's connected check to
+     * match. Left as-is for now to keep this change scoped to linux. */
     virp_trust_tier_t tier = asa_route_command(command);
     if (tier == VIRP_TIER_BLACK) {
         result->success = false;
