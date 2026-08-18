@@ -67,3 +67,17 @@ L2 (dm-error, whole-device I/O failure → the writer must fail CLOSED, refusing
 the append rather than acking an unpersistable write) is the approved
 companion and has not been run. Under L3 the writer acked (drop_writes is
 silent at the syscall); L2 is the test of whether a HARD error is caught.
+
+## Conclusion — the finding of this run
+
+**Ack-before-durability.** VIRP's success reply to a `chain_append` is an
+acknowledgement that the daemon *committed* the transaction, NOT proof that
+the commit reached durable storage. Under a power-loss-style silent write-drop
+the two come apart: the daemon acked 200 appends that the cut discarded. The
+chain does not lie about them (the head reverted atomically, so nothing dangles
+and the verifier does not claim the lost tail) — but a caller holding those 200
+"successes" has no durable record. This is the honest limit `SECURITY.md`'s
+crash-test caveat now states explicitly in the power-loss direction:
+persistence must be read from the chain's own head/entry consistency, never
+inferred from the ack. It is a limit, not a defect — the chain's integrity
+guarantee held; what does not hold is any equation of "acked" with "durable".
