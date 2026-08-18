@@ -863,29 +863,31 @@ I/O, not within one append. The EXECUTION_INTENT proposal
 disposition unknown"; until then an unresolved apply is genuinely ambiguous
 and must be reconciled out-of-band against the target.
 
-**Crash-test caveat — SIGKILL, not power loss.** The fault-injection harness
-(`tests/adversarial/fi-run.sh`, `VIRP_FI` → `SIGKILL`) models a **process
-crash**: the kernel destroys the process without running atexit / stdio
-flush, so what survives is exactly what was already durable at that instant.
-It does **not** model a full power loss or disk failure — SQLite's durability
-under power loss depends on fsync/WAL behaviour and the storage honouring
-flushes, which SIGKILL does not exercise. So a claim of the form "survives a
-crash" means "survives a SIGKILL of the daemon process", **not** "survives
-loss of power or a lying disk".
+### Crash and storage-failure durability — measured, not assumed
 
-**Power-loss result (`tests/adversarial/fi-powerloss.sh`, dm-flakey
-`drop_writes`, 2026-08-18).** A real storage cut — writes acknowledged at the
-syscall that never reach the platter — was exercised against a chain on a
-disposable loop-backed filesystem. Chain integrity held: the lost tail vanished
-atomically, the signed per-session head reverted with its entries, and the
-verifier reported VALID over an honestly-shorter chain that makes no claim to
-the lost writes (no dangling commitment). But the run named a real limit:
-**a success reply is not proof of persistence under power loss.** The daemon
-acknowledged every post-cut append — writes the cut then discarded — so a
-caller that received "success" for them has no durable record. VIRP's
-acknowledgement precedes durability; under power loss the two come apart, and
-only the chain's own head/entry consistency (not the ack) tells you what
-actually persisted.
+Earlier this section could only say "SIGKILL, not power loss". That gap is now
+closed by direct test: the process crash (SIGKILL, `fi-run.sh`) and three
+storage-failure modes were exercised against a chain on a disposable
+loop-backed filesystem. Each row below is a claim with a transcript behind it
+(`tests/adversarial/transcripts/06-power-loss.md`, `07-torn-write.md`):
+
+| Storage failure | What VIRP does | Evidence |
+|---|---|---|
+| **Hard I/O error** — the device returns an error (failing disk, full volume) | **Fails closed** — refuses the append with a typed error; never returns success for a write it cannot persist | L2 `dm-error`: ACK=0 / ERR=200 |
+| **Silent write-drop** — power loss / lying disk: the write is acknowledged at the syscall but never reaches the platter | **Atomic loss** — the lost tail reverts *with* the signed head; the verifier reports VALID over an honestly-shorter chain that claims nothing it cannot show (no dangling commitment) | L3 `dm-flakey drop_writes` |
+| **Torn recovery** — a cut leaves the signed head claiming more entries than survived | **Detected** — the signed-head completeness check reports BROKEN (`expected N, found M`), never VALID | main-db tear, 9/9 attempts |
+
+Two honest limits remain — stated as limits, not defects, because the chain's
+own integrity guarantee held throughout:
+
+1. **A success reply is not proof of persistence under power loss.** VIRP's
+   acknowledgement means the daemon *committed* the transaction, not that the
+   commit reached durable storage; under a silent write-drop the two come apart
+   (the daemon acked writes the cut then discarded). Read persistence from the
+   chain's own head/entry consistency, never from the ack.
+2. The "recorded-happened-once" gap above (a crash between device I/O and the
+   OUTCOME append) is orthogonal to storage durability and is not closed by any
+   of these results; EXECUTION_INTENT is its remedy.
 
 ## Verifier Limitations
 
