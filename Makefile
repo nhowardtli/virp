@@ -457,6 +457,24 @@ $(TEST_LINUX_CONNECT): tests/test_driver_linux_connect.c \
 test-linux-connect: $(TEST_LINUX_CONNECT)
 	./$(TEST_LINUX_CONNECT)
 
+# In-driver BLACK backstop. The test #includes driver_linux.c to reach the
+# static linux_execute() and the private struct virp_conn, so it must NOT
+# also link linux_scrub_driver.o (that object defines the same symbols).
+# It needs the hostkey TU (driver_linux.c references virp_ssh_verify_hostkey)
+# and -lssh2. Built WITHOUT LINUX=1 so $(LIB) does not export the driver.
+TEST_LINUX_BLACK = $(BUILD_DIR)/test_driver_linux_black
+
+$(TEST_LINUX_BLACK): tests/test_driver_linux_black.c \
+                     $(BUILD_DIR)/linux_scrub_hostkey.o $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_LINUX $< \
+	    $(BUILD_DIR)/linux_scrub_hostkey.o \
+	    $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+.PHONY: test-linux-black
+test-linux-black: $(TEST_LINUX_BLACK)
+	./$(TEST_LINUX_BLACK)
+
 # Chain and Federation tests
 TEST_CHAIN = $(BUILD_DIR)/test_chain
 TEST_FED   = $(BUILD_DIR)/test_federation
@@ -1505,8 +1523,13 @@ check-shared-readpath:
 	  if ! grep -q 'virp_ssh_io.h' $$f; then \
 	    echo "  FAIL: $$f does not include virp_ssh_io.h"; fail=1; \
 	  fi; \
-	  if grep -qE 'libssh2_channel_read' $$f | grep -v io_read; then \
-	    :; \
+	  verdict=$$(awk '/_io_read\(/{inio=1} /^\}/{inio=0} \
+	      /libssh2_channel_read/{t++; if(inio)i++} \
+	      END{print (t>0 && t==i)?"ok":"bad"}' $$f); \
+	  if [ "$$verdict" != "ok" ]; then \
+	    echo "  FAIL: $$f calls libssh2_channel_read outside its *_io_read"; \
+	    echo "        adapter — a direct read bypasses the shared read path."; \
+	    fail=1; \
 	  fi; \
 	done; \
 	if [ $$fail -eq 0 ]; then echo "  OK: all four SSH drivers use the shared read path"; \

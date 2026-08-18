@@ -39,6 +39,10 @@
 #include <openssl/crypto.h>
 #include "virp_ssh_hostkey.h"
 
+/* Forward declaration: the classifier is defined far below but the
+ * in-driver BLACK backstop in linux_execute() (near the top) calls it. */
+virp_trust_tier_t linux_gate_tier(const char *command);
+
 /* =========================================================================
  * Constants
  * ========================================================================= */
@@ -327,6 +331,35 @@ static virp_error_t linux_execute(virp_conn_t *conn,
         return VIRP_ERR_NULL_PTR;
 
     memset(result, 0, sizeof(*result));
+
+    /*
+     * BLACK-tier backstop — MODE-INDEPENDENT. The ASA, JunOS, IOS and
+     * FortiGate drivers each refuse a BLACK-classified command inside
+     * their own execute() (e.g. driver_asa.c). The linux/proxmox driver
+     * did not, even though linux_gate_tier() is exactly what classifies
+     * qm|pct destroy, pvesh delete, pvesm remove|wipedisk and
+     * shutdown/halt self-harm as BLACK. That gap matters because the
+     * O-Node gate only blocks BLACK when gate_effective_mode == ENFORCE;
+     * under a per-driver SHADOW override the gate logs "would-block" and
+     * still dispatches to the driver — so the driver is the last line of
+     * defence. This refusal is deliberately placed BEFORE the connected
+     * check: forbidding a destructive command is a policy decision that
+     * does not depend on whether the device is reachable, and it keeps
+     * the guarantee independent of connection state. (This is stricter
+     * than the ASA driver, which refuses BLACK only after the connected
+     * check.)
+     */
+    if (linux_gate_tier(command) == VIRP_TIER_BLACK) {
+        result->success = false;
+        result->exit_code = 1;
+        result->no_dispatch = true;   /* nothing was ever sent */
+        result->disposition = VIRP_DISPOSITION_NOT_SENT;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "BLACK tier: command blocked on %s", conn->device.hostname);
+        fprintf(stderr, "[Linux] BLACK tier blocked: '%s' on %s\n",
+                command, conn->device.hostname);
+        return VIRP_OK;
+    }
 
     if (!conn->connected) {
         result->success = false;
