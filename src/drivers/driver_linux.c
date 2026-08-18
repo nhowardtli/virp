@@ -2857,6 +2857,18 @@ static virp_driver_t proxmox_driver = {
     .disconnect = linux_disconnect,
     .detect     = linux_detect,
     .health_check = linux_health_check,
+    /* A driver with no route_command classifies EVERY command
+     * UNCLASSIFIED (gate_classify falls back to UNCLASSIFIED when the hook
+     * is NULL). This vtable was missing the classifier, so a device with
+     * vendor "proxmox" got UNCLASSIFIED for everything — fail-closed under
+     * ENFORCE (total lockout), but fail-OPEN under any per-driver SHADOW
+     * override (every command, destructive included, "would-block" then
+     * runs). The Proxmox verbs (qm/pct/pvesh/pvesm) are exactly what
+     * linux_gate_tier classifies, so wire proxmox to the SAME classifier
+     * and reason hook the linux vendor uses. (linux_execute already
+     * carries the mode-independent BLACK backstop for both vendors.) */
+    .route_command = linux_gate_tier,
+    .route_reason  = linux_gate_reason,
 };
 
 void virp_driver_linux_init(void)
