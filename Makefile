@@ -555,6 +555,24 @@ onode-fi:
 	@echo "  never 'make install' this, never point the systemd unit at it,"
 	@echo "  and only run it against an isolated socket/chain/spool."
 
+# LAB-ONLY: chain_append crash-atomicity regression (adversarial test #2).
+# Builds tests/test_chain_atomicity_fi.c AND libvirp.a with -DVIRP_FAULT_INJECT
+# into build-fi/ so VIRP_FI("mid_outcome") fires. The test forks, SIGKILLs the
+# child mid-transaction at that point, reopens the crashed DB, and asserts the
+# entry and its body are in the same state (no dangling commitment). Same
+# isolation contract as onode-fi: build-fi/ only, never build/, never installed.
+# Operates on a private /tmp database. Red proof in the .c file header.
+TEST_CHAIN_ATOM_FI = build-fi/test_chain_atomicity_fi
+.PHONY: test-chain-atomicity-fi
+$(TEST_CHAIN_ATOM_FI): tests/test_chain_atomicity_fi.c
+	$(MAKE) BUILD_DIR=build-fi CFLAGS_EXTRA=-DVIRP_FAULT_INJECT \
+	        LINUX=1 build-fi/libvirp.a
+	rm -f $@
+	$(CC) $(CFLAGS) -DVIRP_FAULT_INJECT $< build-fi/libvirp.a $(LDFLAGS) -o $@
+
+test-chain-atomicity-fi: $(TEST_CHAIN_ATOM_FI)
+	./$(TEST_CHAIN_ATOM_FI)
+
 # 'make prod' builds the prod O-Node with all production drivers enabled,
 # including PAN-OS. Uses recursive $(MAKE) because the driver guards are
 # `ifdef PANOS` / `ifdef CISCO` / etc., which are evaluated at Makefile
