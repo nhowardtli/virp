@@ -4385,6 +4385,28 @@ virp_error_t onode_add_device(onode_state_t *state,
         state->devices[state->device_count].device_id =
             virp_device_id_from_hostname(device->hostname);
 
+    /* node_id must be a unique, explicit, NON-ZERO identity. It is what
+     * virp_approval_verify_consume actually binds an approval to: apply
+     * grants when the request's device_node_id matches the SIGNED node_id
+     * in the approval record; the hostname in that record is NOT signed.
+     * node_id 0 ("absent", from a missing/empty/unparseable config value)
+     * was previously exempt from the uniqueness check below — so two
+     * node_id-0 devices could coexist, and an attacker able to edit the
+     * approval store could rewrite the unsigned hostname A->B (both
+     * node_id 0) and have A's approval execute on B, the signature still
+     * valid because it covers node_id 0 either way. Reject node_id 0 at
+     * load, fail closed, so the signed node_id is always a real unique
+     * device identity. (No current device uses node_id 0 — every device
+     * is assigned hex-of-IP — so this only forbids a future misconfig.) */
+    if (state->devices[state->device_count].node_id == 0) {
+        fprintf(stderr, "[O-Node] FATAL: device '%s' has node_id 0 "
+                "(reserved 'absent' value from a missing/empty/unparseable "
+                "config field). Every device must carry a unique NON-ZERO "
+                "node_id — the approval binding depends on it.\n",
+                device->hostname);
+        return VIRP_ERR_DUPLICATE_DEVICE;
+    }
+
     /* Identity uniqueness, same choke point (checked AFTER derivation so
      * an explicit device_id colliding with another device's derived one
      * is caught too). hostname routes requests, node_id routes wire
@@ -4398,10 +4420,9 @@ virp_error_t onode_add_device(onode_state_t *state,
             const char *field = NULL;
             if (strcmp(ed->hostname, nd->hostname) == 0)
                 field = "hostname";
-            else if (nd->node_id != 0 && ed->node_id == nd->node_id)
-                field = "node_id";   /* 0 = absent: never routed, and
-                                        approval binding pairs it with
-                                        the (unique) hostname */
+            else if (ed->node_id == nd->node_id)
+                field = "node_id";   /* node_id 0 already rejected above,
+                                        so this is plain uniqueness */
             else if (ed->device_id == nd->device_id)
                 field = "device_id";
             if (field) {
