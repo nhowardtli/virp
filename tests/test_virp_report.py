@@ -593,14 +593,21 @@ class TestVerificationOnCleanChain(unittest.TestCase):
         self.assertEqual(summary["obs_hmac"][verify.PASS], 0)
 
     def test_gate_rejection_binding_is_unverifiable_not_failed(self):
-        """No body is stored for a gate rejection; that is a retention limit,
-        not a verification failure."""
+        """No body is stored for a gate rejection; that is a retention limit.
+        It is UNVERIFIABLE — neither a verification failure (FAIL/tamper)
+        nor a clean pass. It must roll up as not-ok and NOT read as PASS,
+        yet must stay out of failed_entries (which is tamper only) and land
+        in the distinct unverifiable_entries bucket."""
         gate = [v for v in self.vs
                 if v.entry["artifact_type"] == "gate_rejection"]
         self.assertTrue(gate)
         for v in gate:
             self.assertEqual(v.artifact_bind, verify.UNVERIFIABLE)
-            self.assertTrue(v.ok)
+            self.assertEqual(v.rollup, verify.UNVERIFIABLE)
+            self.assertFalse(v.ok, "an unverifiable entry must not roll up as ok")
+            self.assertNotIn(v, self.summary["failed_entries"],
+                             "unverifiable is not a tamper failure")
+            self.assertIn(v, self.summary["unverifiable_entries"])
 
     def test_lifecycle_reconstruction(self):
         cycles = virp_report.build_lifecycles(self.vs)

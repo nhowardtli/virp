@@ -65,9 +65,9 @@ if [ "${1:-}" = "--selftest" ]; then
     done < "$MANIFEST"
 
     if VIRP_ETC_ROOT="$tmp" "$0" >/dev/null 2>&1; then
-        echo "  selftest 1/4 PASS: clean fixture reports clean"
+        echo "  selftest 1/5 PASS: clean fixture reports clean"
     else
-        echo "  selftest 1/4 FAIL: clean fixture reported drift"
+        echo "  selftest 1/5 FAIL: clean fixture reported drift"
         VIRP_ETC_ROOT="$tmp" "$0" | sed 's/^/      /'
         exit 1
     fi
@@ -76,9 +76,9 @@ if [ "${1:-}" = "--selftest" ]; then
     echo 'Environment=SOMETHING_NEW=1' \
         >> "$tmp/etc/systemd/system/virp-onode.service"
     if VIRP_ETC_ROOT="$tmp" "$0" >/dev/null 2>&1; then
-        echo "  selftest 2/4 FAIL: a one-line edit went undetected"; exit 1
+        echo "  selftest 2/5 FAIL: a one-line edit went undetected"; exit 1
     else
-        echo "  selftest 2/4 PASS: one added line is detected"
+        echo "  selftest 2/5 PASS: one added line is detected"
     fi
 
     # Drifted fixture, NON-unit file: the manifest also covers a plain
@@ -88,25 +88,41 @@ if [ "${1:-}" = "--selftest" ]; then
     if [ -f "$tmp/etc/nftables-virp-netclaw-egress.nft" ]; then
         echo '# stray line' >> "$tmp/etc/nftables-virp-netclaw-egress.nft"
         if VIRP_ETC_ROOT="$tmp" "$0" >/dev/null 2>&1; then
-            echo "  selftest 3/4 FAIL: non-unit file drift went undetected"
+            echo "  selftest 3/5 FAIL: non-unit file drift went undetected"
             exit 1
         else
-            echo "  selftest 3/4 PASS: non-unit file drift is detected"
+            echo "  selftest 3/5 PASS: non-unit file drift is detected"
         fi
         git -C "$REPO_ROOT" show HEAD:deploy/nftables-virp-netclaw-egress.nft \
             > "$tmp/etc/nftables-virp-netclaw-egress.nft" 2>/dev/null || \
             cp "$REPO_ROOT/deploy/nftables-virp-netclaw-egress.nft" \
                "$tmp/etc/nftables-virp-netclaw-egress.nft"
     else
-        echo "  selftest 3/4 SKIP: no non-unit file in the manifest"
+        echo "  selftest 3/5 SKIP: no non-unit file in the manifest"
     fi
 
     # Untracked fixture: a unit nobody named.
     echo "[Unit]" > "$tmp/etc/systemd/system/virp-rogue.service"
     if VIRP_ETC_ROOT="$tmp" "$0" >/dev/null 2>&1; then
-        echo "  selftest 4/4 FAIL: an untracked unit went undetected"; exit 1
+        echo "  selftest 4/5 FAIL: an untracked unit went undetected"; exit 1
     else
-        echo "  selftest 4/4 PASS: an untracked unit is detected"
+        echo "  selftest 4/5 PASS: an untracked unit is detected"
+    fi
+    rm -f "$tmp/etc/systemd/system/virp-rogue.service"
+
+    # Untracked DROP-IN under a NON-onode unit's .d directory. The reverse
+    # scan used to enumerate only virp-onode.service.d/*, so a rogue
+    # drop-in on any other virp unit (e.g. one re-adding VIRP_WAZUH_INSECURE
+    # on the autopilot units that read the chain) was invisible. This is
+    # the installed-side twin of the canonical-unit-only Wazuh check.
+    mkdir -p "$tmp/etc/systemd/system/virp-autopilot.service.d"
+    echo 'Environment=VIRP_WAZUH_INSECURE=1' \
+        > "$tmp/etc/systemd/system/virp-autopilot.service.d/99-rogue.conf"
+    if VIRP_ETC_ROOT="$tmp" "$0" >/dev/null 2>&1; then
+        echo "  selftest 5/5 FAIL: a rogue drop-in outside onode.service.d went undetected"
+        exit 1
+    else
+        echo "  selftest 5/5 PASS: an untracked drop-in in any virp unit's .d is detected"
     fi
     exit 0
 fi
@@ -234,7 +250,7 @@ done < "$MANIFEST"
 # ── 2. installed units nobody tracks ──────────────────────────────────
 echo ""
 echo "=== checking every installed virp-* unit is tracked ==="
-for f in "$UNIT_DIR"/virp-* "$UNIT_DIR"/virp-onode.service.d/*; do
+for f in "$UNIT_DIR"/virp-* "$UNIT_DIR"/virp-*.service.d/*; do
     [ -f "$f" ] || continue
     if [ -z "${known_installed[$f]:-}" ]; then
         fail=1
