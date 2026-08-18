@@ -873,6 +873,20 @@ flushes, which SIGKILL does not exercise. So a claim of the form "survives a
 crash" means "survives a SIGKILL of the daemon process", **not** "survives
 loss of power or a lying disk".
 
+**Power-loss result (`tests/adversarial/fi-powerloss.sh`, dm-flakey
+`drop_writes`, 2026-08-18).** A real storage cut — writes acknowledged at the
+syscall that never reach the platter — was exercised against a chain on a
+disposable loop-backed filesystem. Chain integrity held: the lost tail vanished
+atomically, the signed per-session head reverted with its entries, and the
+verifier reported VALID over an honestly-shorter chain that makes no claim to
+the lost writes (no dangling commitment). But the run named a real limit:
+**a success reply is not proof of persistence under power loss.** The daemon
+acknowledged every post-cut append — writes the cut then discarded — so a
+caller that received "success" for them has no durable record. VIRP's
+acknowledgement precedes durability; under power loss the two come apart, and
+only the chain's own head/entry consistency (not the ack) tells you what
+actually persisted.
+
 ## Verifier Limitations
 
 Two verifiers ship in **this** tree — the Python claim verifier and the C
