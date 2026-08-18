@@ -88,7 +88,21 @@ CHAIN="$MNT/chain.db"; KEY="$MNT/chain.key"
 head -c 32 /dev/urandom > "$KEY"; chmod 600 "$KEY"
 "$CLI" keygen okey "$MNT/onode.key" >/dev/null 2>&1 || { echo "keygen okey failed"; exit 1; }
 chmod 600 "$MNT/onode.key"
-printf '[]' > "$MNT/devices.json"; printf '[]' > "$MNT/approvers.json"
+# The daemon refuses to start with zero devices, so give it one mock device it
+# never uses — this test only chain_appends, it never executes on a device.
+# socket_allowed_uids is omitted, so the daemon defaults it to its own euid
+# (this user), which is exactly who drives the appends below.
+cat > "$MNT/devices.json" <<'JSON'
+{
+  "gate_max_tier": "yellow",
+  "gate_default_mode": "enforce",
+  "devices": [
+    { "hostname": "pl-dummy", "host": "127.0.0.1", "port": 22,
+      "vendor": "mock", "node_id": "0DE0F001" }
+  ]
+}
+JSON
+printf '[]' > "$MNT/approvers.json"
 start_daemon() {
   "$D" -k "$MNT/onode.key" -s "$MNT/onode.sock" -d "$MNT/devices.json" \
        -c "$CHAIN" -C "$KEY" -a "$MNT/approvals" -A "$MNT/approvers.json" \
