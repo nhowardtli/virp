@@ -119,7 +119,14 @@ start_daemon() {
 # Commitment-only fed_observation appends (the oversized shape: no body, so no
 # artifacts row — the daemon accepts the bare commitment). Distinct synthetic
 # 64-hex hash per index; SESSION fixed so the signed head tracks a length.
-append() {  # $1 = index
+append() {  # $1 = index; echoes exactly one of: ACK | ERR | FAIL
+  #   ACK  — a success reply carrying the new chain_entry_hash (the daemon
+  #          says it committed the append)
+  #   ERR  — a typed error (4-byte code) or a signed ERROR observation (the
+  #          daemon refused, cleanly)
+  #   FAIL — transport broke (no/short reply, connection reset, timeout)
+  # This distinction is the whole point of L2: "did the writer ACK a write it
+  # could not persist, or fail closed?" — which a bare exit code cannot answer.
   local h; h=$(printf '%064x' "$1")
   python3 - "$MNT/onode.sock" "$h" "$1" <<'PY'
 import socket,struct,sys
@@ -127,11 +134,19 @@ sock,h,i=sys.argv[1],sys.argv[2],sys.argv[3]
 j=('{"action":"chain_append","session_id":"powerloss:1",'
    '"artifact_type":"fed_observation","artifact_id":"pl-obs-%s",'
    '"artifact_hash":"%s"}'%(i,h)).encode()
-s=socket.socket(socket.AF_UNIX); s.connect(sock)
-s.sendall(struct.pack(">I",1+len(j))+b"\x02"+j)
-hdr=s.recv(4); n=struct.unpack(">I",hdr)[0]; b=b""
-while len(b)<n: b+=s.recv(n-len(b))
-sys.exit(0 if n>4 else 1)
+try:
+    s=socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect(sock)
+    s.sendall(struct.pack(">I",1+len(j))+b"\x02"+j)
+    hdr=s.recv(4)
+    if len(hdr)<4: print("FAIL"); sys.exit(0)
+    n=struct.unpack(">I",hdr)[0]; b=b""
+    while len(b)<n:
+        c=s.recv(n-len(b))
+        if not c: break
+        b+=c
+    print("ACK" if (n>4 and b"chain_entry_hash" in b) else "ERR")
+except Exception:
+    print("FAIL")
 PY
 }
 
@@ -139,7 +154,9 @@ start_daemon
 echo "daemon pid=$DPID on $CHAIN"
 
 # ---- phase 1: land + fsync a durable prefix -----------------------------
-for i in $(seq 1 "$APPENDS_PRESYNC"); do append "$i" >/dev/null || echo "presync append $i refused"; done
+for i in $(seq 1 "$APPENDS_PRESYNC"); do
+  [ "$(append "$i")" = ACK ] || echo "presync append $i: not ACK (pre-cut, unexpected)"
+done
 sync; sudo blockdev --flushbufs "$LOOPDEV"
 PRE=$(sqlite3 "file:$CHAIN?mode=ro" "SELECT COUNT(*) FROM chain_entries WHERE artifact_id LIKE 'pl-obs-%';" 2>/dev/null)
 echo "durable prefix: $PRE entries, synced to the image"
@@ -166,11 +183,15 @@ else
 fi
 
 # ---- phase 3: appends into the void, then a hard crash ------------------
-refused=0
+post_ack=0; post_err=0; post_fail=0
 for i in $(seq $((APPENDS_PRESYNC+1)) $((APPENDS_PRESYNC+APPENDS_POSTCUT))); do
-  append "$i" >/dev/null || refused=$((refused+1))
+  case "$(append "$i")" in
+    ACK) post_ack=$((post_ack+1));;
+    ERR) post_err=$((post_err+1));;
+    *)   post_fail=$((post_fail+1));;
+  esac
 done
-echo "post-cut appends refused by the writer: $refused / $APPENDS_POSTCUT"
+echo "post-cut replies: ACK=$post_ack  ERR=$post_err  FAIL=$post_fail  (of $APPENDS_POSTCUT)"
 sudo kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; DPID=""
 
 # ---- phase 4: reopen from the IMAGE with cold cache, then verify --------
@@ -196,11 +217,21 @@ VERIFY=$?
 
 # ---- verdict ------------------------------------------------------------
 echo "================================================================"
-echo "durable prefix=$PRE  survived=$POST  post-cut-refused=$refused"
+echo "durable prefix=$PRE  survived=$POST  post-cut: ACK=$post_ack ERR=$post_err FAIL=$post_fail"
 echo "signed head last_sequence=$HEADSEQ  verify_exit=$VERIFY  (survived seqs 0..$((POST-1)))"
 if [ "$MODE" != flakey ]; then
-  echo "L2 (dm-error): the writer should have REFUSED post-cut appends (refused=$refused);"
-  echo "               a nonzero refused count with a still-valid pre-cut chain is fail-closed."
+  # L2 dm-error: every chain-device I/O errors. THE QUESTION: does the writer
+  # fail closed, or ack a write it cannot persist?
+  if [ "$post_ack" -gt 0 ]; then
+    echo "FINDING (L2): the writer ACKED $post_ack post-cut appends despite a hard I/O"
+    echo "  error on the chain device — success replies for writes it could not persist."
+    echo "  That is ack-through, not fail-closed."
+  else
+    echo "PASS (L2, fail-closed): 0 acks — every post-cut append was refused with a"
+    echo "  typed error (ERR=$post_err) or a broken connection (FAIL=$post_fail). The"
+    echo "  writer never returned success for a write the storage rejected. (Post-cut"
+    echo "  survived=$POST vs durable=$PRE confirms none of the errored writes persisted.)"
+  fi
 elif [ "$PRE" -eq 0 ]; then
   echo "INVALID: no durable prefix (should have aborted in phase 1)."
 elif [ "$POST" -lt "$PRE" ]; then
