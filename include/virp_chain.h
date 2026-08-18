@@ -364,6 +364,20 @@ virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,
                                              bool *exists);
 
 /*
+ * Set *exists to true iff a chain ENTRY of an observation type
+ * ('observation'/'fed_observation') commits to the given artifact_hash —
+ * i.e. the observation was appended, whether or not its body bytes were
+ * retained. This is what the fed_outcome gate must ask about a citation:
+ * an outcome naming a hash the chain committed to is BACKED even if the
+ * body is not stored (an oversized, commitment-only observation). Distinct
+ * from virp_chain_artifact_body_exists(), which asks whether the BYTES
+ * were retained. Returns VIRP_OK on a successful query (matched or not).
+ */
+virp_error_t virp_chain_entry_commits_to(virp_chain_state_t *state,
+                                         const char *artifact_hash,
+                                         bool *exists);
+
+/*
  * Set *conflict to true iff the artifacts table already holds a body
  * under the given artifact_id whose artifact_hash DIFFERS from the one
  * supplied; a byte-identical resubmission (same id, same hash) is NOT a

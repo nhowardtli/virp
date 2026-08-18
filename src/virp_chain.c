@@ -304,6 +304,51 @@ virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,
     return rc;
 }
 
+/*
+ * Set *exists to true iff a chain ENTRY of an observation type commits to
+ * the given artifact_hash — i.e. a signed observation with this hash was
+ * appended, whether or not its body bytes were retained. This is the
+ * question the fed_outcome gate must ask about a citation: an outcome
+ * whose observation_sha256 names a hash the chain committed to is BACKED
+ * (the observation is in the chain; a missing body only makes it
+ * UNVERIFIABLE, which every reader grades honestly). Distinct from
+ * virp_chain_artifact_body_exists(), which asks whether the BYTES were
+ * retained — the answer that wrongly refused an oversized (commitment-
+ * only) observation's outcome. Restricted to observation types so an
+ * outcome cannot be "backed" by an unrelated entry that happens to share
+ * a hash. Returns VIRP_OK on a successful query (whether or not it matched).
+ */
+virp_error_t virp_chain_entry_commits_to(virp_chain_state_t *state,
+                                         const char *artifact_hash,
+                                         bool *exists)
+{
+    if (!state || !artifact_hash || !exists) return VIRP_ERR_NULL_PTR;
+    *exists = false;
+
+    pthread_mutex_lock(&state->lock);
+    /* One-off statement (not in the shared prepared-statement set), the
+     * same discipline as the sibling probes: a read on the append path
+     * must not contend with the append's own statements. */
+    sqlite3_stmt *st = NULL;
+    virp_error_t rc = VIRP_OK;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT 1 FROM chain_entries WHERE artifact_hash = ? "
+            "AND artifact_type IN ('observation','fed_observation') LIMIT 1",
+            -1, &st, NULL) != SQLITE_OK) {
+        rc = VIRP_ERR_CHAIN_DB;
+    } else {
+        sqlite3_bind_text(st, 1, artifact_hash, -1, SQLITE_TRANSIENT);
+        int step = sqlite3_step(st);
+        if (step == SQLITE_ROW)
+            *exists = true;
+        else if (step != SQLITE_DONE)
+            rc = VIRP_ERR_CHAIN_DB;
+    }
+    if (st) sqlite3_finalize(st);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
 virp_error_t virp_chain_artifact_id_conflict(virp_chain_state_t *state,
                                              const char *artifact_id,
                                              const char *artifact_hash,

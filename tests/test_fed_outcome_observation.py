@@ -91,6 +91,23 @@ def load_hash_types(conn):
     return types
 
 
+def load_committed_observation_hashes(conn):
+    """Every artifact_hash an OBSERVATION chain ENTRY commits to, as a set.
+
+    Distinct from load_artifact_hashes(): that reads the `artifacts` table
+    (bodies retained); this reads `chain_entries` (appends accepted). An
+    oversized observation — a GREEN output past the daemon's 8192-byte
+    inline field — is chained commitment-only: the entry lands and commits
+    to the hash, but no body row is stored. Such an observation is still IN
+    the chain, so a fed_outcome that cites it is BACKED even though the body
+    is not retrievable (the reader grades that entry UNVERIFIABLE, not PASS).
+    This mirrors the daemon's fed_outcome gate (virp_chain_entry_commits_to).
+    """
+    return {h for (h,) in conn.execute(
+        "SELECT artifact_hash FROM chain_entries "
+        "WHERE artifact_type IN ('observation','fed_observation')")}
+
+
 class TestFedOutcomeObservationResolves(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -102,6 +119,7 @@ class TestFedOutcomeObservationResolves(unittest.TestCase):
         cls.since = os.environ.get("VIRP_FED_SINCE") or None
         cls.outcomes = load_fed_outcomes(cls.conn, cls.since)
         cls.hashes = load_artifact_hashes(cls.conn)
+        cls.committed = load_committed_observation_hashes(cls.conn)
         cls.hash_types = load_hash_types(cls.conn)
 
     @classmethod
@@ -129,7 +147,12 @@ class TestFedOutcomeObservationResolves(unittest.TestCase):
             "\n".join("  id=%s completed=%s value=%r" % m for m in missing))
 
     def test_every_cited_observation_resolves(self):
-        """THE assertion: the cited body must be retrievable from artifacts."""
+        """THE assertion: the cited observation must be BACKED by the chain —
+        either its body is retrievable from artifacts, OR an observation
+        entry commits to the hash (an oversized, commitment-only
+        observation, whose body was legitimately not retained). Only a hash
+        that NEITHER stores a body NOR is committed by any observation entry
+        is a dangling pointer — evidence the chain cannot produce."""
         dangling = []
         for rowid, body in self.outcomes:
             if body is None:
@@ -137,14 +160,15 @@ class TestFedOutcomeObservationResolves(unittest.TestCase):
             h = body.get("observation_sha256")
             if not isinstance(h, str) or len(h) != 64:
                 continue          # covered by the previous test
-            if h not in self.hashes:
+            if h not in self.hashes and h not in self.committed:
                 dangling.append((
                     body.get("completed_at"), body.get("device"),
                     body.get("command"), h))
 
         if dangling:
             lines = ["%d of %d fed_outcome artifacts cite an observation "
-                     "that is NOT in the artifacts table." %
+                     "that is NEITHER stored as a body NOR committed by an "
+                     "observation entry." %
                      (len(dangling), len(self.outcomes)),
                      "The chain claims evidence it cannot produce.",
                      "First 10:"]
