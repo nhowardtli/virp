@@ -58,6 +58,12 @@ the run was produced from. Replay the chain at any time:
 ./build/virp-tool chain tail --db demo/output/session-<timestamp>/run/chain.db
 ```
 
+`chain tail` **replays** the chain (lists entries; PREV_HASH linkage is visible but not checked). To **verify** it — recompute each `chain_entry_hash`, check the keyed `chain_hmac`, and require range completeness — use `virp chain verify`:
+
+```bash
+./build/virp-tool chain verify --db demo/output/session-<timestamp>/run/chain.db --key demo/output/session-<timestamp>/run/chain.key
+```
+
 ## The target is simulated
 
 `demo-r1` uses the built-in mock driver (`src/drivers/driver_mock.c`), which

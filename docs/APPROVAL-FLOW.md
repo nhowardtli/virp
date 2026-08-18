@@ -195,7 +195,10 @@ sudo -u virp-onode virp apply <proposal-id>
 virp approve <proposal-id> --pkcs11 … --slot 9c
 
 # 6. Audit: PROPOSAL → APPROVAL(key_id, operator) → OUTCOME, hash-linked.
-virp chain tail -n 12
+virp chain tail -n 12          # replay (list) — PREV_HASH linkage is visible
+virp chain verify --session S  # verify — recompute hashes + keyed chain_hmac,
+                               #          require range completeness (the
+                               #          verification path; tail does not check)
 ```
 
 `virp approve` never opens chain.db and never writes an approval record —

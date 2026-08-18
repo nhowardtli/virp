@@ -119,7 +119,12 @@ Operator client view: rejection observation seq=91.
 ### T8 — chain: PROPOSAL → APPROVAL → OUTCOME, hash-linked
 
 `virp chain tail` against the live chain (each row's PREV_HASH is the
-prior row's ENTRY_HASH within the session; f9e1 flow shown):
+prior row's ENTRY_HASH within the session; f9e1 flow shown). Note `tail`
+**replays** — the PREV_HASH linkage below is visible to the eye but not
+checked. The verification path is `virp chain verify --session <S>` (LIVE,
+via the daemon) or `virp chain verify --db <db> --key <key>` (OFFLINE),
+which recomputes each hash, checks the keyed `chain_hmac`, and requires
+range completeness:
 
 ```
 SESSION       SEQ  TYPE      ARTIFACT_ID                                ENTRY_HASH        PREV_HASH
