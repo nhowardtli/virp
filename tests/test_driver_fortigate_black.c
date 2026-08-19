@@ -469,6 +469,182 @@ static void test_execute_backup_is_gated(void)
     PASS();
 }
 
+/* =========================================================================
+ * Read-only audit set (2026-08-19)
+ *
+ * The GREEN table was widened so a read-only auditor can work without
+ * an approval round-trip. Implemented as EXPLICIT entries, not a
+ * { "get ", GREEN } / { "show ", GREEN } prefix pair: the bare `show`
+ * catch-all removed in b26e34d undercut the RED credential entries, and
+ * a GREEN prefix would do the same one tier lower. The second half of
+ * this suite pins the boundaries that make the explicit form safe.
+ * ========================================================================= */
+
+static void test_readonly_audit_set_is_green(void)
+{
+    printf("\n=== Read-only audit set classifies GREEN ===\n");
+
+    TEST("get system global -> GREEN");
+    assert(fg_route_command("get system global") == VIRP_TIER_GREEN); PASS();
+
+    TEST("get system service -> GREEN");
+    assert(fg_route_command("get system service") == VIRP_TIER_GREEN); PASS();
+
+    TEST("get system certificate local -> GREEN");
+    assert(fg_route_command("get system certificate local") == VIRP_TIER_GREEN); PASS();
+
+    TEST("get vpn ssl settings -> GREEN");
+    assert(fg_route_command("get vpn ssl settings") == VIRP_TIER_GREEN); PASS();
+
+    TEST("get wireless-controller vap -> GREEN");
+    assert(fg_route_command("get wireless-controller vap") == VIRP_TIER_GREEN); PASS();
+
+    TEST("show firewall policy -> GREEN (beats \"show firewall\" YELLOW)");
+    assert(fg_route_command("show firewall policy") == VIRP_TIER_GREEN); PASS();
+
+    TEST("show firewall address -> GREEN");
+    assert(fg_route_command("show firewall address") == VIRP_TIER_GREEN); PASS();
+
+    TEST("show vpn ipsec phase2-interface -> GREEN");
+    assert(fg_route_command("show vpn ipsec phase2-interface") == VIRP_TIER_GREEN); PASS();
+
+    TEST("diagnose sys session stat -> GREEN (beats \"diagnose\" YELLOW)");
+    assert(fg_route_command("diagnose sys session stat") == VIRP_TIER_GREEN); PASS();
+
+    /* Already GREEN before this change — pinned so the widening did not
+     * accidentally shadow them with a longer non-GREEN entry. */
+    TEST("get system interface -> GREEN (pre-existing)");
+    assert(fg_route_command("get system interface") == VIRP_TIER_GREEN); PASS();
+
+    TEST("get router info routing-table all -> GREEN (pre-existing)");
+    assert(fg_route_command("get router info routing-table all")
+           == VIRP_TIER_GREEN); PASS();
+
+    /* Leading whitespace is stripped before matching. */
+    TEST("\" show firewall policy\" -> GREEN (leading space stripped)");
+    assert(fg_route_command("  show firewall policy") == VIRP_TIER_GREEN); PASS();
+}
+
+/* =========================================================================
+ * Hard boundaries — the widening must not reach these
+ *
+ * config / execute / all-other-diagnose / show full-configuration.
+ * ========================================================================= */
+
+static void test_audit_widening_hard_boundaries(void)
+{
+    printf("\n=== Hard boundaries stay non-GREEN ===\n");
+
+    TEST("config system admin -> not GREEN (RED)");
+    assert(fg_route_command("config system admin") != VIRP_TIER_GREEN);
+    assert(fg_route_command("config system admin") == VIRP_TIER_RED); PASS();
+
+    TEST("execute reboot -> not GREEN");
+    assert(fg_route_command("execute reboot") != VIRP_TIER_GREEN); PASS();
+
+    TEST("show full-configuration -> not GREEN (stays YELLOW backup path)");
+    assert(fg_route_command("show full-configuration") != VIRP_TIER_GREEN);
+    assert(fg_route_command("show full-configuration") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("diagnose sys session clear -> not GREEN");
+    assert(fg_route_command("diagnose sys session clear") != VIRP_TIER_GREEN);
+    assert(fg_route_command("diagnose sys session clear") == VIRP_TIER_YELLOW); PASS();
+
+    /* Every OTHER config/execute/diagnose form is untouched by the widening. */
+    TEST("config firewall policy -> not GREEN");
+    assert(fg_route_command("config firewall policy") != VIRP_TIER_GREEN); PASS();
+
+    TEST("config system interface -> not GREEN");
+    assert(fg_route_command("config system interface") != VIRP_TIER_GREEN); PASS();
+
+    TEST("execute factoryreset -> not GREEN");
+    assert(fg_route_command("execute factoryreset") != VIRP_TIER_GREEN); PASS();
+
+    TEST("execute shutdown -> not GREEN");
+    assert(fg_route_command("execute shutdown") != VIRP_TIER_GREEN); PASS();
+
+    TEST("execute backup config ftp ... -> not GREEN (still RED)");
+    assert(fg_route_command("execute backup config ftp c.bak 203.0.113.9 e p")
+           == VIRP_TIER_RED); PASS();
+
+    TEST("diagnose debug enable -> not GREEN");
+    assert(fg_route_command("diagnose debug enable") != VIRP_TIER_GREEN); PASS();
+
+    TEST("diagnose debug application ike -1 -> not GREEN");
+    assert(fg_route_command("diagnose debug application ike -1")
+           != VIRP_TIER_GREEN); PASS();
+
+    TEST("diagnose sys session full-stat -> not GREEN");
+    assert(fg_route_command("diagnose sys session full-stat")
+           != VIRP_TIER_GREEN); PASS();
+
+    TEST("diagnose sniffer packet any -> not GREEN");
+    assert(fg_route_command("diagnose sniffer packet any")
+           != VIRP_TIER_GREEN); PASS();
+}
+
+/* =========================================================================
+ * The widening must not undercut the RED credential entries
+ *
+ * This is the failure mode that killed the { "show", YELLOW } catch-all
+ * (b26e34d). Every new entry is >= 3 tokens and none is a prefix of a
+ * RED entry's suffixed variant, so these must all still fail closed.
+ * ========================================================================= */
+
+static void test_audit_widening_does_not_undercut_red(void)
+{
+    printf("\n=== Credential reads unaffected by the widening ===\n");
+
+    TEST("get system admin -> still RED");
+    assert(fg_route_command("get system admin") == VIRP_TIER_RED); PASS();
+
+    TEST("show system admin -> still RED");
+    assert(fg_route_command("show system admin") == VIRP_TIER_RED); PASS();
+
+    TEST("show system admins -> still RED (boundary variant)");
+    assert(fg_route_command("show system admins") == VIRP_TIER_RED); PASS();
+
+    TEST("get system api-user -> still RED");
+    assert(fg_route_command("get system api-user") == VIRP_TIER_RED); PASS();
+
+    TEST("show user local -> still RED");
+    assert(fg_route_command("show user local") == VIRP_TIER_RED); PASS();
+
+    TEST("show vpn ipsec phase1-interface -> not GREEN (carries psksecret)");
+    assert(fg_route_command("show vpn ipsec phase1-interface")
+           != VIRP_TIER_GREEN);
+    assert(fg_route_command("show vpn ipsec phase1-interface")
+           == VIRP_TIER_YELLOW); PASS();
+
+    TEST("show system ha -> still YELLOW (encrypted HA password)");
+    assert(fg_route_command("show system ha") == VIRP_TIER_YELLOW); PASS();
+
+    /* Suffixed variants of the NEW GREEN entries lose the boundary and
+     * must fall to the fail-closed default, never to GREEN. */
+    TEST("get system globals -> RED (boundary variant of a new entry)");
+    assert(fg_route_command("get system globals") == VIRP_TIER_RED); PASS();
+
+    TEST("show firewall policy6 -> not GREEN (boundary variant)");
+    assert(fg_route_command("show firewall policy6") != VIRP_TIER_GREEN); PASS();
+
+    TEST("diagnose sys session statx -> not GREEN (boundary variant)");
+    assert(fg_route_command("diagnose sys session statx")
+           != VIRP_TIER_GREEN); PASS();
+
+    /* Case-sensitivity of the tier table still holds for new entries. */
+    TEST("SHOW FIREWALL POLICY -> RED (case variant is unlisted)");
+    assert(fg_route_command("SHOW FIREWALL POLICY") == VIRP_TIER_RED); PASS();
+
+    /* Separator injection behind a new GREEN entry still fails closed. */
+    TEST("show firewall policy;execute reboot -> RED");
+    assert(fg_route_command("show firewall policy;execute reboot")
+           == VIRP_TIER_RED); PASS();
+
+    TEST("diagnose sys session stat\nexecute reboot -> RED");
+    assert(fg_route_command("diagnose sys session stat\nexecute reboot")
+           == VIRP_TIER_RED); PASS();
+}
+
 int main(void)
 {
     printf("VIRP FortiGate Driver — BLACK Tier Enforcement Tests\n");
@@ -483,6 +659,9 @@ int main(void)
     test_table_driven_all_entries();
     test_credential_read_variants_fail_closed();
     test_execute_backup_is_gated();
+    test_readonly_audit_set_is_green();
+    test_audit_widening_hard_boundaries();
+    test_audit_widening_does_not_undercut_red();
     printf("\n====================================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 
