@@ -535,6 +535,9 @@ static virp_conn_t *fg_connect(const virp_device_t *device)
  *
  * Tiering policy for this fleet:
  *   GREEN  — passive monitoring reads (status, perf, routing table)
+ *            plus the explicit read-only audit set: non-secret `get`
+ *            reads, the two non-secret `show firewall` reads, and the
+ *            single `diagnose sys session stat` counter read.
  *   YELLOW — config-visibility reads, backups, active diagnostics.
  *            'show full-configuration' is the backup path and MUST stay
  *            at/under a YELLOW threshold so scheduled backups keep working.
@@ -559,6 +562,46 @@ static const fg_command_route_t FG_ROUTE_TABLE[] = {
     { "get router info",            VIRP_TIER_GREEN  },
     { "get router",                 VIRP_TIER_GREEN  },
     { "show router",                VIRP_TIER_GREEN  },
+
+    /*
+     * ── GREEN — read-only audit set (added 2026-08-19) ──────────
+     *
+     * Explicit entries, NOT a `{ "get ", GREEN }` / `{ "show ", GREEN }`
+     * prefix pair. A bare `show` catch-all lived here once and was
+     * removed in b26e34d because it UNDERCUT the RED credential entries:
+     * "show system admins", "show users", "show system api-users" lose
+     * the RED entry's token boundary at the extra character and fall
+     * through to the shorter catch-all. A GREEN prefix would reproduce
+     * that failure one tier lower — those reads would clear the gate
+     * with no approval at all. Every entry below is >= 3 tokens, so
+     * none of them can stand in for a RED entry's variant; a suffixed
+     * variant ("get system globals") fails the boundary check and lands
+     * on the fail-closed RED default.
+     *
+     * `show full-configuration` is deliberately absent: it keeps its
+     * YELLOW entry below and stays approval-gated.
+     */
+    { "get system global",          VIRP_TIER_GREEN  },
+    { "get system service",         VIRP_TIER_GREEN  },
+    { "get system certificate local", VIRP_TIER_GREEN },  /* cert metadata/expiry, not key material */
+    { "get vpn ssl settings",       VIRP_TIER_GREEN  },
+    { "get wireless-controller vap", VIRP_TIER_GREEN },
+    { "show firewall policy",       VIRP_TIER_GREEN  },   /* longest match beats "show firewall" YELLOW */
+    { "show firewall address",      VIRP_TIER_GREEN  },
+    /*
+     * phase2-interface only. "show vpn ipsec phase1-interface" carries
+     * `set psksecret ENC ...` and stays on the "show vpn" YELLOW entry —
+     * the same call this table already makes for "show system ha"
+     * ("incl. encrypted HA password"). phase2 carries no secret.
+     */
+    { "show vpn ipsec phase2-interface", VIRP_TIER_GREEN },
+    /*
+     * The one diagnose read singled out. Longest match beats the
+     * { "diagnose", YELLOW } catch-all below, so every OTHER diagnose —
+     * including "diagnose sys session clear" and the debug toggles —
+     * keeps its YELLOW and never becomes GREEN by this entry.
+     */
+    { "diagnose sys session stat",  VIRP_TIER_GREEN  },
 
     /* ── YELLOW — config reads, backups, active diagnostics ────── */
     { "show full-configuration",    VIRP_TIER_YELLOW },  /* backup path — keep <= YELLOW */
