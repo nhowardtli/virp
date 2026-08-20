@@ -52,7 +52,9 @@ done
 COMMIT="$(git rev-parse --verify "${REF}^{commit}" 2>/dev/null)" || \
     { echo "FAIL: cannot resolve '$REF' to a commit"; exit 1; }
 TREE="$(git rev-parse "${COMMIT}^{tree}")"
-[ -n "$NAME" ] || NAME="virp-$(git describe --tags --always "$COMMIT")"
+# describe output can contain '/' (e.g. archive/... tags) — the name is a
+# filename and a zip prefix, so flatten path separators.
+[ -n "$NAME" ] || NAME="virp-$(git describe --tags --always "$COMMIT" | tr '/' '-')"
 
 if [ -n "$ATTESTATION" ]; then
     [ -f "$ATTESTATION" ] || { echo "FAIL: attestation '$ATTESTATION' not found"; exit 1; }
