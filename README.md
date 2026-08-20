@@ -342,6 +342,7 @@ Yes. VIRP is a protocol and a reference implementation. IronClaw is one consumer
 | Observation flow end-to-end | [`docs/VIRP-OBSERVATION-FLOW.md`](docs/VIRP-OBSERVATION-FLOW.md) |
 | Validator manifest contract | [`docs/VALIDATOR-MANIFEST-CONTRACT.md`](docs/VALIDATOR-MANIFEST-CONTRACT.md) |
 | Threat model and trust boundaries | [`SECURITY.md`](SECURITY.md) |
+| Release provenance and bundle verification | [`docs/RELEASE-PROVENANCE.md`](docs/RELEASE-PROVENANCE.md) |
 | Contributing | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 
 ---
