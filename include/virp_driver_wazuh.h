@@ -24,6 +24,8 @@
 #define VIRP_DRIVER_WAZUH_H
 
 #include "virp_driver.h"
+#include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,6 +89,44 @@ virp_trust_tier_t wazuh_gate_tier(const char *command);
 
 extern const size_t          WZ_ROUTE_TABLE_SIZE;
 extern const wz_command_route_t WZ_ROUTE_TABLE[];
+
+/* ── BLACK tier: protected agents + never-dispatch endpoints ─────
+ *
+ * Separate from the tier table on purpose, exactly as FortiGate keeps
+ * FG_BLACK_COMMANDS separate from FG_ROUTE_TABLE. BLACK is not a tier
+ * a request can hold and then out-rank with an approval — it is a
+ * refusal inside execute(), before anything reaches the wire.
+ */
+#define WZ_PROTECTED_AGENT_MAX  64
+
+/*
+ * Register protected agent ids from a comma-separated decimal list.
+ * Accumulates across calls (the union over every wazuh device) and
+ * de-duplicates. Returns 0 on success, -1 if the list does not parse —
+ * in which case NOTHING from that list is registered, so a half-parsed
+ * list can never leave a partial protection in force. The loader treats
+ * -1 as fatal rather than running without a declared protection.
+ */
+int  wazuh_gate_set_protected_agents(const char *csv);
+
+/* Test-only reset — the daemon never calls this. */
+void wazuh_gate_clear_protected_agents(void);
+
+/* Number of registered protected agents (test/introspection). */
+size_t wazuh_gate_protected_agent_count(void);
+
+/*
+ * True if this command must never be dispatched. Checked at the top of
+ * wazuh_execute(). Denies, independent of HTTP method:
+ *   - any endpoint naming a registered protected agent, in a path
+ *     segment or in an agent-selecting query parameter
+ *   - agent deletion (DELETE against /agents)
+ *   - the manager's / cluster's own configuration
+ *   - active-response dispatch
+ * Deliberately over-matching: this is a deny list, so a false positive
+ * costs a read and a false negative costs the SIEM.
+ */
+bool wz_is_black_endpoint(const char *command);
 
 #ifdef __cplusplus
 }
