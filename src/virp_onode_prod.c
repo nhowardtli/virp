@@ -62,6 +62,9 @@ extern void virp_driver_linux_init(void);
  */
 extern int linux_gate_set_protected_vmids(const char *csv);
 #endif
+#ifdef VIRP_DRIVER_WAZUH
+extern int wazuh_gate_set_protected_agents(const char *csv);
+#endif
 #ifdef VIRP_DRIVER_PALOALTO
 extern void virp_driver_paloalto_init(void);
 #endif
@@ -726,6 +729,70 @@ int load_devices(onode_state_t *state, const char *path)
             }
         }
 
+        /*
+         * protected_agents (Wazuh): agent ids the driver refuses to
+         * touch at any tier. Accepts ["004","313"] (the zero-padded
+         * spelling Wazuh uses in URLs), [4,313], or an equivalent CSV
+         * string, and normalizes to CSV. Ids are compared numerically
+         * downstream, so the paddings are interchangeable.
+         *
+         * Unlike protected_vmids this accepts STRING array entries as
+         * well as ints, because "004" is how an operator reading the
+         * Wazuh UI will naturally write it and JSON has no way to keep
+         * the leading zeros on a number.
+         */
+        /* Guarded to match its only consumer below: without the Wazuh
+         * driver compiled in there is no gate to register into, and an
+         * unused-but-set variable is an error under -Werror. */
+#ifdef VIRP_DRIVER_WAZUH
+        bool pa_declared = false;
+#endif
+        struct json_object *pa_val;
+        if (json_object_object_get_ex(dev_obj, "protected_agents", &pa_val)) {
+#ifdef VIRP_DRIVER_WAZUH
+            pa_declared = true;
+#endif
+            if (json_object_is_type(pa_val, json_type_array)) {
+                size_t used = 0;
+                int n_ag = (int)json_object_array_length(pa_val);
+                for (int v = 0; v < n_ag; v++) {
+                    struct json_object *e = json_object_array_get_idx(pa_val, v);
+                    const char *piece = NULL;
+                    char numbuf[32];
+                    if (e && json_object_is_type(e, json_type_int)) {
+                        snprintf(numbuf, sizeof(numbuf), "%lld",
+                                 (long long)json_object_get_int64(e));
+                        piece = numbuf;
+                    } else if (e && json_object_is_type(e, json_type_string)) {
+                        piece = json_object_get_string(e);
+                    }
+                    if (!piece || piece[0] == '\0') {
+                        fprintf(stderr, "[O-Node] %s: protected_agents entry "
+                                "%d is not an integer or string — ignoring "
+                                "the whole list\n", device.hostname, v);
+                        used = 0;
+                        break;
+                    }
+                    int written = snprintf(device.protected_agents + used,
+                                           sizeof(device.protected_agents) - used,
+                                           "%s%s", used ? "," : "", piece);
+                    if (written < 0 ||
+                        (size_t)written >= sizeof(device.protected_agents) - used) {
+                        fprintf(stderr, "[O-Node] %s: protected_agents too long "
+                                "— ignoring the whole list\n", device.hostname);
+                        used = 0;
+                        break;
+                    }
+                    used += (size_t)written;
+                }
+                device.protected_agents[used] = '\0';
+            } else if (json_object_is_type(pa_val, json_type_string)) {
+                json_get_string(dev_obj, "protected_agents",
+                                device.protected_agents,
+                                sizeof(device.protected_agents));
+            }
+        }
+
         if (device.hostname[0] == '\0' || device.host[0] == '\0') {
             fprintf(stderr, "[O-Node] Skipping device %d: missing hostname/host\n", i);
             continue;
@@ -778,6 +845,61 @@ int load_devices(onode_state_t *state, const char *path)
                 json_object_put(root);
                 return -1;
             }
+        }
+#endif
+
+#ifdef VIRP_DRIVER_WAZUH
+        /*
+         * Push this device's protected agents into the Wazuh driver
+         * before it becomes reachable, for the same reason the linux
+         * gate is populated at load time: the refusal must be in force
+         * for the FIRST request, not from the first connect onward.
+         *
+         * An unparseable list is FATAL, not a warning. The field exists
+         * so that a named agent cannot be touched; loading the device
+         * without it would leave the operator believing a protection
+         * that is not running. Failing the whole config is the only
+         * outcome that cannot be mistaken for success.
+         *
+         * A wazuh device that declares NO protected_agents is loaded as
+         * normal — the static BLACK rules (manager configuration,
+         * active-response, agent deletion) still apply. Whether an
+         * unprotected wazuh device should be refused outright is a
+         * policy question left to the operator, not decided here.
+         */
+        /*
+         * A DECLARED list that normalized to nothing is fatal too.
+         *
+         * The array walk above drops the whole list when an entry is the
+         * wrong JSON type (["004", {...}]) or when the joined CSV would
+         * overflow the field. Without this arm the device then loaded
+         * with an EMPTY protected set behind a single warning line — the
+         * operator wrote protected_agents, saw the daemon start, and got
+         * no protection at all. That is precisely the outcome the fatal
+         * path exists to prevent, arriving by a different route.
+         */
+        if (device.vendor == VIRP_VENDOR_WAZUH &&
+            pa_declared && device.protected_agents[0] == '\0') {
+            fprintf(stderr, "[O-Node] FATAL: %s: protected_agents was "
+                    "declared but no id survived parsing — refusing the "
+                    "config rather than running without the protection it "
+                    "declares\n", device.hostname);
+            json_object_put(root);
+            return -1;
+        }
+
+        if (device.vendor == VIRP_VENDOR_WAZUH &&
+            device.protected_agents[0] != '\0') {
+            if (wazuh_gate_set_protected_agents(device.protected_agents) != 0) {
+                fprintf(stderr, "[O-Node] FATAL: %s: unparseable "
+                        "protected_agents \"%s\" — refusing the config rather "
+                        "than running without the protection it declares\n",
+                        device.hostname, device.protected_agents);
+                json_object_put(root);
+                return -1;
+            }
+            fprintf(stderr, "[O-Node] %s: protected agents registered: %s\n",
+                    device.hostname, device.protected_agents);
         }
 #endif
 

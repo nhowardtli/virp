@@ -57,6 +57,8 @@
       "port": 22
     },
     {
+      "_comment": "Wazuh manager. protected_agents names the agents the driver refuses to touch at ANY tier — enforced in wazuh_execute() and returned as VIRP_TIER_BLACK by the gate hook, so the refusal files no proposal and no approval reaches it. Ids compare numerically, so \"004\" and 4 are one agent. Do NOT rely on the API credential's RBAC for this: Wazuh denies at resource level by returning HTTP 200 with the agent simply absent from affected_items, which is indistinguishable from the agent not existing.",
+      "_tls_note": "The driver verifies the certificate by default. A stock Wazuh manager presents a self-signed cert whose only SAN is DNS:localhost, so addressing it by IP fails hostname verification even with that cert trusted as a CA. Fix the CERTIFICATE (reissue with an IP or DNS SAN via wazuh-certs-tool.sh) and point VIRP_CA_BUNDLE at its signer. The VIRP_WAZUH_INSECURE drop-in disables verification entirely and is a lab-only last resort.",
       "hostname": "wazuh-lab",
       "host": "10.0.20.10",
       "vendor": "wazuh",
@@ -64,6 +66,7 @@
       "api_port": 55000,
       "username": "${WAZUH_USER}",
       "password": "${WAZUH_PASS}",
+      "protected_agents": ["004", "313"],
       "node_id": "0A00140A"
     },
     {

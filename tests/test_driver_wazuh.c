@@ -127,10 +127,21 @@ static void test_routing_table(void)
         /* No YELLOW rows, no write endpoints classified: everything
          * unlisted — including every row the old SHADOW-only table
          * carried — is RED by absence. */
-        { "/manager/status",                         VIRP_TIER_RED    },
-        { "/manager/info",                           VIRP_TIER_RED    },
+        /* Governance read set added 2026-08-19 — now GREEN. */
+        { "/manager/status",                         VIRP_TIER_GREEN  },
+        { "/manager/info",                           VIRP_TIER_GREEN  },
+        { "/manager/stats",                          VIRP_TIER_GREEN  },
+        { "/manager/stats/remoted",                  VIRP_TIER_GREEN  },
+        { "/manager/logs/summary",                   VIRP_TIER_GREEN  },
+        { "/agents/summary/os",                      VIRP_TIER_GREEN  },
+        { "/rules",                                  VIRP_TIER_GREEN  },
+        { "/rules/groups",                           VIRP_TIER_GREEN  },
+        { "/decoders",                               VIRP_TIER_GREEN  },
+        { "/rules?limit=10&pretty=true",             VIRP_TIER_GREEN  },
+        /* Still RED: manager config, and the full log body as opposed
+         * to its summary. */
         { "/manager/configuration",                  VIRP_TIER_RED    },
-        { "/manager/logs/summary",                   VIRP_TIER_RED    },
+        { "/manager/logs",                           VIRP_TIER_RED    },
         { "/vulnerability/001/last_scan",            VIRP_TIER_RED    },
         { "/syscheck/001?limit=100",                 VIRP_TIER_RED    },
         { "/security/users",                         VIRP_TIER_RED    },
@@ -164,6 +175,343 @@ static void test_routing_table(void)
         TEST_FAIL("Routing table mismatches");
     else
         TEST_PASS();
+}
+
+/* =========================================================================
+ * Test: protected_agents registry parsing
+ *
+ * Contract mirrors linux_gate_set_protected_vmids(): a list that does
+ * not parse registers NOTHING, so a half-parsed list can never leave a
+ * partial protection in force while the loader believes it succeeded.
+ * ========================================================================= */
+
+static void test_protected_agent_parsing(void)
+{
+    TEST_START("protected_agents parsing and registration");
+
+    wazuh_gate_clear_protected_agents();
+    assert(wazuh_gate_protected_agent_count() == 0);
+
+    /* Empty / NULL are a no-op success, not an error: a device that
+     * declares no protected agents is a legal configuration. */
+    assert(wazuh_gate_set_protected_agents(NULL) == 0);
+    assert(wazuh_gate_set_protected_agents("") == 0);
+    assert(wazuh_gate_protected_agent_count() == 0);
+
+    /* Zero-padded and bare spellings are the SAME agent. */
+    assert(wazuh_gate_set_protected_agents("004,313") == 0);
+    assert(wazuh_gate_protected_agent_count() == 2);
+    assert(wazuh_gate_set_protected_agents("4") == 0);          /* dup of 004 */
+    assert(wazuh_gate_protected_agent_count() == 2);
+    assert(wazuh_gate_set_protected_agents("0004, 00313") == 0);
+    assert(wazuh_gate_protected_agent_count() == 2);
+
+    /* Accumulates across devices (union), like the linux gate. */
+    assert(wazuh_gate_set_protected_agents("7") == 0);
+    assert(wazuh_gate_protected_agent_count() == 3);
+
+    /* Malformed input is rejected AND registers nothing new. */
+    size_t before = wazuh_gate_protected_agent_count();
+    assert(wazuh_gate_set_protected_agents("abc") == -1);
+    assert(wazuh_gate_set_protected_agents("1,abc") == -1);
+    assert(wazuh_gate_set_protected_agents("1;2") == -1);
+    assert(wazuh_gate_set_protected_agents("99999999999999999999") == -1);
+    assert(wazuh_gate_protected_agent_count() == before);
+
+    /* Overflow of the registry is an error, not a silent truncation. */
+    wazuh_gate_clear_protected_agents();
+    char big[WZ_PROTECTED_AGENT_MAX * 8];
+    size_t off = 0;
+    for (int i = 0; i < WZ_PROTECTED_AGENT_MAX + 1; i++)
+        off += (size_t)snprintf(big + off, sizeof(big) - off, "%s%d",
+                                i ? "," : "", 1000 + i);
+    assert(wazuh_gate_set_protected_agents(big) == -1);
+    assert(wazuh_gate_protected_agent_count() == 0);
+
+    wazuh_gate_clear_protected_agents();
+    TEST_PASS();
+}
+
+/* =========================================================================
+ * Test: BLACK tier — static rules, independent of configuration
+ * ========================================================================= */
+
+static void test_black_static_rules(void)
+{
+    TEST_START("BLACK tier: static rules (no protected agents configured)");
+
+    wazuh_gate_clear_protected_agents();
+
+    /* The manager's / a cluster node's own configuration. */
+    assert(wz_is_black_endpoint("/manager/configuration"));
+    assert(wz_is_black_endpoint("GET /manager/configuration"));
+    assert(wz_is_black_endpoint("PUT /manager/configuration"));
+    assert(wz_is_black_endpoint("/cluster/node01/configuration"));
+
+    /* Active-response dispatch. */
+    assert(wz_is_black_endpoint("/active-response"));
+    assert(wz_is_black_endpoint("PUT /active-response?agents_list=001"));
+
+    /* Agent deletion — the METHOD is what separates this from the
+     * GREEN /agents read, and the check is case-insensitive. */
+    assert(wz_is_black_endpoint("DELETE /agents?agents_list=001"));
+    assert(wz_is_black_endpoint("delete /agents"));
+    assert(wz_is_black_endpoint("DELETE /agents/001"));
+
+    /*
+     * Malformed input is NOT black. BLACK means "forbidden by policy",
+     * and a policy refusal is non-approvable and files no proposal; a
+     * typo must stay an ordinary RED-by-absence rejection the operator
+     * can read and re-file. Both callers refuse garbage on their own
+     * paths, which is asserted immediately below.
+     */
+    assert(!wz_is_black_endpoint(NULL));
+    assert(!wz_is_black_endpoint("agents"));         /* unrooted */
+    assert(!wz_is_black_endpoint(""));
+    assert(wazuh_gate_tier("agents") == VIRP_TIER_RED);
+    assert(wazuh_gate_tier(NULL) == VIRP_TIER_RED);
+    assert(wazuh_gate_tier("") == VIRP_TIER_RED);
+
+    /*
+     * NOT black: ordinary reads, and the writes that are meant to stay
+     * RED-by-absence so they remain proposable. Restart and config PUT
+     * are deliberately absent from the deny list.
+     */
+    assert(!wz_is_black_endpoint("/agents"));
+    assert(!wz_is_black_endpoint("GET /agents?select=id,name,status,ip"));
+    assert(!wz_is_black_endpoint("/agents/summary/status"));
+    assert(!wz_is_black_endpoint("/rules"));
+    assert(!wz_is_black_endpoint("/manager/status"));
+    assert(!wz_is_black_endpoint("PUT /agents/001/restart"));
+    assert(!wz_is_black_endpoint("/agents/001"));
+
+    TEST_PASS();
+}
+
+/* =========================================================================
+ * Test: BLACK tier — configured protected agents
+ *
+ * The whole point of the feature: agent 004 (the reasoning tier's own
+ * host) and agent 313 (the O-Node's own host) must be untouchable
+ * through every endpoint shape, and the ids must come from config
+ * rather than the binary.
+ * ========================================================================= */
+
+static void test_black_protected_agents(void)
+{
+    TEST_START("BLACK tier: configured protected agents");
+
+    wazuh_gate_clear_protected_agents();
+
+    /* Before configuration, 004 is an ordinary agent — proving the
+     * protection comes from devices.json and is NOT hardcoded. */
+    assert(!wz_is_black_endpoint("/agents/004"));
+    assert(!wz_is_black_endpoint("/syscheck/004"));
+
+    assert(wazuh_gate_set_protected_agents("004,313") == 0);
+
+    /* Path-segment shapes, across collections. */
+    assert(wz_is_black_endpoint("/agents/004"));
+    assert(wz_is_black_endpoint("GET /agents/004"));
+    assert(wz_is_black_endpoint("/agents/004/config/client/buffer"));
+    assert(wz_is_black_endpoint("PUT /agents/004/restart"));
+    assert(wz_is_black_endpoint("/syscheck/004"));
+    assert(wz_is_black_endpoint("/rootcheck/004"));
+    assert(wz_is_black_endpoint("/vulnerability/004/last_scan"));
+    assert(wz_is_black_endpoint("/sca/313"));
+    assert(wz_is_black_endpoint("/agents/313"));
+
+    /* Zero-padding is irrelevant — ids compare numerically. */
+    assert(wz_is_black_endpoint("/agents/4"));
+    assert(wz_is_black_endpoint("/agents/0004"));
+
+    /* Agent-selecting query parameters, including inside a list. */
+    assert(wz_is_black_endpoint("/agents?agents_list=004"));
+    assert(wz_is_black_endpoint("/agents?agents_list=001,002,004"));
+    assert(wz_is_black_endpoint("/agents?agents_list=004,001"));
+    assert(wz_is_black_endpoint("GET /agents?agent_id=313"));
+    assert(wz_is_black_endpoint("/agents/restart?agents_list=001,313"));
+    assert(wz_is_black_endpoint("/agents?pretty=true&agents_list=004"));
+
+    /* "all" on an agent-selecting parameter includes the protected
+     * ones without naming them. */
+    assert(wz_is_black_endpoint("/agents?agents_list=all"));
+    assert(wz_is_black_endpoint("PUT /agents/restart?agents_list=ALL"));
+
+    /*
+     * Non-agent parameters are NOT scanned, so an ordinary read whose
+     * limit or offset happens to equal a protected id still works.
+     * This is why the query scan keys on the parameter NAME.
+     */
+    assert(!wz_is_black_endpoint("/agents?limit=313"));
+    assert(!wz_is_black_endpoint("/agents?offset=4&limit=500"));
+
+    /* Unprotected agents remain readable. */
+    assert(!wz_is_black_endpoint("/agents/001"));
+    assert(!wz_is_black_endpoint("/agents?agents_list=001,002"));
+    assert(!wz_is_black_endpoint("/syscheck/001?limit=100"));
+
+    /*
+     * A protected id in ANY numeric path segment is refused, even where
+     * that segment is not an agent id (a rule numbered 313). Documented
+     * over-matching: a deny list should err toward refusing a read.
+     */
+    assert(wz_is_black_endpoint("/rules/313"));
+
+    /*
+     * ── Percent-encoding must not launder a protected agent ────────
+     *
+     * The endpoint goes to libcurl's CURLOPT_URL verbatim and the
+     * MANAGER decodes it, so a scan of the raw bytes alone sees
+     * "/agents/%30%30%34" as a non-numeric segment while Wazuh sees
+     * "/agents/004". These pin the decode pass; without it every case
+     * below reaches the protected agent.
+     */
+    assert(wz_is_black_endpoint("/agents/%30%30%34"));        /* 004      */
+    assert(wz_is_black_endpoint("/agents/%30%30%34/restart"));
+    assert(wz_is_black_endpoint("/syscheck/%304"));           /* 04       */
+    assert(wz_is_black_endpoint("/agents?agents_list=%304"));
+    assert(wz_is_black_endpoint("/agents?agents_list=%61%6C%6C"));  /* all */
+    assert(wz_is_black_endpoint("/agents%2F004"));            /* enc slash */
+    assert(wz_is_black_endpoint("/agents%2f004"));            /* lowercase */
+    assert(wz_is_black_endpoint("/manager/%63onfiguration"));
+
+    /*
+     * Decoding is ONE pass, matching what an HTTP server does. "%2530"
+     * reaches Wazuh as the literal text "%30" and never becomes "0", so
+     * refusing it would deny an endpoint that cannot resolve to a
+     * protected agent.
+     */
+    assert(!wz_is_black_endpoint("/agents/%2530%2530%2534"));
+
+    /* An endpoint too long to analyse is refused rather than guessed at. */
+    {
+        char huge[6000];
+        memset(huge, 'a', sizeof(huge) - 1);
+        huge[0] = '/';
+        huge[sizeof(huge) - 1] = '\0';
+        assert(wz_is_black_endpoint(huge));
+    }
+
+    /* Encoding must not break the ordinary GREEN reads either. */
+    assert(!wz_is_black_endpoint("/agents?select=id%2Cname%2Cstatus"));
+    assert(!wz_is_black_endpoint("/agents/001"));
+
+    wazuh_gate_clear_protected_agents();
+    TEST_PASS();
+}
+
+/* =========================================================================
+ * Test: BLACK is unreachable by approval — it is not a tier
+ *
+ * A BLACK endpoint must ALSO classify RED-by-absence in the tier table,
+ * so there is no path where a classifier says GREEN and only the driver
+ * objects. The two mechanisms have to agree about the direction.
+ * ========================================================================= */
+
+static void test_black_endpoints_are_not_green(void)
+{
+    TEST_START("Every BLACK endpoint classifies BLACK at the gate hook");
+
+    wazuh_gate_clear_protected_agents();
+    assert(wazuh_gate_set_protected_agents("004,313") == 0);
+
+    static const char *black_cases[] = {
+        "/manager/configuration",
+        "/cluster/node01/configuration",
+        "/active-response",
+        "/agents/004",
+        "/agents/313",
+        "/syscheck/004",
+        "/agents?agents_list=004",
+        "/agents?agents_list=all",
+        NULL,
+    };
+
+    int bad = 0;
+    for (int i = 0; black_cases[i]; i++) {
+        if (!wz_is_black_endpoint(black_cases[i])) {
+            fprintf(stderr, "    NOT BLACK (should be): %s\n", black_cases[i]);
+            bad++;
+            continue;
+        }
+        /*
+         * The GATE HOOK is the thing that must agree, not
+         * wz_route_endpoint(): the table lookup strips the query string
+         * by design, so "/agents?agents_list=004" is genuinely
+         * indistinguishable from GREEN "/agents" to it. wazuh_gate_tier()
+         * sees the full command and is what gate_classify() calls.
+         */
+        virp_trust_tier_t t = wazuh_gate_tier(black_cases[i]);
+        if (t != VIRP_TIER_BLACK) {
+            fprintf(stderr, "    BLACK endpoint classifies 0x%02x (want BLACK): "
+                    "%s\n", t, black_cases[i]);
+            bad++;
+        }
+    }
+
+    /*
+     * The converse: the GREEN read set must NOT be swept up by the deny
+     * list. A protection that also blocks the monitoring it exists to
+     * protect is a failure, just a quiet one.
+     */
+    static const char *green_cases[] = {
+        "/agents", "GET /agents?select=id,name,status,ip",
+        "/agents/summary/status", "/agents/summary/os",
+        "/manager/status", "/manager/info", "/manager/stats",
+        "/manager/stats/analysisd", "/manager/stats/remoted",
+        "/manager/logs/summary", "/rules", "/rules/groups", "/decoders",
+        NULL,
+    };
+    for (int i = 0; green_cases[i]; i++) {
+        virp_trust_tier_t t = wazuh_gate_tier(green_cases[i]);
+        if (t != VIRP_TIER_GREEN) {
+            fprintf(stderr, "    GREEN read blocked, got 0x%02x: %s\n",
+                    t, green_cases[i]);
+            bad++;
+        }
+    }
+
+    wazuh_gate_clear_protected_agents();
+
+    if (bad) TEST_FAIL("BLACK/tier-table disagreement");
+    else     TEST_PASS();
+}
+
+/* =========================================================================
+ * Test: every route-table row is reachable and returns its declared tier
+ *
+ * The table-driven reachability check the cisco/fortigate suites run,
+ * ported to exact-match endpoints. Catches a row shadowed by an earlier
+ * duplicate or misspelled into unreachability.
+ * ========================================================================= */
+
+static void test_route_table_reachable(void)
+{
+    TEST_START("Every WZ_ROUTE_TABLE row is reachable");
+
+    int bad = 0;
+    for (size_t i = 0; i < WZ_ROUTE_TABLE_SIZE; i++) {
+        const char *pat = WZ_ROUTE_TABLE[i].endpoint_pattern;
+        virp_trust_tier_t want = WZ_ROUTE_TABLE[i].tier;
+        virp_trust_tier_t got = wz_route_endpoint(pat);
+        if (got != want) {
+            fprintf(stderr, "    UNREACHABLE row %zu: %s → 0x%02x, want 0x%02x\n",
+                    i, pat, got, want);
+            bad++;
+        }
+        /* The table carries no YELLOW and no write rows by design. */
+        if (want != VIRP_TIER_GREEN) {
+            fprintf(stderr, "    Non-GREEN row %zu (%s) — this table is "
+                    "GREEN-only by design\n", i, pat);
+            bad++;
+        }
+    }
+
+    fprintf(stderr, "    %zu rows checked\n", WZ_ROUTE_TABLE_SIZE);
+
+    if (bad) TEST_FAIL("Route table reachability failures");
+    else     TEST_PASS();
 }
 
 /* =========================================================================
@@ -455,7 +803,15 @@ static void test_prefix_boundary_fixed(void)
     assert(wazuh_gate_tier("/manager/stats/analysisd") == VIRP_TIER_GREEN);
     assert(wazuh_gate_tier("POST /agents") == VIRP_TIER_RED);
     assert(wazuh_gate_tier("PUT /agents/restart") == VIRP_TIER_RED);
-    assert(wazuh_gate_tier("DELETE /agents/001") == VIRP_TIER_RED);
+    /*
+     * Agent DELETION is BLACK, not RED, as of the 2026-08-19 governance
+     * set — deletion is the one write that destroys the evidence a
+     * later review would need, so it is refused rather than made
+     * approvable. Every OTHER write stays RED by absence and therefore
+     * proposable; the two lines above pin that.
+     */
+    assert(wazuh_gate_tier("DELETE /agents/001") == VIRP_TIER_BLACK);
+    assert(wazuh_gate_tier("DELETE /agents") == VIRP_TIER_BLACK);
     assert(wazuh_gate_tier("agents") == VIRP_TIER_RED);
     assert(wazuh_gate_tier(NULL) == VIRP_TIER_RED);
 
@@ -464,13 +820,18 @@ static void test_prefix_boundary_fixed(void)
     assert(drv && drv->route_command == wazuh_gate_tier);
 
     /*
-     * The health probe must sit INSIDE the GREEN set. It used to be
-     * /manager/status, which is RED here and returns HTTP 403 on a
-     * properly least-privileged credential (virp-node2's account),
-     * causing an endless health-fail → drop → reconnect churn.
+     * The health probe must sit INSIDE the GREEN set.
+     *
+     * /manager/status is GREEN as of the 2026-08-19 governance set, but
+     * the probe deliberately stays on /agents/summary/status: a
+     * properly least-privileged credential (virp-node2's account) gets
+     * HTTP 403 on /manager/status, which caused an endless health-fail
+     * → drop → reconnect churn. Being classifiable is not the same as
+     * being readable by every credential, and the probe has to hold for
+     * the tightest one.
      */
     assert(wz_route_endpoint(WZ_EP_AGENT_SUMMARY) == VIRP_TIER_GREEN);
-    assert(wz_route_endpoint(WZ_EP_MANAGER_STATUS) == VIRP_TIER_RED);
+    assert(wz_route_endpoint(WZ_EP_MANAGER_STATUS) == VIRP_TIER_GREEN);
 
     TEST_PASS();
 }
@@ -495,6 +856,11 @@ int main(void)
     test_registration();
     test_routing_table();
     test_prefix_boundary_fixed();
+    test_route_table_reachable();
+    test_protected_agent_parsing();
+    test_black_static_rules();
+    test_black_protected_agents();
+    test_black_endpoints_are_not_green();
 
     /* Live tests (need Wazuh Manager) */
     test_live_auth();
