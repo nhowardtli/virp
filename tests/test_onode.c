@@ -38,7 +38,10 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sqlite3.h>
+#include <dirent.h>
 #include <openssl/evp.h>
+#include "virp_federation.h"
+#include "virp_approver_registry.h"
 
 /* =========================================================================
  * Test infrastructure
@@ -2999,6 +3002,173 @@ TEST(test_gate_rejection_reason_body_is_retained_and_matches_commitment)
     sqlite3_finalize(st);
     sqlite3_close(db);
     gr_cleanup();
+}
+
+/* =========================================================================
+ * IOS ABBREVIATION ADVERSARIAL CORPUS v1 — section E (ingress-layer
+ * interactions). A separator-carrying string ("show run | include
+ * hostname", "show ver; reload") must be refused at the INGRESS
+ * boundary — BEFORE driver lookup, before the classifier, before the
+ * gate — and the refusal must file NO proposal: the propose path only
+ * exists inside a GATE decision, and a string the daemon refuses to
+ * treat as one command must never acquire an approvable identity.
+ *
+ * The classifier-level half (the same strings fail closed inside the
+ * directly-callable hooks) lives in test_driver_cisco_gate.c.
+ * ========================================================================= */
+
+#define IE_CHAIN_DB   "/tmp/virp-onode-test-iechain.db"
+#define IE_CHAIN_KEY  "/tmp/virp-onode-test-iechain.key"
+#define IE_APPROVALS  "/tmp/virp-onode-test-ieapprovals"
+#define IE_REGISTRY   "/tmp/virp-onode-test-ieapprovers.json"
+
+static void ie_cleanup(void)
+{
+    unlink(IE_CHAIN_DB);
+    unlink(IE_CHAIN_DB "-wal");
+    unlink(IE_CHAIN_DB "-shm");
+    unlink(IE_CHAIN_KEY);
+    unlink(IE_REGISTRY);
+    /* best-effort empty of the proposal store (records live in the
+     * proposals/ subdir — see approval_store_layout in virp_approval.c) */
+    DIR *d = opendir(IE_APPROVALS "/proposals");
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            char p[512];
+            snprintf(p, sizeof(p), "%s/proposals/%s", IE_APPROVALS,
+                     de->d_name);
+            unlink(p);
+        }
+        closedir(d);
+    }
+}
+
+static int ie_approval_file_count(void)
+{
+    DIR *d = opendir(IE_APPROVALS "/proposals");
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL)
+        if (de->d_name[0] != '.') n++;
+    closedir(d);
+    return n;
+}
+
+TEST(test_ingress_separator_no_proposal)
+{
+    ie_cleanup();
+
+    virp_signing_key_t ck;
+    ASSERT_OK(virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN));
+    ASSERT_OK(virp_key_save_file(&ck, IE_CHAIN_KEY));
+    virp_key_destroy(&ck);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0011, NULL,
+                         "/tmp/virp-onode-iechain.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+    tmp.gate_default_mode = GATE_MODE_ENFORCE;
+    tmp.gate_max_tier = VIRP_TIER_GREEN;
+
+    /* Approval flow LIVE: state->approval_dir is only set when the
+     * registry enrolls at least one key (onode_set_approvers), and
+     * proposal filing is gated on approval_dir — so an inert registry
+     * would make the "no proposal filed" assertions below vacuous.
+     * Enroll one ed25519 approver the way the registry suite builds
+     * its fixtures. */
+    {
+        virp_fed_keypair_t kp;
+        ASSERT_OK(virp_fed_generate(&kp, 1));
+        uint8_t spki[44];
+        virp_approver_ed25519_spki(kp.public_key, spki);
+        char entry[1024];
+        ASSERT_OK(virp_approver_entry_json(spki, sizeof(spki),
+                                           "corpus-e", true,
+                                           entry, sizeof(entry)));
+        FILE *f = fopen(IE_REGISTRY, "w");
+        ASSERT_TRUE(f != NULL);
+        fprintf(f, "[%s]\n", entry);
+        fclose(f);
+    }
+    ASSERT_OK(onode_setup_chain_and_approvals(&tmp, 0xDEAD0011,
+                                              IE_CHAIN_DB, IE_CHAIN_KEY,
+                                              IE_APPROVALS, IE_REGISTRY));
+    ASSERT_EQ((int)tmp.approvers_loaded, 1);
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "R-INGRESS");
+    snprintf(dev.host, sizeof(dev.host), "10.0.0.96");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0BADF11D;
+    dev.enabled = true;
+    ASSERT_OK(onode_add_device(&tmp, &dev));
+
+    int before = ie_approval_file_count();
+
+    static const char *const SEP[] = {
+        "show run | include hostname",   /* pipe */
+        "show ver; reload",              /* semicolon */
+    };
+    for (size_t i = 0; i < 2; i++) {
+        uint8_t obs_buf[VIRP_MAX_MESSAGE_SIZE];
+        size_t obs_len = 0;
+        ASSERT_OK(onode_execute(&tmp, "R-INGRESS", SEP[i],
+                                obs_buf, sizeof(obs_buf), &obs_len));
+
+        virp_header_t hdr;
+        ASSERT_OK(virp_validate_message(obs_buf, obs_len, &tmp.okey, &hdr));
+        /* UNCLASSIFIED is honest: the string was never classified. */
+        ASSERT_EQ(hdr.tier, VIRP_TIER_UNCLASSIFIED);
+
+        virp_observation_t obs;
+        const uint8_t *data;
+        uint16_t data_len;
+        ASSERT_OK(virp_parse_observation(obs_buf + VIRP_HEADER_SIZE,
+                                         obs_len - VIRP_HEADER_SIZE,
+                                         &obs, &data, &data_len));
+        ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+
+        /* The refusal is the INGRESS one — not a gate verdict, not a
+         * classifier verdict, and it carries no escalation identity. */
+        ASSERT_TRUE(strstr((const char *)data,
+                           "illegal separator") != NULL);
+        ASSERT_TRUE(strstr((const char *)data,
+                           "tier gate blocked") == NULL);
+        ASSERT_TRUE(strstr((const char *)data, "proposal_id=") == NULL);
+    }
+
+    /* No proposal was filed for either separator string. */
+    ASSERT_EQ(ie_approval_file_count(), before);
+
+    /* Control: a single-command gate block on the same daemon DOES file
+     * a proposal — proving the counter would have caught one. The mock
+     * classifier routes "reload" RED; the ceiling is GREEN. */
+    {
+        uint8_t obs_buf[VIRP_MAX_MESSAGE_SIZE];
+        size_t obs_len = 0;
+        ASSERT_OK(onode_execute(&tmp, "R-INGRESS", "reload",
+                                obs_buf, sizeof(obs_buf), &obs_len));
+        virp_observation_t obs;
+        const uint8_t *data;
+        uint16_t data_len;
+        ASSERT_OK(virp_parse_observation(obs_buf + VIRP_HEADER_SIZE,
+                                         obs_len - VIRP_HEADER_SIZE,
+                                         &obs, &data, &data_len));
+        ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+        ASSERT_TRUE(strstr((const char *)data, "tier gate blocked") != NULL);
+        ASSERT_TRUE(strstr((const char *)data, "proposal_id=") != NULL);
+        ASSERT_TRUE(ie_approval_file_count() > before);
+    }
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    ie_cleanup();
 }
 
 /* Regression (2026-08-18): a gate_rejection/1 body must record the ceiling
@@ -6268,6 +6438,7 @@ int main(void)
 
     printf("\n[Gate-reason retention (chain body recoverable)]\n");
     RUN_TEST(test_gate_rejection_reason_body_is_retained_and_matches_commitment);
+    RUN_TEST(test_ingress_separator_no_proposal);
     RUN_TEST(test_gate_rejection_records_per_uid_effective_ceiling);
 
     printf("\n[GREEN auto-execution records (chain covers what was allowed)]\n");

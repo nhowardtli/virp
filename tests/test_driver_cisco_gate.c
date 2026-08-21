@@ -103,7 +103,7 @@ static void test_acceptance_criterion(void)
     };
     TEST("sh run family -> one YELLOW identity");
     expect_identical(RUN, "show running-config",
-                     VIRP_TIER_YELLOW, "yellow:show-running-config");
+                     VIRP_TIER_YELLOW, "ios.show-running");
     PASS();
 
     static const char *const CONF[] = {
@@ -111,7 +111,7 @@ static void test_acceptance_criterion(void)
     };
     TEST("conf t family -> one RED identity");
     expect_identical(CONF, "configure terminal",
-                     VIRP_TIER_RED, "red:config-mode-entry");
+                     VIRP_TIER_RED, "ios.config-mode");
     PASS();
 
     /* `write` with no subcommand IS `write memory` on IOS — the
@@ -122,7 +122,7 @@ static void test_acceptance_criterion(void)
     };
     TEST("wr family -> one YELLOW identity (incl. default subcommand)");
     expect_identical(WR, "write memory",
-                     VIRP_TIER_YELLOW, "yellow:write-memory");
+                     VIRP_TIER_YELLOW, "ios.write-mem");
     PASS();
 }
 
@@ -134,22 +134,22 @@ static void test_green_rows(void)
 {
     printf("\n=== GREEN — every curated read pinned ===\n");
     static const struct { const char *cmd; const char *rule; } G[] = {
-        { "show version",            "green:show-version" },
-        { "show clock",              "green:show-clock" },
-        { "show inventory",          "green:show-inventory" },
-        { "show ip interface brief", "green:show-ip-interface-brief" },
-        { "show interfaces",         "green:show-interfaces" },
-        { "show ip route",           "green:show-ip-route" },
-        { "show ip route summary",   "green:show-ip-route-summary" },
-        { "show arp",                "green:show-arp" },
-        { "show cdp neighbors",      "green:show-cdp-neighbors" },
-        { "show vlan",               "green:show-vlan" },
-        { "show spanning-tree",      "green:show-spanning-tree" },
-        { "show processes cpu",      "green:show-processes-cpu" },
-        { "show processes memory",   "green:show-processes-memory" },
-        { "show environment",        "green:show-environment" },
-        { "show users",              "green:show-users" },
-        { "show ntp status",         "green:show-ntp-status" },
+        { "show version",            "ios.show-version" },
+        { "show clock",              "ios.show-clock" },
+        { "show inventory",          "ios.show-inventory" },
+        { "show ip interface brief", "ios.show-ip-int-brief" },
+        { "show interfaces",         "ios.show-interfaces" },
+        { "show ip route",           "ios.show-ip-route" },
+        { "show ip route summary",   "ios.show-ip-route-summary" },
+        { "show arp",                "ios.show-arp" },
+        { "show cdp neighbors",      "ios.show-cdp-neighbors" },
+        { "show vlan",               "ios.show-vlan" },
+        { "show spanning-tree",      "ios.show-spanning-tree" },
+        { "show processes cpu",      "ios.show-proc-cpu" },
+        { "show processes memory",   "ios.show-proc-mem" },
+        { "show environment",        "ios.show-environment" },
+        { "show users",              "ios.show-users" },
+        { "show ntp status",         "ios.show-ntp-status" },
     };
     for (size_t i = 0; i < sizeof(G) / sizeof(G[0]); i++) {
         char label[96];
@@ -161,19 +161,19 @@ static void test_green_rows(void)
 
     /* Abbreviated spellings of GREEN reads resolve to the same rows. */
     TEST("sh ver -> GREEN (show version)");
-    expect("sh ver", VIRP_TIER_GREEN, "green:show-version");
+    expect("sh ver", VIRP_TIER_GREEN, "ios.show-version");
     PASS();
     TEST("sh ip int br -> GREEN (show ip interface brief)");
-    expect("sh ip int br", VIRP_TIER_GREEN, "green:show-ip-interface-brief");
+    expect("sh ip int br", VIRP_TIER_GREEN, "ios.show-ip-int-brief");
     PASS();
     TEST("sh ip route summ -> GREEN (show ip route summary)");
-    expect("sh ip route summ", VIRP_TIER_GREEN, "green:show-ip-route-summary");
+    expect("sh ip route summ", VIRP_TIER_GREEN, "ios.show-ip-route-summary");
     PASS();
     TEST("sh cdp nei -> GREEN (show cdp neighbors)");
-    expect("sh cdp nei", VIRP_TIER_GREEN, "green:show-cdp-neighbors");
+    expect("sh cdp nei", VIRP_TIER_GREEN, "ios.show-cdp-neighbors");
     PASS();
     TEST("sh proc c -> GREEN (show processes cpu)");
-    expect("sh proc c", VIRP_TIER_GREEN, "green:show-processes-cpu");
+    expect("sh proc c", VIRP_TIER_GREEN, "ios.show-proc-cpu");
     PASS();
 }
 
@@ -189,14 +189,14 @@ static void test_yellow_rows(void)
          * approval — enable secrets / SNMP strings must not enter the
          * append-only chain via a GREEN read (the FortiGate
          * show full-configuration precedent). */
-        { "show running-config", "yellow:show-running-config" },
-        { "show startup-config", "yellow:show-startup-config" },
-        { "show tech-support",   "yellow:show-tech-support" },
-        { "write memory",        "yellow:write-memory" },
-        { "copy running-config startup-config", "yellow:copy-run-start" },
-        { "clear counters",      "yellow:clear-counters" },
-        { "ping",                "yellow:ping" },
-        { "traceroute",          "yellow:traceroute" },
+        { "show running-config", "ios.show-running" },
+        { "show startup-config", "ios.show-startup" },
+        { "show tech-support",   "ios.show-tech" },
+        { "write memory",        "ios.write-mem" },
+        { "copy running-config startup-config", "ios.copy-run-start" },
+        { "clear counters",      "ios.clear-counters" },
+        { "ping",                "ios.ping" },
+        { "traceroute",          "ios.traceroute" },
     };
     for (size_t i = 0; i < sizeof(Y) / sizeof(Y[0]); i++) {
         char label[96];
@@ -207,13 +207,13 @@ static void test_yellow_rows(void)
     }
 
     TEST("copy run start -> YELLOW (same row as full spelling)");
-    expect("copy run start", VIRP_TIER_YELLOW, "yellow:copy-run-start");
+    expect("copy run start", VIRP_TIER_YELLOW, "ios.copy-run-start");
     PASS();
     TEST("sh start -> YELLOW (show startup-config)");
-    expect("sh start", VIRP_TIER_YELLOW, "yellow:show-startup-config");
+    expect("sh start", VIRP_TIER_YELLOW, "ios.show-startup");
     PASS();
     TEST("sh tech -> YELLOW (show tech-support)");
-    expect("sh tech", VIRP_TIER_YELLOW, "yellow:show-tech-support");
+    expect("sh tech", VIRP_TIER_YELLOW, "ios.show-tech");
     PASS();
 }
 
@@ -225,38 +225,38 @@ static void test_red_explicit(void)
 {
     printf("\n=== RED — explicit rows and annotated families ===\n");
 
-    TEST("configure terminal -> RED red:config-mode-entry");
-    expect("configure terminal", VIRP_TIER_RED, "red:config-mode-entry");
+    TEST("configure terminal -> RED ios.config-mode");
+    expect("configure terminal", VIRP_TIER_RED, "ios.config-mode");
     PASS();
-    TEST("configure (bare) -> RED red:config-mode-entry");
-    expect("configure", VIRP_TIER_RED, "red:config-mode-entry");
+    TEST("configure (bare) -> RED ios.config-mode");
+    expect("configure", VIRP_TIER_RED, "ios.config-mode");
     PASS();
-    TEST("reload -> RED red:reload");
-    expect("reload", VIRP_TIER_RED, "red:reload");
+    TEST("reload -> RED ios.reload");
+    expect("reload", VIRP_TIER_RED, "ios.reload");
     PASS();
-    TEST("reload in 5 -> RED red:reload (argument form)");
-    expect("reload in 5", VIRP_TIER_RED, "red:reload");
+    TEST("reload in 5 -> RED ios.reload (argument form)");
+    expect("reload in 5", VIRP_TIER_RED, "ios.reload");
     PASS();
-    TEST("write erase -> RED red:erase");
-    expect("write erase", VIRP_TIER_RED, "red:erase");
+    TEST("write erase -> RED ios.erase");
+    expect("write erase", VIRP_TIER_RED, "ios.erase");
     PASS();
-    TEST("wr era -> RED red:erase (abbreviated, same rule)");
-    expect("wr era", VIRP_TIER_RED, "red:erase");
+    TEST("wr era -> RED ios.erase (abbreviated, same rule)");
+    expect("wr era", VIRP_TIER_RED, "ios.erase");
     PASS();
-    TEST("erase startup-config -> RED red:erase");
-    expect("erase startup-config", VIRP_TIER_RED, "red:erase");
+    TEST("erase startup-config -> RED ios.erase");
+    expect("erase startup-config", VIRP_TIER_RED, "ios.erase");
     PASS();
-    TEST("era sta -> RED red:erase (abbreviated, same rule)");
-    expect("era sta", VIRP_TIER_RED, "red:erase");
+    TEST("era sta -> RED ios.erase (abbreviated, same rule)");
+    expect("era sta", VIRP_TIER_RED, "ios.erase");
     PASS();
-    TEST("debug ip packet -> RED red:debug (crash risk)");
-    expect("debug ip packet", VIRP_TIER_RED, "red:debug");
+    TEST("debug ip packet -> RED ios.debug (crash risk)");
+    expect("debug ip packet", VIRP_TIER_RED, "ios.debug");
     PASS();
-    TEST("copy tftp: running-config -> RED red:copy-offbox");
-    expect("copy tftp: running-config", VIRP_TIER_RED, "red:copy-offbox");
+    TEST("copy tftp: running-config -> RED ios.copy-offbox");
+    expect("copy tftp: running-config", VIRP_TIER_RED, "ios.copy-offbox");
     PASS();
-    TEST("copy running-config tftp: -> RED red:copy-offbox");
-    expect("copy running-config tftp:", VIRP_TIER_RED, "red:copy-offbox");
+    TEST("copy running-config tftp: -> RED ios.copy-offbox");
+    expect("copy running-config tftp:", VIRP_TIER_RED, "ios.copy-offbox");
     PASS();
 
     /* Distinct reasons really are distinct rules. */
@@ -295,34 +295,34 @@ static void test_ambiguity_fails_closed(void)
 {
     printf("\n=== Ambiguous prefixes fail closed (no canonical form) ===\n");
 
-    TEST("c -> RED red:canon-ambiguous (clear/configure/copy)");
-    expect_no_canon("c", "red:canon-ambiguous");
+    TEST("c -> RED ios.ambiguous (clear/configure/copy)");
+    expect_no_canon("c", "ios.ambiguous");
     PASS();
-    TEST("co -> RED red:canon-ambiguous (configure/copy)");
-    expect_no_canon("co", "red:canon-ambiguous");
+    TEST("co -> RED ios.ambiguous (configure/copy)");
+    expect_no_canon("co", "ios.ambiguous");
     PASS();
-    TEST("show i -> RED red:canon-ambiguous (interfaces/inventory/ip)");
-    expect_no_canon("show i", "red:canon-ambiguous");
+    TEST("show i -> RED ios.ambiguous (interfaces/inventory/ip)");
+    expect_no_canon("show i", "ios.ambiguous");
     PASS();
-    TEST("show in -> RED red:canon-ambiguous (interfaces/inventory)");
-    expect_no_canon("show in", "red:canon-ambiguous");
+    TEST("show in -> RED ios.ambiguous (interfaces/inventory)");
+    expect_no_canon("show in", "ios.ambiguous");
     PASS();
-    TEST("show v -> RED red:canon-ambiguous (version/vlan)");
-    expect_no_canon("show v", "red:canon-ambiguous");
+    TEST("show v -> RED ios.ambiguous (version/vlan)");
+    expect_no_canon("show v", "ios.ambiguous");
     PASS();
-    TEST("sh c -> RED red:canon-ambiguous (cdp/clock)");
-    expect_no_canon("sh c", "red:canon-ambiguous");
+    TEST("sh c -> RED ios.ambiguous (cdp/clock)");
+    expect_no_canon("sh c", "ios.ambiguous");
     PASS();
 
     /* One more character resolves each. */
     TEST("show int -> unique (interfaces), GREEN");
-    expect("show int", VIRP_TIER_GREEN, "green:show-interfaces");
+    expect("show int", VIRP_TIER_GREEN, "ios.show-interfaces");
     PASS();
     TEST("show inv -> unique (inventory), GREEN");
-    expect("show inv", VIRP_TIER_GREEN, "green:show-inventory");
+    expect("show inv", VIRP_TIER_GREEN, "ios.show-inventory");
     PASS();
     TEST("show ve -> unique (version), GREEN");
-    expect("show ve", VIRP_TIER_GREEN, "green:show-version");
+    expect("show ve", VIRP_TIER_GREEN, "ios.show-version");
     PASS();
 }
 
@@ -335,26 +335,26 @@ static void test_near_miss_boundaries(void)
     printf("\n=== Near-miss boundaries ===\n");
 
     TEST("show running-configg -> RED (token overruns keyword)");
-    expect_no_canon("show running-configg", "red:canon-unmatched");
+    expect_no_canon("show running-configg", "ios.unmatched");
     PASS();
     TEST("show versionitis -> RED (overrun)");
-    expect_no_canon("show versionitis", "red:canon-unmatched");
+    expect_no_canon("show versionitis", "ios.unmatched");
     PASS();
     TEST("pingu -> RED (overrun of root keyword)");
-    expect_no_canon("pingu", "red:canon-unmatched");
+    expect_no_canon("pingu", "ios.unmatched");
     PASS();
     TEST("show clockwork -> RED (overrun)");
-    expect_no_canon("show clockwork", "red:canon-unmatched");
+    expect_no_canon("show clockwork", "ios.unmatched");
     PASS();
 
     /* Keyword-vs-argument: a token that matches no child at a node
      * that takes NO arguments is unmatched — it must not be silently
      * kept as an argument. */
     TEST("show version detail -> RED (version takes no operands)");
-    expect_no_canon("show version detail", "red:canon-unmatched");
+    expect_no_canon("show version detail", "ios.unmatched");
     PASS();
     TEST("show users all -> RED (users takes no operands here)");
-    expect_no_canon("show users all", "red:canon-unmatched");
+    expect_no_canon("show users all", "ios.unmatched");
     PASS();
 
     /* Where the grammar DOES take operands, the operand is preserved
@@ -367,7 +367,7 @@ static void test_near_miss_boundaries(void)
         assert(cisco_canon_command("sh int GigabitEthernet0/0",
                                    canon, sizeof(canon)) >= 0);
         assert(strcmp(canon, "show interfaces GigabitEthernet0/0") == 0);
-        expect("sh int GigabitEthernet0/0", VIRP_TIER_RED, "red:absent");
+        expect("sh int GigabitEthernet0/0", VIRP_TIER_RED, "ios.absent");
     }
     PASS();
     TEST("argument case preserved (GigabitEthernet stays mixed-case)");
@@ -380,7 +380,7 @@ static void test_near_miss_boundaries(void)
     }
     PASS();
     TEST("ping 10.0.0.1 -> RED by absence (v1 table is argument-free)");
-    expect("ping 10.0.0.1", VIRP_TIER_RED, "red:absent");
+    expect("ping 10.0.0.1", VIRP_TIER_RED, "ios.absent");
     PASS();
 
     /* Keyword case-insensitivity: same identity, not a new spelling. */
@@ -389,7 +389,7 @@ static void test_near_miss_boundaries(void)
         static const char *const CASES[] =
             { "SH RUN", "Sh Run", "sh run", "SHOW RUNNING-CONFIG", NULL };
         expect_identical(CASES, "show running-config",
-                         VIRP_TIER_YELLOW, "yellow:show-running-config");
+                         VIRP_TIER_YELLOW, "ios.show-running");
     }
     PASS();
 
@@ -404,7 +404,7 @@ static void test_near_miss_boundaries(void)
                                    canon, sizeof(canon)) >= 0);
         assert(strcmp(canon, "show version") == 0);
         expect("  show    version  ", VIRP_TIER_GREEN,
-               "green:show-version");
+               "ios.show-version");
     }
     PASS();
 }
@@ -452,10 +452,10 @@ static void test_default_deny_sweep(void)
     assert(cisco_gate_tier(NULL) == VIRP_TIER_RED);
     PASS();
     TEST("empty string -> RED");
-    expect_no_canon("", "red:canon-unmatched");
+    expect_no_canon("", "ios.unmatched");
     PASS();
     TEST("whitespace-only -> RED");
-    expect_no_canon("      ", "red:canon-unmatched");
+    expect_no_canon("      ", "ios.unmatched");
     PASS();
 }
 
@@ -476,8 +476,8 @@ static void test_separators_fail_closed(void)
         "\tshow version",
     };
     for (size_t i = 0; i < sizeof(SEP) / sizeof(SEP[0]); i++) {
-        TEST("separator variant -> RED red:separator");
-        expect_no_canon(SEP[i], "red:separator");
+        TEST("separator variant -> RED ios.separator");
+        expect_no_canon(SEP[i], "ios.separator");
         PASS();
     }
 }
@@ -656,6 +656,262 @@ static void test_canon_hook_contract(void)
     PASS();
 }
 
+/* =========================================================================
+ * IOS ABBREVIATION ADVERSARIAL CORPUS v1 (Snow, 2026-08-21)
+ * Assertion style: tier AND fired rule id, both checked.
+ *
+ * Section E (ingress-layer interactions — refusal BEFORE the driver,
+ * no proposal filed) is daemon behavior and lives in
+ * tests/test_onode.c (test_ingress_separator_no_proposal); the
+ * classifier-level half (separator strings fail closed inside the
+ * hooks too) is in test_separators_fail_closed above.
+ * ========================================================================= */
+
+/* One (abbreviation, canonical) pair. Every pair feeds both its
+ * sectional assertions and the section-G invariant sweep. */
+typedef struct {
+    const char *abbrev;
+    const char *canonical;
+} corpus_pair_t;
+
+/* Sections A + D: identity variants of Snow's trio plus the case/
+ * whitespace/argument-preservation spellings. */
+static const corpus_pair_t CORPUS_PAIRS[] = {
+    /* A — show running-config */
+    { "sh run",              "show running-config" },
+    { "sho run",             "show running-config" },
+    { "sh runn",             "show running-config" },
+    { "show run",            "show running-config" },
+    { "SH RUN",              "show running-config" },
+    { "sh  running-config",  "show running-config" },
+    /* A — configure terminal */
+    { "conf t",              "configure terminal" },
+    { "config t",            "configure terminal" },
+    { "conf term",           "configure terminal" },
+    { "configure t",         "configure terminal" },
+    /* A — write memory (incl. the default-subcommand alias) */
+    { "wr",                  "write memory" },
+    { "wr mem",              "write memory" },
+    { "write mem",           "write memory" },
+    /* D — case + whitespace + nested abbreviation */
+    { "SHOW   Version",      "show version" },
+    { "sh ip int br",        "show ip interface brief" },
+};
+static const size_t CORPUS_PAIR_COUNT =
+    sizeof(CORPUS_PAIRS) / sizeof(CORPUS_PAIRS[0]);
+
+static void test_corpus_a_snows_trio(void)
+{
+    printf("\n=== CORPUS A — Snow's trio + identity variants ===\n");
+
+    TEST("show running-config -> YELLOW [ios.show-running]");
+    expect("show running-config", VIRP_TIER_YELLOW, "ios.show-running");
+    PASS();
+    TEST("configure terminal -> RED [ios.config-mode]");
+    expect("configure terminal", VIRP_TIER_RED, "ios.config-mode");
+    PASS();
+    TEST("write memory -> YELLOW [ios.write-mem]");
+    expect("write memory", VIRP_TIER_YELLOW, "ios.write-mem");
+    PASS();
+
+    /* Each variant must land on the canonical row — asserted pairwise
+     * here and again wholesale by the section-G sweep. */
+    static const char *const RUN[] = {
+        "sh run", "sho run", "sh runn", "show run", "SH RUN",
+        "sh  running-config", NULL
+    };
+    TEST("running-config variants -> identical tier AND rule");
+    expect_identical(RUN, "show running-config",
+                     VIRP_TIER_YELLOW, "ios.show-running");
+    PASS();
+
+    static const char *const CONF[] = {
+        "conf t", "config t", "conf term", "configure t", NULL
+    };
+    TEST("configure-terminal variants -> identical tier AND rule");
+    expect_identical(CONF, "configure terminal",
+                     VIRP_TIER_RED, "ios.config-mode");
+    PASS();
+
+    static const char *const WR[] = {
+        "wr", "wr mem", "write mem", NULL
+    };
+    TEST("write-memory variants -> identical tier AND rule");
+    expect_identical(WR, "write memory",
+                     VIRP_TIER_YELLOW, "ios.write-mem");
+    PASS();
+}
+
+static void test_corpus_b_ambiguity(void)
+{
+    printf("\n=== CORPUS B — ambiguity fails closed ===\n");
+
+    /* `s` is ambiguous against the DEVICE's vocabulary (show/ssh/
+     * send/setup), which is why the tree carries known-but-untiered
+     * EXEC verbs: computing ambiguity against only the tiered subset
+     * would "uniquely" expand abbreviations the device itself
+     * refuses. */
+    TEST("s -> ambiguous (show/ssh/send/setup), no canonical form");
+    expect_no_canon("s", "ios.ambiguous");
+    PASS();
+    TEST("sh i -> ambiguous under show (ip/interfaces/inventory)");
+    expect_no_canon("sh i", "ios.ambiguous");
+    PASS();
+    TEST("co -> ambiguous (configure/copy)");
+    expect_no_canon("co", "ios.ambiguous");
+    PASS();
+    TEST("show in -> ambiguous (interfaces/inventory)");
+    expect_no_canon("show in", "ios.ambiguous");
+    PASS();
+}
+
+static void test_corpus_c_overrun(void)
+{
+    printf("\n=== CORPUS C — overrun / near-miss ===\n");
+
+    TEST("show running-configg -> RED (overrun)");
+    expect_no_canon("show running-configg", "ios.unmatched");
+    PASS();
+    TEST("show versionx -> RED (overrun)");
+    expect_no_canon("show versionx", "ios.unmatched");
+    PASS();
+    TEST("shw ver -> RED (shw is not a prefix of show)");
+    expect_no_canon("shw ver", "ios.unmatched");
+    PASS();
+    TEST("showversion -> RED (no token boundary)");
+    expect_no_canon("showversion", "ios.unmatched");
+    PASS();
+}
+
+static void test_corpus_d_case_ws_args(void)
+{
+    printf("\n=== CORPUS D — case + whitespace + argument preservation ===\n");
+
+    TEST("SHOW   Version -> canonical \"show version\", GREEN");
+    {
+        char canon[CISCO_CANON_MAX];
+        assert(cisco_canon_command("SHOW   Version",
+                                   canon, sizeof(canon)) >= 0);
+        assert(strcmp(canon, "show version") == 0);
+        expect("SHOW   Version", VIRP_TIER_GREEN, "ios.show-version");
+    }
+    PASS();
+
+    TEST("show interfaces GigabitEthernet0/1 -> keywords canonical, "
+         "argument byte-preserved");
+    {
+        char canon[CISCO_CANON_MAX];
+        assert(cisco_canon_command("SH INT GigabitEthernet0/1",
+                                   canon, sizeof(canon)) >= 0);
+        assert(strcmp(canon, "show interfaces GigabitEthernet0/1") == 0);
+    }
+    PASS();
+
+    TEST("sh ip int br -> show ip interface brief, GREEN, same rule");
+    {
+        char canon[CISCO_CANON_MAX];
+        assert(cisco_canon_command("sh ip int br",
+                                   canon, sizeof(canon)) >= 0);
+        assert(strcmp(canon, "show ip interface brief") == 0);
+        expect("sh ip int br", VIRP_TIER_GREEN, "ios.show-ip-int-brief");
+        expect("show ip interface brief", VIRP_TIER_GREEN,
+               "ios.show-ip-int-brief");
+    }
+    PASS();
+}
+
+static void test_corpus_f_default_deny(void)
+{
+    printf("\n=== CORPUS F — default-deny sweep (explicit + fuzz) ===\n");
+
+    TEST("reload -> RED [ios.reload]");
+    expect("reload", VIRP_TIER_RED, "ios.reload");
+    PASS();
+    TEST("erase startup-config -> RED [ios.erase]");
+    expect("erase startup-config", VIRP_TIER_RED, "ios.erase");
+    PASS();
+    TEST("debug ip packet -> RED [ios.debug]");
+    expect("debug ip packet", VIRP_TIER_RED, "ios.debug");
+    PASS();
+    TEST("write erase -> RED [ios.erase]");
+    expect("write erase", VIRP_TIER_RED, "ios.erase");
+    PASS();
+    TEST("copy tftp: running-config -> RED [ios.copy-offbox]");
+    expect("copy tftp: running-config", VIRP_TIER_RED, "ios.copy-offbox");
+    PASS();
+    TEST("do show version -> RED (config-mode escape verb, unknown here)");
+    expect("do show version", VIRP_TIER_RED, "ios.unmatched");
+    PASS();
+    TEST("terminal monitor -> RED (known vocabulary, no tier row)");
+    expect("terminal monitor", VIRP_TIER_RED, "ios.absent");
+    PASS();
+
+    /* 20 fuzz-corpus token strings, fixed so refusals are replayable.
+     * Shapes: keyboard mash, wrong-vendor verbs, path/flag noise,
+     * high-bit bytes, digits, near-IOS word salad. */
+    static const char *const FUZZ[] = {
+        "qwjf oiwejf woief",       "zzzz zzzz zzzz zzzz",
+        "asdf",                    "get system status",
+        "set system host-name x",  "request system reboot",
+        "run show version",        "admin reload now please",
+        "-rf / --force",           "/bin/sh -c id",
+        "0x41414141 %n %s",        "12345 67890",
+        "sh0w version",            "shov ver",
+        "showw ver",               "s h o w",
+        "vlan database",           "ip http server",
+        "f\xc3\xb8\xc3\xb8 bar",   "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    };
+    for (size_t i = 0; i < sizeof(FUZZ) / sizeof(FUZZ[0]); i++) {
+        char label[96];
+        snprintf(label, sizeof(label), "fuzz[%zu] \"%.40s\" -> RED",
+                 i, FUZZ[i]);
+        TEST(label);
+        virp_trust_tier_t t = cisco_gate_tier(FUZZ[i]);
+        if (t != VIRP_TIER_RED) {
+            printf("\n    NOT RED: \"%s\" -> %s\n", FUZZ[i], tier_name(t));
+            assert(t == VIRP_TIER_RED);
+        }
+        PASS();
+    }
+}
+
+static void test_corpus_g_cosmetic_gate_invariant(void)
+{
+    printf("\n=== CORPUS G — the cosmetic-gate invariant ===\n");
+
+    /* For EVERY (abbreviation, canonical) pair: tier, fired rule id,
+     * and canonical string must all agree. A divergence anywhere IS
+     * the cosmetic-gate case and fails the suite. */
+    TEST("no (abbreviation, canonical) pair diverges");
+    for (size_t i = 0; i < CORPUS_PAIR_COUNT; i++) {
+        const corpus_pair_t *p = &CORPUS_PAIRS[i];
+
+        virp_trust_tier_t ta = cisco_gate_tier(p->abbrev);
+        virp_trust_tier_t tc = cisco_gate_tier(p->canonical);
+        const char *ra = cisco_gate_rule(p->abbrev);
+        const char *rc = cisco_gate_rule(p->canonical);
+        char ca[CISCO_CANON_MAX], cc[CISCO_CANON_MAX];
+        int na = cisco_canon_command(p->abbrev, ca, sizeof(ca));
+        int nc = cisco_canon_command(p->canonical, cc, sizeof(cc));
+
+        if (ta != tc || strcmp(ra, rc) != 0 ||
+            na < 0 || nc < 0 || strcmp(ca, cc) != 0 ||
+            strcmp(cc, p->canonical) != 0) {
+            printf("\n    COSMETIC-GATE DIVERGENCE: \"%s\" vs \"%s\": "
+                   "%s/%s vs %s/%s (canon \"%s\" vs \"%s\")\n",
+                   p->abbrev, p->canonical,
+                   tier_name(ta), ra, tier_name(tc), rc,
+                   na >= 0 ? ca : "(none)", nc >= 0 ? cc : "(none)");
+            assert(ta == tc);
+            assert(strcmp(ra, rc) == 0);
+            assert(na >= 0 && nc >= 0);
+            assert(strcmp(ca, cc) == 0);
+            assert(strcmp(cc, p->canonical) == 0);
+        }
+    }
+    PASS();
+}
+
 int main(void)
 {
     printf("VIRP Cisco IOS/IOS-XE Gate Classifier — canonicalizer + "
@@ -672,6 +928,12 @@ int main(void)
     test_canonical_only_invariant();
     test_table_invariants();
     test_canon_hook_contract();
+    test_corpus_a_snows_trio();
+    test_corpus_b_ambiguity();
+    test_corpus_c_overrun();
+    test_corpus_d_case_ws_args();
+    test_corpus_f_default_deny();
+    test_corpus_g_cosmetic_gate_invariant();
     printf("\n==================================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

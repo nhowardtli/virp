@@ -130,11 +130,33 @@ static const cisco_kw_node_t N_ROOT_CHILDREN[] = {
     { "configure",  KIDS(N_CONFIGURE), true,  NULL },
     { "copy",       KIDS(N_COPY),      true,  NULL },
     LEAF("debug",      true),
+    /* ── Known-but-untiered EXEC vocabulary ─────────────────────────
+     * These verbs exist on every IOS EXEC line but carry no tier row,
+     * so they classify RED by absence. They are in the tree anyway
+     * because abbreviation resolution must match the DEVICE's
+     * vocabulary, not just the tiered subset: with only tiered verbs
+     * present, `s` would "uniquely" resolve to show — an expansion
+     * the device itself would refuse as ambiguous (show/ssh/send/
+     * setup). Ambiguity must be computed against what IOS knows.
+     * Adding vocabulary here can only widen ambiguity or annotate a
+     * refusal — it can never grant a tier. */
+    LEAF("dir",        true),
+    LEAF("disable",    false),
+    LEAF("enable",     true),
     { "erase",      KIDS(N_ERASE),     true,  NULL },
+    LEAF("exit",       false),
+    LEAF("logout",     false),
     LEAF("ping",       true),
     LEAF("reload",     true),
+    LEAF("send",       true),
+    LEAF("setup",      false),
     { "show",       KIDS(N_SHOW),      false, NULL },
+    LEAF("ssh",        true),
+    LEAF("telnet",     true),
+    LEAF("terminal",   true),
+    LEAF("test",       true),
     LEAF("traceroute", true),
+    LEAF("undebug",    true),
     /* `write` with no subcommand is IOS shorthand for `write memory`. */
     { "write",      KIDS(N_WRITE),     false, "write memory" },
 };
@@ -188,56 +210,56 @@ typedef struct {
 
 static const cisco_tier_row_t CISCO_TIER_TABLE[] = {
     /* ── GREEN — curated read-only status set (v1) ─────────────────── */
-    { "show version",            VIRP_TIER_GREEN, "green:show-version",            NULL },
-    { "show clock",              VIRP_TIER_GREEN, "green:show-clock",              NULL },
-    { "show inventory",          VIRP_TIER_GREEN, "green:show-inventory",          NULL },
-    { "show ip interface brief", VIRP_TIER_GREEN, "green:show-ip-interface-brief", NULL },
-    { "show interfaces",         VIRP_TIER_GREEN, "green:show-interfaces",         NULL },
-    { "show ip route",           VIRP_TIER_GREEN, "green:show-ip-route",           NULL },
-    { "show ip route summary",   VIRP_TIER_GREEN, "green:show-ip-route-summary",   NULL },
-    { "show arp",                VIRP_TIER_GREEN, "green:show-arp",                NULL },
-    { "show cdp neighbors",      VIRP_TIER_GREEN, "green:show-cdp-neighbors",      NULL },
-    { "show vlan",               VIRP_TIER_GREEN, "green:show-vlan",               NULL },
-    { "show spanning-tree",      VIRP_TIER_GREEN, "green:show-spanning-tree",      NULL },
-    { "show processes cpu",      VIRP_TIER_GREEN, "green:show-processes-cpu",      NULL },
-    { "show processes memory",   VIRP_TIER_GREEN, "green:show-processes-memory",   NULL },
-    { "show environment",        VIRP_TIER_GREEN, "green:show-environment",        NULL },
-    { "show users",              VIRP_TIER_GREEN, "green:show-users",              NULL },
-    { "show ntp status",         VIRP_TIER_GREEN, "green:show-ntp-status",         NULL },
+    { "show version",            VIRP_TIER_GREEN, "ios.show-version",            NULL },
+    { "show clock",              VIRP_TIER_GREEN, "ios.show-clock",              NULL },
+    { "show inventory",          VIRP_TIER_GREEN, "ios.show-inventory",          NULL },
+    { "show ip interface brief", VIRP_TIER_GREEN, "ios.show-ip-int-brief", NULL },
+    { "show interfaces",         VIRP_TIER_GREEN, "ios.show-interfaces",         NULL },
+    { "show ip route",           VIRP_TIER_GREEN, "ios.show-ip-route",           NULL },
+    { "show ip route summary",   VIRP_TIER_GREEN, "ios.show-ip-route-summary",   NULL },
+    { "show arp",                VIRP_TIER_GREEN, "ios.show-arp",                NULL },
+    { "show cdp neighbors",      VIRP_TIER_GREEN, "ios.show-cdp-neighbors",      NULL },
+    { "show vlan",               VIRP_TIER_GREEN, "ios.show-vlan",               NULL },
+    { "show spanning-tree",      VIRP_TIER_GREEN, "ios.show-spanning-tree",      NULL },
+    { "show processes cpu",      VIRP_TIER_GREEN, "ios.show-proc-cpu",      NULL },
+    { "show processes memory",   VIRP_TIER_GREEN, "ios.show-proc-mem",   NULL },
+    { "show environment",        VIRP_TIER_GREEN, "ios.show-environment",        NULL },
+    { "show users",              VIRP_TIER_GREEN, "ios.show-users",              NULL },
+    { "show ntp status",         VIRP_TIER_GREEN, "ios.show-ntp-status",         NULL },
 
     /* ── YELLOW — proposable, never GREEN ──────────────────────────── */
-    { "show running-config",     VIRP_TIER_YELLOW, "yellow:show-running-config",
+    { "show running-config",     VIRP_TIER_YELLOW, "ios.show-running",
       REASON_CONFIG_READ },
-    { "show startup-config",     VIRP_TIER_YELLOW, "yellow:show-startup-config",
+    { "show startup-config",     VIRP_TIER_YELLOW, "ios.show-startup",
       REASON_CONFIG_READ },
-    { "show tech-support",       VIRP_TIER_YELLOW, "yellow:show-tech-support",
+    { "show tech-support",       VIRP_TIER_YELLOW, "ios.show-tech",
       REASON_CONFIG_READ },
     /* `write memory` and its exact IOS equivalent share one rule id:
      * one device action, one rule, one audit identity. (`wr` and bare
      * `write` reach the first row via the canonicalizer's
      * default-subcommand alias.) */
-    { "write memory",            VIRP_TIER_YELLOW, "yellow:write-memory",
+    { "write memory",            VIRP_TIER_YELLOW, "ios.write-mem",
       "NVRAM config save — proposable state write" },
     { "copy running-config startup-config",
-                                 VIRP_TIER_YELLOW, "yellow:copy-run-start",
+                                 VIRP_TIER_YELLOW, "ios.copy-run-start",
       "NVRAM config save — proposable state write" },
-    { "clear counters",          VIRP_TIER_YELLOW, "yellow:clear-counters",
+    { "clear counters",          VIRP_TIER_YELLOW, "ios.clear-counters",
       "counter reset — diagnostic action, proposable" },
-    { "ping",                    VIRP_TIER_YELLOW, "yellow:ping",
+    { "ping",                    VIRP_TIER_YELLOW, "ios.ping",
       "active probe — proposable" },
-    { "traceroute",              VIRP_TIER_YELLOW, "yellow:traceroute",
+    { "traceroute",              VIRP_TIER_YELLOW, "ios.traceroute",
       "active probe — proposable" },
 
     /* ── RED — explicit rows with distinct reasons (default also RED) ─ */
-    { "configure terminal",      VIRP_TIER_RED, "red:config-mode-entry",
+    { "configure terminal",      VIRP_TIER_RED, "ios.config-mode",
       REASON_CONFIG_MODE },
-    { "configure",               VIRP_TIER_RED, "red:config-mode-entry",
+    { "configure",               VIRP_TIER_RED, "ios.config-mode",
       REASON_CONFIG_MODE },
-    { "reload",                  VIRP_TIER_RED, "red:reload",
+    { "reload",                  VIRP_TIER_RED, "ios.reload",
       "device restart" },
-    { "write erase",             VIRP_TIER_RED, "red:erase",
+    { "write erase",             VIRP_TIER_RED, "ios.erase",
       "startup-config destruction" },
-    { "erase startup-config",    VIRP_TIER_RED, "red:erase",
+    { "erase startup-config",    VIRP_TIER_RED, "ios.erase",
       "startup-config destruction" },
 };
 static const size_t CISCO_TIER_TABLE_SIZE =
@@ -259,11 +281,11 @@ typedef struct {
 } cisco_red_family_t;
 
 static const cisco_red_family_t CISCO_RED_FAMILIES[] = {
-    { "configure", "red:config-mode-entry", REASON_CONFIG_MODE },
-    { "reload",    "red:reload",  "device restart" },
-    { "erase",     "red:erase",   "filesystem/config destruction" },
-    { "debug",     "red:debug",   "debug output — crash risk on loaded devices" },
-    { "copy",      "red:copy-offbox",
+    { "configure", "ios.config-mode", REASON_CONFIG_MODE },
+    { "reload",    "ios.reload",  "device restart" },
+    { "erase",     "ios.erase",   "filesystem/config destruction" },
+    { "debug",     "ios.debug",   "debug output — crash risk on loaded devices" },
+    { "copy",      "ios.copy-offbox",
       "copy involving a network or filesystem location — off-box "
       "egress / image change, out of scope v1" },
 };
@@ -271,11 +293,11 @@ static const size_t CISCO_RED_FAMILY_COUNT =
     sizeof(CISCO_RED_FAMILIES) / sizeof(CISCO_RED_FAMILIES[0]);
 
 /* Rule ids for classifications that never reach the table. */
-static const char RULE_INVALID[]     = "red:invalid";
-static const char RULE_SEPARATOR[]   = "red:separator";
-static const char RULE_AMBIGUOUS[]   = "red:canon-ambiguous";
-static const char RULE_UNMATCHED[]   = "red:canon-unmatched";
-static const char RULE_ABSENT[]      = "red:absent";
+static const char RULE_INVALID[]     = "ios.invalid";
+static const char RULE_SEPARATOR[]   = "ios.separator";
+static const char RULE_AMBIGUOUS[]   = "ios.ambiguous";
+static const char RULE_UNMATCHED[]   = "ios.unmatched";
+static const char RULE_ABSENT[]      = "ios.absent";
 
 static const char REASON_AMBIGUOUS[] =
     "ambiguous abbreviation — no canonical form; spell the command out";
