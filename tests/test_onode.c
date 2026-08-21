@@ -230,6 +230,60 @@ TEST(test_gate_enforce_blocks_unclassified)
 }
 
 /*
+ * Canonicalization boundary (ios-canon integration): when a driver
+ * carries a canon_command hook, the CANONICAL string — not the raw
+ * submitted spelling — is what the gate classifies, the driver
+ * executes, and the observation signs. The mock's hook expands exactly
+ * "sh ip route" -> "show ip route"; the mock classifier routes the raw
+ * spelling UNCLASSIFIED (blocked under the ENFORCE default) and the
+ * canonical one GREEN, so this test proves the hook was load-bearing
+ * in both directions:
+ *   enabled  -> GREEN device output whose echoed command is the
+ *               canonical spelling (the executed bytes ARE canonical);
+ *   disabled -> the same raw spelling is hard-blocked UNCLASSIFIED.
+ */
+TEST(test_canon_hook_boundary)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    virp_header_t hdr;
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+
+    /* Disabled (default): abbreviation is unclassifiable, blocked. */
+    ssize_t n = client_request(
+        "{\"action\": \"execute\", \"device\": \"R6\", "
+        "\"command\": \"sh ip route\"}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+    ASSERT_OK(virp_validate_message(resp, (size_t)n, &g_state.okey, &hdr));
+    ASSERT_EQ(hdr.tier, VIRP_TIER_UNCLASSIFIED);
+    ASSERT_OK(virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                                     (size_t)n - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+
+    /* Enabled: same raw spelling classifies GREEN via its canonical
+     * form and the driver receives the CANONICAL bytes (the mock
+     * echoes "<host>#<command>"). */
+    virp_driver_mock_set_canon(true);
+    n = client_request(
+        "{\"action\": \"execute\", \"device\": \"R6\", "
+        "\"command\": \"sh ip route\"}",
+        resp, sizeof(resp));
+    virp_driver_mock_set_canon(false);
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+    ASSERT_OK(virp_validate_message(resp, (size_t)n, &g_state.okey, &hdr));
+    ASSERT_EQ(hdr.tier, VIRP_TIER_GREEN);
+    ASSERT_OK(virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                                     (size_t)n - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_DEVICE_OUTPUT);
+    ASSERT_TRUE(strstr((const char *)data, "R6#show ip route") != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "sh ip route") == NULL);
+}
+
+/*
  * L1 (2026-08-18): an over-tier command under ENFORCE must be refused by
  * the gate BEFORE any device connection — no auth attempt, no session, no
  * connect audit noise. Arm the mock to FAIL every connect: pre-L1 the
@@ -6248,6 +6302,7 @@ int main(void)
     printf("\n[O-Node Pipeline Tests]\n");
     RUN_TEST(test_execute_show_ip_route);
     RUN_TEST(test_gate_enforce_blocks_unclassified);
+    RUN_TEST(test_canon_hook_boundary);
     RUN_TEST(test_over_tier_enforce_refused_without_connecting);
 
     printf("\n[Multi-Command Gate Bypass (layer 1)]\n");

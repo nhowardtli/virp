@@ -1422,6 +1422,29 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                       (uint16_t)strlen(err_msg),
                                       &state->okey);
     }
+    /*
+     * Canonicalization boundary (drivers with a canon_command hook —
+     * cisco IOS/IOS-XE). The device treats every unambiguous keyword
+     * abbreviation as the SAME command, so `sh run` and `show
+     * running-config` must produce ONE classification, ONE fired rule,
+     * ONE signed command hash. On success the canonical string
+     * replaces the submitted one for EVERYTHING downstream —
+     * classification, proposal/apply hashing, execution, the v2
+     * command hash — so "the classified bytes are the executed bytes"
+     * holds with both being the canonical bytes. On failure (ambiguous
+     * or unrecognized — the hook logs why) the raw bytes are kept and
+     * the driver's classifier fails closed on them; the raw spelling
+     * never reaches any tier table either way.
+     */
+    const char *raw_command = command;
+    char canon_cmd[512];
+    bool canonicalized = false;
+    if (drv->canon_command &&
+        drv->canon_command(command, canon_cmd, sizeof(canon_cmd)) >= 0) {
+        command = canon_cmd;
+        canonicalized = true;
+    }
+
     virp_trust_tier_t gate_tier = gate_classify(drv, command);
 
     /* Approval-apply state: set when a valid, consumed approval admits a
@@ -1476,10 +1499,27 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
          * The old unconditional "would-block"/"would-allow" wording made
          * an ENFORCE rejection read like a logged-but-executed change.
          * threshold= reports the EFFECTIVE ceiling (post per-uid tighten)
-         * so the log shows what actually decided this connection. */
+         * so the log shows what actually decided this connection.
+         *
+         * Classifier stamp (drivers that carry one): classifier= names
+         * the rule-set version, rule= the rule that fired for THIS
+         * command — the line alone ties the decision to the table that
+         * made it. command= is always the CLASSIFIED (and, if admitted,
+         * executed/hashed) string; raw= preserves the submitted
+         * spelling whenever canonicalization changed it. Drivers
+         * without these hooks emit the line byte-identical to before. */
+        char stamp[192];
+        stamp[0] = '\0';
+        if (drv->classifier_version || drv->route_rule) {
+            const char *rule = drv->route_rule ? drv->route_rule(command)
+                                               : NULL;
+            snprintf(stamp, sizeof(stamp), " classifier=%s rule=%s",
+                     drv->classifier_version ? drv->classifier_version : "-",
+                     rule ? rule : "-");
+        }
         fprintf(stderr,
                 "[GATE] mode=%s device=%s driver=%s tier=%s threshold=%s "
-                "uid=%ld decision=%s command=\"%s\"\n",
+                "uid=%ld decision=%s%s command=\"%s\"%s%s%s\n",
                 mode == GATE_MODE_ENFORCE ? "ENFORCE" : "SHADOW",
                 device_name, drv->name,
                 gate_tier_name(gate_tier),
@@ -1488,7 +1528,14 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                 mode == GATE_MODE_ENFORCE
                     ? (block ? "block" : "allow")
                     : (block ? "would-block" : "would-allow"),
-                command);
+                stamp,
+                command,
+                (canonicalized && strcmp(raw_command, command) != 0)
+                    ? " raw=\"" : "",
+                (canonicalized && strcmp(raw_command, command) != 0)
+                    ? raw_command : "",
+                (canonicalized && strcmp(raw_command, command) != 0)
+                    ? "\"" : "");
 
         if (mode == GATE_MODE_ENFORCE && block &&
             proposal_id && proposal_id[0]) {
@@ -1564,8 +1611,13 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         } else if (mode == GATE_MODE_ENFORCE && block) {
             pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
             char err_msg[448];
+            /* %.256s: `command` can now point at the 512-byte canonical
+             * buffer, whose worst case would not fit err_msg with the
+             * reason/proposal suffixes appended below. The full string
+             * is always in the [GATE] line and the chain body; the
+             * payload keeps a bounded prefix. */
             snprintf(err_msg, sizeof(err_msg),
-                     "ERROR: tier gate blocked '%s' on '%s' "
+                     "ERROR: tier gate blocked '%.256s' on '%s' "
                      "(tier=%s max=%s)",
                      command, device_name, gate_tier_name(gate_tier),
                      gate_tier_name(eff_max));
@@ -1706,6 +1758,23 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                         cJSON_AddStringToObject(o, "matched_rule", matched);
                     else
                         cJSON_AddNullToObject(o, "matched_rule");
+                    /* Classifier stamp (additive, optional — absent for
+                     * drivers without the hooks, so existing consumers
+                     * and the schema id are unchanged). `command` above
+                     * is the CLASSIFIED canonical string; raw_command
+                     * preserves the submitted spelling when
+                     * canonicalization changed it. */
+                    if (drv->classifier_version)
+                        cJSON_AddStringToObject(o, "classifier_version",
+                                                drv->classifier_version);
+                    if (drv->route_rule) {
+                        const char *rl = drv->route_rule(command);
+                        if (rl)
+                            cJSON_AddStringToObject(o, "rule_id", rl);
+                    }
+                    if (canonicalized && strcmp(raw_command, command) != 0)
+                        cJSON_AddStringToObject(o, "raw_command",
+                                                raw_command);
                     cJSON_AddStringToObject(o, "message", err_msg);
                     cJSON_AddBoolToObject(o, "executed", false);
                     body = cJSON_PrintUnformatted(o);

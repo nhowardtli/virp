@@ -334,6 +334,51 @@ typedef struct virp_driver {
     const char *(*route_reason)(const char *command);
 
     /*
+     * route_rule — OPTIONAL companion to route_command: the identifier
+     * of the classifier rule that decided this command's tier (e.g.
+     * "yellow:show-running-config", "red:canon-ambiguous"). The gate
+     * stamps it into the [GATE] journal line and the gate_rejection
+     * chain body so every recorded decision names the rule that fired.
+     * Same contract as route_reason: read-only, side-effect free,
+     * static strings only. Never NULL for a driver that sets the hook —
+     * a classifier that can decide a tier can always name why.
+     */
+    const char *(*route_rule)(const char *command);
+
+    /*
+     * canon_command — OPTIONAL command canonicalizer. When set, the
+     * O-Node calls it ONCE at the request boundary, before
+     * classification; on success (return >= 0, canonical string in
+     * out) the canonical string REPLACES the submitted one for
+     * everything downstream: classification, approval propose/apply
+     * hashing, execution, and the signed v2 command hash. Two
+     * spellings of one device command thus produce one classification,
+     * one rule, one hash identity — and the invariant "the classified
+     * bytes are the executed bytes" holds because both are the
+     * canonical bytes.
+     *
+     * On failure (return < 0: ambiguous abbreviation, unrecognized
+     * token, illegal separator) the daemon keeps the RAW bytes; the
+     * driver's route_command must fail closed on them. A driver that
+     * sets this hook is declaring that its device treats the canonical
+     * and submitted spellings as the SAME command (IOS prefix
+     * expansion): only under that property is executing the expansion
+     * honest. Drivers that execute the caller's original bytes leave
+     * this NULL and keep case-sensitive, abbreviation-free tables
+     * (the 2026-08-09 rule).
+     */
+    int (*canon_command)(const char *command, char *out, size_t out_cap);
+
+    /*
+     * classifier_version — OPTIONAL static identifier of the
+     * classifier rule set (e.g. "ios-canon/1"), stamped alongside
+     * route_rule output in the journal and rejection records so an
+     * audit can tie a decision to the table that produced it. Bump on
+     * any change to classification meaning. NULL = unversioned.
+     */
+    const char *classifier_version;
+
+    /*
      * typed_profile — OPTIONAL. Non-NULL declares that this driver's
      * commands are a TYPED-OPERATION PROFILE (see
      * docs/DRIVER-TYPED-OPS.md), not a CLI string, and selects the
@@ -417,6 +462,10 @@ int  virp_driver_mock_probe_count(void);
 void virp_driver_mock_set_unknown_fail(const char *msg);
 /* Total execute() invocations since the last reset; resets to zero. */
 int  virp_driver_mock_exec_attempts_reset(void);
+/* Enable the mock's canon_command hook ("sh ip route" -> "show ip
+ * route"; everything else reports no canonical form). Disabled (the
+ * default) the hook behaves exactly like an absent hook. */
+void virp_driver_mock_set_canon(bool on);
 
 /* Real drivers — conditionally compiled */
 #ifdef VIRP_DRIVER_CISCO

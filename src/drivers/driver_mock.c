@@ -50,6 +50,28 @@ void virp_driver_mock_set_unknown_fail(const char *msg) { mock_unknown_fail_msg 
 static const char *mock_output_override = NULL;
 void virp_driver_mock_set_output(const char *text) { mock_output_override = text; }
 
+/* Test hook: enable the canon_command hook. The vtable always carries
+ * the hook (the registry copies the struct at init, so it cannot be
+ * added later); disabled it reports "no canonical form" for every
+ * command, which the O-Node treats exactly like a driver without the
+ * hook. Enabled, it expands one fixed abbreviation — enough for the
+ * daemon-boundary test to prove the canonical string (not the raw one)
+ * is what gets classified, executed, and signed. */
+static bool mock_canon_on = false;
+void virp_driver_mock_set_canon(bool on) { mock_canon_on = on; }
+
+static int mock_canon_command(const char *command, char *out, size_t out_cap)
+{
+    if (!mock_canon_on || !command || !out) return -1;
+    if (strcmp(command, "sh ip route") == 0) {
+        static const char CANON[] = "show ip route";
+        if (out_cap < sizeof(CANON)) return -1;
+        memcpy(out, CANON, sizeof(CANON));
+        return (int)(sizeof(CANON) - 1);
+    }
+    return -1;   /* everything else: no canonical form, raw bytes kept */
+}
+
 /*
  * Test hook: simulate a single shared SSH channel per connection.
  *
@@ -409,6 +431,7 @@ static virp_driver_t mock_driver = {
     .detect     = mock_detect,
     .health_check = mock_health_check,
     .route_command = mock_route_command,
+    .canon_command = mock_canon_command,
 };
 
 void virp_driver_mock_init(void)
