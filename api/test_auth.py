@@ -215,3 +215,22 @@ def test_auth_noop_when_token_unset(tmp_path, monkeypatch):
     c = TestClient(server.app)
     r = c.post("/api/observe", json={"device": "R1", "command": "show ver"})
     assert r.status_code == 200
+
+
+def test_openapi_declares_bearer_scheme(client):
+    """The OpenAPI doc must advertise the bearer scheme so Swagger /docs
+    renders an Authorize button (issue #8). Protected operations must
+    carry the security requirement; public ones must not."""
+    spec = client.get("/openapi.json").json()
+
+    schemes = spec.get("components", {}).get("securitySchemes", {})
+    assert "HTTPBearer" in schemes
+    assert schemes["HTTPBearer"] == {"type": "http", "scheme": "bearer"}
+
+    observe = spec["paths"]["/api/observe"]["post"]
+    assert {"HTTPBearer": []} in observe.get("security", []), (
+        "protected operation missing the HTTPBearer security requirement"
+    )
+
+    health = spec["paths"]["/api/health"]["get"]
+    assert not health.get("security"), "public route must not require auth"
