@@ -19,6 +19,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_driver.h"
+#include "virp_driver_cisco_canon.h"
 #include "virp_ssh_io.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -536,200 +537,16 @@ bool cisco_is_black_tier(const char *command)
 /* =========================================================================
  * Gate classifier — SHARED CORE for classic IOS and IOS-XE
  *
- * Longest-prefix match, CASE-SENSITIVE (2026-08-09: the driver executes
- * the caller's original bytes, so the classifier may not vouch for any
- * spelling it did not literally see — "SHOW VERSION" is not "show
- * version" and falls through RED, exactly as abbreviations already
- * did). FAIL-CLOSED: unmatched -> RED.
- * BLACK is handled separately by cisco_is_black_tier() and is NOT in this
- * table. The XE-delta table is intentionally empty for now — cisco_ios and
- * cisco_iosxe share this core until shadow evidence justifies a delta.
+ * Moved to src/drivers/cisco_canon.c (canonicalizer + exact-match tier
+ * table). The former longest-prefix table lived here; it is gone
+ * because IOS abbreviations ARE prefixes and two spellings of one
+ * command must yield one classification, one rule, one hash identity.
+ * All prefix logic now lives in the canonicalizer (ambiguity fails
+ * closed); the tier table exact-matches canonical strings only.
+ * FAIL-CLOSED: anything without a canonical, tabled form is RED.
+ * BLACK is handled separately by cisco_is_black_tier() and is NOT in
+ * that table. cisco_ios and cisco_iosxe still share the core.
  * ========================================================================= */
-
-typedef struct { const char *prefix; virp_trust_tier_t tier; } cisco_route_t;
-
-static const cisco_route_t CISCO_GATE_TABLE[] = {
-    /* ── GREEN — read-only status/monitoring (explicit allow-list) ── */
-    { "show version",                 VIRP_TIER_GREEN  },
-    { "show ip interface brief",      VIRP_TIER_GREEN  },
-    { "show interfaces",              VIRP_TIER_GREEN  },
-    { "show ip route",                VIRP_TIER_GREEN  },
-    { "show cdp neighbors",           VIRP_TIER_GREEN  },
-    { "show lldp neighbors",          VIRP_TIER_GREEN  },
-    { "show inventory",               VIRP_TIER_GREEN  },
-    { "show processes",               VIRP_TIER_GREEN  },
-    { "show clock",                   VIRP_TIER_GREEN  },
-    { "show environment",             VIRP_TIER_GREEN  },
-    { "show ip protocols",            VIRP_TIER_GREEN  },
-    { "show vlan",                    VIRP_TIER_GREEN  },
-    { "show spanning-tree",           VIRP_TIER_GREEN  },
-    { "show mac address-table",       VIRP_TIER_GREEN  },
-    { "show ip arp",                  VIRP_TIER_GREEN  },
-    /* Shadow-evidence promotions (2026-07-16): routing adjacency + status */
-    { "show ip ospf",                 VIRP_TIER_GREEN  },
-    { "show ip bgp",                  VIRP_TIER_GREEN  },
-    { "show ip eigrp",                VIRP_TIER_GREEN  },
-    { "show ip ssh",                  VIRP_TIER_GREEN  },
-    { "show arp",                     VIRP_TIER_GREEN  },
-    { "show etherchannel",            VIRP_TIER_GREEN  },
-    { "show redundancy",              VIRP_TIER_GREEN  },
-    { "show platform",                VIRP_TIER_GREEN  },
-    { "show memory",                  VIRP_TIER_GREEN  },
-    { "show ntp",                     VIRP_TIER_GREEN  },
-    { "show bootvar",                 VIRP_TIER_GREEN  },
-    { "show boot",                    VIRP_TIER_GREEN  },
-    { "show file systems",            VIRP_TIER_GREEN  },
-    /* Read-spelling coverage (2026-08-18): forms that fell through to the
-     * fail-closed RED default because only one spelling was listed. Each has
-     * a direct GREEN precedent above and is unambiguously read-only. Found by
-     * an empirical sweep of the compiled table (see test_driver_cisco_gate).
-     *   - IOS-XE/NX-OS drop "ip" from the BGP namespace ("show ip bgp" GREEN
-     *     above covers only the IOS spelling). "show bgp" is the namespace,
-     *     the two explicit forms are listed for audit clarity (subsumed by it,
-     *     like "configure"/"configure terminal" in the RED block). */
-    { "show bgp",                     VIRP_TIER_GREEN  },
-    { "show bgp summary",             VIRP_TIER_GREEN  },
-    { "show bgp neighbors",           VIRP_TIER_GREEN  },
-    /*   - singular "interface" (plural "show interfaces" is GREEN above; the
-     *     token-boundary match keeps this from standing in for the plural). */
-    { "show interface",               VIRP_TIER_GREEN  },
-    /*   - older hyphenated spelling of "show mac address-table" (GREEN above). */
-    { "show mac-address-table",       VIRP_TIER_GREEN  },
-    /*   - IPv6 parallels of the GREEN v4 routing/neighbor reads. Detailed
-     *     "show ipv6 interface <if>" stays RED exactly as "show ip interface
-     *     <if>" does — only the "brief" form is allow-listed on both sides. */
-    { "show ipv6 route",              VIRP_TIER_GREEN  },
-    { "show ipv6 interface brief",    VIRP_TIER_GREEN  },
-    { "show ipv6 ospf",               VIRP_TIER_GREEN  },
-    { "show ipv6 bgp",                VIRP_TIER_GREEN  },
-    { "show ipv6 neighbors",          VIRP_TIER_GREEN  },
-
-    /* ── YELLOW — config-visibility reads (backups/audits) ────────── */
-    /* Reverted GREEN → YELLOW (2026-08-11): the scrub misses whole
-     * secret classes (server-block `key 0 <numeric>` among them), so
-     * the GREEN row let a GREEN-ceiling requester auto-sign credential
-     * material into the append-only chain. The scrub stays wired —
-     * approval gates the read, the scrub still cleans the body. */
-    { "show running-config",          VIRP_TIER_YELLOW },
-    { "show startup-config",          VIRP_TIER_YELLOW },
-    { "show access-lists",            VIRP_TIER_YELLOW },
-    { "show ip nat translations",     VIRP_TIER_YELLOW },
-    { "show tech-support",            VIRP_TIER_YELLOW },  /* dump incl. config */
-    /* Shadow-evidence promotions (2026-07-16): config-visibility, security
-     * posture (SA state), session visibility, and active diagnostics.
-     * "show crypto" (read) is distinct from bare "crypto" (write=RED). */
-    { "show ip access-lists",         VIRP_TIER_YELLOW },
-    { "show crypto",                  VIRP_TIER_YELLOW },
-    { "show logging",                 VIRP_TIER_YELLOW },
-    { "show users",                   VIRP_TIER_YELLOW },
-    { "show port-security",           VIRP_TIER_YELLOW },  /* per-port security config */
-    { "ping",                         VIRP_TIER_YELLOW },
-    { "traceroute",                   VIRP_TIER_YELLOW },
-    /* Reclassified RED → YELLOW (2026-07-23): counter reset is a
-     * diagnostic action, not a config write. Bare "clear " stays RED
-     * via the fail-closed default. */
-    { "clear counters",               VIRP_TIER_YELLOW },
-
-    /* ── RED — config writes (explicit for audit; default also RED) ── */
-    { "configure terminal",           VIRP_TIER_RED    },
-    { "configure",                    VIRP_TIER_RED    },
-    { "conf t",                       VIRP_TIER_RED    },
-    { "interface",                    VIRP_TIER_RED    },
-    { "ip route",                     VIRP_TIER_RED    },
-    { "router bgp",                   VIRP_TIER_RED    },
-    { "router ospf",                  VIRP_TIER_RED    },
-    { "router eigrp",                 VIRP_TIER_RED    },
-    { "router",                       VIRP_TIER_RED    },
-    { "no ",                          VIRP_TIER_RED    },  /* negation = write */
-    { "hostname",                     VIRP_TIER_RED    },
-
-    /* ── RED — credential/security writes (adversarial; each tested) ─ */
-    { "username",                     VIRP_TIER_RED    },  /* incl. privilege 15 / secret / password */
-    { "enable secret",                VIRP_TIER_RED    },
-    { "enable password",              VIRP_TIER_RED    },
-    { "aaa",                          VIRP_TIER_RED    },
-    { "tacacs-server",                VIRP_TIER_RED    },
-    { "tacacs server",                VIRP_TIER_RED    },  /* IOS-XE form */
-    { "radius-server",                VIRP_TIER_RED    },
-    { "radius server",                VIRP_TIER_RED    },  /* IOS-XE form */
-    { "snmp-server community",        VIRP_TIER_RED    },
-    { "snmp-server",                  VIRP_TIER_RED    },
-    { "crypto key",                   VIRP_TIER_RED    },
-    { "crypto pki",                   VIRP_TIER_RED    },
-    { "crypto",                       VIRP_TIER_RED    },
-    { "key chain",                    VIRP_TIER_RED    },
-    { "key config-key",               VIRP_TIER_RED    },  /* master key */
-    { "line vty",                     VIRP_TIER_RED    },
-    { "line",                         VIRP_TIER_RED    },
-    { "login",                        VIRP_TIER_RED    },
-    { "password",                     VIRP_TIER_RED    },
-};
-static const size_t CISCO_GATE_TABLE_SIZE =
-    sizeof(CISCO_GATE_TABLE) / sizeof(CISCO_GATE_TABLE[0]);
-
-/*
- * Test-support accessors — let a test iterate the gate table without
- * exposing its struct layout (virp_driver_cisco.h cannot be included
- * standalone, so the table itself stays static). Used by the
- * table-driven reachability suite: every entry must classify as the
- * tier it declares, or it is shadowed by a broader/earlier entry and
- * would never fire in production.
- */
-size_t cisco_gate_table_count(void)
-{
-    return CISCO_GATE_TABLE_SIZE;
-}
-
-const char *cisco_gate_table_entry(size_t i, virp_trust_tier_t *tier)
-{
-    if (i >= CISCO_GATE_TABLE_SIZE) return NULL;
-    if (tier) *tier = CISCO_GATE_TABLE[i].tier;
-    return CISCO_GATE_TABLE[i].prefix;
-}
-
-virp_trust_tier_t cisco_gate_tier(const char *command)
-{
-    if (!command) return VIRP_TIER_RED;              /* fail closed */
-
-    /*
-     * Layer 2a — a separator-carrying string is not one command, so this
-     * table cannot vouch for it. Fail closed here as well as at the
-     * daemon boundary: the classifier is called directly by tests and
-     * (via route_command) by any future caller, and must not hand back a
-     * benign tier for "show version;reload" just because the daemon
-     * would have refused it first.
-     */
-    if (virp_command_check_separators(command, NULL, 0) != 0)
-        return VIRP_TIER_RED;
-
-    while (*command == ' ' || *command == '\t') command++;
-
-    const cisco_route_t *best = NULL;
-    size_t best_len = 0;
-    for (size_t i = 0; i < CISCO_GATE_TABLE_SIZE; i++) {
-        size_t plen = strlen(CISCO_GATE_TABLE[i].prefix);
-        if (strncmp(command, CISCO_GATE_TABLE[i].prefix, plen) != 0)
-            continue;
-
-        /*
-         * Layer 2b — the match must END on a token boundary, so a listed
-         * prefix can never stand in for a longer word: "show boot"
-         * (GREEN) must not classify "show bootleg", and "no " must not
-         * be reached by "nonsense". Entries that already end in a space
-         * carry their own boundary.
-         */
-        char after = command[plen];
-        bool self_terminated =
-            (plen > 0 && CISCO_GATE_TABLE[i].prefix[plen - 1] == ' ');
-        if (!self_terminated && after != '\0' &&
-            after != ' ' && after != '\t')
-            continue;
-
-        if (plen > best_len) { best = &CISCO_GATE_TABLE[i]; best_len = plen; }
-    }
-    /* Fail-closed: anything not explicitly GREEN/YELLOW/RED-listed is RED. */
-    return best ? best->tier : VIRP_TIER_RED;
-}
 
 /* =========================================================================
  * Credential scrub for config-bearing reads
@@ -1008,9 +825,12 @@ virp_error_t cisco_scrub_config(const char *in, size_t in_len,
 
 /*
  * Commands whose reply embeds device configuration (and therefore
- * credential material). Matches the gate table's literal spellings —
- * abbreviations never reach GREEN/YELLOW (fail-closed classifier), so
- * prefix-matching the canonical forms here is exhaustive.
+ * credential material). Matches the CANONICAL spellings: the daemon
+ * canonicalizes before execute (virp_driver_t.canon_command), so an
+ * abbreviated read arrives here expanded and the scrub fires. Before
+ * canonical execution this check missed `sh run` under a SHADOW gate
+ * override — the command would-block, proceed, and sign an unscrubbed
+ * config body; the canonicalizer closed that structurally.
  */
 bool cisco_command_returns_config(const char *command)
 {
@@ -1282,6 +1102,10 @@ static virp_driver_t cisco_driver = {
     .detect     = cisco_detect,
     .health_check = cisco_health_check,
     .route_command = cisco_gate_tier,
+    .route_reason  = cisco_gate_reason,
+    .route_rule    = cisco_gate_rule,
+    .canon_command = cisco_canon_command,
+    .classifier_version = CISCO_CANON_VERSION,
 };
 
 /* IOS-XE: identical driver functions + the SAME shared gate core
@@ -1297,10 +1121,28 @@ static virp_driver_t cisco_iosxe_driver = {
     .detect     = cisco_detect,
     .health_check = cisco_health_check,
     .route_command = cisco_gate_tier,
+    .route_reason  = cisco_gate_reason,
+    .route_rule    = cisco_gate_rule,
+    .canon_command = cisco_canon_command,
+    .classifier_version = CISCO_CANON_VERSION,
 };
 
 void virp_driver_cisco_init(void)
 {
+    /*
+     * Table invariants BEFORE registration (zammad pattern): a row
+     * that is prefix-shaped, untierable, unreachable, or not a fixed
+     * point of its own canonicalizer is a startup failure, never a
+     * silent runtime surprise. Refusing registration fails closed —
+     * every command on an unregistered driver is UNCLASSIFIED, which
+     * the gate blocks.
+     */
+    if (cisco_canon_table_validate() != 0) {
+        fprintf(stderr, "[Cisco] classifier table failed validation — "
+                "driver NOT registered; no IOS/IOS-XE device will be "
+                "usable\n");
+        return;
+    }
     virp_driver_register(&cisco_driver);
     virp_driver_register(&cisco_iosxe_driver);
 }

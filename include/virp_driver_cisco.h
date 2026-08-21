@@ -87,16 +87,12 @@ virp_error_t               virp_driver_cisco_register(void);
 /*
  * Gate-facing command classifier (VIRP tier-enforcement gate).
  *
- * Matches the gate's route_command(const char*) contract — same shape as
- * fg_route_command. Shared CORE table for BOTH classic IOS and IOS-XE
- * (the security-critical commands are identical). Longest-prefix match,
- * case-insensitive. FAIL-CLOSED: any command not explicitly classified
- * GREEN/YELLOW returns RED, so no config/credential write can ride a
- * permissive default (Cisco config-mode commands share no common verb
- * prefix, so an allow-list with a RED default is the only robust guard).
- *
- * Declared (not static) so the unit tests can assert on it directly; the
- * driver registration points its .route_command at this.
+ * Matches the gate's route_command(const char*) contract. Shared CORE
+ * for BOTH classic IOS and IOS-XE. Now defined in
+ * src/drivers/cisco_canon.c: canonicalizer (all prefix/abbreviation
+ * logic, ambiguity fails closed) + exact-match tier table on canonical
+ * strings only. FAIL-CLOSED: any command without a canonical, tabled
+ * form returns RED. See virp_driver_cisco_canon.h.
  */
 virp_trust_tier_t cisco_gate_tier(const char *command);
 

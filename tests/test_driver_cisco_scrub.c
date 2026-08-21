@@ -511,12 +511,19 @@ TEST(test_gate_tier_alignment)
           "show startup-config not YELLOW");
     CHECK(cisco_gate_tier("show tech-support") == VIRP_TIER_YELLOW,
           "show tech-support not YELLOW");
-    /* Abbreviations still fail closed — the scrub trigger only needs
-     * to recognize the canonical spellings the gate lets through. */
-    CHECK(cisco_gate_tier("sh run") == VIRP_TIER_RED,
-          "abbreviation escaped the fail-closed default");
-    CHECK(cisco_gate_tier("show run") == VIRP_TIER_RED,
-          "abbreviation escaped the fail-closed default");
+    /* Abbreviations canonicalize to the SAME YELLOW row (ios-canon):
+     * the daemon executes the canonical spelling, so the scrub trigger
+     * still only needs to recognize canonical forms — and now fires
+     * for `sh run` too, which under the old raw-bytes gate slipped
+     * past this check when a SHADOW override let it execute. */
+    CHECK(cisco_gate_tier("sh run") == VIRP_TIER_YELLOW,
+          "abbreviation not canonicalized to the YELLOW config read");
+    CHECK(cisco_gate_tier("show run") == VIRP_TIER_YELLOW,
+          "abbreviation not canonicalized to the YELLOW config read");
+    /* The trigger itself matches canonical spellings only; the raw
+     * abbreviation never reaches execute() through the daemon. */
+    CHECK(!cisco_command_returns_config("sh run"),
+          "scrub trigger must match canonical spellings, not raw");
 }
 
 int main(void)

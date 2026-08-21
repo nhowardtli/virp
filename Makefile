@@ -41,6 +41,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_approver_registry.o \
              $(BUILD_DIR)/virp_obskey.o \
              $(BUILD_DIR)/virp_ssh_io.o \
+             $(BUILD_DIR)/cisco_canon.o \
              $(BUILD_DIR)/cJSON.o
 
 # Optional Cisco driver (requires libssh2)
@@ -210,6 +211,12 @@ $(BUILD_DIR)/driver_mock.o: src/drivers/driver_mock.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_cisco.o: src/drivers/driver_cisco.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Cisco IOS canonicalizer + exact-match tier table: pure code, no
+# transport deps, so it lives in the CORE library — the gate classifies
+# and the gate suites run without CISCO=1 (only the SSH driver needs it).
+$(BUILD_DIR)/cisco_canon.o: src/drivers/cisco_canon.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_fortigate.o: src/drivers/driver_fortigate.c | $(BUILD_DIR)
