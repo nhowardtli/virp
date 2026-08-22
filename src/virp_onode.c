@@ -62,7 +62,8 @@ typedef struct {
     onode_action_t  action;
     char            device[64];
     char            command[1024];
-    int32_t         obs_version;            /* 1 = legacy O-Key, 2 = session-bound */
+    int32_t         obs_version;            /* 1 = legacy O-Key, 2 = session-bound,
+                                               3 = session-bound + Ed25519 */
     char            proposal_id[VIRP_APPROVAL_ID_HEX_LEN + 1]; /* apply/approve ref */
     char            signature[2 * VIRP_APPROVER_SIG_SIZE + 1]; /* approval submit sig (hex) */
     char            key_id[VIRP_APPROVER_KEYID_HEX + 1];       /* approval submit key_id */
@@ -394,14 +395,16 @@ static bool parse_request(const char *json, onode_request_t *req)
 
     /*
      * Observation version for execute/health. Absent → 1 (legacy
-     * master-key signing, the compatibility default). Only 1 and 2 are
-     * meaningful; anything else present-but-invalid rejects the request
-     * so a client typo cannot silently downgrade to v1.
+     * master-key signing, the compatibility default). 1, 2 and 3 are
+     * meaningful (3 = v2 session binding + the O-Node's Ed25519
+     * observation signature; needs a loaded obskey, see
+     * onode_execute_obs_ex); anything else present-but-invalid rejects
+     * the request so a client typo cannot silently downgrade to v1.
      */
     req->obs_version = 1;
     {
         uint64_t v = 0;
-        if (json_extract_u64_bounded(root, "obs_version", 2, &v)) {
+        if (json_extract_u64_bounded(root, "obs_version", 3, &v)) {
             if (v < 1) { cJSON_Delete(root); return false; }
             req->obs_version = (int32_t)v;
         } else if (cJSON_GetObjectItemCaseSensitive(root, "obs_version")) {
@@ -1306,8 +1309,19 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
 {
     if (!state || !device_name || !command || !out_buf || !out_len)
         return VIRP_ERR_NULL_PTR;
-    if (obs_version != 1 && obs_version != 2)
+    if (obs_version != 1 && obs_version != 2 && obs_version != 3)
         return VIRP_ERR_VERSION_MISMATCH;
+
+    /*
+     * v3 needs the observation-signing key. FAIL CLOSED, here, before
+     * any device I/O: a caller who asked for an Ed25519-signed
+     * observation must get one or an error — never a v1/v2 body they
+     * did not ask for. The key is loaded once at startup
+     * (onode_set_obskey) and read-only afterwards, so this check cannot
+     * race the signing step below.
+     */
+    if (obs_version == 3 && !state->obskey_loaded)
+        return VIRP_ERR_KEY_NOT_LOADED;
 
     /* ── Layer 1: single-command boundary ─────────────────────────────
      * Every classifier prefix-matches from index 0 while the drivers
@@ -1358,12 +1372,14 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     }
 
     /*
-     * v2 requires an ACTIVE session BEFORE any device I/O. Checked
-     * again at signing time (the session can idle out mid-command),
-     * but failing early avoids running a command whose observation
-     * could never be delivered in the requested form.
+     * v2 and v3 require an ACTIVE session BEFORE any device I/O (v3 is
+     * the v2 format plus an Ed25519 trailer — its HMAC trailer is still
+     * keyed by the session). Checked again at signing time (the session
+     * can idle out mid-command), but failing early avoids running a
+     * command whose observation could never be delivered in the
+     * requested form.
      */
-    if (obs_version == 2) {
+    if (obs_version == 2 || obs_version == 3) {
         pthread_mutex_lock(&state->session_mutex);
         bool ok = state->ctx &&
                   virp_session_require_active(state->ctx) == VIRP_OK &&
@@ -1992,30 +2008,39 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     /* Phase C truth-fix: stamp the observation with the command's real
      * gate-classified tier (clamped to a transmittable tier) instead of a
      * blanket GREEN. show system admin → RED; get system status → GREEN. */
-    if (obs_version == 2) {
+    if (obs_version == 2 || obs_version == 3) {
         /*
-         * v2 success path: session-bound observation signed with the
-         * HKDF session key. seq_num is per-session monotonic
+         * v2/v3 success path: session-bound observation signed with the
+         * HKDF session key; v3 additionally carries the O-Node's
+         * Ed25519 signature over header || payload || hmac
+         * (virp_build_observation_ed25519 — the library's own builder,
+         * not a refactor of it). seq_num is per-session monotonic
          * (session.last_seq under session_mutex), which is what the
          * verifier's replay high-water store checks against. If the
          * session died while the command ran, fail — never downgrade
-         * to master-key signing on a v2 request.
+         * to master-key signing on a v2/v3 request, and never serve a
+         * v3 request an unsigned v2 body.
          */
         pthread_mutex_lock(&state->session_mutex);
         if (!state->ctx ||
             virp_session_require_active(state->ctx) != VIRP_OK ||
             !state->ctx->session.session_key_valid) {
             err = VIRP_ERR_SESSION_INVALID;
+        } else if (obs_version == 3 && !state->obskey_loaded) {
+            /* Pre-flight already refused this; kept so the signing
+             * step can never fall through to v2 if the two ever drift. */
+            err = VIRP_ERR_KEY_NOT_LOADED;
         } else {
             /* Truncate like the v1 path does rather than erroring:
-             * total message (88 hdr + payload + 32 sig) must fit in
-             * VIRP_MAX_MESSAGE_SIZE. */
+             * total message (88 hdr + payload + 32 hmac [+ 64 ed25519])
+             * must fit in VIRP_MAX_MESSAGE_SIZE. */
+            size_t trailer = VIRP_OBS_V2_SIG_SIZE +
+                             (obs_version == 3 ? VIRP_OBS_ED25519_SIG_SIZE
+                                               : 0);
             if ((size_t)data_len > VIRP_MAX_MESSAGE_SIZE -
-                                   VIRP_OBS_V2_HEADER_SIZE -
-                                   VIRP_OBS_V2_SIG_SIZE)
+                                   VIRP_OBS_V2_HEADER_SIZE - trailer)
                 data_len = (uint16_t)(VIRP_MAX_MESSAGE_SIZE -
-                                      VIRP_OBS_V2_HEADER_SIZE -
-                                      VIRP_OBS_V2_SIG_SIZE);
+                                      VIRP_OBS_V2_HEADER_SIZE - trailer);
             uint64_t seq = ++state->ctx->session.last_seq;
             /*
              * The command hash binds the approved object to the executed
@@ -2028,7 +2053,17 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
              */
             const char *typed_profile = onode_typed_profile(state, dev_idx);
 
-            err = virp_build_observation_v2(state->ctx,
+            if (obs_version == 3)
+                err = virp_build_observation_ed25519(state->ctx,
+                                     &state->obskey,
+                                     (uint64_t)state->devices[dev_idx].node_id,
+                                     state->devices[dev_idx].device_id,
+                                     gate_obs_tier(gate_tier), seq, command,
+                                     typed_profile,
+                                     obs_data, data_len,
+                                     out_buf, out_buf_len, out_len);
+            else
+                err = virp_build_observation_v2(state->ctx,
                                      (uint64_t)state->devices[dev_idx].node_id,
                                      state->devices[dev_idx].device_id,
                                      gate_obs_tier(gate_tier), seq, command,
@@ -4599,6 +4634,49 @@ virp_error_t onode_set_previous_okey(onode_state_t *state,
     return VIRP_OK;
 }
 
+virp_error_t onode_set_obskey(onode_state_t *state, const char *path)
+{
+    if (!state || !path)
+        return VIRP_ERR_NULL_PTR;
+
+    /* One key per node, loaded once. A second load is an operator
+     * error (two -O flags, or a retry after a partial start), not a
+     * rotation mechanism — refuse rather than silently swap the key
+     * every observation since startup was signed under. */
+    if (state->obskey_loaded) {
+        fprintf(stderr, "[O-Node] observation-signing key refused: one is "
+                        "already loaded (key_id ");
+        for (int i = 0; i < VIRP_OBSKEY_KEYID_SIZE; i++)
+            fprintf(stderr, "%02x", state->obskey.key_id[i]);
+        fprintf(stderr, ") — rotation is a restart, not a reload\n");
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    /* Custody gate lives in virp_obskey_load: regular file, no symlink,
+     * no group/world bits, owner == euid (or root), exactly 64 bytes.
+     * It opens exactly `path` — no default, no search, nothing
+     * generated. Each refusal prints its own specific reason. */
+    virp_error_t err = virp_obskey_load(&state->obskey, path);
+    if (err != VIRP_OK) {
+        fprintf(stderr, "[O-Node] Failed to load observation-signing key "
+                        "from %s: %s\n", path, virp_error_str(err));
+        memset(&state->obskey, 0, sizeof(state->obskey));
+        state->obskey_loaded = false;
+        return err;
+    }
+    state->obskey_loaded = true;
+
+    fprintf(stderr, "[O-Node] Loaded Ed25519 observation-signing key from "
+                    "%s (key_id ", path);
+    for (int i = 0; i < VIRP_OBSKEY_KEYID_SIZE; i++)
+        fprintf(stderr, "%02x", state->obskey.key_id[i]);
+    fprintf(stderr, "): v3 observations ENABLED — execute/health/batch with "
+                    "obs_version 3 are Ed25519-signed and chain_append "
+                    "verifies v3 bodies under the public half. v1/v2 "
+                    "unchanged.\n");
+    return VIRP_OK;
+}
+
 virp_error_t onode_set_allowed_uids(onode_state_t *state,
                                     const uid_t *uids, size_t count)
 {
@@ -5042,6 +5120,14 @@ void onode_destroy(onode_state_t *state)
     /* Destroy trust chain */
     if (state->chain_enabled)
         virp_chain_destroy(&state->chain);
+
+    /* Zeroize + munlock the observation-signing secret, if one was
+     * loaded. Done after the device connections and listen socket are
+     * gone so no worker can be mid-signature. */
+    if (state->obskey_loaded) {
+        virp_obskey_destroy(&state->obskey);
+        state->obskey_loaded = false;
+    }
 
     /* Wipe device passwords from inventory */
     for (int i = 0; i < state->device_count; i++) {

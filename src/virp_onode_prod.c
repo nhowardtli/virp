@@ -12,6 +12,10 @@
  *                         NOT for compromise-driven rotation — the window
  *                         keeps honouring that key for its duration.
  *     -W <seconds>        Grace window length (default 900). Only with -K.
+ *     -O <obskey_path>    Ed25519 OBSERVATION-signing secret key (64 bytes,
+ *                         0600, daemon uid). Enables wire-version-3
+ *                         observations. Configured-but-unloadable is FATAL;
+ *                         absent logs loudly once and v3 is refused.
  *     -s <socket_path>    Unix socket path (default: /run/virp/onode.sock)
  *     -d <devices_json>   Path to devices.json config
  *     -n <node_id_hex>    Node ID in hex (default: 0x00000001)
@@ -910,6 +914,14 @@ static void usage(const char *prog)
     printf("              DO NOT USE if you rotated because the old key was\n");
     printf("              COMPROMISED — the window keeps honouring it.\n");
     printf("  -W <secs>   Grace window length (default 900). Only with -K.\n");
+    printf("  -O <path>   Ed25519 OBSERVATION-signing secret key (64 bytes, 0600,\n");
+    printf("              owned by the daemon uid; written by\n");
+    printf("              `virp-tool keygen obskey <prefix>` as <prefix>.key).\n");
+    printf("              Enables wire-version-3 observations: obs_version 3\n");
+    printf("              requests are signed so that a holder of ONLY\n");
+    printf("              <prefix>.pub can verify them. A configured key that\n");
+    printf("              cannot be loaded is FATAL. Without -O, v3 requests\n");
+    printf("              are refused (never downgraded); v1/v2 are unchanged.\n");
     printf("  -s <path>   Unix socket path (default: %s)\n", ONODE_SOCKET_PATH);
     printf("  -d <path>   Device config JSON file (required)\n");
     printf("  -n <hex>    Node ID in hex (default: 0x00000001)\n");
@@ -928,6 +940,7 @@ int main(int argc, char **argv)
     const char *okey_path = NULL;
     const char *prev_okey_path = NULL;
     uint32_t    prev_okey_window = 900;   /* 15 min; > the 5-min cycle */
+    const char *obskey_path = NULL;       /* -O: no default, never searched */
     const char *socket_path = NULL;
     const char *devices_path = NULL;
     const char *chain_db_path = NULL;
@@ -937,7 +950,7 @@ int main(int argc, char **argv)
     uint32_t node_id = 0x00000001;
 
     int opt;
-    while ((opt = getopt(argc, argv, "k:K:W:s:d:n:c:C:a:A:h")) != -1) {
+    while ((opt = getopt(argc, argv, "k:K:W:O:s:d:n:c:C:a:A:h")) != -1) {
         switch (opt) {
         case 'k':
             okey_path = optarg;
@@ -947,6 +960,9 @@ int main(int argc, char **argv)
             break;
         case 'W':
             prev_okey_window = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
+        case 'O':
+            obskey_path = optarg;
             break;
         case 's':
             socket_path = optarg;
@@ -1064,6 +1080,41 @@ int main(int argc, char **argv)
             onode_destroy(&g_state);
             return 1;
         }
+    }
+
+    /*
+     * Ed25519 observation-signing key (wire version 3). Same discipline
+     * as -K: a key the operator CONFIGURED and the daemon cannot load is
+     * a failed start, not a warning — whoever passed -O believes the
+     * observations leaving this daemon are Ed25519-signed, and a daemon
+     * that shrugged and ran HMAC-only would be lying by omission in
+     * every body it minted. Loaded AFTER virp_crypto_harden_process()
+     * and onode_init(), like the O-Key, so the secret never sits in a
+     * dumpable process. onode_set_obskey opens exactly the path given:
+     * no default location, no search.
+     */
+    if (obskey_path) {
+        virp_error_t oerr = onode_set_obskey(&g_state, obskey_path);
+        if (oerr != VIRP_OK) {
+            fprintf(stderr, "[O-Node] FATAL: -O %s could not be loaded (%s). "
+                    "A configured observation-signing key that does not "
+                    "load is a startup failure, not a warning. Refusing "
+                    "to start.\n", obskey_path, virp_error_str(oerr));
+            onode_destroy(&g_state);
+            return 1;
+        }
+    } else {
+        /* Loud, once, at startup — the one place an operator reads. */
+        fprintf(stderr,
+                "[O-Node] WARNING: v3 (Ed25519) OBSERVATION SIGNING "
+                "UNAVAILABLE — no -O <obskey> configured. Every observation "
+                "this daemon emits is HMAC-signed only (v1 O-Key / v2 "
+                "session key): the verify key is also a forge key. "
+                "Requests with obs_version 3 will be REFUSED "
+                "(VIRP_ERR_KEY_NOT_LOADED), never downgraded, and "
+                "chain_append refuses v3 bodies. To enable: "
+                "virp-tool keygen obskey <prefix>  then restart with "
+                "-O <prefix>.key (see docs/DRAFT07-NOTES.md §1).\n");
     }
 
     /*

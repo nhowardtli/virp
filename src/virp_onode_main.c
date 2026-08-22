@@ -6,6 +6,8 @@
  * Usage:
  *   virp-onode [options]
  *     -k <okey_path>    Path to O-Key file (generates if absent)
+ *     -O <obskey_path>  Ed25519 observation-signing key (enables v3;
+ *                       configured-but-unloadable is FATAL)
  *     -s <socket_path>  Unix socket path (default: /run/virp/onode.sock)
  *     -n <node_id_hex>  Node ID in hex (default: 0x00000001)
  *     -m                Use mock driver with test devices
@@ -325,6 +327,9 @@ static void usage(const char *prog)
     printf("Options:\n");
     printf("  -d <path>   Device JSON file path\n");
     printf("  -k <path>   O-Key file path (generates new key if file doesn't exist)\n");
+    printf("  -O <path>   Ed25519 OBSERVATION-signing secret key (64 bytes, 0600).\n");
+    printf("              Enables obs_version 3; unloadable is FATAL; absent\n");
+    printf("              refuses v3 (never downgrades), v1/v2 unchanged.\n");
     printf("  -s <path>   Unix socket path (default: %s)\n", ONODE_SOCKET_PATH);
     printf("  -n <hex>    Node ID in hex (default: 0x00000001)\n");
     printf("  -m          Load mock devices for testing\n");
@@ -335,19 +340,23 @@ static void usage(const char *prog)
 int main(int argc, char **argv)
 {
     const char *okey_path = NULL;
+    const char *obskey_path = NULL;       /* -O: no default, never searched */
     const char *devices_path = NULL;
     const char *socket_path = NULL;
     uint32_t node_id = 0x00000001;
     bool use_mock = false;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:k:s:n:mh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:k:O:s:n:mh")) != -1) {
         switch (opt) {
         case 'd':
             devices_path = optarg;
             break;
         case 'k':
             okey_path = optarg;
+            break;
+        case 'O':
+            obskey_path = optarg;
             break;
         case 's':
             socket_path = optarg;
@@ -427,6 +436,25 @@ int main(int argc, char **argv)
         fprintf(stderr, "[O-Node] Initialization failed: %s\n",
                 virp_error_str(err));
         return 1;
+    }
+
+    /* Ed25519 observation-signing key (v3). Same rule as the prod
+     * daemon: configured-but-unloadable is FATAL; absent is loud, once. */
+    if (obskey_path) {
+        virp_error_t oerr = onode_set_obskey(&g_state, obskey_path);
+        if (oerr != VIRP_OK) {
+            fprintf(stderr, "[O-Node] FATAL: -O %s could not be loaded (%s). "
+                    "Refusing to start.\n", obskey_path, virp_error_str(oerr));
+            onode_destroy(&g_state);
+            return 1;
+        }
+    } else {
+        fprintf(stderr,
+                "[O-Node] WARNING: v3 (Ed25519) OBSERVATION SIGNING "
+                "UNAVAILABLE — no -O <obskey> configured. obs_version 3 "
+                "requests will be REFUSED (VIRP_ERR_KEY_NOT_LOADED), never "
+                "downgraded; v1/v2 unchanged. Enable with: "
+                "virp-tool keygen obskey <prefix>  and  -O <prefix>.key\n");
     }
 
     /*

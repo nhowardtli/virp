@@ -174,11 +174,21 @@ typedef struct {
     virp_signing_key_t  okey;           /* THE key — never leaves this process */
 
     /*
-     * Observation-signing keypair (wire version 3). OPTIONAL: absent on
-     * every deployment that has not generated one, which is all of them
-     * today. Its ONLY use in the daemon is verifying v3 observation
-     * bodies submitted to CHAIN_APPEND; when it is not loaded, v3
-     * bodies are REFUSED rather than recorded unverified.
+     * Observation-signing keypair (wire version 3). OPTIONAL — loaded
+     * by onode_set_obskey() from the daemon's -O <obskey.key>; absent on
+     * every deployment that has not generated one. ONE key per node,
+     * read-only after startup. Two uses, both fail-closed:
+     *
+     *   - EXECUTE with obs_version 3: the observation is built by
+     *     virp_build_observation_ed25519 (v2 header + session HMAC +
+     *     Ed25519 over header || payload || hmac). Not loaded → the
+     *     request is refused with VIRP_ERR_KEY_NOT_LOADED before any
+     *     device I/O; it is never downgraded to v1/v2.
+     *   - CHAIN_APPEND GATE 3, v3 arm: bodies are verified under the
+     *     public half. Not loaded → v3 bodies are REFUSED rather than
+     *     recorded unverified.
+     *
+     * v1 and v2 emission and acceptance are unchanged by its presence.
      */
     virp_obskey_t       obskey;
     bool                obskey_loaded;
@@ -450,6 +460,23 @@ virp_error_t onode_init(onode_state_t *state,
 virp_error_t onode_set_previous_okey(onode_state_t *state,
                                      const char *path,
                                      uint32_t window_seconds);
+
+/*
+ * Load the Ed25519 OBSERVATION-signing secret key (wire version 3).
+ *
+ * Call after onode_init and before onode_start. `path` is the exact
+ * file to open — there is no default path, no search, and nothing is
+ * generated: a missing key is a load failure, which the daemon mains
+ * treat as FATAL. Custody gate is virp_obskey_load's: regular file, no
+ * symlink, no group/world bits, owner == euid (or root), exactly 64
+ * bytes. Loading twice is refused.
+ *
+ * Once loaded, EXECUTE requests with obs_version 3 are signed with it
+ * and chain_append's v3 arm verifies under its public half. It is the
+ * daemon's attester key: the secret lives on this host by design (see
+ * include/virp_obskey.h). Never used for v1/v2.
+ */
+virp_error_t onode_set_obskey(onode_state_t *state, const char *path);
 
 /*
  * Add a device to the O-Node's inventory.
