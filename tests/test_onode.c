@@ -3202,6 +3202,166 @@ static void gx_teardown(onode_state_t *st)
     virp_context_destroy(ctx);
 }
 
+/* =========================================================================
+ * Execution disposition (include/virp_disposition.h), one test per state,
+ * each produced THROUGH onode_execute and read back from the persisted
+ * gate_execution body — never by setting a field. The mock driver leaves
+ * result.disposition UNSET, so these exercise the resolver's legacy rules,
+ * which is what every unconverted real driver goes through.
+ * ========================================================================= */
+
+/* EXECUTED_CONFIRMED: the device answered and reported success. */
+TEST(test_disposition_executed_confirmed_recorded)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    ASSERT_EQ(gx_read_session(GX_SESSION, rows, GX_MAX_ROWS), 1);
+    ASSERT_EQ(strcmp(rows[0].type, "gate_execution"), 0);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"disposition\":\"EXECUTED_CONFIRMED\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"success\":true") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":true") != NULL);
+    gx_cleanup();
+}
+
+/* EXECUTED_FAILED: dispatched, completed, refused BY THE DEVICE. The only
+ * state besides CONFIRMED for which the derived boolean is not null. */
+TEST(test_disposition_executed_failed_recorded)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+    virp_driver_mock_set_exec_failed("% Invalid input detected at '^' marker.");
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    virp_driver_mock_set_exec_failed(NULL);
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    ASSERT_EQ(gx_read_session(GX_SESSION, rows, GX_MAX_ROWS), 1);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"disposition\":\"EXECUTED_FAILED\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"success\":false") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":true") != NULL);
+    /* The device's answer is what was captured and committed to. */
+    ASSERT_TRUE(strstr(rows[0].body, "\"response_len\":0") == NULL);
+    gx_cleanup();
+}
+
+/* EXECUTED_UNKNOWN: possible dispatch, no response. Exactly one dispatch
+ * (no retry), and the record must say UNKNOWN with success null — never
+ * "success": false, which is what it said before this vocabulary. */
+TEST(test_disposition_executed_unknown_recorded_not_false)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+    virp_driver_mock_exec_attempts_reset();
+    virp_driver_mock_set_unknown_fail("response lost after write");
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    virp_driver_mock_set_unknown_fail(NULL);
+    ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 1);
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    ASSERT_EQ(gx_read_session(GX_SESSION, rows, GX_MAX_ROWS), 1);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"disposition\":\"EXECUTED_UNKNOWN\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"success\":null") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"success\":false") == NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"success\":true") == NULL);
+    /* May have executed: the record must not claim nothing ran. */
+    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":true") != NULL);
+    gx_cleanup();
+}
+
+/* NOT_DISPATCHED: the driver PROVED nothing reached the device
+ * (no_dispatch), which is exactly the retry license — so two attempts,
+ * then a record that says NOT_DISPATCHED / executed=false / success null. */
+TEST(test_disposition_not_dispatched_is_the_retry_boundary)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+    virp_driver_mock_exec_attempts_reset();
+    virp_driver_mock_set_soft_fail("refused before device I/O");
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    virp_driver_mock_set_soft_fail(NULL);
+    /* The retry fired: NOT_DISPATCHED and the retry license coincide. */
+    ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 2);
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    ASSERT_EQ(gx_read_session(GX_SESSION, rows, GX_MAX_ROWS), 1);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"disposition\":\"NOT_DISPATCHED\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":false") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"success\":null") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"success\":false") == NULL);
+    gx_cleanup();
+}
+
+/* The resolver itself, pinned at the boundary: the retry predicate and
+ * NOT_DISPATCHED are the same test, the driver-threw case is UNKNOWN, and
+ * an unconverted driver's failure-with-output is FAILED. */
+TEST(test_disposition_resolver_matches_retry_boundary)
+{
+    virp_exec_result_t r;
+
+    memset(&r, 0, sizeof(r));
+    ASSERT_EQ(virp_disposition_resolve(NULL, VIRP_OK),
+              VIRP_DISPOSITION_EXECUTED_UNKNOWN);
+    ASSERT_EQ(virp_disposition_resolve(&r, VIRP_ERR_CRYPTO),
+              VIRP_DISPOSITION_EXECUTED_UNKNOWN);
+
+    memset(&r, 0, sizeof(r));
+    r.no_dispatch = true;                 /* the retry predicate */
+    ASSERT_EQ(virp_disposition_resolve(&r, VIRP_OK),
+              VIRP_DISPOSITION_NOT_DISPATCHED);
+
+    memset(&r, 0, sizeof(r));
+    r.success = true;
+    ASSERT_EQ(virp_disposition_resolve(&r, VIRP_OK),
+              VIRP_DISPOSITION_EXECUTED_CONFIRMED);
+
+    memset(&r, 0, sizeof(r));             /* failure, no output, no proof */
+    ASSERT_EQ(virp_disposition_resolve(&r, VIRP_OK),
+              VIRP_DISPOSITION_EXECUTED_UNKNOWN);
+
+    memset(&r, 0, sizeof(r));             /* failure WITH the device's answer */
+    r.output_len = 5;
+    ASSERT_EQ(virp_disposition_resolve(&r, VIRP_OK),
+              VIRP_DISPOSITION_EXECUTED_FAILED);
+
+    memset(&r, 0, sizeof(r));             /* converted driver says so */
+    r.disposition = VIRP_DISPOSITION_EXECUTED_UNKNOWN;
+    ASSERT_EQ(virp_disposition_resolve(&r, VIRP_OK),
+              VIRP_DISPOSITION_EXECUTED_UNKNOWN);
+
+    memset(&r, 0, sizeof(r));             /* claims not-sent, grants no retry */
+    r.disposition = VIRP_DISPOSITION_NOT_DISPATCHED;
+    ASSERT_EQ(virp_disposition_resolve(&r, VIRP_OK),
+              VIRP_DISPOSITION_EXECUTED_UNKNOWN);
+
+    ASSERT_TRUE(!virp_disposition_persistable(VIRP_DISPOSITION_UNSET));
+    ASSERT_EQ(strcmp(virp_disposition_success_json(
+                         VIRP_DISPOSITION_EXECUTED_UNKNOWN), "null"), 0);
+    ASSERT_EQ(strcmp(virp_disposition_success_json(
+                         VIRP_DISPOSITION_NOT_DISPATCHED), "null"), 0);
+}
+
 /*
  * A GREEN auto-execution leaves a signed, chained, prev-hash-linked
  * gate_execution entry — the thing that was missing. The rejection filed
@@ -3255,7 +3415,9 @@ TEST(test_green_execution_chains_signed_observation)
 
     ASSERT_TRUE(strncmp(rows[1].id, "gateexec-", 9) == 0);
     ASSERT_TRUE(strstr(rows[1].body,
-                       "\"schema\":\"gate_execution/1\"") != NULL);
+                       "\"schema\":\"gate_execution/2\"") != NULL);
+    ASSERT_TRUE(strstr(rows[1].body,
+                       "\"disposition\":\"EXECUTED_CONFIRMED\"") != NULL);
     ASSERT_TRUE(strstr(rows[1].body, "\"device\":\"PVE-LAB\"") != NULL);
     ASSERT_TRUE(strstr(rows[1].body, "\"driver\":\"mock\"") != NULL);
     ASSERT_TRUE(strstr(rows[1].body,
@@ -3389,7 +3551,15 @@ TEST(test_errored_execution_still_chains_no_gap)
     ASSERT_EQ(strcmp(rows[0].type, "gate_execution"), 0);
     ASSERT_TRUE(rows[0].have_body);
 
-    ASSERT_TRUE(strstr(rows[0].body, "\"success\":false") != NULL);
+    /* The driver threw: the record says EXECUTED_UNKNOWN, and the derived
+     * boolean is null — NOT false. "success": false here was the invented
+     * negative certainty the 2026-08 reviews called out. */
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"disposition\":\"EXECUTED_UNKNOWN\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"success\":null") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"success\":false") == NULL);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"driver_disposition\":\"DRIVER_ERROR\"") != NULL);
     /* No proof of non-dispatch: the record must not claim nothing ran. */
     ASSERT_TRUE(strstr(rows[0].body, "\"executed\":true") != NULL);
     ASSERT_TRUE(strstr(rows[0].body,
@@ -6220,6 +6390,11 @@ int main(void)
     RUN_TEST(test_green_execution_chains_signed_observation);
     RUN_TEST(test_execution_record_commits_to_digest_not_response_body);
     RUN_TEST(test_errored_execution_still_chains_no_gap);
+    RUN_TEST(test_disposition_executed_confirmed_recorded);
+    RUN_TEST(test_disposition_executed_failed_recorded);
+    RUN_TEST(test_disposition_executed_unknown_recorded_not_false);
+    RUN_TEST(test_disposition_not_dispatched_is_the_retry_boundary);
+    RUN_TEST(test_disposition_resolver_matches_retry_boundary);
     RUN_TEST(test_refused_action_still_chains_gate_rejection);
     RUN_TEST(test_chain_verify_over_mixed_executions_and_rejections);
 

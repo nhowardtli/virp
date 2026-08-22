@@ -45,7 +45,10 @@ Copyright 2026 Third Level IT LLC — Apache 2.0
 import base64
 import hashlib
 import hmac
+import json
 import struct
+
+import virp_disposition as disp
 
 VIRP_HEADER_SIZE = 56
 VIRP_KEY_SIZE = 32
@@ -130,6 +133,41 @@ UNCHECKED = "UNCHECKED"
 UNVERIFIABLE = "UNVERIFIABLE"
 V2_SESSION = "V2-SESSION"
 NOT_APPLICABLE = "N/A"
+
+# ── Execution disposition (outcome and gate_execution bodies) ───────────────
+# The four-state vocabulary is defined ONCE in include/virp_disposition.h
+# and mirrored into virp_disposition.py by scripts/gen_disposition.py
+# (`make check-disposition` fails on drift). This reader adds exactly two
+# things the C side never writes:
+#
+#   LEGACY_CONFIRMED / LEGACY_FAILED
+#       a record written before the vocabulary existed, carrying only
+#       "success": true/false. It is rendered AS LEGACY, never mapped onto
+#       EXECUTED_*: a legacy false could have been a device failure, an
+#       unknown outcome or a non-dispatch, and collapsing that is the
+#       defect the vocabulary was introduced to end.
+#   UNVERIFIABLE
+#       an outcome/gate_execution entry whose body was never retained
+#       (commitment-only). The chain can never say what happened, so the
+#       grade is the existing "evidence never retained" verdict — not PASS,
+#       not FAIL, and not EXECUTED_UNKNOWN (which is a statement the daemon
+#       made; this is the daemon having said nothing we can read).
+#
+# HOW A VERIFIER TELLS A LEGACY RECORD FROM A NEW ONE:
+#   outcome bodies        new  := "disposition" key present with one of the
+#                                 four names (these bodies also carry
+#                                 "schema": "outcome/2")
+#                         legacy := no "disposition" key (outcome/1 bodies
+#                                 had no schema field at all)
+#   gate_execution bodies keyed on "schema": gate_execution/2 => the
+#                         "disposition" key is authoritative;
+#                         gate_execution/1 => LEGACY, because under /1 the
+#                         same key held the raw DRIVER classification
+#                         ("UNSET", "DRIVER_ERROR", ...), not a disposition.
+#   A recognised-looking disposition under an unrecognised schema, or an
+#   unrecognised disposition string, is graded UNVERIFIABLE with the
+#   reason, never guessed at.
+DISPOSITION_TYPES = frozenset(("outcome", "gate_execution"))
 
 # ── Structural retention limits of the chain format ────────────────────────
 # These are properties of how the daemon and autopilot write evidence, not
@@ -477,7 +515,8 @@ class EntryVerification:
                  "artifact_bind", "artifact_bind_detail", "obs_hmac",
                  "obs_hmac_detail", "header", "payload", "artifact_raw",
                  "artifact_content", "device", "v2_journal",
-                 "v2_journal_detail")
+                 "v2_journal_detail", "disposition", "disposition_detail",
+                 "disposition_legacy")
 
     def __init__(self, entry):
         self.entry = entry
@@ -498,6 +537,15 @@ class EntryVerification:
         # everything that is not a well-formed v2 observation.
         self.v2_journal = NOT_APPLICABLE
         self.v2_journal_detail = ""
+        # Execution disposition for outcome / gate_execution entries; N/A
+        # for every other type. Deliberately NOT in _INTEGRITY_VERDICTS:
+        # EXECUTED_UNKNOWN is an honest statement about the device, not a
+        # statement about the chain's integrity, and must never turn an
+        # intact chain into a FAIL — it gets its own column and its own
+        # flag in the summary instead.
+        self.disposition = NOT_APPLICABLE
+        self.disposition_detail = ""
+        self.disposition_legacy = False
         self.header = None
         self.payload = None
         self.artifact_raw = None
@@ -569,9 +617,64 @@ class EntryVerification:
         return out
 
 
+def grade_disposition(artifact_type, artifact_content):
+    """Grade the execution disposition of one outcome / gate_execution
+    entry from its stored body. Returns (grade, is_legacy, detail).
+
+    grade is one of disp.PERSISTABLE, disp.LEGACY_CONFIRMED,
+    disp.LEGACY_FAILED, or UNVERIFIABLE. See the DISPOSITION_TYPES comment
+    above for the legacy-vs-new rule this implements.
+    """
+    if artifact_type not in DISPOSITION_TYPES:
+        return NOT_APPLICABLE, False, ""
+    if not artifact_content:
+        return UNVERIFIABLE, False, "no %s body retained" % artifact_type
+    try:
+        body = json.loads(artifact_content)
+    except ValueError:
+        return UNVERIFIABLE, False, "%s body is not JSON" % artifact_type
+    if not isinstance(body, dict):
+        return UNVERIFIABLE, False, "%s body is not an object" % artifact_type
+
+    schema = body.get("schema")
+    has_key = "disposition" in body
+
+    if artifact_type == "gate_execution":
+        # /1 bodies carry a "disposition" key that is NOT a disposition.
+        new = (schema == disp.GATE_EXECUTION_SCHEMA_V2)
+        if schema not in (disp.GATE_EXECUTION_SCHEMA_V1,
+                          disp.GATE_EXECUTION_SCHEMA_V2):
+            return (UNVERIFIABLE, False,
+                    "gate_execution body carries unknown schema %r" % schema)
+    else:
+        new = has_key
+
+    if new:
+        value = body.get("disposition")
+        if value in disp.PERSISTABLE:
+            return value, False, ""
+        return (UNVERIFIABLE, False,
+                "%s body carries unrecognised disposition %r"
+                % (artifact_type, value))
+
+    # Legacy: only a boolean to go on, and it is rendered as exactly that.
+    ok = body.get("success")
+    if ok is True:
+        return disp.LEGACY_CONFIRMED, True, "legacy record: success=true only"
+    if ok is False:
+        return (disp.LEGACY_FAILED, True,
+                "legacy record: success=false only (device failure, unknown "
+                "outcome and non-dispatch were not distinguished)")
+    return (UNVERIFIABLE, True,
+            "legacy %s body carries neither disposition nor success"
+            % artifact_type)
+
+
 def verify_entry(entry, artifact_content, okey, chain_key, expected_prev):
     """Run every available check against one chain entry."""
     v = EntryVerification(entry)
+    v.disposition, v.disposition_legacy, v.disposition_detail = \
+        grade_disposition(entry["artifact_type"], artifact_content)
 
     canonical = canonical_json(entry)
 
@@ -1004,4 +1107,27 @@ def summarize(verifications):
         "first_broken_link": first_broken,
         "sessions": len({v.entry["session_id"] for v in verifications}),
         "retention_reasons": retention_reasons(verifications),
+        # Execution dispositions, tallied by grade over outcome and
+        # gate_execution entries. EXECUTED_UNKNOWN is its own column and is
+        # never folded into pass or fail; its presence is what the summary
+        # flags. Legacy records are counted under their LEGACY_* labels.
+        "dispositions": disposition_tally(verifications),
+        "unknown_dispositions": [v for v in verifications
+                                 if getattr(v, "disposition", None)
+                                 == disp.NAME_EXECUTED_UNKNOWN],
+        "legacy_dispositions": sum(1 for v in verifications
+                                   if getattr(v, "disposition_legacy", False)),
     }
+
+
+DISPOSITION_GRADES = disp.PERSISTABLE + (disp.LEGACY_CONFIRMED,
+                                         disp.LEGACY_FAILED, UNVERIFIABLE)
+
+
+def disposition_tally(verifications):
+    counts = {g: 0 for g in DISPOSITION_GRADES}
+    for v in verifications:
+        g = getattr(v, "disposition", NOT_APPLICABLE)
+        if g in counts:
+            counts[g] += 1
+    return counts

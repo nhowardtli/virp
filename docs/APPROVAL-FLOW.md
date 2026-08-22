@@ -64,6 +64,40 @@ Signatures are a fixed 64 bytes on the wire for both algorithms:
   canonical bytes.
 - **Ed25519** — the native 64-byte signature over the canonical bytes.
 
+## The OUTCOME record (outcome/2) and execution disposition
+
+The OUTCOME chain entry's body records what happened after the approved
+command was handed to the driver, using the four-state vocabulary in
+`include/virp_disposition.h` (mirrored to `report/virp_disposition.py` by
+`make gen-disposition`; `make check-disposition` fails on drift):
+
+| `disposition` | meaning | derived `success` |
+|---|---|---|
+| `EXECUTED_CONFIRMED` | dispatched, completed, device reported success | `true` |
+| `EXECUTED_FAILED` | dispatched, completed, device reported failure | `false` |
+| `EXECUTED_UNKNOWN` | dispatch may have occurred; result not confirmed (timeout after send, lost response, channel closed without status, driver threw) | `null` |
+| `NOT_DISPATCHED` | driver proved no byte reached the device; exactly the condition the single auto-retry fires on | `null` |
+
+`disposition` is the truth; `success` is a convenience derived from it
+and is `null` wherever the yes/no question has no honest answer. Until
+2026-08-21 every non-success path wrote `"success": false`, including the
+lost-response path, which recorded "may have executed" as "confirmed
+failure".
+
+**Legacy records.** The chain is append-only. OUTCOME bodies written
+before this revision carry `"success": true|false` and no `disposition`
+or `schema` key. A verifier treats the ABSENCE of `disposition` as the
+legacy marker and renders those as `LEGACY_CONFIRMED` / `LEGACY_FAILED`;
+it never maps them onto the four states, because a legacy `false` could
+have been any of `EXECUTED_FAILED`, `EXECUTED_UNKNOWN` or
+`NOT_DISPATCHED`. New bodies carry `"schema": "outcome/2"`. The same
+vocabulary is used by `gate_execution/2` bodies for auto-executed
+commands; there the schema tag decides, because `gate_execution/1`
+bodies carried the raw driver classification under the same key name.
+
+An OUTCOME entry whose body was not retained (commitment only) is graded
+`UNVERIFIABLE` by the report layer, not PASS and not FAIL.
+
 ## Apply-side check order and DISTINCT rejection codes
 
 | Check                                   | Failure code                              |

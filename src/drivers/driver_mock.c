@@ -43,6 +43,15 @@ void virp_driver_mock_set_soft_fail(const char *msg) { mock_soft_fail_msg = msg;
 static const char *mock_unknown_fail_msg = NULL;
 void virp_driver_mock_set_unknown_fail(const char *msg) { mock_unknown_fail_msg = msg; }
 
+/* Test hook: execute() returns VIRP_OK with success=false, exit_code=1
+ * (trusted) and this text as the device's own response — a command that
+ * DISPATCHED, completed, and was refused by the device ("% Invalid
+ * input"). disposition is left UNSET on purpose so the O-Node's
+ * resolver exercises the legacy rule most real drivers still rely on:
+ * failure WITH output is EXECUTED_FAILED. NULL disables. */
+static const char *mock_exec_failed_output = NULL;
+void virp_driver_mock_set_exec_failed(const char *output) { mock_exec_failed_output = output; }
+
 /* Test hook: execute() succeeds and returns EXACTLY this text as the
  * device response body. Lets a test put chosen bytes — credential-shaped
  * material in particular — into a GREEN device response and then assert
@@ -250,6 +259,22 @@ static virp_error_t mock_execute(virp_conn_t *conn,
         result->success = false;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "%s", mock_unknown_fail_msg);
+        return VIRP_OK;
+    }
+
+    /* Test hook: device answered with a failure (dispatched, completed,
+     * refused by the device) — EXECUTED_FAILED through the resolver. */
+    if (mock_exec_failed_output) {
+        int n = snprintf(result->output, sizeof(result->output), "%s",
+                         mock_exec_failed_output);
+        size_t cap = sizeof(result->output) - 1;
+        result->output_len = (n > 0) ? (((size_t)n > cap) ? cap : (size_t)n)
+                                     : 0;
+        result->success = false;
+        result->exit_code = 1;
+        result->exit_code_trusted = true;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "device rejected command");
         return VIRP_OK;
     }
 

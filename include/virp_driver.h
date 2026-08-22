@@ -194,31 +194,15 @@ typedef struct {
  * bytes came back. Output length must play NO part in this decision: the
  * linux driver seeds its buffer with a "<host>$ <cmd>\n" prefix before
  * reading, so an output-length test is always false and silently dead.
+ *
+ * The enum itself (virp_disposition_t) lives in virp_disposition.h because
+ * it is shared with the report layer; see that header for the meaning of
+ * each state and for the legacy-record rule. A driver that has been
+ * converted to the classifier sets a real disposition on every return
+ * path; an unconverted driver leaves the zero value UNSET and the O-Node
+ * resolves it (virp_disposition_resolve) before anything is persisted.
  */
-typedef enum {
-    /*
-     * Driver has not been converted to the classifier. Legacy success
-     * semantics apply, unchanged. This is the zero value ONLY so that
-     * unconverted drivers keep their existing behaviour rather than being
-     * mass-reclassified as UNKNOWN — converting the remaining drivers is
-     * deliberately out of scope here. A converted driver must set a real
-     * disposition on every return path.
-     */
-    VIRP_DISPOSITION_UNSET              = 0,
-    /* Bytes provably never dispatched (pre-dispatch failure). Retryable. */
-    VIRP_DISPOSITION_NOT_SENT           = 1,
-    /* Clean, complete close AND a trustworthy exit status of 0. */
-    VIRP_DISPOSITION_EXECUTED_CONFIRMED = 2,
-    /* Clean, complete close AND a trustworthy non-zero exit (or a signal). */
-    VIRP_DISPOSITION_EXECUTED_FAILED    = 3,
-    /*
-     * Dispatched, but the channel never closed cleanly / no exit status was
-     * received. The command MAY have executed. Never success, never retried.
-     */
-    VIRP_DISPOSITION_EXECUTED_UNKNOWN   = 4,
-} virp_disposition_t;
-
-const char *virp_disposition_str(virp_disposition_t d);
+#include "virp_disposition.h"
 
 typedef struct {
     char        output[VIRP_OUTPUT_MAX];
@@ -258,6 +242,36 @@ typedef struct {
      */
     bool        no_dispatch;
 } virp_exec_result_t;
+
+/*
+ * Resolve a driver result (and the driver's return code) to exactly one of
+ * the four persistable dispositions. THIS is the boundary every record
+ * write must go through; nothing persists a disposition it did not get
+ * from here. The rules, in precedence order:
+ *
+ *   1. err != VIRP_OK, or no result at all   -> EXECUTED_UNKNOWN
+ *      The driver threw. It proved nothing about dispatch and the O-Node
+ *      does not retry this case, so by the retry logic's own standard it
+ *      is "may have executed".
+ *   2. !success && no_dispatch               -> NOT_DISPATCHED
+ *      The retry predicate, verbatim (src/virp_onode.c, the single
+ *      auto-retry). NOT_DISPATCHED is defined as "what the retry is
+ *      licensed on", so the two can never disagree.
+ *   3. driver set a disposition (converted driver):
+ *        EXECUTED_CONFIRMED / EXECUTED_FAILED / EXECUTED_UNKNOWN -> as set
+ *        NOT_DISPATCHED without no_dispatch     -> EXECUTED_UNKNOWN
+ *      A driver claiming non-dispatch without granting the retry license
+ *      is contradicting itself; the conservative reading wins.
+ *   4. driver left UNSET (unconverted driver):
+ *        success                                -> EXECUTED_CONFIRMED
+ *        !success && output_len == 0            -> EXECUTED_UNKNOWN
+ *          (the legacy "no response after possible dispatch" rule the
+ *          O-Node has always applied to unconverted drivers)
+ *        !success && output_len > 0             -> EXECUTED_FAILED
+ *          (the device answered, and the answer was a failure)
+ */
+virp_disposition_t virp_disposition_resolve(const virp_exec_result_t *r,
+                                            virp_error_t err);
 
 /* =========================================================================
  * Driver Operations
@@ -415,6 +429,12 @@ int  virp_driver_mock_probe_count(void);
  * =false): the O-Node must NOT retry and must report OUTCOME_UNKNOWN.
  * NULL disables. */
 void virp_driver_mock_set_unknown_fail(const char *msg);
+/* Device-reported failure hook: execute() returns VIRP_OK with
+ * success=false, exit_code=1 (trusted), and `output` as the device's
+ * response body (e.g. "% Invalid input") — the shape of a command that
+ * dispatched, completed, and was refused BY THE DEVICE. Resolves to
+ * EXECUTED_FAILED. NULL disables. */
+void virp_driver_mock_set_exec_failed(const char *output);
 /* Total execute() invocations since the last reset; resets to zero. */
 int  virp_driver_mock_exec_attempts_reset(void);
 

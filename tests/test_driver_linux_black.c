@@ -60,8 +60,8 @@ int main(void)
     CHECK(e == VIRP_OK, "linux_execute returned err %d", (int)e);
     CHECK(r.success == false, "a BLACK command reported success");
     CHECK(r.no_dispatch == true, "a BLACK command was dispatched (no_dispatch=false)");
-    CHECK(r.disposition == VIRP_DISPOSITION_NOT_SENT,
-          "BLACK disposition must be NOT_SENT, got %d", (int)r.disposition);
+    CHECK(r.disposition == VIRP_DISPOSITION_NOT_DISPATCHED,
+          "BLACK disposition must be NOT_DISPATCHED, got %d", (int)r.disposition);
     CHECK(strstr(r.error_msg, "BLACK") != NULL,
           "refusal must name BLACK; got: '%s'", r.error_msg);
     if (!failures) printf(" [PASS]\n");

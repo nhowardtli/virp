@@ -507,8 +507,10 @@ typedef enum {
      * The command may have executed on the device. The O-Node refuses
      * to re-execute (authorized once must never become executed twice)
      * and refuses to claim executed=no; it reports this typed UNKNOWN
-     * instead. Full disposition taxonomy (NOT_SENT/SENT_NO_ACK/...) is
-     * deferred to the EXECUTION_INTENT work. */
+     * instead. The persisted four-state disposition vocabulary
+     * (NOT_DISPATCHED / EXECUTED_CONFIRMED / EXECUTED_FAILED /
+     * EXECUTED_UNKNOWN) lives in virp_disposition.h; this error code is
+     * the wire-level signal of EXECUTED_UNKNOWN. */
     VIRP_ERR_OUTCOME_UNKNOWN          = -48,  /* response absent after
                                                  possible dispatch;
                                                  not retried */

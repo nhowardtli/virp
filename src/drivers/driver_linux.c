@@ -353,7 +353,7 @@ static virp_error_t linux_execute(virp_conn_t *conn,
         result->success = false;
         result->exit_code = 1;
         result->no_dispatch = true;   /* nothing was ever sent */
-        result->disposition = VIRP_DISPOSITION_NOT_SENT;
+        result->disposition = VIRP_DISPOSITION_NOT_DISPATCHED;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "BLACK tier: command blocked on %s", conn->device.hostname);
         fprintf(stderr, "[Linux] BLACK tier blocked: '%s' on %s\n",
@@ -364,7 +364,7 @@ static virp_error_t linux_execute(virp_conn_t *conn,
     if (!conn->connected) {
         result->success = false;
         result->no_dispatch = true;   /* refused before any transport write */
-        result->disposition = VIRP_DISPOSITION_NOT_SENT;
+        result->disposition = VIRP_DISPOSITION_NOT_DISPATCHED;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Not connected to %s", conn->device.hostname);
         return VIRP_OK;
@@ -384,7 +384,7 @@ static virp_error_t linux_execute(virp_conn_t *conn,
         conn->connected = false;
         result->success = false;
         result->no_dispatch = true;   /* channel never opened; command not sent */
-        result->disposition = VIRP_DISPOSITION_NOT_SENT;
+        result->disposition = VIRP_DISPOSITION_NOT_DISPATCHED;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Channel open failed on %s: %s", conn->device.hostname, errmsg);
         return VIRP_OK;

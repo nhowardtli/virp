@@ -800,10 +800,29 @@ static void approval_emit_outcome(onode_state_t *state,
                                   const char *proposal_id,
                                   const virp_approval_rec_t *apr,
                                   const char *device_name,
-                                  bool success)
+                                  virp_disposition_t disposition)
 {
     if (!state->chain_enabled)
         return;
+
+    /* outcome/2 (2026-08-21): the body carries the four-state execution
+     * DISPOSITION as the truth and `success` only as the derived
+     * convenience (true for EXECUTED_CONFIRMED, false for
+     * EXECUTED_FAILED, null otherwise). Until this revision every
+     * non-success path wrote "success": false — including the
+     * OUTCOME_UNKNOWN path, where the honest statement is "may have
+     * executed". That was invented negative certainty in the durable
+     * record. Legacy outcome/1 bodies have neither "schema" nor
+     * "disposition"; readers render them LEGACY_* (see
+     * include/virp_disposition.h). A non-persistable disposition here is
+     * a programming error, recorded loudly as UNKNOWN rather than
+     * dropped. */
+    if (!virp_disposition_persistable(disposition)) {
+        fprintf(stderr, "[GATE] BUG: outcome for proposal=%s carried "
+                "non-persistable disposition %d; recording EXECUTED_UNKNOWN\n",
+                proposal_id, (int)disposition);
+        disposition = VIRP_DISPOSITION_EXECUTED_UNKNOWN;
+    }
 
     virp_proposal_rec_t prop;
     bool have_prop = state->approval_dir[0] &&
@@ -812,14 +831,17 @@ static void approval_emit_outcome(onode_state_t *state,
 
     char content[1024];
     snprintf(content, sizeof(content),
-             "{\"proposal_id\":\"%s\",\"proposal_entry_hash\":\"%s\","
+             "{\"schema\":\"" VIRP_OUTCOME_SCHEMA_V2 "\","
+             "\"proposal_id\":\"%s\",\"proposal_entry_hash\":\"%s\","
              "\"approval_entry_hash\":\"%s\",\"device\":\"%s\","
-             "\"command_hash\":\"%s\",\"success\":%s}",
+             "\"command_hash\":\"%s\",\"disposition\":\"%s\","
+             "\"success\":%s}",
              proposal_id,
              have_prop ? prop.chain_entry_hash : "",
              apr->chain_entry_hash,
              device_name, apr->command_hash,
-             success ? "true" : "false");
+             virp_disposition_str(disposition),
+             virp_disposition_success_json(disposition));
 
     char artifact_hash[65];
     gate_sha256_hex(content, strlen(content), artifact_hash);
@@ -839,9 +861,10 @@ static void approval_emit_outcome(onode_state_t *state,
                                           content, &ce);
     if (cerr == VIRP_OK) {
         fprintf(stderr, "[GATE] outcome persisted: proposal=%s seq=%lld "
-                "hash=%.16s success=%s\n", proposal_id,
+                "hash=%.16s disposition=%s success=%s\n", proposal_id,
                 (long long)ce.sequence, ce.chain_entry_hash,
-                success ? "true" : "false");
+                virp_disposition_str(disposition),
+                virp_disposition_success_json(disposition));
     } else {
         fprintf(stderr, "[GATE] outcome chain append+store failed: %s\n",
                 virp_error_str(cerr));
@@ -925,10 +948,23 @@ static void gate_emit_execution(onode_state_t *state,
 
     /* cJSON does the escaping: command text and driver error strings are
      * arbitrary and must never be pasted into JSON by hand. */
+    /* The ONE resolution of what happened, shared with the outcome path:
+     * result == NULL (driver threw) resolves to EXECUTED_UNKNOWN. */
+    virp_disposition_t disposition =
+        virp_disposition_resolve(result, VIRP_OK);
+
     char *body = NULL;
     cJSON *o = cJSON_CreateObject();
     if (o) {
-        cJSON_AddStringToObject(o, "schema", "gate_execution/1");
+        /* gate_execution/2 (2026-08-21): "disposition" is now the RESOLVED
+         * four-state disposition (include/virp_disposition.h) and is the
+         * truth; "success" and "executed" are derived from it. Under
+         * gate_execution/1 this key held the raw driver classification
+         * ("UNSET", "DRIVER_ERROR", ...) and "success" was a bare bool
+         * that read false for unknown outcomes. The raw driver view is
+         * kept under "driver_disposition" for diagnosis. A reader keys
+         * on the schema tag to tell the two apart. */
+        cJSON_AddStringToObject(o, "schema", VIRP_GATE_EXECUTION_SCHEMA_V2);
         cJSON_AddStringToObject(o, "device", device_name);
         cJSON_AddStringToObject(o, "driver", drv->name);
         cJSON_AddStringToObject(o, "command", command);
@@ -961,22 +997,33 @@ static void gate_emit_execution(onode_state_t *state,
          * effect). A driver that errored outright proved nothing, so it
          * counts as executed and executed_reported=false says the driver
          * could not tell us what happened. */
+        cJSON_AddStringToObject(o, "disposition",
+                                virp_disposition_str(disposition));
         cJSON_AddBoolToObject(o, "executed",
-                              !(result && result->no_dispatch));
+                              virp_disposition_may_have_executed(disposition));
         cJSON_AddBoolToObject(o, "executed_reported", result != NULL);
-        cJSON_AddBoolToObject(o, "success", result ? result->success : false);
+        /* Derived, tri-state: true / false / null. Never a bare false for
+         * an outcome nobody confirmed. */
+        switch (disposition) {
+        case VIRP_DISPOSITION_EXECUTED_CONFIRMED:
+            cJSON_AddTrueToObject(o, "success");  break;
+        case VIRP_DISPOSITION_EXECUTED_FAILED:
+            cJSON_AddFalseToObject(o, "success"); break;
+        default:
+            cJSON_AddNullToObject(o, "success");  break;
+        }
         if (result) {
             cJSON_AddNumberToObject(o, "exit_code", (double)result->exit_code);
             cJSON_AddBoolToObject(o, "exit_code_trusted",
                                   result->exit_code_trusted);
-            cJSON_AddStringToObject(o, "disposition",
+            cJSON_AddStringToObject(o, "driver_disposition",
                                     virp_disposition_str(result->disposition));
             cJSON_AddBoolToObject(o, "response_truncated",
                                   result->output_truncated);
         } else {
             cJSON_AddNullToObject(o, "exit_code");
             cJSON_AddBoolToObject(o, "exit_code_trusted", false);
-            cJSON_AddStringToObject(o, "disposition", "DRIVER_ERROR");
+            cJSON_AddStringToObject(o, "driver_disposition", "DRIVER_ERROR");
             cJSON_AddBoolToObject(o, "response_truncated", false);
         }
 
@@ -1019,10 +1066,12 @@ static void gate_emit_execution(onode_state_t *state,
                     "built; entry %s retains only the commitment\n",
                     artifact_id);
         fprintf(stderr, "[GATE] execution persisted: session=%s seq=%lld "
-                "hash=%.16s tier=%s success=%s response_sha256=%.16s\n",
+                "hash=%.16s tier=%s disposition=%s success=%s "
+                "response_sha256=%.16s\n",
                 session_id, (long long)ce.sequence, ce.chain_entry_hash,
                 gate_tier_name(gate_tier),
-                (result && result->success) ? "true" : "false",
+                virp_disposition_str(disposition),
+                virp_disposition_success_json(disposition),
                 response_digest);
     } else {
         fprintf(stderr, "[GATE] execution chain append+store failed: %s\n",
@@ -1804,9 +1853,11 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             gate_emit_execution(state, device_name, drv, command, gate_tier,
                                 gate_eff_max, gate_mode, client_uid,
                                 NULL, err_msg);
+        /* The driver threw: no proof of non-dispatch, so the durable
+         * record says EXECUTED_UNKNOWN, never "success": false. */
         if (approved)
-            approval_emit_outcome(state, proposal_id, &apr,
-                                  device_name, false);
+            approval_emit_outcome(state, proposal_id, &apr, device_name,
+                                  virp_disposition_resolve(&result, err));
         log_error_obs(device_name, gate_tier, err_msg);
         return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
@@ -1853,7 +1904,9 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                         client_uid, NULL, err_msg);
                 if (approved)
                     approval_emit_outcome(state, proposal_id, &apr,
-                                          device_name, false);
+                                          device_name,
+                                          virp_disposition_resolve(&result,
+                                                                   err));
                 log_error_obs(device_name, gate_tier, err_msg);
                 return virp_build_observation_tiered(
                     out_buf, out_buf_len, out_len,
@@ -1870,6 +1923,12 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
 
     pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
 
+    /* The single resolution of what happened, used by every record write
+     * below. virp_disposition_resolve() encodes the retry boundary
+     * (NOT_DISPATCHED == the retry license, exactly) and the legacy
+     * success/output rules for unconverted drivers; see virp_driver.h. */
+    virp_disposition_t disposition = virp_disposition_resolve(&result, VIRP_OK);
+
     /*
      * Failure with no output and NO proof of non-dispatch: the command
      * may have reached and executed on the device (SSH write completed
@@ -1877,21 +1936,19 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * output exceeded the evidence limit). Re-executing here is the
      * authorized-once-executed-twice bug; claiming executed=no is a
      * lie. Report the typed UNKNOWN. The connection is dropped — its
-     * state is unknowable too. Approval outcome stays the existing
-     * binary failure record (a consumed approval cannot be replayed to
-     * "try again"); expressing UNKNOWN in the outcome artifact itself
-     * is EXECUTION_INTENT territory, deferred with Part B.
+     * state is unknowable too. The approval OUTCOME records
+     * EXECUTED_UNKNOWN (outcome/2) — it used to record "success": false
+     * here, which was the invented negative certainty the 2026-08
+     * reviews called out. A consumed approval still cannot be replayed
+     * to "try again"; EXECUTION_INTENT (the record committed BEFORE
+     * device I/O) remains separate, specified-only work.
      */
-    /* A driver that classifies its termination (linux) states UNKNOWN
-     * directly. The output_len test in the second clause is the LEGACY path
-     * for drivers not yet converted to the classifier — it is deliberately
-     * NOT part of the new decision, and must never be reintroduced into it:
-     * for the linux driver it was always false, which is precisely how this
-     * branch came to be dead code. Converting the remaining drivers retires
-     * that clause. */
-    if (result.disposition == VIRP_DISPOSITION_EXECUTED_UNKNOWN ||
-        (result.disposition == VIRP_DISPOSITION_UNSET &&
-         !result.success && result.output_len == 0 && !result.no_dispatch)) {
+    /* The resolver states UNKNOWN for a converted driver that said so,
+     * and applies the legacy "no response after possible dispatch" rule
+     * (!success && output_len == 0 && !no_dispatch) for unconverted ones.
+     * That legacy clause lives in virp_disposition_resolve() and nowhere
+     * else; it must not be reintroduced here. */
+    if (disposition == VIRP_DISPOSITION_EXECUTED_UNKNOWN) {
         pthread_mutex_lock(&state->exec_mutex[dev_idx]);
         drop_connection(state, dev_idx);
         pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -1912,10 +1969,11 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                 &result, err_msg);
         if (approved)
             approval_emit_outcome(state, proposal_id, &apr,
-                                  device_name, false);
+                                  device_name, disposition);
         fprintf(stderr, "[ERROR-OBS] device=%s tier=%s executed=unknown "
-                "disposition=%s reason=\"%s\"\n", device_name,
-                gate_tier_name(gate_tier),
+                "disposition=%s driver_disposition=%s reason=\"%s\"\n",
+                device_name, gate_tier_name(gate_tier),
+                virp_disposition_str(disposition),
                 virp_disposition_str(result.disposition), err_msg);
         return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
@@ -1952,7 +2010,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                 &result, err_msg);
         if (approved)
             approval_emit_outcome(state, proposal_id, &apr,
-                                  device_name, false);
+                                  device_name, disposition);
         log_error_obs(device_name, gate_tier, err_msg);
         return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
@@ -1966,9 +2024,10 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
 
     /* What the device's termination actually told us, recorded before the
      * observation is built so the log and the signed artifact cannot drift. */
-    fprintf(stderr, "[EXEC] device=%s disposition=%s success=%s exit=%d "
-            "exit_trusted=%s truncated=%s reason=\"%s\"\n",
-            device_name, virp_disposition_str(result.disposition),
+    fprintf(stderr, "[EXEC] device=%s disposition=%s driver_disposition=%s "
+            "success=%s exit=%d exit_trusted=%s truncated=%s reason=\"%s\"\n",
+            device_name, virp_disposition_str(disposition),
+            virp_disposition_str(result.disposition),
             result.success ? "true" : "false", result.exit_code,
             result.exit_code_trusted ? "yes" : "no",
             result.output_truncated ? "yes" : "no",
@@ -2053,7 +2112,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     VIRP_FI("pre_outcome");
     if (approved)
         approval_emit_outcome(state, proposal_id, &apr,
-                              device_name, result.success);
+                              device_name, disposition);
 
     if (err == VIRP_OK) {
         pthread_mutex_lock(&state->state_mutex);

@@ -62,6 +62,9 @@ static const char *CHAIN_KEY = "/tmp/virp-test-approval-chain.key";
 static const char *REGISTRY  = "/tmp/virp-test-approvers.json";
 
 extern void virp_driver_mock_init(void);
+extern void virp_driver_mock_set_output(const char *text);
+extern void virp_driver_mock_set_soft_fail(const char *msg);
+extern void virp_driver_mock_set_forced_error(virp_error_t err);
 
 static onode_state_t g;
 static virp_fed_keypair_t g_kp;      /* the enrolled Ed25519 approver key */
@@ -177,6 +180,33 @@ static int run_cmd(onode_state_t *st, const char *device, const char *cmd,
     memcpy(payload, data, n);
     payload[n] = '\0';
     return 0;
+}
+
+/* The persisted OUTCOME body for a proposal, joined on the entry's own
+ * (artifact_id, artifact_hash). Returns 0 and fills buf, -1 if absent. */
+static int read_outcome_body(const char *pid, char *buf, size_t cap)
+{
+    char aid[64];
+    snprintf(aid, sizeof(aid), "outcome:%s", pid);
+    sqlite3 *db = NULL;
+    if (sqlite3_open(CHAIN_DB, &db) != SQLITE_OK) { sqlite3_close(db); return -1; }
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+    if (sqlite3_prepare_v2(db,
+            "SELECT a.artifact_content FROM chain_entries e "
+            "JOIN artifacts a ON a.artifact_id = e.artifact_id "
+            "                AND a.artifact_hash = e.artifact_hash "
+            "WHERE e.artifact_id = ? AND e.artifact_type = 'outcome'",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, aid, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+            snprintf(buf, cap, "%s", (const char *)sqlite3_column_text(st, 0));
+            rc = 0;
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return rc;
 }
 
 /* Extract "proposal_id=<32hex>" from a rejection payload. */
@@ -336,6 +366,107 @@ static void test_e2e_propose_approve_apply(void)
                == VIRP_OK, "chain verify errored");
     ASSERT(vr.valid, "approval chain invalid");
     ASSERT(vr.entries_checked >= 3, "expected proposal+approval+outcome");
+
+    /* outcome/2: the mock does not recognise "reload" and answers with an
+     * error, so the device REPORTED failure — EXECUTED_FAILED, the one
+     * non-success state whose derived boolean is an honest false. */
+    char body[2048];
+    ASSERT(read_outcome_body(g_pid_e2e, body, sizeof(body)) == 0,
+           "outcome body not retained");
+    ASSERT(strstr(body, "\"schema\":\"outcome/2\"") != NULL, "not outcome/2");
+    ASSERT(strstr(body, "\"disposition\":\"EXECUTED_FAILED\"") != NULL,
+           "device-reported failure must record EXECUTED_FAILED");
+    ASSERT(strstr(body, "\"success\":false") != NULL, "derived success");
+    PASS();
+}
+
+/* =========================================================================
+ * Execution disposition in the OUTCOME record (include/virp_disposition.h)
+ *
+ * One approved apply per state, produced through the real
+ * propose -> approve -> apply path and read back from the persisted
+ * outcome body. The load-bearing one is EXECUTED_UNKNOWN: before this
+ * vocabulary the OUTCOME for a lost response was "success": false —
+ * invented negative certainty in the durable record.
+ * ========================================================================= */
+
+static int approved_apply(const char *cmd, char *pid_out,
+                          char *payload, size_t payload_len)
+{
+    if (propose_via_block(&g, "R-APP", cmd, pid_out) != 0) return -1;
+    virp_approval_rec_t apr;
+    if (do_approve(pid_out, &apr) != VIRP_OK) return -2;
+    uint8_t ot, tier;
+    return run_cmd(&g, "R-APP", cmd, pid_out, &ot, &tier, payload,
+                   payload_len);
+}
+
+static void test_outcome_disposition_confirmed(void)
+{
+    TEST("Outcome: device success -> EXECUTED_CONFIRMED");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1], payload[2048], body[2048];
+    virp_driver_mock_set_output("Proceed with reload? [confirm]\nReload scheduled");
+    int rc = approved_apply("reload", pid, payload, sizeof(payload));
+    virp_driver_mock_set_output(NULL);
+    ASSERT(rc == 0, "approved apply failed");
+    ASSERT(strstr(payload, "Reload scheduled") != NULL, "did not execute");
+    ASSERT(read_outcome_body(pid, body, sizeof(body)) == 0, "no outcome body");
+    ASSERT(strstr(body, "\"disposition\":\"EXECUTED_CONFIRMED\"") != NULL,
+           "expected EXECUTED_CONFIRMED");
+    ASSERT(strstr(body, "\"success\":true") != NULL, "derived success");
+    PASS();
+}
+
+static void test_outcome_disposition_unknown_is_not_false(void)
+{
+    TEST("Outcome: lost response -> EXECUTED_UNKNOWN, never success:false");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1], payload[2048], body[2048];
+    virp_driver_mock_set_unknown_fail("response lost after write on R-APP");
+    int rc = approved_apply("reload", pid, payload, sizeof(payload));
+    virp_driver_mock_set_unknown_fail(NULL);
+    ASSERT(rc == 0, "approved apply failed");
+    ASSERT(strstr(payload, "outcome UNKNOWN") != NULL,
+           "caller must be told the outcome is unknown");
+    ASSERT(read_outcome_body(pid, body, sizeof(body)) == 0, "no outcome body");
+    ASSERT(strstr(body, "\"schema\":\"outcome/2\"") != NULL, "not outcome/2");
+    ASSERT(strstr(body, "\"disposition\":\"EXECUTED_UNKNOWN\"") != NULL,
+           "durable record must say EXECUTED_UNKNOWN");
+    ASSERT(strstr(body, "\"success\":null") != NULL,
+           "derived boolean must be null for an unknown outcome");
+    ASSERT(strstr(body, "\"success\":false") == NULL,
+           "REGRESSION: unknown outcome persisted as confirmed failure");
+    PASS();
+}
+
+static void test_outcome_disposition_driver_error_is_unknown(void)
+{
+    TEST("Outcome: driver threw -> EXECUTED_UNKNOWN");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1], payload[2048], body[2048];
+    virp_driver_mock_set_forced_error(VIRP_ERR_CRYPTO);
+    int rc = approved_apply("reload", pid, payload, sizeof(payload));
+    virp_driver_mock_set_forced_error(VIRP_OK);
+    ASSERT(rc == 0, "approved apply failed");
+    ASSERT(read_outcome_body(pid, body, sizeof(body)) == 0, "no outcome body");
+    ASSERT(strstr(body, "\"disposition\":\"EXECUTED_UNKNOWN\"") != NULL,
+           "driver error proves nothing about dispatch: UNKNOWN");
+    ASSERT(strstr(body, "\"success\":false") == NULL,
+           "driver error must not persist as confirmed failure");
+    PASS();
+}
+
+static void test_outcome_disposition_not_dispatched(void)
+{
+    TEST("Outcome: proven non-dispatch -> NOT_DISPATCHED");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1], payload[2048], body[2048];
+    virp_driver_mock_set_soft_fail("refused before device I/O");
+    int rc = approved_apply("reload", pid, payload, sizeof(payload));
+    virp_driver_mock_set_soft_fail(NULL);
+    ASSERT(rc == 0, "approved apply failed");
+    ASSERT(read_outcome_body(pid, body, sizeof(body)) == 0, "no outcome body");
+    ASSERT(strstr(body, "\"disposition\":\"NOT_DISPATCHED\"") != NULL,
+           "proven pre-dispatch refusal must record NOT_DISPATCHED");
+    ASSERT(strstr(body, "\"success\":null") != NULL,
+           "nothing ran: the yes/no question has no answer");
     PASS();
 }
 
@@ -1304,6 +1435,10 @@ int main(void)
     test_block_files_proposal();
     test_e2e_propose_approve_apply();
     test_reused_approval_rejected();
+    test_outcome_disposition_confirmed();
+    test_outcome_disposition_unknown_is_not_false();
+    test_outcome_disposition_driver_error_is_unknown();
+    test_outcome_disposition_not_dispatched();
     test_expired_approval_rejected();
     test_hash_mismatch_rejected();
     test_device_mismatch_rejected();

@@ -1502,6 +1502,28 @@ check-deploy-unit-source:
 	    { echo "FAIL: check-wazuh-dropins.sh selftest failed — the guard is broken"; exit 1; }
 	@scripts/check-wazuh-dropins.sh deploy
 
+# Execution disposition vocabulary: include/virp_disposition.h is the one
+# definition; report/virp_disposition.py is generated from it. The check
+# runs in all-tests so the C writer and the Python reader can never drift
+# on a state name without the build saying so.
+.PHONY: gen-disposition
+gen-disposition:
+	python3 scripts/gen_disposition.py > report/virp_disposition.py
+
+.PHONY: check-disposition
+check-disposition:
+	@echo "=== checking report/virp_disposition.py matches include/virp_disposition.h ==="
+	@python3 scripts/gen_disposition.py | diff -u report/virp_disposition.py - \
+	    || { echo "FAIL: report/virp_disposition.py is stale — run: make gen-disposition"; exit 1; }
+	@echo "  PASS: disposition vocabulary in sync"
+
+# Disposition grading in the report layer: legacy vs new records, the
+# four states, commitment-only outcomes. Pure python, no deps.
+.PHONY: test-disposition-report
+test-disposition-report:
+	@echo "=== execution disposition grading (report layer) ==="
+	python3 tests/test_disposition_report.py
+
 # Lint: fail build if sprintf( appears in src/ (use snprintf instead)
 .PHONY: lint-sprintf
 lint-sprintf:
@@ -1725,7 +1747,7 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-disposition test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-disposition-report test-fed-outcome-observation test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

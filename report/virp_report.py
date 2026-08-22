@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import chain_read  # noqa: E402
 import verify  # noqa: E402
+import virp_disposition as disp  # noqa: E402
 
 from reportlab.lib import colors  # noqa: E402
 from reportlab.lib.enums import TA_LEFT  # noqa: E402
@@ -236,6 +237,18 @@ def artifact_json(v):
         return None
 
 
+def disposition_label(v):
+    """Human label for an entry's execution disposition: the grade, plus
+    '(legacy)' for a pre-vocabulary record and the reason for an
+    UNVERIFIABLE one. Legacy records are never relabelled as EXECUTED_*."""
+    g = getattr(v, "disposition", verify.NOT_APPLICABLE)
+    if getattr(v, "disposition_legacy", False):
+        return "%s (legacy record)" % g
+    if g == verify.UNVERIFIABLE and v.disposition_detail:
+        return "%s (%s)" % (g, v.disposition_detail)
+    return g
+
+
 def entry_device(v):
     """Best available device name for an entry.
 
@@ -346,6 +359,17 @@ def build_lifecycles(verifications):
             flags.append(("ORPHAN",
                           "approval and/or outcome present with no proposal "
                           "entry in the selected range"))
+        for o in c["outcomes"]:
+            if o.disposition == disp.NAME_EXECUTED_UNKNOWN:
+                flags.append(("OUTCOME UNKNOWN",
+                              "the apply was dispatched, or may have been, "
+                              "and the device's result was not confirmed. "
+                              "Neither a pass nor a failure: reconcile "
+                              "against the target out-of-band"))
+            elif o.disposition == verify.UNVERIFIABLE:
+                flags.append(("OUTCOME UNVERIFIABLE",
+                              o.disposition_detail or
+                              "the outcome body was not retained"))
         c["flags"] = flags
         out.append(c)
 
@@ -511,6 +535,8 @@ def section_integrity(story, ss, summary, verifications):
     story.append(t)
     story.append(Spacer(1, 8))
 
+    section_dispositions(story, ss, summary)
+
     failed = summary["failed_entries"]
     broken = summary["first_broken_link"]
 
@@ -650,6 +676,51 @@ def section_integrity(story, ss, summary, verifications):
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ]))
         story.append(t)
+
+
+def section_dispositions(story, ss, summary):
+    """Execution dispositions of outcome and gate_execution entries, one
+    column per state. EXECUTED_UNKNOWN is never counted as pass or fail;
+    its presence is flagged here so it cannot hide inside a total."""
+    tally = summary.get("dispositions") or {}
+    total = sum(tally.values())
+    if not total:
+        return
+    story.append(Paragraph("<b>Execution dispositions</b> — %d outcome / "
+                           "gate_execution entries" % total, ss["Note"]))
+    head = [Paragraph("<b>%s</b>" % g, ss["MonoSmall"])
+            for g in verify.DISPOSITION_GRADES]
+    vals = [Paragraph(str(tally.get(g, 0)), ss["MonoSmall"])
+            for g in verify.DISPOSITION_GRADES]
+    t = Table([head, vals], hAlign="LEFT")
+    style = [("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#c8c8c8")),
+             ("BACKGROUND", (0, 0), (-1, 0), HEAD_BG)]
+    col = verify.DISPOSITION_GRADES.index(disp.NAME_EXECUTED_UNKNOWN)
+    if tally.get(disp.NAME_EXECUTED_UNKNOWN):
+        style.append(("BACKGROUND", (col, 1), (col, 1), UNVERIFIABLE_BG))
+    t.setStyle(TableStyle(style))
+    story.append(t)
+    unknown = tally.get(disp.NAME_EXECUTED_UNKNOWN, 0)
+    if unknown:
+        story.append(Paragraph(
+            '<font color="%s"><b>%d execution%s with disposition '
+            "EXECUTED_UNKNOWN.</b> The command was dispatched, or may have "
+            "been, and the device's result was not confirmed. These are "
+            "counted as neither success nor failure anywhere in this "
+            "report; each needs out-of-band reconciliation against the "
+            "target.</font>"
+            % (vhex(verify.UNVERIFIABLE), unknown,
+               "" if unknown == 1 else "s"), ss["Note"]))
+    legacy = summary.get("legacy_dispositions", 0)
+    if legacy:
+        story.append(Paragraph(
+            "%d record%s predate the disposition vocabulary and carry only "
+            "a success boolean. They are shown as LEGACY_CONFIRMED / "
+            "LEGACY_FAILED and are not mapped onto the four states: a "
+            "legacy failure could have been a device failure, an unknown "
+            "outcome or a non-dispatch." % (legacy, "" if legacy == 1 else "s"),
+            ss["Note"]))
+    story.append(Spacer(1, 8))
 
 
 def section_sessions(story, ss, verifications):
@@ -794,12 +865,16 @@ def section_lifecycles(story, ss, lifecycles):
                    a.entry["chain_entry_hash"][:16]), a))
         for o in c["outcomes"]:
             b = artifact_json(o) or {}
-            ok = b.get("success")
+            # Rendered BY DISPOSITION (include/virp_disposition.h), never
+            # by the derived boolean: a legacy body shows as LEGACY_*, a
+            # body-less outcome as UNVERIFIABLE, and EXECUTED_UNKNOWN is
+            # printed as exactly that — the chain does not know.
+            label = disposition_label(o)
             rows.append((
                 "APPLY/OUTCOME", ns_to_utc(o.entry["timestamp_ns"]),
-                "result: <b>%s</b><br/>proposal_entry_hash: %s<br/>"
+                "disposition: <b>%s</b><br/>proposal_entry_hash: %s<br/>"
                 "approval_entry_hash: %s<br/>entry: %s"
-                % ("SUCCESS" if ok else "FAILURE",
+                % (label,
                    trunc(b.get("proposal_entry_hash", "-"), 40),
                    trunc(b.get("approval_entry_hash", "-"), 40),
                    o.entry["chain_entry_hash"][:16]), o))
@@ -1279,6 +1354,13 @@ def main(argv=None):
         print("  v2 session obs  : %d (at-rest unverifiable by design; "
               "journal corroboration: %s)"
               % (summary["obs_v2"], _fmt(jt)))
+    dt = summary.get("dispositions") or {}
+    if sum(dt.values()):
+        print("  dispositions    : %s" % _fmt(dt))
+    unknown = len(summary.get("unknown_dispositions", ()))
+    if unknown:
+        print("  UNKNOWN DISPOSITIONS: %d (neither pass nor fail; reconcile "
+              "against the target)" % unknown)
     if failed:
         print("  FAILED ENTRIES  : %d" % failed)
     # Exit 1 on any verification failure so a caller can gate on it. The PDF
