@@ -949,6 +949,201 @@ static void test_prox_self_protection(void)
 }
 
 /*
+ * LXC / pct boundary pins (2026-08-22).
+ *
+ * Background: a governed audit of pve-lab ran `qm list` twice and never
+ * issued `pct list`, so six LXC containers were invisible to the sweep.
+ * The table was NOT the cause — `pct list`, `pct status <vmid>` and
+ * `pct config <vmid>` have been GREEN since 46ea70b on the same rows as
+ * their qm twins (the `is_qm || is_pct` conditions in
+ * linux_prox_classify), and the deployed binary was verified to allow
+ * `pct list` live. The model did not know to ask.
+ *
+ * What this function adds is the PINS the qm side already has and the
+ * pct side only had by symmetry of the code: every pct verb the table
+ * does not name stays RED by absence, the verbs that cross a boundary
+ * keep their tier, and self-protection wins over the GREEN reads for
+ * every pct spelling — exactly as `qm status 313` is BLACK. No classifier
+ * row changes; if one of these ever flips, it is a policy change and
+ * this is where it should be argued.
+ */
+static void test_prox_lxc_boundary(void)
+{
+    printf("\n=== Proxmox LXC (pct) — GREEN reads and the boundary around them ===\n");
+    prox_setup();
+
+    /* ---- The GREEN set, stated plainly: three exact shapes. ---- */
+    TEST("pct list / pct status <vmid> / pct config <vmid> -> GREEN, no reason");
+    assert(linux_gate_tier("pct list") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pct status 200") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pct config 200") == VIRP_TIER_GREEN);
+    assert(linux_gate_reason("pct list") == NULL);
+    assert(linux_gate_reason("pct status 200") == NULL);
+    assert(linux_gate_reason("pct config 200") == NULL);
+    PASS();
+
+    /* Exact entries, not prefixes — the same rule that kept a `show `
+     * catch-all out of the FortiGate table. A trailing argument the row
+     * has not reasoned about drops to RED by absence. */
+    TEST("pct GREEN rows are exact shapes — trailing args -> RED by absence");
+    assert_red_blocked("pct list --full");
+    assert_red_blocked("pct list 200");
+    assert_red_blocked("pct status 200 --verbose");
+    assert_red_blocked("pct config 200 --current 1");
+    assert_red_blocked("pct config 200 --snapshot pre-change");
+    PASS();
+
+    /* ---- Self-protection beats every pct GREEN row. `pct list` takes
+     * no target and is the one pct form that cannot name 313. ---- */
+    TEST("pct status 313 / pct config 313 -> BLACK despite the GREEN verb");
+    assert_black_blocked("pct status 313");
+    assert_black_blocked("pct config 313");
+    {
+        const char *why = linux_gate_reason("pct config 313");
+        assert(why != NULL && strstr(why, "protected VMID") != NULL);
+        assert(strstr(why, "not approvable") != NULL);
+    }
+    PASS();
+
+    TEST("pct <any verb> 313 -> BLACK, including verbs the table never names");
+    assert_black_blocked("pct fstrim 313");         /* RED by absence elsewhere */
+    assert_black_blocked("pct start 313");
+    assert_black_blocked("pct stop 313");
+    assert_black_blocked("pct reboot 313");
+    assert_black_blocked("pct shutdown 313");
+    assert_black_blocked("pct set 313 --memory 512");
+    assert_black_blocked("pct destroy 313");
+    assert_black_blocked("pct push 313 /etc/hosts /etc/hosts");
+    assert_black_blocked("pct pull 313 /etc/shadow /tmp/shadow");
+    assert_black_blocked("pct snapshot 313 pre-change");
+    assert_black_blocked("pct mount 313");
+    PASS();
+
+    /* Self-protection runs in front of the exec-by-proxy refusal: on the
+     * protected guest the answer is the stronger tier and the reason
+     * names the VMID, as it does for `qm guest exec 313`. */
+    TEST("pct exec 313 / pct enter 313 -> BLACK, not RED");
+    assert_black_blocked("pct exec 313 poweroff");
+    assert_black_blocked("pct enter 313");
+    {
+        const char *why = linux_gate_reason("pct enter 313");
+        assert(why != NULL && strstr(why, "protected VMID") != NULL);
+    }
+    PASS();
+
+    /* Every numeric argument after a pct verb is scanned, not just
+     * argv[2] — the qm over-reach, restated for containers. */
+    TEST("313 in a non-leading pct argument -> BLACK (over-reach, intended)");
+    assert_black_blocked("pct clone 200 313");
+    assert_black_blocked("pct set 200 --memory 313");
+    assert_black_blocked("pct set 200 --cores 2 --memory 313");
+    PASS();
+
+    /* Same rule as `qm stop "313"` in test_black_survives_quoting: a
+     * quoted token at the STRUCTURAL VMID position does not parse as a
+     * VMID, so it is refused as malformed (RED) before protection ever
+     * judges it. Quoted 313 anywhere else is still found by the scan. */
+    TEST("quoted 313 at the pct VMID position -> RED (refused before protection)");
+    assert_red_blocked("pct status \"313\"");
+    assert_red_blocked("pct config \"313\"");
+    assert_black_blocked("pct clone 200 \"313\"");
+    assert_black_blocked("pct set 200 --memory \"313\"");
+    PASS();
+
+    /* The container spellings of the protected guest outside pct itself:
+     * the /lxc/ API segment and the ct:<id> HA sid, read AND write. */
+    TEST("container API and sid spellings of 313 -> BLACK");
+    assert_black_blocked("pvesh get /nodes/pve-lab/lxc/313/status/current");
+    assert_black_blocked("pvesh get /nodes/pve-lab/lxc/313/config");
+    assert_black_blocked("pvesh create /nodes/pve-lab/lxc/313/status/stop");
+    assert_black_blocked("pvesh set /nodes/pve-lab/lxc/313/config --memory 512");
+    assert_black_blocked("pvesh get /cluster/ha/resources/ct:313");
+    assert_black_blocked("pvesh set /cluster/ha/resources/ct:313 --state stopped");
+    assert_black_blocked("pvesh create /cluster/ha/resources --sid ct:313");
+    assert_black_blocked("pvesh set /pools/testpool --vms 200,313");
+    assert_black_blocked("vzdump --vmid 200,313");
+    PASS();
+
+    /* ---- The hard boundary on an UNPROTECTED container. Nothing here
+     * is GREEN; the interesting part is WHICH non-GREEN tier. ---- */
+    TEST("pct enter / pct exec -> RED with the bypass reason (approvable)");
+    assert_red_blocked("pct enter 200");
+    assert_red_blocked("pct exec 200 ls");
+    assert_red_blocked("pct exec 200 -- rm -rf /");
+    {
+        const char *why = linux_gate_reason("pct enter 200");
+        assert(why != NULL && strstr(why, "bypass") != NULL);
+    }
+    PASS();
+
+    TEST("pct start|stop|reboot|shutdown|set <vmid> -> YELLOW, never GREEN");
+    assert(linux_gate_tier("pct start 200")    == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pct stop 200")     == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pct reboot 200")   == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pct shutdown 200") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pct set 200 --memory 512") == VIRP_TIER_YELLOW);
+    assert(linux_gate_tier("pct set 200 --onboot 1")   == VIRP_TIER_YELLOW);
+    PASS();
+
+    /* fstrim mutates the container filesystem (discards), push/pull move
+     * files across the host/guest boundary in either direction, console
+     * and mount open the guest to the host. None is named in the table,
+     * so all are RED by absence — approvable, never silent. */
+    TEST("pct fstrim / push / pull / console / mount / unmount -> RED by absence");
+    assert_red_blocked("pct fstrim 200");
+    assert_red_blocked("pct push 200 /etc/hosts /etc/hosts");
+    assert_red_blocked("pct pull 200 /etc/shadow /tmp/shadow");
+    assert_red_blocked("pct console 200");
+    assert_red_blocked("pct mount 200");
+    assert_red_blocked("pct unmount 200");
+    PASS();
+
+    /* Read-only in spirit but not in the table: `pct df` and `pct cpusets`
+     * read state, and they are STILL RED by absence, because the table
+     * admits entries, not intentions. Widening is a row, not a guess. */
+    TEST("unlisted pct reads (df, cpusets, listsnapshot) -> RED by absence");
+    assert_red_blocked("pct df 200");
+    assert_red_blocked("pct cpusets");
+    assert_red_blocked("pct listsnapshot 200");
+    PASS();
+
+    TEST("pct rollback / restore / template / resize / delsnapshot -> RED by absence");
+    assert_red_blocked("pct rollback 200 pre-change");
+    assert_red_blocked("pct restore 200 local:backup/vzdump-lxc-200.tar.zst");
+    assert_red_blocked("pct template 200");
+    assert_red_blocked("pct resize 200 rootfs +2G");
+    assert_red_blocked("pct delsnapshot 200 pre-change");
+    PASS();
+
+    TEST("pct destroy <vmid> -> BLACK (unprotected too)");
+    assert_black_blocked("pct destroy 200");
+    PASS();
+
+    /* The raw metacharacter scan and charset run in front of the GREEN
+     * rows, so `pct list` is GREEN only as a clean single command. */
+    TEST("pct GREEN reads are GREEN only as clean single commands");
+    assert_red_blocked("pct list; pct destroy 200");
+    assert_red_blocked("pct list | sh");
+    assert_red_blocked("pct config 200 > /etc/cron.d/pwn");
+    assert_red_blocked("pct status $(id -u)");
+    assert_red_blocked("pct list\npct enter 200");
+    PASS();
+
+    TEST("bare pct / pct with an unparseable VMID -> RED, never judged by verb");
+    assert_red_blocked("pct");
+    assert_red_blocked("pct status");
+    assert_red_blocked("pct status notanumber");
+    assert_red_blocked("pct config 2O0");            /* letter O */
+    PASS();
+
+    TEST("unprotected containers are unaffected (control)");
+    assert(linux_gate_tier("pct status 200") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pct status 3130") == VIRP_TIER_GREEN);
+    assert(linux_gate_tier("pvesh get /nodes/pve-lab/lxc/200/config") == VIRP_TIER_GREEN);
+    PASS();
+}
+
+/*
  * A VMID position that is EXPECTED but does not parse is RED — it never
  * falls through to "well, the verb is YELLOW". Without this, an argument
  * the classifier could not read would be judged by the only part of the
@@ -1109,6 +1304,11 @@ static void test_black_is_the_never_class(void)
         "qm status 313",
         "qm destroy 313",
         "qm set 100 --memory 313",
+        "pct status 313",
+        "pct config 313",
+        "pct fstrim 313",
+        "pct exec 313 poweroff",
+        "pvesh get /nodes/pve-lab/lxc/313/config",
         "pvesh get /nodes/pve-lab/qemu/313/config",
         "vzdump 313",
         /* host halt */
@@ -1636,6 +1836,7 @@ int main(void)
     test_prox_yellow();
     test_prox_red();
     test_prox_self_protection();
+    test_prox_lxc_boundary();
     test_prox_unparseable_vmid();
     test_prox_unconfigured_is_closed();
     test_prox_does_not_broaden_frr();
