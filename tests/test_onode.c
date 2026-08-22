@@ -6156,6 +6156,562 @@ TEST(test_uid_action_map_foreign_uid_keeps_shutdown)
  * Main
  * ========================================================================= */
 
+/* =========================================================================
+ * v3 (Ed25519-signed) observations THROUGH THE REAL PATH
+ *
+ * The standing failure pattern this suite refuses to repeat: a guard
+ * exercised only by a test that props it up by hand. The GATE 3 tests
+ * above set ca_state.obskey_loaded = true themselves; they prove the
+ * verifier arm, not the feature. Everything below goes the way a
+ * deployment does:
+ *
+ *   1. the keypair is written to FILES (the same virp_obskey_save the
+ *      `virp-tool keygen obskey` command uses) and this process FORGETS
+ *      it — the daemon must load it through onode_set_obskey(), i.e.
+ *      through virp_obskey_load's custody gate (mode, owner, size);
+ *   2. a second in-process daemon (own state, own socket, own chain)
+ *      is started with that key, exactly as -O does in the mains;
+ *   3. a client does the JSON SESSION_HELLO/BIND, then EXECUTE with
+ *      obs_version 3, over the socket;
+ *   4. the returned bytes are verified with ONLY the 32 public bytes
+ *      read back from obs.pub — no session key, no secret of any kind
+ *      is handed to the verifier;
+ *   5. the same bytes are submitted to chain_append on that daemon so
+ *      GATE 3's v3 arm is exercised on a body the daemon itself minted.
+ *
+ * The first daemon (g_state) never gets a key; it proves the fallback:
+ * every v1/v2 test in this file still runs against it unchanged, and a
+ * v3 request to it is a typed refusal, never a downgraded body.
+ * ========================================================================= */
+
+#include <errno.h>
+#include <sys/stat.h>
+#include <openssl/hmac.h>
+
+#define V3_SOCKET     "/tmp/virp-onode-test-v3.sock"
+#define V3_KEYDIR     "/tmp/virp-onode-test-v3keys"
+#define V3_SK_PATH    V3_KEYDIR "/obs.key"
+#define V3_PK_PATH    V3_KEYDIR "/obs.pub"
+#define V3_LAX_PATH   V3_KEYDIR "/obs-lax.key"
+#define V3_CHAIN_DB   "/tmp/virp-onode-test-v3-chain.db"
+#define V3_CHAIN_KEY  "/tmp/virp-onode-test-v3-chain.key"
+#define V3_DEVICE     "R33"
+
+static onode_state_t v3_state;
+static pthread_t     v3_thread_id;
+/* The verifier's ONLY material: read back from obs.pub, never copied
+ * out of any in-memory keypair. */
+static uint8_t       v3_pub[VIRP_OBSKEY_PK_SIZE];
+/* The daemon-minted v3 body the positive test produced, kept for the
+ * tamper battery so it attacks real bytes, not a hand-rolled stand-in. */
+static uint8_t       v3_good[VIRP_MAX_MESSAGE_SIZE];
+static size_t        v3_good_len;
+
+static void *v3_thread(void *arg)
+{
+    (void)arg;
+    onode_start(&v3_state);
+    return NULL;
+}
+
+static void v3_cleanup_files(void)
+{
+    unlink(V3_SK_PATH);
+    unlink(V3_PK_PATH);
+    unlink(V3_LAX_PATH);
+    rmdir(V3_KEYDIR);
+    unlink(V3_CHAIN_DB);
+    unlink(V3_CHAIN_DB "-wal");
+    unlink(V3_CHAIN_DB "-shm");
+    unlink(V3_CHAIN_KEY);
+    unlink(V3_SOCKET);
+}
+
+static int v3_start(void)
+{
+    v3_cleanup_files();
+    if (mkdir(V3_KEYDIR, 0700) != 0 && errno != EEXIST) return -1;
+
+    /* 1 — keypair to files, then forgotten. */
+    {
+        virp_obskey_t kp;
+        if (virp_obskey_generate(&kp) != VIRP_OK) return -1;
+        if (virp_obskey_save(&kp, V3_SK_PATH, V3_PK_PATH) != VIRP_OK) {
+            virp_obskey_destroy(&kp);
+            return -1;
+        }
+        virp_obskey_destroy(&kp);
+    }
+    {
+        FILE *f = fopen(V3_PK_PATH, "rb");
+        if (!f) return -1;
+        size_t n = fread(v3_pub, 1, sizeof(v3_pub), f);
+        fclose(f);
+        if (n != sizeof(v3_pub)) return -1;
+    }
+
+    virp_signing_key_t ck;
+    if (virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN) != VIRP_OK) return -1;
+    if (virp_key_save_file(&ck, V3_CHAIN_KEY) != VIRP_OK) return -1;
+    virp_key_destroy(&ck);
+
+    /* 2 — the daemon, configured the way -O configures it. */
+    if (onode_init(&v3_state, 0x00000033, NULL, V3_SOCKET) != VIRP_OK)
+        return -1;
+    v3_state.ctx = virp_context_new();
+    if (!v3_state.ctx) return -1;
+    if (onode_set_obskey(&v3_state, V3_SK_PATH) != VIRP_OK) return -1;
+    if (onode_setup_chain_and_approvals(&v3_state, 0x00000033,
+                                        V3_CHAIN_DB, V3_CHAIN_KEY,
+                                        "/tmp/virp-onode-test-v3-approvals",
+                                        "/tmp/virp-onode-test-no-registry")
+            != VIRP_OK)
+        return -1;
+    if (!v3_state.chain_enabled) return -1;
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "%s", V3_DEVICE);
+    snprintf(dev.host, sizeof(dev.host), "10.0.0.33");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x33333333;
+    dev.enabled = true;
+    if (onode_add_device(&v3_state, &dev) != VIRP_OK) return -1;
+
+    if (pthread_create(&v3_thread_id, NULL, v3_thread, NULL) != 0) return -1;
+    usleep(200000);
+    return 0;
+}
+
+static void v3_stop(void)
+{
+    onode_shutdown(&v3_state);
+    pthread_join(v3_thread_id, NULL);
+    onode_destroy(&v3_state);
+    virp_context_destroy(v3_state.ctx);
+    v3_state.ctx = NULL;
+    v3_cleanup_files();
+}
+
+/* client_request(), parameterized on the socket path. */
+static ssize_t sock_request(const char *sock_path, const char *json,
+                            uint8_t *resp, size_t resp_cap)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    size_t json_len = strlen(json);
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+    send(fd, &frame_len, 4, 0);
+    uint8_t version = VIRP_FRAME_VERSION;
+    send(fd, &version, 1, 0);
+    send(fd, json, json_len, 0);
+    usleep(50000);
+
+    uint32_t net_rlen;
+    if (recv(fd, &net_rlen, 4, 0) != 4) { close(fd); return -1; }
+    uint32_t rlen = ntohl(net_rlen);
+    if (rlen > resp_cap) { close(fd); return -1; }
+    size_t got = 0;
+    while (got < rlen) {
+        ssize_t n = recv(fd, resp + got, rlen - got, 0);
+        if (n <= 0) { close(fd); return (ssize_t)got; }
+        got += (size_t)n;
+    }
+    close(fd);
+    return (ssize_t)rlen;
+}
+
+/* client_batch_request(), parameterized on the socket path. */
+static int sock_batch_request(const char *sock_path, const char *json,
+                              uint8_t resp[][VIRP_MAX_MESSAGE_SIZE],
+                              size_t resp_len[], int max_results)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    size_t json_len = strlen(json);
+    uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+    send(fd, &frame_len, 4, 0);
+    uint8_t version = VIRP_FRAME_VERSION;
+    send(fd, &version, 1, 0);
+    send(fd, json, json_len, 0);
+    usleep(200000);
+
+    uint32_t net_outer;
+    if (recv_all(fd, &net_outer, 4) < 0) { close(fd); return -1; }
+    uint32_t outer_len = ntohl(net_outer);
+    uint8_t *batch = malloc(outer_len);
+    if (!batch) { close(fd); return -1; }
+    if (recv_all(fd, batch, outer_len) < 0) { free(batch); close(fd); return -1; }
+    if (outer_len < 4) { free(batch); close(fd); return -1; }
+    uint32_t net_count;
+    memcpy(&net_count, batch, 4);
+    int count = (int)ntohl(net_count);
+    if (count > max_results) count = max_results;
+    size_t off = 4;
+    for (int i = 0; i < count; i++) {
+        if (off + 4 > outer_len) { free(batch); close(fd); return i; }
+        uint32_t net_len;
+        memcpy(&net_len, batch + off, 4); off += 4;
+        uint32_t msg_len = ntohl(net_len);
+        if (msg_len > VIRP_MAX_MESSAGE_SIZE || off + msg_len > outer_len) {
+            free(batch); close(fd); return i;
+        }
+        memcpy(resp[i], batch + off, msg_len); off += msg_len;
+        resp_len[i] = msg_len;
+    }
+    free(batch);
+    close(fd);
+    return count;
+}
+
+static int32_t framed_error_code(const uint8_t *resp, ssize_t n)
+{
+    if (n != 4) return 0;   /* not an error frame */
+    uint32_t code_n;
+    memcpy(&code_n, resp, 4);
+    return (int32_t)ntohl(code_n);
+}
+
+/* JSON SESSION_HELLO → SESSION_BIND on `sock_path`. 0 on ACTIVE. */
+static int sock_handshake(const char *sock_path, const char *client_id,
+                          const char *nonce_hex)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"action\": \"session_hello\", \"client_id\": \"%s\", "
+             "\"client_nonce\": \"%s\"}", client_id, nonce_hex);
+    ssize_t n = sock_request(sock_path, req, resp, sizeof(resp) - 1);
+    if (n <= 0) return -1;
+    resp[n] = '\0';
+    char sid[64], cn[32], sn[32];
+    if (!json_find_str((const char *)resp, "session_id", sid, sizeof(sid)) ||
+        !json_find_str((const char *)resp, "client_nonce", cn, sizeof(cn)) ||
+        !json_find_str((const char *)resp, "server_nonce", sn, sizeof(sn)))
+        return -1;
+    snprintf(req, sizeof(req),
+             "{\"action\": \"session_bind\", \"client_id\": \"%s\", "
+             "\"session_id\": \"%s\", \"client_nonce\": \"%s\", "
+             "\"server_nonce\": \"%s\"}", client_id, sid, cn, sn);
+    n = sock_request(sock_path, req, resp, sizeof(resp) - 1);
+    if (n <= 0) return -1;
+    resp[n] = '\0';
+    return strstr((const char *)resp, "\"bound\"") ? 0 : -1;
+}
+
+/* chain_append of a binary body to the v3 daemon; >4 bytes = accepted. */
+static ssize_t v3_append_body(const char *aid, const uint8_t *body,
+                              size_t body_len)
+{
+    static char b64[16384];
+    static char json[20000];
+    char h[65];
+    ca_sha256_hex_bin(body, body_len, h);
+    ca_b64_body(body, body_len, b64, sizeof(b64));
+    snprintf(json, sizeof(json),
+             "{\"action\":\"chain_append\",\"session_id\":\"v3:real\","
+             "\"artifact_type\":\"observation\",\"artifact_id\":\"%s\","
+             "\"artifact_hash\":\"%s\",\"artifact_content\":\"%s\"}",
+             aid, h, b64);
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    return sock_request(V3_SOCKET, json, resp, sizeof(resp));
+}
+
+static int v3_count_entries(const char *artifact_id)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open(V3_CHAIN_DB, &db) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*) FROM chain_entries WHERE artifact_id = ?",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, artifact_id, -1, SQLITE_STATIC);
+        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return n;
+}
+
+/* The key the daemon holds came through the file loader, and the loader
+ * is the same gate for everyone: a group-readable copy and a missing
+ * file are both refused, and a second load is refused. */
+TEST(test_v3_daemon_loaded_key_from_file_through_custody_gate)
+{
+    ASSERT_TRUE(v3_state.obskey_loaded);
+    ASSERT_EQ(memcmp(v3_state.obskey.public_key, v3_pub,
+                     VIRP_OBSKEY_PK_SIZE), 0);
+
+    /* Same bytes, lax mode → refused by the same loader. */
+    {
+        FILE *in = fopen(V3_SK_PATH, "rb");
+        ASSERT_TRUE(in != NULL);
+        uint8_t sk[VIRP_OBSKEY_SK_SIZE];
+        size_t n = fread(sk, 1, sizeof(sk), in);
+        fclose(in);
+        ASSERT_EQ((int)n, VIRP_OBSKEY_SK_SIZE);
+        unlink(V3_LAX_PATH);
+        int fd = open(V3_LAX_PATH, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        ASSERT_TRUE(fd >= 0);
+        ASSERT_EQ((int)write(fd, sk, sizeof(sk)), VIRP_OBSKEY_SK_SIZE);
+        close(fd);
+        memset(sk, 0, sizeof(sk));
+    }
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0033, NULL,
+                         "/tmp/virp-onode-test-v3lax.sock"));
+    ASSERT_EQ(onode_set_obskey(&tmp, V3_LAX_PATH), VIRP_ERR_KEY_NOT_LOADED);
+    ASSERT_TRUE(!tmp.obskey_loaded);
+    ASSERT_EQ(onode_set_obskey(&tmp, V3_KEYDIR "/absent.key"),
+              VIRP_ERR_KEY_NOT_LOADED);
+    ASSERT_TRUE(!tmp.obskey_loaded);
+    onode_destroy(&tmp);
+    unlink(V3_LAX_PATH);
+
+    /* One key per node: a second load on the live daemon is refused and
+     * leaves the loaded key untouched. */
+    ASSERT_EQ(onode_set_obskey(&v3_state, V3_SK_PATH), VIRP_ERR_KEY_NOT_LOADED);
+    ASSERT_TRUE(v3_state.obskey_loaded);
+    ASSERT_EQ(memcmp(v3_state.obskey.public_key, v3_pub,
+                     VIRP_OBSKEY_PK_SIZE), 0);
+}
+
+/* v3 is the v2 format plus a signature: no ACTIVE session, no v3 — a
+ * typed SESSION_INVALID, never a v1 body. */
+TEST(test_execute_v3_without_session_is_refused_not_downgraded)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = sock_request(V3_SOCKET,
+        "{\"action\": \"execute\", \"device\": \"" V3_DEVICE "\", "
+        "\"command\": \"show ip route\", \"obs_version\": 3}",
+        resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(framed_error_code(resp, n), (int32_t)VIRP_ERR_SESSION_INVALID);
+}
+
+/* THE feature: handshake, execute obs_version 3, verify with ONLY the
+ * public key read from obs.pub; the HMAC trailer still carries v2
+ * semantics for a session-key holder; and the daemon's own chain gate
+ * accepts the body it minted. */
+TEST(test_execute_v3_emits_ed25519_observation_public_key_verifies)
+{
+    v3_good_len = 0;
+    ASSERT_EQ(sock_handshake(V3_SOCKET, "test-onode-v3", "3333333333333333"), 0);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = sock_request(V3_SOCKET,
+        "{\"action\": \"execute\", \"device\": \"" V3_DEVICE "\", "
+        "\"command\": \"show ip route\", \"obs_version\": 3}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n >= (ssize_t)VIRP_OBS_V3_MIN_SIZE);
+    ASSERT_EQ(resp[0], VIRP_VERSION_3);
+
+    /* Public-key-only verification. Nothing but v3_pub goes in. */
+    virp_obs_header_v2_t hdr;
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+    ASSERT_OK(virp_verify_observation_ed25519(v3_pub, resp, (size_t)n,
+                                              &hdr, &payload, &payload_len));
+    ASSERT_EQ(hdr.version, VIRP_VERSION_3);
+    ASSERT_EQ(hdr.tier, VIRP_TIER_GREEN);
+    ASSERT_TRUE(hdr.device_id == virp_device_id_from_hostname(V3_DEVICE));
+    ASSERT_TRUE(hdr.node_id == 0x33333333ULL);
+    ASSERT_TRUE(payload != NULL && payload_len > 0);
+    ASSERT_TRUE(memmem(payload, payload_len, "directly connected", 18) != NULL);
+    ASSERT_EQ((int)n, (int)(VIRP_OBS_V2_HEADER_SIZE + payload_len +
+                            VIRP_OBS_V2_SIG_SIZE + VIRP_OBS_ED25519_SIG_SIZE));
+
+    /* A different public key does not verify it. */
+    virp_obskey_t other;
+    ASSERT_OK(virp_obskey_generate(&other));
+    ASSERT_EQ(virp_verify_observation_ed25519(other.public_key, resp,
+                                              (size_t)n, NULL, NULL, NULL),
+              VIRP_ERR_OBS_SIG_INVALID);
+    virp_obskey_destroy(&other);
+
+    /* The HMAC trailer is still HMAC-SHA256(session_key, header||payload)
+     * — v2 semantics, intact, for the session holder. */
+    {
+        uint8_t mac[32];
+        unsigned int mac_len = 32;
+        pthread_mutex_lock(&v3_state.session_mutex);
+        const unsigned char *ok = HMAC(EVP_sha256(),
+                                       v3_state.ctx->session.session_key, 32,
+                                       resp, VIRP_OBS_V2_HEADER_SIZE + payload_len,
+                                       mac, &mac_len);
+        pthread_mutex_unlock(&v3_state.session_mutex);
+        ASSERT_TRUE(ok != NULL);
+        ASSERT_EQ(memcmp(mac, resp + VIRP_OBS_V2_HEADER_SIZE + payload_len,
+                         32), 0);
+    }
+
+    /* The daemon's own GATE 3 v3 arm accepts the body it minted. */
+    ssize_t an = v3_append_body("obs-v3-real-1", resp, (size_t)n);
+    ASSERT_TRUE(an > 4);
+    ASSERT_EQ(v3_count_entries("obs-v3-real-1"), 1);
+
+    memcpy(v3_good, resp, (size_t)n);
+    v3_good_len = (size_t)n;
+}
+
+/* One flipped byte in the header, the payload, and the HMAC trailer
+ * respectively: every one fails public-key verification AND is refused
+ * by chain_append. The HMAC case is the 2026-08-08 span fix — those 32
+ * bytes are inside the signed unit. */
+TEST(test_execute_v3_tamper_header_payload_hmac_all_fail)
+{
+    ASSERT_TRUE(v3_good_len >= VIRP_OBS_V3_MIN_SIZE);
+    size_t hmac_off = v3_good_len - VIRP_OBS_V2_SIG_SIZE -
+                      VIRP_OBS_ED25519_SIG_SIZE;
+    struct { const char *what; size_t off; const char *aid; } cases[3] = {
+        { "header",  16,                      "obs-v3-tamper-hdr" }, /* timestamp_ns */
+        { "payload", VIRP_OBS_V2_HEADER_SIZE, "obs-v3-tamper-pay" },
+        { "hmac",    hmac_off,                "obs-v3-tamper-mac" },
+    };
+    for (int i = 0; i < 3; i++) {
+        uint8_t bad[VIRP_MAX_MESSAGE_SIZE];
+        memcpy(bad, v3_good, v3_good_len);
+        bad[cases[i].off] ^= 0x01;
+        ASSERT_EQ(virp_verify_observation_ed25519(v3_pub, bad, v3_good_len,
+                                                  NULL, NULL, NULL),
+                  VIRP_ERR_OBS_SIG_INVALID);
+        ssize_t an = v3_append_body(cases[i].aid, bad, v3_good_len);
+        ASSERT_EQ((int)an, 4);
+        ASSERT_EQ(v3_count_entries(cases[i].aid), 0);
+    }
+    /* Control: the untampered bytes still verify. */
+    ASSERT_OK(virp_verify_observation_ed25519(v3_pub, v3_good, v3_good_len,
+                                              NULL, NULL, NULL));
+}
+
+/* A loaded obskey changes nothing for clients that did not ask for v3:
+ * a v1 request yields a v1 O-Key body, a v2 request a v2 session body. */
+TEST(test_execute_v1_v2_unchanged_when_obskey_loaded)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = sock_request(V3_SOCKET,
+        "{\"action\": \"execute\", \"device\": \"" V3_DEVICE "\", "
+        "\"command\": \"show ip route\"}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+    ASSERT_EQ(resp[0], VIRP_VERSION);
+    virp_header_t h1;
+    ASSERT_OK(virp_validate_message(resp, (size_t)n, &v3_state.okey, &h1));
+    ASSERT_EQ(h1.type, VIRP_MSG_OBSERVATION);
+
+    n = sock_request(V3_SOCKET,
+        "{\"action\": \"execute\", \"device\": \"" V3_DEVICE "\", "
+        "\"command\": \"show ip route\", \"obs_version\": 2}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n >= (ssize_t)VIRP_OBS_V2_MIN_SIZE);
+    ASSERT_EQ(resp[0], VIRP_VERSION_2);
+    virp_obs_header_v2_t h2;
+    pthread_mutex_lock(&v3_state.session_mutex);
+    virp_error_t err = virp_verify_observation_v2_signature(
+        v3_state.ctx->session.session_key, resp, (size_t)n, &h2);
+    pthread_mutex_unlock(&v3_state.session_mutex);
+    ASSERT_OK(err);
+    ASSERT_EQ((int)n, (int)(VIRP_OBS_V2_HEADER_SIZE + h2.payload_len +
+                            VIRP_OBS_V2_SIG_SIZE));
+}
+
+/* Batch honours obs_version 3 for every item — the fan-out path, not
+ * just the single-execute one. Closes the v3 session afterwards. */
+TEST(test_batch_execute_v3_every_item_is_ed25519_signed)
+{
+    uint8_t resp[4][VIRP_MAX_MESSAGE_SIZE];
+    size_t resp_len[4];
+    int count = sock_batch_request(V3_SOCKET,
+        "{\"action\":\"batch_execute\",\"obs_version\":3,\"commands\":["
+        "{\"device\":\"" V3_DEVICE "\",\"command\":\"show version\"},"
+        "{\"device\":\"" V3_DEVICE "\",\"command\":\"show ip route\"}"
+        "]}",
+        resp, resp_len, 4);
+    ASSERT_EQ(count, 2);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_TRUE(resp_len[i] >= VIRP_OBS_V3_MIN_SIZE);
+        ASSERT_EQ(resp[i][0], VIRP_VERSION_3);
+        virp_obs_header_v2_t hdr;
+        ASSERT_OK(virp_verify_observation_ed25519(v3_pub, resp[i], resp_len[i],
+                                                  &hdr, NULL, NULL));
+        ASSERT_EQ(hdr.version, VIRP_VERSION_3);
+    }
+    uint8_t r[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = sock_request(V3_SOCKET, "{\"action\": \"session_close\"}",
+                             r, sizeof(r));
+    ASSERT_TRUE(n > 0);
+}
+
+/* FALLBACK, on the key-less daemon (g_state): with a perfectly good
+ * session, obs_version 3 is a typed KEY_NOT_LOADED — never a v1 or v2
+ * body the caller did not ask for — while obs_version 2 on the same
+ * session still works, and an unknown version is still a parse error. */
+TEST(test_execute_v3_refused_without_obskey_never_downgrades)
+{
+    ASSERT_TRUE(!g_state.obskey_loaded);
+    ASSERT_EQ(sock_handshake(TEST_SOCKET, "test-onode-nokey", "4444444444444444"), 0);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = client_request(
+        "{\"action\": \"execute\", \"device\": \"R6\", "
+        "\"command\": \"show ip route\", \"obs_version\": 3}",
+        resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(framed_error_code(resp, n), (int32_t)VIRP_ERR_KEY_NOT_LOADED);
+
+    /* Same daemon, same session: the batch path refuses too. */
+    uint8_t bresp[2][VIRP_MAX_MESSAGE_SIZE];
+    size_t blen[2];
+    int count = client_batch_request(
+        "{\"action\":\"batch_execute\",\"obs_version\":3,\"commands\":["
+        "{\"device\":\"R5\",\"command\":\"show version\"},"
+        "{\"device\":\"R6\",\"command\":\"show ip route\"}"
+        "]}",
+        bresp, blen, 2);
+    ASSERT_EQ(count, 2);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ((int)blen[i], 4);
+        ASSERT_EQ(framed_error_code(bresp[i], (ssize_t)blen[i]),
+                  (int32_t)VIRP_ERR_KEY_NOT_LOADED);
+    }
+
+    n = client_request(
+        "{\"action\": \"execute\", \"device\": \"R6\", "
+        "\"command\": \"show ip route\", \"obs_version\": 2}",
+        resp, sizeof(resp));
+    ASSERT_TRUE(n >= (ssize_t)VIRP_OBS_V2_MIN_SIZE);
+    ASSERT_EQ(resp[0], VIRP_VERSION_2);
+
+    n = client_request(
+        "{\"action\": \"execute\", \"device\": \"R6\", "
+        "\"command\": \"show ip route\", \"obs_version\": 4}",
+        resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_TRUE(framed_error_code(resp, n) != 0);
+
+    n = client_request("{\"action\": \"session_close\"}", resp, sizeof(resp));
+    ASSERT_TRUE(n > 0);
+}
+
+
 int main(void)
 {
     printf("\n");
@@ -6274,6 +6830,7 @@ int main(void)
     printf("\n[O-Node Batch Execution Tests]\n");
     RUN_TEST(test_batch_execute_two_devices);
     RUN_TEST(test_batch_execute_v2_honors_obs_version);
+    RUN_TEST(test_execute_v3_refused_without_obskey_never_downgrades);
     RUN_TEST(test_batch_execute_four_devices);
     RUN_TEST(test_batch_execute_not_found_device);
     RUN_TEST(test_batch_execute_parallel_timing);
@@ -6311,6 +6868,22 @@ int main(void)
     printf("\n[SO_PEERCRED Allowlist Tests]\n");
     RUN_TEST(test_peer_uid_allowed);
     RUN_TEST(test_peer_uid_rejected);
+
+    printf("\n  -- v3 (Ed25519) observations through the real path --\n");
+    if (v3_start() == 0) {
+        RUN_TEST(test_v3_daemon_loaded_key_from_file_through_custody_gate);
+        RUN_TEST(test_execute_v3_without_session_is_refused_not_downgraded);
+        RUN_TEST(test_execute_v3_emits_ed25519_observation_public_key_verifies);
+        RUN_TEST(test_execute_v3_tamper_header_payload_hmac_all_fail);
+        RUN_TEST(test_execute_v1_v2_unchanged_when_obskey_loaded);
+        RUN_TEST(test_batch_execute_v3_every_item_is_ed25519_signed);
+        v3_stop();
+    } else {
+        printf("  v3 daemon harness FAILED to start (key files, chain, or "
+               "socket) — the v3 suite did not run\n");
+        tests_run++;
+        tests_failed++;
+    }
 
     printf("\n  -- Audit 2026-08-06: CHAIN_APPEND artifact forgery --\n");
     if (ca_start() == 0) {

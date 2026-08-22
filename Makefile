@@ -971,6 +971,17 @@ $(TEST_OBS_NEG): tests/test_obs_ed25519_neg.c $(LIB)
 test-obs-ed25519-neg: $(TEST_OBS_NEG)
 	./$(TEST_OBS_NEG)
 
+# v3 through the SHIPPED binaries: a real virp-onode-prod started with
+# -O <key written by the real `virp-tool keygen obskey`>, executes over
+# the real socket, and the result is checked by `virp-tool obs-verify`
+# holding ONLY the public key. Also proves the fallback (no -O → v3
+# refused, v1/v2 unchanged) and that a configured-but-unloadable key
+# is FATAL. Builds its own prerequisites; needs no Python deps beyond
+# the stdlib, so it never skips for a missing module.
+.PHONY: test-obs-v3-e2e
+test-obs-v3-e2e: $(ONODE_PROD) $(TOOL_BIN)
+	python3 tests/test_obs_v3_e2e.py
+
 # Session key derivation tests
 TEST_SESSION_KEY = $(BUILD_DIR)/test_session_key
 
@@ -1725,7 +1736,7 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-obs-v3-e2e test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 
