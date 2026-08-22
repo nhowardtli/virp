@@ -1,259 +1,305 @@
 <p align="center">
   <img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg">
   <img alt="C11" src="https://img.shields.io/badge/C-11-00599C?logo=c&logoColor=white">
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white">
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white">
   <img alt="IETF Draft" src="https://img.shields.io/badge/IETF-draft--howard--virp--06-orange">
   <img alt="Status" src="https://img.shields.io/badge/Status-Research_Prototype-orange">
 </p>
 
-> **VIRP does not let AI speak first. Reality speaks first, inside a bound session.**
+# VIRP: Verified Infrastructure Response Protocol
 
-# VIRP — Verified Infrastructure Response Protocol
+AI agents operating on infrastructure fabricate device state. VIRP puts a
+signing daemon (the O-Node) between the agent and the devices: the agent
+holds no credentials and no keys, every command is classified against
+fail-closed per-vendor allowlists, commands above the configured tier
+require an Ed25519-signed human approval that the daemon can verify but
+cannot mint, and every device response is authenticated at capture.
+Anything the agent then claims about a device that no authenticated
+observation supports can be flagged.
 
-**Authenticated evidence for infrastructure automation.**
-
-When an AI agent tells you your firewall policy is misconfigured, can you prove it actually checked?
-
-When it says a BGP session is established, did it read that from a real device — or fabricate it?
-
-When it claims a config change succeeded, where is the evidence?
-
-**VIRP authenticates operation records under an explicit collector trust model — not with prompts, not with guardrails, with cryptography. It does not establish that a device is honest or that every AI statement is true.**
-
----
-
-## What VIRP Does
-
-VIRP is an open protocol that authenticates every device observation at the point of collection, before the AI ever sees it.
-
-A dedicated process — the **O-Node** — connects to your network devices, captures raw output, and authenticates it with an HMAC-SHA256 tag. The AI agent receives pre-authenticated data. It can reason about what the device returned. It cannot forge it, modify it, or fabricate it — because it never holds the authentication key.
-
-This is not a policy. It is a code path.
-
-> **Scope caveat — body-to-command correspondence.** The signature binds
-> command, device and session to the bytes the O-Node read. It does
-> **not** currently guarantee that those bytes are the device's response
-> to that command on the SSH drivers: stale buffered output, a
-> concurrent watchdog probe, or driver wrapper echoes can enter the body
-> before signing, and one such mismatch was observed live on 2026-07-29
-> (a signed `show system resources` observation carrying
-> `show system info` output). See
-> [`SECURITY.md`](SECURITY.md) §Observation-Body Integrity.
-
-```
-Agent: "FortiGate policy 2 allows all traffic with no AV/IPS."
-
-VIRP:
-  verdict:       VERIFIED
-  HMAC:          da383afe...c18
-  chain_seq:     4882
-  session_id:    f84c1a3e...
-  device_id:     0x00000002  (FW-01)
-  command_hash:  7c2b4d3a...  (show firewall policy 2)
-  timestamp:     2026-03-11T14:30:22.917384Z
-
-  Verify it yourself.
-```
+The claim ceiling, stated once: VIRP produces authenticated, append-only
+operation records under an explicit collector trust model, plus an
+experimental gate that checks agent claims against those records. It
+does not establish that a device told the truth, and it does not defend
+a record against whoever holds the relevant key or controls the
+collector.
 
 ---
 
-## Reproducible Demo
+## What is proven and what is not
 
-Clone, install the build dependencies, run. No hardware, no credentials, no
-network access (Debian/Ubuntu):
+**Implemented and tested.** The record layer. Observations are
+HMAC-SHA256 authenticated inside the O-Node before the caller sees them.
+Chain entries are hash-linked per session, each carries a keyed HMAC,
+and a signed per-session head record makes tail deletion detectable.
+Commands above the tier ceiling are refused with a typed, authenticated
+rejection and a filed proposal; they execute only after an approval
+signed outside the daemon verifies against an enrolled approver key,
+bound to the command hash and device, with a 300 second TTL and
+single-use consumption. All of this runs in `make all-tests` and in the
+in-tree demo (see below). Evidence for each piece is tagged line by line
+in [`SECURITY.md`](SECURITY.md).
 
-```bash
-git clone https://github.com/nhowardtli/virp
-cd virp
-sudo apt install -y build-essential libssl-dev libsodium-dev \
-     libsqlite3-dev libssh2-1-dev libcurl4-openssl-dev libjson-c-dev
-./demo/run.sh
-```
+**Implemented, not wired into the daemon.** Ed25519 observation signing
+(wire version 3). The library builds and verifies v3 observations and
+`virp-tool obs-verify` checks one with only the public key. The chain
+registration path verifies a v3 body when an observation-signing key is
+loaded. But neither shipped daemon binary loads such a key, nothing in
+the execute path emits v3, a producer is never required to use v3, and a
+downgrade to v1/v2 is never refused. Status: **implemented in the
+library, optional, not enforced.** Verified by: `grep obskey
+src/virp_onode_prod.c src/virp_onode_main.c` returns nothing;
+`tests/test_onode.c` sets `obskey_loaded` by hand.
 
-The demo runs the reference collector against a deterministic **simulated
-target** and asserts nine security behaviors end to end: a GREEN operation
-executes and its record verifies; a tampered record fails verification; a
-RED operation is blocked and a proposal is filed; an Ed25519 approval signed
-outside the collector executes the change once; approval reuse, expiry, and
-absence are refused with typed errors; an unknown operation fails closed;
-and every chain session verifies from its own genesis. On an independent
-verifier machine with the dependencies already installed, it ran 9/9 from a
-fresh clone in 15 seconds; a first run that also installs dependencies and
-compiles takes about two minutes. The target is simulated, so the demo
-establishes protocol behavior, not device truth. Containerized alternative
-and details: [`demo/README.md`](demo/README.md).
+**Experimental.** The check of agent claims against the record. Two
+pieces exist:
+
+- `api/virp_verify.py`, in this tree, verifies a structured claim
+  (subject, predicate, value, cited observation) against a corpus of
+  authenticated observations and returns VERIFIED, CONTRADICTED,
+  UNVERIFIABLE, INCOMPLETE or STALE. It reads payload, timestamp and
+  sequence from the verified bytes only. It needs the O-Key, so it is a
+  key-holder tool. Spec: [`docs/VIRP-CLAIMS.md`](docs/VIRP-CLAIMS.md).
+  Tests: `tests/test_virp_verify.py`.
+- The Observation Gate, which scans an agent's free text for device
+  claims with no matching tool call and for numbers or addresses that
+  disagree with cached observation payloads, is **not in this
+  repository**. It lives in the IronClaw consumer
+  (`github.com/nhowardtli/ironclaw`, `virp_observation_gate.py`). In the
+  copy checked on 2026-08-21 it returns a `flagged` result; it does not
+  refuse. The companion data-envelope check in that consumer has a
+  `STRICT_MODE`, the environment flag `DATA_ENVELOPE_STRICT=1`. It is
+  off by default, and with it off a context that carries device data
+  without a collector status is a logged warning, not an error. This
+  layer is pattern matching over text, not cryptography, and it is not
+  enforcement-grade.
+
+**Specified only.** Role separation into observer, executor and policy
+nodes (draft-06 §10); external anchoring of chain heads (§17.4);
+cross-administrative-domain federation (§17.5); an EXECUTION_INTENT
+record for the crash window between device I/O and the OUTCOME append
+(`docs/virp-audit-design-proposals.md`). None of these exist in code.
+
+**Formal analysis.** ProVerif 2.05 proves O-Key secrecy, session-key
+secrecy and injective agreement for the v2 observation path, under a
+stated trace restriction for the replay store. Freshness is not modeled.
+The v1 path and v3 are not modeled. No Tamarin model exists.
+[`proofs/README.md`](proofs/README.md); `make proofs` (not run here:
+ProVerif is not installed on this host).
 
 ---
 
-## Why This Exists
+## Validation
 
-During development of IronClaw, we observed an AI system:
+- Independent validation by a NATO NCIA engineer on production Cisco
+  hardware: 9/9 HMAC-verified observations. The issues found were filed
+  publicly and fixed: legacy KEX negotiation on older IOS (#5, commit
+  `d6a986a`), the ASA driver missing from the dev binary (#6,
+  `e675b8d`), and a segfault on a device at `enable=0` (#7, regression
+  test in `tests/test_onode.c`). Filed 2026-06-02, closed 2026-08-16.
+- IETF: `draft-howard-virp` revisions -00 through -06 submitted as an
+  individual Internet-Draft; -06 is dated 1 August 2026. -06 specifies
+  the v1 and v2 observation formats only. Its Appendix A records the
+  claims walked back from -05, including the removal of per-observation
+  Ed25519. v3 is ahead of the specification and is -07 material
+  ([`docs/DRAFT07-NOTES.md`](docs/DRAFT07-NOTES.md)).
+- Ongoing formal-methods engagement with TU Dresden on the ProVerif
+  model and the replay-counter restriction, and a routing-area review of
+  -03 that prompted a reframing of the draft. Both are acknowledged in
+  draft-06 §21.
 
-- Generating firewall policies with valid UUIDs that did not exist
-- Reporting threats from RFC 5737 documentation addresses
-- Proposing routing changes based on fabricated OSPF adjacency states
+---
 
-Every output was technically plausible. None of it was real.
+## Verify it yourself
 
-Prompt engineering, output validation, and behavioral guardrails did not fix it. The AI fabricated output directly in its response text without invoking the signed execution path.
+What a verifier can check depends on which key they hold.
 
-**VIRP is the structural fix.**
+| Record | Who can verify today | How |
+|---|---|---|
+| v1 observation (the execute-path default) | Holder of the O-Key | `api/virp_verify.py`, `report/verify.py`, `virp-tool inspect` |
+| v2 session observation | Holder of the derived session key | `virp_verify_observation_v2` in `src/virp_crypto.c` |
+| v3 observation | Anyone with the public key | `virp-tool obs-verify <pubkey> <obs_file>`; but see above: nothing emits v3 yet |
+| Chain entry hash and per-session link | Anyone with the database | `report/verify.py` (reports the keyed checks as UNCHECKED, not as passes) |
+| Chain entry HMAC and signed head | Holder of K_chain | `virp chain verify --db PATH --key PATH`; `report/verify.py` with the key |
+| Approval record | Anyone with the approver's public key | `src/virp_approval.c`; approver registry `docs/APPROVAL-FLOW.md` |
+
+So: a third party without the O-Key can check chain linkage and approval
+signatures but cannot verify that an observation body came from the
+O-Node. Under HMAC the verify key is the forge key. v3 Ed25519 is the
+path to public verification of observations, with the status stated
+above. One more limit: a commitment-only chain entry (hash, no body) is
+accepted by design and grades UNVERIFIABLE in the verifier field, but
+`report/virp_report.py` currently rolls that up as PASS. That gap is
+pinned as an expected failure in `tests/test_commitment_only_grading.py`
+so that fixing it forces this text to change.
+
+---
+
+## The demo, described honestly
+
+`./demo/run.sh` is a deny-side demonstration against a simulated target
+(`src/drivers/driver_mock.c`). No device, credential or network is
+involved. It observes nine behaviors: a GREEN operation executes and
+its record verifies; a modified record fails verification; a RED
+operation is refused and a proposal is filed; an approval signed outside
+the collector lets the exact approved operation execute once; reusing
+the approval fails; an unknown operation fails closed; and every chain
+session verifies from its own genesis. Run here on 2026-08-22 from this
+tree: `9/9 security behaviors observed`, exit 0.
+
+It shows what the daemon refuses and what it records. It does not show
+an agent fabricating, because the agent-side flagging lives in the
+consumer gate described above, and it does not show a device telling the
+truth, because no device is present. There is no write-path autonomy
+demo, because the implementation does not have one: every write above
+the ceiling waits for a human signature.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────┐      ┌─────────────────────┐
-│   AI Node (CT 210)  │      │   O-Node (CT 211)   │
-│                     │      │                     │
-│  Agent + LLM        │─────▶│  VIRP C Library     │
-│                     │      │  Device Credentials │
-│  Zero credentials   │      │  Signing Keys       │
-│  Zero signing keys  │◀─────│  Chain Database     │
-└─────────────────────┘      └──────────┬──────────┘
-                                        │ SSH
-                             ┌──────────┼──────────┐
-                         Cisco IOS  FortiGate   PA-850
+ requesting process             O-Node (sole credential holder)          devices
+ (agent, API, CLI)
+ no credentials         Unix socket, SO_PEERCRED uid allowlist
+ no keys        ------> classify -> gate -> execute -> authenticate ----> SSH / HTTPS
+                <------ authenticated observation or typed refusal
+                        chain.db (per-session hash link, K_chain HMAC,
+                        signed head), proposals, approvals
 ```
 
-**The Cage** — three structural walls enforce isolation:
-
-| Wall | Mechanism |
-|---|---|
-| 1 | AI node has no network route to devices |
-| 2 | Device ACLs accept SSH from O-Node IP only |
-| 3 | O-Node socket locked to authorized processes |
-
----
-
-## Seven Trust Primitives
-
-Names and numbering follow §5 of `draft-howard-virp-06`, which is authoritative.
-
-| # | Name | What It Does | Status | Evidence |
-|---|---|---|---|---|
-| P1 | Observation Integrity | Device output HMAC-authenticated at collection | Production | tested (authentication-tag validity); body-to-command correspondence not guaranteed on SSH drivers — one live mismatch observed 2026-07-29, see `SECURITY.md` §Observation-Body Integrity |
-| P2 | Two-Channel Separation | Observation (read) and Intent (write) channels separated, bound to distinct key roles | Implemented | tested — a message authenticated with the other channel's key is refused |
-| P3 | Intent Gating | Command classification enforced below the AI; signed proposals before execution | Production | tested — see gate-scope caveats below |
-| P4 | Outcome Verification | Before/after authenticated comparison | Implemented | tested |
-| P5 | Baseline Memory | Deviation detection from authenticated history | Implemented | untested — no suite covers deviation detection |
-| P6 | Multi-Vendor Normalization | Normalized observation schema across vendor drivers | Implemented | per-driver unit tests; no published cross-vendor live transcript |
-| P7 | Agent Containment | Requesting process treated as an untrusted principal; containment enforced externally | Specified | the three-layer cage above is the enforcement design; not yet fully demonstrated |
-
-Two supporting mechanisms underpin the primitives without being primitives
-themselves: the SQLite tamper-evident **trust chain** (logic tested;
-production-chain integrity unestablished, see below) and per-node Ed25519
-**federation keys** (crypto tested; no multi-tenant deployment exists —
-federation *operation* is aspirational).
-
-**Production** primitives have accumulated operational history across real deployments. **Implemented** primitives are complete, tested, and exercised in integration runs, but have not yet accumulated equivalent production hours.
-
-> **Gate scope.** The tier gate accepts one command per request. Separator
-> characters (newline, `;`, `|`, `&`, backtick, `$(`, `${`) are rejected
-> fleet-wide, so CLI display filters such as `show run | include bgp` do
-> not work, and multi-line/config-mode payloads are unsupported through
-> the single-command path. The `linux` and `wazuh` drivers have no
-> classifier and execute unclassified under the SHADOW overrides they run
-> with in production. See [`SECURITY.md`](SECURITY.md) §Command Gate —
-> Explicit Scope Limits.
-
----
-
-## Operational Status
-
-VIRP has been running continuously on production infrastructure since March 2026.
-
-Each item below is tagged with its evidence status:
-**[tested]** implemented and covered by a checked-in test or machine proof;
-**[untested]** implemented but with no automated coverage;
-**[unreproduced measurement]** a one-time observation, not re-derived by
-any check;
-**[aspirational]** intended, not yet built.
-
-- **66 days of continuous operation** at time of this writing *[unreproduced measurement — uptime is observed, not asserted by any check]*
-- **2,024 cryptographically linked chain artifacts** across 81 sessions *[unreproduced measurement — a count from a one-time export]*
-- **35-router BGP topology**: full verification under 60 seconds *[unreproduced measurement — one-time timing; no benchmark in the suite]*
-- **FortiGate audit**: 15 findings on real hardware, zero false positives *[unreproduced measurement — a one-time manual audit]*
-
-**Chain integrity — verified 2026-07-28, read-only.** A previous version
-of this section claimed "99.9% chain integrity (verified against full
-export)". That figure is removed: it could not be substantiated, and the
-metric is a category error for a hash-linked structure, where each entry
-commits to its predecessor. What follows replaces it.
-
-The `valid:false first_broken:2` result recorded on 2026-04-24 was a
-**verifier bug, not chain corruption**. `virp-bridge.py:chain_verify()`
-walks `ORDER BY id ASC` — globally — and compares each row's
-`previous_entry_hash` to the previous row's hash. The chain is
-*per-session*: `virp_chain_verify()` walks `(session_id, sequence)` and
-every session begins at sequence 0 with
-`SHA256("VIRP_CHAIN_GENESIS:" || session_id)`. With two or more sessions
-present, the global walk necessarily breaks at the second session's
-genesis entry. Reproduced exactly on all three databases below.
-
-Verified per-session, read-only, no daemon restart:
-
-| Database | Entries | Sessions | Result |
-|---|---|---|---|
-| Live `/var/lib/virp/chain.db` | 3,009 | 169 | **162/169 sessions fully hash-linked**; 7 broken |
-| Export `chain.db.export-20260614-2156` | 2,465 | 125 | 118/125 valid; same 7 broken |
-| Snapshot `chain.db.broken-2026-04-24` | 1,265 | 38 | 31/38 valid; same 7 broken |
-
-The 7 failures are **writer-convention mismatches, not tamper evidence**.
-Five sessions carry an all-zero `previous_entry_hash` at sequence 0 — a
-second writer (the Python bridge) using zeros for "no predecessor"
-instead of the derived genesis; one carries a third, foreign genesis
-value; one has non-contiguous sequence allocation. Six of the seven break
-at their *first* entry, which is the signature of a genesis convention,
-not of modification. The same 7 break identically across all three
-databases. Entry-count ratios overstate the spread: one long-running
-bridge session (`dashboard-obs`) accounts for 1,065 of the 1,776 entries
-in broken sessions.
-
-**All three approval sessions verify clean** — `approval:R1` (15 entries,
-the 2026-07-23 live-proof session), `approval:SW-3850` (10),
-`approval:R21` (1). The PROPOSAL → APPROVAL → OUTCOME evidence in
-[`docs/LIVE-PROOF-2026-07-23.md`](docs/LIVE-PROOF-2026-07-23.md) holds
-under correct per-session verification.
-
-**Narrowed 2026-07-29 (static review):** "fully hash-linked" above
-means internal link consistency, not completeness. The per-session C
-verifier (`chain_verify_locked`) reports `valid:true` when its walk
-ends without checking it reached the session's recorded tail — deleting
-the newest K entries of a session still verifies valid, and a zero-row
-session verifies valid. The 2026-07-28 result therefore does not rule
-out deletion of trailing entries. Additionally, the bridge's
-`chain_verify()` checks only the unkeyed `chain_entry_hash` links and
-never verifies the keyed `chain_hmac`, so a keyless attacker with DB
-write access can produce a chain the operator-facing API reports valid.
-See `SECURITY.md` §Verifier Limitations.
-
-**Fixed 2026-08-01, merged to `main` and deployed (running commit
-`b6e9602c`):** the C verifier's tail-truncation and zero-row
-acceptance. Range verification now
-enforces completeness, and a signed per-session head record
-(`chain_heads`, HMAC'd with K_chain, updated transactionally with
-every append) authenticates chain LENGTH — `virp_chain_verify_session`
-/ daemon action `chain_verify_session` detect tail deletion, head
-deletion, and keyless head forgery. See `SECURITY.md` §Verifier
-Limitations for the mechanism and its trust boundary (a K_chain holder
-can still rewrite history; external anchoring remains future work).
-
-**Still open:** the bridge's global-walk verifier (`virp-bridge.py`,
-consumer side, not in this repository) is unfixed, so that
-operator-facing `chain_verify` API still reports `valid:false` on any
-multi-session database and never verifies `chain_hmac`; and the
-two-writer genesis divergence is unresolved. Chain *logic* is covered
-by `tests/test_chain.c` (genesis, sequential linking, tamper
-detection, crash recovery, tail-truncation, zero-row, head-record
-attacks, backfill) and `tests/test_chain_concurrency.c` *[tested]*.
-
-Fabrication is prevented by protocol design, assuming the O-Node is uncompromised *[tested — see `docs/VIRP-CLAIMS.md` Appendix A, C5–C8 and C16]*. See [`SECURITY.md`](SECURITY.md) for the full trust boundary analysis, including known open work on TCP-path mutual authentication.
+- **Sole credential holder.** Device credentials are rendered into the
+  daemon's config at start from a root-only environment file; the
+  daemon runs as an unprivileged service user
+  ([`deploy/virp-onode.service`](deploy/virp-onode.service)). The
+  socket is mode 0660 and every `accept()` checks the peer uid against
+  a startup allowlist. That socket is the trust boundary; a v1 request
+  needs no handshake, so whoever can deliver bytes can submit, and
+  unauthenticated TCP in front of the socket is not a boundary
+  (SECURITY.md §Trust Boundaries).
+- **Tier classification.** Each driver supplies a `route_command`
+  table. A command is one of GREEN, YELLOW, RED or BLACK, or
+  UNCLASSIFIED when no row matches. The gate refuses UNCLASSIFIED and
+  refuses anything above the ceiling (`gate_max_tier`, default YELLOW).
+  GREEN executes and is recorded. YELLOW executes under the default
+  ceiling and needs approval if the ceiling is set to GREEN. RED needs
+  approval under the default ceiling. Matching is case-sensitive and the
+  exact classified bytes are the bytes executed; separators (`;`, `|`,
+  `&`, newline, backtick, `$(`) are refused before classification, which
+  also means CLI display filters are refused.
+- **BLACK.** Refused under ENFORCE, never filed as a proposal, never
+  approvable (`src/virp_onode.c`, the apply and propose branches), and
+  rejected by the wire format so no observation can carry it. One
+  caveat a reader should know: the gate has a SHADOW mode, a per-driver
+  config override that logs and proceeds, and under SHADOW a BLACK
+  verdict is logged but not blocked (SECURITY.md §4.7, open). The
+  shipped default is ENFORCE for every driver.
+- **Per-identity tier ceiling.** `socket_uid_tier_ceilings` in the prod
+  config maps a connecting uid to a ceiling that can only tighten the
+  node-wide one (`onode_effective_max_tier`). A separate
+  `socket_uid_action_allow` map restricts which socket actions a uid may
+  call at all.
+- **Authenticated observations.** v1 HMAC-SHA256 under the O-Key is
+  what the execute path produces. v2 binds session, device, sequence
+  and command digest under an HKDF session key and needs the
+  HELLO/ACK/BIND handshake. v3 adds Ed25519 (status above).
+- **Chain.** SQLite, append-only by convention, one hash chain per
+  session from a derived genesis, each entry HMAC'd with K_chain, a
+  signed head record per session, and a completeness check so a
+  truncated range never verifies. Externally submitted observation
+  bodies must carry a valid signature or the append is refused; unknown
+  artifact types are refused. A K_chain holder can still rewrite
+  history; anchoring outside the collector is specified only.
+- **Approvals.** The daemon holds only approver public keys. The
+  approver signs a 72 byte canonical payload (proposal id, command hash,
+  device node id, timestamp, TTL) with Ed25519 or ECDSA P-256, from a
+  software key or a PKCS#11 token. The hardware path is built with
+  `make virp-tool-pkcs11` and is exercised against a mock module
+  (`tests/test_pkcs11_plumbing.c`), not against a real token in CI.
+  Known limit: the signature binds `device_node_id`, not the device
+  hostname string (SECURITY.md §4.6).
+- **Durability, measured.** A hard I/O error fails the append closed. A
+  silent write-drop loses head and entries together and the verifier
+  reports a valid shorter chain. A torn head is detected. An approved
+  command that crashes between device I/O and the OUTCOME append is
+  recorded as "approved, no outcome," which is indistinguishable from
+  "never contacted" (SECURITY.md §Execution Durability).
 
 ---
 
-## Quick Start
+## Drivers
+
+`make prod` builds `virp-onode-prod` with every driver flag set
+(`Makefile`, target `prod`). The prod binary then registers these driver
+names (`src/virp_onode_prod.c`, the "Register drivers" block, names from
+each driver's `.name` field):
+
+| Driver name | Transport | Build flag |
+|---|---|---|
+| `cisco_ios`, `cisco_iosxe` | SSH | `CISCO=1` |
+| `cisco_asa` | SSH | `ASA=1` |
+| `fortigate` | SSH | `FORTIGATE=1` |
+| `panos` | SSH | `PANOS=1` |
+| `juniper` | SSH | `JUNIPER=1` |
+| `linux`, `proxmox` | SSH (FRR vtysh, host reads, Proxmox) | `LINUX=1` |
+| `wazuh` | REST | `WAZUH=1` |
+| `librenms` | REST | `LIBRENMS=1` |
+| `pbs` (Proxmox Backup Server) | REST, certificate pinned | `PBS=1` |
+| `zammad` | REST | `ZAMMAD=1` |
+| `mock` | none (demo target) | always |
+
+Every one of them sets `.route_command`, so every command on every
+registered driver is classified (`grep -n '\.route_command'
+src/drivers/*.c src/driver_panos.c`). The default posture is
+fail-closed: a command no table row matches is refused, and a driver
+with no classifier would classify everything UNCLASSIFIED and therefore
+execute nothing. Driver gate suites run in `make all-tests`
+(`test-drivers`).
+
+Scope limits that apply to all drivers, from SECURITY.md §Command Gate:
+one command per request, no display filters, no multi-line or config-mode
+payloads through the single-command path. PAN-OS has no driver-level
+BLACK backstop behind the gate (open).
+
+---
+
+## Scope
+
+VIRP is a protocol with a reference implementation, Apache 2.0. Each
+component exists for one of two reasons.
+
+| Component | Serves | Status |
+|---|---|---|
+| `draft-howard-virp-06`, `docs/VIRP-WIRE-FORMAT.md`, `docs/VIRP-SPEC-RFC-v2.md` | the protocol | specification; -06 covers v1/v2 only |
+| C library and O-Node (`src/`, `include/`) | the protocol | implemented, reference |
+| Go O-Node and message layer (`implementations/go`) | the protocol | implemented; C/Go parity via `make test-interop` (skipped here, no Go toolchain) |
+| Test vectors (`docs/VIRP-WIRE-FORMAT.md` §11) | the protocol | partial: inputs given, expected tag left for the reader to compute |
+| ProVerif model (`proofs/`) | the protocol | v2 path only |
+| Federation: Ed25519 node keys, `fed_request` / `fed_observation` / `fed_outcome` chain types with ingestion gates | the protocol | implemented record types; cross-domain trust specified only |
+| Approval flow and approver registry | the protocol | implemented |
+| v3 Ed25519 observations | the protocol | library only; not emitted, not enforced |
+| Vendor drivers (table above) | this deployment | implemented |
+| Appliance HTTP API (`api/server.py`) | this deployment | implemented |
+| Report layer (`report/`) | this deployment | implemented; PASS/UNVERIFIABLE roll-up gap noted above |
+| Autopilot, config backup, evidence timers (`autopilot/`, `deploy/`) | this deployment | implemented, lab specific |
+| Broker (`broker/`) | this deployment | implemented, loopback only |
+| Prometheus exporter (`integrations/prometheus`) | this deployment | implemented |
+| NetBox sync (`integrations/netbox`) | this deployment | planned; README only, no code |
+| Observation Gate | consumer | experimental, lives in IronClaw, not here |
+| Role separation, external anchoring, EXECUTION_INTENT | the protocol | specified only |
+
+Network containment around the daemon (no route from the agent host to
+devices, device ACLs that accept SSH only from the O-Node address) is a
+deployment control. The tree ships an nftables ruleset for one such
+setup (`deploy/nftables-virp-netclaw-egress.nft`) but does not enforce
+it.
+
+---
+
+## Build, run, test
+
+Executed on this tree on 2026-08-22 (Linux Mint 22.3 on an Ubuntu 24.04
+base, gcc 13.3, Python 3.12) unless marked otherwise.
 
 ```bash
 # Dependencies (Debian/Ubuntu)
@@ -261,73 +307,58 @@ sudo apt install -y build-essential git \
   libssl-dev libsodium-dev libsqlite3-dev \
   libssh2-1-dev libcurl4-openssl-dev libjson-c-dev
 
-# Clone and build
 git clone https://github.com/nhowardtli/virp.git && cd virp
-make CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1
-make CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 prod
+make            # library, dev daemon, virp-tool, core test binaries
+make prod       # virp-onode-prod with all drivers
 
-# Test
-make all-tests
-make test-session
-make test-session-key
+make test       # core: 59/59 here
+make test-onode # daemon: 132/132 here
+make test-chain # chain: 33/33 here
+./demo/run.sh   # 9/9 here
+```
 
-# Generate a signing key and start the O-Node
-./build/virp-tool keygen -o /etc/virp/keys/onode.key
+`make all-tests` is the full battery. It ends with a dependency gate
+that fails closed if `fastapi`, `httpx` or `reportlab` are not
+importable, because suites that skip must not roll up as success. On a
+fresh clone without those modules it runs every C suite and then exits
+non-zero at that gate. To get a green run, put a venv with them on
+`PATH`:
+
+```bash
+python3 -m venv ~/virp-test-venv
+~/virp-test-venv/bin/pip install fastapi httpx pytest reportlab
+PATH=~/virp-test-venv/bin:$PATH make all-tests   # exit 0 here
+```
+
+Two suites skip with a loud message on a build host and did so here:
+`test-interop` without a Go toolchain, and the live-chain federation
+audit without `/var/lib/virp/chain.db`. `check-unit-drift` passes when
+no `virp-*` units are installed. Not run here: `make proofs` (needs
+ProVerif), `make asan-test`, `make fuzz-obs-ed25519` (needs clang).
+
+Test files, counted with `ls tests/*.c | wc -l` and `ls tests/*.py |
+wc -l` on this tree: 47 C files under `tests/` (three of them fuzz
+harnesses and one a mock PKCS#11 module), 14 Python files under
+`tests/`, 5 under `api/`, 1 under `broker/`, plus the adversarial
+program under `tests/adversarial/`.
+
+Start a daemon:
+
+```bash
+./build/virp-tool keygen okey /etc/virp/keys/onode.key
+head -c 32 /dev/urandom > /etc/virp/keys/chain.key
 ./build/virp-onode-prod \
   -k /etc/virp/keys/onode.key \
   -s /run/virp/onode.sock \
   -d /etc/virp/devices.json \
-  -c /var/lib/virp/chain.db
+  -c /var/lib/virp/chain.db \
+  -C /etc/virp/keys/chain.key
 ```
 
-Systemd unit file: [`deploy/virp-onode.service`](deploy/virp-onode.service)
-
-### Device registry configuration
-
-The HTTP API (`api/server.py`) resolves its device list from exactly one
-source, chosen by this precedence rule:
-
-1. **`VIRP_DEVICES` set** — the JSON file it names is the device registry,
-   honored exactly as given. The YAML registry is not consulted at all.
-2. **`VIRP_DEVICES` unset** — the canonical `devices.yaml` registry (via
-   `device_registry.py`), when that module is importable.
-3. **Neither** — the legacy default JSON at `/var/lib/virp/devices.json`.
-
-Whether `device_registry.py` happens to be importable never overrides an
-explicit `VIRP_DEVICES`: module availability is an implementation detail,
-not configuration.
-
----
-
-## What's In The Box
-
-- **C library (libvirp)** — 13,743 source lines + 2,867 header lines, C11, `-Wall -Wextra -Werror -pedantic`
-- **Go implementation** — 2,739 lines, identical wire format, interop-tested against the C reference
-- **Vendor drivers** — Cisco IOS, FortiOS, PAN-OS, Cisco ASA, Juniper, Linux, Wazuh
-- **Session handshake** — `SESSION_HELLO` / `SESSION_HELLO_ACK` / `SESSION_BIND` state machine with HKDF-derived session keys
-- **Trust chain** — SQLite-backed, tamper-evident, crash-safe
-- **Federation** — Ed25519 via libsodium for cross-tenant artifact verification
-- **101 test cases** across 23 files: 71 C unit + integration tests, 30 Python end-to-end and parity tests, plus libFuzzer harness, concurrency tests, and live-hardware tests
-- **Integrations** — Prometheus exporter, NetBox sync
-
----
-
-## FAQ
-
-**Won't a sufficiently advanced AI just learn not to fabricate?**
-No. Fabrication is a structural failure mode: the model generates output in response text without invoking the signed execution path. No amount of training prevents a language model from producing plausible-sounding text. VIRP makes the difference between "text that looks like an observation" and "an observation" cryptographically distinguishable. The fix is not at the model layer.
-
-**Why not just hash the device output after the fact?**
-Because the question is not "did this bytestring get tampered with after we recorded it?" — it is "did this bytestring come from a real device?" Hashing after the AI sees the data lets the AI insert the data. VIRP signs at the point of collection, in a process the AI cannot reach, with a key the AI cannot read.
-
-**How is this different from agent observability or tracing platforms?**
-Observability tools record what the agent claimed to do. VIRP records what was cryptographically verified to have happened. Tracing tells you the agent said it ran `show firewall policy 2`. VIRP tells you the device responded, here is the signed response, here is its position in the tamper-evident chain. (One honest narrowing: "the signed response" means the bytes the O-Node read and signed for that command — on the SSH drivers, body-to-command correspondence is not currently guaranteed; see `SECURITY.md` §Observation-Body Integrity.)
-
-**Is the O-Node a single point of compromise?**
-Yes, and intentionally so. The O-Node is the trust boundary; you harden it the way you would harden a HSM or a credential vault. VIRP's job is to compress the trust surface from "everywhere the AI can reach" down to "one process you can audit." That is a manageable problem. The original is not.
-
-**Can I use VIRP without the rest of IronClaw?**
-Yes. VIRP is a protocol and a reference implementation. IronClaw is one consumer of it. Any agent, dashboard, or automation system can be a VIRP consumer — the wire format is documented in [`docs/VIRP-WIRE-FORMAT.md`](docs/VIRP-WIRE-FORMAT.md).
+`-c` requires `-C`, and approval mode refuses to start without a chain.
+The systemd unit in [`deploy/`](deploy/virp-onode.service) shows the
+intended service user, sandboxing and credential rendering. Not run
+here: no daemon was installed on this host.
 
 ---
 
@@ -335,66 +366,27 @@ Yes. VIRP is a protocol and a reference implementation. IronClaw is one consumer
 
 | Topic | Location |
 |---|---|
-| Protocol specification | [`docs/VIRP-SPEC-RFC-v2.md`](docs/VIRP-SPEC-RFC-v2.md) |
-| Wire format reference | [`docs/VIRP-WIRE-FORMAT.md`](docs/VIRP-WIRE-FORMAT.md) |
-| The seven trust primitives | [`docs/VIRP-7-PRIMITIVES.md`](docs/VIRP-7-PRIMITIVES.md) |
-| AI trust stack model | [`docs/AI-TRUST-STACK.md`](docs/AI-TRUST-STACK.md) |
+| Threat model, trust boundaries, evidence tags per claim | [`SECURITY.md`](SECURITY.md) |
+| Wire format and test vectors | [`docs/VIRP-WIRE-FORMAT.md`](docs/VIRP-WIRE-FORMAT.md) |
+| Protocol specification (repo copy) | [`docs/VIRP-SPEC-RFC-v2.md`](docs/VIRP-SPEC-RFC-v2.md) |
+| Changes pending for draft-07 | [`docs/DRAFT07-NOTES.md`](docs/DRAFT07-NOTES.md) |
+| Approval flow | [`docs/APPROVAL-FLOW.md`](docs/APPROVAL-FLOW.md) |
+| Claim verification layer | [`docs/VIRP-CLAIMS.md`](docs/VIRP-CLAIMS.md) |
 | Observation flow end-to-end | [`docs/VIRP-OBSERVATION-FLOW.md`](docs/VIRP-OBSERVATION-FLOW.md) |
 | Validator manifest contract | [`docs/VALIDATOR-MANIFEST-CONTRACT.md`](docs/VALIDATOR-MANIFEST-CONTRACT.md) |
-| Threat model and trust boundaries | [`SECURITY.md`](SECURITY.md) |
 | Release provenance and bundle verification | [`docs/RELEASE-PROVENANCE.md`](docs/RELEASE-PROVENANCE.md) |
+| Ed25519 observation review | [`docs/REVIEW-ED25519-2026-08-07.md`](docs/REVIEW-ED25519-2026-08-07.md) |
+| Adversarial test program | [`tests/adversarial/README.md`](tests/adversarial/README.md) |
+| Live transcript, Cisco IOS approval flow | [`docs/LIVE-PROOF-2026-07-23.md`](docs/LIVE-PROOF-2026-07-23.md) |
+| Deployment record | [`DEPLOYED.md`](DEPLOYED.md) |
 | Contributing | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 
----
-
-## Protocol Specification
-
-- **IETF Draft:** `draft-howard-virp-06` (filed 2026-08-01; revisions -00
-  through -06 submitted). **-06 specifies the v1 and v2 observation
-  formats only.** The Ed25519-signed observation format (wire version 3)
-  in this repository is implemented ahead of specification: -06 §17.3
-  lists asymmetric observation signing as *future work*, and Appendix A
-  records the removal of the earlier, unsupported per-observation
-  Ed25519 claim. v3 is slated for -07.
-- **Formal verification:** (1) injective agreement (every accepted v2
-  observation corresponds to exactly one signing) and key secrecy
-  (master O-Key and derived session keys) are machine-verified in
-  ProVerif 2.05; the model and raw output are checked in at
-  [`proofs/virp_obs_v2.pv`](proofs/virp_obs_v2.pv) and
-  [`proofs/virp_obs_v2.out`](proofs/virp_obs_v2.out), re-runnable via
-  `make proofs`. (2) The proof holds under a stated trace restriction
-  matching `virp_seqstore_accept()`; that store's correctness is
-  demonstrated by the replay negative tests in `tests/test_obs_v2.c`,
-  including persistence across verifier restart. (3) Timestamp
-  freshness is test-verified only (`test_stale_observation_rejected`),
-  not modeled. There is no Tamarin model — that is future work. The
-  proofs cover the v2 observation path only; `draft-howard-virp-06` §11
-  scopes its evidence claim to match — ProVerif only, v2 only, no
-  Tamarin — and §17.1 names the second-tool cross-check as future work.
-  (The -05 text carried the older, broader claim; -06 Appendix A records
-  the correction.)
-- **License:** Apache 2.0
-
----
-
-## Contributing
-
-We are particularly interested in:
-
-- Infrastructure engineers running VIRP against production fleets
-- Security researchers attacking the protocol
-- Driver authors for Juniper, Arista, Meraki, and cloud APIs
-- Protocol designers working on the IETF drafts
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup, code standards, and the new-driver checklist. Security issues: see [`SECURITY.md`](SECURITY.md).
+Wanted: engineers running it against fleets other than the lab's,
+reviewers attacking the protocol, and driver authors. Security issues go
+to the address in [`SECURITY.md`](SECURITY.md), not the public tracker.
 
 ---
 
 ## Contact
 
-**Nathan M. Howard** — Third Level IT LLC — `nhoward@thirdlevelit.com`
-
----
-
-> *A responsible system does not guess when evidence is absent.*
-> *It says: I don't know, and here's why.*
+Nathan M. Howard, Third Level IT LLC, `nhoward@thirdlevelit.com`
