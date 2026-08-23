@@ -4,7 +4,7 @@
  * CLI Tool — key generation, message inspection, test message building
  *
  * Usage:
- *   virp-tool keygen  <okey|rkey|approval|obskey> <output_file>
+ *   virp-tool keygen  <okey|rkey|approval|obskey|chainsign> <output_file>
  *   virp-tool inspect <message_file> <key_file> <okey|rkey>
  *   virp-tool build   <observation|heartbeat|proposal> [options]
  *   virp-tool hexdump <message_file>
@@ -18,6 +18,7 @@
 #include "virp_approval.h"
 #include "virp_approver_registry.h"
 #include "virp_chain.h"
+#include "virp_chainsign.h"
 #include "virp_federation.h"
 #include "virp_obskey.h"
 #include "cJSON.h"
@@ -185,10 +186,55 @@ static int cmd_keygen_obskey(const char *prefix)
     return 0;
 }
 
+/*
+ * keygen chainsign — generate the per-node Ed25519 CHAIN-SIGNING keypair
+ * (D-1 detached chain signatures). A SIXTH key role: distinct from the
+ * symmetric K_chain (whose HMAC is unchanged and still written), from
+ * the obskey (which signs observation BODIES, not chain entries), and
+ * from the approval keypair. Custody is the obskey's — secret on the
+ * daemon host, because the daemon is the attester of its own chain.
+ *
+ * What the .pub buys: anyone holding it can verify every chain entry
+ * and head the daemon signs, over the SAME canonical bytes K_chain
+ * HMACs, without holding any secret — and cannot mint. Pass the secret
+ * to the daemon with -S; publish the .pub (or its key_id) out of band
+ * and via /api/key.
+ */
+static int cmd_keygen_chainsign(const char *prefix)
+{
+    virp_chainsign_key_t kp;
+    if (virp_chainsign_generate(&kp) != VIRP_OK) {
+        fprintf(stderr, "Error: chain-signing keypair generation failed\n");
+        return 1;
+    }
+
+    char pk_path[512], sk_path[512];
+    snprintf(pk_path, sizeof(pk_path), "%s.pub", prefix);
+    snprintf(sk_path, sizeof(sk_path), "%s.key", prefix);
+
+    if (virp_chainsign_save(&kp, sk_path, pk_path) != VIRP_OK) {
+        fprintf(stderr, "Error: saving chain-signing keypair failed "
+                        "(existing %s is never overwritten)\n", sk_path);
+        virp_chainsign_destroy(&kp);
+        return 1;
+    }
+
+    printf("Generated chain-signing keypair (Ed25519, scheme %s):\n",
+           VIRP_CHAINSIGN_SCHEME);
+    printf("  Secret key:  %s (0600 — DAEMON HOST ONLY; pass with -S)\n",
+           sk_path);
+    printf("  Public key:  %s (32 raw bytes — distribute to verifiers; "
+           "verify-only, cannot forge)\n", pk_path);
+    printf("  Key ID:      %s (sha256-raw-16 over the public key)\n",
+           kp.key_id_hex);
+    virp_chainsign_destroy(&kp);
+    return 0;
+}
+
 static int cmd_keygen(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: virp-tool keygen <okey|rkey|approval|obskey> <output>\n");
+        fprintf(stderr, "Usage: virp-tool keygen <okey|rkey|approval|obskey|chainsign> <output>\n");
         return 1;
     }
 
@@ -201,13 +247,16 @@ static int cmd_keygen(int argc, char **argv)
     if (strcmp(type_str, "obskey") == 0)
         return cmd_keygen_obskey(path);
 
+    if (strcmp(type_str, "chainsign") == 0)
+        return cmd_keygen_chainsign(path);
+
     virp_key_type_t type;
     if (strcmp(type_str, "okey") == 0)
         type = VIRP_KEY_TYPE_OKEY;
     else if (strcmp(type_str, "rkey") == 0)
         type = VIRP_KEY_TYPE_RKEY;
     else {
-        fprintf(stderr, "Error: key type must be 'okey', 'rkey', 'approval', or 'obskey'\n");
+        fprintf(stderr, "Error: key type must be 'okey', 'rkey', 'approval', 'obskey', or 'chainsign'\n");
         return 1;
     }
 
@@ -1856,7 +1905,7 @@ static void usage(void)
     printf("build: ");
     print_version();
     printf("\nCommands:\n");
-    printf("  keygen   <okey|rkey|approval|obskey> <output>  Generate signing key\n");
+    printf("  keygen   <okey|rkey|approval|obskey|chainsign> <output>  Generate signing key\n");
     printf("  inspect  <msg_file> <key_file> <type>    Inspect and verify message\n");
     printf("  build    <type> [options]                 Build test message\n");
     printf("  hexdump  <msg_file>                       Raw hex dump\n");

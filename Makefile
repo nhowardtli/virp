@@ -40,6 +40,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_approval.o \
              $(BUILD_DIR)/virp_approver_registry.o \
              $(BUILD_DIR)/virp_obskey.o \
+             $(BUILD_DIR)/virp_chainsign.o \
              $(BUILD_DIR)/virp_ssh_io.o \
              $(BUILD_DIR)/cJSON.o
 
@@ -282,6 +283,9 @@ $(BUILD_DIR)/virp_approver_registry.o: src/virp_approver_registry.c | $(BUILD_DI
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_obskey.o: src/virp_obskey.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/virp_chainsign.o: src/virp_chainsign.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(LIB): $(LIB_OBJS)
@@ -954,6 +958,18 @@ $(TEST_OBSKEY): tests/test_obskey.c $(LIB)
 
 test-obskey: $(TEST_OBSKEY)
 	./$(TEST_OBSKEY)
+
+# D-1 chain-signing key module (custody, key_id, tagged sign/verify,
+# golden vectors in tests/vectors/chain-signing-v1.json)
+TEST_CHAINSIGN = $(BUILD_DIR)/test_chainsign
+
+$(TEST_CHAINSIGN): tests/test_chainsign.c $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-chainsign
+test-chainsign: $(TEST_CHAINSIGN)
+	./$(TEST_CHAINSIGN)
 
 # v3 (Ed25519-signed) observation build tests
 TEST_OBS_ED25519 = $(BUILD_DIR)/test_obs_ed25519
@@ -1742,7 +1758,7 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 
