@@ -20,6 +20,7 @@
 
 #include "virp_driver.h"
 #include "virp_ssh_io.h"
+#include "virp_driver_cisco_modes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,7 @@ struct virp_conn {
     virp_ssh_io_t       io;          /* shared read path transport adapter */
     bool                connected;
     bool                in_enable;
+    cisco_mode_t        current_mode; /* tracked from the learned prompt */
 };
 
 /* ── Transport adapter for the shared read path ─────────────────── */
@@ -478,6 +480,7 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
     conn->connected = true;
     conn->in_enable = (conn->prompt.prompt_len > 0 &&
                        conn->prompt.prompt[conn->prompt.prompt_len - 1] == '#');
+    conn->current_mode = cisco_parse_mode(conn->prompt.prompt);
 
     fprintf(stderr, "[Cisco] Connected: %s@%s:%u prompt='%s' enable=%d\n",
             device->username, device->host, port,
@@ -729,6 +732,83 @@ virp_trust_tier_t cisco_gate_tier(const char *command)
     }
     /* Fail-closed: anything not explicitly GREEN/YELLOW/RED-listed is RED. */
     return best ? best->tier : VIRP_TIER_RED;
+}
+
+/* =========================================================================
+ * Prompt-mode classification (config-mode support)
+ *
+ * The learned-prompt read (virp_ssh_io.h rule 2) matches ONE exact
+ * prompt, but IOS moves the prompt on every config-mode transition:
+ * R24# -> R24(config)# -> R24(config-if)# -> R24#. The juniper driver
+ * already solved this shape: classify the commands that deliberately
+ * move the prompt and re-learn it when their read ends without the old
+ * one (driver_juniper.c, is_mode_changing). This is the IOS port of
+ * that contract.
+ *
+ * The recovery is deliberately narrow:
+ *   - explicit mode movers from EXEC: configure terminal / conf t /
+ *     configure, end, exit;
+ *   - ANY command while already in (config...)# — IOS enters and
+ *     leaves sub-modes on plain config lines ("interface Loopback0",
+ *     "router bgp 1000", "exit"), and config-mode commands print
+ *     little or no output, so a missing prompt there is a transition,
+ *     not a stalled read.
+ * Every other command keeps the strict incomplete-read guarantee
+ * unchanged. All commands the recovery applies to classify RED (write)
+ * or RED-by-absence, so each one was individually human-approved
+ * before it ran.
+ * ========================================================================= */
+
+cisco_mode_t cisco_parse_mode(const char *prompt)
+{
+    if (!prompt || !*prompt) return CISCO_MODE_UNKNOWN;
+
+    size_t len = strlen(prompt);
+    while (len > 0 && (prompt[len - 1] == ' ' || prompt[len - 1] == '\t' ||
+                       prompt[len - 1] == '\r' || prompt[len - 1] == '\n'))
+        len--;
+    if (len == 0) return CISCO_MODE_UNKNOWN;
+
+    char last = prompt[len - 1];
+    if (last == '>') return CISCO_MODE_USER;
+    if (last != '#') return CISCO_MODE_UNKNOWN;
+
+    const char *paren = memchr(prompt, '(', len);
+    if (paren) {
+        size_t rest = len - (size_t)(paren - prompt);
+        if (rest >= 8 && strncmp(paren, "(config)", 8) == 0)
+            return CISCO_MODE_CONFIG;
+        if (rest >= 8 && strncmp(paren, "(config-", 8) == 0)
+            return CISCO_MODE_CONFIG_SUB;
+        /* Parenthesized but not a config mode (tclsh etc.) — refuse:
+         * UNKNOWN keeps the transition recovery fail-closed. */
+        return CISCO_MODE_UNKNOWN;
+    }
+    return CISCO_MODE_EXEC;
+}
+
+/* First token of cmd equals word, ending on a token boundary. */
+static bool first_tok_is(const char *cmd, const char *word)
+{
+    size_t n = strlen(word);
+    if (strncmp(cmd, word, n) != 0) return false;
+    return cmd[n] == '\0' || cmd[n] == ' ' || cmd[n] == '\t';
+}
+
+bool cisco_is_mode_changing(const char *command, cisco_mode_t mode)
+{
+    if (!command) return false;
+    while (*command == ' ' || *command == '\t') command++;
+    if (*command == '\0') return false;
+
+    /* In config mode every line may move between sub-modes. */
+    if (mode == CISCO_MODE_CONFIG || mode == CISCO_MODE_CONFIG_SUB)
+        return true;
+
+    return first_tok_is(command, "configure") ||
+           first_tok_is(command, "conf") ||
+           first_tok_is(command, "end") ||
+           first_tok_is(command, "exit");
 }
 
 /* =========================================================================
@@ -1094,6 +1174,14 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
         return VIRP_OK;
     }
 
+    /* Commands that may legitimately move the prompt (config mode). */
+    bool is_mode_changing = cisco_is_mode_changing(command,
+                                                   conn->current_mode);
+    const char *cmd_trim = command;
+    while (*cmd_trim == ' ' || *cmd_trim == '\t') cmd_trim++;
+    bool is_config_entry = (strcmp(cmd_trim, "configure terminal") == 0 ||
+                            strcmp(cmd_trim, "conf t") == 0);
+
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
@@ -1111,6 +1199,31 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
     clock_gettime(CLOCK_MONOTONIC, &end);
     result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
                                        (end.tv_nsec - start.tv_nsec) / 1000000);
+
+    if (rerr == VIRP_ERR_NO_PROMPT && is_mode_changing) {
+        /*
+         * A mode-changing command moves the prompt, so the pre-command
+         * prompt legitimately will not reappear (juniper precedent,
+         * driver_juniper.c). Re-learn, and accept the transition ONLY
+         * if the new prompt parses as a known IOS mode — anything else
+         * stays an incomplete read and fails below. A read that DID
+         * end on the learned prompt needs no re-learn: matching it is
+         * proof the prompt did not move.
+         */
+        virp_ssh_learn_opts_t mc_opts = { .channel_has_spoken = true };
+        if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+                                  &mc_opts, &conn->prompt) == VIRP_OK &&
+            cisco_parse_mode(conn->prompt.prompt) != CISCO_MODE_UNKNOWN) {
+            conn->current_mode = cisco_parse_mode(conn->prompt.prompt);
+            conn->in_enable =
+                (conn->prompt.prompt_len > 0 &&
+                 conn->prompt.prompt[conn->prompt.prompt_len - 1] == '#');
+            fprintf(stderr, "[Cisco] Mode transition on %s: '%s' -> "
+                    "prompt '%s'\n", conn->device.hostname, command,
+                    conn->prompt.prompt);
+            rerr = VIRP_OK;
+        }
+    }
 
     if (rerr == VIRP_ERR_NO_PROMPT) {
         /*
@@ -1199,6 +1312,17 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
         result->exit_code = 1;
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "IOS error in command: %s", command);
+    }
+
+    /* Verify config-mode entry actually happened: a "configure
+     * terminal" whose prompt did not move (user EXEC, AAA denial)
+     * must not report success. */
+    if (is_config_entry && conn->current_mode != CISCO_MODE_CONFIG) {
+        result->success = false;
+        result->exit_code = 1;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Failed to enter config mode on %s",
+                 conn->device.hostname);
     }
 
     free(scrubbed);
