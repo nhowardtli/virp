@@ -24,6 +24,7 @@
 #include "virp_message.h"
 #include "virp_onode.h"
 #include "virp_obskey.h"
+#include "virp_scrub.h"
 #include <sodium.h>
 #include "virp_driver.h"
 #include <signal.h>
@@ -3280,12 +3281,17 @@ TEST(test_green_execution_chains_signed_observation)
 /*
  * THE SECRET-SAFETY PROPERTY, asserted directly.
  *
- * A GREEN device response carrying a token-shaped string goes back to the
- * caller in full, and does NOT appear anywhere in the chain — not in the
- * entry, not in the artifact body, not anywhere in the database file. Its
- * sha256 does. That is the whole redaction posture in one test: the chain
- * proves an output with this digest was produced at this position without
- * becoming the place that output is stored.
+ * A GREEN device response carrying a token-shaped string does NOT appear
+ * anywhere in the chain — not in the entry, not in the artifact body,
+ * not anywhere in the database file. Its sha256 commitment does.
+ *
+ * S-1 upgraded this property: scrub-at-capture now redacts the token
+ * BEFORE the observation is signed, so the secret is absent from the
+ * signed observation too — the caller receives the marker, and the
+ * response_sha256 commitment is over the SCRUBBED bytes (the redacted
+ * form IS the artifact; there is no unredacted original anywhere).
+ * The pre-S-1 form of this test asserted the caller still received the
+ * raw token; that assertion is deliberately inverted now.
  */
 TEST(test_execution_record_commits_to_digest_not_response_body)
 {
@@ -3309,9 +3315,21 @@ TEST(test_execution_record_commits_to_digest_not_response_body)
     virp_header_t hdr;
     ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
 
-    /* The caller DID receive the secret. Without this the test could pass
-     * because the response never carried the token in the first place. */
-    ASSERT_TRUE(gx_bytes_contain(obs, olen, TOKEN));
+    /* S-1: the caller receives the REDACTED body — marker present,
+     * token absent, non-secret lines intact. */
+    ASSERT_TRUE(!gx_bytes_contain(obs, olen, TOKEN));
+    ASSERT_TRUE(gx_bytes_contain(obs, olen, "PVE_API_TOKEN=[REDACTED: token]"));
+    ASSERT_TRUE(gx_bytes_contain(obs, olen, "status: stopped"));
+
+    /* The commitment must be over the scrubbed bytes the observation
+     * actually carries — recompute independently. */
+    static char scrubbed[VIRP_OUTPUT_MAX];
+    size_t scrubbed_len = 0;
+    unsigned nred = 0;
+    ASSERT_OK(virp_scrub_body(response, strlen(response), scrubbed,
+                              sizeof(scrubbed), &scrubbed_len, &nred));
+    scrubbed[scrubbed_len] = '\0';
+    ASSERT_EQ((int)nred, 1);
 
     gx_teardown(&st);
 
@@ -3335,9 +3353,10 @@ TEST(test_execution_record_commits_to_digest_not_response_body)
     ASSERT_EQ(gx_file_contains(GX_CHAIN_DB, TOKEN), 0);
     ASSERT_EQ(gx_file_contains(GX_CHAIN_DB "-wal", TOKEN), 0);
 
-    /* What IS committed is the digest of the full raw response. */
+    /* What IS committed is the digest of the SCRUBBED response — the
+     * only response bytes that exist anywhere after S-1. */
     char digest[65];
-    gr_sha256_hex(response, digest);
+    gr_sha256_hex(scrubbed, digest);
     char want[128];
     snprintf(want, sizeof(want), "\"response_sha256\":\"%s\"", digest);
     ASSERT_TRUE(strstr(rows[0].body, want) != NULL);
@@ -3345,7 +3364,7 @@ TEST(test_execution_record_commits_to_digest_not_response_body)
     /* …along with the length of the bytes that digest covers. */
     char want_len[64];
     snprintf(want_len, sizeof(want_len), "\"response_len\":%zu",
-             strlen(response));
+             scrubbed_len);
     ASSERT_TRUE(strstr(rows[0].body, want_len) != NULL);
 
     /* The command IS retained — an execution record that omits what was
@@ -3512,6 +3531,288 @@ TEST(test_chain_verify_over_mixed_executions_and_rejections)
     }
 
     gx_cleanup();
+}
+
+/* =========================================================================
+ * Scrub-at-capture (S-1) gates — G1..G4
+ *
+ * End-to-end through the REAL capture path: mock device output →
+ * onode_execute → scrub → sign → chain, then verified with the
+ * existing verifiers at BOTH tiers — the writer-handle HMAC tier and
+ * the D-1 pubkey-only Ed25519 tier (virp_chain_open_verifier_ex with
+ * ONLY the public key), which is the in-tree form of the
+ * CRYPTOGRAPHICALLY-VERIFIED verdict. Every planted secret carries
+ * CANARY; the core property is that no CANARY survives into anything
+ * signed or stored, while the markers do — visibly, inside the signed
+ * bytes.
+ * ========================================================================= */
+
+#define GXS_SIGN_SK "/tmp/virp-onode-test-gxsign.sk"
+#define GXS_SIGN_PK "/tmp/virp-onode-test-gxsign.pk"
+
+static void gxs_cleanup(void)
+{
+    gx_cleanup();
+    unlink(GXS_SIGN_SK);
+    unlink(GXS_SIGN_PK);
+}
+
+/* gx_setup + D-1 detached Ed25519 chain signing enabled on the writer
+ * handle — the deployed posture this scrub ships into. */
+static virp_error_t gxs_setup(onode_state_t *st)
+{
+    gxs_cleanup();
+
+    virp_chainsign_key_t kp;
+    virp_error_t e = virp_chainsign_generate(&kp);
+    if (e != VIRP_OK) return e;
+    e = virp_chainsign_save(&kp, GXS_SIGN_SK, GXS_SIGN_PK);
+    virp_chainsign_destroy(&kp);
+    if (e != VIRP_OK) return e;
+
+    e = gx_setup(st);
+    if (e != VIRP_OK) return e;
+    return virp_chain_enable_signing(&st->chain, GXS_SIGN_SK);
+}
+
+/* The pubkey-only D-1 verdict over the gate session: valid, signature
+ * tier actually exercised, every entry signed, head authenticated. */
+static void gxs_assert_crypto_verified(void)
+{
+    virp_chain_state_t v;
+    ASSERT_OK(virp_chain_open_verifier_ex(&v, GX_CHAIN_DB, NULL,
+                                          GXS_SIGN_PK, 0xDEAD0008, "local"));
+    virp_chain_verify_result_t r;
+    virp_error_t e = virp_chain_verify_session(&v, GX_SESSION, &r);
+    if (e != VIRP_OK) { virp_chain_destroy(&v); }
+    ASSERT_OK(e);
+    ASSERT_TRUE(r.valid);
+    ASSERT_TRUE(r.sig_checked);
+    ASSERT_EQ((int)r.entries_signed, (int)r.entries_checked);
+    ASSERT_TRUE(r.head_authenticated);
+    ASSERT_TRUE(r.head_sig_ok);
+    virp_chain_destroy(&v);
+}
+
+/*
+ * G1 — a CLEAN body is untouched by the scrub, and the capture still
+ * chains and verifies at the Ed25519 tier. The scrub must be invisible
+ * when it has nothing to do: the signed observation carries the exact
+ * device bytes and no marker.
+ */
+TEST(test_scrub_G1_clean_capture_verifies)
+{
+    onode_state_t st;
+    ASSERT_OK(gxs_setup(&st));
+
+    static const char CLEAN[] =
+        "Cisco IOS Software, C2900 Software\n"
+        "R1 uptime is 3 weeks, 2 days\n"
+        "System returned to ROM by power-on\n";
+    virp_driver_mock_set_output(CLEAN);
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+                                     obs, sizeof(obs), &olen);
+    virp_driver_mock_set_output(NULL);
+    ASSERT_OK(err);
+
+    /* signed observation verifies, body is the exact clean bytes */
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+    ASSERT_TRUE(gx_bytes_contain(obs, olen, CLEAN));
+    ASSERT_TRUE(!gx_bytes_contain(obs, olen, "[REDACTED"));
+
+    /* commitment is over those same clean bytes */
+    virp_chain_verify_result_t vr;
+    ASSERT_OK(virp_chain_verify_session(&st.chain, GX_SESSION, &vr));
+    ASSERT_TRUE(vr.valid);
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    ASSERT_EQ(gx_read_session(GX_SESSION, rows, GX_MAX_ROWS), 1);
+    char digest[65], want[128];
+    gr_sha256_hex(CLEAN, digest);
+    snprintf(want, sizeof(want), "\"response_sha256\":\"%s\"", digest);
+    ASSERT_TRUE(strstr(rows[0].body, want) != NULL);
+
+    gxs_assert_crypto_verified();
+    gxs_cleanup();
+}
+
+/*
+ * G2 — planted secrets in a device response are REDACTED in the signed
+ * body, the markers are visible, and the scrubbed capture still chains
+ * and verifies at the Ed25519 tier — redact-before-sign is coherent.
+ */
+TEST(test_scrub_G2_planted_secrets_redacted_and_verifies)
+{
+    onode_state_t st;
+    ASSERT_OK(gxs_setup(&st));
+
+    static const char PLANTED[] =
+        "Building configuration...\n"
+        "hostname R1\n"
+        "enable secret 5 $1$abcd$CANARYenablehash\n"
+        "snmp-server community CANARYcommunity RO\n"
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "CANARYpemline1\n"
+        "CANARYpemline2\n"
+        "-----END RSA PRIVATE KEY-----\n"
+        "end\n";
+    virp_driver_mock_set_output(PLANTED);
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    virp_error_t err = onode_execute(&st, "PVE-LAB", "show running-config",
+                                     obs, sizeof(obs), &olen);
+    virp_driver_mock_set_output(NULL);
+    ASSERT_OK(err);
+
+    /* the signed observation: markers present, secrets absent */
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+    ASSERT_TRUE(!gx_bytes_contain(obs, olen, "CANARY"));
+    ASSERT_TRUE(gx_bytes_contain(obs, olen, "[REDACTED: enable-secret]"));
+    ASSERT_TRUE(gx_bytes_contain(obs, olen, "[REDACTED: snmp-community]"));
+    ASSERT_TRUE(gx_bytes_contain(obs, olen, "[REDACTED: private-key-block]"));
+    /* non-secret structure survives — the body still shows WHAT happened */
+    ASSERT_TRUE(gx_bytes_contain(obs, olen, "hostname R1"));
+
+    /* the chain commitment is over the SCRUBBED bytes: recompute the
+     * expected scrubbed body independently and match response_sha256 */
+    static char expect[VIRP_OUTPUT_MAX];
+    size_t expect_len = 0;
+    unsigned nred = 0;
+    ASSERT_OK(virp_scrub_body(PLANTED, strlen(PLANTED), expect,
+                              sizeof(expect), &expect_len, &nred));
+    expect[expect_len] = '\0';
+    ASSERT_EQ((int)nred, 3);
+
+    virp_chain_verify_result_t vr;
+    ASSERT_OK(virp_chain_verify_session(&st.chain, GX_SESSION, &vr));
+    ASSERT_TRUE(vr.valid);
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    ASSERT_EQ(gx_read_session(GX_SESSION, rows, GX_MAX_ROWS), 1);
+    char digest[65], want[128];
+    gr_sha256_hex(expect, digest);
+    snprintf(want, sizeof(want), "\"response_sha256\":\"%s\"", digest);
+    ASSERT_TRUE(strstr(rows[0].body, want) != NULL);
+
+    /* no secret anywhere in the database, WAL included */
+    ASSERT_EQ(gx_file_contains(GX_CHAIN_DB, "CANARY"), 0);
+    ASSERT_EQ(gx_file_contains(GX_CHAIN_DB "-wal", "CANARY"), 0);
+
+    gxs_assert_crypto_verified();
+    gxs_cleanup();
+}
+
+/*
+ * G3 — fail-closed at capture: a scrubber failure yields a signed body
+ * that is ENTIRELY [REDACTED: scrub-error]. The raw content reaches
+ * nothing: not the observation, not the chain commitment, not the DB.
+ */
+TEST(test_scrub_G3_fail_closed_full_redaction)
+{
+    onode_state_t st;
+    ASSERT_OK(gxs_setup(&st));
+
+    static const char BODY[] =
+        "harmless line\nCANARYplainbody would leak if scrub failed open\n";
+    virp_driver_mock_set_output(BODY);
+    virp_scrub_test_force_error(true);
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+                                     obs, sizeof(obs), &olen);
+    virp_scrub_test_force_error(false);
+    virp_driver_mock_set_output(NULL);
+    ASSERT_OK(err);
+
+    /* still a valid signed observation — of the marker, nothing else */
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+    ASSERT_TRUE(gx_bytes_contain(obs, olen, "[REDACTED: scrub-error]"));
+    ASSERT_TRUE(!gx_bytes_contain(obs, olen, "CANARY"));
+    ASSERT_TRUE(!gx_bytes_contain(obs, olen, "harmless line"));
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    ASSERT_EQ(gx_read_session(GX_SESSION, rows, GX_MAX_ROWS), 1);
+    /* the commitment is over exactly the marker */
+    char digest[65], want[128];
+    gr_sha256_hex("[REDACTED: scrub-error]", digest);
+    snprintf(want, sizeof(want), "\"response_sha256\":\"%s\"", digest);
+    ASSERT_TRUE(strstr(rows[0].body, want) != NULL);
+
+    ASSERT_EQ(gx_file_contains(GX_CHAIN_DB, "CANARY"), 0);
+    ASSERT_EQ(gx_file_contains(GX_CHAIN_DB "-wal", "CANARY"), 0);
+
+    gxs_assert_crypto_verified();
+    gxs_cleanup();
+}
+
+/*
+ * G4 — going-forward only: a scrubbed capture appended to a chain with
+ * existing entries leaves every prior entry byte-identical, and the
+ * whole session (old + scrubbed) still verifies with unbroken linkage.
+ */
+TEST(test_scrub_G4_existing_entries_untouched)
+{
+    onode_state_t st;
+    ASSERT_OK(gxs_setup(&st));
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+
+    /* the pre-existing entry (clean capture) */
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+
+    /* snapshot it BEFORE the scrubbed append, through a separate
+     * read-only connection */
+    static gx_row_t before[GX_MAX_ROWS];
+    ASSERT_EQ(gx_read_session(GX_SESSION, before, GX_MAX_ROWS), 1);
+
+    /* the scrubbed capture */
+    virp_driver_mock_set_output("enable secret 5 $1$CANARYg4\n");
+    virp_error_t err = onode_execute(&st, "PVE-LAB", "show running-config",
+                                     obs, sizeof(obs), &olen);
+    virp_driver_mock_set_output(NULL);
+    ASSERT_OK(err);
+
+    virp_chain_verify_result_t vr;
+    ASSERT_OK(virp_chain_verify_session(&st.chain, GX_SESSION, &vr));
+    ASSERT_TRUE(vr.valid);
+    ASSERT_EQ((int)vr.entries_checked, 2);
+
+    gx_teardown(&st);
+
+    static gx_row_t after[GX_MAX_ROWS];
+    ASSERT_EQ(gx_read_session(GX_SESSION, after, GX_MAX_ROWS), 2);
+
+    /* the pre-existing entry is byte-identical in every field */
+    ASSERT_EQ((int)after[0].seq, (int)before[0].seq);
+    ASSERT_EQ(strcmp(after[0].type,  before[0].type),  0);
+    ASSERT_EQ(strcmp(after[0].id,    before[0].id),    0);
+    ASSERT_EQ(strcmp(after[0].ahash, before[0].ahash), 0);
+    ASSERT_EQ(strcmp(after[0].ehash, before[0].ehash), 0);
+    ASSERT_EQ(strcmp(after[0].prev,  before[0].prev),  0);
+    ASSERT_EQ(strcmp(after[0].body,  before[0].body),  0);
+
+    /* and the scrubbed entry links to it, unbroken */
+    ASSERT_EQ(strcmp(after[1].prev, after[0].ehash), 0);
+    ASSERT_EQ(gx_file_contains(GX_CHAIN_DB, "CANARY"), 0);
+
+    gxs_assert_crypto_verified();
+    gxs_cleanup();
 }
 
 /* =========================================================================
@@ -6227,6 +6528,12 @@ int main(void)
     RUN_TEST(test_errored_execution_still_chains_no_gap);
     RUN_TEST(test_refused_action_still_chains_gate_rejection);
     RUN_TEST(test_chain_verify_over_mixed_executions_and_rejections);
+
+    printf("\n  -- Scrub-at-capture (S-1) gates G1-G4 --\n");
+    RUN_TEST(test_scrub_G1_clean_capture_verifies);
+    RUN_TEST(test_scrub_G2_planted_secrets_redacted_and_verifies);
+    RUN_TEST(test_scrub_G3_fail_closed_full_redaction);
+    RUN_TEST(test_scrub_G4_existing_entries_untouched);
 
     printf("\n[Gate observation-tier honesty (Item 1 hardening)]\n");
     RUN_TEST(test_gate_obs_tier_honesty);

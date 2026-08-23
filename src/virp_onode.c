@@ -23,6 +23,7 @@
 #include "virp_transcript.h"
 #include "virp_context.h"
 #include "virp_validator.h"
+#include "virp_scrub.h"          /* scrub-at-capture (S-1) — before sign */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1869,6 +1870,24 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     }
 
     pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+
+    /* ── SCRUB-AT-CAPTURE (S-1) — this is the ONE insertion point ─────
+     * Redact secret-shaped content from the captured result BEFORE
+     * anything downstream consumes it. Every consumer sits below this
+     * line: the OUTCOME_UNKNOWN and driver-refused ERROR bodies (built
+     * from result.error_msg), gate_emit_execution's response_sha256
+     * commitment (computed over result.output), and both observation
+     * constructors (v1 tiered / v2 session-bound). The redacted form IS
+     * the artifact: the hash commits to it, the signature verifies over
+     * it, and no unredacted copy is retained anywhere. Fail-closed by
+     * contract — on any scrub failure the wrapper substitutes the whole
+     * field with [REDACTED: scrub-error], never passes it through raw.
+     * This is the generic safety net for a device unexpectedly echoing
+     * a credential; the per-driver config scrubs (cisco/asa/fortigate)
+     * remain the primary defense for known credential-bearing reads.
+     * Moving this call below gate_emit_execution would make the chain
+     * commit to unredacted bytes — do not reorder. */
+    virp_scrub_exec_result(&result);
 
     /*
      * Failure with no output and NO proof of non-dispatch: the command
