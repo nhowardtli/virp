@@ -7,6 +7,7 @@ REST API wrapping virp-onode for consumption by any automation platform.
 import asyncio
 import collections
 import fcntl
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -39,6 +40,13 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 VIRP_SOCKET = os.environ.get("VIRP_SOCKET", "/run/virp/onode.sock")
 VIRP_KEY_PATH = os.environ.get("VIRP_KEY_PATH", "/etc/virp/keys/onode.key")
+# D-1: the PUBLIC half of the node's Ed25519 chain-signing key. Publishing
+# it here lets a third party fetch the key that verifies chain signatures
+# from the node, the same surface that already carries the HMAC-key
+# fingerprint. Only the public key is ever read — the secret lives on the
+# daemon host and never reaches this process.
+VIRP_CHAIN_SIGN_PUB = os.environ.get("VIRP_CHAIN_SIGN_PUB",
+                                     "/etc/virp/keys/chain-sign.pub")
 # devices.json lives under /var/lib/virp (service-user writable) rather
 # than /etc/virp (root-owned, immutable config). Operators can point
 # VIRP_DEVICES elsewhere; see deploy/virp-onode.service for the
@@ -1283,15 +1291,53 @@ async def get_observations(limit: int = 50, device: Optional[str] = None):
     }
 
 
+def _chain_sign_pub_info():
+    """Public chain-signing key info for /api/key, or a not-loaded stub.
+
+    Reads only the PUBLIC key file (32 raw Ed25519 bytes). key_id is
+    sha256-raw-16 over the public key — the same scheme as the C side
+    (virp_chainsign_key_id). No secret material is involved; a missing
+    file simply means this node has not enabled D-1 signing yet."""
+    info = {
+        "key_loaded": False,
+        "algorithm": "Ed25519",
+        "scheme": "ed25519-detached-v1",
+        "key_id": None,
+        "public_key_hex": None,
+        "public_key_spki_b64": None,
+        "pub_path": VIRP_CHAIN_SIGN_PUB,
+    }
+    try:
+        with open(VIRP_CHAIN_SIGN_PUB, "rb") as fh:
+            pub = fh.read()
+    except (FileNotFoundError, IsADirectoryError, PermissionError):
+        return info
+    except Exception:
+        return info
+    if len(pub) != 32:
+        return info
+    # SPKI DER prefix for Ed25519 (RFC 8410): 12-byte header + 32-byte key.
+    spki = bytes.fromhex("302a300506032b6570032100") + pub
+    info.update({
+        "key_loaded": True,
+        "key_id": hashlib.sha256(pub).hexdigest()[:32],
+        "public_key_hex": pub.hex(),
+        "public_key_spki_b64": base64.b64encode(spki).decode("ascii"),
+    })
+    return info
+
+
 @app.get("/api/key")
 async def key_info():
-    """Intentionally public — fingerprint-only info, never exposes key material."""
+    """Intentionally public — fingerprint / public-key info, never secret material."""
     return {
         "key_loaded": key_material is not None,
         "fingerprint": key_fingerprint,
         "channel": "OBSERVATION",
         "algorithm": "HMAC-SHA256",
         "key_path": VIRP_KEY_PATH,
+        # D-1: the public chain-signing key, for asymmetric chain verification.
+        "chain_signing": _chain_sign_pub_info(),
     }
 
 

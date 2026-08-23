@@ -4,7 +4,7 @@
  * CLI Tool — key generation, message inspection, test message building
  *
  * Usage:
- *   virp-tool keygen  <okey|rkey|approval|obskey> <output_file>
+ *   virp-tool keygen  <okey|rkey|approval|obskey|chainsign> <output_file>
  *   virp-tool inspect <message_file> <key_file> <okey|rkey>
  *   virp-tool build   <observation|heartbeat|proposal> [options]
  *   virp-tool hexdump <message_file>
@@ -18,6 +18,7 @@
 #include "virp_approval.h"
 #include "virp_approver_registry.h"
 #include "virp_chain.h"
+#include "virp_chainsign.h"
 #include "virp_federation.h"
 #include "virp_obskey.h"
 #include "cJSON.h"
@@ -185,10 +186,55 @@ static int cmd_keygen_obskey(const char *prefix)
     return 0;
 }
 
+/*
+ * keygen chainsign — generate the per-node Ed25519 CHAIN-SIGNING keypair
+ * (D-1 detached chain signatures). A SIXTH key role: distinct from the
+ * symmetric K_chain (whose HMAC is unchanged and still written), from
+ * the obskey (which signs observation BODIES, not chain entries), and
+ * from the approval keypair. Custody is the obskey's — secret on the
+ * daemon host, because the daemon is the attester of its own chain.
+ *
+ * What the .pub buys: anyone holding it can verify every chain entry
+ * and head the daemon signs, over the SAME canonical bytes K_chain
+ * HMACs, without holding any secret — and cannot mint. Pass the secret
+ * to the daemon with -S; publish the .pub (or its key_id) out of band
+ * and via /api/key.
+ */
+static int cmd_keygen_chainsign(const char *prefix)
+{
+    virp_chainsign_key_t kp;
+    if (virp_chainsign_generate(&kp) != VIRP_OK) {
+        fprintf(stderr, "Error: chain-signing keypair generation failed\n");
+        return 1;
+    }
+
+    char pk_path[512], sk_path[512];
+    snprintf(pk_path, sizeof(pk_path), "%s.pub", prefix);
+    snprintf(sk_path, sizeof(sk_path), "%s.key", prefix);
+
+    if (virp_chainsign_save(&kp, sk_path, pk_path) != VIRP_OK) {
+        fprintf(stderr, "Error: saving chain-signing keypair failed "
+                        "(existing %s is never overwritten)\n", sk_path);
+        virp_chainsign_destroy(&kp);
+        return 1;
+    }
+
+    printf("Generated chain-signing keypair (Ed25519, scheme %s):\n",
+           VIRP_CHAINSIGN_SCHEME);
+    printf("  Secret key:  %s (0600 — DAEMON HOST ONLY; pass with -S)\n",
+           sk_path);
+    printf("  Public key:  %s (32 raw bytes — distribute to verifiers; "
+           "verify-only, cannot forge)\n", pk_path);
+    printf("  Key ID:      %s (sha256-raw-16 over the public key)\n",
+           kp.key_id_hex);
+    virp_chainsign_destroy(&kp);
+    return 0;
+}
+
 static int cmd_keygen(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: virp-tool keygen <okey|rkey|approval|obskey> <output>\n");
+        fprintf(stderr, "Usage: virp-tool keygen <okey|rkey|approval|obskey|chainsign> <output>\n");
         return 1;
     }
 
@@ -201,13 +247,16 @@ static int cmd_keygen(int argc, char **argv)
     if (strcmp(type_str, "obskey") == 0)
         return cmd_keygen_obskey(path);
 
+    if (strcmp(type_str, "chainsign") == 0)
+        return cmd_keygen_chainsign(path);
+
     virp_key_type_t type;
     if (strcmp(type_str, "okey") == 0)
         type = VIRP_KEY_TYPE_OKEY;
     else if (strcmp(type_str, "rkey") == 0)
         type = VIRP_KEY_TYPE_RKEY;
     else {
-        fprintf(stderr, "Error: key type must be 'okey', 'rkey', 'approval', or 'obskey'\n");
+        fprintf(stderr, "Error: key type must be 'okey', 'rkey', 'approval', 'obskey', or 'chainsign'\n");
         return 1;
     }
 
@@ -1584,6 +1633,23 @@ static void chain_verify_print(const char *sess,
     printf("%-32s %s  entries=%lld to_seq=%lld",
            sess, r->valid ? "VALID" : "BROKEN",
            (long long)r->entries_checked, (long long)r->to_sequence);
+
+    /* Tier annotation (D-1). Which checks actually ran, and whether the
+     * head length claim is authenticated — a keyless VALID means the rows
+     * present are self-consistent, NOT that the tail was retained. */
+    char tier[128];
+    int t = 0;
+    t += snprintf(tier + t, sizeof(tier) - t, " tier=hash+link");
+    if (r->hmac_checked) t += snprintf(tier + t, sizeof(tier) - t, "+hmac");
+    if (r->sig_checked)  t += snprintf(tier + t, sizeof(tier) - t, "+ed25519");
+    printf("%s", tier);
+    if (r->sig_checked && r->sig_key_id[0])
+        printf(" key_id=%s", r->sig_key_id);
+    if (r->valid && !r->head_authenticated)
+        printf(" head=UNAUTHENTICATED");
+    if (r->sig_key_unavailable)
+        printf(" sig=KEY_UNAVAILABLE(%s)", r->sig_key_id);
+
     if (!r->valid) {
         if (r->first_broken >= 0)
             printf(" first_broken=%lld", (long long)r->first_broken);
@@ -1675,13 +1741,15 @@ static int chain_verify_socket(const char *sock_path, const char *session)
 }
 
 static int chain_verify_offline(const char *db_path, const char *key_path,
+                                const char *pubkey_path,
                                 const char *only_session)
 {
     virp_chain_state_t chain;
-    if (virp_chain_open_verifier(&chain, db_path, key_path, 1,
-                                 "local") != VIRP_OK) {
-        fprintf(stderr, "Error: cannot open chain %s with key %s\n",
-                db_path, key_path);
+    if (virp_chain_open_verifier_ex(&chain, db_path, key_path, pubkey_path, 1,
+                                    "local") != VIRP_OK) {
+        fprintf(stderr, "Error: cannot open chain %s (key=%s pubkey=%s)\n",
+                db_path, key_path ? key_path : "(none)",
+                pubkey_path ? pubkey_path : "(none)");
         return 1;
     }
 
@@ -1750,21 +1818,30 @@ static void chain_verify_usage(void)
 {
     fprintf(stderr,
         "Usage: virp chain verify --session S [--socket PATH]\n"
-        "       virp chain verify --db PATH --key PATH [--session S]\n"
+        "       virp chain verify --db PATH [--key PATH] [--pubkey PATH]\n"
+        "                          [--keyless] [--session S]\n"
         "\n"
         "Verifies whole sessions against the signed head record\n"
-        "(per-entry HMAC, prev-hash linkage, completeness).\n"
+        "(prev-hash linkage, completeness, and — per tier — HMAC and/or\n"
+        "Ed25519).\n"
         "\n"
         "Live form (--socket, default %s):\n"
         "  asks the running daemon; the daemon remains the chain's only\n"
         "  writer and key-holder. --session is required.\n"
-        "Offline form (--db + --key):\n"
-        "  verifies directly — for an auditor handed a chain.db and its\n"
-        "  chain key. Without --session, verifies every session. Opens\n"
-        "  the DB READ-ONLY: no schema ensure, no migration, no head\n"
-        "  backfill — the file is byte-identical after verification.\n"
-        "  Legacy DBs (no chain_heads) report LEGACY_CHAIN /\n"
-        "  COMPLETENESS_UNPROVABLE rather than being migrated.\n"
+        "Offline form (--db, three independent tiers that compose):\n"
+        "  --key PATH     SYMMETRIC: verify the K_chain HMAC (authenticates\n"
+        "                 chain length via the signed head).\n"
+        "  --pubkey PATH  ASYMMETRIC: verify the Ed25519 chain-signing\n"
+        "                 signature with the PUBLIC key ONLY — no secret\n"
+        "                 material is loaded. This is the third-party path.\n"
+        "  --keyless      KEYLESS: hash+link+completeness only. Required to\n"
+        "                 run with NEITHER key (so a keyless run is a\n"
+        "                 deliberate choice, not a forgotten key). The head\n"
+        "                 length claim is reported UNAUTHENTICATED.\n"
+        "  Without --session, verifies every session. Opens the DB\n"
+        "  READ-ONLY: no schema ensure, no migration, no head backfill —\n"
+        "  the file is byte-identical after verification. Legacy DBs (no\n"
+        "  chain_heads) report LEGACY_CHAIN / COMPLETENESS_UNPROVABLE.\n"
         "Exit status: 0 all verified, 1 anything broken or no sessions.\n",
         ONODE_DEFAULT_SOCKET);
 }
@@ -1772,7 +1849,8 @@ static void chain_verify_usage(void)
 static int cmd_chain_verify(int argc, char **argv)
 {
     const char *session = NULL, *sock_path = NULL;
-    const char *db_path = NULL, *key_path = NULL;
+    const char *db_path = NULL, *key_path = NULL, *pubkey_path = NULL;
+    bool keyless = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--session") == 0 && i + 1 < argc)
             session = argv[++i];
@@ -1782,6 +1860,10 @@ static int cmd_chain_verify(int argc, char **argv)
             db_path = argv[++i];
         else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc)
             key_path = argv[++i];
+        else if (strcmp(argv[i], "--pubkey") == 0 && i + 1 < argc)
+            pubkey_path = argv[++i];
+        else if (strcmp(argv[i], "--keyless") == 0)
+            keyless = true;
         else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             chain_verify_usage();
@@ -1789,9 +1871,9 @@ static int cmd_chain_verify(int argc, char **argv)
         }
     }
 
-    if (db_path || key_path) {
-        if (!db_path || !key_path) {
-            fprintf(stderr, "Error: --db and --key go together\n");
+    if (db_path || key_path || pubkey_path || keyless) {
+        if (!db_path) {
+            fprintf(stderr, "Error: offline verify requires --db\n");
             chain_verify_usage();
             return 1;
         }
@@ -1801,7 +1883,17 @@ static int cmd_chain_verify(int argc, char **argv)
             chain_verify_usage();
             return 1;
         }
-        return chain_verify_offline(db_path, key_path, session);
+        /* Require an explicit tier: a key, a pubkey, or an explicit
+         * --keyless. Refusing the bare form makes a keyless verification a
+         * deliberate choice, never a forgotten --key silently downgrading. */
+        if (!key_path && !pubkey_path && !keyless) {
+            fprintf(stderr, "Error: choose a tier — --key (HMAC), "
+                            "--pubkey (Ed25519), or --keyless "
+                            "(hash+link only)\n");
+            chain_verify_usage();
+            return 1;
+        }
+        return chain_verify_offline(db_path, key_path, pubkey_path, session);
     }
 
     if (!session) {
@@ -1856,7 +1948,7 @@ static void usage(void)
     printf("build: ");
     print_version();
     printf("\nCommands:\n");
-    printf("  keygen   <okey|rkey|approval|obskey> <output>  Generate signing key\n");
+    printf("  keygen   <okey|rkey|approval|obskey|chainsign> <output>  Generate signing key\n");
     printf("  inspect  <msg_file> <key_file> <type>    Inspect and verify message\n");
     printf("  build    <type> [options]                 Build test message\n");
     printf("  hexdump  <msg_file>                       Raw hex dump\n");

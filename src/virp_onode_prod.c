@@ -917,6 +917,13 @@ static void usage(const char *prog)
     printf("              REQUIRED when approval mode is enabled — the daemon\n");
     printf("              refuses to start in approval mode without a chain)\n");
     printf("  -C <path>   Chain key path (32-byte key file, required with -c)\n");
+    printf("  -S <path>   Chain-signing Ed25519 SECRET key (D-1). OPT-IN:\n");
+    printf("              absent = signing off, zero behaviour change.\n");
+    printf("              Enables detached Ed25519 signatures beside every\n");
+    printf("              chain entry and head (pure addition over the same\n");
+    printf("              canonical bytes) so a third party can verify with\n");
+    printf("              the public key alone. Requires -c/-C. Generate\n");
+    printf("              with: virp-tool keygen chainsign <prefix>\n");
     printf("  -a <path>   Approval store dir (default: /var/lib/virp/approvals)\n");
     printf("  -A <path>   Approver registry (default: /etc/virp/approvers.json)\n");
     printf("  -h          Show this help\n");
@@ -932,12 +939,13 @@ int main(int argc, char **argv)
     const char *devices_path = NULL;
     const char *chain_db_path = NULL;
     const char *chain_key_path = NULL;
+    const char *chain_sign_key_path = NULL;   /* D-1: -S, opt-in */
     const char *approval_dir = "/var/lib/virp/approvals";
     const char *approvers_path = "/etc/virp/approvers.json";
     uint32_t node_id = 0x00000001;
 
     int opt;
-    while ((opt = getopt(argc, argv, "k:K:W:s:d:n:c:C:a:A:h")) != -1) {
+    while ((opt = getopt(argc, argv, "k:K:W:s:d:n:c:C:S:a:A:h")) != -1) {
         switch (opt) {
         case 'k':
             okey_path = optarg;
@@ -962,6 +970,9 @@ int main(int argc, char **argv)
             break;
         case 'C':
             chain_key_path = optarg;
+            break;
+        case 'S':
+            chain_sign_key_path = optarg;
             break;
         case 'a':
             approval_dir = optarg;
@@ -1101,6 +1112,30 @@ int main(int argc, char **argv)
         onode_destroy(&g_state);
         virp_context_destroy(ctx);
         return 1;
+    }
+
+    /* D-1: opt-in detached Ed25519 chain signing. Only meaningful with a
+     * chain (-c/-C); requires -S <chain-signing secret>. Absent -> signing
+     * off, zero behaviour change. Present but failing to load -> FATAL: an
+     * operator who asked for signing must not get a silently-unsigned chain
+     * (fail-closed, matching the append path). */
+    if (chain_sign_key_path) {
+        if (!g_state.chain_enabled) {
+            fprintf(stderr, "[O-Node] FATAL: -S (chain signing) requires a "
+                    "trust chain (-c <db> -C <key>). Refusing to start.\n");
+            onode_destroy(&g_state);
+            virp_context_destroy(ctx);
+            return 1;
+        }
+        err = virp_chain_enable_signing(&g_state.chain, chain_sign_key_path);
+        if (err != VIRP_OK) {
+            fprintf(stderr, "[O-Node] FATAL: chain signing was requested "
+                    "(-S %s) but could not be enabled: %s. Refusing to "
+                    "start.\n", chain_sign_key_path, virp_error_str(err));
+            onode_destroy(&g_state);
+            virp_context_destroy(ctx);
+            return 1;
+        }
     }
 
     /* Install signal handlers */
