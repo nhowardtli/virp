@@ -959,6 +959,13 @@ $(TEST_OBSKEY): tests/test_obskey.c $(LIB)
 test-obskey: $(TEST_OBSKEY)
 	./$(TEST_OBSKEY)
 
+# D-1 asymmetric-tier Python cross-check (report/verify.py verifies the C
+# signatures with the public key only). Optional Ed25519 backend: SKIPS
+# loudly (exit 0) when neither pynacl nor cryptography is importable.
+.PHONY: test-chainsign-vectors
+test-chainsign-vectors: $(TEST_CHAIN_SIGNING)
+	python3 tests/test_chainsign_vectors.py
+
 # D-1 chain signing at the CHAIN level (schema, append/head signing,
 # verifier tiers). #includes src/virp_chain.c like test-chain-invariant,
 # so must NOT also be handed virp_chain.o.
@@ -1771,7 +1778,7 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

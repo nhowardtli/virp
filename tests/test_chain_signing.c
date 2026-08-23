@@ -584,8 +584,50 @@ static void test_unsigned_session_with_pubkey(void)
     PASS();
 }
 
+/* Env-gated fixture emitter: when VIRP_CHAINSIGN_OUT is a directory, build
+ * a signed chain there (chain.db + chain.key + sign.pub) and exit, so the
+ * Python verifier can cross-check the asymmetric tier against a chain the
+ * live C append path actually signed. */
+static int emit_fixture(const char *dir)
+{
+    char db[512], ck[512], skf[512], pk[512];
+    snprintf(db, sizeof(db), "%s/chain.db", dir);
+    snprintf(ck, sizeof(ck), "%s/chain.key", dir);
+    snprintf(skf, sizeof(skf), "%s/sign.key", dir);
+    snprintf(pk, sizeof(pk), "%s/sign.pub", dir);
+    unlink(db); unlink(ck); unlink(skf); unlink(pk);
+
+    virp_signing_key_t k;
+    if (virp_key_generate(&k, VIRP_KEY_TYPE_CHAIN) != VIRP_OK) return 1;
+    if (virp_key_save_file(&k, ck) != VIRP_OK) return 1;
+    virp_key_destroy(&k);
+    virp_chainsign_key_t s;
+    if (virp_chainsign_generate(&s) != VIRP_OK) return 1;
+    if (virp_chainsign_save(&s, skf, pk) != VIRP_OK) return 1;
+    virp_chainsign_destroy(&s);
+
+    virp_chain_state_t st;
+    if (virp_chain_init(&st, db, ck, 7, "local") != VIRP_OK) return 1;
+    if (virp_chain_enable_signing(&st, skf) != VIRP_OK) return 1;
+    for (int i = 0; i < 6; i++) {
+        char id[32], h[65];
+        snprintf(id, sizeof(id), "fx-%d", i);
+        memset(h, (char)('a' + (i % 6)), 64); h[64] = '\0';
+        virp_chain_entry_t e;
+        if (virp_chain_append(&st, "fixture-sess", "observation", id, h, &e)
+                != VIRP_OK) { virp_chain_destroy(&st); return 1; }
+    }
+    virp_chain_destroy(&st);
+    fprintf(stderr, "emitted signed fixture in %s\n", dir);
+    return 0;
+}
+
 int main(void)
 {
+    const char *emit = getenv("VIRP_CHAINSIGN_OUT");
+    if (emit && emit[0])
+        return emit_fixture(emit);
+
     printf("\n=== VIRP detached chain signing — chain level (D-1) ===\n\n");
     test_signing_off_schema_identical();
     test_enable_signing_adds_columns();

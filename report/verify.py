@@ -258,6 +258,199 @@ def key_fingerprint(key):
     return hashlib.sha256(key).hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# D-1 detached Ed25519 chain signatures — the ASYMMETRIC verification tier,
+# in pure Python, needing ONLY the public key. Mirrors src/virp_chainsign.c:
+#   signature = Ed25519.verify(pub, TAG || NUL || canonical_bytes)
+# with the entry / head domain tags. The signed bytes are the SAME canonical
+# bytes canonical_json()/head_canonical() produce — never modified.
+#
+# Ed25519 has no stdlib implementation, so the backend is OPTIONAL: PyNaCl
+# or `cryptography` if importable. Absent, signature checks report UNCHECKED
+# with a stated reason (never a silent pass), exactly as a missing chain key
+# reports the HMAC UNCHECKED.
+# ---------------------------------------------------------------------------
+
+CHAINSIGN_TAG_ENTRY = b"VIRP-CHAIN-ENTRY-SIG-v1\x00"
+CHAINSIGN_TAG_HEAD = b"VIRP-CHAIN-HEAD-SIG-v1\x00"
+CHAINSIGN_SCHEME = "ed25519-detached-v1"
+
+_ED25519_BACKEND = None
+_ED25519_BACKEND_NAME = None
+
+
+def _load_ed25519_backend():
+    """Return a callable verify(pub32, msg, sig64)->bool, or None. Tries
+    PyNaCl then `cryptography`; caches the result."""
+    global _ED25519_BACKEND, _ED25519_BACKEND_NAME
+    if _ED25519_BACKEND is not None or _ED25519_BACKEND_NAME == "none":
+        return _ED25519_BACKEND
+    try:
+        from nacl.signing import VerifyKey
+        from nacl.exceptions import BadSignatureError
+
+        def _verify(pub, msg, sig):
+            try:
+                VerifyKey(pub).verify(msg, sig)
+                return True
+            except BadSignatureError:
+                return False
+        _ED25519_BACKEND = _verify
+        _ED25519_BACKEND_NAME = "pynacl"
+        return _verify
+    except ImportError:
+        pass
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey)
+        from cryptography.exceptions import InvalidSignature
+
+        def _verify(pub, msg, sig):
+            try:
+                Ed25519PublicKey.from_public_bytes(pub).verify(sig, msg)
+                return True
+            except InvalidSignature:
+                return False
+        _ED25519_BACKEND = _verify
+        _ED25519_BACKEND_NAME = "cryptography"
+        return _verify
+    except ImportError:
+        _ED25519_BACKEND_NAME = "none"
+        return None
+
+
+def chainsign_available():
+    """True iff an Ed25519 backend is importable in this environment."""
+    return _load_ed25519_backend() is not None
+
+
+def chainsign_backend_name():
+    _load_ed25519_backend()
+    return _ED25519_BACKEND_NAME
+
+
+def load_chainsign_pub(path):
+    """Load a 32-byte raw Ed25519 chain-signing PUBLIC key. No secret."""
+    with open(path, "rb") as fh:
+        pub = fh.read()
+    if len(pub) != 32:
+        raise ValueError("%s: expected 32-byte Ed25519 public key, got %d"
+                         % (path, len(pub)))
+    return pub
+
+
+def chainsign_key_id(pub):
+    """sha256-raw-16 over the public key, 32 lowercase hex — matches
+    virp_chainsign_key_id()."""
+    return hashlib.sha256(pub).hexdigest()[:32]
+
+
+def chainsign_verify(pub, tag, msg_bytes, sig_hex):
+    """Verify a detached signature over tag||msg with the public key.
+    Returns (verdict, detail): PASS/FAIL, or UNCHECKED when no backend.
+    sig_hex is the 128-char stored hex; msg_bytes is the canonical bytes."""
+    backend = _load_ed25519_backend()
+    if backend is None:
+        return (UNCHECKED, "no Ed25519 backend (pip install pynacl or "
+                           "cryptography) — signature not checked")
+    if not sig_hex:
+        return (FAIL, "no signature present")
+    try:
+        sig = bytes.fromhex(sig_hex)
+    except ValueError:
+        return (FAIL, "signature is not valid hex")
+    if len(sig) != 64:
+        return (FAIL, "signature is %d bytes, expected 64" % len(sig))
+    ok = backend(pub, tag + msg_bytes, sig)
+    return (PASS, "") if ok else (FAIL, "Ed25519 signature did not verify")
+
+
+def verify_chain_signatures(entries, heads, pub, selection_complete=False):
+    """ASYMMETRIC-tier verification of a chain, PUBLIC KEY ONLY.
+
+    Mirrors the C verifier's session-granularity rule: in a head-signed
+    session every entry's chain_sig_key_id must equal the head's key_id
+    (which must equal the given key's id), and every entry signature and the
+    head signature must verify. A missing signature or a key_id that differs
+    is a FAIL. A session signed under a DIFFERENT key_id than `pub` is a soft
+    whole-session 'key_unavailable' (never a FAIL). An unsigned (pre-D-1)
+    session is 'unsigned' (never a FAIL).
+
+    Returns {session_id: {verdict, detail, entries_signed, entries_total}}
+    where verdict is one of PASS / FAIL / UNCHECKED / 'unsigned' /
+    'key_unavailable'. `heads` maps session_id -> row dict (may be None)."""
+    want_kid = chainsign_key_id(pub)
+    by_session = {}
+    for e in entries:
+        by_session.setdefault(e["session_id"], []).append(e)
+
+    out = {}
+    for sid in sorted(by_session):
+        rows = sorted(by_session[sid], key=lambda r: r["sequence"])
+        head = (heads or {}).get(sid)
+        head_signed = bool(head and head.get("head_sig"))
+        any_entry_signed = any(r.get("chain_sig") for r in rows)
+
+        if not head_signed and not any_entry_signed:
+            out[sid] = {"verdict": "unsigned", "detail": "no signatures",
+                        "entries_signed": 0, "entries_total": len(rows)}
+            continue
+
+        # Which key_id does this session claim?
+        sess_kid = (head.get("head_sig_key_id") if head_signed
+                    else rows[0].get("chain_sig_key_id")) or ""
+        if sess_kid != want_kid:
+            out[sid] = {"verdict": "key_unavailable",
+                        "detail": "session signed under key_id %s, verifier "
+                                  "holds %s" % (sess_kid, want_kid),
+                        "entries_signed": 0, "entries_total": len(rows),
+                        "sig_key_id": sess_kid}
+            continue
+
+        verdict, detail, signed = PASS, "", 0
+        # Head signature.
+        if head_signed:
+            hc = head_canonical(sid, int(head["last_sequence"]),
+                                head["last_entry_hash"]).encode()
+            hv, hd = chainsign_verify(pub, CHAINSIGN_TAG_HEAD, hc,
+                                      head.get("head_sig"))
+            if hv == FAIL:
+                out[sid] = {"verdict": FAIL, "detail": "head: " + hd,
+                            "entries_signed": 0, "entries_total": len(rows),
+                            "sig_key_id": sess_kid}
+                continue
+            if hv == UNCHECKED:
+                out[sid] = {"verdict": UNCHECKED, "detail": hd,
+                            "entries_signed": 0, "entries_total": len(rows),
+                            "sig_key_id": sess_kid}
+                continue
+        # Every entry must be signed under the session key_id and verify.
+        for e in rows:
+            if not e.get("chain_sig"):
+                verdict, detail = FAIL, ("stripped signature at sequence %d"
+                                         % e["sequence"])
+                break
+            if (e.get("chain_sig_key_id") or "") != sess_kid:
+                verdict, detail = FAIL, ("key_id mismatch at sequence %d"
+                                         % e["sequence"])
+                break
+            ev, ed = chainsign_verify(pub, CHAINSIGN_TAG_ENTRY,
+                                      canonical_json(e).encode(),
+                                      e.get("chain_sig"))
+            if ev == UNCHECKED:
+                verdict, detail = UNCHECKED, ed
+                break
+            if ev == FAIL:
+                verdict, detail = FAIL, ("sequence %d: %s"
+                                         % (e["sequence"], ed))
+                break
+            signed += 1
+        out[sid] = {"verdict": verdict, "detail": detail,
+                    "entries_signed": signed, "entries_total": len(rows),
+                    "sig_key_id": sess_kid}
+    return out
+
+
 def decode_artifact(content):
     """Artifact bodies are stored either as 'base64:<b64>' (signed wire
     messages) or as literal text/JSON. Returns the bytes that artifact_hash
