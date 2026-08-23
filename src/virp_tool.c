@@ -1633,6 +1633,23 @@ static void chain_verify_print(const char *sess,
     printf("%-32s %s  entries=%lld to_seq=%lld",
            sess, r->valid ? "VALID" : "BROKEN",
            (long long)r->entries_checked, (long long)r->to_sequence);
+
+    /* Tier annotation (D-1). Which checks actually ran, and whether the
+     * head length claim is authenticated — a keyless VALID means the rows
+     * present are self-consistent, NOT that the tail was retained. */
+    char tier[128];
+    int t = 0;
+    t += snprintf(tier + t, sizeof(tier) - t, " tier=hash+link");
+    if (r->hmac_checked) t += snprintf(tier + t, sizeof(tier) - t, "+hmac");
+    if (r->sig_checked)  t += snprintf(tier + t, sizeof(tier) - t, "+ed25519");
+    printf("%s", tier);
+    if (r->sig_checked && r->sig_key_id[0])
+        printf(" key_id=%s", r->sig_key_id);
+    if (r->valid && !r->head_authenticated)
+        printf(" head=UNAUTHENTICATED");
+    if (r->sig_key_unavailable)
+        printf(" sig=KEY_UNAVAILABLE(%s)", r->sig_key_id);
+
     if (!r->valid) {
         if (r->first_broken >= 0)
             printf(" first_broken=%lld", (long long)r->first_broken);
@@ -1724,13 +1741,15 @@ static int chain_verify_socket(const char *sock_path, const char *session)
 }
 
 static int chain_verify_offline(const char *db_path, const char *key_path,
+                                const char *pubkey_path,
                                 const char *only_session)
 {
     virp_chain_state_t chain;
-    if (virp_chain_open_verifier(&chain, db_path, key_path, 1,
-                                 "local") != VIRP_OK) {
-        fprintf(stderr, "Error: cannot open chain %s with key %s\n",
-                db_path, key_path);
+    if (virp_chain_open_verifier_ex(&chain, db_path, key_path, pubkey_path, 1,
+                                    "local") != VIRP_OK) {
+        fprintf(stderr, "Error: cannot open chain %s (key=%s pubkey=%s)\n",
+                db_path, key_path ? key_path : "(none)",
+                pubkey_path ? pubkey_path : "(none)");
         return 1;
     }
 
@@ -1799,21 +1818,30 @@ static void chain_verify_usage(void)
 {
     fprintf(stderr,
         "Usage: virp chain verify --session S [--socket PATH]\n"
-        "       virp chain verify --db PATH --key PATH [--session S]\n"
+        "       virp chain verify --db PATH [--key PATH] [--pubkey PATH]\n"
+        "                          [--keyless] [--session S]\n"
         "\n"
         "Verifies whole sessions against the signed head record\n"
-        "(per-entry HMAC, prev-hash linkage, completeness).\n"
+        "(prev-hash linkage, completeness, and — per tier — HMAC and/or\n"
+        "Ed25519).\n"
         "\n"
         "Live form (--socket, default %s):\n"
         "  asks the running daemon; the daemon remains the chain's only\n"
         "  writer and key-holder. --session is required.\n"
-        "Offline form (--db + --key):\n"
-        "  verifies directly — for an auditor handed a chain.db and its\n"
-        "  chain key. Without --session, verifies every session. Opens\n"
-        "  the DB READ-ONLY: no schema ensure, no migration, no head\n"
-        "  backfill — the file is byte-identical after verification.\n"
-        "  Legacy DBs (no chain_heads) report LEGACY_CHAIN /\n"
-        "  COMPLETENESS_UNPROVABLE rather than being migrated.\n"
+        "Offline form (--db, three independent tiers that compose):\n"
+        "  --key PATH     SYMMETRIC: verify the K_chain HMAC (authenticates\n"
+        "                 chain length via the signed head).\n"
+        "  --pubkey PATH  ASYMMETRIC: verify the Ed25519 chain-signing\n"
+        "                 signature with the PUBLIC key ONLY — no secret\n"
+        "                 material is loaded. This is the third-party path.\n"
+        "  --keyless      KEYLESS: hash+link+completeness only. Required to\n"
+        "                 run with NEITHER key (so a keyless run is a\n"
+        "                 deliberate choice, not a forgotten key). The head\n"
+        "                 length claim is reported UNAUTHENTICATED.\n"
+        "  Without --session, verifies every session. Opens the DB\n"
+        "  READ-ONLY: no schema ensure, no migration, no head backfill —\n"
+        "  the file is byte-identical after verification. Legacy DBs (no\n"
+        "  chain_heads) report LEGACY_CHAIN / COMPLETENESS_UNPROVABLE.\n"
         "Exit status: 0 all verified, 1 anything broken or no sessions.\n",
         ONODE_DEFAULT_SOCKET);
 }
@@ -1821,7 +1849,8 @@ static void chain_verify_usage(void)
 static int cmd_chain_verify(int argc, char **argv)
 {
     const char *session = NULL, *sock_path = NULL;
-    const char *db_path = NULL, *key_path = NULL;
+    const char *db_path = NULL, *key_path = NULL, *pubkey_path = NULL;
+    bool keyless = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--session") == 0 && i + 1 < argc)
             session = argv[++i];
@@ -1831,6 +1860,10 @@ static int cmd_chain_verify(int argc, char **argv)
             db_path = argv[++i];
         else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc)
             key_path = argv[++i];
+        else if (strcmp(argv[i], "--pubkey") == 0 && i + 1 < argc)
+            pubkey_path = argv[++i];
+        else if (strcmp(argv[i], "--keyless") == 0)
+            keyless = true;
         else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             chain_verify_usage();
@@ -1838,9 +1871,9 @@ static int cmd_chain_verify(int argc, char **argv)
         }
     }
 
-    if (db_path || key_path) {
-        if (!db_path || !key_path) {
-            fprintf(stderr, "Error: --db and --key go together\n");
+    if (db_path || key_path || pubkey_path || keyless) {
+        if (!db_path) {
+            fprintf(stderr, "Error: offline verify requires --db\n");
             chain_verify_usage();
             return 1;
         }
@@ -1850,7 +1883,17 @@ static int cmd_chain_verify(int argc, char **argv)
             chain_verify_usage();
             return 1;
         }
-        return chain_verify_offline(db_path, key_path, session);
+        /* Require an explicit tier: a key, a pubkey, or an explicit
+         * --keyless. Refusing the bare form makes a keyless verification a
+         * deliberate choice, never a forgotten --key silently downgrading. */
+        if (!key_path && !pubkey_path && !keyless) {
+            fprintf(stderr, "Error: choose a tier — --key (HMAC), "
+                            "--pubkey (Ed25519), or --keyless "
+                            "(hash+link only)\n");
+            chain_verify_usage();
+            return 1;
+        }
+        return chain_verify_offline(db_path, key_path, pubkey_path, session);
     }
 
     if (!session) {

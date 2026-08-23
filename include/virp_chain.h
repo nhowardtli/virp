@@ -250,6 +250,12 @@ typedef struct {
     bool                   verify_sig_enabled;
     uint8_t                verify_pub[VIRP_CHAINSIGN_PK_SIZE];
     char                   verify_key_id_hex[VIRP_CHAINSIGN_KEYID_HEX];
+    /* Transient, set by chain_verify_session_locked before it calls the
+     * range walker and cleared after: this session IS signed but under a
+     * key_id the verifier was not given, so per-entry signatures must be
+     * SKIPPED (a soft whole-session outcome) rather than FAILED. Guarded by
+     * the chain lock like every other verify field. */
+    bool                   sig_key_unavailable_session;
     /* Verifier tier selection: whether K_chain was supplied (HMAC tier).
      * Keyless verification sets this false — hash+link+completeness only,
      * head length claim UNAUTHENTICATED. The writer path always has the

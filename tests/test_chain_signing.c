@@ -312,6 +312,278 @@ static void test_signed_entry_bytes_match_unsigned(void)
     PASS();
 }
 
+/* ===================================================================== */
+/* Verifier-tier tests: build a born-signed chain, close the writer, then  */
+/* re-open read-only at each tier with virp_chain_open_verifier_ex.        */
+/* ===================================================================== */
+
+/* Build a signed session with `n` entries; leaves DB/CK/SK/PK on disk. */
+static void build_signed_chain(const char *sess, int n)
+{
+    cleanup();
+    make_chain_key();
+    uint8_t pub[32]; char kid[33];
+    make_sign_key(pub, kid);
+    virp_chain_state_t st;
+    if (virp_chain_init(&st, DB, CK, 1, "local") != VIRP_OK) abort();
+    if (virp_chain_enable_signing(&st, SK) != VIRP_OK) abort();
+    for (int i = 0; i < n; i++) {
+        char id[32], h[65];
+        snprintf(id, sizeof(id), "%s-%d", sess, i);
+        memset(h, (char)('0' + (i % 10)), 64); h[64] = '\0';
+        virp_chain_entry_t e;
+        if (virp_chain_append(&st, sess, "observation", id, h, &e) != VIRP_OK)
+            abort();
+    }
+    virp_chain_destroy(&st);
+}
+
+static void test_tier_keyless(void)
+{
+    TEST("keyless tier: hash+link+completeness, head UNAUTHENTICATED");
+    build_signed_chain("s-kl", 3);
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, NULL, NULL, 1, "local") == VIRP_OK,
+           "keyless open");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v, "s-kl", &r) == VIRP_OK, "verify rc");
+    ASSERT(r.valid && r.entries_checked == 3, "keyless must verify structure");
+    ASSERT(!r.hmac_checked && !r.sig_checked, "keyless checks nothing keyed");
+    ASSERT(!r.head_authenticated, "keyless: head length claim unauthenticated");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
+static void test_tier_symmetric(void)
+{
+    TEST("symmetric tier: HMAC verifies, head authenticated by HMAC");
+    build_signed_chain("s-sym", 3);
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, CK, NULL, 1, "local") == VIRP_OK,
+           "symmetric open");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v, "s-sym", &r) == VIRP_OK, "verify rc");
+    ASSERT(r.valid && r.hmac_checked && !r.sig_checked, "hmac tier only");
+    ASSERT(r.head_authenticated && r.head_hmac_ok, "head authenticated by HMAC");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
+static void test_tier_asymmetric_pubkey_only(void)
+{
+    TEST("asymmetric tier: pubkey ONLY, no secret material loaded");
+    build_signed_chain("s-asym", 4);
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, NULL, PK, 1, "local") == VIRP_OK,
+           "asymmetric open (no chain key)");
+    /* No secret material: the chain_key slot is zero. */
+    static const uint8_t zero[VIRP_KEY_SIZE] = {0};
+    ASSERT(!v.have_chain_key, "have_chain_key must be false");
+    ASSERT(memcmp(v.chain_key.key.key, zero, VIRP_KEY_SIZE) == 0,
+           "no K_chain bytes may be present in an asymmetric-only verifier");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v, "s-asym", &r) == VIRP_OK, "verify rc");
+    ASSERT(r.valid, "asymmetric must verify");
+    ASSERT(r.sig_checked && !r.hmac_checked, "sig tier, no hmac");
+    ASSERT(r.entries_signed == 4, "all entries signed+verified");
+    ASSERT(r.head_authenticated && r.head_sig_ok, "head authenticated by Ed25519");
+    ASSERT(r.sig_key_id[0] != '\0', "session sig key_id reported");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
+static void test_tier_all_three(void)
+{
+    TEST("all tiers together: HMAC + Ed25519 both verify");
+    build_signed_chain("s-all", 3);
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, CK, PK, 1, "local") == VIRP_OK,
+           "open all tiers");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v, "s-all", &r) == VIRP_OK, "verify rc");
+    ASSERT(r.valid && r.hmac_checked && r.sig_checked, "both tiers active");
+    ASSERT(r.head_hmac_ok && r.head_sig_ok && r.head_authenticated, "head both");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
+/* Flip one hex nibble in a TEXT column of the last entry, via a writable
+ * handle, to simulate tampering the verifier must catch. */
+static void tamper_column(const char *col, const char *sess)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open(DB, &db) != SQLITE_OK) abort();
+    char sql[256];
+    /* flip first char of the column on the max-sequence row */
+    snprintf(sql, sizeof(sql),
+        "UPDATE chain_entries SET %s = "
+        "  (CASE substr(%s,1,1) WHEN 'a' THEN 'b' ELSE 'a' END) || substr(%s,2) "
+        "WHERE session_id=? AND sequence=(SELECT MAX(sequence) FROM chain_entries WHERE session_id=?)",
+        col, col, col);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) abort();
+    sqlite3_bind_text(st, 1, sess, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, sess, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE) abort();
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+}
+
+static void test_tampered_canonical_rejected(void)
+{
+    TEST("tampered canonical: hash + HMAC + sig all reject");
+    build_signed_chain("s-tmp", 3);
+    /* Corrupt the stored artifact_hash: changes the canonical, so the
+     * recomputed entry hash no longer matches. Caught even keyless. */
+    tamper_column("artifact_hash", "s-tmp");
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, CK, PK, 1, "local") == VIRP_OK, "open");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v, "s-tmp", &r) == VIRP_OK, "verify rc");
+    ASSERT(!r.valid, "tampered entry must be rejected");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
+static void test_wrong_key_rejected(void)
+{
+    TEST("wrong pubkey: asymmetric verify fails (soft: key_id mismatch)");
+    build_signed_chain("s-wk", 3);
+    /* A DIFFERENT public key: its key_id won't match the session's, so the
+     * asymmetric tier reports sig_key_unavailable (soft) rather than FAIL —
+     * the verifier simply doesn't hold this session's key. */
+    uint8_t pub2[32]; char kid2[33];
+    virp_chainsign_key_t other;
+    if (virp_chainsign_generate(&other) != VIRP_OK) abort();
+    const char *PK2 = "/tmp/virp_test_chainsig_other.pub";
+    const char *SK2 = "/tmp/virp_test_chainsig_other.key";
+    unlink(PK2); unlink(SK2);
+    if (virp_chainsign_save(&other, SK2, PK2) != VIRP_OK) abort();
+    memcpy(pub2, other.public_key, 32); memcpy(kid2, other.key_id_hex, 33);
+    virp_chainsign_destroy(&other);
+
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, CK, PK2, 1, "local") == VIRP_OK, "open");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v, "s-wk", &r) == VIRP_OK, "verify rc");
+    ASSERT(r.valid, "other tiers still hold");
+    ASSERT(r.sig_key_unavailable, "wrong key -> soft unavailable");
+    ASSERT(!r.sig_checked, "no signatures graded under the wrong key");
+    virp_chain_destroy(&v);
+    unlink(PK2); unlink(SK2);
+    cleanup();
+    PASS();
+}
+
+static void test_forged_signature_rejected(void)
+{
+    TEST("forged signature under the RIGHT key_id: hard FAIL");
+    build_signed_chain("s-fs", 3);
+    /* Corrupt the signature hex on the last entry while leaving key_id
+     * intact: the verifier holds this key_id, so a bad signature is a
+     * hard FAIL (not the soft unavailable case). */
+    tamper_column("chain_sig", "s-fs");
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, NULL, PK, 1, "local") == VIRP_OK, "open");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v, "s-fs", &r) == VIRP_OK, "verify rc");
+    ASSERT(!r.valid, "forged signature must FAIL");
+    ASSERT(r.first_broken >= 0, "first_broken set");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
+static void test_stripped_signature_rejected(void)
+{
+    TEST("stripped signature in a signed session: hard FAIL");
+    build_signed_chain("s-strip", 3);
+    /* NULL out the signature on the last entry (attacker removes it). In a
+     * head-signed session that is a FAIL, not a soft 'unsigned'. */
+    sqlite3 *db = NULL;
+    if (sqlite3_open(DB, &db) != SQLITE_OK) abort();
+    if (sqlite3_exec(db,
+        "UPDATE chain_entries SET chain_sig=NULL, chain_sig_key_id=NULL "
+        "WHERE session_id='s-strip' AND sequence=("
+        "  SELECT MAX(sequence) FROM chain_entries WHERE session_id='s-strip')",
+        NULL, NULL, NULL) != SQLITE_OK) abort();
+    sqlite3_close(db);
+
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, NULL, PK, 1, "local") == VIRP_OK, "open");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v, "s-strip", &r) == VIRP_OK, "verify rc");
+    ASSERT(!r.valid, "stripped signature must FAIL");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
+static void test_keyid_mismatch_within_session_rejected(void)
+{
+    TEST("entry key_id != head key_id (rotation mid-session): hard FAIL");
+    build_signed_chain("s-kid", 3);
+    /* Rewrite the last entry's key_id to something else while the head and
+     * the verifier both carry the original: session-granularity says every
+     * entry's key_id must equal the head's — this is a FAIL. */
+    sqlite3 *db = NULL;
+    if (sqlite3_open(DB, &db) != SQLITE_OK) abort();
+    if (sqlite3_exec(db,
+        "UPDATE chain_entries SET chain_sig_key_id="
+        "  '00000000000000000000000000000000' "
+        "WHERE session_id='s-kid' AND sequence=("
+        "  SELECT MAX(sequence) FROM chain_entries WHERE session_id='s-kid')",
+        NULL, NULL, NULL) != SQLITE_OK) abort();
+    sqlite3_close(db);
+
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, NULL, PK, 1, "local") == VIRP_OK, "open");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v, "s-kid", &r) == VIRP_OK, "verify rc");
+    ASSERT(!r.valid, "key_id mismatch within session must FAIL");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
+static void test_unsigned_session_with_pubkey(void)
+{
+    TEST("unsigned (pre-D-1) session read with a pubkey: not a failure");
+    cleanup();
+    make_chain_key();
+    uint8_t pub[32]; char kid[33];
+    make_sign_key(pub, kid);   /* creates PK, but the chain never signs */
+    virp_chain_state_t st;
+    ASSERT(virp_chain_init(&st, DB, CK, 1, "local") == VIRP_OK, "init");
+    virp_chain_entry_t e;
+    for (int i = 0; i < 2; i++) {
+        char id[16]; snprintf(id, sizeof(id), "u-%d", i);
+        ASSERT(virp_chain_append(&st, "s-uns", "observation", id,
+                                 "aa11aa11aa11aa11aa11aa11aa11aa11"
+                                 "aa11aa11aa11aa11aa11aa11aa11aa11", &e) == VIRP_OK,
+               "append");
+    }
+    virp_chain_destroy(&st);
+
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, CK, PK, 1, "local") == VIRP_OK, "open");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v, "s-uns", &r) == VIRP_OK, "verify rc");
+    ASSERT(r.valid, "unsigned session with pubkey must still verify");
+    ASSERT(r.entries_unsigned == 2 && r.entries_signed == 0,
+           "entries counted unsigned, not failed");
+    ASSERT(!r.head_sig_ok && r.head_authenticated,
+           "head authenticated by HMAC, no head sig");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
 int main(void)
 {
     printf("\n=== VIRP detached chain signing — chain level (D-1) ===\n\n");
@@ -319,6 +591,16 @@ int main(void)
     test_enable_signing_adds_columns();
     test_born_signed_session();
     test_signed_entry_bytes_match_unsigned();
+    test_tier_keyless();
+    test_tier_symmetric();
+    test_tier_asymmetric_pubkey_only();
+    test_tier_all_three();
+    test_tampered_canonical_rejected();
+    test_wrong_key_rejected();
+    test_forged_signature_rejected();
+    test_stripped_signature_rejected();
+    test_keyid_mismatch_within_session_rejected();
+    test_unsigned_session_with_pubkey();
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);
     cleanup();

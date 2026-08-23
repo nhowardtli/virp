@@ -61,6 +61,9 @@ static void sha256_hex(const char *data, size_t len, char out[65]);
 static int table_exists(sqlite3 *db, const char *name);
 static int column_exists(sqlite3 *db, const char *table, const char *col);
 static void detect_sig_columns(virp_chain_state_t *state);
+static int head_canonical(const char *session_id, int64_t last_sequence,
+                          const char *last_entry_hash, char *out,
+                          size_t out_size);
 static virp_error_t head_upsert_locked(virp_chain_state_t *state,
                                        const char *session_id,
                                        int64_t last_sequence,
@@ -152,10 +155,14 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
         return VIRP_OK;
     }
 
-    /* Load the head record */
+    /* Load the head record. The signed head_get variant (prepared when the
+     * head_sig columns exist) also returns head_sig (col 3) and
+     * head_sig_key_id (col 4). */
     int64_t head_seq = -1;
     char head_hash[65] = {0};
     char head_mac[65]  = {0};
+    char head_sig[VIRP_CHAINSIGN_SIG_HEX] = {0};
+    char head_key_id[VIRP_CHAINSIGN_KEYID_HEX] = {0};
 
     sqlite3_reset(state->stmt_head_get);
     sqlite3_bind_text(state->stmt_head_get, 1, session_id, -1,
@@ -168,6 +175,12 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
                  (const char *)sqlite3_column_text(state->stmt_head_get, 1));
         snprintf(head_mac, sizeof(head_mac), "%s",
                  (const char *)sqlite3_column_text(state->stmt_head_get, 2));
+        if (sqlite3_column_count(state->stmt_head_get) > 4) {
+            const unsigned char *hs = sqlite3_column_text(state->stmt_head_get, 3);
+            const unsigned char *hk = sqlite3_column_text(state->stmt_head_get, 4);
+            if (hs) snprintf(head_sig, sizeof(head_sig), "%s", hs);
+            if (hk) snprintf(head_key_id, sizeof(head_key_id), "%s", hk);
+        }
     }
     sqlite3_reset(state->stmt_head_get);
 
@@ -190,21 +203,66 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
         return VIRP_OK;
     }
 
-    /* Authenticate the head itself before trusting its length claim */
-    char expect_mac[65];
-    head_hmac_hex(state, session_id, head_seq, head_hash, expect_mac);
-    if (!hexdigest_eq(expect_mac, head_mac)) {
-        result->valid = false;
-        result->to_sequence = head_seq;
-        snprintf(result->error_detail, sizeof(result->error_detail),
-                 "Head record HMAC mismatch");
-        return VIRP_OK;
+    /* D-1 session-granularity key decision (before the walk; verify_locked
+     * reads state->sig_key_unavailable_session). A head-signed session
+     * whose signing key_id is not the one we were given cannot be checked
+     * asymmetrically — that is a SOFT, whole-session outcome, never a FAIL:
+     * the other tiers still apply. */
+    bool head_is_signed = (state->head_sig_cols && head_sig[0] != '\0');
+    bool head_sig_ok = false;
+    state->sig_key_unavailable_session = false;
+    if (state->verify_sig_enabled && head_is_signed &&
+        strcmp(head_key_id, state->verify_key_id_hex) != 0) {
+        state->sig_key_unavailable_session = true;
     }
 
-    /* Walk the full range the head commits to; completeness enforced */
+    /* Authenticate the head itself before trusting its length claim.
+     * SYMMETRIC: the head HMAC (only when K_chain was supplied — the
+     * KEYLESS tier takes the head's length claim as unauthenticated input
+     * and says so via head_authenticated=false). */
+    if (state->have_chain_key) {
+        char expect_mac[65];
+        head_hmac_hex(state, session_id, head_seq, head_hash, expect_mac);
+        if (!hexdigest_eq(expect_mac, head_mac)) {
+            result->valid = false;
+            result->to_sequence = head_seq;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "Head record HMAC mismatch");
+            state->sig_key_unavailable_session = false;
+            return VIRP_OK;
+        }
+    }
+
+    /* ASYMMETRIC: the head Ed25519 signature, verified with the PUBLIC key.
+     * A head that IS signed under our key but whose signature does not
+     * verify is a FAIL (the head length claim is forged). */
+    if (state->verify_sig_enabled && head_is_signed &&
+        !state->sig_key_unavailable_session) {
+        char head_canon[512];
+        int hn = head_canonical(session_id, head_seq, head_hash,
+                                head_canon, sizeof(head_canon));
+        uint8_t sig[VIRP_CHAINSIGN_SIG_SIZE];
+        if (!virp_chainsign_sig_from_hex(head_sig, sig) ||
+            !virp_chainsign_verify(state->verify_pub, VIRP_CHAINSIGN_TAG_HEAD,
+                                   head_canon, (size_t)hn, sig)) {
+            result->valid = false;
+            result->to_sequence = head_seq;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "Head Ed25519 signature verification failed");
+            state->sig_key_unavailable_session = false;
+            return VIRP_OK;
+        }
+        head_sig_ok = true;
+    }
+
+    /* Walk the full range the head commits to; completeness enforced.
+     * NOTE: chain_verify_locked memsets *result, so every session-level
+     * field below is set AFTER it returns. */
     char last_hash[65] = {0};
     virp_error_t rc = chain_verify_locked(state, session_id, 0, head_seq,
                                           result, last_hash);
+    bool unavailable = state->sig_key_unavailable_session;
+    state->sig_key_unavailable_session = false;   /* transient: clear always */
     if (rc != VIRP_OK || !result->valid)
         return rc;
 
@@ -215,7 +273,16 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
         snprintf(result->error_detail, sizeof(result->error_detail),
                  "Head record does not match final verified entry "
                  "at sequence %lld", (long long)head_seq);
+        return VIRP_OK;
     }
+
+    /* Session-level tier outcome (all pure-addition fields). */
+    result->head_hmac_ok = state->have_chain_key;
+    result->head_sig_ok = head_sig_ok;
+    result->head_authenticated = state->have_chain_key || head_sig_ok;
+    result->sig_key_unavailable = unavailable;
+    snprintf(result->sig_key_id, sizeof(result->sig_key_id), "%s",
+             head_is_signed ? head_key_id : "");
     return VIRP_OK;
 }
 
@@ -805,10 +872,35 @@ static const char *SQL_HEAD_UPSERT_SIGNED =
     " head_sig, head_sig_key_id) "
     "VALUES (?,?,?,?,?,?,?)";
 
-/* The signature-column SELECT variants (SQL_GET_RANGE_SIGNED /
- * SQL_HEAD_GET_SIGNED) are introduced with the verifier tiers, where they
- * are read; the writer path never needs them (it reads only the prior
- * entry's hash to link). */
+/* Signature-column SELECT variants, used by the VERIFIER only (prepared
+ * by virp_chain_open_verifier_ex when the columns exist). The leading
+ * columns match SQL_GET_LAST/RANGE exactly, so read_entry_from_stmt reads
+ * 0..13 as before and column_count>15 lets it pick up chain_sig (14) and
+ * chain_sig_key_id (15). The writer path never needs these — it reads only
+ * the prior entry's hash to link. */
+static const char *SQL_GET_LAST_SIGNED =
+    "SELECT session_id, sequence, chain_entry_hash, previous_entry_hash, "
+    "  timestamp_ns, monotonic_ns, artifact_type, artifact_id, "
+    "  artifact_hash, artifact_hash_alg, artifact_schema_version, "
+    "  signer_node_id, signer_org_id, chain_hmac, "
+    "  chain_sig, chain_sig_key_id "
+    "FROM chain_entries WHERE session_id = ? "
+    "ORDER BY sequence DESC LIMIT 1";
+
+static const char *SQL_GET_RANGE_SIGNED =
+    "SELECT session_id, sequence, chain_entry_hash, previous_entry_hash, "
+    "  timestamp_ns, monotonic_ns, artifact_type, artifact_id, "
+    "  artifact_hash, artifact_hash_alg, artifact_schema_version, "
+    "  signer_node_id, signer_org_id, chain_hmac, "
+    "  chain_sig, chain_sig_key_id "
+    "FROM chain_entries WHERE session_id = ? "
+    "AND sequence >= ? AND sequence <= ? "
+    "ORDER BY sequence ASC";
+
+static const char *SQL_HEAD_GET_SIGNED =
+    "SELECT last_sequence, last_entry_hash, head_hmac, "
+    "  head_sig, head_sig_key_id "
+    "FROM chain_heads WHERE session_id = ?";
 
 /* Intent store SQL */
 static const char *SQL_INTENT_INSERT =
@@ -1507,13 +1599,27 @@ static void detect_sig_columns(virp_chain_state_t *state)
     state->head_sig_cols  = (h == 1);
 }
 
+/* Back-compat wrapper: HMAC tier, no public key. Unchanged behaviour for
+ * every existing caller (virp-tool offline verify, the report tools). */
 virp_error_t virp_chain_open_verifier(virp_chain_state_t *state,
                                       const char *db_path,
                                       const char *chain_key_path,
                                       uint32_t node_id,
                                       const char *org_id)
 {
-    if (!state || !db_path || !chain_key_path)
+    if (!chain_key_path) return VIRP_ERR_NULL_PTR;   /* this form requires K */
+    return virp_chain_open_verifier_ex(state, db_path, chain_key_path,
+                                       NULL, node_id, org_id);
+}
+
+virp_error_t virp_chain_open_verifier_ex(virp_chain_state_t *state,
+                                         const char *db_path,
+                                         const char *chain_key_path,
+                                         const char *pubkey_path,
+                                         uint32_t node_id,
+                                         const char *org_id)
+{
+    if (!state || !db_path)
         return VIRP_ERR_NULL_PTR;
 
     memset(state, 0, sizeof(*state));
@@ -1523,13 +1629,33 @@ virp_error_t virp_chain_open_verifier(virp_chain_state_t *state,
     snprintf(state->org_id, sizeof(state->org_id), "%s",
              org_id ? org_id : "local");
 
-    virp_error_t err = virp_key_load_file(&state->chain_key,
-                                          VIRP_KEY_TYPE_CHAIN,
-                                          chain_key_path);
-    if (err != VIRP_OK) {
-        fprintf(stderr, "[Chain] Failed to load chain key from %s: %s\n",
-                chain_key_path, virp_error_str(err));
-        return err;
+    /* SYMMETRIC tier — load K_chain if given. NULL is the KEYLESS tier:
+     * no secret material touched. */
+    if (chain_key_path) {
+        virp_error_t err = virp_key_load_file(&state->chain_key,
+                                              VIRP_KEY_TYPE_CHAIN,
+                                              chain_key_path);
+        if (err != VIRP_OK) {
+            fprintf(stderr, "[Chain] Failed to load chain key from %s: %s\n",
+                    chain_key_path, virp_error_str(err));
+            return err;
+        }
+        state->have_chain_key = true;
+    }
+
+    /* ASYMMETRIC tier — load the PUBLIC chain-signing key if given. No
+     * secret material: this is exactly what a third-party verifier holds. */
+    if (pubkey_path) {
+        virp_error_t err = virp_chainsign_load_public(pubkey_path,
+                                                      state->verify_pub,
+                                                      state->verify_key_id_hex);
+        if (err != VIRP_OK) {
+            fprintf(stderr, "[Chain] Failed to load chain-signing public "
+                    "key from %s: %s\n", pubkey_path, virp_error_str(err));
+            if (state->have_chain_key) virp_key_destroy(&state->chain_key);
+            return err;
+        }
+        state->verify_sig_enabled = true;
     }
 
     int rc = sqlite3_open_v2(db_path, &state->db,
@@ -1594,16 +1720,27 @@ virp_error_t virp_chain_open_verifier(virp_chain_state_t *state,
         }
     }
 
-    /* Prepare ONLY what verification reads. Mutating statements stay
-     * NULL; the read_only guards refuse before any of them is touched.
-     * stmt_head_get is skipped on a legacy database (no table to
-     * prepare against) — legacy_no_heads short-circuits verify first. */
-    if (sqlite3_prepare_v2(state->db, SQL_GET_LAST, -1,
+    /* D-1: does this database carry the signature columns? Drives which
+     * SELECTs are prepared (so the sig can be READ) and lets the verifier
+     * grade signatures only where they can exist. A pre-D-1 database has
+     * these false and reads through the exact pre-D-1 SELECTs. */
+    detect_sig_columns(state);
+
+    /* Prepare ONLY what verification reads. When the sig columns exist we
+     * read them too (the *_SIGNED SELECTs append chain_sig / head_sig); the
+     * leading columns are identical, so a keyless/HMAC verify over a signed
+     * database is byte-for-byte what it was — the extra columns are just
+     * available to the asymmetric tier. Mutating statements stay NULL;
+     * stmt_head_get is skipped on a legacy database (no table). */
+    const char *sql_last  = state->entry_sig_cols ? SQL_GET_LAST_SIGNED  : SQL_GET_LAST;
+    const char *sql_range = state->entry_sig_cols ? SQL_GET_RANGE_SIGNED : SQL_GET_RANGE;
+    const char *sql_head  = state->head_sig_cols  ? SQL_HEAD_GET_SIGNED  : SQL_HEAD_GET;
+    if (sqlite3_prepare_v2(state->db, sql_last, -1,
                            &state->stmt_get_last, NULL) != SQLITE_OK ||
-        sqlite3_prepare_v2(state->db, SQL_GET_RANGE, -1,
+        sqlite3_prepare_v2(state->db, sql_range, -1,
                            &state->stmt_get_range, NULL) != SQLITE_OK ||
         (!state->legacy_no_heads &&
-         sqlite3_prepare_v2(state->db, SQL_HEAD_GET, -1,
+         sqlite3_prepare_v2(state->db, sql_head, -1,
                             &state->stmt_head_get, NULL) != SQLITE_OK)) {
         fprintf(stderr, "[Chain] verifier: failed to prepare read "
                 "statements: %s\n", sqlite3_errmsg(state->db));
@@ -1611,7 +1748,12 @@ virp_error_t virp_chain_open_verifier(virp_chain_state_t *state,
         return VIRP_ERR_CHAIN_DB;
     }
 
-    fprintf(stderr, "[Chain] Verifier open (read-only): db=%s\n", db_path);
+    fprintf(stderr, "[Chain] Verifier open (read-only): db=%s  "
+            "tiers=%s%s%s  sig_cols=%s\n", db_path,
+            "keyless",
+            state->have_chain_key ? "+hmac" : "",
+            state->verify_sig_enabled ? "+ed25519" : "",
+            state->entry_sig_cols ? "yes" : "no");
     return VIRP_OK;
 }
 
@@ -1915,6 +2057,14 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
     result->to_sequence = to_sequence;
     result->first_broken = -1;
     result->valid = true;
+    /* Tier flags (pure addition). hmac_checked reflects whether K_chain was
+     * supplied; sig_checked whether per-entry Ed25519 was actually graded
+     * for this range (verify_sig_enabled, columns present, and not a
+     * key-unavailable session). */
+    result->hmac_checked = state->have_chain_key;
+    bool check_sigs = state->verify_sig_enabled && state->entry_sig_cols &&
+                      !state->sig_key_unavailable_session;
+    result->sig_checked = check_sigs;
 
     /* The caller asserts this range exists; an inverted or negative range
      * can assert nothing, and before 2026-08-01 verified vacuously valid
@@ -2006,18 +2156,73 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
             break;
         }
 
-        /* Verify HMAC */
-        char computed_hmac[65];
-        hmac_sha256_hex(state->chain_key.key.key,
-                        canonical, (size_t)clen, computed_hmac);
+        /* Verify HMAC — SYMMETRIC tier only. The KEYLESS tier
+         * (have_chain_key false) skips it: hash + link + completeness
+         * stand on their own with no secret. When the key is present the
+         * check and its verdict are byte-for-byte the pre-D-1 behaviour. */
+        if (state->have_chain_key) {
+            char computed_hmac[65];
+            hmac_sha256_hex(state->chain_key.key.key,
+                            canonical, (size_t)clen, computed_hmac);
 
-        if (!hexdigest_eq(computed_hmac, e.chain_hmac)) {
-            result->valid = false;
-            result->first_broken = e.sequence;
-            snprintf(result->error_detail, sizeof(result->error_detail),
-                     "HMAC mismatch at sequence %lld",
-                     (long long)e.sequence);
-            break;
+            if (!hexdigest_eq(computed_hmac, e.chain_hmac)) {
+                result->valid = false;
+                result->first_broken = e.sequence;
+                snprintf(result->error_detail, sizeof(result->error_detail),
+                         "HMAC mismatch at sequence %lld",
+                         (long long)e.sequence);
+                break;
+            }
+        }
+
+        /* ASYMMETRIC tier — Ed25519 over the SAME canonical bytes, verified
+         * with the PUBLIC key only. Session-granularity key rotation: in a
+         * head-signed session every entry MUST carry a signature whose
+         * key_id equals the head's (which the caller has already confirmed
+         * equals verify_key_id). A missing signature or a key_id that
+         * differs is a FAIL at the same severity as a bad signature — the
+         * sig columns sit outside the canonical, so the signature is their
+         * only integrity protection, and a soft "unsigned" reading would
+         * let an attacker strip a signature undetected. The whole-session
+         * key-unavailable case is handled one level up (sig_checked is
+         * false here); an UNSIGNED pre-D-1 session (no head sig) never
+         * reaches this arm and is counted entries_unsigned instead. */
+        if (check_sigs) {
+            uint8_t sig[VIRP_CHAINSIGN_SIG_SIZE];
+            if (e.chain_sig[0] == '\0') {
+                result->valid = false;
+                result->first_broken = e.sequence;
+                snprintf(result->error_detail, sizeof(result->error_detail),
+                         "Missing Ed25519 signature at sequence %lld in a "
+                         "signed session (stripped signature)",
+                         (long long)e.sequence);
+                break;
+            }
+            if (strcmp(e.chain_sig_key_id, state->verify_key_id_hex) != 0) {
+                result->valid = false;
+                result->first_broken = e.sequence;
+                snprintf(result->error_detail, sizeof(result->error_detail),
+                         "Signature key_id mismatch at sequence %lld "
+                         "(entry %s, session %s)", (long long)e.sequence,
+                         e.chain_sig_key_id, state->verify_key_id_hex);
+                break;
+            }
+            if (!virp_chainsign_sig_from_hex(e.chain_sig, sig) ||
+                !virp_chainsign_verify(state->verify_pub,
+                                       VIRP_CHAINSIGN_TAG_ENTRY,
+                                       canonical, (size_t)clen, sig)) {
+                result->valid = false;
+                result->first_broken = e.sequence;
+                snprintf(result->error_detail, sizeof(result->error_detail),
+                         "Ed25519 signature verification failed at "
+                         "sequence %lld", (long long)e.sequence);
+                break;
+            }
+            result->entries_signed++;
+        } else if (state->verify_sig_enabled && e.chain_sig[0] == '\0') {
+            /* pubkey supplied, but this is an unsigned (pre-D-1) session:
+             * informational count, never a failure. */
+            result->entries_unsigned++;
         }
 
         /* ARTIFACT BINDING (2026-08-06). The checks above prove the entry
