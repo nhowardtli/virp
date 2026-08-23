@@ -1,0 +1,69 @@
+{
+  "vector_set": "virp-chain-signing/1",
+  "generated_by": "tests/vectors/generate is NOT a script: values produced 2026-08-23 with PyNaCl 1.5.0 (libsodium) from the seed below; Ed25519 is deterministic so any conforming implementation reproduces signature_hex exactly",
+  "scheme": "ed25519-detached-v1",
+  "construction": "signature = Ed25519.sign(sk, TAG || message) where TAG is the ASCII tag INCLUDING its terminating NUL byte and message is the UNCHANGED canonical bytes (entry canonical from build_canonical_json, or head canonical from head_canonical). The canonical bytes are never modified; the tag is prepended to the signature input only and is not stored.",
+  "key_id_scheme": "sha256-raw-16: key_id = SHA-256(32-byte raw Ed25519 public key)[0:16], rendered as 32 lowercase hex chars",
+  "tags": {
+    "entry": {
+      "ascii": "VIRP-CHAIN-ENTRY-SIG-v1",
+      "bytes_hex": "564952502d434841494e2d454e5452592d5349472d763100",
+      "length": 24
+    },
+    "head": {
+      "ascii": "VIRP-CHAIN-HEAD-SIG-v1",
+      "bytes_hex": "564952502d434841494e2d484541442d5349472d763100",
+      "length": 23
+    }
+  },
+  "test_key": {
+    "warning": "TEST KEY ONLY \u2014 seed is public; never load this as a node's chain-signing key",
+    "seed_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "secret_key_hex_libsodium": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+    "public_key_hex": "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+    "key_id_hex": "24f6ed6acbfe1009c030d7ca567c33ca"
+  },
+  "vectors": [
+    {
+      "name": "appendix-a-entry-A",
+      "tag": "entry",
+      "message_utf8": "{\"artifact_hash\":\"ad9e0fde1c5d49e2d4692109739eb640503776fb8da77b5d0b4df21374eb2440\",\"artifact_hash_alg\":\"sha256\",\"artifact_id\":\"obs:clab-frr-ospf-frr1:1787356803784242805\",\"artifact_schema_version\":\"1\",\"artifact_type\":\"observation\",\"monotonic_ns\":2008462387646283,\"previous_entry_hash\":\"e7326c9a78c5f1a0f4a90b985d720c73d80003b8f2efa9f8802bfcb30424a46e\",\"sequence\":0,\"session_id\":\"autopilot:2026-08-22\",\"signer_node_id\":1,\"signer_org_id\":\"local\",\"timestamp_ns\":1787356803785229661}",
+      "message_hex": "7b2261727469666163745f68617368223a2261643965306664653163356434396532643436393231303937333965623634303530333737366662386461373762356430623464663231333734656232343430222c2261727469666163745f686173685f616c67223a22736861323536222c2261727469666163745f6964223a226f62733a636c61622d6672722d6f7370662d667272313a31373837333536383033373834323432383035222c2261727469666163745f736368656d615f76657273696f6e223a2231222c2261727469666163745f74797065223a226f62736572766174696f6e222c226d6f6e6f746f6e69635f6e73223a323030383436323338373634363238332c2270726576696f75735f656e7472795f68617368223a2265373332366339613738633566316130663461393062393835643732306337336438303030336238663265666139663838303262666362333034323461343665222c2273657175656e6365223a302c2273657373696f6e5f6964223a226175746f70696c6f743a323032362d30382d3232222c227369676e65725f6e6f64655f6964223a312c227369676e65725f6f72675f6964223a226c6f63616c222c2274696d657374616d705f6e73223a313738373335363830333738353232393636317d",
+      "signed_input_sha256": "62be2bc1d461ff9144e7c3efe9584f203c195feee999b062dbafb4f7a29566c1",
+      "signature_hex": "74ccea17b8895f4a39a93a556278a820961cd3ae3b8177333eaf77eec67396d5c1b61fe73ae01fa6196740e387fa99babb9b296749dba1217999580159faa103",
+      "note": "D-0 Appendix A fixture A canonical bytes (autopilot:2026-08-22 seq 0) signed as a chain ENTRY"
+    },
+    {
+      "name": "appendix-a-head",
+      "tag": "head",
+      "message_utf8": "{\"last_entry_hash\":\"d4976e1afdee3a60c9c0ef6604c1afe98100042a3a14610ce978b4531f815f44\",\"last_sequence\":272,\"session_id\":\"approval:clab-frr-ospf-frr1\",\"v\":\"VIRP-CHAIN-HEAD-v1\"}",
+      "message_hex": "7b226c6173745f656e7472795f68617368223a2264343937366531616664656533613630633963306566363630346331616665393831303030343261336131343631306365393738623435333166383135663434222c226c6173745f73657175656e6365223a3237322c2273657373696f6e5f6964223a22617070726f76616c3a636c61622d6672722d6f7370662d66727231222c2276223a22564952502d434841494e2d484541442d7631227d",
+      "signed_input_sha256": "91e8efa35f3fc69aed940214688f4bcd8d53556517c9ce718715241ddf6d1b79",
+      "signature_hex": "6e32e7caebd369e0fe1179931765240e3983ef7117e3f7440fe9e1a61ccd0fc7a9c436661b54420fc10c5c3075fa0c82016ea451bebdd23c3bdd286507e9430e",
+      "note": "D-0 Appendix A head canonical (approval:clab-frr-ospf-frr1 seq 272) signed as a chain HEAD"
+    },
+    {
+      "name": "inv-lock-entry-0",
+      "tag": "entry",
+      "message_utf8": "{\"artifact_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"artifact_hash_alg\":\"sha256\",\"artifact_id\":\"obs:inv-lock:0001\",\"artifact_schema_version\":\"1\",\"artifact_type\":\"observation\",\"monotonic_ns\":123456789012345,\"previous_entry_hash\":\"18d2b8a84c417dc511143e5cce9d4f50313041d0ff750cd548697be7ca33e656\",\"sequence\":0,\"session_id\":\"inv-lock-1\",\"signer_node_id\":1,\"signer_org_id\":\"local\",\"timestamp_ns\":1787000000123456789}",
+      "message_hex": "7b2261727469666163745f68617368223a2230303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030222c2261727469666163745f686173685f616c67223a22736861323536222c2261727469666163745f6964223a226f62733a696e762d6c6f636b3a30303031222c2261727469666163745f736368656d615f76657273696f6e223a2231222c2261727469666163745f74797065223a226f62736572766174696f6e222c226d6f6e6f746f6e69635f6e73223a3132333435363738393031323334352c2270726576696f75735f656e7472795f68617368223a2231386432623861383463343137646335313131343365356363653964346635303331333034316430666637353063643534383639376265376361333365363536222c2273657175656e6365223a302c2273657373696f6e5f6964223a22696e762d6c6f636b2d31222c227369676e65725f6e6f64655f6964223a312c227369676e65725f6f72675f6964223a226c6f63616c222c2274696d657374616d705f6e73223a313738373030303030303132333435363738397d",
+      "signed_input_sha256": "2334e5cd792c7fe3ae195dcf1e1f3586e457581894eb068afc79acefd5a4d5a1",
+      "signature_hex": "9626512b488a795de6156f70a6bf47fd6b5d83a14aa6ed88949eb270da6cea08bc0260690c3ce20e6c97e5ed35d666b075d98930909b0b5c36d8abba3d5fa20d",
+      "note": "verify.py-derived synthetic entry (tests/test_chain_invariant.c GOLD_C0) signed as an ENTRY"
+    },
+    {
+      "name": "inv-lock-head-0",
+      "tag": "head",
+      "message_utf8": "{\"last_entry_hash\":\"d9278b4a17debc43c289a591b2ec6ae9a0deb0db7c8fb10ff0bbdc0cfbca0f1b\",\"last_sequence\":0,\"session_id\":\"inv-lock-1\",\"v\":\"VIRP-CHAIN-HEAD-v1\"}",
+      "message_hex": "7b226c6173745f656e7472795f68617368223a2264393237386234613137646562633433633238396135393162326563366165396130646562306462376338666231306666306262646330636662636130663162222c226c6173745f73657175656e6365223a302c2273657373696f6e5f6964223a22696e762d6c6f636b2d31222c2276223a22564952502d434841494e2d484541442d7631227d",
+      "signed_input_sha256": "90e817916aa9720dcf0c6030b53aef0343c602488e325281fc71a94cc3749905",
+      "signature_hex": "fa78fc4b10f486b9a47544e90a58751f2f6196dce51aa6fc3cf07f8d732a2ee54a8db073c523294bae21d0e8cd2d700160bd8f6be13f9720453b32f5e8c6ee0b",
+      "note": "head canonical committing to inv-lock-entry-0 signed as a HEAD"
+    }
+  ],
+  "negative_expectations": [
+    "Every vector's signature_hex verifies ONLY under its own tag: an entry signature presented with the head tag (or vice versa) must fail.",
+    "Any single-byte change to message bytes must fail verification.",
+    "A signature must fail under any public key other than test_key.public_key_hex."
+  ]
+}

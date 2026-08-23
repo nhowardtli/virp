@@ -97,6 +97,76 @@ Normative comment in-tree: the `VIRP_VERSION_3` block in
 
 ---
 
+## 2. Detached Ed25519 chain signing (D-1, 2026-08-23)
+
+**Decision.** A chain entry and a per-session head MAY additionally carry a
+detached Ed25519 signature, stored ALONGSIDE the existing authenticated
+content, so a party holding only the signer's public key can verify entries
+without the symmetric chain key.
+
+**The canonical bytes are unchanged — normative.** The signature signs the
+EXACT bytes the entry hash and `chain_hmac` already cover
+(`build_canonical_json`, the twelve-field fixed-order construction), and the
+head signature signs the exact `head_canonical` bytes
+(`{"last_entry_hash":…,"last_sequence":…,"session_id":…,"v":"VIRP-CHAIN-HEAD-v1"}`).
+The SHA-256 entry hash, the K_chain HMAC, the head HMAC, the milestone
+canonical and the genesis rule (`SHA-256("VIRP_CHAIN_GENESIS:"+session_id)`)
+are byte-identical to -06/pre-D-1. Any evidence issued before the cut-over
+verifies unchanged; the D-0 seal (`tools/seal/`) attests it.
+
+**Signature construction (normative).**
+
+```
+entry_sig = Ed25519.sign(sk, "VIRP-CHAIN-ENTRY-SIG-v1" 0x00 || canonical_entry_bytes)
+head_sig  = Ed25519.sign(sk, "VIRP-CHAIN-HEAD-SIG-v1"  0x00 || head_canonical_bytes)
+```
+
+- The domain-separation tag INCLUDES its terminating NUL in the signed
+  input (the `VIRP-TYPED-OP` convention). The two tags differ, so no byte
+  string validates as both an entry signature and a head signature.
+- The tag is prepended to the signature INPUT only. It is never stored and
+  is not part of any canonical object.
+- `scheme = "ed25519-detached-v1"`. `key_id = SHA-256(pub)[0:16]`
+  (sha256-raw-16), rendered as 32 lowercase hex.
+- Signatures and key_id are stored in NEW columns
+  (`chain_entries.chain_sig`, `chain_sig_key_id`; `chain_heads.head_sig`,
+  `head_sig_key_id`); a BUNDLE representation distinguishes signed entries by
+  their presence, tagged `signature_scheme: "ed25519-detached-v1"` +
+  `signing_key_id`, with `chain_format` remaining `v1` (the canonical format
+  is unchanged). The C tree emits only these storage-level facts; era
+  labelling ("independently verifiable") belongs to the bundle layer, not
+  this tree.
+
+**Session-granularity key binding (normative).** Per-session chains restart
+at sequence 0, so a session is signed under exactly one key. In a
+head-signed session every entry's `chain_sig_key_id` MUST equal the head's
+key_id. A verifier holding the matching public key MUST reject (as
+tampering) a head-signed session with any entry that is unsigned or carries
+a different key_id. A verifier that does not hold the session's key reports
+it unverifiable-under-this-key (not a failure).
+
+**Three verification tiers (normative).** keyless (hash + link +
+completeness, head length claim unauthenticated), symmetric (adds the
+K_chain HMAC — unchanged), asymmetric (adds Ed25519 under the public key,
+no secret required). Each is independently sufficient for what it claims;
+they compose.
+
+**Milestones are NOT signed in D-1** (HMAC only). Signing the milestone
+canonical is deferred to a later change; recorded here so -07 does not
+assume a milestone signature exists.
+
+**Compatibility.** Pure addition, opt-in per node (`-S`). Old sessions
+remain format v1 and are covered by the D-0 seal; new sessions are born
+dual-signed from sequence 0. There is NO migration of old data. An old
+verifier that ignores the sig columns verifies everything it verified
+before, over identical bytes.
+
+Normative comment in-tree: `include/virp_chainsign.h` and the D-1 blocks in
+`src/virp_chain.c`. Golden vectors: `tests/vectors/chain-signing-v1.json`.
+Key custody: SECURITY.md "Detached Ed25519 Chain Signing (D-1)".
+
+---
+
 *(The typed-operation command hash — `virp_typed_op_hash`, see
 `src/virp_crypto.c` — is an earlier protocol-visible change, now
 flagged "note for draft-07" in code. It predates this file, was NOT

@@ -274,6 +274,106 @@ destroy, and appears in no log or export path; only the public key is
 exportable (raw or SPKI DER, `key_id = SHA-256(pub)[:16]`, the same
 convention the approver registry uses).
 
+## Detached Ed25519 Chain Signing (D-1, added 2026-08-23)
+
+**The scheme.** A node may additionally sign every chain entry and every
+per-session head with a dedicated Ed25519 keypair, so a third party can
+verify chain entries **without the symmetric chain key**. This opens
+independent (asymmetric) verification for every session created after the
+cut-over. It is opt-in (`virp-onode-prod -S <secret>`); absent, the daemon
+runs exactly as before — signing off, zero behaviour change — and rollback
+is removing the flag. It follows the D-0 sealing ceremony (`tools/seal/`),
+which covers everything written before the cut-over.
+
+**The invariant it preserves.** The canonical bytes DO NOT CHANGE. The
+twelve-field `build_canonical_json` construction, the SHA-256
+`chain_entry_hash`, the `chain_hmac` under K_chain, the `head_canonical`
+(`VIRP-CHAIN-HEAD-v1`) and its HMAC, the milestone canonical and the
+genesis rule are byte-identical to the pre-D-1 tree. The Ed25519 signature
+is a PURE ADDITION: it signs the **same** canonical bytes already hashed
+and HMAC'd, and is stored in NEW columns (`chain_entries.chain_sig`,
+`chain_sig_key_id`; `chain_heads.head_sig`, `head_sig_key_id`) that no
+pre-D-1 reader touches. Strip those columns and the chain is exactly the
+old chain, not a broken one. The invariant is locked in every build by
+`tests/test_chain_invariant.c` / `.py` against the D-0 Appendix A fixtures
+(`tools/seal/fixtures-appendix-a.json`) and a second, non-self-referential
+set of goldens from `report/verify.py`.
+
+**Domain separation.** One key signs two object kinds, so the signature
+input is `TAG || NUL || canonical`, with
+`VIRP-CHAIN-ENTRY-SIG-v1` for entries and `VIRP-CHAIN-HEAD-SIG-v1` for
+heads (the NUL is signed, the `VIRP-TYPED-OP` convention). The tags differ,
+so no byte string is a valid entry signature and a valid head signature at
+once — an entry signature can never validate as a head signature or vice
+versa. The tag is never stored and never enters the canonical.
+
+**Three verification tiers, each independent** (`virp_chain_open_verifier_ex`,
+`virp chain verify --db P [--key K] [--pubkey PUB] [--keyless]`, and
+`report/verify.py`):
+
+| tier | needs | authenticates |
+| --- | --- | --- |
+| keyless | nothing | hash + prev-link + completeness. The head's length claim is reported UNAUTHENTICATED. |
+| symmetric | K_chain | adds the per-entry and head HMAC — the pre-D-1 behaviour, byte-for-byte. |
+| asymmetric | the PUBLIC key only | adds Ed25519 on every entry and the head. No secret material is loaded in the process. |
+
+**Session-granularity key rotation.** In a head-signed session every
+entry's `chain_sig_key_id` MUST equal the head's key_id (which must equal
+the verifier's key). A missing signature (stripped), a key_id that differs
+from the head's, or a signature that does not verify is a **hard FAIL** at
+the same severity as tampering — the sig columns sit outside the canonical,
+so the signature is their only integrity protection, and a soft "unsigned"
+reading would let an attacker strip a signature undetected. "Not verifiable
+under this key" is a **soft, whole-session** outcome, reserved for when the
+verifier simply lacks that session's public key; the other tiers still
+apply. An unsigned (pre-D-1) session read with a public key counts its
+entries unsigned and never fails.
+
+**What it does NOT change.** Like the observation-signing key, this does
+not move the daemon-compromise boundary: a compromised daemon holds the
+secret and can still sign a forged chain, because the daemon is the
+attester. What the PUBLIC key buys is on the consumer side — verify without
+forge capability, and without the chain key. A K_chain holder could always
+rewrite history; the Ed25519 signature adds an adversary class the HMAC
+never addressed (a verifier who must hold no secret at all), it does not
+remove one.
+
+**Milestones stay unsigned in D-1** (they remain HMAC-only). Signing the
+milestone canonical is noted as a draft-07 consideration in
+`DEPLOY-NOTES.md`; nothing depends on a milestone signature today.
+
+### Chain-Signing Key — Custody
+
+A per-node Ed25519 chain-signing keypair (`virp-tool keygen chainsign`,
+loader `virp_chainsign_load`) is the **sixth** key role in the tree,
+distinct from every other:
+
+- **O-Key / R-Key** — symmetric HMAC, observation / intent channels.
+- **K_chain** — symmetric HMAC over the chain canonical (unchanged; still
+  written on every entry).
+- **Approval keypair** — Ed25519/P-256, secret OFF-box with a human
+  approver; the daemon holds only the public key.
+- **Observation-signing key (obskey)** — Ed25519, signs v3 observation
+  *bodies*.
+- **Chain-signing key (D-1)** — Ed25519, signs chain *entries and heads*.
+
+Custody mirrors the obskey's, and for the same reason: the daemon is the
+attester of its own chain, so the secret lives ON the daemon host and only
+the public half is distributed. Enforcement (tested in
+`tests/test_chainsign.c`): the secret file must be a regular file, mode
+0400/0600, owned by the daemon's effective UID (or root); symlinks,
+group/world-accessible modes and wrong-size (non-64-byte) files are refused
+at load with distinct errors; the loader re-derives the public half from
+the seed and refuses a file whose halves disagree. The secret is
+`sodium_mlock`'d while loaded, zeroized on destroy, and appears in no log
+or export path. Only the public key is exportable (raw or SPKI DER,
+`key_id = SHA-256(pub)[:16]`), and it is published on the node's `/api/key`
+surface (`chain_signing` block, from `VIRP_CHAIN_SIGN_PUB`) so a verifier
+can obtain it from the node or out of band. Signing is fail-closed: once
+`-S` is given, a signing error fails the append and a key that will not
+load fails startup — the node never runs silently-unsigned when asked to
+sign.
+
 ## Chain Registration — Observation Signature Gate (added 2026-08-08)
 
 `CHAIN_APPEND` is the socket path by which a client asks the daemon to

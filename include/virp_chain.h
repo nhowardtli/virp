@@ -16,6 +16,7 @@
 
 #include "virp.h"
 #include "virp_crypto.h"
+#include "virp_chainsign.h"
 #include <sqlite3.h>
 #include <pthread.h>
 
@@ -50,6 +51,12 @@ typedef struct {
     uint32_t signer_node_id;
     char     signer_org_id[64];
     char     chain_hmac[65];            /* HMAC-SHA256 hex of canonical entry */
+    /* D-1 detached Ed25519 signature over the SAME canonical bytes (with
+     * the VIRP-CHAIN-ENTRY-SIG-v1 domain tag), and the signing key_id.
+     * Empty strings when the entry carries no signature (pre-D-1 session,
+     * or signing-off chain). Never part of the canonical — pure sidecar. */
+    char     chain_sig[129];            /* 128 hex + NUL, or "" */
+    char     chain_sig_key_id[33];      /* 32 hex + NUL,  or "" */
 } virp_chain_entry_t;
 
 /* =========================================================================
@@ -73,6 +80,47 @@ typedef struct {
      * tampering and clears valid. */
     int64_t  artifacts_bound;
     int64_t  artifacts_unverifiable;
+
+    /* =====================================================================
+     * D-1 asymmetric tier (Ed25519 detached signatures). All PURE-ADDITION
+     * counters — the fields above keep their exact pre-D-1 meaning, and a
+     * verifier run without a public key leaves everything here zero/false.
+     *
+     * Three independent tiers, reported together:
+     *   keyless    hash + link + completeness (no secrets). head_authenticated
+     *              is false: the head's length claim is unverified.
+     *   symmetric  adds HMAC under K_chain. have_chain_key drives it; when
+     *              set, head_hmac_ok authenticates the head length claim.
+     *   asymmetric adds Ed25519 under the PUBLIC key only. sig_checked is
+     *              set when a public key was supplied.
+     * ===================================================================== */
+    bool     hmac_checked;      /* K_chain was supplied and HMACs verified   */
+    bool     sig_checked;       /* a public key was supplied and sigs graded */
+    bool     head_authenticated;/* head length claim authenticated (HMAC or
+                                 * Ed25519, per tier)                        */
+    bool     head_hmac_ok;      /* head HMAC verified (symmetric tier)       */
+    bool     head_sig_ok;       /* head Ed25519 signature verified           */
+
+    /* Per-entry signature accounting (asymmetric tier). In a HEAD-SIGNED
+     * session every entry MUST carry a signature under the head's key_id;
+     * a missing signature or a key_id that differs from the head's is a
+     * FAIL at the same severity as a stripped signature (the sig columns
+     * sit outside the canonical, so the signature is their only integrity
+     * protection). entries_signed counts entries whose Ed25519 verified;
+     * a mismatch clears valid and sets first_broken. */
+    int64_t  entries_signed;
+    int64_t  entries_unsigned;  /* entries with no signature in an UNSIGNED
+                                 * (pre-D-1) session — informational, never
+                                 * a failure                                 */
+
+    /* Whole-session soft outcome (NOT a failure): the session IS signed but
+     * the verifier was not given this session's public key, so signatures
+     * could not be checked. Set only when sig_checked would otherwise apply
+     * and the key_id did not match verify_key_id. */
+    bool     sig_key_unavailable;
+    char     sig_key_id[VIRP_CHAINSIGN_KEYID_HEX]; /* the session's signing
+                                 * key_id as read from the head/entries, or
+                                 * "" if the session is unsigned            */
 } virp_chain_verify_result_t;
 
 /* =========================================================================
@@ -171,6 +219,49 @@ typedef struct {
     /* Artifact store */
     sqlite3_stmt       *stmt_artifact_insert;
 
+    /* =====================================================================
+     * D-1 detached Ed25519 chain signing — PURE ADDITION. When disabled
+     * (the default, and every pre-D-1 deployment) none of this is touched
+     * and the append path, the schema on disk and every hash/HMAC are
+     * byte-identical to the pre-D-1 tree.
+     * ===================================================================== */
+
+    /* Writer side: set by virp_chain_enable_signing(). When true, every
+     * append also Ed25519-signs the canonical bytes and the head canonical
+     * and stores the signatures + key_id in the sig columns. */
+    bool                   sign_enabled;
+    virp_chainsign_key_t   sign_key;
+    /* Insert / head-upsert variants that also bind the sig columns. Prepared
+     * only when sign_enabled; the unsigned statements above are used
+     * otherwise, so a signing-off chain issues the exact pre-D-1 SQL. */
+    sqlite3_stmt          *stmt_insert_signed;
+    sqlite3_stmt          *stmt_head_upsert_signed;
+
+    /* Read side: whether the sig columns exist in this database. Detected
+     * at open from PRAGMA table_info; drives which SELECT is used and lets
+     * the verifier grade signatures only where they can exist. A chain that
+     * never enabled signing has these false and reads exactly as before. */
+    bool                   entry_sig_cols;   /* chain_entries has chain_sig */
+    bool                   head_sig_cols;    /* chain_heads has head_sig   */
+
+    /* Verifier side (virp_chain_open_verifier_ex): the public key to check
+     * chain/head signatures against, and whether one was supplied. No
+     * secret material. */
+    bool                   verify_sig_enabled;
+    uint8_t                verify_pub[VIRP_CHAINSIGN_PK_SIZE];
+    char                   verify_key_id_hex[VIRP_CHAINSIGN_KEYID_HEX];
+    /* Transient, set by chain_verify_session_locked before it calls the
+     * range walker and cleared after: this session IS signed but under a
+     * key_id the verifier was not given, so per-entry signatures must be
+     * SKIPPED (a soft whole-session outcome) rather than FAILED. Guarded by
+     * the chain lock like every other verify field. */
+    bool                   sig_key_unavailable_session;
+    /* Verifier tier selection: whether K_chain was supplied (HMAC tier).
+     * Keyless verification sets this false — hash+link+completeness only,
+     * head length claim UNAUTHENTICATED. The writer path always has the
+     * key and leaves this true. */
+    bool                   have_chain_key;
+
     /* Set by virp_chain_open_verifier(): the connection is
      * SQLITE_OPEN_READONLY and every mutating entry point returns
      * VIRP_ERR_CHAIN_READONLY. */
@@ -213,6 +304,36 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
                              const char *org_id);
 
 /*
+ * D-1: turn on detached Ed25519 chain signing for a chain opened with
+ * virp_chain_init(). PURE ADDITION and OPT-IN: a daemon that never calls
+ * this behaves exactly as pre-D-1 — signing off, on-disk schema untouched,
+ * every hash/HMAC byte-identical. Rollback is simply not calling it.
+ *
+ * On success:
+ *   - loads the per-node chain-signing SECRET key from sk_path (obskey
+ *     custody gate: regular file, 0600/0400, owner==euid or root, 64 bytes);
+ *   - adds the signature columns to chain_entries (chain_sig,
+ *     chain_sig_key_id) and chain_heads (head_sig, head_sig_key_id) via
+ *     ALTER TABLE ... ADD COLUMN IF the columns are absent — a metadata-only
+ *     change on SQLite (no row rewrite), and NEVER touched when signing is
+ *     off, so an opted-out database's schema is bit-for-bit the old one;
+ *   - prepares the signing INSERT/head-upsert variants.
+ *
+ * From the next append on, every entry and head this node writes carries a
+ * signature over the SAME canonical bytes already hashed and HMAC'd,
+ * domain-separated by the VIRP-CHAIN-ENTRY-SIG-v1 / VIRP-CHAIN-HEAD-SIG-v1
+ * tags. Old entries in the same database are left exactly as they are (no
+ * migration, no backfill — per-session chains restart at 0, so a node born
+ * dual-signed has no old entries in its new sessions).
+ *
+ * Refuses on a read-only handle (VIRP_ERR_CHAIN_READONLY) and on any key
+ * or schema error (the caller must treat failure as fatal if it intended
+ * to sign — never fall back to signing-off silently).
+ */
+virp_error_t virp_chain_enable_signing(virp_chain_state_t *state,
+                                       const char *sk_path);
+
+/*
  * Open an existing chain database for VERIFICATION ONLY.
  *
  * virp_chain_init() is the daemon's open: it creates schema, migrates
@@ -247,6 +368,39 @@ virp_error_t virp_chain_open_verifier(virp_chain_state_t *state,
                                       const char *chain_key_path,
                                       uint32_t node_id,
                                       const char *org_id);
+
+/*
+ * D-1: open an existing chain database read-only for verification at one or
+ * more of the three independent tiers. Same read-only, no-migration,
+ * no-backfill discipline as virp_chain_open_verifier() (which is now a thin
+ * wrapper: HMAC tier, no public key).
+ *
+ *   chain_key_path == NULL  -> KEYLESS tier: hash + link + completeness
+ *                              only. No secret material is loaded. The
+ *                              head's length claim is reported
+ *                              UNAUTHENTICATED (head_authenticated=false)
+ *                              unless a public key authenticates it.
+ *   chain_key_path != NULL  -> SYMMETRIC tier: additionally verifies the
+ *                              K_chain HMAC on every entry and the head.
+ *   pubkey_path    != NULL  -> ASYMMETRIC tier: additionally verifies the
+ *                              Ed25519 signature on every entry and the head
+ *                              under the PUBLIC key (no secret needed). A
+ *                              head-signed session whose signing key_id does
+ *                              not match this key verifies at the other
+ *                              tiers and is reported sig_key_unavailable
+ *                              (a soft, whole-session outcome, never a FAIL).
+ *
+ * At least one of chain_key_path / pubkey_path SHOULD be given; passing
+ * neither is the pure keyless tier and is allowed (the caller asked for it).
+ * The tiers compose: e.g. key + pubkey verifies all three. The keyless and
+ * HMAC results are byte-for-byte what the pre-D-1 verifier produced.
+ */
+virp_error_t virp_chain_open_verifier_ex(virp_chain_state_t *state,
+                                         const char *db_path,
+                                         const char *chain_key_path,
+                                         const char *pubkey_path,
+                                         uint32_t node_id,
+                                         const char *org_id);
 
 /*
  * Append an artifact to the chain for a given session.
