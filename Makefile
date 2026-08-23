@@ -42,6 +42,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_obskey.o \
              $(BUILD_DIR)/virp_chainsign.o \
              $(BUILD_DIR)/virp_ssh_io.o \
+             $(BUILD_DIR)/virp_scrub.o \
              $(BUILD_DIR)/cJSON.o
 
 # Optional Cisco driver (requires libssh2)
@@ -207,6 +208,9 @@ $(BUILD_DIR)/virp_message.o: src/virp_message.c | $(BUILD_DIR)
 $(BUILD_DIR)/virp_driver.o: src/virp_driver.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/virp_scrub.o: src/virp_scrub.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/driver_mock.o: src/drivers/driver_mock.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -348,6 +352,17 @@ $(TEST_SSH_IO): tests/test_ssh_io.c $(LIB)
 .PHONY: test-ssh-io
 test-ssh-io: $(TEST_SSH_IO)
 	./$(TEST_SSH_IO)
+
+# Scrub-at-capture (S-1): the generic O-Node observation-body scrubber
+TEST_SCRUB = $(BUILD_DIR)/test_virp_scrub
+
+$(TEST_SCRUB): tests/test_virp_scrub.c $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-scrub
+test-scrub: $(TEST_SCRUB)
+	./$(TEST_SCRUB)
 
 # FortiGate reply scrubbing (finding N1 / 2c)
 TEST_FG_SCRUB = $(BUILD_DIR)/test_driver_fortigate_scrub
@@ -1778,7 +1793,7 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-scrub test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 
