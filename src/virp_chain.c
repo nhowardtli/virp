@@ -1544,6 +1544,16 @@ virp_error_t virp_chain_enable_signing(virp_chain_state_t *state,
     state->head_sig_cols = true;
     state->sign_enabled = true;
 
+    /* The live daemon verifies its own chain, so let its chain_verify_session
+     * exercise the asymmetric tier too: the public half is right here in the
+     * loaded keypair (no secret exposure). have_chain_key is already true
+     * (init loaded K_chain), so the live verify now spans all three tiers. */
+    memcpy(state->verify_pub, state->sign_key.public_key,
+           VIRP_CHAINSIGN_PK_SIZE);
+    snprintf(state->verify_key_id_hex, sizeof(state->verify_key_id_hex),
+             "%s", state->sign_key.key_id_hex);
+    state->verify_sig_enabled = true;
+
     fprintf(stderr, "[Chain] Detached Ed25519 chain signing ENABLED "
             "(scheme %s, key_id %s)\n",
             VIRP_CHAINSIGN_SCHEME, state->sign_key.key_id_hex);
