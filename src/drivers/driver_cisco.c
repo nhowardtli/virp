@@ -1385,9 +1385,22 @@ static virp_error_t cisco_health_check(virp_conn_t *conn)
     if (!conn) return VIRP_ERR_NULL_PTR;
     if (!conn->connected) return VIRP_ERR_KEY_NOT_LOADED;
 
-    /* Send a simple command and check for valid response */
+    /* Send a simple command and check for valid response.
+     *
+     * Mode-aware probe: while a gated config-mode sequence is in
+     * flight the connection sits at a (config...)# prompt, where a
+     * bare "show clock" is "% Invalid input" — the watchdog would
+     * read that as unhealthy and drop the session mid-sequence
+     * (probe cadence ONODE_WATCHDOG_INTERVAL_SEC is shorter than a
+     * gate approval roundtrip). "do show clock" is the config-mode
+     * spelling of the same liveness probe. */
+    bool in_config = (conn->current_mode == CISCO_MODE_CONFIG ||
+                      conn->current_mode == CISCO_MODE_CONFIG_SUB);
     virp_exec_result_t result;
-    virp_error_t err = cisco_execute(conn, "show clock", &result);
+    virp_error_t err = cisco_execute(conn,
+                                     in_config ? "do show clock"
+                                               : "show clock",
+                                     &result);
     if (err != VIRP_OK) return err;
 
     return result.success ? VIRP_OK : VIRP_ERR_KEY_NOT_LOADED;
