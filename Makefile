@@ -490,6 +490,23 @@ $(TEST_FED): tests/test_federation.c $(LIB)
 test-chain: $(TEST_CHAIN)
 	./$(TEST_CHAIN)
 
+# Chain canonical-bytes INVARIANT (D-1 gate). #includes src/virp_chain.c to
+# reach the static canonical builders and locks them to the D-0 Appendix A
+# fixtures (tools/seal/fixtures-appendix-a.json) plus verify.py-derived
+# goldens; the Python half re-verifies the C binary's end-to-end DB with
+# report/verify.py. Must NOT also link virp_chain.o (same symbols) — the
+# archive member is not pulled because nothing unresolved needs it.
+TEST_CHAIN_INV = $(BUILD_DIR)/test_chain_invariant
+
+$(TEST_CHAIN_INV): tests/test_chain_invariant.c src/virp_chain.c $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-chain-invariant
+test-chain-invariant: $(TEST_CHAIN_INV)
+	./$(TEST_CHAIN_INV)
+	python3 tests/test_chain_invariant.py $(TEST_CHAIN_INV)
+
 # Chain concurrency test (Item 3 hardening — shared prepared-statement race)
 TEST_CHAIN_CONC = $(BUILD_DIR)/test_chain_concurrency
 
@@ -1725,7 +1742,7 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 
