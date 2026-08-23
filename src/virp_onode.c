@@ -2145,11 +2145,40 @@ static virp_error_t onode_list_devices(onode_state_t *state,
 }
 
 /*
- * list_fleet (Item 8): fleet ENUMERATION only — device names and their
- * connection status. Deliberately narrower than list_devices: no host
- * addresses, no node ids, no vendor detail, no config bodies. This is
- * the read a restricted federated principal keeps, so its content is
- * pinned by test to never quietly widen.
+ * Canonical class string for a device's vendor — the exact inverse of the
+ * config parser's vendor_from_string() (first-listed spelling per vendor).
+ * Read-only presentation for list_fleet; never used for dispatch.
+ */
+static const char *onode_vendor_class_string(virp_vendor_t v)
+{
+    switch (v) {
+    case VIRP_VENDOR_CISCO_IOS:   return "cisco_ios";
+    case VIRP_VENDOR_CISCO_IOSXE: return "cisco_iosxe";
+    case VIRP_VENDOR_FORTINET:    return "fortinet";
+    case VIRP_VENDOR_LINUX:       return "linux";
+    case VIRP_VENDOR_JUNIPER:     return "juniper";
+    case VIRP_VENDOR_PALOALTO:    return "paloalto";
+    case VIRP_VENDOR_WINDOWS:     return "windows";
+    case VIRP_VENDOR_PROXMOX:     return "proxmox";
+    case VIRP_VENDOR_CISCO_ASA:   return "cisco_asa";
+    case VIRP_VENDOR_WAZUH:       return "wazuh";
+    case VIRP_VENDOR_LIBRENMS:    return "librenms";
+    case VIRP_VENDOR_PBS:         return "pbs";
+    case VIRP_VENDOR_ZAMMAD:      return "zammad";
+    case VIRP_VENDOR_MOCK:        return "mock";
+    case VIRP_VENDOR_UNKNOWN:
+    default:                      return "unknown";
+    }
+}
+
+/*
+ * list_fleet (Item 8): fleet ENUMERATION only — device names, the vendor
+ * CLASS the gate dispatches on, and connection status. Deliberately
+ * narrower than list_devices: no host addresses, no node ids, no config
+ * bodies. Rows are exactly three tokens — "Name Class Status" — which is
+ * the contract the harness's fleet_classes() parses. This is the read a
+ * restricted federated principal keeps, so its content is pinned by test
+ * to never quietly widen.
  */
 static virp_error_t onode_list_fleet(onode_state_t *state,
                                      uint8_t *out_buf, size_t out_buf_len,
@@ -2160,9 +2189,9 @@ static virp_error_t onode_list_fleet(onode_state_t *state,
 
     int hw = snprintf(listing, sizeof(listing),
                       "VIRP Fleet (%d devices)\n"
-                      "%-24s %s\n"
-                      "----------------------------------------\n",
-                      state->device_count, "Name", "Status");
+                      "%-24s %-12s %s\n"
+                      "--------------------------------------------------\n",
+                      state->device_count, "Name", "Class", "Status");
     if (hw < 0 || (size_t)hw >= sizeof(listing))
         return VIRP_ERR_BUFFER_TOO_SMALL;
     offset = (size_t)hw;
@@ -2178,8 +2207,10 @@ static virp_error_t onode_list_fleet(onode_state_t *state,
         }
 
         int rw = snprintf(listing + offset, sizeof(listing) - offset,
-                          "%-24s %s\n",
-                          state->devices[i].hostname, status);
+                          "%-24s %-12s %s\n",
+                          state->devices[i].hostname,
+                          onode_vendor_class_string(state->devices[i].vendor),
+                          status);
         if (rw < 0 || (size_t)rw >= sizeof(listing) - offset)
             break;                 /* row truncated — stop, keep offset sane */
         offset += (size_t)rw;

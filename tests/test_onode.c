@@ -894,6 +894,162 @@ TEST(test_list_fleet_names_and_status_only)
     ASSERT_TRUE(strstr((const char *)data, "05050505") == NULL);
 }
 
+/* list_fleet carries each device's vendor CLASS (the canonical string the
+ * config parser accepts — the inverse of vendor_from_string) between the
+ * name and the status, so a consumer can pick read commands that fit the
+ * device. Rows are exactly three tokens: "Name Class Status". Driven on an
+ * isolated daemon with one device per class plus a disabled one, so the
+ * pinned 4-mock fleet above is untouched. */
+#define LF_SOCKET "/tmp/virp-onode-test-listfleet.sock"
+static onode_state_t lf_state;
+static void *lf_thread(void *arg)
+{
+    (void)arg;
+    onode_start(&lf_state);
+    return NULL;
+}
+static int lf_add(const char *name, virp_vendor_t vendor, uint32_t node_id,
+                  bool enabled)
+{
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "%s", name);
+    snprintf(dev.host, sizeof(dev.host), "10.255.1.%u", node_id & 0xFF);
+    dev.port = 22;
+    dev.vendor = vendor;
+    dev.node_id = node_id;
+    dev.enabled = enabled;
+    return onode_add_device(&lf_state, &dev) == VIRP_OK ? 0 : -1;
+}
+/* Find the row for `name` in the listing and split it into its tokens.
+ * Returns the token count (0 if the row is absent). */
+static int lf_row(const char *listing, const char *name,
+                  char *cls, size_t cls_sz, char *status, size_t status_sz)
+{
+    const char *line = listing;
+    size_t nlen = strlen(name);
+    while (line && *line) {
+        const char *eol = strchr(line, '\n');
+        size_t llen = eol ? (size_t)(eol - line) : strlen(line);
+        if (llen > nlen && strncmp(line, name, nlen) == 0 && line[nlen] == ' ') {
+            char row[256], a[64], b[64], c[64], extra[8];
+            snprintf(row, sizeof(row), "%.*s", (int)llen, line);
+            int n = sscanf(row, "%63s %63s %63s %7s", a, b, c, extra);
+            snprintf(cls, cls_sz, "%s", n >= 2 ? b : "");
+            snprintf(status, status_sz, "%s", n >= 3 ? c : "");
+            return n;
+        }
+        line = eol ? eol + 1 : NULL;
+    }
+    return 0;
+}
+TEST(test_list_fleet_enumerates_vendor_class)
+{
+    unlink(LF_SOCKET);
+    ASSERT_OK(onode_init(&lf_state, 0x0000004C, NULL, LF_SOCKET));
+    lf_state.ctx = virp_context_new();
+    ASSERT_TRUE(lf_state.ctx != NULL);
+    ASSERT_EQ(lf_add("FLT-IOS",  VIRP_VENDOR_CISCO_IOS, 0x0A0001F1, true),  0);
+    ASSERT_EQ(lf_add("FLT-PVE",  VIRP_VENDOR_PROXMOX,   0x0A0001F2, true),  0);
+    ASSERT_EQ(lf_add("FLT-LNX",  VIRP_VENDOR_LINUX,     0x0A0001F3, true),  0);
+    ASSERT_EQ(lf_add("FLT-FGT",  VIRP_VENDOR_FORTINET,  0x0A0001F4, true),  0);
+    ASSERT_EQ(lf_add("FLT-OFF",  VIRP_VENDOR_CISCO_ASA, 0x0A0001F5, false), 0);
+
+    pthread_t tid;
+    ASSERT_EQ(pthread_create(&tid, NULL, lf_thread, NULL), 0);
+    usleep(200000);
+
+    /* Same v2 framing as client_request(), against the isolated socket. */
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", LF_SOCKET);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            const char *json = "{\"action\": \"list_fleet\"}";
+            size_t json_len = strlen(json);
+            uint32_t frame_len = htonl((uint32_t)(1 + json_len));
+            uint8_t version = VIRP_FRAME_VERSION;
+            send(fd, &frame_len, 4, 0);
+            send(fd, &version, 1, 0);
+            send(fd, json, json_len, 0);
+            usleep(50000);
+            uint32_t net_rlen;
+            if (recv(fd, &net_rlen, 4, 0) == 4) {
+                uint32_t rlen = ntohl(net_rlen);
+                if (rlen <= sizeof(resp)) {
+                    size_t got = 0;
+                    while (got < rlen) {
+                        ssize_t r = recv(fd, resp + got, rlen - got, 0);
+                        if (r <= 0) break;
+                        got += (size_t)r;
+                    }
+                    n = (ssize_t)got;
+                }
+            }
+        }
+        close(fd);
+    }
+
+    /* Verify and parse while the daemon's O-Key is still loaded (destroy
+     * wipes it); assert after teardown so an early return cannot leak the
+     * thread or socket. */
+    virp_header_t hdr;
+    virp_observation_t obs;
+    const uint8_t *data = NULL;
+    uint16_t data_len = 0;
+    virp_error_t verr = VIRP_ERR_NULL_PTR, perr = VIRP_ERR_NULL_PTR;
+    if (n > (ssize_t)VIRP_HEADER_SIZE) {
+        verr = virp_validate_message(resp, (size_t)n, &lf_state.okey, &hdr);
+        perr = virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                                      (size_t)n - VIRP_HEADER_SIZE,
+                                      &obs, &data, &data_len);
+    }
+
+    onode_shutdown(&lf_state);
+    pthread_join(tid, NULL);
+    virp_context_destroy(lf_state.ctx);
+    lf_state.ctx = NULL;
+    onode_destroy(&lf_state);
+    unlink(LF_SOCKET);
+
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+    /* still a valid SIGNED observation under the daemon's O-Key */
+    ASSERT_OK(verr);
+    ASSERT_OK(perr);
+    ASSERT_EQ(obs.obs_type, VIRP_OBS_RESOURCE_STATE);
+
+    char listing[VIRP_OUTPUT_MAX];
+    snprintf(listing, sizeof(listing), "%.*s", (int)data_len, (const char *)data);
+    ASSERT_TRUE(strstr(listing, "5 devices") != NULL);
+    ASSERT_TRUE(strstr(listing, "Class") != NULL);
+
+    /* one row per device, exactly three tokens, class = canonical string */
+    char cls[64], st[64];
+    ASSERT_EQ(lf_row(listing, "FLT-IOS", cls, sizeof(cls), st, sizeof(st)), 3);
+    ASSERT_TRUE(strcmp(cls, "cisco_ios") == 0);
+    ASSERT_TRUE(strcmp(st, "unconnected") == 0);
+    ASSERT_EQ(lf_row(listing, "FLT-PVE", cls, sizeof(cls), st, sizeof(st)), 3);
+    ASSERT_TRUE(strcmp(cls, "proxmox") == 0);
+    ASSERT_TRUE(strcmp(st, "unconnected") == 0);
+    ASSERT_EQ(lf_row(listing, "FLT-LNX", cls, sizeof(cls), st, sizeof(st)), 3);
+    ASSERT_TRUE(strcmp(cls, "linux") == 0);
+    ASSERT_EQ(lf_row(listing, "FLT-FGT", cls, sizeof(cls), st, sizeof(st)), 3);
+    ASSERT_TRUE(strcmp(cls, "fortinet") == 0);
+    /* a disabled device still reports its class, status "disabled" */
+    ASSERT_EQ(lf_row(listing, "FLT-OFF", cls, sizeof(cls), st, sizeof(st)), 3);
+    ASSERT_TRUE(strcmp(cls, "cisco_asa") == 0);
+    ASSERT_TRUE(strcmp(st, "disabled") == 0);
+
+    /* still enumeration only: no host addresses, no node ids */
+    ASSERT_TRUE(strstr(listing, "10.255.1.") == NULL);
+    ASSERT_TRUE(strstr(listing, "0A0001F1") == NULL);
+    ASSERT_TRUE(strstr(listing, "0a0001f1") == NULL);
+}
+
 TEST(test_sequence_numbers_increment)
 {
     uint8_t resp1[VIRP_MAX_MESSAGE_SIZE];
@@ -6267,6 +6423,7 @@ int main(void)
     RUN_TEST(test_heartbeat);
     RUN_TEST(test_list_devices);
     RUN_TEST(test_list_fleet_names_and_status_only);
+    RUN_TEST(test_list_fleet_enumerates_vendor_class);
     RUN_TEST(test_sequence_numbers_increment);
     RUN_TEST(test_tampered_response_fails_verify);
     RUN_TEST(test_wrong_key_fails_verify);
