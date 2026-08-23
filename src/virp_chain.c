@@ -59,6 +59,8 @@ static void head_hmac_hex(virp_chain_state_t *state,
 static bool hexdigest_eq(const char *a, const char *b);
 static void sha256_hex(const char *data, size_t len, char out[65]);
 static int table_exists(sqlite3 *db, const char *name);
+static int column_exists(sqlite3 *db, const char *table, const char *col);
+static void detect_sig_columns(virp_chain_state_t *state);
 static virp_error_t head_upsert_locked(virp_chain_state_t *state,
                                        const char *session_id,
                                        int64_t last_sequence,
@@ -781,6 +783,33 @@ static const char *SQL_HEAD_GET =
     "SELECT last_sequence, last_entry_hash, head_hmac "
     "FROM chain_heads WHERE session_id = ?";
 
+/* =========================================================================
+ * D-1 signing-path SQL. Used ONLY when signing is enabled and the sig
+ * columns exist; a signing-off chain never prepares or issues these, so it
+ * emits the exact pre-D-1 statements above. The column ORDER matches the
+ * unsigned statement so the first N binds are identical; the sig columns
+ * are appended.
+ * ========================================================================= */
+static const char *SQL_INSERT_SIGNED =
+    "INSERT INTO chain_entries "
+    "(session_id, sequence, chain_entry_hash, previous_entry_hash, "
+    " timestamp_ns, monotonic_ns, artifact_type, artifact_id, "
+    " artifact_hash, artifact_hash_alg, artifact_schema_version, "
+    " signer_node_id, signer_org_id, chain_hmac, "
+    " chain_sig, chain_sig_key_id) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+
+static const char *SQL_HEAD_UPSERT_SIGNED =
+    "INSERT OR REPLACE INTO chain_heads "
+    "(session_id, last_sequence, last_entry_hash, head_hmac, updated_at_ns, "
+    " head_sig, head_sig_key_id) "
+    "VALUES (?,?,?,?,?,?,?)";
+
+/* The signature-column SELECT variants (SQL_GET_RANGE_SIGNED /
+ * SQL_HEAD_GET_SIGNED) are introduced with the verifier tiers, where they
+ * are read; the writer path never needs them (it reads only the prior
+ * entry's hash to link). */
+
 /* Intent store SQL */
 static const char *SQL_INTENT_INSERT =
     "INSERT OR REPLACE INTO intents "
@@ -953,6 +982,17 @@ static void read_entry_from_stmt(sqlite3_stmt *stmt, virp_chain_entry_t *e)
              (const char *)sqlite3_column_text(stmt, 12));
     snprintf(e->chain_hmac, sizeof(e->chain_hmac), "%s",
              (const char *)sqlite3_column_text(stmt, 13));
+    /* D-1 sig columns (14, 15) are present only in the *_SIGNED SELECTs.
+     * sqlite3_column_count guards against reading past a non-signing
+     * SELECT, and a NULL cell (unsigned entry in a signed DB) leaves the
+     * field the empty string set by memset above. */
+    if (sqlite3_column_count(stmt) > 15) {
+        const unsigned char *sig = sqlite3_column_text(stmt, 14);
+        const unsigned char *kid = sqlite3_column_text(stmt, 15);
+        if (sig) snprintf(e->chain_sig, sizeof(e->chain_sig), "%s", sig);
+        if (kid) snprintf(e->chain_sig_key_id, sizeof(e->chain_sig_key_id),
+                          "%s", kid);
+    }
 }
 
 /* =========================================================================
@@ -994,15 +1034,46 @@ static void head_hmac_hex(virp_chain_state_t *state,
 /*
  * Write/replace the head row for a session. Caller must already be inside
  * a transaction (append path) or hold the chain lock (backfill).
+ *
+ * D-1: when signing is enabled, the head is Ed25519-signed over the SAME
+ * head canonical bytes (with the VIRP-CHAIN-HEAD-SIG-v1 tag) and the
+ * signature + key_id go into the head_sig columns via the signed upsert.
+ * A signing failure fails the whole append (fail-closed) — the head can
+ * never be stored HMAC'd-but-not-signed once the node has committed to
+ * signing. Signing off: the exact pre-D-1 statement and bytes.
  */
 static virp_error_t head_upsert_locked(virp_chain_state_t *state,
                                        const char *session_id,
                                        int64_t last_sequence,
                                        const char *last_entry_hash)
 {
+    char canonical[512];
+    int n = head_canonical(session_id, last_sequence, last_entry_hash,
+                           canonical, sizeof(canonical));
     char hmac_hex[65];
-    head_hmac_hex(state, session_id, last_sequence, last_entry_hash,
-                  hmac_hex);
+    hmac_sha256_hex(state->chain_key.key.key, canonical, (size_t)n, hmac_hex);
+
+    if (state->sign_enabled) {
+        uint8_t sig[VIRP_CHAINSIGN_SIG_SIZE];
+        if (virp_chainsign_sign(&state->sign_key, VIRP_CHAINSIGN_TAG_HEAD,
+                                canonical, (size_t)n, sig) != VIRP_OK)
+            return VIRP_ERR_CRYPTO;
+        char sig_hex[VIRP_CHAINSIGN_SIG_HEX];
+        virp_chainsign_sig_to_hex(sig, sig_hex);
+
+        sqlite3_stmt *st = state->stmt_head_upsert_signed;
+        sqlite3_reset(st);
+        sqlite3_bind_text(st, 1, session_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, last_sequence);
+        sqlite3_bind_text(st, 3, last_entry_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, hmac_hex, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 5, (int64_t)get_wall_ns());
+        sqlite3_bind_text(st, 6, sig_hex, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 7, state->sign_key.key_id_hex, -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(st);
+        sqlite3_reset(st);
+        return (rc == SQLITE_DONE) ? VIRP_OK : VIRP_ERR_CHAIN_DB;
+    }
 
     sqlite3_reset(state->stmt_head_upsert);
     sqlite3_bind_text(state->stmt_head_upsert, 1, session_id, -1, SQLITE_TRANSIENT);
@@ -1289,9 +1360,103 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
         if (bf) sqlite3_finalize(bf);
     }
 
+    /* D-1: note whether this database already carries the signature
+     * columns (a previously signing-enabled chain reopened). The writer's
+     * statement choice keys off sign_enabled, not this, but the read path
+     * and the verifier need to know the columns exist. Default false —
+     * a chain that never enabled signing is byte-identical to pre-D-1. */
+    detect_sig_columns(state);
+    state->have_chain_key = true;   /* init always loads K_chain */
+
     fprintf(stderr, "[Chain] Initialized: db=%s node=%u org=%s\n",
             db_path, node_id, state->org_id);
 
+    return VIRP_OK;
+}
+
+/* =========================================================================
+ * D-1 — enable detached Ed25519 chain signing on an init'd chain
+ * ========================================================================= */
+
+virp_error_t virp_chain_enable_signing(virp_chain_state_t *state,
+                                       const char *sk_path)
+{
+    if (!state || !sk_path)
+        return VIRP_ERR_NULL_PTR;
+    if (!state->db)
+        return VIRP_ERR_CHAIN_DB;
+    if (state->read_only)
+        return VIRP_ERR_CHAIN_READONLY;
+
+    pthread_mutex_lock(&state->lock);
+
+    virp_error_t err = virp_chainsign_load(&state->sign_key, sk_path);
+    if (err != VIRP_OK) {
+        fprintf(stderr, "[Chain] chain-signing key load failed (%s): %s\n",
+                sk_path, virp_error_str(err));
+        pthread_mutex_unlock(&state->lock);
+        return err;
+    }
+
+    /* Add the signature columns if absent. ADD COLUMN with no default is
+     * metadata-only on SQLite — no row rewrite, no data migration — and it
+     * runs ONLY here, so a daemon that never enables signing leaves the
+     * on-disk schema bit-for-bit the pre-D-1 shape. Each ALTER is its own
+     * statement so a partially-migrated DB (columns added in a prior run)
+     * is handled: skip the ones already present. */
+    static const struct { const char *tbl; const char *col; } COLS[] = {
+        { "chain_entries", "chain_sig" },
+        { "chain_entries", "chain_sig_key_id" },
+        { "chain_heads",   "head_sig" },
+        { "chain_heads",   "head_sig_key_id" },
+    };
+    for (size_t i = 0; i < sizeof(COLS) / sizeof(COLS[0]); i++) {
+        int has = column_exists(state->db, COLS[i].tbl, COLS[i].col);
+        if (has < 0) {
+            virp_chainsign_destroy(&state->sign_key);
+            pthread_mutex_unlock(&state->lock);
+            return VIRP_ERR_CHAIN_DB;
+        }
+        if (has == 1) continue;
+        char sql[128];
+        snprintf(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s TEXT",
+                 COLS[i].tbl, COLS[i].col);
+        char *errmsg = NULL;
+        if (sqlite3_exec(state->db, sql, NULL, NULL, &errmsg) != SQLITE_OK) {
+            fprintf(stderr, "[Chain] failed to add %s.%s: %s\n",
+                    COLS[i].tbl, COLS[i].col, errmsg ? errmsg : "?");
+            sqlite3_free(errmsg);
+            virp_chainsign_destroy(&state->sign_key);
+            pthread_mutex_unlock(&state->lock);
+            return VIRP_ERR_CHAIN_DB;
+        }
+    }
+
+    /* Prepare the signing statement variants. */
+    if (sqlite3_prepare_v2(state->db, SQL_INSERT_SIGNED, -1,
+                           &state->stmt_insert_signed, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(state->db, SQL_HEAD_UPSERT_SIGNED, -1,
+                           &state->stmt_head_upsert_signed, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[Chain] failed to prepare signing statements: %s\n",
+                sqlite3_errmsg(state->db));
+        if (state->stmt_insert_signed) {
+            sqlite3_finalize(state->stmt_insert_signed);
+            state->stmt_insert_signed = NULL;
+        }
+        virp_chainsign_destroy(&state->sign_key);
+        pthread_mutex_unlock(&state->lock);
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    state->entry_sig_cols = true;
+    state->head_sig_cols = true;
+    state->sign_enabled = true;
+
+    fprintf(stderr, "[Chain] Detached Ed25519 chain signing ENABLED "
+            "(scheme %s, key_id %s)\n",
+            VIRP_CHAINSIGN_SCHEME, state->sign_key.key_id_hex);
+
+    pthread_mutex_unlock(&state->lock);
     return VIRP_OK;
 }
 
@@ -1308,6 +1473,38 @@ static int table_exists(sqlite3 *db, const char *name)
     sqlite3_finalize(st);
     if (rc == SQLITE_ROW) return 1;
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+/* Does `table` have a column named `col`? 1/0, or -1 on query failure.
+ * PRAGMA table_info is the authoritative introspection; a substring scan
+ * of the CREATE text would false-match a column mentioned in a comment or
+ * a longer name. Used only to detect the D-1 sig columns. */
+static int column_exists(sqlite3 *db, const char *table, const char *col)
+{
+    char sql[128];
+    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s)", table);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    int found = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(st, 1); /* "name" */
+        if (name && strcmp(name, col) == 0) { found = 1; break; }
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+/* Detect the D-1 signature columns on an already-open database and record
+ * their presence on the state. Safe on any schema: absent columns just
+ * leave the flags false, and a chain that never enabled signing reads
+ * exactly as it did pre-D-1. */
+static void detect_sig_columns(virp_chain_state_t *state)
+{
+    int e = column_exists(state->db, "chain_entries", "chain_sig");
+    int h = column_exists(state->db, "chain_heads", "head_sig");
+    state->entry_sig_cols = (e == 1);
+    state->head_sig_cols  = (h == 1);
 }
 
 virp_error_t virp_chain_open_verifier(virp_chain_state_t *state,
@@ -1546,25 +1743,53 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
     hmac_sha256_hex(state->chain_key.key.key,
                     canonical, (size_t)clen, entry->chain_hmac);
 
-    /* INSERT */
-    sqlite3_reset(state->stmt_insert);
-    sqlite3_bind_text(state->stmt_insert, 1, entry->session_id, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(state->stmt_insert, 2, entry->sequence);
-    sqlite3_bind_text(state->stmt_insert, 3, entry->chain_entry_hash, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(state->stmt_insert, 4, entry->previous_entry_hash, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(state->stmt_insert, 5, (int64_t)entry->timestamp_ns);
-    sqlite3_bind_int64(state->stmt_insert, 6, (int64_t)entry->monotonic_ns);
-    sqlite3_bind_text(state->stmt_insert, 7, entry->artifact_type, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(state->stmt_insert, 8, entry->artifact_id, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(state->stmt_insert, 9, entry->artifact_hash, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(state->stmt_insert, 10, entry->artifact_hash_alg, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(state->stmt_insert, 11, entry->artifact_schema_version, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(state->stmt_insert, 12, (int)entry->signer_node_id);
-    sqlite3_bind_text(state->stmt_insert, 13, entry->signer_org_id, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(state->stmt_insert, 14, entry->chain_hmac, -1, SQLITE_TRANSIENT);
+    /* D-1: detached Ed25519 signature over the EXACT SAME canonical bytes
+     * (domain-tagged VIRP-CHAIN-ENTRY-SIG-v1), stored beside — never inside
+     * — the authenticated content. Computed here, after the hash and HMAC,
+     * so it signs precisely what they cover. Fail-closed: once signing is
+     * enabled, a signing failure fails the append; the entry is never
+     * stored hashed-and-HMAC'd-but-unsigned. When signing is off, none of
+     * this runs and the INSERT below is the pre-D-1 statement. */
+    char sig_hex[VIRP_CHAINSIGN_SIG_HEX];
+    if (state->sign_enabled) {
+        uint8_t sig[VIRP_CHAINSIGN_SIG_SIZE];
+        if (virp_chainsign_sign(&state->sign_key, VIRP_CHAINSIGN_TAG_ENTRY,
+                                canonical, (size_t)clen, sig) != VIRP_OK) {
+            sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+            return VIRP_ERR_CRYPTO;
+        }
+        virp_chainsign_sig_to_hex(sig, sig_hex);
+        snprintf(entry->chain_sig, sizeof(entry->chain_sig), "%s", sig_hex);
+        snprintf(entry->chain_sig_key_id, sizeof(entry->chain_sig_key_id),
+                 "%s", state->sign_key.key_id_hex);
+    }
 
-    rc = sqlite3_step(state->stmt_insert);
-    sqlite3_reset(state->stmt_insert);
+    /* INSERT — the signed variant binds two extra columns; the first 14
+     * binds are identical to the unsigned statement. */
+    sqlite3_stmt *ins = state->sign_enabled ? state->stmt_insert_signed
+                                            : state->stmt_insert;
+    sqlite3_reset(ins);
+    sqlite3_bind_text(ins, 1, entry->session_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ins, 2, entry->sequence);
+    sqlite3_bind_text(ins, 3, entry->chain_entry_hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 4, entry->previous_entry_hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ins, 5, (int64_t)entry->timestamp_ns);
+    sqlite3_bind_int64(ins, 6, (int64_t)entry->monotonic_ns);
+    sqlite3_bind_text(ins, 7, entry->artifact_type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 8, entry->artifact_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 9, entry->artifact_hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 10, entry->artifact_hash_alg, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 11, entry->artifact_schema_version, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(ins, 12, (int)entry->signer_node_id);
+    sqlite3_bind_text(ins, 13, entry->signer_org_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 14, entry->chain_hmac, -1, SQLITE_TRANSIENT);
+    if (state->sign_enabled) {
+        sqlite3_bind_text(ins, 15, entry->chain_sig, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins, 16, entry->chain_sig_key_id, -1, SQLITE_TRANSIENT);
+    }
+
+    rc = sqlite3_step(ins);
+    sqlite3_reset(ins);
 
     if (rc != SQLITE_DONE) {
         sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
@@ -1913,10 +2138,16 @@ void virp_chain_destroy(virp_chain_state_t *state)
         sqlite3_finalize(state->stmt_intent_execute);
     if (state->stmt_artifact_insert)
         sqlite3_finalize(state->stmt_artifact_insert);
+    if (state->stmt_insert_signed)
+        sqlite3_finalize(state->stmt_insert_signed);
+    if (state->stmt_head_upsert_signed)
+        sqlite3_finalize(state->stmt_head_upsert_signed);
     if (state->db)
         sqlite3_close(state->db);
 
     virp_key_destroy(&state->chain_key);
+    if (state->sign_enabled)
+        virp_chainsign_destroy(&state->sign_key);
 
     /* Safe: destroy runs only after the worker drain (Item 2), so no thread
      * still holds the lock. Destroy before the memset zeroes it. */
