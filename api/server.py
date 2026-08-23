@@ -26,8 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -972,19 +973,28 @@ def _read_then_write_devices(path: str, mutate) -> dict:
                 os.close(lock_fd)
 
 
-async def check_auth(request: Request):
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def check_auth(
+    creds: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
+):
     """FastAPI dependency: bearer token auth (if configured).
 
     Use via `dependencies=[Depends(check_auth)]` on route decorators.
     When VIRP_API_TOKEN is unset, auth is a no-op (POC/dev mode).
     Comparison is constant-time so a valid-length wrong token cannot be
     learned byte-by-byte from response-time differences.
+
+    The token is consumed via an HTTPBearer scheme declared with
+    `Security(...)` so it lands in the OpenAPI document as a
+    securityScheme — Swagger /docs renders an Authorize button and
+    attaches the token to protected requests. `auto_error=False` keeps
+    the 401 message and the token-unset dev-mode path unchanged.
     """
     if not API_TOKEN:
         return  # No auth configured
-    auth = request.headers.get("Authorization", "")
-    expected = f"Bearer {API_TOKEN}"
-    if not hmac.compare_digest(auth, expected):
+    if creds is None or not hmac.compare_digest(creds.credentials, API_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid or missing API token")
 
 

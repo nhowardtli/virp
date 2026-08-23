@@ -863,10 +863,12 @@ TEST(test_list_devices)
     ASSERT_TRUE(strstr((const char *)data, "4 devices") != NULL);
 }
 
-/* Item 8: list_fleet is enumeration ONLY — names and status. No host
- * addresses, no node ids, no config bodies. Pinned so the fleet view a
- * restricted principal gets can never quietly widen. */
-TEST(test_list_fleet_names_and_status_only)
+/* Item 8: list_fleet is enumeration ONLY — names, vendor class, status.
+ * No host addresses, no node ids, no config bodies. The class column is
+ * the gate's own dispatch metadata (the same vendor field that selects
+ * the per-class allowlist). Pinned so the fleet view a restricted
+ * principal gets can never quietly widen beyond name+class+status. */
+TEST(test_list_fleet_names_class_and_status_only)
 {
     uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
     ssize_t n = client_request(
@@ -889,7 +891,10 @@ TEST(test_list_fleet_names_and_status_only)
     ASSERT_TRUE(strstr((const char *)data, "R7") != NULL);
     ASSERT_TRUE(strstr((const char *)data, "R8") != NULL);
     ASSERT_TRUE(strstr((const char *)data, "4 devices") != NULL);
-    /* names and status only */
+    /* class column present, from the gate's own vendor metadata */
+    ASSERT_TRUE(strstr((const char *)data, "Class") != NULL);
+    ASSERT_TRUE(strstr((const char *)data, "mock") != NULL);
+    /* names, class and status only */
     ASSERT_TRUE(strstr((const char *)data, "10.0.0.5") == NULL);
     ASSERT_TRUE(strstr((const char *)data, "05050505") == NULL);
 }
@@ -6266,7 +6271,7 @@ int main(void)
     RUN_TEST(test_device_not_found);
     RUN_TEST(test_heartbeat);
     RUN_TEST(test_list_devices);
-    RUN_TEST(test_list_fleet_names_and_status_only);
+    RUN_TEST(test_list_fleet_names_class_and_status_only);
     RUN_TEST(test_sequence_numbers_increment);
     RUN_TEST(test_tampered_response_fails_verify);
     RUN_TEST(test_wrong_key_fails_verify);
