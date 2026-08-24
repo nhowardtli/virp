@@ -60,12 +60,16 @@ Copyright (c) 2026 Third Level IT LLC. All rights reserved.
 """
 
 import argparse
+import base64
+import glob
 import hashlib
 import json
 import os
+import signal
 import socket
 import sqlite3
 import struct
+import subprocess
 import sys
 import time
 
@@ -535,12 +539,28 @@ def _camera_bodies(db_path):
 
 # ── audit: the anti-chainwalk-bug regression, runnable ─────────────────
 
+def _load_pubkeys(pubkey_paths):
+    """Return {key_id: pk_raw} for a list of pinned public-key files. An
+    Option B chain legitimately carries more than one producer identity
+    (the capture host's key differs from a bootstrap replay key); each
+    body names its producer_key_id, so a body is checked against the
+    pinned key that matches it."""
+    keys = {}
+    for p in pubkey_paths or []:
+        with open(p, "rb") as f:
+            raw = f.read()
+        keys[producer_key_id(raw)] = raw
+    return keys
+
+
 def audit_chain(db_path, session_prefix="camera:", pubkey_path=None):
     """For every camera_segment entry: recompute sha256 over the body
     bytes AS STORED in the chain and match artifact_hash (the
     chainwalk_summary defect was exactly this failing); check the
     in-body prev-hash chain per camera; optionally verify every
-    producer_sig. Returns (checked, failures:list)."""
+    producer_sig against the pinned key(s). pubkey_path may be a single
+    path or a list of paths (multi-producer chains). Returns
+    (checked, failures:list)."""
     conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
     try:
         rows = conn.execute(
@@ -555,14 +575,20 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None):
     finally:
         conn.close()
 
-    pk = None
-    if pubkey_path:
-        with open(pubkey_path, "rb") as f:
-            pk = f.read()
+    if isinstance(pubkey_path, (list, tuple)):
+        pubkeys = _load_pubkeys(pubkey_path)
+    elif pubkey_path:
+        pubkeys = _load_pubkeys([pubkey_path])
+    else:
+        pubkeys = {}
 
     failures = []
-    chains = {}   # camera_id -> (last_seq, last_sha)
     checked = 0
+    cam_bodies = []   # (session_id, artifact_id, body) in seq order
+
+    # Pass 1 — the hash invariant, order-independent (the chainwalk
+    # regression): every stored body must hash to its recorded
+    # artifact_hash. Also collect the camera bodies to walk by seq.
     for session_id, seq, artifact_id, ahash, content in rows:
         stored = content.encode("ascii")
         checked += 1
@@ -570,8 +596,7 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None):
         if recomputed != ahash:
             failures.append("%s %s: sha256(stored body) %s != "
                             "artifact_hash %s"
-                            % (session_id, artifact_id, recomputed,
-                               ahash))
+                            % (session_id, artifact_id, recomputed, ahash))
             continue
         try:
             body = json.loads(content)
@@ -581,27 +606,471 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None):
             continue
         if body.get("schema") != SCHEMA:
             continue
+        cam_bodies.append((session_id, artifact_id, body))
+
+    # Pass 2 — the prev-hash continuity chain, walked in segment_seq
+    # order per camera (the canonical order of the stream), NOT chain
+    # append order: an Option B record is appended when its ship is
+    # relayed, which need not match capture order. A seq that does not
+    # follow its predecessor, or a prev-hash that does not cite it, is a
+    # break — unless the record itself carries a gap, which is the
+    # explicit, signed statement that continuity is not claimed there.
+    chains = {}
+    for session_id, artifact_id, body in sorted(
+            cam_bodies, key=lambda t: (t[2]["camera_id"],
+                                       t[2]["segment_seq"])):
         cam = body["camera_id"]
+        gapped = body.get("gap") is not None
         if cam in chains:
             last_seq, last_sha = chains[cam]
-            if body["segment_seq"] != last_seq + 1:
+            if body["segment_seq"] != last_seq + 1 and not gapped:
                 failures.append("%s %s: segment_seq %s does not follow "
-                                "%s" % (session_id, artifact_id,
-                                        body["segment_seq"], last_seq))
-            if body["prev_segment_sha256"] != last_sha:
+                                "%s (and carries no gap record)"
+                                % (session_id, artifact_id,
+                                   body["segment_seq"], last_seq))
+            if body["prev_segment_sha256"] != last_sha and not gapped:
                 failures.append("%s %s: prev_segment_sha256 does not "
-                                "cite the previous segment"
-                                % (session_id, artifact_id))
+                                "cite the previous segment (and carries "
+                                "no gap record)" % (session_id, artifact_id))
         else:
-            if body["prev_segment_sha256"] is not None:
+            if body["prev_segment_sha256"] is not None and not gapped:
                 failures.append("%s %s: first record for %s has non-null "
                                 "prev_segment_sha256"
                                 % (session_id, artifact_id, cam))
         chains[cam] = (body["segment_seq"], body["segment_sha256"])
-        if pk is not None and not producer_verify(pk, body):
-            failures.append("%s %s: producer_sig INVALID"
-                            % (session_id, artifact_id))
+        if pubkeys:
+            kid = body.get("producer_key_id")
+            pk = pubkeys.get(kid)
+            if pk is None:
+                failures.append("%s %s: producer_key_id %s is not among "
+                                "the pinned keys" % (session_id,
+                                                     artifact_id, kid))
+            elif not producer_verify(pk, body):
+                failures.append("%s %s: producer_sig INVALID"
+                                % (session_id, artifact_id))
     return checked, failures
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 2 — live capture over the Option B split
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The capture host (ffmpeg, producer key, continuity state) and the
+# O-node (the socket, the chain-signing key, chain_append authority) are
+# two different machines connected by ONE ssh path. Neither the daemon
+# nor a live ffmpeg can be moved across that boundary, so:
+#
+#   capture host  ─ build camera_segment/1 body, producer-sign, ship the
+#                   {segment, signed-body} pair to a chrooted spool ─┐
+#                                                                    │  ssh
+#   O-node host   ─ submit-spool watches the spool and relays each ──┘
+#                   body VERBATIM into chain_append (as the identity
+#                   that Phase 1 used). It never builds or signs a body;
+#                   it only carries already-signed bytes to the daemon,
+#                   which re-derives artifact_hash (GATE 2) and D-1 signs
+#                   the chain entry.
+#
+# The producer key lives ONLY on the capture host: the submitter needs
+# no key and can forge nothing — a body it did not receive intact fails
+# GATE 2 at the daemon and its own segment-hash check here. Continuity
+# (segment_seq, prev_segment_sha256) is owned by the capture host, since
+# that is where the body — which commits to them — is built and signed.
+
+
+# ── RTSP source (credentials never touch a body, a log or a report) ────
+
+def rtsp_url_from_config(env_var="VIRP_CAMERA_RTSP_URL", config_path=None):
+    """The live RTSP URL comes from the environment or a 0600 config file
+    (one line, the full rtsp://user:pass@host:port/path). It is used only
+    to open the stream; it is never placed in a body (the schema has no
+    URL field at all), never printed, never logged. Returns the URL or
+    None if unconfigured."""
+    url = os.environ.get(env_var)
+    if url:
+        return url.strip()
+    if config_path and os.path.exists(config_path):
+        st = os.stat(config_path)
+        if st.st_mode & 0o077:
+            raise SystemExit("rtsp config %s is group/world-readable "
+                             "(mode %o) — refusing to read a credential "
+                             "from it" % (config_path, st.st_mode & 0o777))
+        with open(config_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line
+    return None
+
+
+def ffmpeg_cmd(cfg):
+    """The capture child. Real camera: copy stream1 (720p H.264) with no
+    audio into wall-clock-closed segments, exactly as Phase 0 proved
+    (-an -c copy). No RTSP URL configured but --test-source given: a
+    real-time synthetic 720p H.264 source, so the whole ship→submit→
+    chain→docket path can be exercised without the rotated credential.
+    The pixels differ; every attested fact (bytes, timing, continuity)
+    is produced identically."""
+    pat = os.path.join(cfg["workdir"], "seg_%06d.mp4")
+    st = str(cfg["segment_time"])
+    common = ["-f", "segment", "-segment_time", st,
+              "-reset_timestamps", "1", "-segment_format", "mp4",
+              "-movflags", "+faststart", pat]
+    if cfg.get("rtsp_url"):
+        return (["ffmpeg", "-nostdin", "-loglevel", "error",
+                 "-rtsp_transport", "tcp", "-i", cfg["rtsp_url"],
+                 "-an", "-c", "copy"] + common)
+    # synthetic real-time source (no camera credential required). A live
+    # wall-clock overlay is burned in, so — like a real scene — no two
+    # runs and no two segments ever produce byte-identical frames; the
+    # content-addressed store never coincidentally collapses distinct
+    # captures. Falls back to the bare pattern if the font is absent.
+    gop = str(int(cfg["segment_time"]) * 15)
+    vf = None
+    font = cfg.get("overlay_font")
+    if font and os.path.exists(font):
+        vf = ("drawtext=fontfile=%s:text='%%{localtime}':x=24:y=24:"
+              "fontsize=40:fontcolor=white:box=1:boxcolor=black@0.5" % font)
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error",
+           "-re", "-f", "lavfi",
+           "-i", "testsrc2=size=1280x720:rate=15"]
+    if vf:
+        cmd += ["-vf", vf]
+    return (cmd + ["-an", "-c:v", "libx264", "-preset", "veryfast",
+                   "-pix_fmt", "yuv420p", "-g", gop] + common)
+
+
+# ── Capture-host delivery: ship the {segment, signed body} pair ────────
+
+def sftp_ship(spool_target, ssh_key=None, extra_opts=None):
+    """Return ship(seg_file, body_file, name) -> bool. Uploads to the
+    chrooted spool as <name>.mp4/.body via .part staging + rename, then
+    a <name>.done marker LAST, so the submitter only ever sees complete
+    jobs. One ssh path, key-only, sftp-only (the account is chrooted to
+    internal-sftp on the far end)."""
+    opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+    if ssh_key:
+        opts += ["-o", "IdentitiesOnly=yes", "-i", ssh_key]
+    if extra_opts:
+        opts += list(extra_opts)
+
+    def _batch(script):
+        p = subprocess.run(["sftp"] + opts + ["-b", "-", spool_target],
+                           input=script.encode(), capture_output=True)
+        if p.returncode != 0:
+            sys.stderr.write("sftp: %s\n" % p.stderr.decode(errors="replace"))
+        return p.returncode == 0
+
+    def ship(seg_file, body_file, name):
+        rd = "/incoming"
+        if not _batch("\n".join([
+                "put %s %s/%s.mp4.part" % (seg_file, rd, name),
+                "put %s %s/%s.body.part" % (body_file, rd, name),
+                "rename %s/%s.mp4.part %s/%s.mp4" % (rd, name, rd, name),
+                "rename %s/%s.body.part %s/%s.body" % (rd, name, rd, name),
+                ])):
+            return False
+        marker = body_file + ".done"
+        open(marker, "wb").close()
+        try:
+            ok = _batch("put %s %s/%s.done" % (marker, rd, name))
+        finally:
+            os.unlink(marker)
+        return ok
+
+    return ship
+
+
+def process_live_segment(path, cfg, state, gap, ship):
+    """Hash a CLOSED live segment, build+producer-sign the body with a
+    host-clock timestamp, stage it, and ship the pair to the spool. State
+    advances only after a durable handoff (ship ok); a failed ship raises
+    SubmitError and continuity is NOT advanced — the segment is retried,
+    never skipped."""
+    with open(path, "rb") as f:
+        seg_bytes = f.read()
+    seg_sha = hashlib.sha256(seg_bytes).hexdigest()
+    duration = mp4_duration_s(path)          # raises on a partial (no moov)
+
+    end_ns = time.time_ns()
+    time_source = "host-clock"
+    start_ns = end_ns - int(duration * 1e9)
+
+    seq = (state["segment_seq"] + 1) if state else 0
+    prev = state["last_segment_sha256"] if state else None
+
+    body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
+                            prev, len(seg_bytes), duration, start_ns,
+                            end_ns, time_source, "live", gap, cfg["key_id"])
+    body_bytes, body = producer_sign(cfg["sk"], body_nosig)
+    if len(body_bytes) >= ARTIFACT_LIMIT:
+        raise SubmitError("%s: body is %d bytes, at/past the daemon's "
+                          "%d-byte artifact field — not shipped"
+                          % (os.path.basename(path), len(body_bytes),
+                             ARTIFACT_LIMIT))
+
+    session_id = session_for(cfg["camera_id"], end_ns)
+    artifact_id = "camseg:%s:%d:%d" % (cfg["camera_id"], seq, end_ns)
+
+    out = cfg["outbox"]
+    os.makedirs(out, mode=0o700, exist_ok=True)
+    name = "%06d.%s" % (seq, seg_sha)
+    seg_out = os.path.join(out, name + ".mp4")
+    body_out = os.path.join(out, name + ".body")
+    with open(seg_out + ".tmp", "wb") as f:
+        f.write(seg_bytes)
+    os.replace(seg_out + ".tmp", seg_out)
+    with open(body_out + ".tmp", "wb") as f:
+        f.write(body_bytes)
+    os.replace(body_out + ".tmp", body_out)
+
+    if not ship(seg_out, body_out, name):
+        raise SubmitError("%s: ship to spool failed (continuity not "
+                          "advanced)" % os.path.basename(path))
+
+    # Capture-side handoff record: the exact bytes shipped, for audit of
+    # what left this host independent of what the far end did with it.
+    handoff = {
+        "artifact_id": artifact_id,
+        "session_id": session_id,
+        "segment_sha256": seg_sha,
+        "body": body_bytes.decode("ascii"),
+        "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
+        "shipped_as": name,
+        "source_file": os.path.basename(path),
+    }
+    with open(os.path.join(out, name + ".handoff.json"), "w") as f:
+        json.dump(handoff, f, indent=1, sort_keys=True)
+        f.write("\n")
+
+    new_state = {
+        "camera_id": cfg["camera_id"],
+        "segment_seq": seq,
+        "last_segment_sha256": seg_sha,
+        "last_session_id": session_id,
+        "last_end_ns": end_ns,
+    }
+    state_save(cfg["state_path"], new_state)
+    print("live seq=%d sha256=%.16s… shipped session=%s%s"
+          % (seq, seg_sha, session_id,
+             "  GAP(%s)" % gap["reason"] if gap else ""), flush=True)
+    return new_state
+
+
+def _closed_segments(workdir, ffmpeg_done):
+    """Names of segments safe to attest: every seg_*.mp4 except the
+    highest-indexed one while ffmpeg is still running (that one is the
+    open, growing segment). Once ffmpeg has exited, all are closed."""
+    names = sorted(n for n in os.listdir(workdir) if n.endswith(".mp4"))
+    if not names:
+        return []
+    if ffmpeg_done:
+        return names
+    return names[:-1]
+
+
+def run_live(cfg, ship, stop_after_s=None, poll_s=0.5,
+             _spawn=None, _clock=time.time):
+    """Spawn the capture child, and as each segment closes, attest+ship it
+    in order. A prior run means this run cannot claim continuous coverage
+    across the restart: the first record carries an explicit gap — the
+    same honesty rule as replay, now across a live kill/restart. SIGINT/
+    SIGTERM stop the child and drain the segments already closed."""
+    os.makedirs(cfg["workdir"], mode=0o700, exist_ok=True)
+    os.makedirs(cfg["outbox"], mode=0o700, exist_ok=True)
+    state = state_load(cfg["state_path"])
+    pending_gap = None
+    if state is not None:
+        pending_gap = {"reason": "driver-restart",
+                       "after_seq": state["segment_seq"]}
+
+    proc = (_spawn or _spawn_ffmpeg)(cfg)
+    stop = {"flag": False}
+
+    def _sig(_signo, _frame):
+        stop["flag"] = True
+    old_int = signal.signal(signal.SIGINT, _sig)
+    old_term = signal.signal(signal.SIGTERM, _sig)
+
+    processed = set()
+    done = 0
+    start = _clock()
+    try:
+        while True:
+            ffmpeg_done = proc.poll() is not None
+            for name in _closed_segments(cfg["workdir"], ffmpeg_done):
+                if name in processed:
+                    continue
+                path = os.path.join(cfg["workdir"], name)
+                try:
+                    state = process_live_segment(path, cfg, state,
+                                                 pending_gap, ship)
+                except ValueError as e:      # partial/no-moov: skip honestly
+                    sys.stderr.write("skip %s: %s\n" % (name, e))
+                    processed.add(name)
+                    continue
+                except SubmitError as e:
+                    sys.stderr.write("SUBMIT REFUSED: %s\n" % e)
+                    break                    # retry this segment next poll
+                processed.add(name)
+                pending_gap = None
+                done += 1
+            if ffmpeg_done:
+                break
+            if stop["flag"]:
+                proc.terminate()             # ffmpeg finalizes current seg
+                try:
+                    proc.wait(timeout=8)
+                except Exception:
+                    proc.kill()
+                continue                     # loop once more: drain closed
+            if stop_after_s is not None and (_clock() - start) >= stop_after_s:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=8)
+                except Exception:
+                    proc.kill()
+                continue
+            time.sleep(poll_s)
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except Exception:
+                proc.kill()
+    print("live capture stopped: %d segment(s) attested+shipped, last "
+          "seq=%s" % (done, state["segment_seq"] if state else "-"),
+          flush=True)
+    return state
+
+
+def _spawn_ffmpeg(cfg):
+    return subprocess.Popen(ffmpeg_cmd(cfg))
+
+
+# ── O-node side: submit-spool (runs as the Phase 1 identity) ───────────
+
+def submit_one(cfg, name, seg_path, body_path, send=onode_send):
+    """Relay ONE shipped job into the chain. Reads the producer's exact
+    signed bytes and submits them verbatim; the daemon re-derives
+    artifact_hash. Verifies the shipped segment file matches the hash the
+    body commits to. Idempotent: a job whose segment is already attested
+    (sidecar present) is a no-op success. Returns True if the record is
+    on the chain (now or already), False if the daemon refused (leave the
+    job to retry)."""
+    with open(body_path, "rb") as f:
+        body_bytes = f.read()
+    body = json.loads(body_bytes)            # must parse; bytes go verbatim
+    if body.get("schema") != SCHEMA:
+        raise ValueError("%s: body schema is %r, not %s"
+                         % (name, body.get("schema"), SCHEMA))
+    with open(seg_path, "rb") as f:
+        seg_bytes = f.read()
+    seg_sha = hashlib.sha256(seg_bytes).hexdigest()
+    if seg_sha != body.get("segment_sha256"):
+        raise ValueError("%s: shipped segment sha256 %s != body "
+                         "segment_sha256 %s — refusing to submit a body "
+                         "whose file does not match"
+                         % (name, seg_sha, body.get("segment_sha256")))
+
+    # session_id / artifact_id are pure functions of body fields, derived
+    # here EXACTLY as the producer derived them — identical ids to replay.
+    cam = body["camera_id"]
+    seq = body["segment_seq"]
+    end_ns = body["capture_end_utc_ns"]
+    session_id = session_for(cam, end_ns)
+    artifact_id = "camseg:%s:%d:%d" % (cam, seq, end_ns)
+
+    art_dir = os.path.join(cfg["data_dir"], "artifacts")
+    os.makedirs(art_dir, mode=0o700, exist_ok=True)
+
+    # Idempotency is keyed on the BODY, not the segment bytes: two
+    # distinct records (different seq / capture time) may legitimately
+    # carry identical video, and dropping the second because its pixels
+    # already appeared would be exactly the kind of SILENT discontinuity
+    # this system refuses. Only a true re-submission of the same signed
+    # body — same body_sha256 — is a no-op.
+    body_sha = hashlib.sha256(body_bytes).hexdigest()
+    sidecar_path = os.path.join(art_dir, body_sha + ".json")
+    if os.path.exists(sidecar_path):
+        print("skip %s: this exact record already attested (body %.16s…)"
+              % (name, body_sha), flush=True)
+        return True
+
+    # The segment FILE is still content-addressed by its own sha (files
+    # with identical bytes are stored once); only the receipt is per-body.
+    art_path = os.path.join(art_dir, seg_sha + ".mp4")
+    if not os.path.exists(art_path):
+        with open(art_path + ".tmp", "wb") as f:
+            f.write(seg_bytes)
+        os.replace(art_path + ".tmp", art_path)
+
+    ok, receipt = chain_append_evidence(session_id, artifact_id, body_bytes,
+                                        sock_path=cfg["sock"], send=send)
+    if not ok:
+        sys.stderr.write("chain refused %s: %s\n" % (name, receipt))
+        return False
+
+    sidecar = {
+        "artifact_id": artifact_id,
+        "session_id": session_id,
+        "body": body_bytes.decode("ascii"),
+        "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
+        "chain_receipt_b64": base64.b64encode(receipt).decode(),
+        "source_file": name + ".mp4",
+        "submitted_via": "spool",
+    }
+    with open(sidecar_path, "w") as f:
+        json.dump(sidecar, f, indent=1, sort_keys=True)
+        f.write("\n")
+    print("appended seq=%d sha256=%.16s… session=%s"
+          % (seq, seg_sha, session_id), flush=True)
+    return True
+
+
+def submit_spool(cfg, once=False, send=onode_send, _clock=time.time):
+    """Watch the spool for complete jobs (a .done marker with its .mp4 and
+    .body present) and relay each into the chain in seq order. A refused
+    append leaves the job in place to retry; a completed one is moved to
+    done/. Runs until SIGINT/SIGTERM, or one pass with once=True."""
+    incoming = cfg["incoming"]
+    done_dir = cfg["done"]
+    os.makedirs(done_dir, mode=0o770, exist_ok=True)
+    stop = {"flag": False}
+    if not once:
+        signal.signal(signal.SIGINT, lambda *_a: stop.update(flag=True))
+        signal.signal(signal.SIGTERM, lambda *_a: stop.update(flag=True))
+
+    appended = 0
+    while True:
+        markers = sorted(n for n in os.listdir(incoming)
+                         if n.endswith(".done"))
+        for m in markers:
+            name = m[:-len(".done")]
+            seg = os.path.join(incoming, name + ".mp4")
+            body = os.path.join(incoming, name + ".body")
+            marker = os.path.join(incoming, m)
+            if not (os.path.exists(seg) and os.path.exists(body)):
+                continue                     # marker raced ahead; wait
+            try:
+                landed = submit_one(cfg, name, seg, body, send=send)
+            except (ValueError, OSError) as e:
+                sys.stderr.write("submit %s: %s\n" % (name, e))
+                continue                     # malformed; leave for a human
+            if landed:
+                for p in (seg, body, marker):
+                    try:
+                        os.replace(p, os.path.join(done_dir,
+                                                   os.path.basename(p)))
+                    except OSError:
+                        pass
+                appended += 1
+        if once or stop["flag"]:
+            break
+        time.sleep(cfg.get("interval", 1.0))
+    return appended
 
 
 # ── CLI ────────────────────────────────────────────────────────────────
@@ -623,6 +1092,48 @@ def main(argv=None):
     rp.add_argument("--data-dir", default=DATA_DIR)
     rp.add_argument("--sock", default=ONODE_SOCKET)
 
+    lv = sub.add_parser("live",
+                        help="CAPTURE HOST: capture live segments, "
+                             "producer-sign and ship them to the O-node "
+                             "spool (Option B)")
+    lv.add_argument("--camera-id", default="tapo-c100")
+    lv.add_argument("--device", default=None)
+    lv.add_argument("--data-dir", default=DATA_DIR,
+                    help="producer key + continuity state live here")
+    lv.add_argument("--workdir", default=None,
+                    help="ffmpeg segment dir (default: <data-dir>/work)")
+    lv.add_argument("--spool", required=True,
+                    help="sftp target of the chrooted spool, "
+                         "e.g. virp-capture@10.0.0.13")
+    lv.add_argument("--ssh-key", default=None,
+                    help="identity for the spool account (key-only)")
+    lv.add_argument("--segment-time", type=float, default=6.0)
+    lv.add_argument("--minutes", type=float, default=None,
+                    help="stop after N minutes (default: until signalled)")
+    lv.add_argument("--rtsp-config", default=None,
+                    help="0600 file holding the rtsp:// URL (else "
+                         "$VIRP_CAMERA_RTSP_URL)")
+    lv.add_argument("--test-source", action="store_true",
+                    help="no camera credential: capture a real-time "
+                         "synthetic 720p source to exercise the path")
+
+    sp = sub.add_parser("submit-spool",
+                        help="O-NODE HOST: watch the spool and relay "
+                             "shipped bodies into chain_append (run as "
+                             "the Phase 1 identity)")
+    sp.add_argument("--data-dir", default=DATA_DIR)
+    sp.add_argument("--sock", default=ONODE_SOCKET)
+    sp.add_argument("--incoming", required=True,
+                    help="spool incoming dir, e.g. "
+                         "/var/spool/virp-capture/incoming")
+    sp.add_argument("--done", default=None,
+                    help="archive dir for processed jobs "
+                         "(default: <incoming>/../done)")
+    sp.add_argument("--interval", type=float, default=1.0)
+    sp.add_argument("--once", action="store_true",
+                    help="drain one pass and exit (else poll until "
+                         "signalled)")
+
     vs = sub.add_parser("verify-segment",
                         help="recompute a file's sha256 and compare it "
                              "with the chain-stored signed bodies")
@@ -637,7 +1148,10 @@ def main(argv=None):
                              "body vs artifact_hash; check prev chain")
     au.add_argument("--db", default=CHAIN_DB)
     au.add_argument("--session-prefix", default="camera:")
-    au.add_argument("--pubkey", default=None)
+    au.add_argument("--pubkey", action="append", default=None,
+                    help="pinned producer public key; repeat for a "
+                         "multi-producer chain (each body is checked "
+                         "against the key matching its producer_key_id)")
 
     args = p.parse_args(argv)
 
@@ -674,6 +1188,55 @@ def main(argv=None):
             print("continuity state NOT advanced; fix and re-run.",
                   file=sys.stderr)
             return 1
+        return 0
+
+    if args.cmd == "live":
+        sk_path = os.path.join(args.data_dir, "producer.key")
+        pk_path = os.path.join(args.data_dir, "producer.pub")
+        with open(pk_path, "rb") as f:
+            key_id = producer_key_id(f.read())
+        rtsp_url = rtsp_url_from_config(config_path=args.rtsp_config)
+        if not rtsp_url and not args.test_source:
+            raise SystemExit("no RTSP URL: set $VIRP_CAMERA_RTSP_URL or "
+                             "--rtsp-config <0600 file>, or pass "
+                             "--test-source to capture a synthetic feed")
+        workdir = args.workdir or os.path.join(args.data_dir, "work")
+        cfg = {
+            "camera_id": args.camera_id,
+            "device": args.device or args.camera_id,
+            "data_dir": args.data_dir,
+            "state_path": os.path.join(args.data_dir, "state.json"),
+            "workdir": workdir,
+            "outbox": os.path.join(args.data_dir, "outbox"),
+            "segment_time": args.segment_time,
+            "rtsp_url": rtsp_url,            # None → synthetic source
+            "mode": "live",
+            "overlay_font": os.environ.get(
+                "VIRP_CAMERA_OVERLAY_FONT",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            "sk": producer_load_sk(sk_path),
+            "key_id": key_id,
+        }
+        ship = sftp_ship(args.spool, ssh_key=args.ssh_key)
+        stop_after = args.minutes * 60 if args.minutes else None
+        print("live capture: source=%s segment_time=%ss spool=%s"
+              % ("rtsp(configured)" if rtsp_url else "synthetic-test",
+                 args.segment_time, args.spool), flush=True)
+        run_live(cfg, ship, stop_after_s=stop_after)
+        return 0
+
+    if args.cmd == "submit-spool":
+        done = args.done or os.path.join(os.path.dirname(args.incoming),
+                                         "done")
+        cfg = {
+            "data_dir": args.data_dir,
+            "sock": args.sock,
+            "incoming": args.incoming,
+            "done": done,
+            "interval": args.interval,
+        }
+        n = submit_spool(cfg, once=args.once)
+        print("submit-spool: %d job(s) appended this run" % n, flush=True)
         return 0
 
     if args.cmd == "verify-segment":
