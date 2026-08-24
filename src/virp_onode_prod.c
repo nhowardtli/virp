@@ -39,6 +39,22 @@
  * -DVIRP_ONODE_PROD_NO_MAIN, which excludes the daemon scaffolding so
  * there's no duplicate main()/g_state and no unused-static warnings.
  */
+#ifdef VIRP_DRIVER_LINUX
+/*
+ * Register a device's protected VMIDs with the linux gate classifier.
+ * The route_command() hook receives a command and no device, so the
+ * classifier cannot look this up per-device at decision time — the
+ * loader pushes it in at startup instead, and the classifier holds the
+ * union across devices. Returns -1 on an unparseable list.
+ *
+ * Declared OUTSIDE the VIRP_ONODE_PROD_NO_MAIN block: load_devices() is
+ * compiled into both the daemon and the NO_MAIN lib object
+ * (virp_onode_prod_lib.o) and calls it, so the plain LINUX=1 dev build
+ * failed with -Wimplicit-function-declaration under -Werror.
+ */
+extern int linux_gate_set_protected_vmids(const char *csv);
+#endif
+
 #ifndef VIRP_ONODE_PROD_NO_MAIN
 
 static onode_state_t g_state;
@@ -53,14 +69,6 @@ extern void virp_driver_fortinet_init(void);
 #endif
 #ifdef VIRP_DRIVER_LINUX
 extern void virp_driver_linux_init(void);
-/*
- * Register a device's protected VMIDs with the linux gate classifier.
- * The route_command() hook receives a command and no device, so the
- * classifier cannot look this up per-device at decision time — the
- * loader pushes it in at startup instead, and the classifier holds the
- * union across devices. Returns -1 on an unparseable list.
- */
-extern int linux_gate_set_protected_vmids(const char *csv);
 #endif
 #ifdef VIRP_DRIVER_PALOALTO
 extern void virp_driver_paloalto_init(void);
