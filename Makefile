@@ -904,6 +904,17 @@ test-render-devices:
 test-evidence:
 	python3 tests/test_evidence.py
 
+# Camera driver (camera/virp_camera.py) — segment attestation producer.
+# Pure python against fakes: no daemon, no camera, throwaway sqlite
+# only. Pins the serialize-once/hash-those-bytes invariant (the
+# chainwalk_summary regression), the producer signature, prev-hash
+# continuity, gap honesty, and the chain_append/evidence_item-only
+# vocabulary. Needs the `cryptography` package (Ed25519).
+.PHONY: test-camera
+test-camera:
+	@echo "=== camera driver ==="
+	python3 tests/test_camera_driver.py
+
 # Commitment-only observation grading. Pins the chain_append GATE 3
 # decision that a body-less observation registers but grades
 # UNVERIFIABLE — the reason accepting it is not a signature bypass.
