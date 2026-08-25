@@ -300,7 +300,89 @@ def state_save(path, state):
     with open(tmp, "w") as f:
         json.dump(state, f, indent=1, sort_keys=True)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_dir(os.path.dirname(path))
+
+
+def _fsync_dir(dirpath):
+    """A rename or append is durable only once its DIRECTORY entry is —
+    fsync the containing dir, not just the file."""
+    fd = os.open(dirpath or ".", os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+# ── Durable submit checkpoint (Fix A) ──────────────────────────────────
+#
+# The record of what this capture host has HANDED OFF, keyed on content
+# (segment_sha256) plus the segment_seq it shipped under — never on a
+# workdir filename, which ffmpeg reuses from seg_000000 after every
+# restart. Append-only JSONL, fsynced before continuity advances, so it
+# survives process death: startup consults this file, not a directory
+# listing and not process memory. state.json remains the fast-path
+# continuity cursor; where the two disagree (a crash between
+# checkpoint_append and state_save) the checkpoint is authoritative —
+# see _resume_state — so a sequence number is never reused.
+#
+# Named open item, deliberately NOT designed here: the checkpoint marks
+# ship-acknowledged, not chain-append-acknowledged — there is no ack
+# path from the O-node back to the capture host. Until one exists, the
+# spool-side chain-keyed idempotency (_on_chain in submit_one) is the
+# backstop that makes any re-offer a no-op instead of a duplicate.
+
+def checkpoint_load(path):
+    """{segment_sha256: record} from the shipped checkpoint. A crash
+    mid-append can leave one torn final line; complete records are kept,
+    the torn tail is ignored."""
+    if not path or not os.path.exists(path):
+        return {}
+    out = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            out[rec["segment_sha256"]] = rec
+    return out
+
+
+def checkpoint_append(path, rec):
+    """Append one shipped record and fsync file AND directory before
+    returning: the marker must be durable before continuity state may
+    advance past it."""
+    with open(path, "a") as f:
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_dir(os.path.dirname(path))
+
+
+def _resume_state(state, shipped, camera_id):
+    """Resume point across process death. The checkpoint tail wins when
+    it is ahead of state.json (crash after checkpoint_append, before
+    state_save): adopting it keeps seq/prev-hash continuity aligned with
+    what actually shipped."""
+    if not shipped:
+        return state
+    tail = max(shipped.values(), key=lambda r: r["segment_seq"])
+    if state is not None and state["segment_seq"] >= tail["segment_seq"]:
+        return state
+    return {
+        "camera_id": camera_id,
+        "segment_seq": tail["segment_seq"],
+        "last_segment_sha256": tail["segment_sha256"],
+        "last_session_id": session_for(camera_id,
+                                       tail["capture_end_utc_ns"]),
+        "last_end_ns": tail["capture_end_utc_ns"],
+    }
 
 
 # ── Body construction ──────────────────────────────────────────────────
@@ -842,6 +924,16 @@ def process_live_segment(path, cfg, state, gap, ship):
         json.dump(handoff, f, indent=1, sort_keys=True)
         f.write("\n")
 
+    # Durable checkpoint BEFORE the continuity cursor moves: if we die
+    # between the two, _resume_state adopts the checkpoint tail.
+    if cfg.get("checkpoint_path"):
+        checkpoint_append(cfg["checkpoint_path"], {
+            "segment_seq": seq,
+            "segment_sha256": seg_sha,
+            "capture_end_utc_ns": end_ns,
+            "shipped_as": name,
+        })
+
     new_state = {
         "camera_id": cfg["camera_id"],
         "segment_seq": seq,
@@ -877,7 +969,9 @@ def run_live(cfg, ship, stop_after_s=None, poll_s=0.5,
     SIGTERM stop the child and drain the segments already closed."""
     os.makedirs(cfg["workdir"], mode=0o700, exist_ok=True)
     os.makedirs(cfg["outbox"], mode=0o700, exist_ok=True)
-    state = state_load(cfg["state_path"])
+    shipped = checkpoint_load(cfg.get("checkpoint_path"))
+    state = _resume_state(state_load(cfg["state_path"]), shipped,
+                          cfg["camera_id"])
     pending_gap = None
     if state is not None:
         pending_gap = {"reason": "driver-restart",
@@ -952,6 +1046,26 @@ def _spawn_ffmpeg(cfg):
 
 # ── O-node side: submit-spool (runs as the Phase 1 identity) ───────────
 
+def _on_chain(db_path, artifact_hash):
+    """True iff a chain entry committing to these exact body bytes
+    already exists. Read-only; ANY failure (no db, locked, schema)
+    returns False — the worst case is then the pre-existing behavior,
+    a duplicate append, never a dropped record."""
+    if not db_path or not os.path.exists(db_path):
+        return False
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM chain_entries WHERE artifact_hash = ? "
+                "LIMIT 1", (artifact_hash,)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
 def submit_one(cfg, name, seg_path, body_path, send=onode_send):
     """Relay ONE shipped job into the chain. Reads the producer's exact
     signed bytes and submits them verbatim; the daemon re-derives
@@ -997,6 +1111,29 @@ def submit_one(cfg, name, seg_path, body_path, send=onode_send):
     if os.path.exists(sidecar_path):
         print("skip %s: this exact record already attested (body %.16s…)"
               % (name, body_sha), flush=True)
+        return True
+
+    # Chain-keyed backstop (Fix A): the sidecar can be lost to a crash
+    # between append-ack and sidecar write. Before appending, ask the
+    # chain itself: artifact_hash IS sha256(body_bytes), so one lookup
+    # answers whether these exact bytes already landed. On a hit the
+    # sidecar is reconstructed so the fast-path key exists again.
+    if _on_chain(cfg.get("db"), body_sha):
+        sidecar = {
+            "artifact_id": artifact_id,
+            "session_id": session_id,
+            "body": body_bytes.decode("ascii"),
+            "body_sha256": body_sha,
+            "source_file": name + ".mp4",
+            "submitted_via": "spool",
+            "note": "sidecar reconstructed: body already on chain "
+                    "(chain-keyed idempotency); receipt not retained",
+        }
+        with open(sidecar_path, "w") as f:
+            json.dump(sidecar, f, indent=1, sort_keys=True)
+            f.write("\n")
+        print("skip %s: body already on chain (%.16s…); sidecar "
+              "reconstructed" % (name, body_sha), flush=True)
         return True
 
     # The segment FILE is still content-addressed by its own sha (files
@@ -1123,6 +1260,10 @@ def main(argv=None):
                              "the Phase 1 identity)")
     sp.add_argument("--data-dir", default=DATA_DIR)
     sp.add_argument("--sock", default=ONODE_SOCKET)
+    sp.add_argument("--db", default=CHAIN_DB,
+                    help="chain database for the chain-keyed idempotency "
+                         "backstop (read-only; unreadable degrades to "
+                         "sidecar-only dedup)")
     sp.add_argument("--incoming", required=True,
                     help="spool incoming dir, e.g. "
                          "/var/spool/virp-capture/incoming")
@@ -1206,6 +1347,7 @@ def main(argv=None):
             "device": args.device or args.camera_id,
             "data_dir": args.data_dir,
             "state_path": os.path.join(args.data_dir, "state.json"),
+            "checkpoint_path": os.path.join(args.data_dir, "shipped.jsonl"),
             "workdir": workdir,
             "outbox": os.path.join(args.data_dir, "outbox"),
             "segment_time": args.segment_time,
@@ -1234,6 +1376,7 @@ def main(argv=None):
             "incoming": args.incoming,
             "done": done,
             "interval": args.interval,
+            "db": args.db,
         }
         n = submit_spool(cfg, once=args.once)
         print("submit-spool: %d job(s) appended this run" % n, flush=True)
