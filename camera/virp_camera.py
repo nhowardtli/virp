@@ -418,6 +418,38 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
     }
 
 
+# Fix D: gap records come from capture-time continuity, not only from
+# restarts. Tolerance for the hole between one segment's capture_end and
+# the next segment's capture_start:
+#
+#   - healthy ~6 s boundaries in the 2026-08-24 record jitter within
+#     about ±0.5 s (poll pacing + keyframe-aligned cuts; extremes there:
+#     −1.8 s overlap to +0.43 s hole), so 2 s is > 4x the largest
+#     healthy hole ever observed — no false positives on a live cadence;
+#   - one wholly missing 6 s segment opens a hole of >= ~5.5 s, so 2 s
+#     is comfortably below the smallest real loss — no false negatives.
+#
+# The 69.1 s gap:null hole at seg 77 of that record is the defect this
+# closes: it must produce a gap under this rule.
+CAPTURE_GAP_TOLERANCE_NS = 2_000_000_000
+
+
+def continuity_gap(state, start_ns, pending_gap):
+    """The gap record (or None) for a segment whose capture starts at
+    start_ns. A pending driver-restart gap wins — it already disclaims
+    coverage across the restart. Otherwise, a hole beyond
+    CAPTURE_GAP_TOLERANCE_NS since the previous segment's capture_end is
+    stated explicitly, restart or no restart; the two reasons stay
+    distinguishable."""
+    if pending_gap:
+        return pending_gap
+    if state is not None and (start_ns - state["last_end_ns"]
+                              > CAPTURE_GAP_TOLERANCE_NS):
+        return {"reason": "capture-discontinuity",
+                "after_seq": state["segment_seq"]}
+    return None
+
+
 def session_for(camera_id, end_ns):
     """Daily sessions: camera:<id>:<UTC date of capture end>. Fresh and
     post-D-1 by construction; the prev-hash chain runs ACROSS the day
@@ -460,6 +492,7 @@ def process_segment(path, cfg, state, gap, send=onode_send):
 
     seq = (state["segment_seq"] + 1) if state else 0
     prev = state["last_segment_sha256"] if state else None
+    gap = continuity_gap(state, start_ns, gap)
 
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
@@ -885,6 +918,7 @@ def process_live_segment(path, cfg, state, gap, ship):
 
     seq = (state["segment_seq"] + 1) if state else 0
     prev = state["last_segment_sha256"] if state else None
+    gap = continuity_gap(state, start_ns, gap)
 
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,

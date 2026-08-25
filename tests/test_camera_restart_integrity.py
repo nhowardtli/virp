@@ -446,5 +446,104 @@ class ReconcileTests(unittest.TestCase):
                         _spawn=lambda cfg: FakeProc())
 
 
+# The hole between segs 76 and 77 of camera:tapo-c100:2026-08-24:
+# capture_start 1787614325523357095 minus capture_end 1787614256399015562.
+# It carried gap: null. Under Fix D it must not.
+SEG77_HOLE_NS = 1787614325523357095 - 1787614256399015562
+
+
+class ContinuityGapTests(unittest.TestCase):
+    """Fix D: a gap record comes from capture-time continuity, not only
+    from restarts. The 69.1 s hole at seg 77 must be flagged; healthy
+    ~6 s boundaries (which jitter within about ±0.5 s in the record)
+    must not."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.sk_path, self.pk_path = make_keypair(self.tmp)
+        self.cfg = restart_cfg(self.tmp, self.sk_path, self.pk_path)
+        os.makedirs(self.cfg["workdir"])
+        os.makedirs(self.cfg["outbox"])
+
+    def _seg(self, name, pad=b"gap" * 40, duration_s=10.0):
+        p = os.path.join(self.cfg["workdir"], name)
+        with open(p, "wb") as f:
+            f.write(make_mp4(duration_s=duration_s, pad=pad))
+        return p
+
+    def _state_ending(self, end_ns, seq=76):
+        return {"camera_id": "tapo-c100", "segment_seq": seq,
+                "last_segment_sha256": "aa" * 32,
+                "last_session_id": "camera:tapo-c100:2026-08-24",
+                "last_end_ns": end_ns}
+
+    def _attest(self, path, state, gap=None):
+        ship = ShipRecorder()
+        vc.process_live_segment(path, self.cfg, state, gap, ship)
+        return json.loads(ship.calls[0]["body_bytes"])
+
+    def test_69s_hole_produces_continuity_gap(self):
+        p = self._seg("seg_000000.mp4")
+        # place the predecessor's capture_end exactly SEG77_HOLE_NS
+        # before this segment's capture_start
+        dur_ns = int(vc.mp4_duration_s(p) * 1e9)
+        # same arithmetic the driver uses: start = end - duration
+        end_ns = os.stat(p).st_mtime_ns
+        body = self._attest(p, self._state_ending(
+            end_ns - dur_ns - SEG77_HOLE_NS))
+        self.assertIsNotNone(body["gap"], "69.1 s capture hole was not "
+                                          "flagged (the seg-77 defect)")
+        self.assertEqual(body["gap"]["reason"], "capture-discontinuity")
+        self.assertEqual(body["gap"]["after_seq"], 76)
+
+    def test_normal_boundary_no_gap(self):
+        p = self._seg("seg_000000.mp4")
+        dur_ns = int(vc.mp4_duration_s(p) * 1e9)
+        end_ns = os.stat(p).st_mtime_ns
+        # predecessor ended 0.3 s before this capture began — the normal
+        # jitter of a healthy 6 s cadence
+        body = self._attest(p, self._state_ending(
+            end_ns - dur_ns - int(0.3e9)))
+        self.assertIsNone(body["gap"])
+
+    def test_restart_gap_takes_precedence(self):
+        # a pending driver-restart gap already disclaims coverage; the
+        # hole does not demote or duplicate it
+        p = self._seg("seg_000000.mp4")
+        dur_ns = int(vc.mp4_duration_s(p) * 1e9)
+        end_ns = os.stat(p).st_mtime_ns
+        body = self._attest(
+            p, self._state_ending(end_ns - dur_ns - SEG77_HOLE_NS),
+            gap={"reason": "driver-restart", "after_seq": 76})
+        self.assertEqual(body["gap"]["reason"], "driver-restart")
+
+    def test_replay_path_flags_capture_hole(self):
+        # replay stamps from file mtime; a 69 s hole between the files'
+        # capture windows must be flagged there too
+        rdir = os.path.join(self.tmp, "replay")
+        os.makedirs(rdir)
+        a = os.path.join(rdir, "seg_000.mp4")
+        b = os.path.join(rdir, "seg_001.mp4")
+        for p, pad in ((a, b"ra" * 40), (b, b"rb" * 40)):
+            with open(p, "wb") as f:
+                f.write(make_mp4(duration_s=10.0, pad=pad))
+        t0 = os.stat(a).st_mtime_ns
+        # b's capture window starts exactly SEG77_HOLE_NS after a's ends:
+        # start_b = mtime_b - dur = t0 + SEG77_HOLE_NS
+        os.utime(b, ns=(t0, t0 + SEG77_HOLE_NS + int(10e9)))
+        from test_camera_driver import make_cfg
+        cfg = make_cfg(self.tmp, self.sk_path, self.pk_path)
+        send = FakeSend()
+        vc.run_replay(rdir, cfg, send=send)
+        bodies = [json.loads(r["artifact_content"])
+                  for r in send.requests]
+        self.assertEqual(len(bodies), 2)
+        self.assertIsNone(bodies[0]["gap"])
+        self.assertEqual(bodies[1]["gap"],
+                         {"reason": "capture-discontinuity",
+                          "after_seq": 0})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
