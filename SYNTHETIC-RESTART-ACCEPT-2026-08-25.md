@@ -111,9 +111,9 @@ have had a second ffmpeg writing the same filenames as the orphan.
 
 Fix C handles the residue correctly, so this did not cause loss here, and
 Fix F's lock protects the data dir — but the lock binds the *driver*, not
-a stray ffmpeg. Worth a look separately; not filed as one of tonight's
-three items because it needs a decision (process-group kill on startup vs.
-leave it to reconciliation) rather than a small addition.
+a stray ffmpeg. **Decided 2026-08-25 and filed as item 4:** process-group
+kill at startup, before reconciliation, because `_reconcile_workdir`
+assumes files at rest and a live writer violates that assumption.
 
 ## The seven read-only checks, run from 313
 
@@ -193,6 +193,8 @@ artifact_binding ✓ VERIFIED — 67/67 entries have carried bodies (SHA-256 rec
 
 - **The Tapo acceptance.** Not run, not claimed. Blocked on the laptop's
   IoT lease and RTSP URL, which the operator is fixing.
-- A pure `capture-discontinuity` gap (stall without restart) is still
-  fixture-only.
-- Orphaned ffmpeg after `kill -9` (above).
+- A pure `capture-discontinuity` gap (stall without restart) was not
+  exercised — filed as item 5. Existing tests cover it at the attestation
+  level and end to end through `run_replay`; the untested path is
+  `run_live` stalling mid-run with no restart.
+- Orphaned ffmpeg after `kill -9` — decided and filed as item 4.

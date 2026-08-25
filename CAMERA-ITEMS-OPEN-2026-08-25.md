@@ -1,7 +1,11 @@
-# Camera driver — three open items
+# Camera driver — five open items
 
-Opened 2026-08-25. **Not implemented.** Each is scoped to the minimum that
-makes a currently-invisible condition visible. Item 3 is the real one.
+Opened 2026-08-25. **Not implemented.** Items 1–3 are each scoped to the
+minimum that makes a currently-invisible condition visible; **item 3 is
+the real one**. Items 4–5 came out of the synthetic restart-integrity run
+the same day (`SYNTHETIC-RESTART-ACCEPT-2026-08-25.md`): item 4 is a
+correctness fix for an assumption that run falsified, item 5 closes a
+test gap that run exposed.
 
 Branch `feat/camera-driver`, code commit `50444f0`. Filed from the source
 answers in `CAMERA-OPEN-ITEMS-2026-08-25.md`; the underlying behaviour is
@@ -125,20 +129,6 @@ device registry. Both need a decision rather than a default.
 
 **Done when:** stopping a capture host mid-session produces an alert
 within the configured tolerance, and restarting it clears the alert.
-
----
-
-## Not filed, needs a decision first
-
-`kill -9` on the driver **orphans its ffmpeg child**, which keeps writing
-segments into the workdir (observed live, 2026-08-25: residue grew from 3
-to 14 files while the driver was already dead). Fix C reconciles the
-residue correctly and Fix F's lock protects the data dir, so this caused
-no loss — but the lock binds the driver, not a stray ffmpeg, and an
-immediate restart puts a second ffmpeg on the same filenames as the
-orphan. The fix is a choice (kill the process group on startup vs. leave
-it to reconciliation), so it wants a decision rather than a small
-addition.
 
 ---
 
