@@ -967,6 +967,98 @@ def _stat_sig(path):
     return (st.st_size, st.st_mtime_ns)
 
 
+def _staged_pair(outbox, sha):
+    """The staged {segment, signed body} pair for this content, if a
+    previous run built one before dying: (seg_path, body_path) or None."""
+    bodies = sorted(glob.glob(os.path.join(outbox, "*.%s.body" % sha)))
+    for body_path in reversed(bodies):
+        seg_path = body_path[:-len(".body")] + ".mp4"
+        if os.path.exists(seg_path):
+            return seg_path, body_path
+    return None
+
+
+def _reconcile_workdir(cfg, state, shipped, ship):
+    """Startup reconciliation (Fix C), run BEFORE the capture child
+    spawns and renumbers into these names. The shutdown handler is
+    correct and unchanged — it finalizes and drains the in-progress
+    segment; what no shutdown path can do is settle files for a process
+    that dies without one. So every start walks the workdir and settles
+    each file by CONTENT:
+
+      already in the shipped checkpoint -> residue of a handled
+        segment: remove it (never replay it)
+      closed but never shipped -> footage that closed and then the
+        process died: attest and ship it NOW, before any new capture,
+        so segment_seq order stays capture order (the 2026-08-24
+        session's ten-minute ingest inversion is what draining stale
+        work late looks like). If the previous run already staged and
+        signed the body in the outbox, those exact bytes are re-shipped
+        — byte-identical, so any true re-offer is a spool-side no-op.
+      unfinalized partial (no moov) -> not attestable: removed, the
+        loss logged plainly.
+
+    The driver-restart gap is NOT attached here: residue belongs to the
+    previous run's continuity, and the gap rides the first segment of
+    NEW capture. If the spool refuses while unshipped residue exists,
+    this raises SubmitError rather than starting a capture that would
+    bury real footage. Returns the (possibly advanced) state."""
+    names = _segment_names(cfg["workdir"])
+    names.sort(key=lambda n: os.stat(
+        os.path.join(cfg["workdir"], n)).st_mtime_ns)
+    for name in names:
+        path = os.path.join(cfg["workdir"], name)
+        with open(path, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        if sha in shipped:
+            sys.stderr.write("reconcile %s: content already attested "
+                             "(%.16s… seq=%s); removing residue\n"
+                             % (name, sha, shipped[sha]["segment_seq"]))
+            _unlink_quiet(path)
+            continue
+        try:
+            mp4_duration_s(path)
+        except ValueError as e:
+            sys.stderr.write("reconcile %s: unfinalized partial (%s); "
+                             "removing — this footage is lost\n"
+                             % (name, e))
+            _unlink_quiet(path)
+            continue
+        staged = _staged_pair(cfg["outbox"], sha)
+        if staged:
+            seg_out, body_out = staged
+            job = os.path.basename(body_out)[:-len(".body")]
+            with open(body_out, "rb") as f:
+                body = json.loads(f.read())
+            if not ship(seg_out, body_out, job):
+                raise SubmitError("%s: re-ship of staged pair %s failed "
+                                  "(unshipped residue; refusing to start "
+                                  "capture over it)" % (name, job))
+            rec = {
+                "segment_seq": body["segment_seq"],
+                "segment_sha256": sha,
+                "capture_end_utc_ns": body["capture_end_utc_ns"],
+                "shipped_as": job,
+            }
+            if cfg.get("checkpoint_path"):
+                checkpoint_append(cfg["checkpoint_path"], rec)
+            shipped[sha] = rec
+            state = _resume_state(state, {sha: rec}, cfg["camera_id"])
+            state_save(cfg["state_path"], state)
+            sys.stderr.write("reconcile %s: re-shipped staged pair %s "
+                             "(seq=%d, original body bytes)\n"
+                             % (name, job, body["segment_seq"]))
+        else:
+            state = process_live_segment(path, cfg, state, None, ship)
+            shipped[state["last_segment_sha256"]] = {
+                "segment_seq": state["segment_seq"],
+                "segment_sha256": state["last_segment_sha256"],
+                "capture_end_utc_ns": state["last_end_ns"],
+            }
+        _unlink_quiet(path)
+    return state
+
+
 def run_live(cfg, ship, stop_after_s=None, poll_s=0.5,
              _spawn=None, _clock=time.time):
     """Spawn the capture child, and as each segment closes, attest+ship it
@@ -979,6 +1071,10 @@ def run_live(cfg, ship, stop_after_s=None, poll_s=0.5,
     shipped = checkpoint_load(cfg.get("checkpoint_path"))
     state = _resume_state(state_load(cfg["state_path"]), shipped,
                           cfg["camera_id"])
+    state = _reconcile_workdir(cfg, state, shipped, ship)
+    # A prior run (including late-settled residue above) means this run
+    # cannot claim continuous coverage across the restart: the first
+    # segment of NEW capture carries the explicit gap.
     pending_gap = None
     if state is not None:
         pending_gap = {"reason": "driver-restart",

@@ -292,5 +292,159 @@ class ContentIdentityTests(unittest.TestCase):
              if n.endswith(".mp4")], [])
 
 
+class ReconcileTests(unittest.TestCase):
+    """Fix C: startup workdir reconciliation. Whatever a previous run
+    left behind — attested residue, closed-but-never-shipped footage, an
+    unfinalized partial — the next run settles it by content BEFORE new
+    capture begins, so restarts of either kind (graceful or hard kill)
+    produce zero duplicates and zero drops. The committed shutdown
+    handler is correct and unchanged; the graceful-versus-hard-kill
+    replay asymmetry in the 2026-08-24 record was an artifact of
+    uncommitted WIP, so these tests assert the SAME invariants for
+    both endings."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.sk_path, self.pk_path = make_keypair(self.tmp)
+        self.cfg = restart_cfg(self.tmp, self.sk_path, self.pk_path)
+        os.makedirs(self.cfg["workdir"])
+        os.makedirs(self.cfg["outbox"])
+
+    def _write(self, name, data):
+        p = os.path.join(self.cfg["workdir"], name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def _shas(self, ship):
+        return [json.loads(c["body_bytes"])["segment_sha256"]
+                for c in ship.calls]
+
+    def _bodies(self, ship):
+        return [json.loads(c["body_bytes"]) for c in ship.calls]
+
+    def test_graceful_restart_zero_duplicates(self):
+        # modeled on run B: full segments then a truncated final segment
+        # the shutdown handler finalized and drained (1.067 s in the
+        # record), then a restart where ffmpeg renumbers from 000000
+        self._write("seg_000000.mp4", make_mp4(pad=b"b7" * 64))
+        self._write("seg_000001.mp4", make_mp4(pad=b"b8" * 64))
+        self._write("seg_000002.mp4",
+                    make_mp4(duration_s=1.067, pad=b"b9" * 16))
+        ship1 = ShipRecorder()
+        vc.run_live(self.cfg, ship1, _spawn=lambda cfg: FakeProc())
+        self.assertEqual(len(ship1.calls), 3)
+
+        new = make_mp4(pad=b"c-run" * 40)
+        # the restarted ffmpeg renumbers from seg_000000 and captures new
+        # footage mid-run (a pre-existing file would rightly be settled
+        # as residue of the PREVIOUS run and carry no gap)
+        proc = ScriptedProc([
+            (None, lambda: self._write("seg_000000.mp4", new)),
+            (None, None), (None, None),
+            (0, None),
+        ])
+        ship2 = ShipRecorder()
+        vc.run_live(self.cfg, ship2, poll_s=0, _spawn=lambda cfg: proc)
+
+        all_shas = self._shas(ship1) + self._shas(ship2)
+        self.assertEqual(len(all_shas), len(set(all_shas)),
+                         "duplicate segment_sha256 across a graceful "
+                         "restart: %s" % all_shas)
+        b = self._bodies(ship2)[0]
+        self.assertEqual(b["segment_sha256"], hashlib.sha256(new).hexdigest())
+        self.assertEqual(b["gap"]["reason"], "driver-restart")
+        self.assertEqual(b["gap"]["after_seq"], 2)
+        # prev cites the truncated final segment of the previous run
+        self.assertEqual(b["prev_segment_sha256"], self._shas(ship1)[-1])
+
+    def test_hard_kill_residue_settled_before_new_capture(self):
+        # modeled on run D's ending: the process died leaving in the
+        # workdir (a) a closed segment that never shipped and (b) an
+        # unfinalized partial (no moov). The record for that shape must
+        # be: residue attested FIRST (capture order == seq order — the
+        # record's ten-minute ingest inversion is the counterexample),
+        # the partial logged+removed, the restart gap riding the first
+        # NEW segment, zero duplicates, zero drops.
+        self._write("seg_000000.mp4", make_mp4(pad=b"d0" * 64))
+        ship1 = ShipRecorder()
+        vc.run_live(self.cfg, ship1, _spawn=lambda cfg: FakeProc())
+        self.assertEqual(len(ship1.calls), 1)       # seq 0 shipped
+
+        # the hard kill's leavings:
+        residue = make_mp4(pad=b"d1-closed-never-shipped" * 8)
+        self._write("seg_000001.mp4", residue)      # closed, unshipped
+        partial_path = self._write("seg_000002.mp4",
+                                   make_mp4(pad=b"d2" * 64)[:48])
+
+        new = make_mp4(pad=b"e-run" * 40)
+        proc = ScriptedProc([
+            (None, None), (None, None),
+            (None, lambda: self._write("seg_000000.mp4", new)),
+            (None, None), (None, None),
+            (0, None),
+        ])
+        ship2 = ShipRecorder()
+        vc.run_live(self.cfg, ship2, poll_s=0, _spawn=lambda cfg: proc)
+
+        bodies = self._bodies(ship2)
+        shas = [b["segment_sha256"] for b in bodies]
+        # zero drops: both the residue and the new footage landed
+        self.assertIn(hashlib.sha256(residue).hexdigest(), shas)
+        self.assertIn(hashlib.sha256(new).hexdigest(), shas)
+        # zero duplicates across both runs
+        all_shas = self._shas(ship1) + shas
+        self.assertEqual(len(all_shas), len(set(all_shas)))
+        # residue settled BEFORE new capture: seq order == capture order
+        self.assertEqual(shas[0], hashlib.sha256(residue).hexdigest())
+        self.assertEqual([b["segment_seq"] for b in bodies], [1, 2])
+        # the restart gap rides the first NEW segment, not the residue
+        self.assertIsNone(bodies[0]["gap"])
+        self.assertEqual(bodies[1]["gap"]["reason"], "driver-restart")
+        self.assertEqual(bodies[1]["gap"]["after_seq"], 1)
+        # prev chain: residue cites run 1, new cites residue
+        self.assertEqual(bodies[0]["prev_segment_sha256"],
+                         self._shas(ship1)[-1])
+        self.assertEqual(bodies[1]["prev_segment_sha256"], shas[0])
+        # the unfinalized partial is gone: removed at reconcile, lost
+        # honestly, never attested
+        self.assertFalse(os.path.exists(partial_path))
+        self.assertNotIn(hashlib.sha256(
+            make_mp4(pad=b"d2" * 64)[:48]).hexdigest(), shas)
+
+    def test_staged_outbox_pair_reshipped_byte_identical(self):
+        # crash window: the body was built, signed and staged in the
+        # outbox, but the process died around the ship. Reconcile must
+        # re-ship those EXACT bytes (a re-offer is then a spool-side
+        # no-op), not build and sign a fresh body.
+        p = self._write("seg_000000.mp4", make_mp4(pad=b"staged" * 20))
+        with self.assertRaises(vc.SubmitError):
+            vc.process_live_segment(p, self.cfg, None, None,
+                                    ShipRecorder(fail_on=0))
+        staged_bodies = [n for n in os.listdir(self.cfg["outbox"])
+                         if n.endswith(".body")]
+        self.assertEqual(len(staged_bodies), 1)
+        with open(os.path.join(self.cfg["outbox"], staged_bodies[0]),
+                  "rb") as f:
+            staged = f.read()
+
+        ship = ShipRecorder()
+        vc.run_live(self.cfg, ship, _spawn=lambda cfg: FakeProc())
+        self.assertEqual(len(ship.calls), 1)
+        self.assertEqual(ship.calls[0]["body_bytes"], staged)
+        # and the checkpoint now covers it
+        shipped = vc.checkpoint_load(self.cfg["checkpoint_path"])
+        self.assertIn(json.loads(staged)["segment_sha256"], shipped)
+
+    def test_unshippable_residue_refuses_to_start(self):
+        # unshipped residue + a dead spool: starting capture would bury
+        # real footage under new work — refuse loudly instead
+        self._write("seg_000000.mp4", make_mp4(pad=b"stuck" * 20))
+        with self.assertRaises(vc.SubmitError):
+            vc.run_live(self.cfg, ShipRecorder(fail_on=0),
+                        _spawn=lambda cfg: FakeProc())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

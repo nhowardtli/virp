@@ -147,10 +147,30 @@ class LiveSegmentTests(unittest.TestCase):
         self.assertEqual([n for n in os.listdir(self.cfg["workdir"])
                           if n.endswith(".mp4")], [])
 
-        # second run: ffmpeg renumbers from seg_000000 -> gap + prev
-        self._seg("seg_000000.mp4", b"c" * 40)
+        # second run: ffmpeg renumbers from seg_000000 and writes NEW
+        # capture mid-run -> its first record carries gap + cross-run prev
+        class CapturesOneThenExits:
+            def __init__(proc):
+                proc.n = 0
+
+            def poll(proc):
+                proc.n += 1
+                if proc.n == 1:
+                    self._seg("seg_000000.mp4", b"c" * 40)
+                return None if proc.n <= 3 else 0
+
+            def wait(proc, timeout=None):
+                return 0
+
+            def terminate(proc):
+                pass
+
+            def kill(proc):
+                pass
+
         ship2 = ShipRecorder()
-        vc.run_live(self.cfg, ship2, _spawn=lambda cfg: FakeProc())
+        vc.run_live(self.cfg, ship2, poll_s=0,
+                    _spawn=lambda cfg: CapturesOneThenExits())
         self.assertEqual(len(ship2.calls), 1)
         first = json.loads(ship2.calls[0]["body_bytes"])
         self.assertEqual(first["segment_seq"], 2)
