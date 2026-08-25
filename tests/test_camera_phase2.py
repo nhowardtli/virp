@@ -326,10 +326,6 @@ class MultiProducerAuditTests(unittest.TestCase):
                             for f in failures2))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class NoSilentDropTests(unittest.TestCase):
     """The regression that a deterministic source exposed: two DISTINCT
     records (different seq/capture time) that carry byte-identical video
@@ -373,3 +369,7 @@ class NoSilentDropTests(unittest.TestCase):
         seqs = sorted(json.loads(r["artifact_content"])["segment_seq"]
                       for r in send.requests)
         self.assertEqual(seqs, [0, 1])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
