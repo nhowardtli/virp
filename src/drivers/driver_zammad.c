@@ -1250,10 +1250,13 @@ static virp_error_t zammad_execute(virp_conn_t *base_conn,
          * without re-running the driver — the same reason the PBS
          * observation carries its derived path.
          */
+        /* ISSUE-A branch 2: the derived path and the derived JSON stay —
+         * neither is recoverable from the command alone — but they are
+         * tagged as daemon-attested instead of wearing a fabricated
+         * `hostname>` prompt. The response bytes follow the newline. */
         int w = snprintf(result->output, sizeof(result->output),
-                         "%s>%s %s [HTTP %ld]\n%s\n%s",
-                         conn->device.hostname, "POST", req.op->path,
-                         wcode, json, wresp);
+                         VIRP_OBS_DERIVED_TAG "POST %s [HTTP %ld] %s\n%s",
+                         req.op->path, wcode, json, wresp);
         result->output_len = (w > 0) ? (size_t)w : 0;
 
         if (wcode == 401 || wcode == 403) {
@@ -1349,11 +1352,17 @@ static virp_error_t zammad_execute(virp_conn_t *base_conn,
         return VIRP_OK;
     }
 
+    /* Read path: the body is the API response bytes only (ISSUE-A branch
+     * 2). `path` is the command string, already hashed into the frame and
+     * recorded in the chain; the HTTP status is carried by exit_code /
+     * error_msg. Nothing observed is lost with the fabricated header. */
     int written = snprintf(result->output, sizeof(result->output),
-                           "%s>%s [HTTP %ld]\n%s",
-                           conn->device.hostname, path,
-                           http_code, api_response);
-    result->output_len = (written > 0) ? (size_t)written : 0;
+                           "%s", api_response);
+    size_t rcap = sizeof(result->output) - 1;
+    result->output_len = (written > 0)
+                       ? (((size_t)written > rcap) ? rcap : (size_t)written) : 0;
+    if (written > 0 && (size_t)written > rcap)
+        result->output_truncated = true;
 
     if (http_code == 401 || http_code == 403) {
         result->success = false;

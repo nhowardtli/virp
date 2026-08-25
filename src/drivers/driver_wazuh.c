@@ -523,12 +523,26 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
     long http_code = 0;
     curl_easy_getinfo(conn->curl, CURLINFO_RESPONSE_CODE, &http_code);
 
-    /* Step 4: Format output like other drivers: hostname>endpoint\nresponse */
+    /*
+     * Step 4: the body is the API response bytes, nothing else
+     * (ISSUE-A branch 2).
+     *
+     * This used to open with `hostname>endpoint [HTTP n]` — "Format
+     * output like other drivers", which is how the CLI-prompt habit
+     * reached a driver that has no CLI and no prompt. There is nothing
+     * here for a '>' to mean: it imitated a device prompt that never
+     * existed. Nothing observed is lost by dropping it. The endpoint IS
+     * the command string (see the file header), so it is already hashed
+     * into the frame and recorded in the gate_execution chain body, and
+     * the HTTP status is carried by exit_code / error_msg below.
+     */
     int written = snprintf(result->output, sizeof(result->output),
-                           "%s>%s [HTTP %ld]\n%s",
-                           conn->device.hostname, endpoint,
-                           http_code, api_response);
-    result->output_len = (written > 0) ? (size_t)written : 0;
+                           "%s", api_response);
+    size_t cap = sizeof(result->output) - 1;
+    result->output_len = (written > 0)
+                       ? (((size_t)written > cap) ? cap : (size_t)written) : 0;
+    if (written > 0 && (size_t)written > cap)
+        result->output_truncated = true;
 
     /* Step 5: Check for errors */
     if (http_code == 401) {

@@ -356,10 +356,18 @@ def emit_alert(kind, detail, sink_file=ALERTS_FILE):
 
 
 def strip_echo(payload, device, command):
-    """The linux driver prefixes every exec result with '<hostname>$
-    <command>\\n' (driver_linux.c linux_execute). Remove exactly that
-    line so the stored evidence is the device's answer, not our own
-    question echoed back."""
+    """Remove the legacy synthesized header line, if present.
+
+    ERA BOUNDARY (ISSUE-A, 2026-08-25): the linux driver used to prefix
+    every exec result with '<hostname>$ <command>\\n' — a line invented by
+    the daemon, since an SSH exec channel presents no prompt to learn. It
+    no longer emits any header: the body is device bytes only.
+
+    Both eras are handled, and neither needs a flag. On a post-fix body no
+    prefix matches and the payload is returned unchanged, which is the
+    correct answer for a body that is already device bytes. On a pre-fix
+    body the old line is stripped exactly as before. Old evidence keeps
+    parsing the way it always did; nothing is rewritten."""
     if not payload:
         return ""
     prefix = "%s$ %s\n" % (device, command)

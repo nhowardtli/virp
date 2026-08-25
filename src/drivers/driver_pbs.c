@@ -902,11 +902,26 @@ int pbs_format_observation(char *out, size_t out_len,
     if (stored) *stored = 0;
     if (!out || out_len == 0) return -1;
 
-    int written = snprintf(out, out_len, "%s>%s [GET %s] [HTTP %ld]\n%s",
-                           hostname ? hostname : "?",
-                           command ? command : "?",
+    /*
+     * ISSUE-A branch 2: the old first line was `hostname>command [GET
+     * path] [HTTP n]` — a fabricated CLI prompt on a driver that has no
+     * CLI, with the registry hostname standing in for device identity.
+     *
+     * The derived path does NOT simply disappear with it. PBS derives
+     * the URL from the approved op through a lookup table, so the path
+     * is not recoverable from the command alone, and recording it is
+     * what lets a later reader confirm the derivation without re-running
+     * the driver. It is daemon-attested context rather than device
+     * bytes, so it is kept and TAGGED as such. The hostname and the
+     * fake prompt character are gone: the first is a registry claim,
+     * the second was never anything at all.
+     */
+    int written = snprintf(out, out_len,
+                           VIRP_OBS_DERIVED_TAG "GET %s [HTTP %ld]\n%s",
                            path ? path : "?",
                            http_code, body ? body : "");
+    (void)hostname;
+    (void)command;
     if (written < 0) { out[0] = '\0'; return -1; }
 
     if ((size_t)written >= out_len) {

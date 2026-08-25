@@ -180,6 +180,26 @@ typedef struct {
 #define VIRP_OUTPUT_MAX     65536   /* 64KB max output per command */
 
 /*
+ * Marker for a line the DAEMON wrote into an observation body.
+ *
+ * ISSUE-A (2026-08-25): nothing synthesized may sit in an observed-body
+ * position wearing the clothes of device output. Most such lines are
+ * simply deleted (the drivers carry device bytes, or nothing). A few
+ * carry something a later reader genuinely cannot recover from the
+ * response alone — a request path DERIVED from the command by a lookup
+ * table, or the exact JSON a write op derived and posted. Those stay,
+ * but they must announce themselves: a reader of the evidence has to be
+ * able to tell daemon-attested context from device bytes without
+ * consulting the source. Any line beginning with this marker is the
+ * daemon speaking; everything after the first newline is the response.
+ *
+ * This is deliberately verbose. It is one line per observation, and the
+ * cost of ambiguity here is exactly the defect being fixed.
+ */
+#define VIRP_OBS_DERIVED_TAG \
+    "[VIRP daemon-attested request — not device output] "
+
+/*
  * How an execution TERMINATED — the only honest basis for claiming a device
  * did or did not run a command.
  *

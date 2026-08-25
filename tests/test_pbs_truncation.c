@@ -20,8 +20,11 @@
  *   1. the curl capture buffer   (PBS_RESPONSE_MAX)
  *   2. the observation formatter (VIRP_OUTPUT_MAX)
  *
- * A body can clear (1) and still be truncated by (2), because the header
- * line "<host>><command> [GET <path>] [HTTP <code>]\n" is prepended.
+ * A body can clear (1) and still be truncated by (2), because a header
+ * line is prepended. Since ISSUE-A (2026-08-25) that line is the tagged
+ * daemon-attested record of the DERIVED request —
+ * VIRP_OBS_DERIVED_TAG "GET <path> [HTTP <code>]\n" — not the old
+ * fabricated "<host>><command> ..." CLI prompt.
  *
  * Offline and pure: the callback and the formatter are driven directly,
  * so nothing here opens a socket.
@@ -217,8 +220,9 @@ static void test_format_boundaries(void)
         size_t body_len = OUT * 4;
         char *body = malloc(body_len + 1);
         memset(body, 'q', body_len); body[body_len] = '\0';
-        int would_have = snprintf(NULL, 0, "%s>%s [GET %s] [HTTP %ld]\n%s",
-                                  "h", "c", "/p", 200L, body);
+        int would_have = snprintf(NULL, 0,
+                                  VIRP_OBS_DERIVED_TAG "GET %s [HTTP %ld]\n%s",
+                                  "/p", 200L, body);
         assert(would_have > (int)OUT);       /* the inflated value */
         assert(pbs_format_observation(out, OUT, "h", "c", "/p", 200,
                                       body, &stored) != 0);
@@ -271,6 +275,38 @@ static void test_shipped_limits(void)
             assert(out[0] == '\0');
         }
         free(body); free(out);
+    }
+    PASS();
+
+    TEST("ISSUE-A: no fabricated prompt, no registry hostname in the body");
+    {
+        /* The old first line was `pbs-lab>pbs op=... [GET /p] [HTTP 200]`:
+         * a CLI prompt on a driver with no CLI, prefixed with the registry
+         * name rather than anything the server sent. The derived path is
+         * genuine derivation evidence and stays, but tagged as
+         * daemon-attested so no reader mistakes it for response bytes. */
+        char out[4096];
+        size_t stored = 0;
+        assert(pbs_format_observation(out, sizeof(out), "pbs-lab",
+                                      "pbs op=backup.datastore.usage",
+                                      "/api2/json/status/datastore-usage",
+                                      200, "{\"data\":[]}", &stored) == 0);
+
+        /* The tag leads, so the daemon-attested line announces itself. */
+        assert(strncmp(out, VIRP_OBS_DERIVED_TAG,
+                       strlen(VIRP_OBS_DERIVED_TAG)) == 0);
+        /* No fabricated prompt character anywhere in the header line. */
+        char *nl = strchr(out, '\n');
+        assert(nl != NULL);
+        *nl = '\0';
+        assert(strchr(out, '>') == NULL);
+        assert(strchr(out, '#') == NULL);
+        /* The registry name is a config claim and must not be in the body. */
+        assert(strstr(out, "pbs-lab") == NULL);
+        /* The derived path IS retained — that is the point of keeping it. */
+        assert(strstr(out, "/api2/json/status/datastore-usage") != NULL);
+        /* Response bytes follow the newline, unmodified. */
+        assert(strcmp(nl + 1, "{\"data\":[]}") == 0);
     }
     PASS();
 

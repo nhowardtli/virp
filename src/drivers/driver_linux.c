@@ -416,11 +416,25 @@ static virp_error_t linux_execute(virp_conn_t *conn,
     libssh2_session_set_blocking(conn->session, 0);
     const uint64_t deadline = mono_ms() + SSH_EXEC_DEADLINE_MS;
 
-    /* Reserve space for hostname prefix. NOTE: this is exactly why output
-     * length can never be the "did we get a response" signal — the buffer is
-     * non-empty before a single byte is read from the device. */
-    size_t total = (size_t)snprintf(result->output, sizeof(result->output),
-                                    "%s$ %s\n", conn->device.hostname, command);
+    /*
+     * The body is device bytes ONLY — nothing is written here before the
+     * first byte arrives (ISSUE-A, branch 2; driver_fortigate.c is the
+     * in-tree precedent).
+     *
+     * This driver used to open the body with `hostname$ command\n`. There
+     * is no prompt to learn on an SSH exec channel — the shell never
+     * presents one — so that line was invented end to end: the '$' claimed
+     * an unprivileged shell the daemon had not observed (and on a root
+     * session the real convention is '#', so the claim was typically
+     * inverted), and the hostname was the registry's name, not the host's.
+     * An omitted header is a hole a reviewer can see. A plausible one is
+     * not.
+     *
+     * The command is not lost: it is the string the gate classified and
+     * hashed into the frame, and it is recorded in the gate_execution
+     * chain body.
+     */
+    size_t total = 0;
 
     /*
      * Record HOW the read ended. Previously EOF and transport error shared

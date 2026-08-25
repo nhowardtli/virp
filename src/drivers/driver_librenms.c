@@ -328,11 +328,20 @@ static virp_error_t librenms_execute(virp_conn_t *base_conn,
         return VIRP_OK;
     }
 
+    /*
+     * The body is the API response bytes, nothing else (ISSUE-A branch
+     * 2). The old `hostname>path [HTTP n]` header imitated a CLI prompt
+     * on a driver that has no CLI. `path` IS the command string (see
+     * above), already hashed into the frame and recorded in the chain;
+     * the HTTP status is carried by exit_code / error_msg.
+     */
     int written = snprintf(result->output, sizeof(result->output),
-                           "%s>%s [HTTP %ld]\n%s",
-                           conn->device.hostname, path,
-                           http_code, api_response);
-    result->output_len = (written > 0) ? (size_t)written : 0;
+                           "%s", api_response);
+    size_t cap = sizeof(result->output) - 1;
+    result->output_len = (written > 0)
+                       ? (((size_t)written > cap) ? cap : (size_t)written) : 0;
+    if (written > 0 && (size_t)written > cap)
+        result->output_truncated = true;
 
     if (http_code == 401 || http_code == 403) {
         result->success = false;

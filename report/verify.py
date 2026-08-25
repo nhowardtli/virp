@@ -307,6 +307,11 @@ def parse_message_header(raw):
     }
 
 
+# Mirrors VIRP_OBS_DERIVED_TAG in include/virp_driver.h. A body line
+# beginning with this is the daemon speaking, not the device (ISSUE-A).
+OBS_DERIVED_TAG = "[VIRP daemon-attested request \u2014 not device output] "
+
+
 def parse_observation_v2_header(raw):
     """Parse the 88-byte v2 observation header. Returns a dict, or None if
     too short. Field names deliberately mirror parse_message_header where
@@ -349,7 +354,9 @@ def parse_observation_v2_payload(raw):
     output = text
     if "\n" in text:
         first, rest = text.split("\n", 1)
-        if "$ " in first or first.endswith("$"):
+        if first.startswith(OBS_DERIVED_TAG):
+            output = rest                       # daemon-attested, not output
+        elif "$ " in first or first.endswith("$"):
             command = first.split("$ ", 1)[-1] if "$ " in first else ""
             output = rest
     return {
@@ -428,8 +435,23 @@ def parse_observation_payload(raw):
     """Extract the observation body from a signed message.
 
     Payload begins with virp_observation_t {u8 obs_type, u8 obs_scope,
-    u16 obs_length} followed by obs_length bytes of data. The data for device
-    observations is text of the form "<device>$ <command>\\n<output>".
+    u16 obs_length} followed by obs_length bytes of data.
+
+    ERA BOUNDARY (ISSUE-A, 2026-08-25). Pre-fix bodies opened with a
+    synthesized header the daemon wrote — "<device>$ <command>" on the
+    linux driver, "<device>><path> [HTTP n]" on the REST drivers. Those
+    headers were not device bytes, and on the CLI drivers the prompt
+    character in them was a privilege-level claim the session may never
+    have held. Post-fix, prompt-less drivers emit NO header: the body is
+    response bytes only, and a daemon-attested line (where one is still
+    warranted, e.g. a derived request path) is prefixed with
+    OBS_DERIVED_TAG so it cannot be mistaken for device output.
+
+    Both eras parse here. A post-fix body yields command="" and
+    output=the whole body, which is correct: there is no command echo to
+    strip, and the command itself is carried by the frame's command_hash
+    and by the gate_execution chain entry — not by the body. Old frames
+    parse exactly as they always did. Nothing is rewritten.
     """
     if raw is None or len(raw) < VIRP_HEADER_SIZE + 4:
         return None
@@ -442,11 +464,15 @@ def parse_observation_payload(raw):
     output = text
     if "\n" in text:
         first, rest = text.split("\n", 1)
-        if "$ " in first or first.endswith("$"):
+        if first.startswith(OBS_DERIVED_TAG):
+            # Post-fix daemon-attested line: explicitly NOT device output,
+            # and explicitly not a command echo. Keep it out of `output`.
+            output = rest
+        elif "$ " in first or first.endswith("$"):
             command = first.split("$ ", 1)[-1] if "$ " in first else ""
             output = rest
         elif ">" in first:
-            # REST-style: "<device>>/path [HTTP 200]"
+            # Legacy REST-style: "<device>>/path [HTTP 200]"
             command = first.split(">", 1)[-1]
             output = rest
     return {
