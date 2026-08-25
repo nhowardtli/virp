@@ -32,6 +32,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.DEPS }}
+      - name: Install test-battery Python dependencies
+        # make all-tests ends with check-test-deps, which fails the run if any
+        # suite would have silently skipped: test-api needs fastapi/httpx/pytest,
+        # test-virp-report needs reportlab, test-chainsign-vectors uses pynacl or
+        # cryptography. Without this step the battery has never been green here.
+        run: python3 -m pip install --quiet pynacl fastapi httpx pytest reportlab
       # CFLAGS already carry -Wall -Wextra -Werror -pedantic -std=c11, so a
       # warning is a build failure without any extra flag here.
       - name: Build (warnings are errors)

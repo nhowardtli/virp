@@ -123,11 +123,23 @@ def test_live_signed_chain():
               res2.get("fixture-sess", {}).get("verdict") == verify.FAIL)
 
         # A different key -> soft key_unavailable, not FAIL.
-        from nacl.signing import SigningKey
-        other_pub = bytes(SigningKey.generate().verify_key)
+        other_pub = _random_ed25519_pub()
         res3 = verify.verify_chain_signatures(entries, heads, other_pub)
         check("wrong key -> key_unavailable (soft)",
               res3.get("fixture-sess", {}).get("verdict") == "key_unavailable")
+
+
+def _random_ed25519_pub():
+    """A fresh Ed25519 public key from whichever backend is importable.
+    The module docstring promises PyNaCl OR cryptography; this used to
+    hard-import PyNaCl, so a cryptography-only host crashed with
+    ModuleNotFoundError instead of running the cross-check."""
+    try:
+        from nacl.signing import SigningKey
+        return bytes(SigningKey.generate().verify_key)
+    except ImportError:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        return Ed25519PrivateKey.generate().public_key().public_bytes_raw()
 
 
 def main():
