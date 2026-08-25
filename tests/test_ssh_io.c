@@ -701,6 +701,146 @@ TEST(test_keepalive_without_prompt_is_error)
     CHECK(got > 0, "expected the partial bytes to be reported, got %zu", got);
 }
 
+
+/* =========================================================================
+ * ISSUE-A: the observation header carries the prompt the DEVICE sent
+ *
+ * Reported by Snow 2026-08-25, verified on physical hardware: every SSH
+ * driver templated `hostname` + a literal '#' + the command, consulting
+ * neither the learned prompt nor anything else the device sent. A read
+ * collected at `ASA>` was signed as `ASA#show version` — a privilege-level
+ * claim the session never held.
+ *
+ * These assert EQUALITY AGAINST THE LEARNED VALUE, never against a
+ * literal, so a driver cannot pass them by hardcoding a different
+ * constant. Both directions ('>' and '#') are covered so the tests
+ * cannot pass by hardcoding either one.
+ * ========================================================================= */
+
+/* Learn a prompt through the real two-probe path, so the value under
+ * test is one the mock device actually sent. */
+static void learn_from_device(virp_ssh_prompt_t *out, const char *sends)
+{
+    mock_pty_t m;
+    mock_init(&m, "", 16);
+    /* The device answers each probe newline with its prompt — the same
+     * two-probe confirmation a real session goes through. */
+    m.reply_on_write = sends;
+    virp_ssh_io_t io = { .ctx = &m, .read = mock_read, .write = mock_write };
+    virp_ssh_learn_opts_t lo = { .channel_has_spoken = true,
+                                 .first_byte_ms = 500, .total_ms = 3000 };
+    virp_error_t rc = virp_ssh_learn_prompt(&io, "issue-a", &lo, out);
+    if (rc != VIRP_OK) {
+        printf(" [SETUP FAIL] learn returned %d\n", (int)rc);
+        tests_failed++;
+    }
+}
+
+TEST(test_header_carries_user_exec_prompt_byte_exact)
+{
+    virp_ssh_prompt_t pr;
+    learn_from_device(&pr, "\r\nASA> ");
+
+    size_t hlen = 0;
+    const char *head = virp_ssh_obs_prompt_head(&pr, &hlen);
+
+    /* Byte-for-byte equal to what was learned — not to any literal. */
+    CHECK(hlen == pr.prompt_len,
+          "header head length %zu != learned length %zu", hlen, pr.prompt_len);
+    CHECK(memcmp(head, pr.prompt, hlen) == 0,
+          "header head '%.*s' is not the learned prompt '%s'",
+          (int)hlen, head, pr.prompt);
+
+    /* Snow's exact case: a user-exec session must not read as privileged. */
+    CHECK(memchr(head, '#', hlen) == NULL,
+          "user-exec session recorded a '#' privilege claim: '%.*s'",
+          (int)hlen, head);
+    CHECK(head[hlen - 1] == '>',
+          "learned prompt ended '%c', expected '>'", head[hlen - 1]);
+}
+
+TEST(test_header_carries_enable_prompt_byte_exact)
+{
+    virp_ssh_prompt_t pr;
+    learn_from_device(&pr, "\r\nASA# ");
+
+    size_t hlen = 0;
+    const char *head = virp_ssh_obs_prompt_head(&pr, &hlen);
+
+    CHECK(hlen == pr.prompt_len,
+          "header head length %zu != learned length %zu", hlen, pr.prompt_len);
+    CHECK(memcmp(head, pr.prompt, hlen) == 0,
+          "header head '%.*s' is not the learned prompt '%s'",
+          (int)hlen, head, pr.prompt);
+    CHECK(head[hlen - 1] == '#',
+          "learned prompt ended '%c', expected '#'", head[hlen - 1]);
+}
+
+/* The device's own name, not the registry's. R24 in the lab presents an
+ * 'R25#' prompt (the 2026-07-29 cross-learn incident): the header must
+ * carry what the device said, so the disagreement is visible evidence
+ * instead of being papered over with the configured hostname. */
+TEST(test_header_carries_device_presented_identity)
+{
+    virp_ssh_prompt_t pr;
+    learn_from_device(&pr, "\r\nR25# ");
+
+    size_t hlen = 0;
+    const char *head = virp_ssh_obs_prompt_head(&pr, &hlen);
+
+    CHECK(hlen == pr.prompt_len && memcmp(head, pr.prompt, hlen) == 0,
+          "header head is not the learned prompt");
+    CHECK(memcmp(head, "R25#", 4) == 0,
+          "device-presented identity lost: '%.*s'", (int)hlen, head);
+}
+
+/* No prompt learned: an explicit tag, never a plausible default. A hole a
+ * reviewer can see beats a fabrication they cannot. */
+TEST(test_unlearned_prompt_yields_tagged_header_not_a_default)
+{
+    virp_ssh_prompt_t pr;
+    memset(&pr, 0, sizeof(pr));   /* learned == false */
+
+    size_t hlen = 0;
+    const char *head = virp_ssh_obs_prompt_head(&pr, &hlen);
+
+    CHECK(hlen == sizeof(VIRP_SSH_NO_PROMPT_TAG) - 1,
+          "tag length %zu unexpected", hlen);
+    CHECK(memcmp(head, VIRP_SSH_NO_PROMPT_TAG, hlen) == 0,
+          "unlearned header is not the tag: '%.*s'", (int)hlen, head);
+
+    /* The whole point: no privilege character, no hostname-plus-symbol. */
+    CHECK(memchr(head, '#', hlen) == NULL,
+          "unlearned header fabricated a '#': '%.*s'", (int)hlen, head);
+    CHECK(memchr(head, '>', hlen) == NULL,
+          "unlearned header fabricated a '>': '%.*s'", (int)hlen, head);
+
+    /* NULL is the same case, not a crash. */
+    size_t nlen = 0;
+    const char *nhead = virp_ssh_obs_prompt_head(NULL, &nlen);
+    CHECK(nhead != NULL && nlen == hlen &&
+          memcmp(nhead, VIRP_SSH_NO_PROMPT_TAG, nlen) == 0,
+          "NULL prompt did not yield the tag");
+}
+
+/* A half-populated struct (bytes present, learned flag clear) must take
+ * the tag path: `learned` is the authority, so a prompt from a failed or
+ * abandoned learn can never reach a signed body. */
+TEST(test_unconfirmed_prompt_bytes_are_not_used)
+{
+    virp_ssh_prompt_t pr;
+    memset(&pr, 0, sizeof(pr));
+    memcpy(pr.prompt, "ASA#", 5);
+    pr.prompt_len = 4;
+    pr.learned = false;
+
+    size_t hlen = 0;
+    const char *head = virp_ssh_obs_prompt_head(&pr, &hlen);
+    CHECK(memcmp(head, VIRP_SSH_NO_PROMPT_TAG, hlen) == 0,
+          "unconfirmed prompt bytes reached the header: '%.*s'",
+          (int)hlen, head);
+}
+
 /* ========================================================================= */
 
 int main(void)
@@ -723,6 +863,13 @@ int main(void)
     printf("\n--- PAN-OS keepalive window (2b) ---\n");
     RUN_TEST(test_keepalive_exchange_leaves_channel_clean);
     RUN_TEST(test_keepalive_without_prompt_is_error);
+
+    printf("\n--- ISSUE-A: observed prompt truth ---\n");
+    RUN_TEST(test_header_carries_user_exec_prompt_byte_exact);
+    RUN_TEST(test_header_carries_enable_prompt_byte_exact);
+    RUN_TEST(test_header_carries_device_presented_identity);
+    RUN_TEST(test_unlearned_prompt_yields_tagged_header_not_a_default);
+    RUN_TEST(test_unconfirmed_prompt_bytes_are_not_used);
 
     printf("\n--- Scrubbing and drain accounting ---\n");
     RUN_TEST(test_strip_echo_matches_command_text);

@@ -306,7 +306,18 @@ static virp_error_t mock_execute(virp_conn_t *conn,
     const char *chan = shared ? conn->chan_buf : "";
 
     if (response) {
-        /* Format like real CLI output: hostname#command\noutput */
+        /*
+         * ISSUE-A scope note: this driver IS the device. Everything it
+         * emits is simulated device output by construction, so the '#'
+         * here is the simulated device's presented prompt, not a claim
+         * about a session that really held privileged exec. The real
+         * drivers now carry the LEARNED prompt byte-exact
+         * (virp_ssh_obs_prompt_head); there is nothing to learn from a
+         * simulator, and several onode/approval tests pin this exact
+         * shape as their fixture. Left deliberately as-is.
+         *
+         * Format like real CLI output: hostname#command\noutput
+         */
         int n = snprintf(result->output, sizeof(result->output),
                          "%s%s#%s\n%s",
                          chan, conn->device.hostname, command, response);

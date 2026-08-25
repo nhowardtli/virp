@@ -187,6 +187,48 @@ virp_error_t virp_ssh_exec(const virp_ssh_io_t *io,
                            const char *device_label);
 
 /*
+ * Compose the first line of a signed observation body: the prompt the
+ * device ACTUALLY presented, immediately followed by the command, exactly
+ * as an operator's terminal would have shown the typed line.
+ *
+ * ISSUE-A (2026-08-25, reported by Snow): every SSH driver used to
+ * template `hostname` + a literal '#' + the command, consulting neither
+ * the learned prompt nor anything else the device sent. On IOS and ASA
+ * '#' is a privilege-level claim, so an observation collected at `ASA>`
+ * was signed as `ASA#show version` — synthesized text occupying an
+ * observed-body position, which is the failure mode the protocol exists
+ * to prevent. The chain proved those bytes unaltered because they were;
+ * they were untrue when written.
+ *
+ * The prompt is copied BYTE-EXACT from `prompt`. No normalization, no
+ * reconstruction, no defaulting: whatever the two-probe learn confirmed
+ * the device sends is what a reader of the evidence sees.
+ *
+ * Fallback when nothing was learned (prompt NULL, !learned, or empty):
+ * the line is tagged VIRP_SSH_NO_PROMPT_TAG and carries NO prompt
+ * character at all. A plausible-looking default is worse than an obvious
+ * hole — a hole is visible to a reviewer, a default is not. On the SSH
+ * drivers this path should be unreachable (a driver that cannot learn a
+ * prompt refuses the connection, and virp_ssh_exec independently refuses
+ * to run without one), so the tag also marks a real anomaly.
+ *
+ * Returns a pointer to the head bytes (never NULL) and writes their
+ * length to *len_out. The caller composes the line as
+ *
+ *     snprintf(out, cap, "%.*s%s\n%s", (int)hlen, head, command, body);
+ *
+ * so each driver keeps its own single-snprintf truncation accounting and
+ * no second output-sized buffer is needed. The returned pointer aliases
+ * `prompt` when one was learned, so it is valid only as long as `prompt`
+ * is — callers pass a dispatch-time snapshot, never a live conn field
+ * that a re-learn could move under them.
+ */
+#define VIRP_SSH_NO_PROMPT_TAG   "[VIRP: no prompt learned] "
+
+const char *virp_ssh_obs_prompt_head(const virp_ssh_prompt_t *prompt,
+                                     size_t *len_out);
+
+/*
  * Strip the echoed command from the head of a reply.
  *
  * Matches the command TEXT rather than deleting the first line

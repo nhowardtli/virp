@@ -23,6 +23,7 @@
 #define VIRP_DRIVER_CISCO_H
 
 #include "virp.h"
+#include "virp_ssh_io.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -124,12 +125,18 @@ bool cisco_is_black_tier(const char *command);
  * secret classes); the scrub still runs on every approved read.
  */
 /*
- * Compose hostname#command\nbody into result->output with honest
+ * Compose <prompt><command>\nbody into result->output with honest
  * length accounting (Item 5): output_len is the actual stored byte
  * count; a clamped scrubbed body is withheld typed; a clamped raw
  * body is marked output_truncated. Exposed for the unit suite.
+ *
+ * `prompt` is the dispatch-time learned prompt, written byte-exact
+ * (ISSUE-A). `hostname` appears only in operator-facing error text —
+ * it is a registry claim, not device bytes, and must never re-enter
+ * the signed header.
  */
 virp_error_t cisco_store_output(virp_exec_result_t *result,
+                                const virp_ssh_prompt_t *prompt,
                                 const char *hostname,
                                 const char *command,
                                 const char *body,

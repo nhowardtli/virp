@@ -21,6 +21,7 @@
 
 #include "virp.h"
 #include "virp_driver.h"
+#include "virp_ssh_io.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,12 +79,18 @@ asa_mode_t asa_parse_mode(const char *prompt);
  * embed configuration; asa_execute applies the scrub to exactly those.
  */
 /*
- * Compose hostname#command\nbody into result->output with honest
+ * Compose <prompt><command>\nbody into result->output with honest
  * length accounting (Item 5): output_len is the actual stored byte
  * count; a clamped scrubbed body is withheld typed; a clamped raw
  * body is marked output_truncated. Exposed for the unit suite.
+ *
+ * `prompt` is the dispatch-time learned prompt, written byte-exact
+ * (ISSUE-A). `hostname` appears only in operator-facing error text —
+ * it is a registry claim, not device bytes, and must never re-enter
+ * the signed header.
  */
 virp_error_t asa_store_output(virp_exec_result_t *result,
+                              const virp_ssh_prompt_t *prompt,
                               const char *hostname,
                               const char *command,
                               const char *body,

@@ -1102,8 +1102,14 @@ bool cisco_command_returns_config(const char *command)
 }
 
 /*
- * Compose `hostname#command\nbody` into result->output — the bytes
- * the O-Node signs. snprintf returns the length it WOULD have
+ * Compose `<prompt><command>\nbody` into result->output — the bytes
+ * the O-Node signs. `prompt` is the learned prompt as of DISPATCH and is
+ * copied byte-exact (virp_ssh_obs_prompt_head); `hostname` is used only
+ * for operator-facing error text, never for the signed header. Before
+ * ISSUE-A this templated hostname + a literal '#', asserting privileged
+ * exec on every observation regardless of the session's real mode.
+ *
+ * snprintf returns the length it WOULD have
  * written; storing that as output_len let a clamped body sign with
  * success=true and truncated=no (Item 5, 2026-08-11). Mirror
  * driver_fortigate.c: output_len is ALWAYS the actual stored byte
@@ -1115,13 +1121,16 @@ bool cisco_command_returns_config(const char *command)
  * as complete. Exposed (non-static) for the unit suite.
  */
 virp_error_t cisco_store_output(virp_exec_result_t *result,
+                                const virp_ssh_prompt_t *prompt,
                                 const char *hostname,
                                 const char *command,
                                 const char *body,
                                 bool scrubbed_body)
 {
+    size_t hlen = 0;
+    const char *head = virp_ssh_obs_prompt_head(prompt, &hlen);
     int written = snprintf(result->output, sizeof(result->output),
-                           "%s#%s\n%s", hostname, command, body);
+                           "%.*s%s\n%s", (int)hlen, head, command, body);
     if (written >= 0 && (size_t)written < sizeof(result->output)) {
         result->output_len = (size_t)written;
         result->success = true;
@@ -1184,6 +1193,18 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
+
+    /*
+     * The prompt as it stood when this command was DISPATCHED. A
+     * mode-changing command makes the read path re-learn below, so the
+     * live conn->prompt after the read is the prompt the command LANDED
+     * at, not the one it was typed at. `conf t` issued at `R24#` must be
+     * recorded at `R24#`, never restamped `R24(config)#` — restamping is
+     * the same class of defect as the fabricated '#' this fix removes
+     * (ISSUE-A), and would assert the command was issued from a mode the
+     * session had not yet entered.
+     */
+    const virp_ssh_prompt_t dispatch_prompt = conn->prompt;
 
     /*
      * Shared read path: drain residue, send, read until the LEARNED
@@ -1292,9 +1313,11 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
         output_start = scrubbed;
     }
 
-    /* Format: hostname#command\noutput — actual-length accounting and
-     * honest truncation/withhold live in cisco_store_output. */
-    virp_error_t werr = cisco_store_output(result, conn->device.hostname,
+    /* Format: <dispatch prompt><command>\noutput — actual-length
+     * accounting and honest truncation/withhold live in
+     * cisco_store_output. */
+    virp_error_t werr = cisco_store_output(result, &dispatch_prompt,
+                                           conn->device.hostname,
                                            command, output_start,
                                            scrubbed != NULL);
     if (werr != VIRP_OK) {

@@ -33,6 +33,7 @@
 #include <stdlib.h>
 
 #include "virp_driver.h"
+#include "virp_ssh_io.h"
 
 /* Declared in virp_driver_cisco.h, but that header embeds an opaque
  * virp_conn_t by value (the RESTCONF struct) and cannot be included
@@ -44,10 +45,15 @@ virp_error_t cisco_scrub_config(const char *in, size_t in_len,
                                 size_t *out_len);
 bool cisco_command_returns_config(const char *command);
 virp_error_t cisco_store_output(virp_exec_result_t *result,
+                                const virp_ssh_prompt_t *prompt,
                                 const char *hostname,
                                 const char *command,
                                 const char *body,
                                 bool scrubbed_body);
+
+/* Prompt fixtures: what the device actually presented. */
+static const virp_ssh_prompt_t PROMPT_ENABLE = {
+    .prompt = "R1#", .prompt_len = 3, .learned = true };
 
 static int tests_run = 0;
 static int tests_failed = 0;
@@ -444,7 +450,7 @@ TEST(test_scrub_growth_overflow_withheld)
 
     static virp_exec_result_t res;
     memset(&res, 0, sizeof(res));
-    virp_error_t err = cisco_store_output(&res, "R1",
+    virp_error_t err = cisco_store_output(&res, &PROMPT_ENABLE, "R1",
                                           "show running-config",
                                           GROW_SCRUBBED, true);
     CHECK(err == VIRP_ERR_BUFFER_TOO_SMALL,
@@ -467,7 +473,7 @@ TEST(test_plain_clamp_marked_truncated)
 
     static virp_exec_result_t res;
     memset(&res, 0, sizeof(res));
-    virp_error_t err = cisco_store_output(&res, "R1", "show tech-support",
+    virp_error_t err = cisco_store_output(&res, &PROMPT_ENABLE, "R1", "show tech-support",
                                           GROW_SCRUBBED, false);
     CHECK(err == VIRP_OK, "plain clamp must not fail (err=%d)", (int)err);
     CHECK(res.output_len == sizeof(res.output) - 1,
@@ -484,7 +490,7 @@ TEST(test_store_output_fit_unchanged)
 {
     static virp_exec_result_t res;
     memset(&res, 0, sizeof(res));
-    virp_error_t err = cisco_store_output(&res, "R1", "show version",
+    virp_error_t err = cisco_store_output(&res, &PROMPT_ENABLE, "R1", "show version",
                                           "Cisco IOS Software", false);
     CHECK(err == VIRP_OK, "fitting body failed (err=%d)", (int)err);
     CHECK(strcmp(res.output, "R1#show version\nCisco IOS Software") == 0,
@@ -492,6 +498,109 @@ TEST(test_store_output_fit_unchanged)
     CHECK(res.output_len == strlen(res.output), "output_len wrong");
     CHECK(!res.output_truncated && res.success,
           "fitting body mis-flagged");
+}
+
+/* =========================================================================
+ * ISSUE-A: the signed header carries the prompt the device presented
+ * ========================================================================= */
+
+/* The two directions, asserted against the learned value rather than a
+ * literal, so neither can pass by hardcoding. */
+TEST(test_header_is_the_learned_prompt_both_directions)
+{
+    const virp_ssh_prompt_t user_exec = {
+        .prompt = "R1>", .prompt_len = 3, .learned = true };
+    const virp_ssh_prompt_t enable = {
+        .prompt = "R1#", .prompt_len = 3, .learned = true };
+
+    static virp_exec_result_t res;
+    char expect[128];
+
+    memset(&res, 0, sizeof(res));
+    cisco_store_output(&res, &user_exec, "R1", "show version", "IOS", false);
+    snprintf(expect, sizeof(expect), "%s%s\n%s",
+             user_exec.prompt, "show version", "IOS");
+    CHECK(strcmp(res.output, expect) == 0,
+          "user-exec body '%s' != learned-prompt body '%s'",
+          res.output, expect);
+    CHECK(strchr(res.output, '#') == NULL,
+          "user-exec read signed a '#' privilege claim: '%s'", res.output);
+
+    memset(&res, 0, sizeof(res));
+    cisco_store_output(&res, &enable, "R1", "show version", "IOS", false);
+    snprintf(expect, sizeof(expect), "%s%s\n%s",
+             enable.prompt, "show version", "IOS");
+    CHECK(strcmp(res.output, expect) == 0,
+          "enable body '%s' != learned-prompt body '%s'", res.output, expect);
+}
+
+/*
+ * The registry name must never re-enter the signed header. R24 in the lab
+ * presents an 'R25#' prompt (2026-07-29 cross-learn incident): the header
+ * carries what the DEVICE said, so the disagreement stays visible.
+ */
+TEST(test_header_prefers_device_identity_over_registry_name)
+{
+    const virp_ssh_prompt_t presented = {
+        .prompt = "R25#", .prompt_len = 4, .learned = true };
+
+    static virp_exec_result_t res;
+    memset(&res, 0, sizeof(res));
+    /* hostname is the REGISTRY name and disagrees with the device. */
+    cisco_store_output(&res, &presented, "R24", "show version", "IOS", false);
+
+    CHECK(strncmp(res.output, "R25#show version", 16) == 0,
+          "header did not carry the device-presented prompt: '%s'",
+          res.output);
+    CHECK(strstr(res.output, "R24") == NULL,
+          "registry name leaked into the signed header: '%s'", res.output);
+}
+
+/*
+ * Dispatch-time capture, the ticket's specific case. `conf t` is issued at
+ * R24# and the device answers at R24(config)#, so cisco_execute re-learns
+ * mid-execute. The header must record where the command was TYPED, never
+ * where it landed — restamping would assert the command was issued from a
+ * mode the session had not yet entered.
+ */
+TEST(test_header_records_pre_dispatch_prompt_not_post_transition)
+{
+    const virp_ssh_prompt_t at_dispatch = {
+        .prompt = "R24#", .prompt_len = 4, .learned = true };
+    const virp_ssh_prompt_t after_relearn = {
+        .prompt = "R24(config)#", .prompt_len = 12, .learned = true };
+
+    static virp_exec_result_t res;
+    memset(&res, 0, sizeof(res));
+    /* cisco_execute snapshots the prompt BEFORE virp_ssh_exec and passes
+     * that snapshot here; the post-transition value is what the live
+     * conn->prompt would hold by now. */
+    cisco_store_output(&res, &at_dispatch, "R24", "configure terminal",
+                       "Enter configuration commands, one per line.", false);
+
+    CHECK(strncmp(res.output, "R24#configure terminal", 22) == 0,
+          "header is not the dispatch-time prompt: '%s'", res.output);
+    CHECK(strstr(res.output, after_relearn.prompt) == NULL,
+          "post-transition prompt restamped the header: '%s'", res.output);
+}
+
+/* No prompt learned: the explicit tag, never a plausible default. */
+TEST(test_unlearned_prompt_is_tagged_never_defaulted)
+{
+    virp_ssh_prompt_t unlearned;
+    memset(&unlearned, 0, sizeof(unlearned));
+
+    static virp_exec_result_t res;
+    memset(&res, 0, sizeof(res));
+    cisco_store_output(&res, &unlearned, "R1", "show version", "IOS", false);
+
+    CHECK(strncmp(res.output, VIRP_SSH_NO_PROMPT_TAG,
+                  sizeof(VIRP_SSH_NO_PROMPT_TAG) - 1) == 0,
+          "unlearned header is not tagged: '%s'", res.output);
+    CHECK(strchr(res.output, '#') == NULL,
+          "unlearned header fabricated a '#': '%s'", res.output);
+    CHECK(strstr(res.output, "R1#") == NULL && strstr(res.output, "R1>") == NULL,
+          "unlearned header fabricated a hostname+symbol: '%s'", res.output);
 }
 
 TEST(test_gate_tier_alignment)
@@ -539,6 +648,10 @@ int main(void)
     RUN_TEST(test_overflow_fails_closed);
     RUN_TEST(test_null_args);
     RUN_TEST(test_trigger_commands);
+    RUN_TEST(test_header_is_the_learned_prompt_both_directions);
+    RUN_TEST(test_header_prefers_device_identity_over_registry_name);
+    RUN_TEST(test_header_records_pre_dispatch_prompt_not_post_transition);
+    RUN_TEST(test_unlearned_prompt_is_tagged_never_defaulted);
     RUN_TEST(test_gate_tier_alignment);
 
     printf("\n%d tests, %d failures\n", tests_run, tests_failed);

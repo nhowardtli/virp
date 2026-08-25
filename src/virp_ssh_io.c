@@ -425,6 +425,25 @@ virp_error_t virp_ssh_exec(const virp_ssh_io_t *io,
                                       timeout_ms, device_label);
 }
 
+const char *virp_ssh_obs_prompt_head(const virp_ssh_prompt_t *prompt,
+                                     size_t *len_out)
+{
+    /*
+     * Byte-exact. prompt_len rather than strlen: the learned value is
+     * measured at learn time, so nothing here can silently shorten or
+     * extend what the device actually sent.
+     */
+    bool learned = prompt && prompt->learned && prompt->prompt_len > 0 &&
+                   prompt->prompt_len < sizeof(prompt->prompt);
+
+    if (learned) {
+        if (len_out) *len_out = prompt->prompt_len;
+        return prompt->prompt;
+    }
+    if (len_out) *len_out = sizeof(VIRP_SSH_NO_PROMPT_TAG) - 1;
+    return VIRP_SSH_NO_PROMPT_TAG;
+}
+
 char *virp_ssh_strip_echo(char *buf, const char *command)
 {
     if (!buf || !command)

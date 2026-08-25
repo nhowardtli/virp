@@ -760,6 +760,12 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
         snprintf(cmd_buf, sizeof(cmd_buf), "%s\n", command);
     }
 
+    /* The prompt as it stood when this command was DISPATCHED. JunOS
+     * re-learns after configure/exit/rollback, so the live conn->prompt
+     * after the read is where the command LANDED, not where it was
+     * typed; the header must carry the snapshot (ISSUE-A). */
+    const virp_ssh_prompt_t dispatch_prompt = conn->prompt;
+
     /* Drain residue from any earlier command before sending. */
     virp_ssh_drain(&conn->io, conn->device.hostname);
 
@@ -870,10 +876,15 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
         output_start[--clean_len] = '\0';
     }
 
-    /* Format: hostname>command\noutput (matches existing executor format) */
+    /* Format: <prompt the device presented><command>\noutput. The real
+     * JunOS prompt is `user@host>` (config mode `#`), so the old
+     * `hostname>` template fabricated both the identity and the mode
+     * (ISSUE-A). */
+    size_t hlen = 0;
+    const char *head = virp_ssh_obs_prompt_head(&dispatch_prompt, &hlen);
     int written = snprintf(result->output, sizeof(result->output),
-                           "%s>%s\n%s",
-                           conn->device.hostname, command, output_start);
+                           "%.*s%s\n%s",
+                           (int)hlen, head, command, output_start);
     result->output_len = (written > 0) ? (size_t)written : 0;
     result->success = true;
     result->exit_code = 0;

@@ -25,6 +25,10 @@
 #include "virp_driver.h"
 #include "virp_driver_asa.h"
 
+/* Prompt fixtures: what the device actually presented. */
+static const virp_ssh_prompt_t PROMPT_ENABLE = {
+    .prompt = "ASA-Lab#", .prompt_len = 8, .learned = true };
+
 static int tests_run = 0;
 static int tests_failed = 0;
 
@@ -296,7 +300,7 @@ TEST(test_scrub_growth_overflow_withheld)
 
     static virp_exec_result_t res;
     memset(&res, 0, sizeof(res));
-    virp_error_t err = asa_store_output(&res, "ASA-Lab",
+    virp_error_t err = asa_store_output(&res, &PROMPT_ENABLE, "ASA-Lab",
                                         "show running-config",
                                         GROW_SCRUBBED, true);
     CHECK(err == VIRP_ERR_BUFFER_TOO_SMALL,
@@ -315,7 +319,7 @@ TEST(test_plain_clamp_marked_truncated)
 
     static virp_exec_result_t res;
     memset(&res, 0, sizeof(res));
-    virp_error_t err = asa_store_output(&res, "ASA-Lab", "show tech-support",
+    virp_error_t err = asa_store_output(&res, &PROMPT_ENABLE, "ASA-Lab", "show tech-support",
                                         GROW_SCRUBBED, false);
     CHECK(err == VIRP_OK, "plain clamp must not fail (err=%d)", (int)err);
     CHECK(res.output_len == sizeof(res.output) - 1,
@@ -331,7 +335,7 @@ TEST(test_store_output_fit_unchanged)
 {
     static virp_exec_result_t res;
     memset(&res, 0, sizeof(res));
-    virp_error_t err = asa_store_output(&res, "ASA-Lab", "show version",
+    virp_error_t err = asa_store_output(&res, &PROMPT_ENABLE, "ASA-Lab", "show version",
                                         "Cisco Adaptive Security Appliance",
                                         false);
     CHECK(err == VIRP_OK, "fitting body failed (err=%d)", (int)err);

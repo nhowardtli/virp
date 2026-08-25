@@ -953,8 +953,14 @@ bool asa_command_returns_config(const char *command)
 }
 
 /*
- * Compose `hostname#command\nbody` into result->output — the bytes
- * the O-Node signs. snprintf returns the length it WOULD have
+ * Compose `<prompt><command>\nbody` into result->output — the bytes
+ * the O-Node signs. `prompt` is the learned prompt as of DISPATCH,
+ * copied byte-exact (virp_ssh_obs_prompt_head); `hostname` is used only
+ * for operator-facing error text, never for the signed header. Before
+ * ISSUE-A this templated hostname + a literal '#' — a privilege-level
+ * claim on ASA — regardless of the mode the session actually held.
+ *
+ * snprintf returns the length it WOULD have
  * written; storing that as output_len let a clamped body sign with
  * success=true and truncated=no (Item 5, 2026-08-11). Mirror
  * driver_fortigate.c: output_len is ALWAYS the actual stored byte
@@ -966,13 +972,16 @@ bool asa_command_returns_config(const char *command)
  * as complete. Exposed (non-static) for the unit suite.
  */
 virp_error_t asa_store_output(virp_exec_result_t *result,
+                              const virp_ssh_prompt_t *prompt,
                               const char *hostname,
                               const char *command,
                               const char *body,
                               bool scrubbed_body)
 {
+    size_t hlen = 0;
+    const char *head = virp_ssh_obs_prompt_head(prompt, &hlen);
     int written = snprintf(result->output, sizeof(result->output),
-                           "%s#%s\n%s", hostname, command, body);
+                           "%.*s%s\n%s", (int)hlen, head, command, body);
     if (written >= 0 && (size_t)written < sizeof(result->output)) {
         result->output_len = (size_t)written;
         result->success = true;
@@ -1043,6 +1052,14 @@ static virp_error_t asa_execute(virp_conn_t *conn,
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
+
+    /* The prompt as it stood when this command was DISPATCHED. ASA
+     * re-learns on mode changes (and asa_verify_enable re-learns before
+     * every command), so the header must carry the snapshot, not a live
+     * field a later re-learn could restamp (ISSUE-A). Snow collected
+     * `show version` at `ASA>` and the signed observation read
+     * `ASA#show version`: a privilege claim the session never held. */
+    const virp_ssh_prompt_t dispatch_prompt = conn->prompt;
 
     /* Step 2: shared read path — drain residue, send, read to the
      * LEARNED prompt (which the helper strips). */
@@ -1120,10 +1137,11 @@ static virp_error_t asa_execute(virp_conn_t *conn,
         output_start = scrubbed;
     }
 
-    /* Format: hostname#command\noutput (compatible with existing
-     * format) — actual-length accounting and honest truncation/
-     * withhold live in asa_store_output. */
-    virp_error_t werr = asa_store_output(result, conn->device.hostname,
+    /* Format: <dispatch prompt><command>\noutput — actual-length
+     * accounting and honest truncation/withhold live in
+     * asa_store_output. */
+    virp_error_t werr = asa_store_output(result, &dispatch_prompt,
+                                         conn->device.hostname,
                                          command, output_start,
                                          scrubbed != NULL);
     if (werr != VIRP_OK) {

@@ -869,6 +869,12 @@ static virp_error_t pa_execute(virp_conn_t *conn,
                 read_timeout / 1000, command);
     }
 
+    /* The prompt as it stood when this command was DISPATCHED — the line
+     * the operator would have seen the command typed at. Snapshotted
+     * before the write so a later re-learn can never restamp the header
+     * with a prompt the command was not issued at (ISSUE-A). */
+    const virp_ssh_prompt_t dispatch_prompt = conn->prompt;
+
     /* Shared read path: drain residue, send, read to the LEARNED prompt. */
     char raw_output[VIRP_OUTPUT_MAX];
     size_t n = 0;
@@ -909,8 +915,13 @@ static virp_error_t pa_execute(virp_conn_t *conn,
      *   <actual output>
      *   username@hostname>
      *
-     * We want: hostname>command\nactual output
-     * (Matches existing VIRP output format)
+     * The trailing prompt is the read terminator and is consumed by
+     * virp_ssh_read_until_prompt, but it is NOT lost: it is byte-identical
+     * to conn->prompt, which is what the header below now carries. This
+     * driver used to discard it and template `hostname>` instead — and on
+     * PAN-OS the learned prompt is `username@hostname>`, so the template
+     * dropped the administrative identity the device itself reported as
+     * well as asserting a mode it had not confirmed (ISSUE-A).
      */
 
     /* Strip the echoed command by matching its text, not by position. */
@@ -924,10 +935,12 @@ static virp_error_t pa_execute(virp_conn_t *conn,
         output_start[--clean_len] = '\0';
     }
 
-    /* Format: hostname>command\noutput */
+    /* Format: <prompt the device presented><command>\noutput */
+    size_t hlen = 0;
+    const char *head = virp_ssh_obs_prompt_head(&dispatch_prompt, &hlen);
     int written = snprintf(result->output, sizeof(result->output),
-                           "%s>%s\n%s",
-                           conn->device.hostname, command, output_start);
+                           "%.*s%s\n%s",
+                           (int)hlen, head, command, output_start);
     result->output_len = (written > 0) ? (size_t)written : 0;
     result->success = true;
     result->exit_code = 0;
