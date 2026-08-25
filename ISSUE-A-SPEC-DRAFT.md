@@ -72,44 +72,75 @@ Proposed for the era-boundary record kept alongside the other
 body-semantics boundaries, including the camera driver's `duration_s`
 change of 2026-08-25.
 
-> ### Era boundary — Observation body composition (2026-08-25)
+> ### Era boundary — Observation body semantics (2026-08-25)
 >
 > **Applies to:** every Observation emitted by a VIRP O-Node before
 > 2026-08-25, from all SSH and REST drivers.
 >
-> **What changed.** Observation bodies were composed with a synthesized
-> first line. The four SSH drivers built it by templating the
-> configured hostname, a literal prompt character, and the command. The
-> learned session prompt was never consulted. The prompt-less drivers
-> (linux exec channel, and the REST drivers) emitted the same shape
-> although no prompt exists on those transports at all.
+> **TWO meaning changes land at this one boundary.** They were found and
+> fixed together but are independent, and a reader of pre-boundary
+> evidence must apply both. Change A alters what a record *says about the
+> session*; change B alters *what kind of event the record is*.
 >
-> **What this means for evidence written before the boundary:**
+> ---
 >
-> - The prompt character in the first line of an Observation body
->   **does not indicate the privilege level of the session**. On IOS and
->   ASA it was always `#`, which denotes privileged exec; a command
->   collected at a user-exec prompt (`>`) was recorded as `#`. The
->   character records nothing about the session and MUST NOT be read as
+> #### Change A — the observation header was synthesized
+>
+> Observation bodies were composed with a synthesized first line. The four
+> SSH drivers built it by templating the configured hostname, a literal
+> prompt character, and the command; the learned session prompt was never
+> consulted. The prompt-less drivers (linux exec channel, REST drivers)
+> emitted the same shape although no prompt exists on those transports.
+>
+> - The prompt character **does not indicate the privilege level of the
+>   session**. On IOS and ASA it was always `#`, which denotes privileged
+>   exec; a command collected at a user-exec prompt (`>`) was recorded as
+>   `#`. It records nothing about the session and MUST NOT be read as
 >   evidence of the mode a command was issued from.
-> - The hostname in the first line is the **configured registry name**,
->   not an identity the device presented. Where the two disagreed — a
->   device presenting a different name than its registry entry, which
->   has been observed in the lab fleet — the record shows the registry
->   name and the disagreement is not visible.
-> - On the linux driver the `$` character likewise indicated nothing;
->   an SSH exec channel presents no prompt. On a root session the shell
->   convention would be `#`, so the recorded character was typically
->   the inverse of the session's actual privilege.
+> - The hostname is the **configured registry name**, not an identity the
+>   device presented. Where the two disagreed — observed in the lab fleet
+>   — the record shows the registry name and the disagreement is invisible.
+> - On the linux driver the `$` indicated nothing; an SSH exec channel
+>   presents no prompt. On a root session the shell convention would be
+>   `#`, so the character was typically the inverse of actual privilege.
 > - On the REST drivers the `>` framing imitated a CLI prompt for a
 >   transport that has none.
-> - **Driver-level refusals were recorded as device output.** A BLACK-tier
->   refusal, a JunOS commit rejection, and a multi-command refusal each
->   produced a body composed by the O-Node and signed through the
->   device-output path. Consumers that counted device-output
->   observations as executions therefore counted these refusals as
->   commands that ran. After the boundary they are typed ERROR
->   observations.
+>
+> **Scope:** observation bodies from 2026-03-29 onward, and earlier for
+> the drivers that predate that commit.
+>
+> ---
+>
+> #### Change B — driver refusals were recorded as executions
+>
+> A driver-level refusal (BLACK-tier backstop, JunOS commit rejection,
+> multi-command refusal) composed a body and returned success-shaped, so
+> it was signed through the **device-output** path rather than as a typed
+> ERROR observation, and the corresponding `gate_execution/1` chain entry
+> recorded **`executed: true` for a command that was never transmitted.**
+>
+> A reader of pre-boundary evidence MUST NOT treat a device-output
+> observation as proof that a command reached the device, and MUST NOT
+> read `executed: true` in a `gate_execution/1` entry as a positive claim
+> of execution.
+>
+> Refusals ARE identifiable in existing history, so affected corpora are
+> recoverable by re-interpretation in place rather than being lost — see
+> `FINDING-refusals-recorded-as-executions.md` §4. Two independent means,
+> both inside signed bytes: the chain entry's `executed && !success`
+> together with its verbatim `error` string, and the fixed literal marker
+> (`BLACK tier: command forbidden` and siblings) in the observation body.
+>
+> Note also that `executed` in `gate_execution/1` never meant "executed":
+> it is defined as *not proven non-dispatched*. Before and after this
+> boundary, that field is a retry-safety signal, not an execution claim.
+>
+> **Scope:** observation bodies from 2026-03-29 onward; the false
+> `executed: true` in chain entries only from 2026-08-12, when
+> `gate_execution/1` was introduced. The two windows are different
+> lengths and must not be conflated.
+>
+> ---
 >
 > **After the boundary:** the first line carries the learned prompt
 > octet-for-octet, captured at dispatch; where no prompt was learned the
@@ -117,6 +148,7 @@ change of 2026-08-25.
 > header, and where an O-Node-derived value is still recorded (a request
 > path resolved through a lookup table, the JSON a write operation
 > derived) the line is prefixed with an explicit daemon-attested marker.
+> Refusals are typed ERROR observations and record `executed: false`.
 >
 > **No existing chain entry was altered, rewritten, or back-filled.**
 > Entries signed before this boundary remain exactly as signed. They are

@@ -144,3 +144,74 @@ Stacked, landing in order; each buildable and tested alone:
    actual code in front of us, and reported.
 
 Phase 5 (`api/server.py:803`) lands on the umbrella branch — independent.
+
+---
+
+## 5. Post-implementation: verified rendering, and one side effect branch 2 created
+
+Verified by running Docket's own `body_display` and `body_json`/`derive_device`
+(`crates/docket/src/query.rs`) against the new body shapes. **The Docket working
+tree was left pristine — the probe was removed and the file restored.**
+
+### The derived tag reads unmistakably as a daemon claim
+
+```
+| [VIRP daemon-attested request — not device output] GET /api2/json/status/datastore-usage [HTTP 200]
+| {"data":{"used":81.8}}
+```
+
+It is bracketed, it names VIRP, and it states the negative in the line itself, so
+a reader scanning raw bodies does not need to know a convention to know what they
+are looking at. No device on any supported transport emits a line of that shape.
+The em-dash survives `body_display` (it is not a control character, so it is not
+replaced with `·`).
+
+Post-fix bodies side by side, as Docket renders them:
+
+| Shape | Renders as |
+|---|---|
+| Cisco, user exec | `R24>show version` then output — the `>` is now the device's own byte |
+| Cisco, legacy | `R24#show version` — the fabrication, for contrast |
+| Wazuh, headerless | `{"data":{"affected_items":[]}}` — response bytes, nothing else |
+| PBS / Zammad write | tagged line, then response bytes after the newline |
+
+### Side effect: bare-JSON bodies are now parseable by the display layer
+
+Measured, not theorised:
+
+```
+PBS tagged                             json=false device=None
+legacy REST (had header)               json=false device=None
+post-fix wazuh (bare JSON)             json=true  device=None
+HAZARD: top-level "device" field       json=true  device=Some("not-the-real-one")
+```
+
+Before branch 2, a REST observation body never parsed as JSON — the synthesized
+header line guaranteed it. Now the headerless REST bodies **are** valid JSON, and
+Docket's `derive_device` checks `body_json.get("device")` **first**, ahead of the
+`obs:<device>:<ts>` artifact_id convention.
+
+So: if a monitored API ever returns a top-level string field named exactly
+`device`, Docket would display that value as the entry's device — a value
+supplied by the monitored system rather than by VIRP's addressing.
+
+**Assessment.** Bounded and not urgent, but it is a device-attribution risk and
+therefore the same category of problem as ISSUE-A itself, so it is recorded
+rather than waved off:
+
+- No observed payload triggers it. Wazuh returns `{"data":…,"error":…}`,
+  LibreNMS `{"status":…,"devices":[…]}`, Zammad ticket objects — none has a
+  top-level `device`.
+- It affects **display only** (`derive_device` is documented "never a verdict")
+  and cannot change what is signed or verified.
+- The tagged PBS/Zammad-write bodies are immune: the tag prefix makes them
+  invalid JSON, so they take the artifact_id path.
+- It is a **Docket** change, in a different repository, and Docket format work
+  is out of scope for this ticket. Not fixed here.
+
+**Recommended follow-up (Docket ticket, not this one):** have `derive_device`
+prefer the `obs:<device>:<ts>` artifact_id convention over a body-supplied
+`device` field for `observation` artifact types — VIRP's addressing is the
+authority for which device an observation concerns, and the body is the
+monitored system's data. That ordering is correct independently of this change;
+branch 2 just made it reachable.
