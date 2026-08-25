@@ -182,20 +182,26 @@ def mp4_duration_s(path):
     than guessing."""
     with open(path, "rb") as f:
         data = f.read()
-    moov = _find_box(data, 0, len(data), b"moov")
-    if moov is None:
-        raise ValueError("%s: no moov box" % path)
-    mvhd = _find_box(data, moov[0], moov[1], b"mvhd")
-    if mvhd is None:
-        raise ValueError("%s: no mvhd box" % path)
-    off = mvhd[0]
-    version = data[off]
-    if version == 1:
-        timescale = struct.unpack(">I", data[off + 20:off + 24])[0]
-        duration = struct.unpack(">Q", data[off + 24:off + 32])[0]
-    else:
-        timescale = struct.unpack(">I", data[off + 12:off + 16])[0]
-        duration = struct.unpack(">I", data[off + 16:off + 20])[0]
+    try:
+        moov = _find_box(data, 0, len(data), b"moov")
+        if moov is None:
+            raise ValueError("%s: no moov box" % path)
+        mvhd = _find_box(data, moov[0], moov[1], b"mvhd")
+        if mvhd is None:
+            raise ValueError("%s: no mvhd box" % path)
+        off = mvhd[0]
+        version = data[off]
+        if version == 1:
+            timescale = struct.unpack(">I", data[off + 20:off + 24])[0]
+            duration = struct.unpack(">Q", data[off + 24:off + 32])[0]
+        else:
+            timescale = struct.unpack(">I", data[off + 12:off + 16])[0]
+            duration = struct.unpack(">I", data[off + 16:off + 20])[0]
+    except (struct.error, IndexError):
+        # a box header pointing past EOF: an open/torn file, not a
+        # closed segment — the same "not attestable yet" answer as a
+        # missing moov, never an unhandled crash
+        raise ValueError("%s: truncated box structure" % path)
     if timescale == 0:
         raise ValueError("%s: mvhd timescale 0" % path)
     return duration / timescale
@@ -948,16 +954,17 @@ def process_live_segment(path, cfg, state, gap, ship):
     return new_state
 
 
-def _closed_segments(workdir, ffmpeg_done):
-    """Names of segments safe to attest: every seg_*.mp4 except the
-    highest-indexed one while ffmpeg is still running (that one is the
-    open, growing segment). Once ffmpeg has exited, all are closed."""
-    names = sorted(n for n in os.listdir(workdir) if n.endswith(".mp4"))
-    if not names:
-        return []
-    if ffmpeg_done:
-        return names
-    return names[:-1]
+def _segment_names(workdir):
+    return sorted(n for n in os.listdir(workdir) if n.endswith(".mp4"))
+
+
+def _stat_sig(path):
+    """(size, mtime_ns) — the cheap change signature that tells a file
+    apart from what previously occupied its NAME. ffmpeg restarts its
+    numbering at seg_000000 after every driver restart, so a filename
+    identifies nothing; content does (Fix B)."""
+    st = os.stat(path)
+    return (st.st_size, st.st_mtime_ns)
 
 
 def run_live(cfg, ship, stop_after_s=None, poll_s=0.5,
@@ -985,27 +992,74 @@ def run_live(cfg, ship, stop_after_s=None, poll_s=0.5,
     old_int = signal.signal(signal.SIGINT, _sig)
     old_term = signal.signal(signal.SIGTERM, _sig)
 
-    processed = set()
+    # Per-file bookkeeping is keyed on (name, stat signature) so a name
+    # ffmpeg reuses with NEW bytes is seen as new work, and on content
+    # (`shipped`) so bytes already attested are never re-offered. The
+    # old name-keyed set silently dropped ~72 s of real footage when a
+    # restarted ffmpeg renumbered into just-drained names (the gap:null
+    # hole at seg 77 of the 2026-08-24 session).
+    handled = {}    # name -> sig it was handled at (attested or skipped)
+    tried = {}      # name -> sig that failed to parse (retry on change)
+    seen = {}       # name -> last observed sig (quiescence gate)
     done = 0
     start = _clock()
     try:
         while True:
             ffmpeg_done = proc.poll() is not None
-            for name in _closed_segments(cfg["workdir"], ffmpeg_done):
-                if name in processed:
-                    continue
+            for name in _segment_names(cfg["workdir"]):
                 path = os.path.join(cfg["workdir"], name)
+                try:
+                    sig = _stat_sig(path)
+                except OSError:
+                    continue
+                if handled.get(name) == sig:
+                    continue
+                if tried.get(name) == sig and not ffmpeg_done:
+                    continue                 # unparseable and unchanged
+                if not ffmpeg_done and seen.get(name) != sig:
+                    # first sight, or still growing: a segment is closed
+                    # when its size+mtime hold still across two polls
+                    # (an open segment grows every poll; a stalled one
+                    # has no moov and fails the parse below). Once the
+                    # child has exited every file is final.
+                    seen[name] = sig
+                    continue
+                try:
+                    with open(path, "rb") as f:
+                        sha = hashlib.sha256(f.read()).hexdigest()
+                except OSError:
+                    continue
+                if sha in shipped:
+                    sys.stderr.write("skip %s: content already attested "
+                                     "(%.16s… seq=%s)\n"
+                                     % (name, sha,
+                                        shipped[sha]["segment_seq"]))
+                    handled[name] = sig
+                    _unlink_quiet(path)
+                    continue
                 try:
                     state = process_live_segment(path, cfg, state,
                                                  pending_gap, ship)
-                except ValueError as e:      # partial/no-moov: skip honestly
-                    sys.stderr.write("skip %s: %s\n" % (name, e))
-                    processed.add(name)
+                except ValueError as e:      # no moov: open or a partial
+                    if ffmpeg_done:
+                        sys.stderr.write("skip %s: %s (unfinalized "
+                                         "partial; footage lost)\n"
+                                         % (name, e))
+                        handled[name] = sig
+                    else:
+                        tried[name] = sig    # retry when the file changes
                     continue
                 except SubmitError as e:
                     sys.stderr.write("SUBMIT REFUSED: %s\n" % e)
                     break                    # retry this segment next poll
-                processed.add(name)
+                shipped[state["last_segment_sha256"]] = {
+                    "segment_seq": state["segment_seq"],
+                    "segment_sha256": state["last_segment_sha256"],
+                    "capture_end_utc_ns": state["last_end_ns"],
+                }
+                handled[name] = sig
+                _unlink_quiet(path)          # attested+checkpointed: the
+                                             # workdir copy is done
                 pending_gap = None
                 done += 1
             if ffmpeg_done:
@@ -1038,6 +1092,13 @@ def run_live(cfg, ship, stop_after_s=None, poll_s=0.5,
           "seq=%s" % (done, state["segment_seq"] if state else "-"),
           flush=True)
     return state
+
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _spawn_ffmpeg(cfg):

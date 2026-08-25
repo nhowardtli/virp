@@ -141,9 +141,13 @@ class LiveSegmentTests(unittest.TestCase):
         last = json.loads(ship.calls[-1]["body_bytes"])
         self.assertEqual(last["segment_seq"], 1)
 
-        # second run: a fresh work dir with a new segment -> gap + prev
-        for n in ("seg_000000.mp4", "seg_000001.mp4"):
-            os.unlink(os.path.join(self.cfg["workdir"], n))
+        # first run's segments were shipped, so the driver itself removed
+        # them from the workdir (the old version of this test had to
+        # delete them by hand — doing manually what the driver now does)
+        self.assertEqual([n for n in os.listdir(self.cfg["workdir"])
+                          if n.endswith(".mp4")], [])
+
+        # second run: ffmpeg renumbers from seg_000000 -> gap + prev
         self._seg("seg_000000.mp4", b"c" * 40)
         ship2 = ShipRecorder()
         vc.run_live(self.cfg, ship2, _spawn=lambda cfg: FakeProc())
@@ -156,9 +160,15 @@ class LiveSegmentTests(unittest.TestCase):
                          last["segment_sha256"])
 
     def test_open_segment_not_attested_while_running(self):
-        # ffmpeg "running": the single, highest segment is the open one
-        self._seg("seg_000000.mp4", b"z" * 40)
-        ship = ShipRecorder()
+        # An OPEN segment is one ffmpeg is still writing: it has no moov
+        # yet and its bytes keep changing. It must not be attested until
+        # finalized. (This test used to model "open" as "the highest
+        # name", which is exactly the assumption a renumbering ffmpeg
+        # breaks — openness is now a property of the file, not its name.)
+        full = make_mp4(pad=b"z" * 40)
+        p = os.path.join(self.cfg["workdir"], "seg_000000.mp4")
+        with open(p, "wb") as f:
+            f.write(full[:32])                     # growing: no moov yet
 
         class RunningThenDone:
             def __init__(self):
@@ -166,7 +176,10 @@ class LiveSegmentTests(unittest.TestCase):
 
             def poll(self):
                 self.n += 1
-                return None if self.n <= 2 else 0   # running, then exits
+                if self.n == 4:                    # ffmpeg finalizes...
+                    with open(p, "wb") as f:
+                        f.write(full)
+                return None if self.n <= 4 else 0  # ...then exits
 
             def wait(self, timeout=None):
                 return 0
@@ -177,10 +190,14 @@ class LiveSegmentTests(unittest.TestCase):
             def kill(self):
                 pass
 
+        ship = ShipRecorder()
         vc.run_live(self.cfg, ship, poll_s=0,
                     _spawn=lambda cfg: RunningThenDone())
-        # attested exactly once — only after the child exited (closed)
+        # attested exactly once — only the finalized bytes
         self.assertEqual(len(ship.calls), 1)
+        body = json.loads(ship.calls[0]["body_bytes"])
+        self.assertEqual(body["segment_sha256"],
+                         hashlib.sha256(full).hexdigest())
 
 
 class SubmitSpoolTests(unittest.TestCase):

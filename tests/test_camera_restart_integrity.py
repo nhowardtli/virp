@@ -183,5 +183,114 @@ class ChainKeyedBackstopTests(unittest.TestCase):
         self.assertEqual(len(send.requests), 1)
 
 
+class ScriptedProc:
+    """Popen stand-in whose poll() runs a per-call script: each entry is
+    (returncode_or_None, side_effect_callable_or_None). The last entry
+    repeats."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.n = 0
+
+    def poll(self):
+        i = min(self.n, len(self.script) - 1)
+        self.n += 1
+        rc, effect = self.script[i]
+        if effect:
+            effect()
+        return rc
+
+    def wait(self, timeout=None):
+        return 0
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+class ContentIdentityTests(unittest.TestCase):
+    """Fix B: the silent-drop defect. In the 2026-08-24 record, a
+    restart drained stale workdir files under names seg_000000..11,
+    marked those NAMES handled, and then silently skipped ~72 s of new
+    footage ffmpeg wrote under the same names — the 69.1 s gap:null hole
+    before seg 77. Identity must be content, never filename."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.sk_path, self.pk_path = make_keypair(self.tmp)
+        self.cfg = restart_cfg(self.tmp, self.sk_path, self.pk_path)
+        os.makedirs(self.cfg["workdir"])
+        os.makedirs(self.cfg["outbox"])
+
+    def _write(self, name, data):
+        p = os.path.join(self.cfg["workdir"], name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def test_reused_name_old_bytes_skipped_new_footage_lands(self):
+        old_a = make_mp4(pad=b"old-a" * 40)
+        old_b = make_mp4(pad=b"old-b" * 40)
+        new = make_mp4(pad=b"new-frames" * 40)
+        # a prior run shipped old_a/old_b (durable checkpoint says so),
+        # but died before removing them from the workdir
+        for i, data in enumerate((old_a, old_b)):
+            sha = hashlib.sha256(data).hexdigest()
+            vc.checkpoint_append(self.cfg["checkpoint_path"],
+                                 {"segment_seq": i, "segment_sha256": sha,
+                                  "capture_end_utc_ns": 10 ** 18 + i,
+                                  "shipped_as": "%06d.%s" % (i, sha)})
+        self._write("seg_000000.mp4", old_a)
+        self._write("seg_000001.mp4", old_b)
+
+        # the restarted ffmpeg renumbers from seg_000000 and reuses the
+        # name for NEW footage mid-run
+        proc = ScriptedProc([
+            (None, None), (None, None),
+            (None, lambda: self._write("seg_000000.mp4", new)),
+            (None, None), (None, None),
+            (0, None),
+        ])
+        ship = ShipRecorder()
+        vc.run_live(self.cfg, ship, poll_s=0, _spawn=lambda cfg: proc)
+
+        # exactly one attestation: the NEW footage — the stale bytes were
+        # not replayed, and the reused name did not shadow the new bytes
+        self.assertEqual(len(ship.calls), 1)
+        body = json.loads(ship.calls[0]["body_bytes"])
+        self.assertEqual(body["segment_sha256"],
+                         hashlib.sha256(new).hexdigest())
+        self.assertEqual(body["segment_seq"], 2)
+
+    def test_growing_open_segment_not_attested_until_finalized(self):
+        full = make_mp4(pad=b"grow" * 40)
+        p = self._write("seg_000000.mp4", full[:40])   # open: no moov yet
+        proc = ScriptedProc([
+            (None, None), (None, None), (None, None),
+            (None, lambda: self._write("seg_000000.mp4", full)),
+            (0, None),
+        ])
+        ship = ShipRecorder()
+        vc.run_live(self.cfg, ship, poll_s=0, _spawn=lambda cfg: proc)
+        self.assertEqual(len(ship.calls), 1)
+        body = json.loads(ship.calls[0]["body_bytes"])
+        self.assertEqual(body["segment_sha256"],
+                         hashlib.sha256(full).hexdigest())
+
+    def test_shipped_segment_leaves_the_workdir(self):
+        # once attested+shipped (checkpoint durable), the workdir copy is
+        # removed: nothing is left for a later run to mistake for new
+        self._write("seg_000000.mp4", make_mp4(pad=b"leave" * 30))
+        ship = ShipRecorder()
+        vc.run_live(self.cfg, ship, _spawn=lambda cfg: FakeProc())
+        self.assertEqual(len(ship.calls), 1)
+        self.assertEqual(
+            [n for n in os.listdir(self.cfg["workdir"])
+             if n.endswith(".mp4")], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
