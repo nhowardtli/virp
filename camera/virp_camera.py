@@ -61,6 +61,7 @@ Copyright (c) 2026 Third Level IT LLC. All rights reserved.
 
 import argparse
 import base64
+import fcntl
 import glob
 import hashlib
 import json
@@ -391,6 +392,54 @@ def _resume_state(state, shipped, camera_id):
     }
 
 
+# ── Single-instance lock (Fix F) ───────────────────────────────────────
+#
+# One driver per camera/spool: two live captures into the same workdir
+# would interleave segment files; two submit-spools over the same
+# incoming/ would race jobs. flock(2) is the primitive because the lock
+# DIES WITH ITS HOLDER — a stale lock after an unclean exit can never
+# require manual intervention. The pid written inside is diagnostic
+# only: found non-empty on a successful acquire, it means the previous
+# holder exited uncleanly, and the recovery is logged.
+
+def acquire_instance_lock(path, label):
+    """Take the exclusive instance lock or die. Returns the open fd —
+    keep it for the life of the process (closing it releases the
+    lock)."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            holder = os.read(fd, 64).decode("ascii", "replace").strip()
+        except OSError:
+            holder = ""
+        os.close(fd)
+        raise SystemExit(
+            "%s: another instance%s holds %s — refusing to run twice "
+            "against the same camera/spool"
+            % (label, " (pid %s)" % holder if holder else "", path))
+    prev = os.read(fd, 64).decode("ascii", "replace").strip()
+    if prev:
+        sys.stderr.write("%s: recovered stale instance lock %s (unclean "
+                         "exit of pid %s); proceeding\n"
+                         % (label, path, prev))
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
+    return fd
+
+
+def release_instance_lock(fd):
+    """Clean release: empty the pid (so the next acquire logs no stale
+    recovery) and let the close drop the flock."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+    finally:
+        os.close(fd)
+
+
 # ── Body construction ──────────────────────────────────────────────────
 
 def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
@@ -551,6 +600,18 @@ def run_replay(replay_dir, cfg, send=onode_send):
     if not names:
         raise SystemExit("no .mp4 segments in %s" % replay_dir)
 
+    # replay shares state.json with live capture, so it takes the SAME
+    # instance lock: a replay racing a live run would corrupt continuity
+    lock_fd = (acquire_instance_lock(cfg["lock_path"], "replay")
+               if cfg.get("lock_path") else None)
+    try:
+        _run_replay_locked(replay_dir, names, cfg, send)
+    finally:
+        if lock_fd is not None:
+            release_instance_lock(lock_fd)
+
+
+def _run_replay_locked(replay_dir, names, cfg, send):
     state = state_load(cfg["state_path"])
     # A prior run means this run cannot attest continuous coverage in
     # between: the first record of THIS run carries an explicit gap.
@@ -1114,6 +1175,17 @@ def run_live(cfg, ship, stop_after_s=None, poll_s=0.5,
     across the restart: the first record carries an explicit gap — the
     same honesty rule as replay, now across a live kill/restart. SIGINT/
     SIGTERM stop the child and drain the segments already closed."""
+    lock_fd = (acquire_instance_lock(cfg["lock_path"], "live")
+               if cfg.get("lock_path") else None)
+    try:
+        return _run_live_locked(cfg, ship, stop_after_s, poll_s,
+                                _spawn, _clock)
+    finally:
+        if lock_fd is not None:
+            release_instance_lock(lock_fd)
+
+
+def _run_live_locked(cfg, ship, stop_after_s, poll_s, _spawn, _clock):
     os.makedirs(cfg["workdir"], mode=0o700, exist_ok=True)
     os.makedirs(cfg["outbox"], mode=0o700, exist_ok=True)
     shipped = checkpoint_load(cfg.get("checkpoint_path"))
@@ -1380,6 +1452,16 @@ def submit_spool(cfg, once=False, send=onode_send, _clock=time.time):
     incoming = cfg["incoming"]
     done_dir = cfg["done"]
     os.makedirs(done_dir, mode=0o770, exist_ok=True)
+    lock_fd = (acquire_instance_lock(cfg["lock_path"], "submit-spool")
+               if cfg.get("lock_path") else None)
+    try:
+        return _submit_spool_locked(cfg, once, send, incoming, done_dir)
+    finally:
+        if lock_fd is not None:
+            release_instance_lock(lock_fd)
+
+
+def _submit_spool_locked(cfg, once, send, incoming, done_dir):
     stop = {"flag": False}
     if not once:
         signal.signal(signal.SIGINT, lambda *_a: stop.update(flag=True))
@@ -1522,6 +1604,7 @@ def main(argv=None):
             "device": args.device or args.camera_id,
             "data_dir": args.data_dir,
             "state_path": os.path.join(args.data_dir, "state.json"),
+            "lock_path": os.path.join(args.data_dir, "instance.lock"),
             "sock": args.sock,
             "mode": "replay",
             "sk": producer_load_sk(sk_path),
@@ -1553,6 +1636,7 @@ def main(argv=None):
             "data_dir": args.data_dir,
             "state_path": os.path.join(args.data_dir, "state.json"),
             "checkpoint_path": os.path.join(args.data_dir, "shipped.jsonl"),
+            "lock_path": os.path.join(args.data_dir, "instance.lock"),
             "workdir": workdir,
             "outbox": os.path.join(args.data_dir, "outbox"),
             "segment_time": args.segment_time,
@@ -1582,6 +1666,8 @@ def main(argv=None):
             "done": done,
             "interval": args.interval,
             "db": args.db,
+            "lock_path": os.path.join(args.incoming,
+                                      ".submit-spool.lock"),
         }
         n = submit_spool(cfg, once=args.once)
         print("submit-spool: %d job(s) appended this run" % n, flush=True)

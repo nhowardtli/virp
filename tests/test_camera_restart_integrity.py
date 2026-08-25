@@ -615,5 +615,69 @@ class NoRestampTests(unittest.TestCase):
         self.assertEqual(body["capture_end_utc_ns"], end_ns)
 
 
+class InstanceLockTests(unittest.TestCase):
+    """Fix F: one driver instance per camera/spool. flock-based, so a
+    stale lock (unclean exit) can never wedge the next start — the lock
+    dies with its holder — and the recovery is logged."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.lock = os.path.join(self.tmp, "instance.lock")
+
+    def test_second_instance_refused_then_recoverable(self):
+        fd = vc.acquire_instance_lock(self.lock, "live")
+        with self.assertRaises(SystemExit) as cm:
+            vc.acquire_instance_lock(self.lock, "live")
+        self.assertIn("another instance", str(cm.exception))
+        self.assertIn(str(os.getpid()), str(cm.exception))
+        vc.release_instance_lock(fd)
+        fd2 = vc.acquire_instance_lock(self.lock, "live")
+        vc.release_instance_lock(fd2)
+
+    def test_stale_lock_recovered_without_intervention_and_logged(self):
+        # an unclean exit leaves the pid behind but no live flock; the
+        # next start must recover on its own and say so
+        with open(self.lock, "w") as f:
+            f.write("54321\n")
+        import io
+        err, real = io.StringIO(), sys.stderr
+        sys.stderr = err
+        try:
+            fd = vc.acquire_instance_lock(self.lock, "live")
+        finally:
+            sys.stderr = real
+        self.assertIn("recovered stale", err.getvalue())
+        self.assertIn("54321", err.getvalue())
+        vc.release_instance_lock(fd)
+        # clean release empties the pid: the NEXT start logs no recovery
+        err2 = io.StringIO()
+        sys.stderr = err2
+        try:
+            fd2 = vc.acquire_instance_lock(self.lock, "live")
+        finally:
+            sys.stderr = real
+        self.assertNotIn("recovered", err2.getvalue())
+        vc.release_instance_lock(fd2)
+
+    def test_run_live_refuses_second_instance(self):
+        sk_path, pk_path = make_keypair(self.tmp)
+        cfg = restart_cfg(self.tmp, sk_path, pk_path)
+        cfg["lock_path"] = self.lock
+        os.makedirs(cfg["workdir"])
+        os.makedirs(cfg["outbox"])
+        fd = vc.acquire_instance_lock(self.lock, "other-driver")
+        try:
+            with self.assertRaises(SystemExit):
+                vc.run_live(cfg, ShipRecorder(),
+                            _spawn=lambda cfg: FakeProc())
+        finally:
+            vc.release_instance_lock(fd)
+        # and with the lock free, the same cfg runs (and releases: a
+        # second run afterwards also succeeds)
+        vc.run_live(cfg, ShipRecorder(), _spawn=lambda cfg: FakeProc())
+        vc.run_live(cfg, ShipRecorder(), _spawn=lambda cfg: FakeProc())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
