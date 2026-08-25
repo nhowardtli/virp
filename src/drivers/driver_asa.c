@@ -1036,10 +1036,10 @@ static virp_error_t asa_execute(virp_conn_t *conn,
                  "BLACK tier: command blocked on %s", conn->device.hostname);
         fprintf(stderr, "[ASA] BLACK tier blocked: '%s' on %s\n",
                 command, conn->device.hostname);
-        int written = snprintf(result->output, sizeof(result->output),
-                               "%s# %s\nBLACK tier: command forbidden",
-                               conn->device.hostname, command);
-        result->output_len = (written > 0) ? (size_t)written : 0;
+        /* ISSUE-A branch 3: no body — the refusal is the daemon's text,
+         * not the device's, and belongs in the typed ERROR observation.
+         * no_dispatch keeps it out of the OUTCOME_UNKNOWN branch. */
+        result->no_dispatch = true;   /* refused before any transport write */
         return VIRP_OK;
     }
 

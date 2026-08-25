@@ -685,10 +685,10 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
                  "BLACK tier: command blocked on %s", conn->device.hostname);
         fprintf(stderr, "[JunOS] BLACK tier blocked: '%s' on %s\n",
                 command, conn->device.hostname);
-        int written = snprintf(result->output, sizeof(result->output),
-                               "%s>%s\nBLACK tier: command forbidden",
-                               conn->device.hostname, command);
-        result->output_len = (written > 0) ? (size_t)written : 0;
+        /* ISSUE-A branch 3: no body — driver-authored refusal text goes
+         * to the typed ERROR observation. no_dispatch keeps it out of
+         * the OUTCOME_UNKNOWN branch. */
+        result->no_dispatch = true;   /* refused before any transport write */
         return VIRP_OK;
     }
 
@@ -719,8 +719,18 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
     if (is_commit && !conn->commit_check_ok) {
         result->success = false;
         result->exit_code = 1;
+        /*
+         * ISSUE-A branch 3: this message is the whole record now, so it
+         * must carry the SIDE EFFECT as well as the refusal. The commit
+         * itself is never written to the device — but `rollback 0` is,
+         * just below, and the body being deleted here was the only place
+         * that said so. A reader must not be able to conclude that
+         * nothing touched the device.
+         */
         snprintf(result->error_msg, sizeof(result->error_msg),
-                 "commit rejected: commit check required first on %s",
+                 "commit rejected: commit check required first on %s; "
+                 "the commit was never sent, and 'rollback 0' WAS applied "
+                 "to discard the pending candidate config",
                  conn->device.hostname);
         fprintf(stderr, "[JunOS] Commit blocked (no commit check) on %s "
                 "— auto-rollback\n", conn->device.hostname);
@@ -736,11 +746,17 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
         conn->current_mode = junos_parse_mode(conn->prompt.prompt);
         conn->config_error = false;
         conn->commit_check_ok = false;
-        int written = snprintf(result->output, sizeof(result->output),
-                               "%s>%s\ncommit rejected: run 'commit check' "
-                               "first (auto-rollback applied)",
-                               conn->device.hostname, command);
-        result->output_len = (written > 0) ? (size_t)written : 0;
+        /*
+         * No body: the text was the daemon's, not the device's, and the
+         * typed ERROR observation is where constructed text belongs.
+         *
+         * no_dispatch is true of THE COMMAND — the commit was refused
+         * before any commit was written, so re-authorizing it cannot
+         * execute it twice, which is what this flag licenses. The
+         * rollback that DID run is recorded in error_msg above rather
+         * than being implied by this flag.
+         */
+        result->no_dispatch = true;   /* the commit itself was never sent */
         return VIRP_OK;
     }
 
@@ -1008,10 +1024,10 @@ static virp_error_t junos_execute(virp_conn_t *conn,
                  conn->device.hostname, why);
         fprintf(stderr, "[JunOS] Multi-command refused on %s: %s\n",
                 conn->device.hostname, why);
-        int w = snprintf(result->output, sizeof(result->output),
-                         "%s> multi-command string refused: %s",
-                         conn->device.hostname, why);
-        result->output_len = (w > 0) ? (size_t)w : 0;
+        /* ISSUE-A branch 3: no body — the refusal is the daemon's own
+         * finding about the command string, decided before any transport
+         * write, so it is a typed ERROR observation. */
+        result->no_dispatch = true;   /* refused before any transport write */
         return VIRP_OK;
     }
 

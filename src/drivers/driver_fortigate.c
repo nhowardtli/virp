@@ -803,10 +803,10 @@ static virp_error_t fg_execute(virp_conn_t *base_conn,
                  conn->device.hostname);
         fprintf(stderr, "[FortiGate] BLACK tier blocked: '%s' on %s\n",
                 command, conn->device.hostname);
-        int written = snprintf(result->output, sizeof(result->output),
-                               "%s $ %s\nBLACK tier: command forbidden",
-                               conn->device.hostname, command);
-        result->output_len = (written > 0) ? (size_t)written : 0;
+        /* ISSUE-A branch 3: no body — driver-authored refusal text goes
+         * to the typed ERROR observation, not the DEVICE_OUTPUT path.
+         * no_dispatch keeps it out of the OUTCOME_UNKNOWN branch. */
+        result->no_dispatch = true;   /* refused before any transport write */
         return VIRP_OK;
     }
 

@@ -1168,10 +1168,15 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
                  "BLACK tier: command blocked on %s", conn->device.hostname);
         fprintf(stderr, "[Cisco] BLACK tier blocked: '%s' on %s\n",
                 command, conn->device.hostname);
-        int written = snprintf(result->output, sizeof(result->output),
-                               "%s#%s\nBLACK tier: command forbidden",
-                               conn->device.hostname, command);
-        result->output_len = (written > 0) ? (size_t)written : 0;
+        /* ISSUE-A branch 3: no body. The refusal text is driver-authored,
+         * so signing it through the DEVICE_OUTPUT path presented the
+         * daemon's own words as device output. Leaving output_len at 0
+         * with no_dispatch set routes this to the O-Node's typed
+         * VIRP_OBS_ERROR branch, which is the sanctioned channel for
+         * constructed text. no_dispatch is REQUIRED here: without it the
+         * daemon reads success=false + empty body as OUTCOME_UNKNOWN and
+         * records that the command may have executed. */
+        result->no_dispatch = true;   /* refused before any transport write */
         return VIRP_OK;
     }
 

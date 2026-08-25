@@ -816,6 +816,18 @@ $(TEST_PBS_TRUNC): tests/test_pbs_truncation.c $(LIB)
 test-pbs-trunc: $(TEST_PBS_TRUNC)
 	./$(TEST_PBS_TRUNC)
 
+# Driver refusals are typed ERROR observations, never signed device
+# output (ISSUE-A branch 3). Pure shape tests against the daemon's
+# routing predicate; no socket, no driver objects needed.
+TEST_REFUSAL_OBS = $(BUILD_DIR)/test_refusal_observation_type
+
+$(TEST_REFUSAL_OBS): tests/test_refusal_observation_type.c $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+test-refusal-obs: $(TEST_REFUSAL_OBS)
+	./$(TEST_REFUSAL_OBS)
+
 TEST_PBS_GATE = $(BUILD_DIR)/test_driver_pbs_gate
 
 $(TEST_PBS_GATE): tests/test_driver_pbs_gate.c $(LIB)
@@ -1030,7 +1042,8 @@ test-drivers:
 	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, zammad-gate, typed-hash, ingress-nul, pbs-trunc) ==="
 	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 ZAMMAD=1 \
 	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms \
-	        test-pbs test-pbs-gate test-zammad-gate test-typed-hash test-ingress-nul test-pbs-trunc
+	        test-pbs test-pbs-gate test-zammad-gate test-typed-hash test-ingress-nul test-pbs-trunc \
+	        test-refusal-obs
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.
 #
