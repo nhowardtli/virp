@@ -479,15 +479,15 @@ def process_segment(path, cfg, state, gap, send=onode_send):
         os.replace(tmp, art_path)
 
     duration = mp4_duration_s(path)
-    if cfg["mode"] == "replay":
-        # Replay has no live clock to attest: the honest time source is
-        # the file's mtime (when ffmpeg closed the segment), stated as
-        # such in the body rather than dressed up as host-clock.
-        end_ns = os.stat(path).st_mtime_ns
-        time_source = "file-mtime"
-    else:
-        end_ns = time.time_ns()
-        time_source = "host-clock"
+    # Replay has no live clock to attest: the honest time source is the
+    # file's mtime (when the segment was closed — or, honestly visible
+    # in the record, when the file was copied), stated as such in the
+    # body. There is deliberately no other arm (Fix E): this path is
+    # only ever replay, and stamping a replayed file with the clock of
+    # the moment it happened to be processed is exactly the re-stamp
+    # defect of the 2026-08-24 session.
+    end_ns = os.stat(path).st_mtime_ns
+    time_source = "file-mtime"
     start_ns = end_ns - int(duration * 1e9)
 
     seq = (state["segment_seq"] + 1) if state else 0
@@ -907,13 +907,27 @@ def process_live_segment(path, cfg, state, gap, ship):
     advances only after a durable handoff (ship ok); a failed ship raises
     SubmitError and continuity is NOT advanced — the segment is retried,
     never skipped."""
+    # Fix E: the capture window is a function of the SEGMENT, never of
+    # when this code happens to run. capture_end is the file's mtime —
+    # the host clock as sampled by the kernel when ffmpeg finalized the
+    # segment — and duration_s comes from the moov/mvhd of the attested
+    # bytes themselves (the one consistent source: any verifier can
+    # recompute it from the artifact). Both are fixed at capture and
+    # immutable across re-offers and late submission, which makes the
+    # body deterministic: a re-offered segment rebuilds byte-identical
+    # signed bytes, and the spool's body-keyed dedup is exact. A late
+    # submission's DELAY is already recorded without any new field: the
+    # chain entry's own timestamp is the append time; delay = append
+    # time minus capture_end.
+    st = os.stat(path)
     with open(path, "rb") as f:
         seg_bytes = f.read()
     seg_sha = hashlib.sha256(seg_bytes).hexdigest()
     duration = mp4_duration_s(path)          # raises on a partial (no moov)
 
-    end_ns = time.time_ns()
-    time_source = "host-clock"
+    end_ns = st.st_mtime_ns
+    time_source = "host-clock"               # mtime IS the host clock,
+                                             # sampled at finalize
     start_ns = end_ns - int(duration * 1e9)
 
     seq = (state["segment_seq"] + 1) if state else 0

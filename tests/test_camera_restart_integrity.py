@@ -545,5 +545,75 @@ class ContinuityGapTests(unittest.TestCase):
                           "after_seq": 0})
 
 
+class NoRestampTests(unittest.TestCase):
+    """Fix E: the capture window is fixed at capture time — a function
+    of the segment file (finalize mtime + moov duration) — and is
+    immutable thereafter. Late submission keeps the original window
+    exactly; a re-offer rebuilds the byte-identical signed body, so
+    the spool's body-keyed dedup catches every duplicate. (Both replay
+    incidents in the 2026-08-24 record presented old media as new
+    capture moments because stamps were taken at processing time.)"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.sk_path, self.pk_path = make_keypair(self.tmp)
+        self.cfg = restart_cfg(self.tmp, self.sk_path, self.pk_path)
+        os.makedirs(self.cfg["workdir"])
+        os.makedirs(self.cfg["outbox"])
+
+    def test_late_submission_keeps_exact_capture_window(self):
+        # a segment that closed long ago and is only submitted now must
+        # carry its ORIGINAL window, to the nanosecond. Values from the
+        # record: seg 12 of the damaged session ended at
+        # 1787611801697990689 with duration 6.0 — its clone seg 19
+        # claimed 1787612005299300617 instead.
+        end_ns = 1787611801697990689
+        p = os.path.join(self.cfg["workdir"], "seg_000000.mp4")
+        with open(p, "wb") as f:
+            f.write(make_mp4(duration_s=6.0, pad=b"late" * 40))
+        os.utime(p, ns=(end_ns, end_ns))
+        ship = ShipRecorder()
+        vc.process_live_segment(p, self.cfg, None, None, ship)
+        body = json.loads(ship.calls[0]["body_bytes"])
+        self.assertEqual(body["capture_end_utc_ns"], end_ns)
+        self.assertEqual(body["capture_start_utc_ns"],
+                         end_ns - int(6.0 * 1e9))
+        self.assertEqual(body["duration_s"], 6.0)
+        self.assertEqual(body["time_source"], "host-clock")
+
+    def test_reoffer_rebuilds_byte_identical_body(self):
+        # crash between ship-ack and checkpoint: the segment is offered
+        # again. The rebuilt body must be the SAME bytes — same window,
+        # same seq, same signature — so the spool-side dedup (keyed on
+        # body sha) is exact, and duplicates are structurally impossible.
+        p = os.path.join(self.cfg["workdir"], "seg_000000.mp4")
+        with open(p, "wb") as f:
+            f.write(make_mp4(pad=b"again" * 30))
+        ship1, ship2 = ShipRecorder(), ShipRecorder()
+        vc.process_live_segment(p, self.cfg, None, None, ship1)
+        vc.process_live_segment(p, self.cfg, None, None, ship2)
+        self.assertEqual(ship1.calls[0]["body_bytes"],
+                         ship2.calls[0]["body_bytes"])
+
+    def test_replay_never_stamps_host_clock(self):
+        # the replay path's only honest time source is the file mtime,
+        # stated as such; the old host-clock else-branch is gone
+        rdir = os.path.join(self.tmp, "replay")
+        os.makedirs(rdir)
+        p = os.path.join(rdir, "seg_000.mp4")
+        with open(p, "wb") as f:
+            f.write(make_mp4(pad=b"rp" * 40))
+        end_ns = 1787609824949255966          # run A's mtime, from the record
+        os.utime(p, ns=(end_ns, end_ns))
+        from test_camera_driver import make_cfg
+        cfg = make_cfg(self.tmp, self.sk_path, self.pk_path)
+        send = FakeSend()
+        vc.run_replay(rdir, cfg, send=send)
+        body = json.loads(send.requests[0]["artifact_content"])
+        self.assertEqual(body["time_source"], "file-mtime")
+        self.assertEqual(body["capture_end_utc_ns"], end_ns)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
