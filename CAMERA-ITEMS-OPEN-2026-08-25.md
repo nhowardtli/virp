@@ -139,3 +139,114 @@ immediate restart puts a second ffmpeg on the same filenames as the
 orphan. The fix is a choice (kill the process group on startup vs. leave
 it to reconciliation), so it wants a decision rather than a small
 addition.
+
+---
+
+## Item 4 — `live`: kill the orphaned process group at startup, before reconciliation
+
+**Size:** small. One kill, before an existing call, plus logging.
+
+**Decision (2026-08-25):** process-group kill at startup, placed **before
+reconciliation**. Rationale: `_reconcile_workdir` assumes the files it
+inspects are **at rest** — it hashes them, tests them for a moov box,
+attests them and removes them. An orphaned ffmpeg still writing into that
+workdir violates the assumption directly. A file can grow between the
+hash and the attestation, or gain its moov after being classified a
+partial. Reconciliation cannot be made safe against a live writer, so the
+writer must be gone before it runs.
+
+**Now.** Observed live, 2026-08-25 (this is not hypothetical): SIGKILL on
+the driver left its ffmpeg child running, and it kept writing segments —
+residue grew from 3 files to 14 while the driver was already dead. Fix F's
+instance lock binds the *driver*, not a stray encoder, so a prompt restart
+puts a second ffmpeg on the same filenames the orphan is still writing.
+
+**Placement.** In `_run_live_locked` (`virp_camera.py:1186`), the current
+order is:
+
+```
+makedirs → checkpoint_load → _resume_state
+  → _reconcile_workdir(...)        # :1192
+  → pending_gap                    # :1195-1199
+  → _spawn_ffmpeg(cfg)             # :1202
+```
+
+The kill goes **between `_resume_state` and `_reconcile_workdir`** — i.e.
+after the instance lock is already held (so no other driver races it) and
+before anything reads the workdir.
+
+**Minimum.**
+
+1. Identify encoder processes whose open files live in this run's
+   `workdir` — the workdir is the ownership test, so a second capture
+   against a *different* data dir is never touched.
+2. Kill that process group and wait for exit; if anything survives the
+   wait, refuse to start rather than reconcile against a live writer
+   (consistent with Fix C's existing refusal discipline).
+3. **Log every process killed with its pid and the filenames it held**,
+   one line each, e.g.
+
+```
+live: killed orphaned encoder pid 2947226 (pgid 2947214) holding seg_000014.mp4, seg_000015.mp4, seg_000016.mp4
+```
+
+That line is the record of why the residue set is what it is, and it is
+what makes the subsequent reconcile log readable after the fact.
+
+**Done when:** starting `live` with an orphaned ffmpeg present kills it,
+logs it with pid and held filenames, and only then reconciles; and an
+encoder writing into a different data dir is left alone.
+
+---
+
+## Item 5 — fixture test: a pure `capture-discontinuity` on the **live** path, no restart
+
+**Size:** small. One fixture test, no product change.
+
+**Why.** The 2026-08-25 synthetic run produced four discontinuities and
+**all four were `driver-restart`**. `continuity_gap` (`:486-498`) gives an
+outstanding restart gap unconditional precedence:
+
+```python
+if pending_gap:
+    return pending_gap
+if state is not None and (start_ns - state["last_end_ns"]
+                          > CAPTURE_GAP_TOLERANCE_NS):     # 2 s
+    return {"reason": "capture-discontinuity", ...}
+```
+
+so the second branch is unreachable in any run that gapped because of a
+restart. A stall *within a single run* is the only way to reach it, and
+that path has never been exercised end to end on the live side.
+
+**Existing coverage — do not redo it.** `tests/test_camera_restart_integrity.py`
+already has:
+
+- `test_69s_hole_produces_continuity_gap` (:486) — the seg-77 hole at the
+  attestation level, asserting `capture-discontinuity`;
+- `test_restart_gap_takes_precedence` (:510) — the precedence rule itself;
+- `test_replay_path_flags_capture_hole` (:521) — end to end, but through
+  **`run_replay`**.
+
+**The actual hole:** no test drives **`run_live` / `_run_live_locked`**
+through a mid-run stall with no restart and asserts the emitted body
+carries `{"reason": "capture-discontinuity", "after_seq": N}`. That is
+where the precedence rule lives, and it is the branch a real camera stall
+(RTSP drop, encoder hiccup, network stall) would take while the driver
+keeps running.
+
+**Minimum.** `_run_live_locked` already accepts injectable `_spawn` and
+`_clock`, so no hardware and no ffmpeg are needed: a fake spawn drops
+prepared segment files whose mtimes leave a hole > `CAPTURE_GAP_TOLERANCE_NS`
+between two segments **within one run**, and the test asserts:
+
+- the segment after the stall carries `reason: "capture-discontinuity"`
+  with the correct `after_seq`;
+- `pending_gap` is `None` at that point — i.e. the gap is genuinely not a
+  restart artifact;
+- segments either side of the stall carry `gap: null`;
+- `segment_seq` stays contiguous across the stall (a stall is not a drop).
+
+**Done when:** the live path produces a `capture-discontinuity` body in a
+fixture with no restart anywhere in the run, and the test fails if the
+reason comes back `driver-restart` or `null`.
