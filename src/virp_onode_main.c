@@ -219,6 +219,13 @@ static int load_devices_json(onode_state_t *state, const char *path)
             json_object_is_type(val, json_type_int))
             device.port = (uint16_t)json_object_get_int(val);
 
+        /* Per-device legacy SSH KEX opt-in (issue #5, d6a986a). The prod
+         * loader parses this; the dev loader must too, or the same
+         * devices.json connects a different set of devices per binary. */
+        if (json_object_object_get_ex(dev_obj, "ssh_legacy", &val) &&
+            json_object_is_type(val, json_type_boolean))
+            device.ssh_legacy = json_object_get_boolean(val);
+
         char vendor_str[32] = {0};
         if (json_get_string(dev_obj, "vendor", vendor_str, sizeof(vendor_str)))
             device.vendor = vendor_from_string(vendor_str);
