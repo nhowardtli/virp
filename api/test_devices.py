@@ -296,3 +296,38 @@ def test_virp_devices_env_bypasses_yaml_registry(tmp_path, monkeypatch):
     assert server.load_devices() == {
         "R-env": {"host": "10.9.9.9", "driver": "cisco"},
     }
+
+
+# ---- driver label truth (ISSUE-A Phase 5) ------------------------------------
+def test_legacy_vendor_list_reports_asa_driver_truthfully(tmp_path, monkeypatch):
+    """The legacy devices.json vendor-list fallback used to collapse every
+    vendor starting with "cisco" to driver "cisco", so the ASA showed up as
+    driver cisco in /api/devices (issue 6 leftover). The fallback must use
+    the same vendor→driver map as the registry path."""
+    devices_path = tmp_path / "devices.json"
+    devices_path.write_text(json.dumps({"devices": [
+        {"hostname": "asa-lab", "host": "10.0.0.61", "vendor": "cisco_asa"},
+        {"hostname": "R1", "host": "10.0.0.50", "vendor": "cisco_ios"},
+    ]}))
+    monkeypatch.setenv("VIRP_API_TOKEN", TEST_TOKEN)
+    monkeypatch.setenv("VIRP_DEVICES", str(devices_path))
+    monkeypatch.setenv("VIRP_SOCKET", str(tmp_path / "no.sock"))
+    monkeypatch.setenv("VIRP_KEY_PATH", str(tmp_path / "no.key"))
+    monkeypatch.setenv("VIRP_WEB_DIR", str(tmp_path / "no-web"))
+    monkeypatch.delenv("VIRP_ALLOWED_ORIGINS", raising=False)
+
+    api_dir = Path(__file__).parent
+    if str(api_dir) not in sys.path:
+        sys.path.insert(0, str(api_dir))
+    if "server" in sys.modules:
+        del sys.modules["server"]
+    server = importlib.import_module("server")
+    monkeypatch.setattr(server, "_USE_REGISTRY", False)
+    client = TestClient(server.app)
+
+    resp = client.get("/api/devices", headers=_auth())
+    assert resp.status_code == 200
+    by_name = {d["name"]: d for d in resp.json()["devices"]}
+    assert by_name["asa-lab"]["driver"] == "cisco_asa"
+    assert by_name["asa-lab"]["virp_supported"] is True
+    assert by_name["R1"]["driver"] == "cisco"

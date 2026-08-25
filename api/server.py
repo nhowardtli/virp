@@ -798,9 +798,14 @@ def load_devices() -> dict:
             result = {}
             for d in raw["devices"]:
                 name = d.get("hostname", d.get("name", "unknown"))
+                # Same vendor→driver map as the registry path above. The
+                # old startswith("cisco") collapse reported the ASA as
+                # driver "cisco" (issue 6 leftover) — label-truth bug.
+                vendor = d.get("vendor", "")
                 result[name] = {
                     "host": d.get("host", ""),
-                    "driver": "cisco" if d.get("vendor", "").startswith("cisco") else d.get("driver", "unknown"),
+                    "driver": _VENDOR_TO_DRIVER.get(vendor, vendor) if vendor
+                              else d.get("driver", "unknown"),
                 }
             return result
         return raw
