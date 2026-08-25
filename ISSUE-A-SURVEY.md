@@ -203,3 +203,77 @@ truth on both source paths.
    DEVICE_OUTPUT path, while a typed ERROR-observation channel for constructed
    text already exists in the onode. Phase 2 needs a decision on whether these
    move to the ERROR channel or get the tagged-constructed-header form.
+
+---
+
+# Phase 2 addendum — corrections to this survey, found while implementing
+
+The ticket asks for contradictions. Four of these correct **this document**.
+
+1. **My claim 4 was overstated, and it was the one the ticket acted on.**
+   I reported PAN-OS as "the only site where true bytes are destroyed rather
+   than merely ignored," and the ticket reasonably ordered the work around it.
+   That is not accurate. `virp_ssh_read_until_prompt` strips the trailing
+   prompt in **all four** SSH drivers — it is the read terminator — and in all
+   four the bytes are retained in `conn->prompt`, because a read only
+   terminates on an exact match of the learned value. Nothing was destroyed
+   anywhere; all four ignored a value they still held. PAN-OS remains
+   distinctive for a weaker reason: its comment *documented* the true prompt
+   format (`username@hostname>`) and templated `hostname>` anyway, so the
+   discard was explicit and it discarded strictly more identity than the
+   others. Fixing it first cost nothing, but the stated rationale was wrong.
+
+2. **Snow's ASA line number is exact; his cisco line number was stale** (1124
+   on main, not 1044) — as reported in Phase 1, now confirmed by the edit.
+
+3. **"Omit the header entirely" is wrong for two of the five prompt-less
+   drivers.** PBS derives its request path from the approved op through a
+   lookup table, and Zammad derives the exact JSON a write op posts. Neither
+   is recoverable from the command alone, and both are deliberately recorded
+   as derivation evidence. Deleting them would destroy real evidence to fix a
+   different problem. They keep their line under an explicit
+   `VIRP_OBS_DERIVED_TAG` marker instead — the ticket's own option (b).
+   Wazuh and LibreNMS *were* safe to omit outright: for those two the
+   endpoint IS the command string, so the header carried nothing the frame
+   did not already hash. Linux was safe to omit outright as well.
+
+4. **The mock driver is deliberately excluded**, against the ticket's "every
+   site." `driver_mock.c` IS the device; everything it emits is simulated
+   device output by construction, so its `#` is the simulated device's
+   presented prompt rather than a claim about a real session. Several
+   onode/approval tests pin its exact shape as a fixture. A comment records
+   the exclusion at the site. Production site count is therefore 16 fixed,
+   2 mock sites intentionally unchanged.
+
+5. **The JunOS commit-reject refusal performs real device I/O**, which the
+   Phase 1 survey flagged as a question and Phase 3 resolved. The commit is
+   never sent, but `rollback 0` **is** written to the device — and the body
+   being deleted was the only place that recorded it. That fact moved into
+   `error_msg`. `no_dispatch = true` is still correct, because that flag
+   licenses retry of *the command*, and the commit genuinely was not
+   dispatched.
+
+6. **Branch 3 corrects a live miscount, not just a cosmetic label.**
+   `narration_check.py` already documents "a refusal is an error frame" and
+   computes `executed = otype != "error"`. Because driver-level refusals were
+   emitted as `device_output`, every one of them counted as an execution in
+   that layer's census. The drivers now match what the checker always
+   assumed.
+
+7. **Deleting a refusal body is not sufficient and would have been a worse
+   bug.** The daemon tests outcome-UNKNOWN first
+   (`disposition == UNSET && !success && output_len == 0 && !no_dispatch`).
+   A refusal that clears its body without setting `no_dispatch` matches that
+   condition exactly, and would have recorded "the command may have executed;
+   not retried" for a command never transmitted — trading a false privilege
+   claim for a false execution claim. Every site sets `no_dispatch`;
+   `tests/test_refusal_observation_type.c` pins it.
+
+8. **The PBS test targets are not broken.** They fail to link under a bare
+   `make` because the PBS driver is opt-in; `make PBS=1 test-pbs-trunc`
+   builds and passes (27/27). Worth stating because a bare `make test-pbs`
+   looks like a pre-existing failure and is not one.
+
+9. **No FastAPI venv existed on this laptop.** `~/virp-api-venv` (in the
+   memory notes) lives on 313, not here. Created locally to run the Phase 5
+   API tests; 45/45 pass.
