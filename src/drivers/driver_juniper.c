@@ -685,10 +685,16 @@ static virp_error_t junos_execute_single(virp_conn_t *conn,
                  "BLACK tier: command blocked on %s", conn->device.hostname);
         fprintf(stderr, "[JunOS] BLACK tier blocked: '%s' on %s\n",
                 command, conn->device.hostname);
-        int written = snprintf(result->output, sizeof(result->output),
-                               "%s>%s\nBLACK tier: command forbidden",
-                               conn->device.hostname, command);
-        result->output_len = (written > 0) ? (size_t)written : 0;
+        /* Defect B (2026-08-26): declare non-dispatch. no_dispatch is the
+         * O-Node's proof standard and NOT_SENT states it positively rather
+         * than by omission; without both, gate_emit_execution records this
+         * refusal as "executed":true and the observation is signed as
+         * DEVICE_OUTPUT. The refusal text moves to error_msg, which is what
+         * the signed ERROR observation is built from — result->output is the
+         * DEVICE's voice, and the device was never asked. Contract and
+         * placement follow driver_linux.c:352-372. */
+        result->no_dispatch = true;
+        result->disposition = VIRP_DISPOSITION_NOT_SENT;
         return VIRP_OK;
     }
 
@@ -997,10 +1003,16 @@ static virp_error_t junos_execute(virp_conn_t *conn,
                  conn->device.hostname, why);
         fprintf(stderr, "[JunOS] Multi-command refused on %s: %s\n",
                 conn->device.hostname, why);
-        int w = snprintf(result->output, sizeof(result->output),
-                         "%s> multi-command string refused: %s",
-                         conn->device.hostname, why);
-        result->output_len = (w > 0) ? (size_t)w : 0;
+        /* Defect B (2026-08-26): declare non-dispatch. no_dispatch is the
+         * O-Node's proof standard and NOT_SENT states it positively rather
+         * than by omission; without both, gate_emit_execution records this
+         * refusal as "executed":true and the observation is signed as
+         * DEVICE_OUTPUT. The refusal text moves to error_msg, which is what
+         * the signed ERROR observation is built from — result->output is the
+         * DEVICE's voice, and the device was never asked. Contract and
+         * placement follow driver_linux.c:352-372. */
+        result->no_dispatch = true;
+        result->disposition = VIRP_DISPOSITION_NOT_SENT;
         return VIRP_OK;
     }
 

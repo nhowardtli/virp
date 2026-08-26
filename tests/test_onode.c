@@ -47,22 +47,79 @@
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
+static int tests_pending = 0;
+static int pending_unexpected_pass = 0;
+
+/*
+ * current_test_failed replaces the old accounting, which was wrong in a
+ * way that mattered (2026-08-26). ASSERT_EQ used to do
+ * `tests_run++; tests_failed++; return;` and RUN_TEST then did
+ * `tests_run++; tests_passed++; printf(" [PASS]")` unconditionally when
+ * the function returned — so a FAILING test printed [FAIL], its detail,
+ * and then [PASS], was counted in tests_passed, and inflated tests_run by
+ * one. "135/137 passed (2 FAILED)" actually meant 133 passed of 135. The
+ * exit status was still correct, so this never lost a red build; it made
+ * the summary line overstate the pass count and print a pass label on a
+ * failed test. Found while adding PENDING_TEST below, which cannot be
+ * trusted on top of accounting that reports failures as passes.
+ */
+static int current_test_failed = 0;
 
 #define TEST(name) static void name(void)
 #define RUN_TEST(name) do { \
     printf("  %-60s", #name); \
     fflush(stdout); \
+    current_test_failed = 0; \
     name(); \
     tests_run++; \
-    tests_passed++; \
-    printf(" [PASS]\n"); \
+    if (current_test_failed) { \
+        tests_failed++; \
+    } else { \
+        tests_passed++; \
+        printf(" [PASS]\n"); \
+    } \
+} while(0)
+
+/*
+ * PENDING_TEST — a test that is known-failing BY DESIGN because the code
+ * to satisfy it has not been written yet.
+ *
+ * It must never roll up as green. A pending test is counted in its own
+ * bucket, never in tests_passed, and the summary refuses to print a clean
+ * line while any exist. The failing suite that reports success is the
+ * pattern check-test-deps.sh exists to prevent; this is the same hazard
+ * one layer in.
+ *
+ * If a pending test unexpectedly PASSES, that is a hard FAILURE. The
+ * acceptance criterion has been met and the marker is now a lie about the
+ * state of the code — a pending marker that silently becomes correct is
+ * how stale markers accumulate. Remove the marker in the same commit that
+ * makes it pass.
+ */
+#define PENDING_TEST(name, criterion) do { \
+    printf("  %-60s", #name); \
+    fflush(stdout); \
+    current_test_failed = 0; \
+    name(); \
+    tests_run++; \
+    if (current_test_failed) { \
+        tests_pending++; \
+        printf("    ^^ [PENDING] known-failing by design; NOT a pass\n"); \
+        printf("       acceptance criterion: %s\n", (criterion)); \
+    } else { \
+        tests_failed++; \
+        pending_unexpected_pass++; \
+        printf(" [PENDING BUT PASSED]\n"); \
+        printf("    This test is marked PENDING but now passes. The\n"); \
+        printf("    acceptance criterion is met — remove the marker.\n"); \
+    } \
 } while(0)
 
 #define ASSERT_EQ(a, b) do { \
     if ((a) != (b)) { \
         printf(" [FAIL]\n    Expected %d, got %d at line %d\n", \
                (int)(b), (int)(a), __LINE__); \
-        tests_run++; tests_failed++; return; \
+        current_test_failed = 1; return; \
     } \
 } while(0)
 
@@ -3207,6 +3264,187 @@ static void gx_teardown(onode_state_t *st)
     virp_context_destroy(ctx);
 }
 
+extern void virp_driver_mock_set_refusal_with_body(const char *body_text);
+extern void virp_driver_mock_set_declared_refusal(const char *body_text);
+
+/*
+ * STEP 1 — proves the routing clause added in step 1 actually fires.
+ *
+ * A refusal that DECLARES non-dispatch (no_dispatch + NOT_SENT) must be
+ * routed to VIRP_OBS_ERROR even though it wrote a non-empty body. Before
+ * step 1 the branch required output_len == 0, so a declared refusal
+ * carrying a banner still fell through to DEVICE_OUTPUT.
+ *
+ * This test PASSES on step 1 alone. Its two siblings above stay red until
+ * step 2 teaches the real drivers to declare — the split is deliberate:
+ * this one covers the routing, they cover the signal.
+ */
+TEST(test_declared_refusal_with_body_routes_to_error)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+
+    virp_driver_mock_set_declared_refusal(
+        "PVE-LAB#show version\nBLACK tier: command forbidden");
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+                                     obs, sizeof(obs), &olen);
+    virp_driver_mock_set_declared_refusal(NULL);
+    ASSERT_OK(err);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    virp_observation_t o;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE,
+                                     &o, &data, &data_len));
+
+    uint8_t got_type = o.obs_type;
+    int echoed = (strstr((const char *)data, "PVE-LAB#") != NULL);
+
+    gx_teardown(&st);
+    gx_cleanup();
+
+    ASSERT_EQ(got_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(!echoed);
+}
+
+
+/*
+ * STEP 0 — DEFECT DEMONSTRATION (Defect B, execution truth).
+ *
+ * A driver-level policy refusal that writes its reason into
+ * result->output must NOT be recorded as an execution.
+ *
+ * This is the shape five production drivers actually emit
+ * (driver_asa.c:1027, driver_cisco.c:1078, driver_juniper.c:684,
+ * driver_juniper.c:996, driver_fortigate.c:802): VIRP_OK,
+ * success=false, a NON-EMPTY output body, and no no_dispatch /
+ * disposition signal.
+ *
+ * Both onode refusal filters (virp_onode.c:1892 and :1940) require
+ * output_len == 0, so this shape defeats both, falls through to the
+ * success path at :1984, and is recorded "executed":true and signed as
+ * DEVICE_OUTPUT.
+ *
+ * The existing guard test_error_obs_driver_refusal_is_error_not_output
+ * asserts this same contract but drives the mock through
+ * set_soft_fail, which sets no_dispatch=true AND writes no output — the
+ * shape where both filters already fire. No test has ever exercised the
+ * shape below, which is how a fix that was made, tested and believed
+ * complete has been defeated in production ever since.
+ *
+ * The gate is ENFORCE/GREEN and the command is GREEN, so the gate
+ * ADMITS it and the driver's own backstop refuses — classifier
+ * disagreement, reachable today without SHADOW.
+ *
+ * THIS TEST FAILS ON UNFIXED CODE. That is its purpose in Step 0.
+ */
+TEST(test_refusal_with_body_is_not_an_execution)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+
+    /* Exactly what driver_cisco.c:1078 writes into result->output. */
+    virp_driver_mock_set_refusal_with_body(
+        "PVE-LAB#show version\nBLACK tier: command forbidden");
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+                                     obs, sizeof(obs), &olen);
+    virp_driver_mock_set_refusal_with_body(NULL);
+    ASSERT_OK(err);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    virp_observation_t o;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE,
+                                     &o, &data, &data_len));
+
+    /* Capture, then release BEFORE asserting. An ASSERT returns from the
+     * test, so asserting first would skip gx_teardown/gx_cleanup and leave
+     * an open chain handle on a db the next test's gx_setup deletes — the
+     * following test then reads zero rows and fails for a reason that has
+     * nothing to do with its subject. Teardown-then-assert keeps each
+     * failure attributable to its own test. */
+    uint8_t  got_obs_type = o.obs_type;
+    int      echoed_prompt =
+        (strstr((const char *)data, "PVE-LAB#") != NULL);
+
+    gx_teardown(&st);
+    gx_cleanup();
+
+    /* (1) A refusal is not device output. Every real consumer branches on
+     * obs_type: virp_tool.c:807 derives is_rejection from it and prints
+     * gate_decision=allowed / exit 0 for DEVICE_OUTPUT, and
+     * api/server.py:567 renders it as something a device said. */
+    ASSERT_EQ(got_obs_type, VIRP_OBS_ERROR);
+
+    /* (2) The refusal banner must not go out as though the device spoke
+     * it. The device said nothing; it was never asked. */
+    ASSERT_TRUE(!echoed_prompt);
+}
+
+/*
+ * STEP 0 — DEFECT DEMONSTRATION, ledger half.
+ *
+ * Split from the test above deliberately: an ASSERT returns from the
+ * test, so a single test would abort on the obs_type mismatch and never
+ * reach the ledger claim. The two halves fail for different reasons and
+ * are fixed by different edits (Step 1 routes the observation, Steps 1-2
+ * supply the non-dispatch proof), so they report independently.
+ *
+ * THIS TEST FAILS ON UNFIXED CODE.
+ */
+TEST(test_refusal_with_body_is_not_recorded_executed)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+
+    virp_driver_mock_set_refusal_with_body(
+        "PVE-LAB#show version\nBLACK tier: command forbidden");
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+                                     obs, sizeof(obs), &olen);
+    virp_driver_mock_set_refusal_with_body(NULL);
+    ASSERT_OK(err);
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+
+    /* Same discipline as above: capture the verdicts, release the db, then
+     * assert. */
+    int is_exec_row  = (n == 1 && strcmp(rows[0].type, "gate_execution") == 0);
+    int has_body     = (n == 1 && rows[0].have_body);
+    int claims_ran   = (n == 1 && rows[0].have_body &&
+                        strstr(rows[0].body, "\"executed\":true") != NULL);
+
+    gx_cleanup();
+
+    ASSERT_EQ(n, 1);
+    ASSERT_TRUE(is_exec_row);
+    ASSERT_TRUE(has_body);
+
+    /* The ledger must not assert that a refused command ran. This is the
+     * fabricated FACT, as distinct from the fabricated string: 40,388
+     * gate_execution entries carry this field. */
+    ASSERT_TRUE(!claims_ran);
+}
+
 /*
  * A GREEN auto-execution leaves a signed, chained, prev-hash-linked
  * gate_execution entry — the thing that was missing. The rejection filed
@@ -6222,6 +6460,17 @@ int main(void)
     RUN_TEST(test_gate_rejection_records_per_uid_effective_ceiling);
 
     printf("\n[GREEN auto-execution records (chain covers what was allowed)]\n");
+    RUN_TEST(test_declared_refusal_with_body_routes_to_error);
+    /* PENDING until the /2 three-valued work. Steps 1-2 fixed the five
+     * production drivers, which now DECLARE non-dispatch; these two drive
+     * a mock that deliberately reproduces the pre-step-2 shape (refusal
+     * with a body, no declaration) to hold the O-Node itself to account.
+     * It still records that shape as executed. No shipping driver emits
+     * it — driver twelve will. */
+    PENDING_TEST(test_refusal_with_body_is_not_an_execution,
+                 "gate_execution/2 three-valued executed (EXECUTED / REFUSED / UNKNOWN): an undeclared !success result must resolve to UNKNOWN, never EXECUTED, and must not be signed as DEVICE_OUTPUT");
+    PENDING_TEST(test_refusal_with_body_is_not_recorded_executed,
+                 "gate_execution/2 three-valued executed (EXECUTED / REFUSED / UNKNOWN): an undeclared !success result must resolve to UNKNOWN, never EXECUTED, and must not be signed as DEVICE_OUTPUT");
     RUN_TEST(test_green_execution_chains_signed_observation);
     RUN_TEST(test_execution_record_commits_to_digest_not_response_body);
     RUN_TEST(test_errored_execution_still_chains_no_gap);
@@ -6395,7 +6644,27 @@ int main(void)
     printf("  Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0)
         printf("  (%d FAILED)", tests_failed);
-    printf("\n================================================================\n\n");
+    if (tests_pending > 0)
+        printf("  (%d PENDING)", tests_pending);
+    printf("\n");
+
+    /* A pending test must never let this read as a clean run. The word
+     * "PENDING" is on the results line above, and the suite says plainly
+     * that it is not clean rather than leaving a reader to notice a
+     * count. */
+    if (tests_pending > 0) {
+        printf("\n  ****  SUITE IS NOT CLEAN: %d PENDING test(s)  ****\n",
+               tests_pending);
+        printf("  Known-failing by design. They are NOT counted as passes\n");
+        printf("  and they are NOT skipped — they ran and they failed.\n");
+        printf("  Each names its acceptance criterion above.\n");
+    }
+    if (pending_unexpected_pass > 0) {
+        printf("\n  ****  %d PENDING test(s) UNEXPECTEDLY PASSED  ****\n",
+               pending_unexpected_pass);
+        printf("  Remove the marker in the commit that satisfied it.\n");
+    }
+    printf("================================================================\n\n");
 
     return (tests_failed > 0) ? 1 : 0;
 }
