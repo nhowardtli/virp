@@ -1870,6 +1870,19 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
 
     pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
 
+    /* ── SCRUB-BARRIER ────────────────────────────────────────────────
+     * Everything below this line may commit to, or sign, bytes captured
+     * from the device. feat/camera-driver inserts
+     * virp_scrub_exec_result(&result) exactly HERE (S-1, scrub-at-
+     * capture); the marker is placed before that merge so the rebase
+     * cannot land the scrub in the wrong place unnoticed.
+     *
+     * Enforced by scripts/check-obs-build-ordering.sh, which fails the
+     * build if a result-carrying gate_emit_execution() or observation
+     * constructor appears above it — and which self-tests in both
+     * directions, because a guard that cannot fail is the defect it
+     * exists to catch. Do not move this marker to make the check pass. */
+
     /*
      * Failure with no output and NO proof of non-dispatch: the command
      * may have reached and executed on the device (SSH write completed
@@ -1937,15 +1950,51 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * DEVICE_OUTPUT / v2 session-bound constructor used for executed
      * output, which downstream renders as a logged change.
      */
-    if (!result.success && result.output_len == 0 && result.error_msg[0]) {
+    /* ── REFUSAL ROUTING (Defect B, step 1) ───────────────────────────
+     * The no_dispatch / NOT_SENT clauses are NEW. This branch previously
+     * required output_len == 0, which is the whole defect: five
+     * production refusal paths write an explanatory banner into
+     * result->output — driver_asa.c:1027, driver_cisco.c:1078,
+     * driver_juniper.c:684, driver_juniper.c:996, driver_fortigate.c:802
+     * — so they failed this test, fell through to the success path, were
+     * recorded "executed":true and signed as DEVICE_OUTPUT. A driver was
+     * penalised for explaining itself.
+     *
+     * The widening is ADDITIVE: output_len == 0 is retained, so nothing
+     * that reaches DEVICE_OUTPUT today stops doing so. Only a driver that
+     * PROVES non-dispatch is newly routed here.
+     *
+     * Deliberately NOT keyed on !success alone. success is defined as
+     * `disposition == EXECUTED_CONFIRMED` (driver_linux.c:583), so a
+     * command that ran cleanly and exited non-zero is EXECUTED_FAILED
+     * with success=false — it executed. Keying on !success would route a
+     * real device error response here and discard the device's own bytes,
+     * narrowing production behaviour. Whether the device was reached is
+     * the driver's claim; whether nothing was dispatched is the driver's
+     * proof. This branch acts only on the proof.
+     *
+     * Step 1 supplies the routing; the five drivers do not yet offer the
+     * proof, so this is inert for them until step 2 sets it. That is the
+     * intended split: routing and signal reviewed separately. */
+    if (!result.success && result.error_msg[0] &&
+        (result.no_dispatch ||
+         result.disposition == VIRP_DISPOSITION_NOT_SENT ||
+         result.output_len == 0)) {
         char err_msg[sizeof(result.error_msg) + 96];
         snprintf(err_msg, sizeof(err_msg),
                  "ERROR: driver refused '%s': %s",
                  device_name, result.error_msg);
         /* Recorded even though nothing ran: the gate ADMITTED this action,
          * and "admitted then refused by the driver" is a distinct fact
-         * from "never admitted". no_dispatch is proven here, so the entry
-         * says executed=false rather than claiming an execution. */
+         * from "never admitted".
+         *
+         * CORRECTED 2026-08-26 (Defect B): this comment previously read
+         * "no_dispatch is proven here, so the entry says executed=false".
+         * It never was. This branch tests success/output_len/error_msg and
+         * has never tested no_dispatch — whatever the driver set is what
+         * gate_emit_execution records. The claim was read as a guarantee
+         * and is how the defect survived a fix, a test and a survey. The
+         * entry says executed=false only if the DRIVER proved it. */
         if (!approved)
             gate_emit_execution(state, device_name, drv, command, gate_tier,
                                 gate_eff_max, gate_mode, client_uid,

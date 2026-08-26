@@ -479,6 +479,42 @@ $(TEST_LINUX_BLACK): tests/test_driver_linux_black.c \
 test-linux-black: $(TEST_LINUX_BLACK)
 	./$(TEST_LINUX_BLACK)
 
+# ── Driver refusal contract (Defect B) ───────────────────────────────
+# Each driver's execute() and struct virp_conn are private, so the source
+# is #included and each driver gets its own TU (two drivers in one TU
+# collide). Built WITHOUT the driver flag so $(LIB) does not also export
+# the symbols. These assert the CONTRACT — no_dispatch, NOT_SENT, empty
+# output — not merely that the classifier returns BLACK, which is all the
+# pre-existing *_black tests checked.
+TEST_ASA_REFUSAL  = $(BUILD_DIR)/test_driver_asa_refusal
+TEST_CISCO_REFUSAL = $(BUILD_DIR)/test_driver_cisco_refusal
+TEST_JUNIPER_REFUSAL = $(BUILD_DIR)/test_driver_juniper_refusal
+TEST_FG_REFUSAL   = $(BUILD_DIR)/test_driver_fortigate_refusal
+
+$(TEST_ASA_REFUSAL): tests/test_driver_asa_refusal.c tests/refusal_contract.h $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+$(TEST_CISCO_REFUSAL): tests/test_driver_cisco_refusal.c tests/refusal_contract.h $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+$(TEST_JUNIPER_REFUSAL): tests/test_driver_juniper_refusal.c tests/refusal_contract.h $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+$(TEST_FG_REFUSAL): tests/test_driver_fortigate_refusal.c tests/refusal_contract.h $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -lcurl -o $@
+
+.PHONY: test-refusal-contract
+test-refusal-contract: $(TEST_ASA_REFUSAL) $(TEST_CISCO_REFUSAL) \
+                       $(TEST_JUNIPER_REFUSAL) $(TEST_FG_REFUSAL)
+	./$(TEST_ASA_REFUSAL)
+	./$(TEST_CISCO_REFUSAL)
+	./$(TEST_JUNIPER_REFUSAL)
+	./$(TEST_FG_REFUSAL)
+
 # Chain and Federation tests
 TEST_CHAIN = $(BUILD_DIR)/test_chain
 TEST_FED   = $(BUILD_DIR)/test_federation
@@ -1789,6 +1825,12 @@ all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path ch
 # above still runs — and fails the aggregate if any required dependency is
 # absent, so a skip can never masquerade as clean success. Installing the
 # deps is the fix; the message names them.
+.PHONY: check-obs-build-ordering
+check-obs-build-ordering:
+	@scripts/check-obs-build-ordering.sh --selftest >/dev/null || \
+	    { echo "FAIL: check-obs-build-ordering.sh selftest failed — the guard is broken"; exit 1; }
+	@scripts/check-obs-build-ordering.sh
+
 .PHONY: check-test-deps
 check-test-deps:
 	@scripts/check-test-deps.sh --selftest >/dev/null || \
