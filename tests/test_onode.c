@@ -2599,6 +2599,57 @@ TEST(test_load_devices_skips_missing_required_fields)
     unlink(WRONG_TYPE_CFG);
 }
 
+/*
+ * Issue #14: a cisco_asa entry with no "enable" credential is refused
+ * at load, not loaded to churn. The ASA driver's health check needs
+ * enable mode; without a credential the watchdog connects, fails the
+ * check, drops and reconnects on every backoff for the life of the
+ * daemon. The refusal is per entry: the two ASA entries here (one with
+ * no "enable" key, one with the issue-#7 wrong-type "enable": 0) must
+ * be skipped, the ASA with a credential and the mock device must load.
+ */
+TEST(test_load_devices_refuses_asa_without_enable)
+{
+    FILE *f = fopen(WRONG_TYPE_CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"ASA-NOENABLE\", \"host\": \"10.0.0.61\",\n"
+        "      \"vendor\": \"cisco_asa\", \"username\": \"u\", \"password\": \"p\",\n"
+        "      \"node_id\": \"0A000061\" },\n"
+        "    { \"hostname\": \"ASA-BADTYPE\", \"host\": \"10.0.0.62\",\n"
+        "      \"vendor\": \"cisco_asa\", \"username\": \"u\", \"password\": \"p\",\n"
+        "      \"enable\": 0, \"node_id\": \"0A000062\" },\n"
+        "    { \"hostname\": \"ASA-OK\", \"host\": \"10.0.0.63\",\n"
+        "      \"vendor\": \"cisco_asa\", \"username\": \"u\", \"password\": \"p\",\n"
+        "      \"enable\": \"s\", \"node_id\": \"0A000063\" },\n"
+        "    { \"hostname\": \"R-MOCK\", \"host\": \"10.0.0.64\", \"vendor\": \"mock\",\n"
+        "      \"node_id\": \"0A000064\" }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    const char *tmp_sock = "/tmp/virp-onode-asaenable.sock";
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0004, NULL, tmp_sock));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    int loaded = load_devices(&tmp, WRONG_TYPE_CFG);
+    ASSERT_EQ(loaded, 2);
+    ASSERT_EQ(tmp.device_count, 2);
+    /* Load order is preserved: the two refused entries leave no gap. */
+    ASSERT_EQ(strcmp(tmp.devices[0].hostname, "ASA-OK"), 0);
+    ASSERT_EQ((int)tmp.devices[0].vendor, (int)VIRP_VENDOR_CISCO_ASA);
+    ASSERT_EQ(strcmp(tmp.devices[0].enable_password, "s"), 0);
+    ASSERT_EQ(strcmp(tmp.devices[1].hostname, "R-MOCK"), 0);
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(WRONG_TYPE_CFG);
+}
+
 /* =========================================================================
  * Duplicate device identities — hostname, node_id, and device_id are
  * each an authorization-binding key (request routing, approval device
@@ -6209,6 +6260,7 @@ int main(void)
     RUN_TEST(test_load_devices_wrong_type_does_not_crash);
     RUN_TEST(test_load_devices_refuses_absent_node_id);
     RUN_TEST(test_load_devices_skips_missing_required_fields);
+    RUN_TEST(test_load_devices_refuses_asa_without_enable);
     RUN_TEST(test_add_device_rejects_duplicate_identities);
     RUN_TEST(test_load_devices_duplicate_identities_fatal);
 

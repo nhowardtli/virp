@@ -257,6 +257,19 @@ static int load_devices_json(onode_state_t *state, const char *path)
             continue;
         }
 
+        /* cisco_asa without an "enable" credential: refuse at load, same
+         * as the prod loader (issue #14) — the ASA health check needs
+         * enable mode, so the watchdog would reconnect forever. */
+        if (device.vendor == VIRP_VENDOR_CISCO_ASA &&
+            device.enable_password[0] == '\0') {
+            fprintf(stderr, "[O-Node] Skipping %s: cisco_asa device has no "
+                            "\"enable\" credential — the ASA driver needs "
+                            "enable mode for its health check and would "
+                            "reconnect indefinitely without it (#14)\n",
+                    device.hostname);
+            continue;
+        }
+
         /* device_id — hex string or int, like node_id; derived from the
          * hostname when the config omits it (see virp_driver.h). */
         if (json_object_object_get_ex(dev_obj, "device_id", &val)) {

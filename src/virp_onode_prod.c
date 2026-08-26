@@ -761,6 +761,28 @@ int load_devices(onode_state_t *state, const char *path)
             continue;
         }
 
+        /*
+         * A cisco_asa device without an "enable" credential is the same
+         * class of error (issue #14). The ASA driver connects at user
+         * mode, cannot reach enable, and its "show clock" health check
+         * then fails at priv-1 — so the watchdog drops the session and
+         * reconnects every backoff interval for as long as the daemon
+         * runs: an SSH login storm against the firewall that never
+         * converges. A non-string value ("enable": 0, the issue #7
+         * shape) reads as absent and lands here too, now with a line
+         * that names the problem instead of a warning per reconnect.
+         * Refusing at load keeps "loaded" meaning "usable".
+         */
+        if (device.vendor == VIRP_VENDOR_CISCO_ASA &&
+            device.enable_password[0] == '\0') {
+            fprintf(stderr, "[O-Node] Skipping %s: cisco_asa device has no "
+                            "\"enable\" credential — the ASA driver needs "
+                            "enable mode for its health check and would "
+                            "reconnect indefinitely without it (#14)\n",
+                    device.hostname);
+            continue;
+        }
+
 #ifdef VIRP_DRIVER_LINUX
         /*
          * Push this device's protected VMIDs into the linux gate before
