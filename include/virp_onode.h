@@ -252,6 +252,19 @@ typedef struct {
     onode_reconnect_t   reconnect[ONODE_MAX_DEVICES];    /* Per-device reconnect state */
     int                 device_count;
 
+    /* Config entries the loader REFUSED (no enable credential on a
+     * cisco_asa, no PBS pin, unknown vendor, missing fields). Kept in
+     * state and reported by list_fleet / list_devices, so whether a
+     * device was governed is answerable from the fleet listing itself,
+     * not only from the load-time stderr line (#14 review). */
+    struct {
+        char            hostname[64];
+        char            host[64];
+        virp_vendor_t   vendor;
+        char            reason[128];
+    }                   rejected[ONODE_MAX_DEVICES];
+    int                 rejected_count;
+
     /* Sequence tracking (anti-replay) */
     uint32_t            seq_num;        /* Monotonically increasing */
 
@@ -456,6 +469,16 @@ virp_error_t onode_set_previous_okey(onode_state_t *state,
  */
 virp_error_t onode_add_device(onode_state_t *state,
                               const virp_device_t *device);
+
+/*
+ * Record a config entry the loader refused, so it shows up in the fleet
+ * listings as "refused: <reason>" instead of silently not existing.
+ * hostname/host may be empty (missing-field refusals). Bounded: entries
+ * past ONODE_MAX_DEVICES are counted in rejected_count but not stored.
+ */
+void onode_note_rejected(onode_state_t *state, const char *hostname,
+                         const char *host, virp_vendor_t vendor,
+                         const char *reason);
 
 /*
  * Start the O-Node event loop. Blocks until shutdown.
