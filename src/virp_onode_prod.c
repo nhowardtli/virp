@@ -669,6 +669,12 @@ int load_devices(onode_state_t *state, const char *path)
         if (json_get_bool(dev_obj, "ssh_legacy", &bool_val))
             device.ssh_legacy = bool_val;
 
+        /* cisco_asa only: the operator declares that login already lands
+         * in enable mode (aaa authorization exec ... auto-enable), so the
+         * no-enable-credential refusal below does not apply (#14). */
+        if (json_get_bool(dev_obj, "asa_auto_enable", &bool_val))
+            device.asa_auto_enable = bool_val;
+
         /* PBS-specific fields (ignored for other vendors).
          *
          * tls_fingerprint is the PBS driver's server identity. It is
@@ -736,12 +742,16 @@ int load_devices(onode_state_t *state, const char *path)
 
         if (device.hostname[0] == '\0' || device.host[0] == '\0') {
             fprintf(stderr, "[O-Node] Skipping device %d: missing hostname/host\n", i);
+            onode_note_rejected(state, device.hostname, device.host,
+                                device.vendor, "missing hostname/host");
             continue;
         }
 
         if (device.vendor == VIRP_VENDOR_UNKNOWN) {
             fprintf(stderr, "[O-Node] Skipping %s: unknown vendor\n",
                     device.hostname);
+            onode_note_rejected(state, device.hostname, device.host,
+                                device.vendor, "unknown vendor");
             continue;
         }
 
@@ -758,6 +768,8 @@ int load_devices(onode_state_t *state, const char *path)
                             "tls_fingerprint — the PBS driver pins the "
                             "server certificate and has no insecure mode\n",
                     device.hostname);
+            onode_note_rejected(state, device.hostname, device.host,
+                                device.vendor, "PBS device has no tls_fingerprint");
             continue;
         }
 
@@ -772,15 +784,34 @@ int load_devices(onode_state_t *state, const char *path)
          * shape) reads as absent and lands here too, now with a line
          * that names the problem instead of a warning per reconnect.
          * Refusing at load keeps "loaded" meaning "usable".
+         *
+         * Exception, declared per device: "asa_auto_enable": true means
+         * the ASA runs `aaa authorization exec ... auto-enable` and the
+         * login lands at `#` already (verified on a 5505 / 9.1(7)). The
+         * connect path's already-in-enable branch handles that session;
+         * no credential is needed. If the declaration is wrong the old
+         * reconnect behaviour returns — the warning names the device.
          */
         if (device.vendor == VIRP_VENDOR_CISCO_ASA &&
             device.enable_password[0] == '\0') {
-            fprintf(stderr, "[O-Node] Skipping %s: cisco_asa device has no "
-                            "\"enable\" credential — the ASA driver needs "
-                            "enable mode for its health check and would "
-                            "reconnect indefinitely without it (#14)\n",
-                    device.hostname);
-            continue;
+            if (device.asa_auto_enable) {
+                fprintf(stderr, "[O-Node] WARNING: asa_auto_enable=true for %s "
+                                "— no \"enable\" credential; the login must "
+                                "already land in enable mode (#14)\n",
+                        device.hostname);
+            } else {
+                fprintf(stderr, "[O-Node] Skipping %s: cisco_asa device has no "
+                                "\"enable\" credential — the ASA driver needs "
+                                "enable mode for its health check and would "
+                                "reconnect indefinitely without it (#14; set "
+                                "\"asa_auto_enable\": true only if login "
+                                "lands at '#' via aaa authorization auto-enable)\n",
+                        device.hostname);
+                onode_note_rejected(state, device.hostname, device.host,
+                                    device.vendor,
+                                    "cisco_asa without \"enable\" credential (#14)");
+                continue;
+            }
         }
 
 #ifdef VIRP_DRIVER_LINUX

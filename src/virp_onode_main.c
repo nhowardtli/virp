@@ -226,6 +226,12 @@ static int load_devices_json(onode_state_t *state, const char *path)
             json_object_is_type(val, json_type_boolean))
             device.ssh_legacy = json_object_get_boolean(val);
 
+        /* cisco_asa auto-enable declaration — same field as the prod
+         * loader (#14): login already lands in enable mode, no credential. */
+        if (json_object_object_get_ex(dev_obj, "asa_auto_enable", &val) &&
+            json_object_is_type(val, json_type_boolean))
+            device.asa_auto_enable = json_object_get_boolean(val);
+
         char vendor_str[32] = {0};
         if (json_get_string(dev_obj, "vendor", vendor_str, sizeof(vendor_str)))
             device.vendor = vendor_from_string(vendor_str);
@@ -248,26 +254,43 @@ static int load_devices_json(onode_state_t *state, const char *path)
 
         if (device.hostname[0] == '\0' || device.host[0] == '\0') {
             fprintf(stderr, "[O-Node] Skipping device %d: missing hostname/host\n", i);
+            onode_note_rejected(state, device.hostname, device.host,
+                                device.vendor, "missing hostname/host");
             continue;
         }
 
         if (device.vendor == VIRP_VENDOR_UNKNOWN) {
             fprintf(stderr, "[O-Node] Skipping %s: unknown vendor '%s'\n",
                     device.hostname, vendor_str);
+            onode_note_rejected(state, device.hostname, device.host,
+                                device.vendor, "unknown vendor");
             continue;
         }
 
         /* cisco_asa without an "enable" credential: refuse at load, same
          * as the prod loader (issue #14) — the ASA health check needs
-         * enable mode, so the watchdog would reconnect forever. */
+         * enable mode, so the watchdog would reconnect forever. Unless
+         * the operator declared asa_auto_enable (login lands at '#'). */
         if (device.vendor == VIRP_VENDOR_CISCO_ASA &&
             device.enable_password[0] == '\0') {
-            fprintf(stderr, "[O-Node] Skipping %s: cisco_asa device has no "
-                            "\"enable\" credential — the ASA driver needs "
-                            "enable mode for its health check and would "
-                            "reconnect indefinitely without it (#14)\n",
-                    device.hostname);
-            continue;
+            if (device.asa_auto_enable) {
+                fprintf(stderr, "[O-Node] WARNING: asa_auto_enable=true for %s "
+                                "— no \"enable\" credential; the login must "
+                                "already land in enable mode (#14)\n",
+                        device.hostname);
+            } else {
+                fprintf(stderr, "[O-Node] Skipping %s: cisco_asa device has no "
+                                "\"enable\" credential — the ASA driver needs "
+                                "enable mode for its health check and would "
+                                "reconnect indefinitely without it (#14; set "
+                                "\"asa_auto_enable\": true only if login "
+                                "lands at '#' via aaa authorization auto-enable)\n",
+                        device.hostname);
+                onode_note_rejected(state, device.hostname, device.host,
+                                    device.vendor,
+                                    "cisco_asa without \"enable\" credential (#14)");
+                continue;
+            }
         }
 
         /* device_id — hex string or int, like node_id; derived from the

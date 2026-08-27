@@ -2625,7 +2625,10 @@ TEST(test_load_devices_refuses_asa_without_enable)
         "      \"vendor\": \"cisco_asa\", \"username\": \"u\", \"password\": \"p\",\n"
         "      \"enable\": \"s\", \"node_id\": \"0A000063\" },\n"
         "    { \"hostname\": \"R-MOCK\", \"host\": \"10.0.0.64\", \"vendor\": \"mock\",\n"
-        "      \"node_id\": \"0A000064\" }\n"
+        "      \"node_id\": \"0A000064\" },\n"
+        "    { \"hostname\": \"ASA-AUTOEN\", \"host\": \"10.0.0.65\",\n"
+        "      \"vendor\": \"cisco_asa\", \"username\": \"u\", \"password\": \"p\",\n"
+        "      \"asa_auto_enable\": true, \"node_id\": \"0A000065\" }\n"
         "  ]\n"
         "}\n");
     fclose(f);
@@ -2637,13 +2640,25 @@ TEST(test_load_devices_refuses_asa_without_enable)
     ASSERT_TRUE(tmp.ctx != NULL);
 
     int loaded = load_devices(&tmp, WRONG_TYPE_CFG);
-    ASSERT_EQ(loaded, 2);
-    ASSERT_EQ(tmp.device_count, 2);
+    ASSERT_EQ(loaded, 3);
+    ASSERT_EQ(tmp.device_count, 3);
     /* Load order is preserved: the two refused entries leave no gap. */
     ASSERT_EQ(strcmp(tmp.devices[0].hostname, "ASA-OK"), 0);
     ASSERT_EQ((int)tmp.devices[0].vendor, (int)VIRP_VENDOR_CISCO_ASA);
     ASSERT_EQ(strcmp(tmp.devices[0].enable_password, "s"), 0);
     ASSERT_EQ(strcmp(tmp.devices[1].hostname, "R-MOCK"), 0);
+    /* The declared auto-enable ASA loads without a credential. */
+    ASSERT_EQ(strcmp(tmp.devices[2].hostname, "ASA-AUTOEN"), 0);
+    ASSERT_TRUE(tmp.devices[2].asa_auto_enable);
+    ASSERT_EQ(tmp.devices[2].enable_password[0], '\0');
+
+    /* The refusals outlive the log line: both live in state, with the
+     * reason, and the fleet listing reports them. */
+    ASSERT_EQ(tmp.rejected_count, 2);
+    ASSERT_EQ(strcmp(tmp.rejected[0].hostname, "ASA-NOENABLE"), 0);
+    ASSERT_EQ(strcmp(tmp.rejected[1].hostname, "ASA-BADTYPE"), 0);
+    ASSERT_TRUE(strstr(tmp.rejected[0].reason, "#14") != NULL);
+    ASSERT_EQ((int)tmp.rejected[1].vendor, (int)VIRP_VENDOR_CISCO_ASA);
 
     onode_destroy(&tmp);
     virp_context_destroy(tmp.ctx);
