@@ -42,6 +42,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_obskey.o \
              $(BUILD_DIR)/virp_chainsign.o \
              $(BUILD_DIR)/virp_ssh_io.o \
+             $(BUILD_DIR)/virp_body_filter.o \
              $(BUILD_DIR)/cJSON.o
 
 # Optional Cisco driver (requires libssh2)
@@ -255,6 +256,9 @@ $(BUILD_DIR)/cJSON.o: src/third_party/cJSON.c | $(BUILD_DIR)
 $(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/virp_body_filter.o: src/virp_body_filter.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/virp_chain.o: src/virp_chain.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -371,6 +375,16 @@ $(TEST_FG_SCRUB): tests/test_driver_fortigate_scrub.c \
 .PHONY: test-fg-scrub
 test-fg-scrub: $(TEST_FG_SCRUB)
 	./$(TEST_FG_SCRUB)
+
+# Collector-side body filter (allowlist + recorded removal, pre-chain)
+TEST_BODY_FILTER = $(BUILD_DIR)/test_body_filter
+
+$(TEST_BODY_FILTER): tests/test_body_filter.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-body-filter
+test-body-filter: $(TEST_BODY_FILTER)
+	./$(TEST_BODY_FILTER)
 
 # Cisco config credential scrubbing (show running-config GREEN gate)
 TEST_CISCO_SCRUB = $(BUILD_DIR)/test_driver_cisco_scrub
@@ -1814,7 +1828,7 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

@@ -40,6 +40,7 @@
 #include <openssl/evp.h>
 #include "cJSON.h"
 #include "virp_approval.h"
+#include "virp_body_filter.h"
 
 /* =========================================================================
  * JSON Request Parsing
@@ -1882,6 +1883,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * constructor appears above it — and which self-tests in both
      * directions, because a guard that cannot fail is the defect it
      * exists to catch. Do not move this marker to make the check pass. */
+    virp_body_filter_apply(drv->name, command, &result);
 
     /*
      * Failure with no output and NO proof of non-dispatch: the command
