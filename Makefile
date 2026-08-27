@@ -504,6 +504,7 @@ TEST_ASA_REFUSAL  = $(BUILD_DIR)/test_driver_asa_refusal
 TEST_CISCO_REFUSAL = $(BUILD_DIR)/test_driver_cisco_refusal
 TEST_JUNIPER_REFUSAL = $(BUILD_DIR)/test_driver_juniper_refusal
 TEST_FG_REFUSAL   = $(BUILD_DIR)/test_driver_fortigate_refusal
+TEST_PANOS_REFUSAL = $(BUILD_DIR)/test_driver_panos_refusal
 
 $(TEST_ASA_REFUSAL): tests/test_driver_asa_refusal.c tests/refusal_contract.h $(LIB)
 	rm -f $@
@@ -521,13 +522,19 @@ $(TEST_FG_REFUSAL): tests/test_driver_fortigate_refusal.c tests/refusal_contract
 	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -lcurl -o $@
 
+$(TEST_PANOS_REFUSAL): tests/test_driver_panos_refusal.c tests/refusal_contract.h $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+
 .PHONY: test-refusal-contract
 test-refusal-contract: $(TEST_ASA_REFUSAL) $(TEST_CISCO_REFUSAL) \
-                       $(TEST_JUNIPER_REFUSAL) $(TEST_FG_REFUSAL)
+                       $(TEST_JUNIPER_REFUSAL) $(TEST_FG_REFUSAL) \
+                       $(TEST_PANOS_REFUSAL)
 	./$(TEST_ASA_REFUSAL)
 	./$(TEST_CISCO_REFUSAL)
 	./$(TEST_JUNIPER_REFUSAL)
 	./$(TEST_FG_REFUSAL)
+	./$(TEST_PANOS_REFUSAL)
 
 # Chain and Federation tests
 TEST_CHAIN = $(BUILD_DIR)/test_chain

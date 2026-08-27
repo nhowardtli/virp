@@ -49,6 +49,148 @@ Two further defences are worth stating explicitly:
 - Issues requiring physical access to the host machine
 - Social engineering
 
+## Current State — Status Index (introduced 2026-08-27)
+
+Every tracked security item carries exactly one of four statuses. The
+narrative sections below (audits, reviews, corrections) are the record
+of how each item was found and argued; THIS index is the current state,
+and is expected to resolve against the tree and the running deployment
+on the date it carries. The evidence tags in §Scope ([tested],
+[untested], …) are orthogonal: they say what backs a defence, not
+whether an item is resolved.
+
+- **FIXED** — in `main` AND in the running production binary, with
+  commit ref.
+- **FIXED, NOT DEPLOYED** — in `main`, not yet in the running
+  production binary. The fix deploys with the next rebuild/restart; the
+  defect still applies to the deployed daemon. (Supersedes the older
+  "[fixed in branch, undeployed]" tag in §Scope for current-state
+  tracking.)
+- **OPEN** — confirmed present, not yet fixed, stated in its honest
+  current shape.
+- **OBSOLETE, RETAINED FOR HISTORY** — the item text elsewhere in this
+  file (or in the repo's dated records) describes a state that no
+  longer exists; the entry here points at the commit that closed it.
+  History is reclassified and referenced, never deleted.
+
+**Deployment boundary as of 2026-08-27:** the running production
+binaries report build `482d8a52` (daemon restarted 2026-08-27 16:54
+UTC). Everything merged to `main` after `482d8a52` is FIXED, NOT
+DEPLOYED until the next rebuild.
+
+### FIXED
+
+- Audit §4.1 — sign_intent/sign_outcome signing oracle. Deployed
+  2026-08-01 (`b6e9602c`).
+- Audit §4.3 — FortiGate `execute backup` YELLOW → RED. Deployed
+  2026-08-01.
+- Audit §4.4 — non-constant-time digest/MAC compares. Deployed
+  2026-08-01.
+- Audit §4.5 — chain range completeness + signed per-session head.
+  Deployed 2026-08-01.
+- Audit §4.8 — proxmox driver had no classifier (everything
+  UNCLASSIFIED). Closed by `8bdfe3f9` (proxmox wired to the shared
+  linux/FRR classifier, `src/drivers/driver_linux.c`); in the running
+  binary.
+- node_id == 0 device-binding degeneracy (the sub-claim inside audit
+  §4.6): the daemon now REFUSES node_id 0 at load (`5bbbacfe`) and
+  every fleet device carries a unique node_id (`b733153d`); deployed
+  2026-08-16 (`a3752e18` restart). The REST of §4.6 stays OPEN below.
+- linux/proxmox driver-level BLACK backstop independent of gate mode
+  (`3ef712fc`); driver refusal contract — refusals declare non-dispatch
+  and are never recorded as executions (`f48360c1`); both in the
+  running binary.
+
+### FIXED, NOT DEPLOYED
+
+- ASA device with no enable credential refused at config load; refused
+  entries reported in fleet listings (PR #15: `b53fbf05`, `f1737806`,
+  merged `4dbfb67b`).
+- Collector-side allowlist body filtering is IN the running binary
+  (`482d8a52` is the running build); listed here as the boundary
+  marker: every merge after it awaits the next rebuild.
+- Audit §4.7 — **BLACK is unconditional in the gate** (branch
+  `fix/black-unconditional`, this repository's HEAD once merged).
+  The gate previously refused BLACK only under
+  `mode == GATE_MODE_ENFORCE`; under SHADOW a BLACK verdict was logged
+  and the command proceeded to the driver. The gate now refuses BLACK
+  BEFORE any mode check: SHADOW still observes what enforcement would
+  have done for GREEN/YELLOW/RED/UNCLASSIFIED (that is its purpose),
+  but it can never turn inexpressible into executable. The refusal is
+  persisted as the same gate_rejection/1 chain entry an ENFORCE
+  refusal writes, now with a `gate_mode` field naming the mode that
+  refused. Invariant test:
+  `test_shadow_black_refused_recorded_driver_never_invoked`
+  (`tests/test_onode.c`).
+- PAN-OS BLACK deny table + driver-level backstop, and the broad
+  YELLOW verbs (`debug`, `test`, `less`, `tail`) replaced by
+  enumerated known-safe forms (same branch). PAN-OS destructive
+  operations (commit / load / scp+tftp import / delete /
+  request restart|shutdown system / private-data-reset / raid) now
+  classify BLACK — unapprovable, refused in both gate modes — and
+  `pa_execute` refuses them again driver-side under the refusal
+  contract. **PAN-OS remains the least-mature driver: this change
+  narrows exposure but does not make it enforcement-equal to Cisco or
+  FortiGate.**
+
+### OPEN
+
+- Audit §4.2 — an ABBREVIATED BLACK command falls through to RED
+  (approvable) because BLACK matching is a literal full-token prefix
+  compare with no abbreviation expansion, at the gate and in every
+  driver backstop alike. Whether a given device accepts a given
+  abbreviation is not provable from this tree.
+- Audit §4.6 (core) — the approval signature does not cover the
+  `device` hostname string; verification compares the UNSIGNED string.
+  The signed binding is `device_node_id` — no longer degenerate (see
+  FIXED above), so the practical exposure is narrowed, but the
+  signature still does not say what the comments in
+  `src/virp_approval.c` claim. Fixing it means widening the signed
+  canonical — approval-identity binding is pending that format window.
+- Execution intent (gate_execution/2, three-valued `executed`):
+  an undeclared `!success` driver result still resolves to
+  `executed:true` and is signed as DEVICE_OUTPUT. Tracked by the two
+  deliberately-PENDING tests in `tests/test_onode.c`
+  (`test_refusal_with_body_is_not_an_execution`,
+  `test_refusal_with_body_is_not_recorded_executed`). No shipping
+  driver emits that shape today (all declare non-dispatch since
+  `f48360c1`); the O-Node itself is what remains to be held to
+  account.
+- Audit §4.5 residual — a mid-walk SQLite error is reported as "chain
+  truncated" rather than as a database error (fail-closed; diagnostic
+  defect, non-security).
+- TCP-path mutual authentication (mTLS or request-side signing) —
+  see §Trust Boundaries.
+- Command-gate scope limits by design (single command per request, no
+  display filters, no multi-line config transactions) — see §Command
+  Gate for the honest shape and intended future forms.
+
+### OBSOLETE, RETAINED FOR HISTORY
+
+- "The proxmox driver has no classifier" (audit §4.8 text below) —
+  true when written; closed by `8bdfe3f9`. Retained unedited in the
+  audit section as the record of the finding.
+- "5 of 7 devices load node_id == 0" (inside audit §4.6 text below) —
+  true when written; closed by `5bbbacfe` (load-time refusal) and
+  `b733153d` (unique fleet node_ids), deployed `a3752e18`.
+- "SHADOW mode does not honour BLACK" as a LATENT defect note (audit
+  §4.7 text below) — the code fact was re-confirmed on 2026-08-27
+  HEAD before fixing; fixed on `fix/black-unconditional` (see FIXED,
+  NOT DEPLOYED). The audit text stands as the record.
+- The old systemd unit trust-chain notes (units executing paths out of
+  the working tree; install procedure existing only as memory) — those
+  notes live in the repo's deploy records, not in this file; closed by
+  `32dd710f` (install procedure as code: install-prod / install-units
+  / rollback-prod, every Exec* path an installed artifact) and
+  `3a5d741a` + `make check-deploy-unit` / `check-unit-drift`
+  (installed units compared against tracked ones, structurally).
+- The per-caller policy TODO in §Trust Boundaries ("NOT implemented",
+  all-or-nothing submit) — superseded 2026-08-09/11 by per-uid tier
+  ceilings (`5841ec71`, `socket_uid_tier_ceilings`) and per-uid action
+  allowlists (`socket_uid_action_allow`), both enforced at SO_PEERCRED
+  and live in the production config; see the dated correction at that
+  TODO.
+
 ## Socket Peer Authentication
 
 The O-Node Unix domain socket is gated by `SO_PEERCRED` (Linux). VIRP
@@ -175,6 +317,18 @@ follow-up hardening.
 > invariant "v1 EXECUTE requires no session" is an absence, which is
 > awkward to grep-assert without pinning internals; a positive test that
 > a submit succeeds with no prior handshake is the right future hook.)*
+
+> **Corrected 2026-08-27 — the per-caller control now EXISTS.** The
+> TODO above was written before 2026-08-09 and stood after the
+> plumbing landed. `5841ec71` added per-uid tier ceilings
+> (`socket_uid_tier_ceilings`: the SO_PEERCRED uid's effective gate
+> ceiling is TIGHTENED, never raised — the netclaw remote identity is
+> pinned to GREEN in the production config), and Item 8 (2026-08-11)
+> added per-uid action allowlists (`socket_uid_action_allow`,
+> fail-closed on malformed entries). "Capping remotely-sourced
+> operations at GREEN" — the exact example above — is what production
+> runs today. The TODO text is retained unedited as the record;
+> corrected here in the house style rather than silently rewritten.
 
 ## Ed25519 Observation Signing (added 2026-08-07)
 
@@ -1173,6 +1327,18 @@ the audit referred to a different tree and did not all transfer.
   the range demands — so it is a diagnostic defect, not an integrity
   one: the operator is told "chain truncated" when the real cause was a
   database error. *[open, non-security]*
+
+> **Status update 2026-08-27.** This list is the audit record and is
+> left as written; current state now lives in §Current State — Status
+> Index. Since the audit: §4.7 (SHADOW does not honour BLACK) was
+> re-confirmed on HEAD and fixed on `fix/black-unconditional` — BLACK
+> is refused before any mode check, in both modes, with the refusal
+> persisted; §4.8 (proxmox no classifier) was closed by `8bdfe3f9`;
+> the PAN-OS item was closed on the same branch as §4.7 (BLACK deny
+> table + driver backstop; broad YELLOW verbs replaced by enumerated
+> safe forms); §4.6's node_id==0 degeneracy was closed by `5bbbacfe`
+> + `b733153d` while §4.6's core (unsigned `device` string) and §4.2
+> (abbreviation fallthrough) remain OPEN.
 
 ## External Review — 2026-08-02
 

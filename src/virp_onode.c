@@ -627,9 +627,9 @@ static virp_conn_t *get_connection(onode_state_t *state, int dev_idx)
  * execution. It classifies the command via the driver's optional
  * route_command() hook and compares the result to state->gate_max_tier.
  *
- * SHADOW mode logs the decision and proceeds. ENFORCE mode hard-rejects
- * over-tier and UNCLASSIFIED commands. The GREEN-hardcoded response tier
- * and rejection persistence are deliberately out of scope here (Phase C).
+ * BLACK is refused UNCONDITIONALLY, in both modes — inexpressible is not
+ * mode-dependent. For every other tier: SHADOW logs the decision and
+ * proceeds; ENFORCE hard-rejects over-tier and UNCLASSIFIED commands.
  * ========================================================================= */
 
 static const char *gate_tier_name(virp_trust_tier_t t)
@@ -1296,6 +1296,244 @@ static void approval_proposer_id(onode_state_t *state, int obs_version,
     snprintf(out, out_len, "unauthenticated-v1");
 }
 
+/* =========================================================================
+ * Gate refusal — shared by BOTH refusal sites in onode_execute_obs_ex():
+ * the unconditional BLACK branch (any mode) and the ENFORCE over-tier /
+ * unclassified branch. Files the escalation proposal when the tier
+ * allows one (never for BLACK), persists the gate_rejection/1 chain
+ * entry, logs, and builds the signed ERROR observation.
+ *
+ * `mode` is recorded in the chain body (gate_mode, additive to schema
+ * gate_rejection/1 — the same field gate_execution/1 has carried from
+ * the start): a BLACK refused under SHADOW must read as exactly that —
+ * the same entry shape an ENFORCE refusal writes, plus which mode
+ * refused — so the chain shows the attempt instead of leaving its
+ * absence to be inferred.
+ *
+ * Caller must have RELEASED exec_mutex[dev_idx] first: this path does
+ * no device I/O and must not hold the per-device execution lock across
+ * chain writes.
+ * ========================================================================= */
+static virp_error_t gate_refuse_obs(onode_state_t *state,
+                                    const char *device_name,
+                                    int dev_idx,
+                                    const virp_driver_t *drv,
+                                    const char *command,
+                                    virp_trust_tier_t gate_tier,
+                                    virp_trust_tier_t eff_max,
+                                    onode_gate_mode_t mode,
+                                    uid_t client_uid,
+                                    int obs_version,
+                                    uint8_t *out_buf, size_t out_buf_len,
+                                    size_t *out_len)
+{
+    char err_msg[448];
+    snprintf(err_msg, sizeof(err_msg),
+             "ERROR: tier gate blocked '%s' on '%s' "
+             "(tier=%s max=%s)",
+             command, device_name, gate_tier_name(gate_tier),
+             gate_tier_name(eff_max));
+
+    /* Classifier-supplied instructive reason (optional hook):
+     * appended before the proposal_id so the rejection payload
+     * teaches the escalation path, not just the tier math. */
+    if (drv->route_reason) {
+        const char *why = drv->route_reason(command);
+        if (why) {
+            size_t off = strlen(err_msg);
+            snprintf(err_msg + off, sizeof(err_msg) - off,
+                     " reason: %s", why);
+        }
+    }
+
+    /*
+     * PROPOSE: file a signed proposal so a human can escalate
+     * this exact command via `virp approve`. Best-effort — a
+     * proposal failure never weakens the rejection — and never
+     * offered for BLACK: inexpressible has no escalation path.
+     */
+    if (state->approval_dir[0] && gate_tier != VIRP_TIER_BLACK) {
+        char proposer[80];
+        approval_proposer_id(state, obs_version, proposer,
+                             sizeof(proposer));
+        virp_proposal_rec_t prop;
+        virp_error_t perr = virp_approval_propose(
+                state->approval_dir,
+                state->chain_enabled ? &state->chain : NULL,
+                proposer, device_name,
+                state->devices[dev_idx].node_id,
+                command,
+                onode_typed_profile(state, dev_idx),
+                proposer, gate_tier_name(gate_tier),
+                &prop);
+        if (perr == VIRP_OK) {
+            size_t off = strlen(err_msg);
+            snprintf(err_msg + off, sizeof(err_msg) - off,
+                     " proposal_id=%s", prop.proposal_id);
+            fprintf(stderr, "[GATE] proposal filed: proposal=%s "
+                    "device=%s tier=%s chain=%.16s\n",
+                    prop.proposal_id, device_name,
+                    gate_tier_name(gate_tier),
+                    prop.chain_entry_hash[0] ? prop.chain_entry_hash
+                                             : "-");
+        } else {
+            fprintf(stderr, "[GATE] proposal filing failed: %s\n",
+                    virp_error_str(perr));
+        }
+    }
+
+    /* Phase C — rejection persistence: write a durable, HMAC-signed
+     * entry to the trust chain via the same append path the AI
+     * layer uses, so a refused command leaves an auditable record.
+     * Best-effort: a chain failure must not alter the rejection.
+     * Runs for EVERY gate refusal — ENFORCE blocks and the
+     * unconditional BLACK refusal under SHADOW alike (before the
+     * BLACK branch existed, this code was dormant under SHADOW).
+     * NOTE: virp_chain_append serializes writes with BEGIN
+     * IMMEDIATE but shares prepared statements with the AI-path
+     * chain_append handler; a dedicated chain mutex shared by both
+     * paths is the proper hardening before high-concurrency enforce. */
+    if (state->chain_enabled) {
+        /*
+         * Reason RETENTION. The entry commits to sha256(body) as
+         * before, but the body is now STORED, so the reason is
+         * recoverable from the chain alone instead of only from
+         * the daemon journal. Before this, an evidence report
+         * could prove a block happened and commit to its reason
+         * but could not show the reason.
+         *
+         * Body is a structured object (schema gate_rejection/1):
+         * device, driver, command, classified tier, gate max
+         * tier, the classifier's matched rule when it supplied
+         * one, and the exact human-readable message — the same
+         * text the signed ERROR observation carries as its
+         * payload, so the chain body and the O-Key-signed
+         * observation agree by construction.
+         *
+         * Binding: the body is committed to by artifact_hash,
+         * which is itself covered by the entry's chain HMAC. The
+         * body is HMAC-bound through the entry, not directly
+         * O-Key-signed; the O-Key-signed copy of the same text
+         * is the ERROR observation returned to the caller.
+         *
+         * RETENTION SENSITIVITY (reviewed 2026-07-30): a
+         * classification reason is metadata — tiers, rule names,
+         * device and driver names — and carries no credential.
+         * The one field that can carry caller-supplied content is
+         * `command`, and a blocked write attempt can legitimately
+         * contain a secret the caller typed (e.g. an attempted
+         * "username x secret y"). That text is NOT newly exposed
+         * by this change: it already goes to the journal, is
+         * already the payload of the signed ERROR observation
+         * returned to the caller, and was already hashed into
+         * this entry. What does change is durability and reach —
+         * chain.db is permanent where the journal rotates, and it
+         * is group-readable under /var/lib/virp (0750 virp:virp),
+         * so group `virp` members can read attempted command
+         * text. Retained deliberately: an audit record of a
+         * refused command that omits the command is not an audit
+         * record. If a deployment cannot accept that, scrub at
+         * the caller — never here, where scrubbing would break
+         * the observation/chain agreement above.
+         */
+        char session_id[96];
+        snprintf(session_id, sizeof(session_id),
+                 "gate-enforce:%s", device_name);
+
+        const char *matched = drv->route_reason
+                            ? drv->route_reason(command) : NULL;
+
+        /* cJSON does the escaping: command text is arbitrary and
+         * must never be pasted into JSON by hand. */
+        char *body = NULL;
+        cJSON *o = cJSON_CreateObject();
+        if (o) {
+            cJSON_AddStringToObject(o, "schema", "gate_rejection/1");
+            cJSON_AddStringToObject(o, "device", device_name);
+            cJSON_AddStringToObject(o, "driver", drv->name);
+            cJSON_AddStringToObject(o, "command", command);
+            cJSON_AddStringToObject(o, "classified_tier",
+                                    gate_tier_name(gate_tier));
+            /* gate_max_tier is the NODE-WIDE ceiling; on its own it
+             * misreads a per-uid refusal (a YELLOW-classified command
+             * refused under a GREEN per-uid ceiling looks like it
+             * should have passed a YELLOW node-wide max). Record the
+             * ceiling that ACTUALLY fired (eff_max) and where it
+             * came from, so the chain body explains the decision by
+             * itself. */
+            cJSON_AddStringToObject(o, "gate_max_tier",
+                                    gate_tier_name(state->gate_max_tier));
+            cJSON_AddStringToObject(o, "effective_max_tier",
+                                    gate_tier_name(eff_max));
+            cJSON_AddStringToObject(o, "ceiling_source",
+                                    onode_ceiling_source(state, client_uid));
+            /* Which mode refused. ENFORCE entries read exactly as
+             * before plus this field; a SHADOW entry can only be a
+             * BLACK refusal — the one verdict SHADOW does not
+             * observe-and-admit. */
+            cJSON_AddStringToObject(o, "gate_mode",
+                                    mode == GATE_MODE_ENFORCE ? "ENFORCE"
+                                                              : "SHADOW");
+            if (matched)
+                cJSON_AddStringToObject(o, "matched_rule", matched);
+            else
+                cJSON_AddNullToObject(o, "matched_rule");
+            cJSON_AddStringToObject(o, "message", err_msg);
+            cJSON_AddBoolToObject(o, "executed", false);
+            body = cJSON_PrintUnformatted(o);
+            cJSON_Delete(o);
+        }
+
+        /* Commit to the body actually stored. If the body could
+         * not be built, fall back to the historical
+         * commit-to-message behaviour rather than losing the
+         * entry — a rejection must always be recorded. */
+        char artifact_hash[65];
+        const char *commit_src = body ? body : err_msg;
+        gate_sha256_hex(commit_src, strlen(commit_src), artifact_hash);
+        char artifact_id[64];
+        snprintf(artifact_id, sizeof(artifact_id),
+                 "gatereject-%.16s", artifact_hash);
+
+        /* Entry and body are one transaction now: a stored
+         * rejection always has its reason recoverable, and a
+         * body-store failure fails the whole append (logged
+         * below) instead of stranding a commitment. The
+         * body==NULL fallback keeps the historical entry-only
+         * append — a rejection must always be recorded even
+         * when its body could not be built. */
+        virp_chain_entry_t ce;
+        virp_error_t cerr = virp_chain_append_with_artifact(
+                                &state->chain, session_id,
+                                "gate_rejection", artifact_id,
+                                artifact_hash, body, &ce);
+        if (cerr == VIRP_OK) {
+            if (!body)
+                fprintf(stderr, "[GATE] rejection reason body could "
+                        "not be built; entry %s retains only the "
+                        "commitment\n", artifact_id);
+            fprintf(stderr, "[GATE] rejection persisted: session=%s "
+                    "seq=%lld hash=%.16s\n", session_id,
+                    (long long)ce.sequence, ce.chain_entry_hash);
+        } else {
+            fprintf(stderr, "[GATE] rejection chain append+store "
+                    "failed: %s\n", virp_error_str(cerr));
+        }
+
+        if (body) free(body);
+    }
+
+    log_error_obs(device_name, gate_tier, err_msg);
+    return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                  state->devices[dev_idx].node_id,
+                                  onode_next_seq(state),
+                                  VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                  gate_obs_tier(gate_tier),
+                                  (const uint8_t *)err_msg,
+                                  (uint16_t)strlen(err_msg),
+                                  &state->okey);
+}
+
 virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                   const char *device_name,
                                   const char *command,
@@ -1454,8 +1692,10 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
 
     /* ── Tier-enforcement gate (Phase B/C) ────────────────────────────
      * Classify at the boundary, decide allow/block against the configured
-     * max tier, and log. SHADOW logs and proceeds; ENFORCE hard-rejects
-     * over-tier / unclassified commands before the driver runs. The
+     * max tier, and log. BLACK is refused unconditionally in BOTH modes;
+     * for every other tier SHADOW logs and proceeds while ENFORCE
+     * hard-rejects over-tier / unclassified commands before the driver
+     * runs. The
      * classified tier (computed above, before the connection attempt) is
      * function-scoped so the success observation below can be stamped
      * with it (Phase C truth-fix). */
@@ -1476,6 +1716,8 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         /* ENFORCE states what it did; only SHADOW speaks hypothetically.
          * The old unconditional "would-block"/"would-allow" wording made
          * an ENFORCE rejection read like a logged-but-executed change.
+         * BLACK logs "block" in BOTH modes — its refusal below is
+         * unconditional, so there is nothing hypothetical to report.
          * threshold= reports the EFFECTIVE ceiling (post per-uid tighten)
          * so the log shows what actually decided this connection. */
         fprintf(stderr,
@@ -1486,10 +1728,35 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                 gate_tier_name(gate_tier),
                 gate_tier_name(eff_max),
                 (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
-                mode == GATE_MODE_ENFORCE
+                (gate_tier == VIRP_TIER_BLACK) ? "block"
+                : mode == GATE_MODE_ENFORCE
                     ? (block ? "block" : "allow")
                     : (block ? "would-block" : "would-allow"),
                 command);
+
+        /* ── BLACK: refuse, always. ───────────────────────────────────
+         * BLACK means inexpressible, and inexpressible is not
+         * mode-dependent. SHADOW exists to OBSERVE what enforcement
+         * would have done for GREEN, YELLOW, RED and UNCLASSIFIED — it
+         * must never turn inexpressible into executable. This branch
+         * therefore runs BEFORE any mode check, and before the
+         * approval-apply path below: BLACK is unapprovable, so an
+         * apply reference on a BLACK command is not even examined (and
+         * its approval, if one somehow exists, is not consumed). The
+         * refusal is recorded exactly like an ENFORCE rejection — same
+         * gate_rejection/1 entry, with gate_mode naming the mode that
+         * refused — so the chain shows a BLACK was attempted and
+         * refused under SHADOW rather than leaving that to be inferred
+         * from an absence. Several drivers carry their own BLACK
+         * backstop in execute(); this branch is what makes the
+         * guarantee driver-independent (PAN-OS had no backstop). */
+        if (gate_tier == VIRP_TIER_BLACK) {
+            pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+            return gate_refuse_obs(state, device_name, dev_idx, drv,
+                                   command, gate_tier, eff_max, mode,
+                                   client_uid, obs_version,
+                                   out_buf, out_buf_len, out_len);
+        }
 
         if (mode == GATE_MODE_ENFORCE && block &&
             proposal_id && proposal_id[0]) {
@@ -1502,16 +1769,15 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
              * verifies nothing (fail closed).
              */
             /*
-             * BLACK is unapprovable BY DESIGN and this check runs before
-             * any signature work, so a classifier that returns BLACK
-             * makes its commands permanently un-escalatable: the
-             * propose→approve→apply path dead-ends for exactly the
-             * commands most likely to need a human. Driver tables are
-             * therefore expected to top out at RED (blocked, but
-             * approvable). The linux/FRR table is pinned to that by
-             * test_never_returns_black() in
-             * tests/test_driver_linux_gate.c; any new table should carry
-             * the same invariant test.
+             * BLACK is unapprovable BY DESIGN, and the unconditional
+             * BLACK branch above refuses before this apply path can
+             * run — the TIER_VIOLATION arm below is a retained belt,
+             * not the primary refusal. The consequence stands: a
+             * classifier that returns BLACK makes its commands
+             * permanently un-escalatable (the propose→approve→apply
+             * path dead-ends), which is the intent for the
+             * destructive never-tier; anything merely dangerous
+             * belongs in RED (blocked, but approvable).
              */
             virp_error_t aerr;
             if (gate_tier == VIRP_TIER_BLACK)
@@ -1564,208 +1830,16 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             }
         } else if (mode == GATE_MODE_ENFORCE && block) {
             pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
-            char err_msg[448];
-            snprintf(err_msg, sizeof(err_msg),
-                     "ERROR: tier gate blocked '%s' on '%s' "
-                     "(tier=%s max=%s)",
-                     command, device_name, gate_tier_name(gate_tier),
-                     gate_tier_name(eff_max));
-
-            /* Classifier-supplied instructive reason (optional hook):
-             * appended before the proposal_id so the rejection payload
-             * teaches the escalation path, not just the tier math. */
-            if (drv->route_reason) {
-                const char *why = drv->route_reason(command);
-                if (why) {
-                    size_t off = strlen(err_msg);
-                    snprintf(err_msg + off, sizeof(err_msg) - off,
-                             " reason: %s", why);
-                }
-            }
-
-            /*
-             * PROPOSE: file a signed proposal so a human can escalate
-             * this exact command via `virp approve`. Best-effort — a
-             * proposal failure never weakens the rejection — and never
-             * offered for BLACK. The rejection payload carries the
-             * proposal_id so the caller can capture it.
-             */
-            if (state->approval_dir[0] && gate_tier != VIRP_TIER_BLACK) {
-                char proposer[80];
-                approval_proposer_id(state, obs_version, proposer,
-                                     sizeof(proposer));
-                virp_proposal_rec_t prop;
-                virp_error_t perr = virp_approval_propose(
-                        state->approval_dir,
-                        state->chain_enabled ? &state->chain : NULL,
-                        proposer, device_name,
-                        state->devices[dev_idx].node_id,
-                        command,
-                        onode_typed_profile(state, dev_idx),
-                        proposer, gate_tier_name(gate_tier),
-                        &prop);
-                if (perr == VIRP_OK) {
-                    size_t off = strlen(err_msg);
-                    snprintf(err_msg + off, sizeof(err_msg) - off,
-                             " proposal_id=%s", prop.proposal_id);
-                    fprintf(stderr, "[GATE] proposal filed: proposal=%s "
-                            "device=%s tier=%s chain=%.16s\n",
-                            prop.proposal_id, device_name,
-                            gate_tier_name(gate_tier),
-                            prop.chain_entry_hash[0] ? prop.chain_entry_hash
-                                                     : "-");
-                } else {
-                    fprintf(stderr, "[GATE] proposal filing failed: %s\n",
-                            virp_error_str(perr));
-                }
-            }
-
-            /* Phase C — rejection persistence: write a durable, HMAC-signed
-             * entry to the trust chain via the same append path the AI
-             * layer uses, so a refused command leaves an auditable record.
-             * Best-effort: a chain failure must not alter the rejection.
-             * DORMANT under SHADOW — this branch runs only in ENFORCE.
-             * NOTE: virp_chain_append serializes writes with BEGIN
-             * IMMEDIATE but shares prepared statements with the AI-path
-             * chain_append handler; a dedicated chain mutex shared by both
-             * paths is the proper hardening before high-concurrency enforce. */
-            if (state->chain_enabled) {
-                /*
-                 * Reason RETENTION. The entry commits to sha256(body) as
-                 * before, but the body is now STORED, so the reason is
-                 * recoverable from the chain alone instead of only from
-                 * the daemon journal. Before this, an evidence report
-                 * could prove a block happened and commit to its reason
-                 * but could not show the reason.
-                 *
-                 * Body is a structured object (schema gate_rejection/1):
-                 * device, driver, command, classified tier, gate max
-                 * tier, the classifier's matched rule when it supplied
-                 * one, and the exact human-readable message — the same
-                 * text the signed ERROR observation carries as its
-                 * payload, so the chain body and the O-Key-signed
-                 * observation agree by construction.
-                 *
-                 * Binding: the body is committed to by artifact_hash,
-                 * which is itself covered by the entry's chain HMAC. The
-                 * body is HMAC-bound through the entry, not directly
-                 * O-Key-signed; the O-Key-signed copy of the same text
-                 * is the ERROR observation returned to the caller.
-                 *
-                 * RETENTION SENSITIVITY (reviewed 2026-07-30): a
-                 * classification reason is metadata — tiers, rule names,
-                 * device and driver names — and carries no credential.
-                 * The one field that can carry caller-supplied content is
-                 * `command`, and a blocked write attempt can legitimately
-                 * contain a secret the caller typed (e.g. an attempted
-                 * "username x secret y"). That text is NOT newly exposed
-                 * by this change: it already goes to the journal, is
-                 * already the payload of the signed ERROR observation
-                 * returned to the caller, and was already hashed into
-                 * this entry. What does change is durability and reach —
-                 * chain.db is permanent where the journal rotates, and it
-                 * is group-readable under /var/lib/virp (0750 virp:virp),
-                 * so group `virp` members can read attempted command
-                 * text. Retained deliberately: an audit record of a
-                 * refused command that omits the command is not an audit
-                 * record. If a deployment cannot accept that, scrub at
-                 * the caller — never here, where scrubbing would break
-                 * the observation/chain agreement above.
-                 */
-                char session_id[96];
-                snprintf(session_id, sizeof(session_id),
-                         "gate-enforce:%s", device_name);
-
-                const char *matched = drv->route_reason
-                                    ? drv->route_reason(command) : NULL;
-
-                /* cJSON does the escaping: command text is arbitrary and
-                 * must never be pasted into JSON by hand. */
-                char *body = NULL;
-                cJSON *o = cJSON_CreateObject();
-                if (o) {
-                    cJSON_AddStringToObject(o, "schema", "gate_rejection/1");
-                    cJSON_AddStringToObject(o, "device", device_name);
-                    cJSON_AddStringToObject(o, "driver", drv->name);
-                    cJSON_AddStringToObject(o, "command", command);
-                    cJSON_AddStringToObject(o, "classified_tier",
-                                            gate_tier_name(gate_tier));
-                    /* gate_max_tier is the NODE-WIDE ceiling; on its own it
-                     * misreads a per-uid refusal (a YELLOW-classified command
-                     * refused under a GREEN per-uid ceiling looks like it
-                     * should have passed a YELLOW node-wide max). Record the
-                     * ceiling that ACTUALLY fired (gate_eff_max) and where it
-                     * came from, so the chain body explains the decision by
-                     * itself. */
-                    cJSON_AddStringToObject(o, "gate_max_tier",
-                                            gate_tier_name(state->gate_max_tier));
-                    cJSON_AddStringToObject(o, "effective_max_tier",
-                                            gate_tier_name(gate_eff_max));
-                    cJSON_AddStringToObject(o, "ceiling_source",
-                                            onode_ceiling_source(state, client_uid));
-                    if (matched)
-                        cJSON_AddStringToObject(o, "matched_rule", matched);
-                    else
-                        cJSON_AddNullToObject(o, "matched_rule");
-                    cJSON_AddStringToObject(o, "message", err_msg);
-                    cJSON_AddBoolToObject(o, "executed", false);
-                    body = cJSON_PrintUnformatted(o);
-                    cJSON_Delete(o);
-                }
-
-                /* Commit to the body actually stored. If the body could
-                 * not be built, fall back to the historical
-                 * commit-to-message behaviour rather than losing the
-                 * entry — a rejection must always be recorded. */
-                char artifact_hash[65];
-                const char *commit_src = body ? body : err_msg;
-                gate_sha256_hex(commit_src, strlen(commit_src), artifact_hash);
-                char artifact_id[64];
-                snprintf(artifact_id, sizeof(artifact_id),
-                         "gatereject-%.16s", artifact_hash);
-
-                /* Entry and body are one transaction now: a stored
-                 * rejection always has its reason recoverable, and a
-                 * body-store failure fails the whole append (logged
-                 * below) instead of stranding a commitment. The
-                 * body==NULL fallback keeps the historical entry-only
-                 * append — a rejection must always be recorded even
-                 * when its body could not be built. */
-                virp_chain_entry_t ce;
-                virp_error_t cerr = virp_chain_append_with_artifact(
-                                        &state->chain, session_id,
-                                        "gate_rejection", artifact_id,
-                                        artifact_hash, body, &ce);
-                if (cerr == VIRP_OK) {
-                    if (!body)
-                        fprintf(stderr, "[GATE] rejection reason body could "
-                                "not be built; entry %s retains only the "
-                                "commitment\n", artifact_id);
-                    fprintf(stderr, "[GATE] rejection persisted: session=%s "
-                            "seq=%lld hash=%.16s\n", session_id,
-                            (long long)ce.sequence, ce.chain_entry_hash);
-                } else {
-                    fprintf(stderr, "[GATE] rejection chain append+store "
-                            "failed: %s\n", virp_error_str(cerr));
-                }
-
-                if (body) free(body);
-            }
-
-            log_error_obs(device_name, gate_tier, err_msg);
-            return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
-                                          state->devices[dev_idx].node_id,
-                                          onode_next_seq(state),
-                                          VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
-                                          gate_obs_tier(gate_tier),
-                                          (const uint8_t *)err_msg,
-                                          (uint16_t)strlen(err_msg),
-                                          &state->okey);
+            return gate_refuse_obs(state, device_name, dev_idx, drv,
+                                   command, gate_tier, eff_max, mode,
+                                   client_uid, obs_version,
+                                   out_buf, out_buf_len, out_len);
         }
     }
 
     /* Admitted by the gate above — allowed, an approved apply, or a
-     * SHADOW would-block that proceeds. ONLY NOW connect (L1): the gate
+     * SHADOW would-block (never BLACK) that proceeds. ONLY NOW connect
+     * (L1): the gate
      * decision above never touched the device, so a refused request cost
      * nothing on the wire. */
     virp_conn_t *conn = get_connection(state, dev_idx);

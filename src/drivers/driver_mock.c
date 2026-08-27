@@ -445,11 +445,21 @@ static virp_error_t mock_health_check(virp_conn_t *conn)
  * driver under the fail-closed ENFORCE default: read-only commands are
  * GREEN, state-changing ones YELLOW, destructive ones RED, anything
  * unrecognized stays UNCLASSIFIED (blocked under ENFORCE).
+ *
+ * "selfdestruct" is BLACK: it exists so the gate's unconditional-BLACK
+ * invariant can be tested through a driver that has NO BLACK backstop
+ * of its own in execute() — if the gate ever admits a BLACK command in
+ * any mode, mock_execute runs it and the invariant test sees the leak
+ * directly instead of a driver belt masking it. Do not add a BLACK
+ * refusal to mock_execute.
  */
 static virp_trust_tier_t mock_route_command(const char *command)
 {
     if (!command) return VIRP_TIER_UNCLASSIFIED;
     while (*command == ' ' || *command == '\t') command++;
+
+    if (strncmp(command, "selfdestruct", 12) == 0)
+        return VIRP_TIER_BLACK;
 
     if (strncmp(command, "show ", 5) == 0 ||
         strcmp(command, "show") == 0 ||

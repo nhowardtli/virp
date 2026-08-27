@@ -3819,6 +3819,231 @@ TEST(test_chain_verify_over_mixed_executions_and_rejections)
 }
 
 /* =========================================================================
+ * BLACK is unconditional (2026-08-27)
+ *
+ * BLACK means inexpressible, and inexpressible is not mode-dependent.
+ * SHADOW observes what enforcement would have done for GREEN, YELLOW,
+ * RED and UNCLASSIFIED — that is its purpose — but it must never turn
+ * inexpressible into executable. The gate refuses BLACK BEFORE any mode
+ * check (virp_onode.c, "BLACK: refuse, always"), records the refusal
+ * with the SAME gate_rejection/1 entry an ENFORCE refusal writes (plus
+ * gate_mode naming the mode that refused), and the driver is never
+ * invoked.
+ *
+ * The mock driver classifies "selfdestruct" BLACK and deliberately has
+ * NO BLACK backstop in execute(), so these tests probe the gate alone:
+ * if the gate ever admits BLACK, the mock executes it and the leak is
+ * caught directly instead of being masked by a driver-level belt (the
+ * pre-fix production shape: PAN-OS had no backstop either).
+ * ========================================================================= */
+
+/* BLACK under ENFORCE: refused at the gate, driver never invoked. */
+TEST(test_black_enforce_refused_at_gate)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+    st.gate_max_tier = VIRP_TIER_RED;    /* even the widest ceiling */
+
+    virp_driver_mock_exec_attempts_reset();
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "selfdestruct now",
+                            obs, sizeof(obs), &olen));
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    virp_observation_t o;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE,
+                                     &o, &data, &data_len));
+
+    /* Capture, release, then assert (see the teardown discipline in the
+     * GX tests above). */
+    int attempts   = virp_driver_mock_exec_attempts_reset();
+    uint8_t wire_tier = hdr.tier;
+    uint8_t got_type  = o.obs_type;
+    int blocked = gx_bytes_contain(data, data_len, "tier gate blocked");
+    int black   = gx_bytes_contain(data, data_len, "tier=BLACK");
+
+    gx_teardown(&st);
+    gx_cleanup();
+
+    ASSERT_EQ(got_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(blocked);
+    ASSERT_TRUE(black);
+    /* BLACK is untransmittable on the wire: over-reported as RED. */
+    ASSERT_EQ(wire_tier, VIRP_TIER_RED);
+    ASSERT_EQ(attempts, 0);
+}
+
+/*
+ * THE INVARIANT TEST: a BLACK-classified command in SHADOW mode is
+ * refused, the refusal is recorded in the chain, and the driver is
+ * never invoked. (Named so a reader grepping "shadow" and "black" finds
+ * the invariant.)
+ */
+TEST(test_shadow_black_refused_recorded_driver_never_invoked)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+    st.gate_default_mode = GATE_MODE_SHADOW;
+    st.gate_max_tier = VIRP_TIER_YELLOW;
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+
+    /* Precondition: this state really is SHADOW-permissive — an
+     * UNCLASSIFIED command EXECUTES — so the refusal below cannot be
+     * ENFORCE quietly doing the work. */
+    virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "frobnicate the widget",
+                            obs, sizeof(obs), &olen));
+    {
+        virp_header_t hdr;
+        virp_observation_t o;
+        const uint8_t *data;
+        uint16_t data_len;
+        ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+        ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                         olen - VIRP_HEADER_SIZE,
+                                         &o, &data, &data_len));
+        ASSERT_EQ(o.obs_type, VIRP_OBS_DEVICE_OUTPUT);
+        ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 1);
+    }
+
+    /* The BLACK command: refused, driver untouched. */
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "selfdestruct now",
+                            obs, sizeof(obs), &olen));
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    virp_observation_t o;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE,
+                                     &o, &data, &data_len));
+
+    int attempts  = virp_driver_mock_exec_attempts_reset();
+    uint8_t got_type = o.obs_type;
+    int blocked = gx_bytes_contain(data, data_len, "tier gate blocked");
+
+    gx_teardown(&st);
+
+    /* Recorded: the SHADOW refusal writes the SAME entry shape an
+     * ENFORCE refusal writes, with the mode named. Row 0 is the
+     * precondition's gate_execution; row 1 is the refusal. A refusal
+     * that happened but left no record would be the absence-inferred
+     * failure again. */
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+
+    int is_reject   = (n == 2 && strcmp(rows[1].type, "gate_rejection") == 0);
+    int has_body    = (n == 2 && rows[1].have_body);
+    int schema_ok   = has_body && strstr(rows[1].body,
+                          "\"schema\":\"gate_rejection/1\"") != NULL;
+    int cmd_ok      = has_body && strstr(rows[1].body,
+                          "\"command\":\"selfdestruct now\"") != NULL;
+    int tier_ok     = has_body && strstr(rows[1].body,
+                          "\"classified_tier\":\"BLACK\"") != NULL;
+    int mode_ok     = has_body && strstr(rows[1].body,
+                          "\"gate_mode\":\"SHADOW\"") != NULL;
+    int not_run     = has_body && strstr(rows[1].body,
+                          "\"executed\":false") != NULL;
+    /* BLACK files no proposal: inexpressible has no escalation path. */
+    int no_proposal = has_body && strstr(rows[1].body,
+                          "proposal_id") == NULL;
+    char recomputed[65] = {0};
+    if (has_body) gr_sha256_hex(rows[1].body, recomputed);
+    int bound = has_body && strcmp(recomputed, rows[1].ahash) == 0;
+
+    gx_cleanup();
+
+    ASSERT_EQ(got_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(blocked);
+    ASSERT_EQ(attempts, 0);
+    ASSERT_EQ(n, 2);
+    ASSERT_TRUE(is_reject);
+    ASSERT_TRUE(has_body);
+    ASSERT_TRUE(schema_ok);
+    ASSERT_TRUE(cmd_ok);
+    ASSERT_TRUE(tier_ok);
+    ASSERT_TRUE(mode_ok);
+    ASSERT_TRUE(not_run);
+    ASSERT_TRUE(no_proposal);
+    ASSERT_TRUE(bound);
+}
+
+/*
+ * SHADOW's purpose is UNCHANGED for every other tier: YELLOW (within
+ * ceiling, would-allow) and RED (over ceiling, would-block) both
+ * proceed, and each leaves a gate_execution record naming SHADOW — the
+ * hypothetical verdict stays observable. Pins current behaviour so the
+ * BLACK fix cannot silently narrow what SHADOW is for.
+ */
+TEST(test_shadow_yellow_red_still_proceed_and_are_recorded)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+    st.gate_default_mode = GATE_MODE_SHADOW;
+    st.gate_max_tier = VIRP_TIER_YELLOW;
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+
+    /* YELLOW, within the ceiling: would-allow, proceeds. */
+    virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "clear counters",
+                            obs, sizeof(obs), &olen));
+    ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 1);
+
+    /* RED, over the ceiling: would-block under ENFORCE, proceeds. */
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "reload now",
+                            obs, sizeof(obs), &olen));
+    ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 1);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    virp_observation_t o;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE,
+                                     &o, &data, &data_len));
+    uint8_t got_type = o.obs_type;
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+
+    int both_exec = (n == 2 &&
+                     strcmp(rows[0].type, "gate_execution") == 0 &&
+                     strcmp(rows[1].type, "gate_execution") == 0);
+    int red_body  = (n == 2 && rows[1].have_body &&
+                     strstr(rows[1].body,
+                            "\"classified_tier\":\"RED\"") != NULL &&
+                     strstr(rows[1].body,
+                            "\"gate_mode\":\"SHADOW\"") != NULL &&
+                     strstr(rows[1].body,
+                            "\"decision\":\"auto-execute\"") != NULL);
+
+    gx_cleanup();
+
+    /* The RED command really executed and came back as device output. */
+    ASSERT_EQ(got_type, VIRP_OBS_DEVICE_OUTPUT);
+    ASSERT_EQ(n, 2);
+    ASSERT_TRUE(both_exec);
+    ASSERT_TRUE(red_body);
+}
+
+/* =========================================================================
  * hex_decode unit tests
  * ========================================================================= */
 
@@ -6543,6 +6768,11 @@ int main(void)
     RUN_TEST(test_errored_execution_still_chains_no_gap);
     RUN_TEST(test_refused_action_still_chains_gate_rejection);
     RUN_TEST(test_chain_verify_over_mixed_executions_and_rejections);
+
+    printf("\n[BLACK unconditional (inexpressible in every mode)]\n");
+    RUN_TEST(test_black_enforce_refused_at_gate);
+    RUN_TEST(test_shadow_black_refused_recorded_driver_never_invoked);
+    RUN_TEST(test_shadow_yellow_red_still_proceed_and_are_recorded);
 
     printf("\n[Gate observation-tier honesty (Item 1 hardening)]\n");
     RUN_TEST(test_gate_obs_tier_honesty);
