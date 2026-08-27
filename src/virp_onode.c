@@ -2198,6 +2198,24 @@ static virp_error_t onode_list_devices(onode_state_t *state,
         offset += (size_t)rw;
     }
 
+    /* Refused config entries (see onode_note_rejected): the NodeID column
+     * carries "refused: <reason>" — there is no node id, the entry was
+     * never added. */
+    for (int i = 0; i < state->rejected_count && i < ONODE_MAX_DEVICES &&
+                    offset < sizeof(listing); i++) {
+        int rw = snprintf(listing + offset, sizeof(listing) - offset,
+                           "%-16s %-16s %-12s refused: %s\n",
+                           state->rejected[i].hostname[0]
+                               ? state->rejected[i].hostname : "(no hostname)",
+                           state->rejected[i].host[0]
+                               ? state->rejected[i].host : "-",
+                           onode_vendor_name(state->rejected[i].vendor),
+                           state->rejected[i].reason);
+        if (rw < 0 || (size_t)rw >= sizeof(listing) - offset)
+            break;
+        offset += (size_t)rw;
+    }
+
     return virp_build_observation(out_buf, out_buf_len, out_len,
                                   state->node_id, onode_next_seq(state),
                                   VIRP_OBS_RESOURCE_STATE, VIRP_SCOPE_LOCAL,
@@ -2247,6 +2265,22 @@ static virp_error_t onode_list_fleet(onode_state_t *state,
                           status);
         if (rw < 0 || (size_t)rw >= sizeof(listing) - offset)
             break;                 /* row truncated — stop, keep offset sane */
+        offset += (size_t)rw;
+    }
+
+    /* Refused config entries: name + class + "refused: <reason>". Still
+     * no host address here (Item 8). A device the operator listed but the
+     * loader would not govern is part of the fleet's honest state. */
+    for (int i = 0; i < state->rejected_count && i < ONODE_MAX_DEVICES &&
+                    offset < sizeof(listing); i++) {
+        int rw = snprintf(listing + offset, sizeof(listing) - offset,
+                          "%-24s %-12s refused: %s\n",
+                          state->rejected[i].hostname[0]
+                              ? state->rejected[i].hostname : "(no hostname)",
+                          onode_vendor_name(state->rejected[i].vendor),
+                          state->rejected[i].reason);
+        if (rw < 0 || (size_t)rw >= sizeof(listing) - offset)
+            break;
         offset += (size_t)rw;
     }
 
@@ -4605,6 +4639,24 @@ virp_error_t onode_add_device(onode_state_t *state,
             device->hostname, device->host, device->node_id);
 
     return VIRP_OK;
+}
+
+void onode_note_rejected(onode_state_t *state, const char *hostname,
+                         const char *host, virp_vendor_t vendor,
+                         const char *reason)
+{
+    if (!state) return;
+    int i = state->rejected_count;
+    if (i < ONODE_MAX_DEVICES) {
+        snprintf(state->rejected[i].hostname, sizeof(state->rejected[i].hostname),
+                 "%s", hostname ? hostname : "");
+        snprintf(state->rejected[i].host, sizeof(state->rejected[i].host),
+                 "%s", host ? host : "");
+        state->rejected[i].vendor = vendor;
+        snprintf(state->rejected[i].reason, sizeof(state->rejected[i].reason),
+                 "%s", reason ? reason : "");
+    }
+    state->rejected_count = i + 1;
 }
 
 virp_error_t onode_set_previous_okey(onode_state_t *state,

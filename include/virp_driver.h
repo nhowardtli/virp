@@ -92,6 +92,10 @@ typedef struct {
     char            vdom[64];           /* VDOM name (default "root") */
     bool            verify_tls;         /* Verify TLS cert on REST calls */
     bool            ssh_legacy;         /* Force legacy SSH ciphers (group14-sha1, ssh-rsa, aes256-cbc) */
+    bool            asa_auto_enable;    /* cisco_asa: login already lands in enable mode
+                                         * (aaa authorization exec ... auto-enable), so no
+                                         * "enable" credential is needed — opts out of the
+                                         * load-time refusal (#14). Operator's declaration. */
     /*
      * Vendor-optional (PBS) — zero-initialized for other vendors.
      *
