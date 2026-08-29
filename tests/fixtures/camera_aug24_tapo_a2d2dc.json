@@ -1,0 +1,56 @@
+{
+ "_note": "The 7 camera_segment/1 bodies of session camera:tapo-c100:2026-08-24 signed by producer_key_id a2d2dc0fac250b722c6a77c87be9e341 \u2014 the replay bootstrap identity whose PUBLIC key was recovered on 2026-08-25 to ~/camera-provenance-aug25/producer.pub on 313. Frozen VERBATIM as stored on the live chain: artifact_hash is sha256 over the `body` string exactly as it appears here. Nothing in this file may be reformatted.",
+ "producer_key_id": "a2d2dc0fac250b722c6a77c87be9e341",
+ "producer_pubkey_hex": "1bb217d09fa262ca52a979cf8776f87fd06d8867f843365da284d676313944e4",
+ "records": [
+  {
+   "artifact_hash": "c185e5fc3c3a2508389ab4d479bb3ada44140146a06568f4aae0e641461b6941",
+   "artifact_id": "camseg:tapo-c100:0:1787609824949255966",
+   "body": "{\"byte_len\":301743,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787609824949255966,\"capture_start_utc_ns\":1787609818750255966,\"device\":\"tapo-c100\",\"duration_s\":6.199,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"replay\",\"prev_segment_sha256\":null,\"producer_key_id\":\"a2d2dc0fac250b722c6a77c87be9e341\",\"producer_sig\":\"0be2b69f7d7ac17020efd8a63f6c3668bae0334972ee8a8cb440ee20ba751151875df3aee45c395cc9fc01f3c081de9e858696f14c945987cd5b60c88d5acc04\",\"schema\":\"camera_segment/1\",\"segment_seq\":0,\"segment_sha256\":\"c3396d619a760757a240c2267a0e86ed06b16dc19f175bcddf0283b1ea6bd9b9\",\"time_source\":\"file-mtime\"}",
+   "chain_sequence": 0,
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "5ac13bf5039c1a6337698e8295e7f05184b82ba40277a0b1dd0329f1bb49e4c7",
+   "artifact_id": "camseg:tapo-c100:1:1787609824949255966",
+   "body": "{\"byte_len\":188256,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787609824949255966,\"capture_start_utc_ns\":1787609820947255966,\"device\":\"tapo-c100\",\"duration_s\":4.002,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"replay\",\"prev_segment_sha256\":\"c3396d619a760757a240c2267a0e86ed06b16dc19f175bcddf0283b1ea6bd9b9\",\"producer_key_id\":\"a2d2dc0fac250b722c6a77c87be9e341\",\"producer_sig\":\"e81ae15acb5b7a2127d6c703422d9b7cfdf23ce4a44d2ee8b16c9c6fd34aa49567bae0b66b54b7681dd75afef2835f32353e945cbe4f5ae86d87bb37f03b1809\",\"schema\":\"camera_segment/1\",\"segment_seq\":1,\"segment_sha256\":\"a598607cbae012b69b06b84e85298a84e97ab046bb61216d39153fd2eeb8cb3d\",\"time_source\":\"file-mtime\"}",
+   "chain_sequence": 1,
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "0bda4b3d212a3880b668debb76138d5be0426dfa6a93fcc481da7d0762a48a20",
+   "artifact_id": "camseg:tapo-c100:2:1787609824949255966",
+   "body": "{\"byte_len\":269921,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787609824949255966,\"capture_start_utc_ns\":1787609818951255966,\"device\":\"tapo-c100\",\"duration_s\":5.998,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"replay\",\"prev_segment_sha256\":\"a598607cbae012b69b06b84e85298a84e97ab046bb61216d39153fd2eeb8cb3d\",\"producer_key_id\":\"a2d2dc0fac250b722c6a77c87be9e341\",\"producer_sig\":\"1ae87782128c637625a1414c5a597121ed3870feccc09ba2af9f9e3d9d632d3e7fccff361bf70b0b4e983e4ef4bec3fbc9917ed4b4e3fed4783a14db5012c103\",\"schema\":\"camera_segment/1\",\"segment_seq\":2,\"segment_sha256\":\"416bd854e0738af2b78ef2a1f6aff4586e149fa14fc1ef755d86fd13c51eba71\",\"time_source\":\"file-mtime\"}",
+   "chain_sequence": 2,
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "3ca690ab39a29e90f66dcfbffa9bf88aba8657bde49e38820c10924861234f3b",
+   "artifact_id": "camseg:tapo-c100:3:1787609824949255966",
+   "body": "{\"byte_len\":185500,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787609824949255966,\"capture_start_utc_ns\":1787609821000255966,\"device\":\"tapo-c100\",\"duration_s\":3.949,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"replay\",\"prev_segment_sha256\":\"416bd854e0738af2b78ef2a1f6aff4586e149fa14fc1ef755d86fd13c51eba71\",\"producer_key_id\":\"a2d2dc0fac250b722c6a77c87be9e341\",\"producer_sig\":\"38b6004b93b98d9353ff3a7a68ada08adaf9f697fbd754609f3fb389bcaa74020614b8c4d211d52ea4d280ecaee9af58cfce7d5ce82e946722b5f9a796f4f307\",\"schema\":\"camera_segment/1\",\"segment_seq\":3,\"segment_sha256\":\"3f174a72707d0c42a3468b781575510f9c383f71d8804592e8d9b06b72d9c3b5\",\"time_source\":\"file-mtime\"}",
+   "chain_sequence": 3,
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "9a67cadd752ed280dc8b9d86d0be05930352a2ffe10e7ef65edced2fa9db918f",
+   "artifact_id": "camseg:tapo-c100:4:1787609824949255966",
+   "body": "{\"byte_len\":277186,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787609824949255966,\"capture_start_utc_ns\":1787609818946255966,\"device\":\"tapo-c100\",\"duration_s\":6.003,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"replay\",\"prev_segment_sha256\":\"3f174a72707d0c42a3468b781575510f9c383f71d8804592e8d9b06b72d9c3b5\",\"producer_key_id\":\"a2d2dc0fac250b722c6a77c87be9e341\",\"producer_sig\":\"cd7aa94bd77ece2733b6a7b74e9e69cb44a01b88030ebe431c32d5e3934fa570c1f3cfca069be5d0794f484888129427436ab607d5d573713693f7a561e22c06\",\"schema\":\"camera_segment/1\",\"segment_seq\":4,\"segment_sha256\":\"8b19507f953d51f46bbb4bfb1e24fdabe58245c78cdb7912621acb804ccdf803\",\"time_source\":\"file-mtime\"}",
+   "chain_sequence": 4,
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "337da234b4e912ba0a0e2a658ec93cd04f533854ebeb1079e437365f41dacd8f",
+   "artifact_id": "camseg:tapo-c100:5:1787609824949255966",
+   "body": "{\"byte_len\":185818,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787609824949255966,\"capture_start_utc_ns\":1787609820945255967,\"device\":\"tapo-c100\",\"duration_s\":4.004,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"replay\",\"prev_segment_sha256\":\"8b19507f953d51f46bbb4bfb1e24fdabe58245c78cdb7912621acb804ccdf803\",\"producer_key_id\":\"a2d2dc0fac250b722c6a77c87be9e341\",\"producer_sig\":\"5e1a314e57dfd99ef251e5bee12b9c6c984dc60a2ea9bcfd97256574ee6525a2f142746c88f4744d98bef2030456a6411d98360c5b5426b9c3d53410d396410b\",\"schema\":\"camera_segment/1\",\"segment_seq\":5,\"segment_sha256\":\"e46fe1c5798768f23d279fb549c05c2bbaf141e639c1c88a22aaac4c36db0fbd\",\"time_source\":\"file-mtime\"}",
+   "chain_sequence": 5,
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "b1ce0fb51f1f785679ed11c978d6fb876936f09c66b44acabdc35bad5bd7a43c",
+   "artifact_id": "camseg:tapo-c100:6:1787609824950255978",
+   "body": "{\"byte_len\":263724,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787609824950255978,\"capture_start_utc_ns\":1787609819350255978,\"device\":\"tapo-c100\",\"duration_s\":5.6,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"replay\",\"prev_segment_sha256\":\"e46fe1c5798768f23d279fb549c05c2bbaf141e639c1c88a22aaac4c36db0fbd\",\"producer_key_id\":\"a2d2dc0fac250b722c6a77c87be9e341\",\"producer_sig\":\"5ebcfeba4a8f6d805589206e4220660ebec03ff2bf9158c831085bb3b89bf42533e4f9bac60346870be5f18b0c29345357e5ba50e470b0cd70d6b515581bb80d\",\"schema\":\"camera_segment/1\",\"segment_seq\":6,\"segment_sha256\":\"5c3cdca48b81cbc63c138cd3111d9d5cf617e81ea45edd6debb878dc4ce81d3a\",\"time_source\":\"file-mtime\"}",
+   "chain_sequence": 6,
+   "session_id": "camera:tapo-c100:2026-08-24"
+  }
+ ]
+}
