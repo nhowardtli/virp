@@ -74,7 +74,14 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "camera_segment/1"
+SCHEMA_V1 = "camera_segment/1"
+SCHEMA_V2 = "camera_segment/2"
+# What this producer emits when a capture policy is declared (always,
+# from the CLI). SCHEMA_V1 remains emitted only by callers that pass no
+# policy, and remains READABLE forever: 2553 live records carry it and
+# nothing here may re-sign or rewrite them.
+SCHEMA = SCHEMA_V2
+SCHEMAS = (SCHEMA_V1, SCHEMA_V2)
 ONODE_SOCKET = "/run/virp/onode.sock"
 CHAIN_DB = "/var/lib/virp/chain.db"
 DATA_DIR = "/var/lib/virp/camera"
@@ -444,12 +451,23 @@ def release_instance_lock(fd):
 
 def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
                duration_s, start_ns, end_ns, time_source, mode, gap,
-               key_id):
-    """The camera_segment/1 record, WITHOUT producer_sig (added by
+               key_id, policy=None):
+    """The camera_segment record, WITHOUT producer_sig (added by
     producer_sign). Field set is the schema — nothing optional, nothing
-    extra, no credentials, no URLs."""
-    return {
-        "schema": SCHEMA,
+    extra, no credentials, no URLs.
+
+    policy None  → camera_segment/1, exactly the bytes this producer has
+                   always built (2553 live records depend on that form).
+    policy dict  → camera_segment/2: the same fields plus
+                   capture_policy, the producer's OWN signed statement
+                   of the cadence it intends to keep. It is inside the
+                   signed bytes precisely so that no one — operator
+                   included — can loosen the gap tolerance afterwards to
+                   make a bad window look clean; doing so would require
+                   the producer key and would produce a different
+                   record."""
+    body = {
+        "schema": SCHEMA_V1 if policy is None else SCHEMA_V2,
         "camera_id": camera_id,
         "device": device,
         "segment_seq": seq,
@@ -465,6 +483,99 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
         "gap": gap,
         "producer_key_id": key_id,
     }
+    if policy is not None:
+        body["capture_policy"] = policy
+    return body
+
+
+# ── Capture-session policy (the signed cadence declaration) ────────────
+#
+# WHERE IT LIVES, and why: the authoritative copy is inside every signed
+# body, because that is the only copy a verifier may trust — a file on
+# the capture host can be edited after the fact, a verifier constant
+# cannot describe two streams that legitimately differ (the Tapo cuts at
+# 6 s, the Reolink sub at ~10 s), and a per-run CLI value alone would
+# leave no stable statement across restarts of the same camera.
+#
+# The data_dir file is therefore a DEFAULTS file, not a policy: it is
+# what the next run of THIS camera will declare unless the operator
+# overrides it on the command line. Changing it changes only future
+# records, and the change is visible per-record in the signed bytes.
+#
+# NO HEARTBEAT INTERVAL. It was considered and rejected: a heartbeat is
+# a liveness promise, and a producer that has stopped cannot emit the
+# signed bytes that would keep it. Declaring one would (a) put a promise
+# in the signed record that the failure mode it covers guarantees will
+# be broken, and (b) make the audit verdict depend on wall-clock time at
+# audit, so the same corpus would grade differently on two runs. The
+# trailing-silence question ("has this camera stopped?") is monitoring,
+# and belongs to whatever watches the producer, not to an audit of
+# fixed evidence.
+
+CAPTURE_POLICY_FILE = "capture-policy.json"
+
+
+def capture_policy_new(nominal_segment_s, jitter_s, max_unexplained_gap_s):
+    """Validate and normalise a capture policy. A policy that cannot be
+    met, or that tolerates everything, is a signed lie — refuse it here
+    rather than sign it."""
+    try:
+        nominal = float(nominal_segment_s)
+        jitter = float(jitter_s)
+        max_gap = float(max_unexplained_gap_s)
+    except (TypeError, ValueError):
+        raise SystemExit("capture policy values must be numbers")
+    if not (nominal > 0):
+        raise SystemExit("capture policy: nominal_segment_s must be > 0")
+    if jitter < 0 or max_gap < 0:
+        raise SystemExit("capture policy: jitter_s and "
+                         "max_unexplained_gap_s must be >= 0")
+    if jitter >= nominal:
+        raise SystemExit("capture policy: jitter_s (%g) >= "
+                         "nominal_segment_s (%g) would tolerate a whole "
+                         "missing segment as continuous coverage"
+                         % (jitter, nominal))
+    return {"nominal_segment_s": round(nominal, 3),
+            "jitter_s": round(jitter, 3),
+            "max_unexplained_gap_s": round(max_gap, 3)}
+
+
+def capture_policy_resolve(data_dir, nominal_segment_s=None, jitter_s=None,
+                           max_unexplained_gap_s=None,
+                           default_nominal_s=6.0):
+    """The policy this run will declare: the data_dir defaults file,
+    with any explicitly given CLI value overriding it. The resolved
+    policy is written back, so the next run of this camera declares the
+    same cadence without being told again."""
+    path = os.path.join(data_dir, CAPTURE_POLICY_FILE)
+    stored = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                stored = json.load(f)
+        except ValueError:
+            raise SystemExit("%s is not valid JSON — refusing to guess "
+                             "the capture policy" % path)
+        if not isinstance(stored, dict):
+            raise SystemExit("%s does not hold a capture policy object"
+                             % path)
+    policy = capture_policy_new(
+        nominal_segment_s if nominal_segment_s is not None
+        else stored.get("nominal_segment_s", default_nominal_s),
+        jitter_s if jitter_s is not None
+        else stored.get("jitter_s", CAPTURE_GAP_TOLERANCE_NS / 1e9),
+        max_unexplained_gap_s if max_unexplained_gap_s is not None
+        else stored.get("max_unexplained_gap_s", 0.0))
+    if policy != stored:
+        os.makedirs(data_dir, mode=0o700, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(policy, f, indent=1, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    return policy
 
 
 # Fix D: gap records come from capture-time continuity, not only from
@@ -546,7 +657,7 @@ def process_segment(path, cfg, state, gap, send=onode_send):
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
                             end_ns, time_source, cfg["mode"], gap,
-                            cfg["key_id"])
+                            cfg["key_id"], cfg.get("capture_policy"))
     body_bytes, body = producer_sign(cfg["sk"], body_nosig)
 
     session_id = session_for(cfg["camera_id"], end_ns)
@@ -643,7 +754,15 @@ def verify_segment(file_path, db_path, pubkey_path=None):
     any camera_segment/1 body stored on the chain commits to that hash.
     This helper renders the verdict from the signed body — it recomputes
     ONE hash and compares. It does not verify chain entry signatures or
-    sequencing; that is Docket's job. Returns process exit code."""
+    sequencing; that is Docket's job. Returns process exit code.
+
+    If a pubkey was asked for, it is established FIRST: a trust root
+    that cannot be loaded raises TrustRootError before the file is read,
+    so a broken --pubkey can never end in a MATCH verdict that silently
+    checked no signature."""
+    pk = None
+    if pubkey_path is not None:
+        _, pk = load_trust_root(pubkey_path)
     with open(file_path, "rb") as f:
         file_sha = hashlib.sha256(f.read()).hexdigest()
     print("file: %s" % file_path)
@@ -677,9 +796,7 @@ def verify_segment(file_path, db_path, pubkey_path=None):
           "bytes committed by a chain-stored body:")
     print("  session=%s seq=%s artifact_id=%s"
           % (session_id, body["segment_seq"], artifact_id))
-    if pubkey_path:
-        with open(pubkey_path, "rb") as f:
-            pk = f.read()
+    if pk is not None:
         ok = producer_verify(pk, body)
         print("  producer_sig: %s (out-of-band check against %s; not a "
               "chain verdict)" % ("VALID" if ok else "INVALID",
@@ -714,35 +831,121 @@ def _camera_bodies(db_path):
             body = json.loads(content)
         except ValueError:
             continue
-        if body.get("schema") == SCHEMA:
+        if body.get("schema") in SCHEMAS:
             out.append((session_id, artifact_id, content, body))
     return out
 
 
 # ── audit: the anti-chainwalk-bug regression, runnable ─────────────────
 
+class TrustRootError(Exception):
+    """A trust root the caller ASKED FOR could not be established.
+
+    The invariant this type exists to enforce: failure to establish a
+    requested trust root must never degrade into successful
+    verification. It is raised before any evidence is read, is never
+    caught to continue, and reaches the CLI only as an abort.
+    """
+
+
+ED25519_PUBKEY_LEN = 32
+
+
+def load_trust_root(path):
+    """Establish ONE pinned trust root from a file. Returns
+    (key_id, pk_raw); every way of failing raises TrustRootError.
+
+    Each check below was a way to end up with either no key or a
+    non-key while the caller believed a key had been pinned:
+      - a path that is not a file (missing, or a directory)
+      - a file that cannot be read (permissions)
+      - an empty file (zero bytes hashes fine and pins nothing)
+      - the wrong length for a raw Ed25519 public key (a PEM, a hex
+        dump, a truncated copy)
+      - 32 bytes the Ed25519 implementation will not accept as a point
+      - the cryptography package missing, so nothing could be verified
+        even with a good key
+    """
+    if not isinstance(path, str) or not path:
+        raise TrustRootError("empty trust-root path")
+    if os.path.isdir(path):
+        raise TrustRootError("%s is a directory, not an Ed25519 public "
+                             "key file" % path)
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        raise TrustRootError("cannot read trust root %s: %s"
+                             % (path, e.strerror or e))
+    if not raw:
+        raise TrustRootError("trust root %s is empty (0 bytes) — an "
+                             "empty file pins no key" % path)
+    if len(raw) != ED25519_PUBKEY_LEN:
+        raise TrustRootError("trust root %s is %d bytes, not a %d-byte "
+                             "raw Ed25519 public key (a PEM or hex file "
+                             "is not accepted here)"
+                             % (path, len(raw), ED25519_PUBKEY_LEN))
+    try:
+        ed = _ed25519()
+    except ImportError as e:
+        raise TrustRootError("a trust root was requested but the "
+                             "cryptography package is unavailable, so "
+                             "no signature could be checked: %s" % e)
+    try:
+        ed.Ed25519PublicKey.from_public_bytes(raw)
+    except Exception as e:
+        raise TrustRootError("trust root %s is not a valid Ed25519 "
+                             "public key: %s" % (path, e))
+    return producer_key_id(raw), raw
+
+
 def _load_pubkeys(pubkey_paths):
     """Return {key_id: pk_raw} for a list of pinned public-key files. An
     Option B chain legitimately carries more than one producer identity
     (the capture host's key differs from a bootstrap replay key); each
     body names its producer_key_id, so a body is checked against the
-    pinned key that matches it."""
+    pinned key that matches it.
+
+    Every path must resolve to a usable key, and the resulting set must
+    be non-empty: a caller that asked for trust roots and got none must
+    not proceed to verify anything.
+    """
     keys = {}
     for p in pubkey_paths or []:
-        with open(p, "rb") as f:
-            raw = f.read()
-        keys[producer_key_id(raw)] = raw
+        key_id, raw = load_trust_root(p)
+        keys[key_id] = raw
+    if pubkey_paths and not keys:
+        raise TrustRootError("trust roots were requested but the pinned "
+                             "set is empty — nothing to verify against")
     return keys
 
 
-def audit_chain(db_path, session_prefix="camera:", pubkey_path=None):
+def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
+                report=None):
     """For every camera_segment entry: recompute sha256 over the body
     bytes AS STORED in the chain and match artifact_hash (the
     chainwalk_summary defect was exactly this failing); check the
     in-body prev-hash chain per camera; optionally verify every
     producer_sig against the pinned key(s). pubkey_path may be a single
     path or a list of paths (multi-producer chains). Returns
-    (checked, failures:list)."""
+    (checked, failures:list).
+
+    If `report` is a dict it is filled in with the two axes that are NOT
+    chain integrity — coverage completeness and content reuse — which
+    are reported separately because they are different properties: a
+    chain can be perfectly intact across an outage it never claimed to
+    cover.
+
+    The pinned keys are established FIRST, before a single row is read:
+    a requested trust root that cannot be established raises
+    TrustRootError and no evidence is judged at all."""
+    if isinstance(pubkey_path, (list, tuple)):
+        pubkeys = _load_pubkeys(pubkey_path)
+    elif pubkey_path:
+        pubkeys = _load_pubkeys([pubkey_path])
+    else:
+        pubkeys = {}
+
     conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
     try:
         rows = conn.execute(
@@ -757,15 +960,9 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None):
     finally:
         conn.close()
 
-    if isinstance(pubkey_path, (list, tuple)):
-        pubkeys = _load_pubkeys(pubkey_path)
-    elif pubkey_path:
-        pubkeys = _load_pubkeys([pubkey_path])
-    else:
-        pubkeys = {}
-
     failures = []
     checked = 0
+    verified = 0
     cam_bodies = []   # (session_id, artifact_id, body) in seq order
 
     # Pass 1 — the hash invariant, order-independent (the chainwalk
@@ -786,8 +983,20 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None):
             failures.append("%s %s: body is not JSON"
                             % (session_id, artifact_id))
             continue
-        if body.get("schema") != SCHEMA:
+        schema = body.get("schema")
+        if schema not in SCHEMAS:
+            # An unrecognised camera_segment/N must never be skipped in
+            # silence: skipping is exactly how an unverified record ends
+            # up counted inside a clean verdict.
+            if isinstance(schema, str) and schema.startswith("camera_segment/"):
+                failures.append("%s %s: unrecognised schema %s — this "
+                                "auditor cannot judge it, and will not "
+                                "pass it"
+                                % (session_id, artifact_id, schema))
             continue
+        if schema == SCHEMA_V2 and _body_policy(body) is None:
+            failures.append("%s %s: %s carries no usable capture_policy"
+                            % (session_id, artifact_id, schema))
         cam_bodies.append((session_id, artifact_id, body))
 
     # Pass 2 — the prev-hash continuity chain, walked in segment_seq
@@ -797,6 +1006,21 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None):
     # follow its predecessor, or a prev-hash that does not cite it, is a
     # break — unless the record itself carries a gap, which is the
     # explicit, signed statement that continuity is not claimed there.
+    if pubkeys and cam_bodies:
+        present = {b.get("producer_key_id") for _, _, b in cam_bodies}
+        if not (present & set(pubkeys)):
+            # 32 arbitrary bytes are a syntactically valid Ed25519 public
+            # key, so a junk file of the right length loads. What it
+            # cannot do is match anything — and a pinned set that
+            # describes none of the corpus is a trust root that was never
+            # really established.
+            failures.append(
+                "none of the %d pinned key(s) %s matches the "
+                "producer_key_id of any of the %d records (%s) — the "
+                "pinned set does not describe this corpus"
+                % (len(pubkeys), sorted(pubkeys), len(cam_bodies),
+                   sorted(k for k in present if k)))
+
     chains = {}
     for session_id, artifact_id, body in sorted(
             cam_bodies, key=lambda t: (t[2]["camera_id"],
@@ -830,7 +1054,312 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None):
             elif not producer_verify(pk, body):
                 failures.append("%s %s: producer_sig INVALID"
                                 % (session_id, artifact_id))
+            else:
+                verified += 1
+
+    if report is not None:
+        report["camera_bodies"] = len(cam_bodies)
+        report["verified_sigs"] = verified
+        report["pinned_key_ids"] = sorted(pubkeys)
+        report["coverage"] = grade_coverage(cam_bodies)
+        report["reuse_axis"], report["reuse"] = \
+            grade_content_reuse(cam_bodies)
     return checked, failures
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Coverage completeness — a SEPARATE axis from chain integrity
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The chain answers "are these records unaltered and in order". It
+# cannot answer "was the camera recording the whole time", because
+# nothing in a camera_segment/1 record says what "the whole time" was
+# meant to look like. camera_segment/2 carries the producer's own signed
+# capture_policy, and only then can an outage be graded.
+#
+# A signed gap record makes an outage ACCOUNTED FOR. It does not make
+# coverage COMPLETE, and the grader never collapses the two: the verdict
+# for a stream with signed gaps is INTERRUPTED / ACCOUNTED, never
+# CONTINUOUS.
+
+COVERAGE_UNDECLARED = "UNDECLARED"
+COVERAGE_CONTINUOUS = "CONTINUOUS"
+COVERAGE_ACCOUNTED = "INTERRUPTED / ACCOUNTED"
+COVERAGE_UNEXPLAINED = "INTERRUPTED / UNEXPLAINED"
+
+_COVERAGE_RANK = {COVERAGE_CONTINUOUS: 0, COVERAGE_ACCOUNTED: 1,
+                  COVERAGE_UNEXPLAINED: 2, COVERAGE_UNDECLARED: 3}
+
+
+def _body_policy(body):
+    """The usable capture_policy of a body, or None. A /1 record has
+    none by construction — that is UNDECLARED, not zero tolerance."""
+    if body.get("schema") != SCHEMA_V2:
+        return None
+    p = body.get("capture_policy")
+    if not isinstance(p, dict):
+        return None
+    try:
+        nominal = float(p["nominal_segment_s"])
+        jitter = float(p["jitter_s"])
+        max_gap = float(p["max_unexplained_gap_s"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if nominal <= 0 or jitter < 0 or max_gap < 0 or jitter >= nominal:
+        return None
+    return {"nominal_segment_s": nominal, "jitter_s": jitter,
+            "max_unexplained_gap_s": max_gap}
+
+
+def grade_coverage(cam_bodies):
+    """cam_bodies: [(session_id, artifact_id, body)] — grade each camera
+    separately. Returns {camera_id: {...}}.
+
+    Per adjacent pair of segments in segment_seq order, the hole is
+    next.capture_start − prev.capture_end (negative = overlap, which the
+    -c copy keyframe cuts produce routinely and which covers the window
+    either way). It is graded against the LATER record's own policy,
+    because that is the record making the continuity claim:
+
+      hole <= jitter_s                         → covered. Every overlap
+                                                 is covered: overlapping
+                                                 windows leave no time
+                                                 unrecorded. An overlap
+                                                 deeper than the declared
+                                                 jitter is still reported,
+                                                 as a timing observation
+                                                 that does not move the
+                                                 verdict.
+      hole  >  jitter_s, record carries a gap  → ACCOUNTED outage
+      hole  >  jitter_s, no gap, within
+                    max_unexplained_gap_s      → tolerated outage
+      otherwise                                → UNEXPLAINED outage
+
+    A camera with even one record that declares no policy grades
+    UNDECLARED: a /1 record cannot be shown to be continuous, and
+    guessing a cadence for it would be the verifier constant this
+    design exists to avoid."""
+    by_cam = {}
+    for session_id, artifact_id, body in cam_bodies:
+        by_cam.setdefault(body["camera_id"], []).append(
+            (session_id, artifact_id, body))
+    out = {}
+    for cam, lst in by_cam.items():
+        lst.sort(key=lambda t: t[2]["segment_seq"])
+        undeclared = [b for _, _, b in lst if _body_policy(b) is None]
+        info = {
+            "records": len(lst),
+            "undeclared_records": len(undeclared),
+            "seq_first": lst[0][2]["segment_seq"],
+            "seq_last": lst[-1][2]["segment_seq"],
+            "policies": [],
+            "outages": [],
+            "overlaps": [],
+            "outage_s": 0.0,
+            "span_s": (lst[-1][2]["capture_end_utc_ns"]
+                       - lst[0][2]["capture_start_utc_ns"]) / 1e9,
+        }
+        seen = []
+        for _, _, b in lst:
+            p = _body_policy(b)
+            if p is not None and p not in seen:
+                seen.append(p)
+        info["policies"] = seen
+        if undeclared:
+            info["verdict"] = COVERAGE_UNDECLARED
+            info["reason"] = ("%d of %d records declare no capture "
+                              "policy (camera_segment/1)"
+                              % (len(undeclared), len(lst)))
+            out[cam] = info
+            continue
+        worst = COVERAGE_CONTINUOUS
+        for i in range(1, len(lst)):
+            prev = lst[i - 1][2]
+            cur = lst[i][2]
+            pol = _body_policy(cur)
+            hole_s = (cur["capture_start_utc_ns"]
+                      - prev["capture_end_utc_ns"]) / 1e9
+            if hole_s <= pol["jitter_s"]:
+                if hole_s < -pol["jitter_s"]:
+                    # the windows overlap by more than the declared
+                    # jitter: no footage is missing, but the two records'
+                    # claimed times cannot both be tight. Reported, never
+                    # graded as an interruption.
+                    info["overlaps"].append({
+                        "after_seq": prev["segment_seq"],
+                        "seq": cur["segment_seq"],
+                        "overlap_s": round(-hole_s, 3),
+                        "artifact_id": lst[i][1],
+                    })
+                continue
+            gap = cur.get("gap")
+            if gap:
+                cls, verdict = "ACCOUNTED", COVERAGE_ACCOUNTED
+            elif hole_s <= pol["max_unexplained_gap_s"]:
+                cls, verdict = "TOLERATED", COVERAGE_ACCOUNTED
+            else:
+                cls, verdict = "UNEXPLAINED", COVERAGE_UNEXPLAINED
+            info["outages"].append({
+                "after_seq": prev["segment_seq"],
+                "seq": cur["segment_seq"],
+                "hole_s": round(hole_s, 3),
+                "gap_reason": (gap or {}).get("reason"),
+                "class": cls,
+                "artifact_id": lst[i][1],
+            })
+            info["outage_s"] += hole_s
+            if _COVERAGE_RANK[verdict] > _COVERAGE_RANK[worst]:
+                worst = verdict
+        info["outage_s"] = round(info["outage_s"], 3)
+        info["verdict"] = worst
+        if worst == COVERAGE_CONTINUOUS:
+            info["reason"] = ("no uncovered time; %d boundary/ies beyond "
+                              "the declared jitter, all overlaps"
+                              % len(info["overlaps"])
+                              if info["overlaps"] else
+                              "every segment boundary within the "
+                              "declared jitter")
+        else:
+            info["reason"] = ("%d outage(s), %.1f s not covered"
+                              % (len(info["outages"]), info["outage_s"]))
+        out[cam] = info
+    return out
+
+
+def coverage_axis(coverage):
+    """The one-line worst-case across cameras."""
+    if not coverage:
+        return COVERAGE_UNDECLARED
+    return max((c["verdict"] for c in coverage.values()),
+               key=lambda v: _COVERAGE_RANK[v])
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Content reuse — an OBSERVATION, never a verdict of forgery
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Identical segment bytes under two sequence numbers are NOT proof of
+# anything on their own. This corpus holds 18 such pairs (36 records)
+# that are artifacts of a producer replay defect fixed 2026-08-25, and a
+# static scene will legitimately re-encode to identical bytes. So
+# duplication is reported with the facts that bear on it — same camera
+# or not, sequence delta, claimed capture-time delta — and graded on its
+# own axis, which never fails the audit.
+#
+# THE RULE IMPLEMENTED, and why each arm:
+#
+#   EXPECTED              same camera, consecutive segments (Δseq == 1)
+#                         whose windows abut within the declared jitter.
+#                         A static 640x360 scene producing byte-identical
+#                         back-to-back segments is ordinary, and there is
+#                         no missing footage to explain: both records
+#                         cover their own distinct window.
+#
+#   DUPLICATE/EXPLAINED   same camera, Δseq > 1, and the producer's own
+#                         SIGNED bytes carry a gap record somewhere in
+#                         (lo_seq, hi_seq]. The producer stated a
+#                         discontinuity across the interval in which the
+#                         bytes reappear; a re-ship after a restart is
+#                         exactly that, and it is attested, not asserted
+#                         by the auditor.
+#
+#   DUPLICATE/UNEXPLAINED everything else, and ALWAYS when the same bytes
+#                         appear under two different camera_ids — two
+#                         cameras cannot legitimately produce identical
+#                         files, so no static-scene argument applies.
+#
+# EXPLAINED is a policy judgement about the producer, not a
+# cryptographic fact: it says a signed statement exists that accounts
+# for the reuse. It does not say the reuse was harmless.
+
+REUSE_NONE = "NONE"
+REUSE_EXPECTED = "EXPECTED"
+REUSE_EXPLAINED = "DUPLICATE / EXPLAINED"
+REUSE_UNEXPLAINED = "DUPLICATE / UNEXPLAINED"
+
+_REUSE_RANK = {REUSE_NONE: 0, REUSE_EXPECTED: 1,
+               REUSE_EXPLAINED: 2, REUSE_UNEXPLAINED: 3}
+
+
+def grade_content_reuse(cam_bodies):
+    """Returns (axis, groups). groups is one entry per repeated
+    segment_sha256, carrying the supporting facts."""
+    by_hash = {}
+    gaps_by_cam = {}
+    for session_id, artifact_id, body in cam_bodies:
+        by_hash.setdefault(body["segment_sha256"], []).append(
+            (session_id, artifact_id, body))
+        if body.get("gap"):
+            gaps_by_cam.setdefault(body["camera_id"], []).append(
+                (body["segment_seq"], body["gap"].get("reason")))
+
+    groups = []
+    axis = REUSE_NONE
+    for sha, lst in by_hash.items():
+        if len(lst) < 2:
+            continue
+        lst.sort(key=lambda t: t[2]["segment_seq"])
+        cams = sorted({b["camera_id"] for _, _, b in lst})
+        seqs = [b["segment_seq"] for _, _, b in lst]
+        first, last = lst[0][2], lst[-1][2]
+        facts = {
+            "segment_sha256": sha,
+            "cameras": cams,
+            "sessions": sorted({s for s, _, _ in lst}),
+            "occurrences": len(lst),
+            "segment_seqs": seqs,
+            "seq_delta": seqs[-1] - seqs[0],
+            "byte_len": sorted({b["byte_len"] for _, _, b in lst}),
+            "capture_start_delta_s": round(
+                (last["capture_start_utc_ns"]
+                 - first["capture_start_utc_ns"]) / 1e9, 3),
+            "artifact_ids": [a for _, a, _ in lst],
+        }
+        if len(cams) > 1:
+            facts["class"] = REUSE_UNEXPLAINED
+            facts["basis"] = ("identical bytes under %d different "
+                              "camera_ids — no static-scene explanation "
+                              "applies" % len(cams))
+        else:
+            cls = REUSE_EXPECTED
+            basis = ("consecutive segments with abutting capture "
+                     "windows — a static scene re-encoding identically")
+            for i in range(1, len(lst)):
+                lo, hi = lst[i - 1][2], lst[i][2]
+                pol = _body_policy(hi) or {
+                    "jitter_s": CAPTURE_GAP_TOLERANCE_NS / 1e9}
+                hole = (hi["capture_start_utc_ns"]
+                        - lo["capture_end_utc_ns"]) / 1e9
+                if (hi["segment_seq"] - lo["segment_seq"] == 1
+                        and abs(hole) <= pol["jitter_s"]):
+                    pair_cls, pair_basis = REUSE_EXPECTED, basis
+                else:
+                    spanning = [g for g in gaps_by_cam.get(cams[0], [])
+                                if lo["segment_seq"] < g[0]
+                                <= hi["segment_seq"]]
+                    if spanning:
+                        pair_cls = REUSE_EXPLAINED
+                        pair_basis = ("a signed gap record (%s) sits at "
+                                      "seq %d, inside the interval in "
+                                      "which the bytes reappear"
+                                      % (spanning[0][1], spanning[0][0]))
+                    else:
+                        pair_cls = REUSE_UNEXPLAINED
+                        pair_basis = ("bytes repeat %d sequence numbers "
+                                      "later with no signed gap record "
+                                      "in between"
+                                      % (hi["segment_seq"]
+                                         - lo["segment_seq"]))
+                if _REUSE_RANK[pair_cls] >= _REUSE_RANK[cls]:
+                    cls, basis = pair_cls, pair_basis
+            facts["class"] = cls
+            facts["basis"] = basis
+        groups.append(facts)
+        if _REUSE_RANK[facts["class"]] > _REUSE_RANK[axis]:
+            axis = facts["class"]
+    groups.sort(key=lambda g: (-_REUSE_RANK[g["class"]],
+                               g["segment_seqs"][0]))
+    return axis, groups
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -997,7 +1526,8 @@ def process_live_segment(path, cfg, state, gap, ship):
 
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
-                            end_ns, time_source, "live", gap, cfg["key_id"])
+                            end_ns, time_source, "live", gap, cfg["key_id"],
+                            cfg.get("capture_policy"))
     body_bytes, body = producer_sign(cfg["sk"], body_nosig)
     if len(body_bytes) >= ARTIFACT_LIMIT:
         raise SubmitError("%s: body is %d bytes, at/past the daemon's "
@@ -1354,9 +1884,9 @@ def submit_one(cfg, name, seg_path, body_path, send=onode_send):
     with open(body_path, "rb") as f:
         body_bytes = f.read()
     body = json.loads(body_bytes)            # must parse; bytes go verbatim
-    if body.get("schema") != SCHEMA:
-        raise ValueError("%s: body schema is %r, not %s"
-                         % (name, body.get("schema"), SCHEMA))
+    if body.get("schema") not in SCHEMAS:
+        raise ValueError("%s: body schema is %r, not one of %s"
+                         % (name, body.get("schema"), ", ".join(SCHEMAS)))
     with open(seg_path, "rb") as f:
         seg_bytes = f.read()
     seg_sha = hashlib.sha256(seg_bytes).hexdigest()
@@ -1515,6 +2045,7 @@ def main(argv=None):
                     help="device name in bodies (default: camera-id)")
     rp.add_argument("--data-dir", default=DATA_DIR)
     rp.add_argument("--sock", default=ONODE_SOCKET)
+    _add_policy_args(rp)
 
     lv = sub.add_parser("live",
                         help="CAPTURE HOST: capture live segments, "
@@ -1537,6 +2068,7 @@ def main(argv=None):
     lv.add_argument("--rtsp-config", default=None,
                     help="0600 file holding the rtsp:// URL (else "
                          "$VIRP_CAMERA_RTSP_URL)")
+    _add_policy_args(lv)
     lv.add_argument("--test-source", action="store_true",
                     help="no camera credential: capture a real-time "
                          "synthetic 720p source to exercise the path")
@@ -1580,6 +2112,11 @@ def main(argv=None):
                     help="pinned producer public key; repeat for a "
                          "multi-producer chain (each body is checked "
                          "against the key matching its producer_key_id)")
+    au.add_argument("--fail-on-coverage", action="store_true",
+                    help="also exit nonzero when coverage grades "
+                         "INTERRUPTED / UNEXPLAINED (chain integrity and "
+                         "coverage are separate properties; by default "
+                         "only integrity drives the exit code)")
 
     args = p.parse_args(argv)
 
@@ -1597,8 +2134,14 @@ def main(argv=None):
     if args.cmd == "replay":
         sk_path = os.path.join(args.data_dir, "producer.key")
         pk_path = os.path.join(args.data_dir, "producer.pub")
-        with open(pk_path, "rb") as f:
-            key_id = producer_key_id(f.read())
+        try:
+            key_id, sk = _producer_identity(sk_path, pk_path)
+        except TrustRootError as e:
+            print("TRUST ROOT NOT ESTABLISHED: %s" % e, file=sys.stderr)
+            return 2
+        policy = capture_policy_resolve(
+            args.data_dir, args.nominal_segment_s, args.jitter_s,
+            args.max_unexplained_gap_s)
         cfg = {
             "camera_id": args.camera_id,
             "device": args.device or args.camera_id,
@@ -1607,8 +2150,9 @@ def main(argv=None):
             "lock_path": os.path.join(args.data_dir, "instance.lock"),
             "sock": args.sock,
             "mode": "replay",
-            "sk": producer_load_sk(sk_path),
+            "sk": sk,
             "key_id": key_id,
+            "capture_policy": policy,
         }
         try:
             run_replay(args.dir, cfg)
@@ -1622,8 +2166,11 @@ def main(argv=None):
     if args.cmd == "live":
         sk_path = os.path.join(args.data_dir, "producer.key")
         pk_path = os.path.join(args.data_dir, "producer.pub")
-        with open(pk_path, "rb") as f:
-            key_id = producer_key_id(f.read())
+        try:
+            key_id, sk = _producer_identity(sk_path, pk_path)
+        except TrustRootError as e:
+            print("TRUST ROOT NOT ESTABLISHED: %s" % e, file=sys.stderr)
+            return 2
         rtsp_url = rtsp_url_from_config(config_path=args.rtsp_config)
         if not rtsp_url and not args.test_source:
             raise SystemExit("no RTSP URL: set $VIRP_CAMERA_RTSP_URL or "
@@ -1645,8 +2192,14 @@ def main(argv=None):
             "overlay_font": os.environ.get(
                 "VIRP_CAMERA_OVERLAY_FONT",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-            "sk": producer_load_sk(sk_path),
+            "sk": sk,
             "key_id": key_id,
+            "capture_policy": capture_policy_resolve(
+                args.data_dir,
+                args.nominal_segment_s
+                if args.nominal_segment_s is not None
+                else args.segment_time,
+                args.jitter_s, args.max_unexplained_gap_s),
         }
         ship = sftp_ship(args.spool, ssh_key=args.ssh_key)
         stop_after = args.minutes * 60 if args.minutes else None
@@ -1674,23 +2227,122 @@ def main(argv=None):
         return 0
 
     if args.cmd == "verify-segment":
-        return verify_segment(args.file, args.db, args.pubkey)
+        try:
+            return verify_segment(args.file, args.db, args.pubkey)
+        except TrustRootError as e:
+            print("TRUST ROOT NOT ESTABLISHED: %s" % e, file=sys.stderr)
+            print("no evidence was evaluated.", file=sys.stderr)
+            return 2
 
     if args.cmd == "audit":
-        checked, failures = audit_chain(args.db, args.session_prefix,
-                                        args.pubkey)
+        report = {}
+        try:
+            checked, failures = audit_chain(args.db, args.session_prefix,
+                                            args.pubkey, report=report)
+        except TrustRootError as e:
+            print("TRUST ROOT NOT ESTABLISHED: %s" % e, file=sys.stderr)
+            print("no evidence was evaluated; this is NOT a clean audit.",
+                  file=sys.stderr)
+            return 2
         print("audited %d camera evidence entr%s"
               % (checked, "y" if checked == 1 else "ies"))
+        if checked == 0:
+            # An empty scope is not a clean audit: it is a scope that was
+            # never established. Saying "intact" here was the same class
+            # of fail-open as an unloadable trust root.
+            print("SCOPE NOT ESTABLISHED: no camera evidence matched "
+                  "session prefix %r in %s — nothing was verified."
+                  % (args.session_prefix, args.db), file=sys.stderr)
+            return 2
         for f in failures:
             print("FAIL: %s" % f)
+        print(_audit_axes_text(report, bool(args.pubkey)))
         if not failures:
-            print("all stored bodies hash to their recorded "
-                  "artifact_hash; prev-hash chain intact%s"
-                  % ("; producer signatures valid" if args.pubkey
-                     else ""))
-        return 1 if failures else 0
+            print("INTEGRITY: OK — all %d stored bodies hash to their "
+                  "recorded artifact_hash; prev-hash chain intact%s"
+                  % (checked,
+                     "; %d/%d producer signature(s) verified against %d "
+                     "pinned key(s)"
+                     % (report.get("verified_sigs", 0),
+                        report.get("camera_bodies", 0),
+                        len(report.get("pinned_key_ids", [])))
+                     if args.pubkey else
+                     "; NO producer signature was checked (no --pubkey)"))
+        else:
+            print("INTEGRITY: FAILED — %d failure(s)" % len(failures))
+        if failures:
+            return 1
+        if (args.fail_on_coverage
+                and coverage_axis(report["coverage"]) == COVERAGE_UNEXPLAINED):
+            return 3
+        return 0
 
     return 2
+
+
+def _add_policy_args(sp):
+    """The signed capture-session policy, declared per run and remembered
+    per data_dir (see capture_policy_resolve)."""
+    sp.add_argument("--nominal-segment-s", type=float, default=None,
+                    help="declared nominal segment duration (default: "
+                         "--segment-time for live, else the data_dir "
+                         "policy or 6.0)")
+    sp.add_argument("--jitter-s", type=float, default=None,
+                    help="declared permitted boundary jitter in seconds "
+                         "(default: the data_dir policy or 2.0)")
+    sp.add_argument("--max-unexplained-gap-s", type=float, default=None,
+                    help="largest hole tolerated WITHOUT a signed gap "
+                         "record before coverage grades UNEXPLAINED "
+                         "(default: the data_dir policy or 0.0)")
+
+
+def _producer_identity(sk_path, pk_path):
+    """The producing side's own trust root: the data_dir public key must
+    be a real Ed25519 key AND must be the public half of the secret this
+    run will sign with. A mismatch would produce records stamped with a
+    producer_key_id that verifies against nothing — evidence that looks
+    signed and can never be checked."""
+    key_id, pk_raw = load_trust_root(pk_path)
+    sk = producer_load_sk(sk_path)
+    if sk.public_key().public_bytes_raw() != pk_raw:
+        raise TrustRootError(
+            "%s is not the public half of %s — refusing to sign records "
+            "under a producer_key_id nobody can verify"
+            % (pk_path, sk_path))
+    return key_id, sk
+
+
+def _audit_axes_text(report, have_pubkey):
+    """The two axes that are not chain integrity, always printed, always
+    separately — a chain can be intact across an outage it never claimed
+    to cover, and identical bytes are an observation, not a verdict."""
+    lines = []
+    cov = report.get("coverage") or {}
+    lines.append("COVERAGE: %s" % coverage_axis(cov))
+    for cam in sorted(cov):
+        c = cov[cam]
+        lines.append("  %-24s %-24s %s (seq %d..%d, %d record(s))"
+                     % (cam, c["verdict"], c["reason"], c["seq_first"],
+                        c["seq_last"], c["records"]))
+        for o in c["outages"]:
+            lines.append("      %-12s seq %d→%d  hole %.1fs  gap=%s"
+                         % (o["class"], o["after_seq"], o["seq"],
+                            o["hole_s"], o["gap_reason"] or "none"))
+        for o in c.get("overlaps") or []:
+            lines.append("      %-12s seq %d→%d  windows overlap %.1fs "
+                         "(no time uncovered)"
+                         % ("OVERLAP", o["after_seq"], o["seq"],
+                            o["overlap_s"]))
+    lines.append("CONTENT REUSE: %s" % report.get("reuse_axis", REUSE_NONE))
+    for g in report.get("reuse") or []:
+        lines.append("  %-22s %.16s… x%d  cam=%s seqs=%s Δseq=%d "
+                     "Δcapture_start=%.1fs bytes=%s"
+                     % (g["class"], g["segment_sha256"], g["occurrences"],
+                        ",".join(g["cameras"]), g["segment_seqs"],
+                        g["seq_delta"], g["capture_start_delta_s"],
+                        ",".join(str(b) for b in g["byte_len"])))
+        lines.append("      basis: %s" % g["basis"])
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
