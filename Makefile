@@ -43,6 +43,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_chainsign.o \
              $(BUILD_DIR)/virp_ssh_io.o \
              $(BUILD_DIR)/virp_scrub.o \
+             $(BUILD_DIR)/virp_body_filter.o \
              $(BUILD_DIR)/cJSON.o
 
 # Optional Cisco driver (requires libssh2)
@@ -259,6 +260,9 @@ $(BUILD_DIR)/cJSON.o: src/third_party/cJSON.c | $(BUILD_DIR)
 $(BUILD_DIR)/virp_onode.o: src/virp_onode.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/virp_body_filter.o: src/virp_body_filter.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/virp_chain.o: src/virp_chain.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -387,6 +391,16 @@ $(TEST_FG_SCRUB): tests/test_driver_fortigate_scrub.c \
 test-fg-scrub: $(TEST_FG_SCRUB)
 	./$(TEST_FG_SCRUB)
 
+# Collector-side body filter (allowlist + recorded removal, pre-chain)
+TEST_BODY_FILTER = $(BUILD_DIR)/test_body_filter
+
+$(TEST_BODY_FILTER): tests/test_body_filter.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-body-filter
+test-body-filter: $(TEST_BODY_FILTER)
+	./$(TEST_BODY_FILTER)
+
 # Cisco config credential scrubbing (show running-config GREEN gate)
 TEST_CISCO_SCRUB = $(BUILD_DIR)/test_driver_cisco_scrub
 
@@ -493,6 +507,49 @@ $(TEST_LINUX_BLACK): tests/test_driver_linux_black.c \
 .PHONY: test-linux-black
 test-linux-black: $(TEST_LINUX_BLACK)
 	./$(TEST_LINUX_BLACK)
+
+# ── Driver refusal contract (Defect B) ───────────────────────────────
+# Each driver's execute() and struct virp_conn are private, so the source
+# is #included and each driver gets its own TU (two drivers in one TU
+# collide). Built WITHOUT the driver flag so $(LIB) does not also export
+# the symbols. These assert the CONTRACT — no_dispatch, NOT_SENT, empty
+# output — not merely that the classifier returns BLACK, which is all the
+# pre-existing *_black tests checked.
+TEST_ASA_REFUSAL  = $(BUILD_DIR)/test_driver_asa_refusal
+TEST_CISCO_REFUSAL = $(BUILD_DIR)/test_driver_cisco_refusal
+TEST_JUNIPER_REFUSAL = $(BUILD_DIR)/test_driver_juniper_refusal
+TEST_FG_REFUSAL   = $(BUILD_DIR)/test_driver_fortigate_refusal
+TEST_PANOS_REFUSAL = $(BUILD_DIR)/test_driver_panos_refusal
+
+$(TEST_ASA_REFUSAL): tests/test_driver_asa_refusal.c tests/refusal_contract.h $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+$(TEST_CISCO_REFUSAL): tests/test_driver_cisco_refusal.c tests/refusal_contract.h $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+$(TEST_JUNIPER_REFUSAL): tests/test_driver_juniper_refusal.c tests/refusal_contract.h $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+$(TEST_FG_REFUSAL): tests/test_driver_fortigate_refusal.c tests/refusal_contract.h $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -lcurl -o $@
+
+$(TEST_PANOS_REFUSAL): tests/test_driver_panos_refusal.c tests/refusal_contract.h $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+.PHONY: test-refusal-contract
+test-refusal-contract: $(TEST_ASA_REFUSAL) $(TEST_CISCO_REFUSAL) \
+                       $(TEST_JUNIPER_REFUSAL) $(TEST_FG_REFUSAL) \
+                       $(TEST_PANOS_REFUSAL)
+	./$(TEST_ASA_REFUSAL)
+	./$(TEST_CISCO_REFUSAL)
+	./$(TEST_JUNIPER_REFUSAL)
+	./$(TEST_FG_REFUSAL)
+	./$(TEST_PANOS_REFUSAL)
 
 # Chain and Federation tests
 TEST_CHAIN = $(BUILD_DIR)/test_chain
@@ -1804,7 +1861,7 @@ test-api:
 	    echo "  *** The API auth + bind-safety guards are NOT covered in this run."; \
 	fi
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-scrub test-ssh-io test-fg-scrub test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-autopilot test-config-backup test-render-devices test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 
@@ -1815,6 +1872,12 @@ all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path ch
 # above still runs — and fails the aggregate if any required dependency is
 # absent, so a skip can never masquerade as clean success. Installing the
 # deps is the fix; the message names them.
+.PHONY: check-obs-build-ordering
+check-obs-build-ordering:
+	@scripts/check-obs-build-ordering.sh --selftest >/dev/null || \
+	    { echo "FAIL: check-obs-build-ordering.sh selftest failed — the guard is broken"; exit 1; }
+	@scripts/check-obs-build-ordering.sh
+
 .PHONY: check-test-deps
 check-test-deps:
 	@scripts/check-test-deps.sh --selftest >/dev/null || \

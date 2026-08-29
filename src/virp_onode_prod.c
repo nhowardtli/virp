@@ -39,6 +39,22 @@
  * -DVIRP_ONODE_PROD_NO_MAIN, which excludes the daemon scaffolding so
  * there's no duplicate main()/g_state and no unused-static warnings.
  */
+#ifdef VIRP_DRIVER_LINUX
+/*
+ * Register a device's protected VMIDs with the linux gate classifier.
+ * The route_command() hook receives a command and no device, so the
+ * classifier cannot look this up per-device at decision time — the
+ * loader pushes it in at startup instead, and the classifier holds the
+ * union across devices. Returns -1 on an unparseable list.
+ *
+ * Declared OUTSIDE the VIRP_ONODE_PROD_NO_MAIN block: load_devices() is
+ * compiled into both the daemon and the NO_MAIN lib object
+ * (virp_onode_prod_lib.o) and calls it, so the plain LINUX=1 dev build
+ * failed with -Wimplicit-function-declaration under -Werror.
+ */
+extern int linux_gate_set_protected_vmids(const char *csv);
+#endif
+
 #ifndef VIRP_ONODE_PROD_NO_MAIN
 
 static onode_state_t g_state;
@@ -53,14 +69,6 @@ extern void virp_driver_fortinet_init(void);
 #endif
 #ifdef VIRP_DRIVER_LINUX
 extern void virp_driver_linux_init(void);
-/*
- * Register a device's protected VMIDs with the linux gate classifier.
- * The route_command() hook receives a command and no device, so the
- * classifier cannot look this up per-device at decision time — the
- * loader pushes it in at startup instead, and the classifier holds the
- * union across devices. Returns -1 on an unparseable list.
- */
-extern int linux_gate_set_protected_vmids(const char *csv);
 #endif
 #ifdef VIRP_DRIVER_PALOALTO
 extern void virp_driver_paloalto_init(void);
@@ -661,6 +669,12 @@ int load_devices(onode_state_t *state, const char *path)
         if (json_get_bool(dev_obj, "ssh_legacy", &bool_val))
             device.ssh_legacy = bool_val;
 
+        /* cisco_asa only: the operator declares that login already lands
+         * in enable mode (aaa authorization exec ... auto-enable), so the
+         * no-enable-credential refusal below does not apply (#14). */
+        if (json_get_bool(dev_obj, "asa_auto_enable", &bool_val))
+            device.asa_auto_enable = bool_val;
+
         /* PBS-specific fields (ignored for other vendors).
          *
          * tls_fingerprint is the PBS driver's server identity. It is
@@ -728,12 +742,16 @@ int load_devices(onode_state_t *state, const char *path)
 
         if (device.hostname[0] == '\0' || device.host[0] == '\0') {
             fprintf(stderr, "[O-Node] Skipping device %d: missing hostname/host\n", i);
+            onode_note_rejected(state, device.hostname, device.host,
+                                device.vendor, "missing hostname/host");
             continue;
         }
 
         if (device.vendor == VIRP_VENDOR_UNKNOWN) {
             fprintf(stderr, "[O-Node] Skipping %s: unknown vendor\n",
                     device.hostname);
+            onode_note_rejected(state, device.hostname, device.host,
+                                device.vendor, "unknown vendor");
             continue;
         }
 
@@ -750,7 +768,50 @@ int load_devices(onode_state_t *state, const char *path)
                             "tls_fingerprint — the PBS driver pins the "
                             "server certificate and has no insecure mode\n",
                     device.hostname);
+            onode_note_rejected(state, device.hostname, device.host,
+                                device.vendor, "PBS device has no tls_fingerprint");
             continue;
+        }
+
+        /*
+         * A cisco_asa device without an "enable" credential is the same
+         * class of error (issue #14). The ASA driver connects at user
+         * mode, cannot reach enable, and its "show clock" health check
+         * then fails at priv-1 — so the watchdog drops the session and
+         * reconnects every backoff interval for as long as the daemon
+         * runs: an SSH login storm against the firewall that never
+         * converges. A non-string value ("enable": 0, the issue #7
+         * shape) reads as absent and lands here too, now with a line
+         * that names the problem instead of a warning per reconnect.
+         * Refusing at load keeps "loaded" meaning "usable".
+         *
+         * Exception, declared per device: "asa_auto_enable": true means
+         * the ASA runs `aaa authorization exec ... auto-enable` and the
+         * login lands at `#` already (verified on a 5505 / 9.1(7)). The
+         * connect path's already-in-enable branch handles that session;
+         * no credential is needed. If the declaration is wrong the old
+         * reconnect behaviour returns — the warning names the device.
+         */
+        if (device.vendor == VIRP_VENDOR_CISCO_ASA &&
+            device.enable_password[0] == '\0') {
+            if (device.asa_auto_enable) {
+                fprintf(stderr, "[O-Node] WARNING: asa_auto_enable=true for %s "
+                                "— no \"enable\" credential; the login must "
+                                "already land in enable mode (#14)\n",
+                        device.hostname);
+            } else {
+                fprintf(stderr, "[O-Node] Skipping %s: cisco_asa device has no "
+                                "\"enable\" credential — the ASA driver needs "
+                                "enable mode for its health check and would "
+                                "reconnect indefinitely without it (#14; set "
+                                "\"asa_auto_enable\": true only if login "
+                                "lands at '#' via aaa authorization auto-enable)\n",
+                        device.hostname);
+                onode_note_rejected(state, device.hostname, device.host,
+                                    device.vendor,
+                                    "cisco_asa without \"enable\" credential (#14)");
+                continue;
+            }
         }
 
 #ifdef VIRP_DRIVER_LINUX

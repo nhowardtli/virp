@@ -43,6 +43,45 @@ void virp_driver_mock_set_soft_fail(const char *msg) { mock_soft_fail_msg = msg;
 static const char *mock_unknown_fail_msg = NULL;
 void virp_driver_mock_set_unknown_fail(const char *msg) { mock_unknown_fail_msg = msg; }
 
+/*
+ * Test hook: the CLI-driver refusal shape — VIRP_OK, success=false, a
+ * NON-EMPTY output body carrying the refusal banner, and no_dispatch /
+ * disposition left unset.
+ *
+ * This is what driver_asa.c:1027, driver_cisco.c:1078,
+ * driver_juniper.c:684, driver_juniper.c:996 and
+ * driver_fortigate.c:802 actually emit when their BLACK-tier or
+ * separator backstop refuses a command: they write
+ * "<host><prompt><cmd>\n<reason>" into result->output and return.
+ *
+ * It is deliberately NOT the soft-fail shape above. Both onode refusal
+ * filters (virp_onode.c:1892 and :1940) require output_len == 0, so a
+ * driver that explains its refusal in the output buffer defeats both
+ * and falls through to the success path at :1984 — recorded
+ * "executed":true and signed as DEVICE_OUTPUT. No existing hook
+ * reproduces that, which is why the defect survived a fix, a test and
+ * a survey. NULL disables.
+ */
+static const char *mock_refusal_body = NULL;
+void virp_driver_mock_set_refusal_with_body(const char *body_text)
+{
+    mock_refusal_body = body_text;
+}
+
+/*
+ * Test hook: the same refusal-with-body shape, but the driver DECLARES
+ * non-dispatch (no_dispatch + NOT_SENT) as the contract requires. This is
+ * what the five drivers will emit after step 2. It exists now so step 1's
+ * routing is exercised on its own rather than taken on trust: without it
+ * the new no_dispatch/NOT_SENT clause is unreachable until step 2 lands,
+ * and unreachable code that nothing runs is how this defect got here.
+ */
+static const char *mock_declared_refusal_body = NULL;
+void virp_driver_mock_set_declared_refusal(const char *body_text)
+{
+    mock_declared_refusal_body = body_text;
+}
+
 /* Test hook: execute() succeeds and returns EXACTLY this text as the
  * device response body. Lets a test put chosen bytes — credential-shaped
  * material in particular — into a GREEN device response and then assert
@@ -253,6 +292,36 @@ static virp_error_t mock_execute(virp_conn_t *conn,
         return VIRP_OK;
     }
 
+    /* Test hook: refusal WITH a body that DOES declare non-dispatch —
+     * the post-step-2 shape. Ordered before the undeclared variant so a
+     * test can enable either independently. */
+    if (mock_declared_refusal_body) {
+        result->success = false;
+        result->exit_code = 1;
+        result->no_dispatch = true;
+        result->disposition = VIRP_DISPOSITION_NOT_SENT;
+        int n = snprintf(result->output, sizeof(result->output),
+                         "%s", mock_declared_refusal_body);
+        result->output_len = (n > 0) ? (size_t)n : 0;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "BLACK tier: command blocked on %s", conn->device.hostname);
+        return VIRP_OK;
+    }
+
+    /* Test hook: CLI-driver refusal WITH a body. Mirrors the real
+     * drivers exactly: success=false, a populated output buffer, and
+     * NO no_dispatch / disposition signal. */
+    if (mock_refusal_body) {
+        result->success = false;
+        result->exit_code = 1;
+        int n = snprintf(result->output, sizeof(result->output),
+                         "%s", mock_refusal_body);
+        result->output_len = (n > 0) ? (size_t)n : 0;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "BLACK tier: command blocked on %s", conn->device.hostname);
+        return VIRP_OK;
+    }
+
     /* Test hook: simulate a driver soft-failure (refused before device I/O) */
     if (mock_soft_fail_msg) {
         result->success = false;
@@ -376,11 +445,21 @@ static virp_error_t mock_health_check(virp_conn_t *conn)
  * driver under the fail-closed ENFORCE default: read-only commands are
  * GREEN, state-changing ones YELLOW, destructive ones RED, anything
  * unrecognized stays UNCLASSIFIED (blocked under ENFORCE).
+ *
+ * "selfdestruct" is BLACK: it exists so the gate's unconditional-BLACK
+ * invariant can be tested through a driver that has NO BLACK backstop
+ * of its own in execute() — if the gate ever admits a BLACK command in
+ * any mode, mock_execute runs it and the invariant test sees the leak
+ * directly instead of a driver belt masking it. Do not add a BLACK
+ * refusal to mock_execute.
  */
 static virp_trust_tier_t mock_route_command(const char *command)
 {
     if (!command) return VIRP_TIER_UNCLASSIFIED;
     while (*command == ' ' || *command == '\t') command++;
+
+    if (strncmp(command, "selfdestruct", 12) == 0)
+        return VIRP_TIER_BLACK;
 
     if (strncmp(command, "show ", 5) == 0 ||
         strcmp(command, "show") == 0 ||

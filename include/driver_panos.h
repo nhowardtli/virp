@@ -60,6 +60,11 @@ void virp_driver_paloalto_init(void);
 /* Command routing — maps CLI command to trust tier */
 virp_trust_tier_t pa_route_command(const char *command);
 
+/* BLACK deny list membership — prefix-matched, case-insensitive.
+ * pa_route_command returns VIRP_TIER_BLACK for these, and pa_execute
+ * carries its own refusal backstop for them. */
+bool pa_is_black_tier(const char *command);
+
 /* Exported for tests */
 extern const size_t PA_ROUTE_TABLE_SIZE;
 extern const pa_command_route_t PA_ROUTE_TABLE[];

@@ -8,9 +8,12 @@
  * assert table ORDER — a broad entry must not shadow a more specific one.
  */
 
+#define _GNU_SOURCE             /* memmem */
 #include "virp.h"
 #include "virp_driver.h"
 #include "driver_panos.h"
+#include "virp_onode.h"
+#include "virp_message.h"
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -92,8 +95,21 @@ static void test_yellow(void)
     assert(pa_route_command("show running security-policy") == VIRP_TIER_YELLOW);
     PASS();
 
-    TEST("debug dataplane pool statistics -> YELLOW");
-    assert(pa_route_command("debug dataplane pool statistics") == VIRP_TIER_YELLOW);
+    /* 2026-08-27: `debug` is no longer a YELLOW verb — its safe subset
+     * was never enumerated (it reaches process restarts). Its commands
+     * fall to RED by absence; see test_black_and_narrowed_yellow(). */
+
+    TEST("test security-policy-match ... -> YELLOW (enumerated safe form)");
+    assert(pa_route_command(
+        "test security-policy-match from trust to untrust source 10.0.0.1 "
+        "destination 8.8.8.8 protocol 6 destination-port 443")
+           == VIRP_TIER_YELLOW);
+    PASS();
+
+    TEST("test routing fib-lookup virtual-router default ip 8.8.8.8 -> YELLOW");
+    assert(pa_route_command(
+        "test routing fib-lookup virtual-router default ip 8.8.8.8")
+           == VIRP_TIER_YELLOW);
     PASS();
 
     TEST("ping host 1.1.1.1 -> YELLOW");
@@ -311,17 +327,19 @@ static void test_no_match_fails_closed(void)
 {
     printf("\n=== No-match default fails closed to RED ===\n");
 
-    TEST("unlisted: commit -> RED (applies the entire candidate configuration)");
-    assert(pa_route_command("commit") == VIRP_TIER_RED); PASS();
-
-    TEST("unlisted: delete rulebase security rules TRUST-ANY -> RED (deletes a firewall rule)");
-    assert(pa_route_command("delete rulebase security rules TRUST-ANY") == VIRP_TIER_RED); PASS();
+    /* 2026-08-27: commit / delete / request restart system moved from
+     * RED-by-absence to explicit BLACK (deny table) — strictly tighter;
+     * asserted in test_black_and_narrowed_yellow(). The fail-closed
+     * default is still load-bearing for everything unlisted: */
 
     TEST("unlisted: set deviceconfig system permitted-ip 0.0.0.0 -> RED (opens mgmt to the world)");
     assert(pa_route_command("set deviceconfig system permitted-ip 0.0.0.0") == VIRP_TIER_RED); PASS();
 
-    TEST("unlisted: request restart system -> RED (reboots the firewall)");
-    assert(pa_route_command("request restart system") == VIRP_TIER_RED); PASS();
+    TEST("unlisted: request license fetch -> RED (fail closed)");
+    assert(pa_route_command("request license fetch") == VIRP_TIER_RED); PASS();
+
+    TEST("unlisted: frobnicate the widget -> RED (fail closed)");
+    assert(pa_route_command("frobnicate the widget") == VIRP_TIER_RED); PASS();
 
     TEST("NULL command -> RED (fail closed)");
     assert(pa_route_command(NULL) == VIRP_TIER_RED); PASS();
@@ -507,6 +525,175 @@ static void test_prefix_entries_positive_and_negative(void)
     assert(pa_route_command("show systemfoo") == VIRP_TIER_RED); PASS();
 }
 
+/* =========================================================================
+ * BLACK deny table + narrowed YELLOW (2026-08-27)
+ *
+ * BLACK entries derive from the PAN-OS CLI reference (see the table
+ * comment in driver_panos.c). The classifier RETURNS BLACK — unlike
+ * Cisco/FortiGate, like ASA/JunOS — so the O-Node gate refuses these
+ * unconditionally in both modes; pa_execute carries the driver belt.
+ * ========================================================================= */
+
+static void test_black_and_narrowed_yellow(void)
+{
+    printf("\n=== BLACK tier + narrowed YELLOW ===\n");
+
+    TEST("commit -> BLACK");
+    assert(pa_route_command("commit") == VIRP_TIER_BLACK); PASS();
+
+    TEST("commit force -> BLACK");
+    assert(pa_route_command("commit force") == VIRP_TIER_BLACK); PASS();
+
+    TEST("COMMIT -> BLACK (deny list is case-insensitive)");
+    assert(pa_route_command("COMMIT") == VIRP_TIER_BLACK); PASS();
+
+    TEST("load config from backup.xml -> BLACK");
+    assert(pa_route_command("load config from backup.xml") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("scp import configuration ... -> BLACK");
+    assert(pa_route_command("scp import configuration from user@h:/c.xml")
+           == VIRP_TIER_BLACK); PASS();
+
+    TEST("tftp import software ... -> BLACK");
+    assert(pa_route_command("tftp import software from h file p")
+           == VIRP_TIER_BLACK); PASS();
+
+    TEST("delete config saved old.xml -> BLACK");
+    assert(pa_route_command("delete config saved old.xml") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("delete certificate my-cert -> BLACK (key/cert deletion)");
+    assert(pa_route_command("delete certificate my-cert") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("request restart system -> BLACK");
+    assert(pa_route_command("request restart system") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("request shutdown system -> BLACK");
+    assert(pa_route_command("request shutdown system") == VIRP_TIER_BLACK);
+    PASS();
+
+    TEST("request system private-data-reset -> BLACK");
+    assert(pa_route_command("request system private-data-reset")
+           == VIRP_TIER_BLACK); PASS();
+
+    TEST("request system raid remove A1 -> BLACK");
+    assert(pa_route_command("request system raid remove A1")
+           == VIRP_TIER_BLACK); PASS();
+
+    TEST("pa_is_black_tier agrees with the classifier");
+    assert(pa_is_black_tier("commit"));
+    assert(pa_is_black_tier("Request Restart System"));
+    assert(!pa_is_black_tier("show system info"));
+    assert(!pa_is_black_tier("test security-policy-match from a to b"));
+    PASS();
+
+    /* Formerly-YELLOW broad verbs now fall to RED by absence:
+     * approvable is the correct home for "safe subset not enumerated". */
+
+    TEST("debug dataplane pool statistics -> RED (verb out of YELLOW)");
+    assert(pa_route_command("debug dataplane pool statistics")
+           == VIRP_TIER_RED); PASS();
+
+    TEST("debug software restart process management-server -> RED");
+    assert(pa_route_command("debug software restart process management-server")
+           == VIRP_TIER_RED); PASS();
+
+    TEST("less mp-log ms.log -> RED (verb out of YELLOW)");
+    assert(pa_route_command("less mp-log ms.log") == VIRP_TIER_RED); PASS();
+
+    TEST("tail follow yes mp-log ms.log -> RED (verb out of YELLOW)");
+    assert(pa_route_command("tail follow yes mp-log ms.log")
+           == VIRP_TIER_RED); PASS();
+
+    TEST("test scp-server-connection ... -> RED (unlisted test form)");
+    assert(pa_route_command("test scp-server-connection initiate")
+           == VIRP_TIER_RED); PASS();
+
+    /* Allowlisted exact YELLOW forms are still YELLOW. */
+    TEST("test nat-policy-match ... stays YELLOW");
+    assert(pa_route_command("test nat-policy-match source 10.0.0.1 "
+                            "destination 8.8.8.8 protocol 6")
+           == VIRP_TIER_YELLOW); PASS();
+
+    TEST("ping host 1.1.1.1 stays YELLOW");
+    assert(pa_route_command("ping host 1.1.1.1") == VIRP_TIER_YELLOW); PASS();
+}
+
+/* =========================================================================
+ * Gate-level: a table-listed BLACK PAN-OS command is refused by the
+ * O-Node gate in BOTH modes, before any connection attempt.
+ *
+ * PAN-OS is the driver that had NO driver-level BLACK backstop when the
+ * SHADOW/BLACK gap was found, so this drives the REAL driver through
+ * the real gate. The gate refuses BLACK before get_connection(), so no
+ * SSH is ever attempted (the device host below would refuse instantly
+ * anyway — and a "cannot connect" ERROR instead of "tier gate blocked"
+ * would fail the payload assertion, distinguishing a gate refusal from
+ * a connect failure).
+ * ========================================================================= */
+
+static void gate_black_one_mode(onode_gate_mode_t mode, const char *sock,
+                                const char *label)
+{
+    TEST(label);
+
+    onode_state_t st;
+    assert(onode_init(&st, 0xDEAD0B1A, NULL, sock) == VIRP_OK);
+    st.gate_default_mode = mode;
+    st.gate_max_tier = VIRP_TIER_RED;      /* even the widest ceiling */
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "PA-GATE");
+    snprintf(dev.host, sizeof(dev.host), "127.0.0.1");
+    dev.port = 9;                          /* discard — refuses instantly */
+    dev.vendor = VIRP_VENDOR_PALOALTO;
+    dev.node_id = 0x0B1AC001;
+    dev.enabled = true;
+    assert(onode_add_device(&st, &dev) == VIRP_OK);
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    assert(onode_execute(&st, "PA-GATE", "request restart system",
+                         obs, sizeof(obs), &olen) == VIRP_OK);
+
+    virp_header_t hdr;
+    assert(virp_validate_message(obs, olen, &st.okey, &hdr) == VIRP_OK);
+
+    virp_observation_t o;
+    const uint8_t *data;
+    uint16_t data_len;
+    assert(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                  olen - VIRP_HEADER_SIZE,
+                                  &o, &data, &data_len) == VIRP_OK);
+
+    assert(o.obs_type == VIRP_OBS_ERROR);
+    assert(memmem(data, data_len, "tier gate blocked",
+                  strlen("tier gate blocked")) != NULL);
+    assert(memmem(data, data_len, "tier=BLACK",
+                  strlen("tier=BLACK")) != NULL);
+    /* BLACK is untransmittable on the wire: over-reported as RED. */
+    assert(hdr.tier == VIRP_TIER_RED);
+
+    onode_destroy(&st);
+    PASS();
+}
+
+static void test_gate_refuses_black_both_modes(void)
+{
+    printf("\n=== Gate refuses PAN-OS BLACK in ENFORCE and SHADOW ===\n");
+    virp_driver_paloalto_init();
+    gate_black_one_mode(GATE_MODE_ENFORCE,
+                        "/tmp/virp-onode-panos-black-enf.sock",
+                        "request restart system refused at gate (ENFORCE)");
+    gate_black_one_mode(GATE_MODE_SHADOW,
+                        "/tmp/virp-onode-panos-black-shdw.sock",
+                        "request restart system refused at gate (SHADOW)");
+}
+
 int main(void)
 {
     printf("VIRP PAN-OS Driver — Unit Tests\n");
@@ -523,6 +710,8 @@ int main(void)
     test_table_driven_all_entries();
     test_prefix_flag_lint();
     test_prefix_entries_positive_and_negative();
+    test_black_and_narrowed_yellow();
+    test_gate_refuses_black_both_modes();
     printf("\n================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
 

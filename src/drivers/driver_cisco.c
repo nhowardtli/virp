@@ -1159,10 +1159,16 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
                  "BLACK tier: command blocked on %s", conn->device.hostname);
         fprintf(stderr, "[Cisco] BLACK tier blocked: '%s' on %s\n",
                 command, conn->device.hostname);
-        int written = snprintf(result->output, sizeof(result->output),
-                               "%s#%s\nBLACK tier: command forbidden",
-                               conn->device.hostname, command);
-        result->output_len = (written > 0) ? (size_t)written : 0;
+        /* Defect B (2026-08-26): declare non-dispatch. no_dispatch is the
+         * O-Node's proof standard and NOT_SENT states it positively rather
+         * than by omission; without both, gate_emit_execution records this
+         * refusal as "executed":true and the observation is signed as
+         * DEVICE_OUTPUT. The refusal text moves to error_msg, which is what
+         * the signed ERROR observation is built from — result->output is the
+         * DEVICE's voice, and the device was never asked. Contract and
+         * placement follow driver_linux.c:352-372. */
+        result->no_dispatch = true;
+        result->disposition = VIRP_DISPOSITION_NOT_SENT;
         return VIRP_OK;
     }
 

@@ -130,12 +130,23 @@ const pa_command_route_t PA_ROUTE_TABLE[] = {
     { "show running qos-policy",            VIRP_TIER_YELLOW, false },
     { "show running",                       VIRP_TIER_YELLOW, false },
     { "show config",                        VIRP_TIER_YELLOW, false },
-    { "debug",                              VIRP_TIER_YELLOW, false },
-    { "test",                               VIRP_TIER_YELLOW, false },
+    /* 2026-08-27: the broad verbs `debug`, `test`, `less` and `tail`
+     * are OUT of YELLOW. Their safe subsets were never enumerated —
+     * `debug` reaches process restarts (debug software restart
+     * process), `less`/`tail` read arbitrary on-box log files — and
+     * "we have not enumerated what's safe" is RED by the tier
+     * definitions (blocked, approvable), which is where their commands
+     * now fall by absence. Only COMPLETE, known-safe `test` forms are
+     * listed, per the PAN-OS CLI reference (Test the Configuration /
+     * Test Policy Matches; policy-match simulators and FIB lookups are
+     * read-only evaluations of candidate traffic): */
+    { "test security-policy-match",         VIRP_TIER_YELLOW, false },
+    { "test nat-policy-match",              VIRP_TIER_YELLOW, false },
+    { "test pbf-policy-match",              VIRP_TIER_YELLOW, false },
+    { "test decryption-policy-match",       VIRP_TIER_YELLOW, false },
+    { "test routing fib-lookup",            VIRP_TIER_YELLOW, false },
     { "ping",                               VIRP_TIER_YELLOW, false },
     { "traceroute",                         VIRP_TIER_YELLOW, false },
-    { "less",                               VIRP_TIER_YELLOW, false },
-    { "tail",                               VIRP_TIER_YELLOW, false },
     /* Operational/topology reads — NOT credential-exposing; YELLOW to
      * match the config-read precedent. show panorama-status reveals the
      * Panorama mgmt IP + connection state; show device-group reveals
@@ -155,6 +166,65 @@ const pa_command_route_t PA_ROUTE_TABLE[] = {
 
 const size_t PA_ROUTE_TABLE_SIZE =
     sizeof(PA_ROUTE_TABLE) / sizeof(PA_ROUTE_TABLE[0]);
+
+/* =========================================================================
+ * BLACK Tier — Destructive commands that must never reach the wire.
+ *
+ * Prefix-matched, CASE-INSENSITIVE, same structure and rationale as
+ * CISCO_BLACK_COMMANDS / FG_BLACK_COMMANDS: this is a DENY list, and
+ * over-matching a deny list is the fail-closed direction ("COMMIT"
+ * stays BLACK, never RED-by-absence where the propose/approve path
+ * could in principle reach it). Nothing matched here ever executes.
+ *
+ * Entries derived from the PAN-OS CLI reference (PAN-OS CLI Quick
+ * Start: Modify the Configuration / Test the Configuration; PAN-OS
+ * op-mode `request` and `delete` families; scp/tftp import per "CLI
+ * Commands to Export/Import Configuration and Log Files"):
+ *
+ *   commit                            — apply the candidate config
+ *   load                              — stage a config / device-state
+ *                                       replacement (load config from,
+ *                                       load config partial, ...)
+ *   scp import / tftp import          — pull config/software/certs
+ *                                       onto the box (there is no bare
+ *                                       `import` verb in PAN-OS)
+ *   delete                            — op- and config-mode deletion:
+ *                                       delete config saved, delete
+ *                                       certificate, key material
+ *                                       (ASA precedent: bare `delete`
+ *                                       is BLACK there too)
+ *   request restart system            — reboot
+ *   request shutdown system           — power off
+ *   request system private-data-reset — wipe logs + config to factory
+ *   request system raid               — RAID membership changes
+ *                                       (add/remove/copy log disks)
+ * ========================================================================= */
+
+static const char *PA_BLACK_COMMANDS[] = {
+    "commit",
+    "load ",
+    "scp import",
+    "tftp import",
+    "delete",
+    "request restart system",
+    "request shutdown system",
+    "request system private-data-reset",
+    "request system raid",
+};
+static const size_t PA_BLACK_COUNT =
+    sizeof(PA_BLACK_COMMANDS) / sizeof(PA_BLACK_COMMANDS[0]);
+
+bool pa_is_black_tier(const char *command)
+{
+    if (!command) return false;
+    while (*command == ' ' || *command == '\t') command++;
+    for (size_t i = 0; i < PA_BLACK_COUNT; i++) {
+        size_t plen = strlen(PA_BLACK_COMMANDS[i]);
+        if (strncasecmp(command, PA_BLACK_COMMANDS[i], plen) == 0)
+            return true;
+    }
+    return false;
+}
 
 /* =========================================================================
  * Command Routing — prefix match against table
@@ -185,6 +255,17 @@ virp_trust_tier_t pa_route_command(const char *command)
 
     /* Skip leading whitespace */
     while (*command == ' ' || *command == '\t') command++;
+
+    /*
+     * BLACK deny list FIRST: unlike Cisco/FortiGate (whose classifiers
+     * top out at RED and rely on their execute() backstop alone), this
+     * classifier RETURNS BLACK — like ASA and JunOS — so the O-Node
+     * gate refuses these commands unconditionally, in ENFORCE and
+     * SHADOW alike, before any connection attempt. The execute()
+     * backstop below is the second, driver-local belt.
+     */
+    if (pa_is_black_tier(command))
+        return VIRP_TIER_BLACK;
 
     /*
      * First match wins here (NOT longest match) — table order is load-
@@ -813,6 +894,26 @@ static virp_error_t pa_execute(virp_conn_t *conn,
         return VIRP_ERR_NULL_PTR;
 
     memset(result, 0, sizeof(*result));
+
+    /* ── BLACK tier safety: never execute destructive commands ──
+     * Placed BEFORE the connected check (driver_linux.c precedent):
+     * refusing a destructive command is a policy decision independent
+     * of reachability. The O-Node gate already refuses BLACK
+     * unconditionally in both modes; this is the driver-local belt,
+     * following the refusal contract (tests/refusal_contract.h):
+     * no_dispatch + NOT_SENT, empty output (the device's voice — it
+     * was never asked), reason in error_msg, VIRP_OK. */
+    if (pa_is_black_tier(command)) {
+        result->success = false;
+        result->exit_code = 1;
+        result->no_dispatch = true;   /* nothing was ever sent */
+        result->disposition = VIRP_DISPOSITION_NOT_SENT;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "BLACK tier: command blocked on %s", conn->device.hostname);
+        fprintf(stderr, "[PAN-OS] BLACK tier blocked: '%s' on %s\n",
+                command, conn->device.hostname);
+        return VIRP_OK;
+    }
 
     if (!conn->connected) {
         result->success = false;

@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "Collector-side body filter rules — see include/virp_body_filter.h.",
+    "Install as /etc/virp/body-filters.json (or point $VIRP_BODY_FILTERS",
+    "at a copy). This file ships the SAME rules that are compiled into",
+    "the daemon as built-in defaults (src/virp_body_filter.c",
+    "VBF_BUILTIN_RULES); a missing or unparseable config falls back to",
+    "those built-ins, never to 'no filtering'. Keep the two in sync.",
+    "Rules are ALLOWLISTS: name what may pass; everything else is",
+    "removed and the removed key names are recorded in the body's",
+    "_virp_filtered annotation before the body is hashed or chained."
+  ],
+  "version": 1,
+  "rules": [
+    {
+      "name": "librenms-devices-v1",
+      "driver": "librenms",
+      "path": "/api/v0/devices",
+      "envelope_allow": ["status", "count", "message"],
+      "array_key": "devices",
+      "item_allow": [
+        "device_id", "hostname", "sysName", "ip", "os", "type",
+        "hardware", "version", "serial", "status", "status_reason",
+        "ignore", "disabled", "uptime", "last_polled",
+        "last_discovered", "last_ping", "last_ping_timetaken",
+        "location_id", "dependency_parent_id"
+      ]
+    }
+  ]
+}
