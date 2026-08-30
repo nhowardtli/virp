@@ -238,16 +238,24 @@ class SubmitSpoolTests(unittest.TestCase):
                        "done": self.done,
                        "interval": 0}
 
-    def _ship_job(self, seq, prev, pad=b"seg" * 32, corrupt_seg=False):
+    def _ship_job(self, seq, prev, pad=b"seg" * 32, corrupt_seg=False,
+                  camera="tapo-c100", scheme="old"):
         """Build+sign a live body just like the capture host, drop the
-        {name.mp4, name.body, name.done} triple into incoming."""
+        {name.mp4, name.body, name.done} triple into incoming.
+
+        scheme="old" names the job <seq>.<sha>, the camera-blind form
+        that ~7600 files in the live done/ carry and that the capture
+        host wrote until this change; scheme="new" names it the way
+        spool_job_name does now. Both are exercised, because a real
+        incoming/ will hold both during a rollover."""
         seg_bytes = make_mp4(pad=pad)
         seg_sha = hashlib.sha256(seg_bytes).hexdigest()
-        nosig = vc.build_body("tapo-c100", "tapo-c100", seq, seg_sha, prev,
+        nosig = vc.build_body(camera, camera, seq, seg_sha, prev,
                               len(seg_bytes), 5.0, 0, 10 ** 18,
                               "host-clock", "live", None, self.cfg["key_id"])
         body_bytes, _ = vc.producer_sign(self.cfg["sk"], nosig)
-        name = "%06d.%s" % (seq, seg_sha)
+        name = ("%06d.%s" % (seq, seg_sha) if scheme == "old"
+                else vc.spool_job_name(camera, seq, seg_sha))
         stored_seg = seg_bytes if not corrupt_seg else (seg_bytes + b"X")
         with open(os.path.join(self.incoming, name + ".mp4"), "wb") as f:
             f.write(stored_seg)
@@ -312,6 +320,121 @@ class SubmitSpoolTests(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertTrue(os.path.exists(
             os.path.join(self.data_dir, "artifacts", body_sha + ".json")))
+
+    # ── mixed-convention spool ──────────────────────────
+    #
+    # A real incoming/ holds both conventions during a rollover, and
+    # done/ holds ~7600 files under the old one that are NOT renamed.
+    # Nothing lists or parses done/ — submit_spool only os.replace()s
+    # into it — and incoming/ is drained by pairing suffixes off the
+    # .done marker, so the two conventions simply coexist. The only thing
+    # the name decides is the sorted() drain ORDER, and ASCII puts every
+    # digit-leading old name ahead of every letter-leading new one, so a
+    # backlog drains before new work.
+
+    def test_both_conventions_drain_in_one_pass(self):
+        old_name, _, _ = self._ship_job(0, None, pad=b"old" * 20,
+                                        scheme="old")
+        new_name, _, _ = self._ship_job(1, None, pad=b"new" * 20,
+                                        scheme="new")
+        self.assertTrue(old_name[0].isdigit())
+        self.assertTrue(new_name.startswith("tapo-c100."))
+        send = FakeSend()
+        self.assertEqual(vc.submit_spool(self.subcfg, once=True, send=send),
+                         2)
+        self.assertEqual(len(send.requests), 2)
+        self.assertEqual([n for n in os.listdir(self.incoming)
+                          if not n.endswith(".part")], [])
+        for n in os.listdir(self.done):
+            self.assertTrue(n.startswith(old_name) or
+                            n.startswith(new_name), n)
+
+    def test_the_old_backlog_drains_first(self):
+        self._ship_job(5, None, pad=b"newer" * 20, scheme="new")
+        self._ship_job(2, None, pad=b"older" * 20, scheme="old")
+        send = FakeSend()
+        vc.submit_spool(self.subcfg, once=True, send=send)
+        seqs = [json.loads(r["artifact_content"])["segment_seq"]
+                for r in send.requests]
+        self.assertEqual(seqs, [2, 5])
+
+    def test_the_chain_record_does_not_depend_on_the_name(self):
+        # the same signed body under both names produces the same
+        # session_id, artifact_id and artifact_hash — the name is not
+        # an input to anything that reaches the chain
+        _, _, body_bytes = self._ship_job(0, None, pad=b"same" * 20,
+                                          scheme="old")
+        send_old = FakeSend()
+        vc.submit_spool(self.subcfg, once=True, send=send_old)
+
+        shutil.rmtree(self.data_dir, ignore_errors=True)
+        _, _, body2 = self._ship_job(0, None, pad=b"same" * 20,
+                                     scheme="new")
+        self.assertEqual(body2, body_bytes)
+        send_new = FakeSend()
+        vc.submit_spool(self.subcfg, once=True, send=send_new)
+
+        a, b = send_old.requests[0], send_new.requests[0]
+        for k in ("session_id", "artifact_id", "artifact_hash",
+                  "artifact_type", "artifact_content"):
+            self.assertEqual(a[k], b[k], k)
+
+
+class SpoolJobNamingTests(unittest.TestCase):
+    """<camera>.<seq>.<sha>, and what still holds because of what the
+    name is NOT used for.
+
+    The old name was <seq>.<sha>. Both live cameras wrote 000000.
+    through 000008. into one incoming/, told apart only by the hash —
+    the same collision class already fixed in three places on the
+    detection side, and the last layer still carrying it. Nothing broke
+    then and nothing changes on the chain now, because submit_one never
+    parses the name: camera_id, segment_seq, capture_end, session_id,
+    artifact_id and every hash come from the signed body. The name is
+    an operator-facing handle and a uniqueness key in one directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_the_name_carries_the_camera(self):
+        self.assertEqual(vc.spool_job_name("tapo-c100", 8, "a" * 64),
+                         "tapo-c100.000008." + "a" * 64)
+
+    def test_two_cameras_at_the_same_seq_no_longer_collide(self):
+        a = vc.spool_job_name("tapo-c100", 0, "a" * 64)
+        b = vc.spool_job_name("reolink-rlc810a-sub", 0, "a" * 64)
+        self.assertNotEqual(a, b)
+        # ... and under the old scheme they were the same name
+        self.assertEqual("%06d.%s" % (0, "a" * 64),
+                         "%06d.%s" % (0, "a" * 64))
+
+    def test_the_camera_token_cannot_reach_out_of_the_spool(self):
+        # the token now lands in an sftp put path inside a chroot
+        for bad in ("../etc/passwd", "a/b", "a.b", "-rf", "", "a b",
+                    "caf\u00e9", "x" * 65, "_lead", None, 7):
+            with self.subTest(camera=bad):
+                with self.assertRaises(ValueError):
+                    vc.spool_job_name(bad, 0, "a" * 64)
+
+    def test_the_live_camera_ids_are_all_accepted(self):
+        for good in ("tapo-c100", "tapo-c100-accept",
+                     "synthetic-restart-accept", "reolink-rlc810a-sub"):
+            with self.subTest(camera=good):
+                self.assertEqual(vc.spool_camera_token(good), good)
+
+    def test_a_staged_pair_is_still_found_under_the_new_name(self):
+        # _staged_pair globs *.<sha>.body, so the camera prefix is
+        # transparent to restart reconciliation
+        out = os.path.join(self.tmp, "outbox")
+        os.makedirs(out)
+        sha = "b" * 64
+        name = vc.spool_job_name("tapo-c100", 3, sha)
+        for ext in (".mp4", ".body"):
+            open(os.path.join(out, name + ext), "wb").close()
+        pair = vc._staged_pair(out, sha)
+        self.assertIsNotNone(pair)
+        self.assertEqual(os.path.basename(pair[1]), name + ".body")
 
 
 class MultiProducerAuditTests(unittest.TestCase):

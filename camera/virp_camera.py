@@ -1668,7 +1668,7 @@ def process_live_segment(path, cfg, state, gap, ship):
 
     out = cfg["outbox"]
     os.makedirs(out, mode=0o700, exist_ok=True)
-    name = "%06d.%s" % (seq, seg_sha)
+    name = spool_job_name(cfg["camera_id"], seq, seg_sha)
     seg_out = os.path.join(out, name + ".mp4")
     body_out = os.path.join(out, name + ".body")
     with open(seg_out + ".tmp", "wb") as f:
@@ -1719,6 +1719,50 @@ def process_live_segment(path, cfg, state, gap, ship):
           % (seq, seg_sha, session_id,
              "  GAP(%s)" % gap["reason"] if gap else ""), flush=True)
     return new_state
+
+
+# ── Spool job naming ───────────────────────────────────────────────────
+#
+# A shipped job is <camera>.<seq>.<segment-sha256>. It used to be
+# <seq>.<sha>, which is camera-blind: both live cameras have written
+# 000000. through 000008. into the same incoming/, told apart only by
+# the hash. Nothing broke — the bodies carry camera_id, submit_one
+# derives every chain-bound value from the body and never parses the
+# name, and the sha makes a true collision a content collision. But it
+# is the same collision class already fixed in three places on the
+# detection side, and this was the last layer still carrying it.
+#
+# The camera token reaches a FILESYSTEM PATH — an sftp `put` into a
+# chrooted spool — which the old name never did, so it is bounded to a
+# charset that cannot traverse, hide, or start an option: ASCII
+# letters, digits, '_' and '-', first character alphanumeric. Refused
+# at config time, where an operator sees it, and again here, where the
+# invariant actually matters.
+SPOOL_CAMERA_MAX = 64
+_SPOOL_CAMERA_OK = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def spool_camera_token(camera_id):
+    """The camera_id as it may appear in a spool filename, or
+    ValueError. Never rewrites: a silently sanitized id would map two
+    distinct cameras onto one token, which is the collision this
+    naming exists to remove."""
+    if (not isinstance(camera_id, str) or not camera_id
+            or len(camera_id) > SPOOL_CAMERA_MAX
+            or not (camera_id[0].isascii() and camera_id[0].isalnum())
+            or any(c not in _SPOOL_CAMERA_OK for c in camera_id)):
+        raise ValueError(
+            "camera-id %r cannot be used in a spool filename: 1-%d "
+            "characters, ASCII letters/digits/underscore/hyphen only, "
+            "first character a letter or digit"
+            % (camera_id, SPOOL_CAMERA_MAX))
+    return camera_id
+
+
+def spool_job_name(camera_id, seq, seg_sha):
+    """The spool job name for one shipped segment."""
+    return "%s.%06d.%s" % (spool_camera_token(camera_id), seq, seg_sha)
 
 
 def _segment_names(workdir):
@@ -2305,6 +2349,9 @@ def main(argv=None):
                              "--rtsp-config <0600 file>, or pass "
                              "--test-source to capture a synthetic feed")
         workdir = args.workdir or os.path.join(args.data_dir, "work")
+        # before the capture child spawns: a camera-id that cannot be a
+        # spool filename must fail here, not after footage exists
+        spool_camera_token(args.camera_id)
         cfg = {
             "camera_id": args.camera_id,
             "device": args.device or args.camera_id,
