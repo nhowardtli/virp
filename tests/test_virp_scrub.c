@@ -418,6 +418,174 @@ TEST(test_wrapper_empty_fields_stay_empty)
     CHECK(r.error_msg[0] == '\0', "empty error_msg written to");
 }
 
+/* =========================================================================
+ * JSON key syntax — the blind spot measured during the merge
+ * reconciliation (MERGE-RECONCILIATION-20260829.md §3.2, result 1)
+ *
+ * The labeled-secret rule wants `<label>[:=] <value>` with the label as
+ * a whitespace token. JSON puts the closing quote between the label and
+ * the colon, and a compact body has no whitespace at all — so a real
+ * LibreNMS device record came back byte-identical, zero redactions.
+ * On an endpoint the allowlist body filter has no rule for (thirteen of
+ * the fourteen gate-admitted REST endpoints today), that left the
+ * credential protected by neither barrier.
+ * ========================================================================= */
+
+TEST(test_json_compact_body_credentials)
+{
+    /* the §3.2 body shape: one line, no whitespace, four credential
+     * keys and one non-secret key */
+    CHECK(scrub("{\"status\":\"ok\",\"devices\":[{\"hostname\":\"pve01\","
+                "\"community\":\"CANARY-COMMUNITY\","
+                "\"authpass\":\"CANARY-AUTHPASS\","
+                "\"cryptopass\":\"CANARY-CRYPTOPASS\","
+                "\"api_token\":\"CANARY-TOKEN\"}]}\n") == VIRP_OK,
+          "scrub failed");
+    CHECK(strstr(OUT, "CANARY") == NULL,
+          "a JSON credential survived: %s", OUT);
+    CHECK(N == 1, "expected one redacted line, got %u", N);
+    CHECK(strstr(OUT, "[REDACTED: snmp-community]") != NULL,
+          "community marker missing: %s", OUT);
+    CHECK(strstr(OUT, "[REDACTED: snmp-authpass]") != NULL,
+          "authpass marker missing: %s", OUT);
+    CHECK(strstr(OUT, "[REDACTED: snmp-privpass]") != NULL,
+          "cryptopass marker missing: %s", OUT);
+    CHECK(strstr(OUT, "[REDACTED: token]") != NULL,
+          "api_token marker missing: %s", OUT);
+    /* diagnostic value kept: the non-secret keys and the envelope */
+    CHECK(strstr(OUT, "\"hostname\":\"pve01\"") != NULL,
+          "non-secret field destroyed: %s", OUT);
+    CHECK(strstr(OUT, "\"status\":\"ok\"") != NULL,
+          "envelope destroyed: %s", OUT);
+}
+
+TEST(test_json_redacted_body_still_parses)
+{
+    /* the marker goes in a VALUE position, so it is emitted QUOTED —
+     * a redacted body must still be JSON for anything downstream */
+    CHECK(scrub("{\"password\":\"CANARY1\",\"n\":1}\n") == VIRP_OK,
+          "scrub failed");
+    CHECK(strcmp(OUT, "{\"password\":\"[REDACTED: password]\",\"n\":1}\n")
+          == 0, "unexpected form: %s", OUT);
+}
+
+TEST(test_json_pretty_printed_keys)
+{
+    /* whitespace around the colon, one key per line */
+    CHECK(scrub("{\n"
+                "  \"hostname\" : \"pve01\",\n"
+                "  \"api_token\" : \"CANARY-TOKEN\"\n"
+                "}\n") == VIRP_OK, "scrub failed");
+    CHECK(strstr(OUT, "CANARY") == NULL, "pretty JSON leaked: %s", OUT);
+    CHECK(strstr(OUT, "\"hostname\" : \"pve01\"") != NULL,
+          "non-secret line changed: %s", OUT);
+}
+
+TEST(test_json_non_string_values)
+{
+    /* a secret key whose value is a number, a literal, an object or an
+     * array: the WHOLE value span goes, and nothing after it */
+    CHECK(scrub("{\"a_token\":12345,\"b\":1}\n"
+                "{\"a_secret\":null,\"b\":2}\n"
+                "{\"a_password\":{\"x\":\"CANARY1\"},\"b\":3}\n"
+                "{\"a_apikey\":[\"CANARY2\",\"CANARY3\"],\"b\":4}\n")
+          == VIRP_OK, "scrub failed");
+    CHECK(strstr(OUT, "CANARY") == NULL, "structured value leaked: %s", OUT);
+    CHECK(strstr(OUT, "12345") == NULL, "numeric secret kept: %s", OUT);
+    CHECK(strstr(OUT, "\"b\":1") != NULL, "trailing key lost: %s", OUT);
+    CHECK(strstr(OUT, "\"b\":3") != NULL, "key after object lost: %s", OUT);
+    CHECK(strstr(OUT, "\"b\":4") != NULL, "key after array lost: %s", OUT);
+    CHECK(N == 4, "expected 4 redacted lines, got %u", N);
+}
+
+TEST(test_json_non_secret_keys_untouched)
+{
+    static const char CLEAN[] =
+        "{\"status\":\"ok\",\"count\":6,\"hostname\":\"pve01\","
+        "\"os\":\"linux\",\"uptime\":98123,\"notes\":\"see the runbook\"}\n";
+    CHECK(scrub(CLEAN) == VIRP_OK, "scrub failed");
+    CHECK(N == 0, "clean JSON body redacted: %s", OUT);
+    CHECK(strcmp(OUT, CLEAN) == 0, "clean JSON body not byte-identical");
+}
+
+TEST(test_json_string_value_carrying_a_bare_label_over_redacts)
+{
+    /* PRE-EXISTING, and measured byte-identical before and after this
+     * rule was added: a JSON string VALUE containing `token: ` puts the
+     * whitespace token `token:` in front of the line's token sweep,
+     * which redacts the remainder of the line — closing braces
+     * included, so the body stops being JSON. The new rule does not see
+     * it (the label is not a KEY), does not fire, and leaves the line
+     * to the sweep exactly as before.
+     *
+     * Over-redaction is the fail-closed direction, so this is pinned
+     * rather than fixed: making the token sweep JSON-aware would mean
+     * teaching it to NOT redact things it redacts today, which is a
+     * weakening and belongs in its own item with its own review. */
+    CHECK(scrub("{\"notes\":\"see token: 5\",\"n\":1}\n") == VIRP_OK,
+          "scrub failed");
+    CHECK(N == 1, "expected the pre-existing sweep hit, got %u", N);
+    CHECK(strstr(OUT, "[REDACTED: token]") != NULL,
+          "pre-existing behaviour changed: %s", OUT);
+    CHECK(strstr(OUT, "\"n\":1") == NULL,
+          "the sweep no longer redacts to end of line: %s", OUT);
+}
+
+TEST(test_json_value_is_not_mistaken_for_a_key)
+{
+    /* a VALUE that itself contains a colon, and an escaped quote, must
+     * not be read as a key — and must not shift the scan */
+    CHECK(scrub("{\"desc\":\"ratio 1:2\",\"esc\":\"a\\\"b\","
+                "\"password\":\"CANARY1\"}\n") == VIRP_OK, "scrub failed");
+    CHECK(strstr(OUT, "CANARY") == NULL, "secret survived: %s", OUT);
+    CHECK(strstr(OUT, "\"desc\":\"ratio 1:2\"") != NULL,
+          "value with a colon was rewritten: %s", OUT);
+}
+
+TEST(test_json_idempotent)
+{
+    CHECK(scrub("{\"authpass\":\"CANARY1\",\"n\":1}\n") == VIRP_OK,
+          "scrub failed");
+    char once[sizeof(OUT)];
+    snprintf(once, sizeof(once), "%s", OUT);
+    CHECK(scrub(once) == VIRP_OK, "second scrub failed");
+    CHECK(N == 0, "second pass redacted again: %s", OUT);
+    CHECK(strcmp(OUT, once) == 0, "second pass changed the body: %s", OUT);
+}
+
+TEST(test_json_rule_does_not_disturb_cli_text)
+{
+    /* the §3.2 measured-result-2 control: CLI output is the scrubber's
+     * own class of body and must come out exactly as it did before */
+    static const char CLI[] =
+        "R1>show running-config\n"
+        "username admin password 7 CANARY1\n"
+        "snmp-server community CANARY2 RO 99\n"
+        "interface GigabitEthernet0/0\n"
+        " description uplink to core\n";
+    CHECK(scrub(CLI) == VIRP_OK, "scrub failed");
+    CHECK(strcmp(OUT,
+                 "R1>show running-config\n"
+                 "username admin password [REDACTED: password]\n"
+                 "snmp-server community [REDACTED: snmp-community] RO 99\n"
+                 "interface GigabitEthernet0/0\n"
+                 " description uplink to core\n") == 0,
+          "CLI scrubbing moved: %s", OUT);
+    CHECK(N == 2, "expected 2 CLI redactions, got %u", N);
+}
+
+TEST(test_json_unlabeled_value_is_still_NOT_caught)
+{
+    /* the honesty limit holds one level down: JSON syntax is now read,
+     * but the vocabulary is still known key names only. A credential
+     * under a name this rule does not know passes through. */
+    CHECK(scrub("{\"opaque\":\"hunter2\",\"blob\":\"8f3a9c0d4e5b6a71\"}\n")
+          == VIRP_OK, "scrub failed");
+    CHECK(N == 0, "unknown JSON key unexpectedly redacted — update "
+          "SCRUB-DESIGN.md if this is intentional");
+    CHECK(strstr(OUT, "hunter2") != NULL, "value dropped");
+}
+
 int main(void)
 {
     printf("test_virp_scrub:\n");
@@ -434,6 +602,16 @@ int main(void)
     RUN_TEST(test_generic_labeled_secrets);
     RUN_TEST(test_prose_words_without_separator_untouched);
     RUN_TEST(test_unlabeled_secret_is_NOT_caught);
+    RUN_TEST(test_json_compact_body_credentials);
+    RUN_TEST(test_json_redacted_body_still_parses);
+    RUN_TEST(test_json_pretty_printed_keys);
+    RUN_TEST(test_json_non_string_values);
+    RUN_TEST(test_json_non_secret_keys_untouched);
+    RUN_TEST(test_json_string_value_carrying_a_bare_label_over_redacts);
+    RUN_TEST(test_json_value_is_not_mistaken_for_a_key);
+    RUN_TEST(test_json_idempotent);
+    RUN_TEST(test_json_rule_does_not_disturb_cli_text);
+    RUN_TEST(test_json_unlabeled_value_is_still_NOT_caught);
     RUN_TEST(test_clean_body_byte_identical);
     RUN_TEST(test_idempotent);
     RUN_TEST(test_crlf_preserved);

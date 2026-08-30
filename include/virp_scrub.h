@@ -64,6 +64,14 @@
  *   - Generic labeled secrets: a label token equal to (or ending in)
  *     password/passwd/secret/token/api-key/api_key/apikey followed by
  *     `:` or `=` — the value is replaced, the label kept.
+ *   - JSON labeled secrets: a QUOTED key followed by `:` whose name
+ *     matches that same vocabulary plus the SNMP credential family
+ *     (community/authpass/privpass/cryptopass). The whole value span —
+ *     string, number, literal, object or array — is replaced by a
+ *     QUOTED marker, so a redacted body still parses as JSON. The rule
+ *     above cannot see this shape: JSON puts the closing quote between
+ *     the label and the colon, and a compact body is a single
+ *     whitespace token.
  *
  * Returns VIRP_OK on completion. On any failure (output would not
  * fit, forced test error) returns the error with *out_len zeroed —

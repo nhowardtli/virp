@@ -447,6 +447,101 @@ def release_instance_lock(fd):
         os.close(fd)
 
 
+# ── Gap validity — the producer's copy of the verifier's rule ──────────
+#
+# A `gap` is the producer's signed statement that continuity is NOT
+# claimed at this point in the stream. Because it is the one thing that
+# excuses a continuity break, it is exactly the field a malformed or
+# invented value must not be able to abuse.
+#
+# Docket grades a record FAILED unless a present gap is an OBJECT
+# carrying an integer after_seq that cites the previous record for the
+# same camera, plus a nonempty, bounded reason. This file used to excuse
+# a break on `gap is not None` — a truthy scalar, an empty object, an
+# after_seq pointing anywhere at all would do. That was a live
+# divergence: this producer could sign, and this auditor could pass, a
+# record the verifier rejects. The rule below is that rule, re-derived
+# from the record format, and it is applied on BOTH sides here — at
+# emission (build_body refuses to build such a body) and at every point
+# that grades one (audit continuity, coverage, content reuse).
+#
+# The external-predecessor case: on a camera's FIRST record carried in
+# the corpus there is no previous record to cite, but the stream itself
+# may legitimately begin mid-run — a sliced export, a session-boundary
+# rollover. A gap whose after_seq is segment_seq - 1 names that absent
+# predecessor and is valid. Segment 0 has no predecessor at all,
+# external or otherwise, so any gap there is a defect.
+#
+# That form is accepted wherever it appears, not only on the first
+# record, because THIS auditor is handed filtered corpora on purpose
+# (--session-prefix, and the frozen two-block Aug-24 fixture) while
+# Docket grades whole chains. On a complete corpus the two citations are
+# the same number, so a complete chain grades identically here and in
+# Docket; they differ only where the corpus itself is incomplete, and
+# there the record is not the thing at fault. Refusing the form
+# mid-corpus would make a valid signed record grade FAILED because the
+# operator filtered the query — a defect invented by the auditor.
+#
+# Extra keys are refused. `build_body` states the field set IS the
+# schema, nothing optional and nothing extra; the same holds one level
+# down, and an unrecognised key inside a gap is a body this auditor
+# cannot claim to have judged.
+GAP_REASON_MAX = 128
+
+
+def gap_defect(gap, segment_seq, prev_seq):
+    """None if `gap` is a valid gap record for the segment at
+    segment_seq, whose previous carried record for the same camera is
+    at prev_seq (None when this is the first carried record for that
+    camera). Otherwise a one-line statement of what is wrong with it.
+
+    gap is None — the ordinary no-gap case — is valid."""
+    if gap is None:
+        return None
+    if not isinstance(gap, dict):
+        return "gap is %s, not an object" % type(gap).__name__
+    extra = sorted(set(gap) - {"reason", "after_seq"})
+    if extra:
+        return "gap carries unexpected key(s): %s" % ", ".join(extra)
+    if "after_seq" not in gap:
+        return "gap carries no after_seq"
+    after = gap["after_seq"]
+    # bool is an int in Python; a flag is not a sequence number.
+    if isinstance(after, bool) or not isinstance(after, int):
+        return ("gap after_seq is %s, not an integer"
+                % type(after).__name__)
+    if "reason" not in gap:
+        return "gap carries no reason"
+    reason = gap["reason"]
+    if not isinstance(reason, str):
+        return "gap reason is %s, not a string" % type(reason).__name__
+    if not reason:
+        return "gap reason is empty"
+    if len(reason) > GAP_REASON_MAX:
+        return ("gap reason is %d characters, over the %d-character "
+                "bound" % (len(reason), GAP_REASON_MAX))
+    if segment_seq == 0:
+        return "gap on segment 0, which has no predecessor to cite"
+    # Two citations are valid, and on a COMPLETE corpus they are the
+    # same number: the previous record carried for this camera, or this
+    # segment's immediate predecessor at segment_seq - 1. The second is
+    # the external-predecessor form — the record cited a predecessor
+    # this corpus does not carry. It is the only form available to a
+    # camera's first carried record, and a sliced export or a
+    # session-boundary rollover produces it legitimately anywhere a
+    # block of the stream opens. Anything else points nowhere real.
+    if after not in (segment_seq - 1, prev_seq):
+        if prev_seq is None:
+            return ("gap after_seq %d does not cite the external "
+                    "predecessor (%d) of this camera's first carried "
+                    "record" % (after, segment_seq - 1))
+        return ("gap after_seq %d cites neither the previous record "
+                "carried for this camera (%d) nor this segment's "
+                "immediate predecessor (%d)"
+                % (after, prev_seq, segment_seq - 1))
+    return None
+
+
 # ── Body construction ──────────────────────────────────────────────────
 
 def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
@@ -466,6 +561,14 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
                    make a bad window look clean; doing so would require
                    the producer key and would produce a different
                    record."""
+    # The producer always cites the record it just emitted, so the
+    # external-predecessor form and the ordinary form coincide here at
+    # segment_seq - 1. A body whose gap would grade FAILED is never
+    # built, let alone signed and submitted.
+    defect = gap_defect(gap, seq, seq - 1)
+    if defect:
+        raise ValueError("refusing to build a camera_segment body: %s"
+                         % defect)
     body = {
         "schema": SCHEMA_V1 if policy is None else SCHEMA_V2,
         "camera_id": camera_id,
@@ -1026,18 +1129,25 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
             cam_bodies, key=lambda t: (t[2]["camera_id"],
                                        t[2]["segment_seq"])):
         cam = body["camera_id"]
-        gapped = body.get("gap") is not None
+        gap = body.get("gap")
+        defect = gap_defect(body.get("gap"), body["segment_seq"],
+                            chains[cam][0] if cam in chains else None)
+        if defect:
+            failures.append("%s %s: %s"
+                            % (session_id, artifact_id, defect))
+        # Fail closed: a gap that does not grade valid excuses nothing.
+        gapped = gap is not None and defect is None
         if cam in chains:
             last_seq, last_sha = chains[cam]
             if body["segment_seq"] != last_seq + 1 and not gapped:
                 failures.append("%s %s: segment_seq %s does not follow "
-                                "%s (and carries no gap record)"
+                                "%s (and carries no valid gap record)"
                                 % (session_id, artifact_id,
                                    body["segment_seq"], last_seq))
             if body["prev_segment_sha256"] != last_sha and not gapped:
                 failures.append("%s %s: prev_segment_sha256 does not "
                                 "cite the previous segment (and carries "
-                                "no gap record)" % (session_id, artifact_id))
+                                "no valid gap record)" % (session_id, artifact_id))
         else:
             if body["prev_segment_sha256"] is not None and not gapped:
                 failures.append("%s %s: first record for %s has non-null "
@@ -1193,6 +1303,10 @@ def grade_coverage(cam_bodies):
                     })
                 continue
             gap = cur.get("gap")
+            if gap is not None and gap_defect(
+                    gap, cur["segment_seq"], prev["segment_seq"]):
+                # a gap that would grade FAILED accounts for nothing
+                gap = None
             if gap:
                 cls, verdict = "ACCOUNTED", COVERAGE_ACCOUNTED
             elif hole_s <= pol["max_unexplained_gap_s"]:
@@ -1285,13 +1399,27 @@ def grade_content_reuse(cam_bodies):
     """Returns (axis, groups). groups is one entry per repeated
     segment_sha256, carrying the supporting facts."""
     by_hash = {}
-    gaps_by_cam = {}
+    by_cam = {}
     for session_id, artifact_id, body in cam_bodies:
         by_hash.setdefault(body["segment_sha256"], []).append(
             (session_id, artifact_id, body))
-        if body.get("gap"):
-            gaps_by_cam.setdefault(body["camera_id"], []).append(
-                (body["segment_seq"], body["gap"].get("reason")))
+        by_cam.setdefault(body["camera_id"], []).append(body)
+
+    # Only a gap that grades VALID may explain a reuse. Deciding that
+    # needs each record's predecessor for its own camera, so the gaps
+    # are collected on a per-camera walk in segment_seq order rather
+    # than in one pass over the corpus.
+    gaps_by_cam = {}
+    for cam, bodies in by_cam.items():
+        bodies.sort(key=lambda b: b["segment_seq"])
+        prev_seq = None
+        for body in bodies:
+            gap = body.get("gap")
+            if gap is not None and gap_defect(
+                    gap, body["segment_seq"], prev_seq) is None:
+                gaps_by_cam.setdefault(cam, []).append(
+                    (body["segment_seq"], gap.get("reason")))
+            prev_seq = body["segment_seq"]
 
     groups = []
     axis = REUSE_NONE
@@ -1540,7 +1668,7 @@ def process_live_segment(path, cfg, state, gap, ship):
 
     out = cfg["outbox"]
     os.makedirs(out, mode=0o700, exist_ok=True)
-    name = "%06d.%s" % (seq, seg_sha)
+    name = spool_job_name(cfg["camera_id"], seq, seg_sha)
     seg_out = os.path.join(out, name + ".mp4")
     body_out = os.path.join(out, name + ".body")
     with open(seg_out + ".tmp", "wb") as f:
@@ -1591,6 +1719,50 @@ def process_live_segment(path, cfg, state, gap, ship):
           % (seq, seg_sha, session_id,
              "  GAP(%s)" % gap["reason"] if gap else ""), flush=True)
     return new_state
+
+
+# ── Spool job naming ───────────────────────────────────────────────────
+#
+# A shipped job is <camera>.<seq>.<segment-sha256>. It used to be
+# <seq>.<sha>, which is camera-blind: both live cameras have written
+# 000000. through 000008. into the same incoming/, told apart only by
+# the hash. Nothing broke — the bodies carry camera_id, submit_one
+# derives every chain-bound value from the body and never parses the
+# name, and the sha makes a true collision a content collision. But it
+# is the same collision class already fixed in three places on the
+# detection side, and this was the last layer still carrying it.
+#
+# The camera token reaches a FILESYSTEM PATH — an sftp `put` into a
+# chrooted spool — which the old name never did, so it is bounded to a
+# charset that cannot traverse, hide, or start an option: ASCII
+# letters, digits, '_' and '-', first character alphanumeric. Refused
+# at config time, where an operator sees it, and again here, where the
+# invariant actually matters.
+SPOOL_CAMERA_MAX = 64
+_SPOOL_CAMERA_OK = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def spool_camera_token(camera_id):
+    """The camera_id as it may appear in a spool filename, or
+    ValueError. Never rewrites: a silently sanitized id would map two
+    distinct cameras onto one token, which is the collision this
+    naming exists to remove."""
+    if (not isinstance(camera_id, str) or not camera_id
+            or len(camera_id) > SPOOL_CAMERA_MAX
+            or not (camera_id[0].isascii() and camera_id[0].isalnum())
+            or any(c not in _SPOOL_CAMERA_OK for c in camera_id)):
+        raise ValueError(
+            "camera-id %r cannot be used in a spool filename: 1-%d "
+            "characters, ASCII letters/digits/underscore/hyphen only, "
+            "first character a letter or digit"
+            % (camera_id, SPOOL_CAMERA_MAX))
+    return camera_id
+
+
+def spool_job_name(camera_id, seq, seg_sha):
+    """The spool job name for one shipped segment."""
+    return "%s.%06d.%s" % (spool_camera_token(camera_id), seq, seg_sha)
 
 
 def _segment_names(workdir):
@@ -2177,6 +2349,9 @@ def main(argv=None):
                              "--rtsp-config <0600 file>, or pass "
                              "--test-source to capture a synthetic feed")
         workdir = args.workdir or os.path.join(args.data_dir, "work")
+        # before the capture child spawns: a camera-id that cannot be a
+        # spool filename must fail here, not after footage exists
+        spool_camera_token(args.camera_id)
         cfg = {
             "camera_id": args.camera_id,
             "device": args.device or args.camera_id,
