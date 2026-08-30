@@ -63,6 +63,7 @@ inside the signed bytes, the redaction itself is tamper-evident.
 | `key-string …` | everything after the keyword | `key-string` |
 | PEM `-----BEGIN … PRIVATE KEY-----` blocks | interior replaced by one marker line; BEGIN/END kept; an **unterminated** block redacts to end of body | `private-key-block` |
 | labeled values: label token equal to or ending in `password`/`passwd`/`secret`/`token`/`api-key`/`api_key`/`apikey`/`psk` followed by `:` or `=` (e.g. `PVE_API_TOKEN=…`, `api_key: …`) | the value; label + separator kept | `token` / `api-key` / `password` / … |
+| JSON labeled values: a **quoted** key followed by `:` whose name matches that vocabulary, plus the SNMP credential family `community`/`authpass`/`privpass`/`cryptopass` (e.g. `"authpass":"…"`) | the whole value span — string, number, literal, object or array — replaced by a **quoted** marker, so the body still parses as JSON | `snmp-community` / `snmp-authpass` / `snmp-privpass` / `token` / … |
 
 Matching is exact-token and case-insensitive: `service
 password-encryption` and `ip ospf authentication message-digest`
@@ -74,7 +75,13 @@ public material and are not touched.
 Known accepted over-redaction: a prose line containing the bare token
 `secret`/`password` redacts its remainder. Over-redaction is the
 fail-closed direction; the behavior is pinned by test so changing it
-is a decision, not an accident.
+is a decision, not an accident. The same sweep reaches INSIDE a JSON
+string value — `{"notes":"see token: 5","n":1}` redacts from `token:`
+to end of line, closing braces included, so that body stops being
+JSON. Measured byte-identical before and after the JSON rule was
+added, and pinned by
+`test_json_string_value_carrying_a_bare_label_over_redacts`: the JSON
+rule matches KEYS only and never fires here.
 
 ## What it does NOT catch — the honesty limit
 
@@ -84,7 +91,13 @@ secret-free.** A credential that looks like ordinary text — an
 unlabeled plaintext password on its own line, a bare hex or base64
 token with no label — will NOT be caught, and there is a test
 (`test_unlabeled_secret_is_NOT_caught`) pinning that limit so the
-code and the claim cannot drift apart.
+code and the claim cannot drift apart. The limit holds one level down
+in JSON too: the syntax is now read, but the vocabulary is still known
+key names, so a credential under a name this ruleset does not know
+passes through (`test_json_unlabeled_value_is_still_NOT_caught`).
+Structural PII such as LibreNMS's `sysContact` is likewise not a
+credential shape and is not touched here — the allowlist body filter
+is what removes it, and only on an endpoint that has a rule.
 
 Any user-facing or reviewer-facing description must say **"secrets in
 recognized formats are scrubbed at capture"** — never "no secret can

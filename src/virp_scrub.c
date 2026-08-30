@@ -266,6 +266,165 @@ static const char *label_reason(const char *label, size_t llen)
     return NULL;
 }
 
+/* =========================================================================
+ * JSON key syntax — the labeled-secret rule's measured blind spot
+ *
+ * The rule above wants `<label>[:=] <value>` where the label is a
+ * whitespace token. JSON puts the closing quote BETWEEN the label and
+ * the colon, so the token is `"authpass"` and every suffix test fails;
+ * and a COMPACT body carries no whitespace at all, so the whole payload
+ * is one token and the walk only ever sees a single label of
+ * `{"status`. Measured on a real LibreNMS device record: zero
+ * redactions, output byte-identical to the raw response.
+ *
+ * That blind spot is not covered by the other barrier. The allowlist
+ * body filter acts only on a (driver, endpoint) it has a rule for, and
+ * exactly one of the fourteen gate-admitted REST endpoints has one —
+ * so on the other thirteen, three of which the live autopilot battery
+ * polls every cycle, a credential in a JSON body reached the chain past
+ * BOTH mechanisms, protected only by whatever the driver itself
+ * scrubbed.
+ *
+ * This rule reads JSON key syntax with JSON semantics: a quoted key
+ * followed by ':' whose name matches the label vocabulary, with the
+ * whole VALUE span — string, number, literal, object or array —
+ * replaced by a QUOTED marker, so a redacted body still parses as JSON
+ * for any reader downstream. Unlike the line rules it does not stop at
+ * the first hit: one compact JSON body is one "line" and can carry
+ * many keys.
+ *
+ * It cannot change CLI scrubbing. The three rules above anchor on the
+ * first token of a line and still run first; a line carrying no
+ * `"key":` pair is left untouched here and falls through to the token
+ * sweep exactly as before; and the vocabulary widening below is scoped
+ * to this rule rather than to label_reason().
+ * ========================================================================= */
+
+/* Everything the CLI labeled-secret rule knows, plus the SNMP
+ * credential key family. Those names — community, authpass, cryptopass
+ * — are the credentials measured passing both barriers in a LibreNMS
+ * device record. They are not CLI label shapes (the CLI form is
+ * `snmp-server community <tok>`, which rule_snmp_community covers), so
+ * widening here rather than in label_reason() leaves the CLI path
+ * byte-identical. */
+static const char *json_label_reason(const char *label, size_t llen)
+{
+    const char *r = label_reason(label, llen);
+    if (r) return r;
+    if (ci_ends_with(label, llen, "community"))  return "snmp-community";
+    if (ci_ends_with(label, llen, "authpass"))   return "snmp-authpass";
+    if (ci_ends_with(label, llen, "privpass") ||
+        ci_ends_with(label, llen, "cryptopass")) return "snmp-privpass";
+    return NULL;
+}
+
+/* Just past the closing quote of the JSON string starting at s (which
+ * points at the opening quote); end if the string is unterminated. */
+static const char *json_string_end(const char *s, const char *end)
+{
+    s++;
+    while (s < end) {
+        if (*s == '\\') { s += 2; continue; }
+        if (*s == '"')  return s + 1;
+        s++;
+    }
+    return end;
+}
+
+/* Just past the JSON value starting at s: a string, a balanced object
+ * or array, or a bare literal (number/true/false/null). An unbalanced
+ * or unterminated value runs to end of line — the fail-closed
+ * direction, since the whole remainder is then redacted. */
+static const char *json_value_end(const char *s, const char *end)
+{
+    if (s >= end) return end;
+    if (*s == '"') return json_string_end(s, end);
+    if (*s == '{' || *s == '[') {
+        int depth = 0;
+        while (s < end) {
+            if (*s == '"') { s = json_string_end(s, end); continue; }
+            if (*s == '{' || *s == '[') depth++;
+            else if (*s == '}' || *s == ']') {
+                if (--depth == 0) return s + 1;
+            }
+            s++;
+        }
+        return end;
+    }
+    while (s < end && *s != ',' && *s != '}' && *s != ']' &&
+           *s != ' ' && *s != '\t')
+        s++;
+    return s;
+}
+
+/* Idempotence: the value position already holds a marker (quoted by
+ * this rule, or bare from an upstream driver scrub). */
+static bool value_is_json_marker(const char *v, const char *end)
+{
+    size_t ml = strlen(VIRP_SCRUB_MARK_PREFIX);
+    if (v < end && *v == '"') v++;
+    return (size_t)(end - v) >= ml &&
+           memcmp(v, VIRP_SCRUB_MARK_PREFIX, ml) == 0;
+}
+
+/* If p (pointing at '"') opens a JSON KEY — a quoted string followed by
+ * optional blanks and ':' — return the reason its name triggers and set
+ * *vstart to the first byte of its value. NULL otherwise. */
+static const char *json_key_reason(const char *p, const char *end,
+                                   const char **vstart)
+{
+    const char *kend = json_string_end(p, end);
+    if (kend <= p + 1 || kend[-1] != '"') return NULL;   /* unterminated */
+    const char *c = kend;
+    while (c < end && (*c == ' ' || *c == '\t')) c++;
+    if (c >= end || *c != ':') return NULL;
+    c++;
+    while (c < end && (*c == ' ' || *c == '\t')) c++;
+    if (c >= end) return NULL;
+    *vstart = c;
+    return json_label_reason(p + 1, (size_t)(kend - 1 - (p + 1)));
+}
+
+static int rule_json_labeled_secret(const char *line, size_t len,
+                                    char *out, size_t cap, size_t *pos)
+{
+    const char *end = line + len;
+    const char *p, *v;
+    bool any = false;
+
+    /* Detect first: a line with no matching key must reach the rules
+     * below byte for byte, so nothing is emitted until a hit is known. */
+    for (p = line; p < end; p++) {
+        if (*p != '"') continue;
+        v = NULL;
+        const char *reason = json_key_reason(p, end, &v);
+        if (reason && !value_is_json_marker(v, end)) { any = true; break; }
+        p = json_string_end(p, end) - 1;
+    }
+    if (!any) return 0;
+
+    const char *kept = line;
+    for (p = line; p < end; p++) {
+        if (*p != '"') continue;
+        v = NULL;
+        const char *reason = json_key_reason(p, end, &v);
+        if (!reason || value_is_json_marker(v, end)) {
+            p = json_string_end(p, end) - 1;
+            continue;
+        }
+        const char *vend = json_value_end(v, end);
+        if (!emit(out, cap, pos, kept, (size_t)(v - kept)) ||
+            !emit(out, cap, pos, "\"", 1) ||
+            !emit_marker(out, cap, pos, reason) ||
+            !emit(out, cap, pos, "\"", 1))
+            return -1;
+        kept = vend;
+        p = vend - 1;
+    }
+    if (!emit(out, cap, pos, kept, (size_t)(end - kept))) return -1;
+    return 1;
+}
+
 /*
  * Scrub one line (terminator excluded). Returns 1 if a redaction was
  * emitted, 0 if the line was emitted verbatim, -1 on overflow.
@@ -278,6 +437,11 @@ static int scrub_line(const char *line, size_t len,
     if ((r = rule_snmp_community(line, len, out, cap, pos)) != 0) return r;
     if ((r = rule_crypto_key(line, len, out, cap, pos)) != 0)     return r;
     if ((r = rule_leading_key(line, len, out, cap, pos)) != 0)    return r;
+
+    /* JSON key syntax, which the whitespace-token sweep below cannot
+     * see (the closing quote sits between the label and the colon). */
+    if ((r = rule_json_labeled_secret(line, len, out, cap, pos)) != 0)
+        return r;
 
     /* token sweep: exact keywords, then labeled suffix forms */
     tokwalk_t w = { line, len, 0 };
