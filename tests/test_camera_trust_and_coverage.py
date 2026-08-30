@@ -58,6 +58,9 @@ def run_main(argv):
     return rc, out.getvalue(), err.getvalue()
 
 
+_UNSET = object()
+
+
 class SignedChain:
     """A throwaway chain DB of producer-signed bodies, built the way the
     driver builds them (no re-serialization anywhere)."""
@@ -76,7 +79,10 @@ class SignedChain:
         self.end_ns = 1_700_000_000_000_000_000
 
     def add(self, policy=POLICY_6S, gap=None, hole_s=0.0, duration_s=6.0,
-            seg_sha=None, camera=None, bump_seq=1):
+            seg_sha=None, camera=None, bump_seq=1, raw_gap=_UNSET):
+        """raw_gap substitutes the gap AFTER build_body, bypassing the
+        emission guard — the only way to produce the signed-but-invalid
+        record the pre-hardening producer could emit."""
         cam = camera or self.camera
         self.seq += bump_seq
         start_ns = self.end_ns + int(hole_s * 1e9)
@@ -85,7 +91,10 @@ class SignedChain:
             ("seg-%s-%d" % (cam, self.seq)).encode()).hexdigest()
         nosig = vc.build_body(cam, cam, self.seq, sha, self.prev, 1000,
                               duration_s, start_ns, end_ns, "host-clock",
-                              "live", gap, self.key_id, policy)
+                              "live", None if raw_gap is not _UNSET else gap,
+                              self.key_id, policy)
+        if raw_gap is not _UNSET:
+            nosig["gap"] = raw_gap
         body_bytes, body = vc.producer_sign(self.sk, nosig)
         content = body_bytes.decode("ascii")
         ahash = hashlib.sha256(body_bytes).hexdigest()
@@ -816,6 +825,223 @@ class Aug24DuplicatePairFixtureTests(unittest.TestCase):
         self.assertIn("INTEGRITY: OK", out)
         self.assertIn("CONTENT REUSE: DUPLICATE / EXPLAINED", out)
         self.assertIn("COVERAGE: UNDECLARED", out)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Producer gap strictness — the validity matrix, shared with the verifier
+# ═══════════════════════════════════════════════════════════════════════
+#
+# A `gap` is the one field that excuses a continuity break, so it is
+# exactly the field an invented value must not be able to abuse. Docket
+# grades a record FAILED unless a present gap is an OBJECT carrying an
+# integer after_seq that cites a real predecessor, plus a nonempty,
+# bounded reason. This producer used to excuse a break on
+# `gap is not None`: a truthy scalar, an empty object, an after_seq
+# pointing anywhere would do. It could therefore SIGN, and this auditor
+# could PASS, a record the verifier rejects.
+#
+# These are the six outcomes the record format admits, plus the
+# external-predecessor case, graded here exactly as the verifier grades
+# them. The rule is enforced at four points — emission (build_body) and
+# the three graders (audit continuity, coverage, content reuse) — and
+# every one of them is exercised below.
+
+class GapValidityMatrixTests(unittest.TestCase):
+
+    # (label, gap, segment_seq, prev_seq, valid)
+    MATRIX = [
+        # 1 — no gap at all: continuity is claimed, and that is valid
+        ("absent", None, 5, 4, True),
+        # 2 — not an object: the pre-hardening producer's whole hole
+        ("truthy bool", True, 5, 4, False),
+        ("bare string", "driver-restart", 5, 4, False),
+        ("bare int", 4, 5, 4, False),
+        ("list", [{"after_seq": 4, "reason": "r"}], 5, 4, False),
+        # 3 — after_seq missing or not an integer
+        ("no after_seq", {"reason": "driver-restart"}, 5, 4, False),
+        ("after_seq str", {"after_seq": "4", "reason": "r"}, 5, 4, False),
+        ("after_seq float", {"after_seq": 4.0, "reason": "r"}, 5, 4, False),
+        ("after_seq bool", {"after_seq": True, "reason": "r"}, 5, 4, False),
+        # 4 — after_seq cites nowhere real
+        ("cites too early", {"after_seq": 2, "reason": "r"}, 5, 4, False),
+        ("cites the future", {"after_seq": 9, "reason": "r"}, 5, 4, False),
+        ("cites itself", {"after_seq": 5, "reason": "r"}, 5, 4, False),
+        # 5 — reason missing, empty, mistyped or unbounded
+        ("no reason", {"after_seq": 4}, 5, 4, False),
+        ("empty reason", {"after_seq": 4, "reason": ""}, 5, 4, False),
+        ("reason not a string", {"after_seq": 4, "reason": 7}, 5, 4, False),
+        ("reason over bound",
+         {"after_seq": 4, "reason": "x" * (vc.GAP_REASON_MAX + 1)},
+         5, 4, False),
+        ("reason at the bound",
+         {"after_seq": 4, "reason": "x" * vc.GAP_REASON_MAX},
+         5, 4, True),
+        # 6 — well formed, citing the previous record for this camera
+        ("cites the carried predecessor",
+         {"after_seq": 4, "reason": "driver-restart"}, 5, 4, True),
+        # the case Docket added after the fact: a corpus that begins
+        # mid-run names an external predecessor at segment_seq - 1
+        ("external predecessor, first carried record",
+         {"after_seq": 4, "reason": "driver-restart"}, 5, None, True),
+        ("first carried record citing nowhere",
+         {"after_seq": 1, "reason": "driver-restart"}, 5, None, False),
+        # ... and the Aug-24 fixture's shape: a two-block slice, so the
+        # second block opens mid-corpus on its external predecessor
+        ("external predecessor, mid-corpus block",
+         {"after_seq": 51, "reason": "driver-restart"}, 52, 19, True),
+        # segment 0 has no predecessor at all, external or otherwise
+        ("gap on segment 0", {"after_seq": -1, "reason": "r"}, 0, None,
+         False),
+        ("gap on segment 0, citing 0", {"after_seq": 0, "reason": "r"},
+         0, None, False),
+        # the field set is the schema, one level down as well
+        ("unexpected key",
+         {"after_seq": 4, "reason": "r", "note": "x"}, 5, 4, False),
+    ]
+
+    def test_the_matrix(self):
+        for label, gap, seq, prev, valid in self.MATRIX:
+            with self.subTest(case=label):
+                defect = vc.gap_defect(gap, seq, prev)
+                if valid:
+                    self.assertIsNone(defect, "%s should be valid" % label)
+                else:
+                    self.assertIsInstance(
+                        defect, str, "%s should be a defect" % label)
+                    self.assertTrue(defect, label)
+
+    def test_every_defect_names_the_field(self):
+        # a verdict a reader cannot act on is not a verdict
+        for label, gap, seq, prev, valid in self.MATRIX:
+            if valid:
+                continue
+            with self.subTest(case=label):
+                self.assertIn("gap", vc.gap_defect(gap, seq, prev))
+
+
+class GapEmissionGuardTests(unittest.TestCase):
+    """The producer never builds a body whose gap would grade FAILED —
+    the signature is applied to the body build_body returns, so refusing
+    here is refusing to sign."""
+
+    def _build(self, seq, gap):
+        return vc.build_body("cam", "cam", seq, "a" * 64, None, 1, 6.0,
+                             1, 2, "host-clock", "live", gap, "k")
+
+    def test_a_well_formed_gap_still_builds(self):
+        body = self._build(5, {"after_seq": 4, "reason": "driver-restart"})
+        self.assertEqual(body["gap"],
+                         {"after_seq": 4, "reason": "driver-restart"})
+
+    def test_no_gap_still_builds(self):
+        self.assertIsNone(self._build(0, None)["gap"])
+
+    def test_every_invalid_shape_is_refused(self):
+        for gap in (True, "driver-restart", 4, {}, {"after_seq": 4},
+                    {"reason": "r"}, {"after_seq": "4", "reason": "r"},
+                    {"after_seq": 4, "reason": ""},
+                    {"after_seq": 3, "reason": "r"},
+                    {"after_seq": 4, "reason": "r", "note": "x"}):
+            with self.subTest(gap=gap):
+                with self.assertRaises(ValueError) as cm:
+                    self._build(5, gap)
+                self.assertIn("refusing to build", str(cm.exception))
+
+    def test_a_gap_on_segment_0_is_refused(self):
+        with self.assertRaises(ValueError):
+            self._build(0, {"after_seq": -1, "reason": "driver-restart"})
+
+
+class InvalidGapExcusesNothingTests(unittest.TestCase):
+    """The graders' side of the same rule. A gap that does not grade
+    valid is not a gap: it fails the record, and it excuses neither a
+    sequence break, nor an outage, nor a reappearance of bytes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_a_signed_but_invalid_gap_fails_the_audit(self):
+        chain = SignedChain(self.tmp, camera="badgap")
+        chain.add()
+        chain.add()
+        chain.add(raw_gap=True)
+        rc, out, err = run_main(["audit", "--db", chain.write(),
+                                 "--pubkey", chain.pk_path])
+        self.assertEqual(rc, 1, out + err)
+        self.assertNotIn("INTEGRITY: OK", out)
+        self.assertIn("gap is bool, not an object", out + err)
+
+    def test_an_invalid_gap_no_longer_excuses_a_sequence_break(self):
+        chain = SignedChain(self.tmp, camera="jump")
+        chain.add()
+        chain.add(bump_seq=3, raw_gap={"after_seq": 4, "reason": "r"})
+        rc, out, err = run_main(["audit", "--db", chain.write(),
+                                 "--pubkey", chain.pk_path])
+        both = out + err
+        self.assertEqual(rc, 1, both)
+        self.assertIn("does not follow", both)
+        self.assertIn("no valid gap record", both)
+
+    def test_a_valid_gap_citing_the_carried_predecessor_still_excuses(self):
+        # the Docket branch: after_seq names the previous record for
+        # this camera, which is three sequence numbers back
+        chain = SignedChain(self.tmp, camera="ok1")
+        chain.add()
+        chain.add(bump_seq=3, raw_gap={"after_seq": 0,
+                                       "reason": "driver-restart"})
+        rc, out, err = run_main(["audit", "--db", chain.write(),
+                                 "--pubkey", chain.pk_path])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("INTEGRITY: OK", out)
+
+    def test_a_valid_external_predecessor_gap_still_excuses(self):
+        # the sliced-corpus branch: after_seq names the immediate
+        # predecessor, which this corpus does not carry
+        chain = SignedChain(self.tmp, camera="ok2")
+        chain.add()
+        chain.add(bump_seq=3, raw_gap={"after_seq": 2,
+                                       "reason": "driver-restart"})
+        rc, out, err = run_main(["audit", "--db", chain.write(),
+                                 "--pubkey", chain.pk_path])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("INTEGRITY: OK", out)
+
+    def test_an_invalid_gap_does_not_account_for_an_outage(self):
+        chain = SignedChain(self.tmp, camera="cov")
+        chain.add()
+        chain.add()
+        chain.add(hole_s=300.0, raw_gap=True)
+        bodies = [(s, a, json.loads(c)) for s, _, a, _, c in chain.rows]
+        info = vc.grade_coverage(bodies)["cov"]
+        self.assertEqual(info["verdict"], vc.COVERAGE_UNEXPLAINED)
+        self.assertEqual(info["outages"][0]["class"], "UNEXPLAINED")
+        self.assertIsNone(info["outages"][0]["gap_reason"])
+
+    def test_an_invalid_gap_does_not_explain_a_reappearance(self):
+        chain = SignedChain(self.tmp, camera="reuse")
+        sha = "d" * 64
+        chain.add(seg_sha=sha)
+        chain.add()
+        chain.add(hole_s=200.0, raw_gap={"after_seq": 99, "reason": "r"})
+        chain.add(seg_sha=sha)
+        bodies = [(s, a, json.loads(c)) for s, _, a, _, c in chain.rows]
+        axis, groups = vc.grade_content_reuse(bodies)
+        self.assertEqual(axis, vc.REUSE_UNEXPLAINED)
+        self.assertIn("no signed gap record", groups[0]["basis"])
+
+    def test_the_same_reuse_is_explained_by_a_valid_gap(self):
+        # the control for the test above: identical chain, valid gap
+        chain = SignedChain(self.tmp, camera="reuse2")
+        sha = "d" * 64
+        chain.add(seg_sha=sha)
+        chain.add()
+        chain.add(hole_s=200.0, gap={"after_seq": 1,
+                                     "reason": "driver-restart"})
+        chain.add(seg_sha=sha)
+        bodies = [(s, a, json.loads(c)) for s, _, a, _, c in chain.rows]
+        axis, groups = vc.grade_content_reuse(bodies)
+        self.assertEqual(axis, vc.REUSE_EXPLAINED)
 
 
 # ═══════════════════════════════════════════════════════════════════════
