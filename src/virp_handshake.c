@@ -228,6 +228,19 @@ virp_error_t virp_handle_session_bind(virp_context_t *ctx,
     if (!(id_ok & cn_ok & sn_ok))
         return VIRP_ERR_CONTEXT_MISMATCH;
 
+    /*
+     * EVERY identity the BIND serializes into the transcript must equal
+     * the one negotiated in HELLO/HELLO_ACK — otherwise the derived key
+     * is "bound to the identities" only in the sense of binding whatever
+     * bytes the BIND happened to carry (crypto review 2026-08-31,
+     * finding 7). Identities are public, so plain comparison is fine.
+     */
+    if (strncmp(bind_in->client_id, ctx->session.client_id,
+                sizeof(bind_in->client_id)) != 0 ||
+        strncmp(bind_in->server_id, ctx->session.server_id,
+                sizeof(bind_in->server_id)) != 0)
+        return VIRP_ERR_CONTEXT_MISMATCH;
+
     /* Accumulate transcript: serialize SESSION_BIND */
     {
         uint8_t ser[256];

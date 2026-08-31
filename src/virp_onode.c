@@ -4152,6 +4152,14 @@ static void handle_client(onode_state_t *state, int client_fd,
         snprintf(bind_msg.client_id, sizeof(bind_msg.client_id),
                  "%s", req.client_id);
 
+        /* The BIND transcript must carry the identities the derived key
+         * claims to bind. server_id used to be left zero-filled here, so
+         * the transcript bound a blank server identity (crypto review
+         * 2026-08-31, finding 7). Set once at session_init, read-only
+         * afterwards, so reading it outside session_mutex is fine. */
+        snprintf(bind_msg.server_id, sizeof(bind_msg.server_id),
+                 "%s", state->ctx->session.server_id);
+
         /* session_id from hex (reuse req.session_id, 16 bytes = 32 hex) */
         if (req.session_id[0]) {
             virp_hex_decode(req.session_id, bind_msg.session_id, 16);
