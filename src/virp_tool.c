@@ -1167,80 +1167,36 @@ struct approve_opts {
  */
 static int load_approver_secret(const char *path, virp_fed_keypair_t *kp)
 {
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) {
-        if (errno == ENOENT)
-            fprintf(stderr, "Error: approver key file not found: %s\n"
-                    "  (this is the 64-byte SECRET key `<prefix>.key` from "
-                    "`virp-tool keygen approval <prefix>`.)\n", path);
-        else if (errno == EACCES)
-            fprintf(stderr, "Error: permission denied reading %s\n"
-                    "  Run as the file's owner (e.g. sudo -u virp-onode) or "
-                    "root.\n", path);
-        else if (errno == ELOOP)
-            fprintf(stderr, "Error: %s is a symlink — refusing to follow.\n",
-                    path);
-        else
-            fprintf(stderr, "Error: cannot open %s: %s\n", path,
-                    strerror(errno));
-        return -1;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        fprintf(stderr, "Error: cannot stat %s: %s\n", path, strerror(errno));
-        close(fd);
-        return -1;
-    }
-    if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "Error: %s is not a regular file.\n", path);
-        close(fd);
-        return -1;
-    }
-    /* Size checks first — the likeliest mistake is pointing --key at the
-     * `.pub` — so the message is helpful even though .pub is world-readable. */
-    if (st.st_size == VIRP_FED_PK_SIZE) {
-        fprintf(stderr, "Error: %s is %d bytes — that is a PUBLIC key.\n"
-                "  --key needs the 64-byte SECRET key (`<prefix>.key`), not "
-                "`<prefix>.pub`.\n", path, VIRP_FED_PK_SIZE);
-        close(fd);
-        return -1;
-    }
-    if (st.st_size != VIRP_FED_SK_SIZE) {
-        fprintf(stderr, "Error: %s is %lld bytes — expected a %d-byte "
-                "libsodium Ed25519 secret key.\n",
-                path, (long long)st.st_size, VIRP_FED_SK_SIZE);
-        close(fd);
-        return -1;
-    }
-    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
-        fprintf(stderr, "Error: %s has insecure permissions 0%o — a secret "
-                "key must be 0600.\n  Run: chmod 600 %s\n",
-                path, (unsigned)(st.st_mode & 07777), path);
-        close(fd);
-        return -1;
-    }
-    if (!virp_key_owner_ok(st.st_uid, geteuid())) {
-        fprintf(stderr, "Error: %s is owned by uid=%u but you are euid=%u.\n"
-                "  Run as that user (e.g. sudo -u <owner>) or root.\n",
-                path, (unsigned)st.st_uid, (unsigned)geteuid());
-        close(fd);
-        return -1;
-    }
-
     uint8_t sk[VIRP_FED_SK_SIZE];
-    ssize_t n = read(fd, sk, sizeof(sk));
-    close(fd);
-    if (n != (ssize_t)sizeof(sk)) {
-        fprintf(stderr, "Error: short read of %s.\n", path);
+    virp_error_t err = virp_keyfile_read(path,
+                                         "Error: approver secret key",
+                                         true, sk, VIRP_FED_SK_SIZE);
+    if (err != VIRP_OK) {
+        /* The primitive printed the refusal; add the CLI hints for the
+         * two likeliest operator mistakes. stat() here is diagnostic
+         * only — enforcement already happened on the opened fd. */
+        struct stat st;
+        if (stat(path, &st) != 0 && errno == ENOENT)
+            fprintf(stderr, "  approver key file not found — this is the "
+                    "64-byte SECRET key `<prefix>.key` from `virp-tool "
+                    "keygen approval <prefix>`.\n");
+        else if (stat(path, &st) == 0 &&
+                 st.st_size == (off_t)VIRP_FED_PK_SIZE)
+            fprintf(stderr, "  %s is %d bytes — that is a PUBLIC key. "
+                    "--key needs the 64-byte SECRET key (`<prefix>.key`), "
+                    "not `<prefix>.pub`.\n", path, VIRP_FED_PK_SIZE);
+        else if (err == VIRP_ERR_KEY_NOT_LOADED)
+            fprintf(stderr, "  Run as the file's owner (e.g. sudo -u "
+                    "virp-onode) or root, with the key at mode 0600.\n");
         return -1;
     }
-    virp_error_t err = virp_fed_from_secret(kp, sk, 1);
+    err = virp_fed_from_secret(kp, sk, 1);
     volatile uint8_t *p = sk;
     for (size_t i = 0; i < sizeof(sk); i++) p[i] = 0;
     if (err != VIRP_OK) {
         fprintf(stderr, "Error: %s is not a valid Ed25519 secret key "
-                "(wrong format?).\n", path);
+                "(wrong format, or its public half does not match its "
+                "seed).\n", path);
         return -1;
     }
     return 0;

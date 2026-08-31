@@ -1489,6 +1489,31 @@ TEST(test_key_generate_distinct_across_key_types)
     virp_key_destroy(&r);
 }
 
+TEST(test_key_lock_lifecycle_generated_and_loaded)
+{
+    /* GENERATED keys get the same mlock lifecycle as loaded ones —
+     * generation used to skip the lock while a comment claimed
+     * otherwise (crypto review 2026-08-31, finding 5). The flag lets
+     * destroy munlock exactly what init locked. mlock of one 32-byte
+     * region is well inside any sane RLIMIT_MEMLOCK; if this ever
+     * fails here it is worth a look, not a shrug. */
+    virp_signing_key_t gen;
+    ASSERT_OK(virp_key_generate(&gen, VIRP_KEY_TYPE_OKEY));
+    ASSERT_TRUE(gen.locked);
+
+    const char *path = "/tmp/virp_test_key_lock.bin";
+    ASSERT_OK(virp_key_save_file(&gen, path));
+    virp_signing_key_t loaded;
+    ASSERT_OK(virp_key_load_file(&loaded, VIRP_KEY_TYPE_OKEY, path));
+    ASSERT_TRUE(loaded.locked);
+    unlink(path);
+
+    virp_key_destroy(&gen);
+    virp_key_destroy(&loaded);
+    ASSERT_TRUE(!gen.locked);
+    ASSERT_TRUE(!loaded.locked);
+}
+
 int main(void)
 {
     printf("\n");
@@ -1586,6 +1611,7 @@ int main(void)
     RUN_TEST(test_key_generate_two_keys_differ);
     RUN_TEST(test_key_generate_rejects_null);
     RUN_TEST(test_key_generate_distinct_across_key_types);
+    RUN_TEST(test_key_lock_lifecycle_generated_and_loaded);
     printf("\n================================================================\n");
     printf("  Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0)

@@ -118,87 +118,18 @@ virp_error_t virp_chainsign_save(const virp_chainsign_key_t *kp,
     return VIRP_OK;
 }
 
-/* Open for reading with the symlink/regular-file gate shared by both
- * loaders. Returns the fd or -1 (message already printed). */
-static int chainsign_open_regular(const char *path, const char *what,
-                                  struct stat *st)
-{
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) {
-        if (errno == ELOOP)
-            fprintf(stderr, "[ChainSign] %s %s is a symlink — refusing to "
-                            "follow (O_NOFOLLOW)\n", what, path);
-        else
-            fprintf(stderr, "[ChainSign] open(%s): %s\n", path, strerror(errno));
-        return -1;
-    }
-    if (fstat(fd, st) < 0) { close(fd); return -1; }
-    if (!S_ISREG(st->st_mode)) {
-        fprintf(stderr, "[ChainSign] %s %s is not a regular file\n", what, path);
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-static int read_exact(int fd, uint8_t *buf, size_t want)
-{
-    size_t got = 0;
-    while (got < want) {
-        ssize_t r = read(fd, buf + got, want - got);
-        if (r == 0) break;
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        got += (size_t)r;
-    }
-    return got == want ? 0 : -1;
-}
-
 virp_error_t virp_chainsign_load(virp_chainsign_key_t *kp, const char *sk_path)
 {
     if (!kp || !sk_path) return VIRP_ERR_NULL_PTR;
     if (sodium_init() < 0) return VIRP_ERR_CRYPTO;
     memset(kp, 0, sizeof(*kp));
 
-    struct stat st;
-    int fd = chainsign_open_regular(sk_path, "chain-signing secret key", &st);
-    if (fd < 0) return VIRP_ERR_KEY_NOT_LOADED;
+    virp_error_t kerr = virp_keyfile_read(
+        sk_path, "[ChainSign] chain-signing secret key", true,
+        kp->secret_key, VIRP_CHAINSIGN_SK_SIZE);
+    if (kerr != VIRP_OK)
+        return kerr;
 
-    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
-        fprintf(stderr,
-                "[ChainSign] chain-signing secret key %s has insecure mode "
-                "0%o — any group/world access makes every local reader a "
-                "chain forger. Refusing to load. Run: chmod 0600 %s\n",
-                sk_path, (unsigned)(st.st_mode & 07777), sk_path);
-        close(fd);
-        return VIRP_ERR_KEY_NOT_LOADED;
-    }
-    uid_t euid = geteuid();
-    if (!virp_key_owner_ok(st.st_uid, euid)) {
-        fprintf(stderr,
-                "[ChainSign] chain-signing secret key %s is owned by uid=%u, "
-                "expected %u — refusing to load\n",
-                sk_path, (unsigned)st.st_uid, (unsigned)euid);
-        close(fd);
-        return VIRP_ERR_KEY_NOT_LOADED;
-    }
-    if (st.st_size != (off_t)VIRP_CHAINSIGN_SK_SIZE) {
-        fprintf(stderr,
-                "[ChainSign] chain-signing secret key %s is %lld bytes, "
-                "expected exactly %d (Ed25519 seed||pub) — malformed or "
-                "truncated key, refusing to load\n",
-                sk_path, (long long)st.st_size, VIRP_CHAINSIGN_SK_SIZE);
-        close(fd);
-        return VIRP_ERR_INVALID_LENGTH;
-    }
-    int rrc = read_exact(fd, kp->secret_key, VIRP_CHAINSIGN_SK_SIZE);
-    close(fd);
-    if (rrc != 0) {
-        sodium_memzero(kp->secret_key, VIRP_CHAINSIGN_SK_SIZE);
-        return VIRP_ERR_INVALID_LENGTH;
-    }
     /* libsodium sk = seed(32) || pub(32). RE-DERIVE the public half from
      * the seed and cross-check it against the stored half: a file whose
      * two halves disagree is corrupt (or hand-assembled) and must not
@@ -229,19 +160,11 @@ virp_error_t virp_chainsign_load_public(const char *pk_path,
     if (!pk_path || !pk) return VIRP_ERR_NULL_PTR;
     if (sodium_init() < 0) return VIRP_ERR_CRYPTO;
 
-    struct stat st;
-    int fd = chainsign_open_regular(pk_path, "chain-signing public key", &st);
-    if (fd < 0) return VIRP_ERR_KEY_NOT_LOADED;
-    if (st.st_size != (off_t)VIRP_CHAINSIGN_PK_SIZE) {
-        fprintf(stderr, "[ChainSign] chain-signing public key %s is %lld "
-                        "bytes, expected exactly %d raw Ed25519 bytes\n",
-                pk_path, (long long)st.st_size, VIRP_CHAINSIGN_PK_SIZE);
-        close(fd);
-        return VIRP_ERR_INVALID_LENGTH;
-    }
-    int rrc = read_exact(fd, pk, VIRP_CHAINSIGN_PK_SIZE);
-    close(fd);
-    if (rrc != 0) return VIRP_ERR_INVALID_LENGTH;
+    virp_error_t kerr = virp_keyfile_read(
+        pk_path, "[ChainSign] chain-signing public key", false,
+        pk, VIRP_CHAINSIGN_PK_SIZE);
+    if (kerr != VIRP_OK)
+        return kerr;
     if (key_id_hex) virp_chainsign_key_id_hex(pk, key_id_hex);
     return VIRP_OK;
 }

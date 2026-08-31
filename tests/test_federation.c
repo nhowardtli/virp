@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>     /* chmod (custody-gate test) */
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -314,6 +315,53 @@ static void test_destroy_zeros(void)
     PASS();
 }
 
+/* Custody hardening (crypto review 2026-08-31, finding 3): the fed
+ * loader used to be a bare open()+read() with no mode/owner/symlink/
+ * consistency policy. It now rides the shared virp_keyfile_read
+ * primitive plus the seed↔pub cross-checks. */
+static void test_load_custody_gates(void)
+{
+    TEST("Load refuses lax mode, mismatched pub, franken sk");
+    cleanup();
+
+    virp_fed_keypair_t kp, loaded;
+    virp_fed_generate(&kp, 1);
+    ASSERT(virp_fed_save(&kp, TEST_PK, TEST_SK) == VIRP_OK, "save");
+
+    /* Group-readable secret: refuse. */
+    ASSERT(chmod(TEST_SK, 0640) == 0, "chmod 0640");
+    ASSERT(virp_fed_load(&loaded, TEST_PK, TEST_SK, 1) != VIRP_OK,
+           "0640 secret key must refuse to load");
+    ASSERT(chmod(TEST_SK, 0600) == 0, "chmod back");
+    ASSERT(virp_fed_load(&loaded, TEST_PK, TEST_SK, 1) == VIRP_OK,
+           "0600 loads again");
+    virp_fed_destroy(&loaded);
+
+    /* .pub that is not the key the seed derives to: refuse. */
+    virp_fed_keypair_t other;
+    virp_fed_generate(&other, 1);
+    unlink(TEST_PK);
+    FILE *f = fopen(TEST_PK, "wb");
+    ASSERT(f != NULL, "rewrite pub");
+    ASSERT(fwrite(other.public_key, 1, VIRP_FED_PK_SIZE, f)
+           == VIRP_FED_PK_SIZE, "write pub");
+    fclose(f);
+    ASSERT(virp_fed_load(&loaded, TEST_PK, TEST_SK, 1) == VIRP_ERR_CRYPTO,
+           "mismatched .pub must refuse to load");
+
+    /* seed_A || pub_B inside the secret file itself: refuse. */
+    uint8_t franken[VIRP_FED_SK_SIZE];
+    memcpy(franken, kp.secret_key, VIRP_FED_SK_SIZE - VIRP_FED_PK_SIZE);
+    memcpy(franken + VIRP_FED_SK_SIZE - VIRP_FED_PK_SIZE,
+           other.public_key, VIRP_FED_PK_SIZE);
+    ASSERT(virp_fed_from_secret(&loaded, franken, 1) == VIRP_ERR_CRYPTO,
+           "seed/pub-half mismatch must refuse to load");
+
+    virp_fed_destroy(&kp);
+    virp_fed_destroy(&other);
+    PASS();
+}
+
 /* =========================================================================
  * Main
  * ========================================================================= */
@@ -332,6 +380,7 @@ int main(void)
     test_mlock();
     test_key_id();
     test_destroy_zeros();
+    test_load_custody_gates();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);
