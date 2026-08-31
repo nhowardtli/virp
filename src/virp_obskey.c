@@ -193,11 +193,30 @@ virp_error_t virp_obskey_load(virp_obskey_t *kp, const char *sk_path)
         return VIRP_ERR_INVALID_LENGTH;
     }
 
-    /* libsodium sk = seed(32) || pub(32); derive and cross-check. */
-    if (crypto_sign_ed25519_sk_to_pk(kp->public_key, kp->secret_key) != 0) {
+    /* libsodium sk = seed(32) || pub(32). RE-DERIVE the public half from
+     * the seed and cross-check it against the stored half: a file whose
+     * two halves disagree is corrupt (or hand-assembled) and must not
+     * sign. crypto_sign_ed25519_sk_to_pk() would NOT do this — it only
+     * copies the stored half — so the derivation goes through
+     * crypto_sign_seed_keypair on a scratch key, exactly as
+     * virp_chainsign_load() does. */
+    uint8_t derived_pk[VIRP_OBSKEY_PK_SIZE];
+    uint8_t derived_sk[VIRP_OBSKEY_SK_SIZE];
+    int drc = crypto_sign_seed_keypair(derived_pk, derived_sk,
+                                       kp->secret_key);
+    sodium_memzero(derived_sk, VIRP_OBSKEY_SK_SIZE);
+    if (drc != 0 ||
+        sodium_memcmp(derived_pk,
+                      kp->secret_key + VIRP_OBSKEY_SK_SIZE
+                                     - VIRP_OBSKEY_PK_SIZE,
+                      VIRP_OBSKEY_PK_SIZE) != 0) {
+        fprintf(stderr, "[ObsKey] %s: public half does not match the "
+                        "seed — corrupt key file, refusing to load\n",
+                sk_path);
         sodium_memzero(kp->secret_key, VIRP_OBSKEY_SK_SIZE);
         return VIRP_ERR_CRYPTO;
     }
+    memcpy(kp->public_key, derived_pk, VIRP_OBSKEY_PK_SIZE);
 
     obskey_key_id(kp->public_key, kp->key_id);
     kp->loaded = true;
