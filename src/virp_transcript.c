@@ -184,19 +184,36 @@ virp_error_t virp_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
         salt_len = 32;
     }
 
+    /*
+     * Single cleanup exit: the PRK is key material and must be wiped on
+     * EVERY path out of this function — the error returns used to leave
+     * it live on the stack (crypto review 2026-08-31, finding 6).
+     *
+     * NOTE (deferred, draft-07): `info` is currently the bare 8-octet
+     * generation counter per draft-06 §6.1. Prefixing a purpose label
+     * ("VIRP-SESSION-OBS-v2\0") changes the derived key — a wire break —
+     * so it rides the canonical-format window with the version bump,
+     * not this cleanup fix.
+     */
+    virp_error_t rc = VIRP_OK;
+
     /* Extract: PRK = HMAC-SHA256(salt, IKM) */
     uint8_t prk[32];
     unsigned int prk_len = 32;
-    if (!HMAC(EVP_sha256(), salt, (int)salt_len, ikm, ikm_len, prk, &prk_len))
-        return VIRP_ERR_CRYPTO;
+    if (!HMAC(EVP_sha256(), salt, (int)salt_len, ikm, ikm_len, prk, &prk_len)) {
+        rc = VIRP_ERR_CRYPTO;
+        goto out;
+    }
 
     /* Expand: T(1) = HMAC-SHA256(PRK, info || 0x01) */
     uint8_t expand_buf[256 + 1]; /* info + counter byte */
     size_t expand_len = 0;
 
     if (info && info_len > 0) {
-        if (info_len > 256)
-            return VIRP_ERR_BUFFER_TOO_SMALL;
+        if (info_len > 256) {
+            rc = VIRP_ERR_BUFFER_TOO_SMALL;
+            goto out;
+        }
         memcpy(expand_buf, info, info_len);
         expand_len = info_len;
     }
@@ -205,12 +222,11 @@ virp_error_t virp_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
 
     unsigned int okm_len = 32;
     if (!HMAC(EVP_sha256(), prk, 32, expand_buf, expand_len, okm, &okm_len))
-        return VIRP_ERR_CRYPTO;
+        rc = VIRP_ERR_CRYPTO;
 
-    /* Wipe PRK */
+out:
     OPENSSL_cleanse(prk, sizeof(prk));
-
-    return VIRP_OK;
+    return rc;
 }
 
 /* =========================================================================
