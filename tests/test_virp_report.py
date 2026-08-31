@@ -1047,6 +1047,20 @@ class TestV2SessionObservations(unittest.TestCase):
                                                           TEST_OKEY)
         self.assertEqual(verdict, verify.FAIL)
 
+    def test_spliced_v1_suffix_is_FAIL_not_PASS(self):
+        """A genuine v1 frame with bytes appended beyond the declared
+        length must grade FAIL — the HMAC covers only the declared span,
+        so a PASS would launder an unauthenticated suffix. Mirrors the
+        exact-length check classify_observation_v2 already applies and
+        the equality check virp_validate_message enforces in C (crypto
+        review 2026-08-31, finding 1)."""
+        vs, _ = self._analyse()
+        v1 = next(v for v in vs if v.obs_hmac == verify.PASS)
+        spliced = bytes(v1.artifact_raw) + b"INJECTED-SUFFIX"
+        verdict, detail = verify.verify_observation_hmac(spliced, TEST_OKEY)
+        self.assertEqual(verdict, verify.FAIL)
+        self.assertIn("declared length", detail)
+
     def test_cli_reports_v2_without_failing_the_run(self):
         """Through the real CLI: a chain whose only oddity is a v2 frame
         exits 0 (with --no-journal the corroboration is UNCHECKED, which

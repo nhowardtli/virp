@@ -353,6 +353,42 @@ TEST(test_wrong_key_fails_verify)
     ASSERT_EQ(err, VIRP_ERR_HMAC_FAILED);
 }
 
+TEST(test_trailing_bytes_rejected)
+{
+    /* A genuine signed v1 message with bytes appended after hdr.length
+     * must be refused outright. The HMAC covers only the declared span,
+     * so accepting the longer buffer would authenticate a message while
+     * leaving an attacker-chosen suffix unauthenticated — and
+     * artifact_hash commits to the FULL submitted bytes. */
+    uint8_t buf[512];
+    size_t out_len;
+    uint8_t data[] = "R6#show version\nCisco IOS";
+
+    virp_error_t err = virp_build_observation(buf, sizeof(buf), &out_len,
+                                              0x01020304, 7,
+                                              VIRP_OBS_DEVICE_OUTPUT,
+                                              VIRP_SCOPE_LOCAL,
+                                              data, sizeof(data),
+                                              &okey);
+    ASSERT_OK(err);
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(buf, out_len, &okey, &hdr));
+
+    /* One appended byte */
+    buf[out_len] = 0xAA;
+    err = virp_validate_message(buf, out_len + 1, &okey, &hdr);
+    ASSERT_EQ(err, VIRP_ERR_INVALID_LENGTH);
+
+    /* A 40-byte appended suffix */
+    memset(buf + out_len, 0x42, 40);
+    err = virp_validate_message(buf, out_len + 40, &okey, &hdr);
+    ASSERT_EQ(err, VIRP_ERR_INVALID_LENGTH);
+
+    /* The exact span still verifies */
+    ASSERT_OK(virp_validate_message(buf, out_len, &okey, &hdr));
+}
+
 /* =========================================================================
  * 8. Channel-type consistency enforcement
  * ========================================================================= */
@@ -1480,6 +1516,7 @@ int main(void)
     RUN_TEST(test_observation_tier_honesty);
     RUN_TEST(test_observation_wrapper_unchanged_green);
     RUN_TEST(test_wrong_key_fails_verify);
+    RUN_TEST(test_trailing_bytes_rejected);
 
     printf("\n[Channel-Type Consistency]\n");
     RUN_TEST(test_observation_on_ic_rejected);

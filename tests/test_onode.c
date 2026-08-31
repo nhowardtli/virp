@@ -4924,6 +4924,33 @@ TEST(test_chain_append_rejects_tampered_v1_observation)
     ASSERT_EQ(ca_count_entries("obs-tampered-1"), 0);
 }
 
+/* ATTACK 5b (GATE 3): a REAL, untampered signed observation with an
+ * attacker-chosen suffix appended AFTER hdr.length, and the declared
+ * hash honestly recomputed over the whole spliced buffer so GATE 2 is
+ * satisfied. The HMAC verifies over the declared span, so only the
+ * exact-length check in virp_validate_message() stands between this
+ * splice and the chain recording unauthenticated bytes as an
+ * authenticated observation (crypto review 2026-08-31, finding 1). */
+TEST(test_chain_append_rejects_spliced_v1_suffix)
+{
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9003);
+    ASSERT_TRUE(olen > 0);
+
+    memcpy(obs + olen, "INJECTED-SUFFIX", 15);   /* unsigned tail */
+    size_t splen = olen + 15;
+
+    char h[65];  ca_sha256_hex_bin(obs, splen, h);   /* honest hash */
+    char body[2048]; ca_b64_body(obs, splen, body, sizeof(body));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("attack:splice", "observation",
+                          "obs-spliced-1", h, body, resp, sizeof(resp));
+
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(ca_count_entries("obs-spliced-1"), 0);
+}
+
 /* ATTACK 6 (GATE 3): dispatch must be explicit. An unknown version byte
  * is refused, never guessed at or waved through. */
 TEST(test_chain_append_rejects_unknown_obs_version)
@@ -6872,6 +6899,7 @@ int main(void)
         RUN_TEST(test_chain_append_accepts_signed_v1_observation);
         RUN_TEST(test_chain_append_rejects_unsigned_observation_body);
         RUN_TEST(test_chain_append_rejects_tampered_v1_observation);
+        RUN_TEST(test_chain_append_rejects_spliced_v1_suffix);
         RUN_TEST(test_chain_append_rejects_unknown_obs_version);
         RUN_TEST(test_chain_append_rejects_v3_without_obskey);
         RUN_TEST(test_chain_append_accepts_signed_v3_observation);

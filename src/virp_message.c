@@ -305,8 +305,14 @@ virp_error_t virp_validate_message(const uint8_t *msg, size_t msg_len,
     err = virp_check_channel_type(hdr_out->channel, hdr_out->type);
     if (err != VIRP_OK) return err;
 
-    /* Step 4: Check message length matches buffer */
-    if (hdr_out->length > msg_len)
+    /*
+     * Step 4: The declared length must equal the buffer exactly. A
+     * surplus would ride behind a valid HMAC as an unauthenticated
+     * suffix while artifact_hash commits to the full submitted bytes;
+     * v2/v3 already refuse unattributed bytes (virp_crypto.c) and v1
+     * must hold the same line.
+     */
+    if ((size_t)hdr_out->length != msg_len)
         return VIRP_ERR_INVALID_LENGTH;
 
     /*

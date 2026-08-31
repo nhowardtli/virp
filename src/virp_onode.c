@@ -2837,8 +2837,12 @@ static bool fed_outcome_observation_hash(const char *body, char out_hex[65])
  * the signature is the 64-byte signature itself — and that is pinned
  * too: libsodium refuses a non-canonical S, and the byte-by-byte sweep
  * in tests/test_obs_ed25519_forge.c walks the signature bytes as well
- * as the signed span. v1 and v2 have deterministic HMAC trailers and
- * were never malleable.
+ * as the signed span. v2 refuses any byte its declared payload length
+ * does not account for, and v1 does too now that
+ * virp_validate_message() requires hdr.length == msg_len exactly —
+ * before that check, a v1 frame could carry an unauthenticated suffix
+ * behind a valid HMAC while artifact_hash committed to the whole
+ * thing (crypto review 2026-08-31, finding 1).
  *
  * Consequence to hold on to: hash-over-full-message is load-bearing on
  * that non-malleability. Any future format that puts an unsigned or

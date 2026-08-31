@@ -603,10 +603,13 @@ def verify_observation_hmac(raw, okey):
     length = struct.unpack_from("!H", raw, 2)[0]
     if length < VIRP_HEADER_SIZE:
         return FAIL, "declared length %d < header size" % length
-    payload_len = length - VIRP_HEADER_SIZE
-    if len(raw) < VIRP_HEADER_SIZE + payload_len:
-        return FAIL, ("declared length %d exceeds stored bytes %d"
+    # Exact framing, both directions — as classify_observation_v2 already
+    # does for v2. A frame longer than its declared length carries an
+    # unauthenticated suffix behind a valid HMAC; that is how splices hide.
+    if length != len(raw):
+        return FAIL, ("declared length %d != stored bytes %d"
                       % (length, len(raw)))
+    payload_len = length - VIRP_HEADER_SIZE
 
     received = raw[24:56]
     signed = raw[0:24] + raw[VIRP_HEADER_SIZE:VIRP_HEADER_SIZE + payload_len]
