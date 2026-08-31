@@ -409,12 +409,21 @@ int virp_consttime_eq(const void *a, const void *b, size_t n)
  * HMAC-SHA256
  * ========================================================================= */
 
-void virp_hmac_sha256(const uint8_t key[VIRP_KEY_SIZE],
-                      const uint8_t *data, size_t data_len,
-                      uint8_t out[VIRP_HMAC_SIZE])
+virp_error_t virp_hmac_sha256(const uint8_t key[VIRP_KEY_SIZE],
+                              const uint8_t *data, size_t data_len,
+                              uint8_t out[VIRP_HMAC_SIZE])
 {
     unsigned int len = VIRP_HMAC_SIZE;
-    HMAC(EVP_sha256(), key, VIRP_KEY_SIZE, data, data_len, out, &len);
+    /* An OpenSSL HMAC failure is unusual, but it must become
+     * VIRP_ERR_CRYPTO, never "carry on using whatever is in the output
+     * buffer" — the newer v3 code already holds this line (crypto
+     * review 2026-08-31, finding 4). */
+    if (!HMAC(EVP_sha256(), key, VIRP_KEY_SIZE, data, data_len, out, &len)
+        || len != VIRP_HMAC_SIZE) {
+        memset(out, 0, VIRP_HMAC_SIZE);
+        return VIRP_ERR_CRYPTO;
+    }
+    return VIRP_OK;
 }
 
 /* =========================================================================
@@ -492,10 +501,8 @@ virp_error_t virp_sign(virp_context_t *ctx,
         memcpy(sign_buf + pre_hmac_len, msg + post_hmac_start, post_hmac_len);
 
     /* Compute and write HMAC */
-    virp_hmac_sha256(sk->key.key, sign_buf, sign_len,
-                     msg + hmac_offset);
-
-    return VIRP_OK;
+    return virp_hmac_sha256(sk->key.key, sign_buf, sign_len,
+                            msg + hmac_offset);
 }
 
 virp_error_t virp_verify(virp_context_t *ctx,
@@ -536,7 +543,9 @@ virp_error_t virp_verify(virp_context_t *ctx,
         memcpy(sign_buf + pre_hmac_len, msg + post_hmac_start, post_hmac_len);
 
     uint8_t expected[VIRP_HMAC_SIZE];
-    virp_hmac_sha256(sk->key.key, sign_buf, sign_len, expected);
+    err = virp_hmac_sha256(sk->key.key, sign_buf, sign_len, expected);
+    if (err != VIRP_OK)
+        return err;
 
     /* Constant-time comparison to prevent timing attacks */
     return virp_consttime_eq(msg + hmac_offset, expected, VIRP_HMAC_SIZE)
@@ -1013,7 +1022,10 @@ virp_error_t virp_verify_observation_v2_signature(
      * unauthenticated influences a later decision except the length. */
     size_t signed_len = msg_len - VIRP_OBS_V2_SIG_SIZE;
     uint8_t expected_sig[VIRP_OBS_V2_SIG_SIZE];
-    virp_hmac_sha256(session_key, msg, signed_len, expected_sig);
+    virp_error_t herr = virp_hmac_sha256(session_key, msg, signed_len,
+                                         expected_sig);
+    if (herr != VIRP_OK)
+        return herr;
     if (!virp_consttime_eq(msg + signed_len, expected_sig,
                            VIRP_OBS_V2_SIG_SIZE))
         return VIRP_ERR_HMAC_FAILED;
@@ -1062,8 +1074,10 @@ virp_error_t virp_verify_observation_v2(
      */
     size_t signed_len = msg_len - VIRP_OBS_V2_SIG_SIZE;
     uint8_t expected_sig[VIRP_OBS_V2_SIG_SIZE];
-    virp_hmac_sha256(ctx->session.session_key, msg, signed_len,
-                     expected_sig);
+    virp_error_t herr = virp_hmac_sha256(ctx->session.session_key, msg,
+                                         signed_len, expected_sig);
+    if (herr != VIRP_OK)
+        return herr;
     if (!virp_consttime_eq(msg + signed_len, expected_sig,
                            VIRP_OBS_V2_SIG_SIZE))
         return VIRP_ERR_HMAC_FAILED;

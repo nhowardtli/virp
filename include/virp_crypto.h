@@ -184,14 +184,18 @@ virp_error_t virp_verify(virp_context_t *ctx,
  * Compute HMAC-SHA256 over arbitrary data.
  * Low-level utility used internally. Exposed for testing.
  *
+ * Returns VIRP_OK, or VIRP_ERR_CRYPTO if the underlying primitive
+ * failed (out is zeroed in that case — callers must propagate, never
+ * use the buffer).
+ *
  * key:      32-byte HMAC key
  * data:     Data to sign
  * data_len: Length of data
  * out:      32-byte output buffer for HMAC
  */
-void virp_hmac_sha256(const uint8_t key[VIRP_KEY_SIZE],
-                      const uint8_t *data, size_t data_len,
-                      uint8_t out[VIRP_HMAC_SIZE]);
+virp_error_t virp_hmac_sha256(const uint8_t key[VIRP_KEY_SIZE],
+                              const uint8_t *data, size_t data_len,
+                              uint8_t out[VIRP_HMAC_SIZE]);
 
 /* =========================================================================
  * V2 Command Canonicalization and Signing

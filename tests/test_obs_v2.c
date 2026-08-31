@@ -486,8 +486,8 @@ static void test_master_key_signature_rejected(void)
 
     /* Re-sign the same bytes with the MASTER key instead of the session
      * key — a v1-style signer must not be able to mint v2 observations */
-    virp_hmac_sha256(test_master_key, msg, n - VIRP_OBS_V2_SIG_SIZE,
-                     msg + (n - VIRP_OBS_V2_SIG_SIZE));
+    assert(virp_hmac_sha256(test_master_key, msg, n - VIRP_OBS_V2_SIG_SIZE,
+                            msg + (n - VIRP_OBS_V2_SIG_SIZE)) == VIRP_OK);
 
     virp_seqstore_t store;
     assert(virp_seqstore_init(&store, NULL) == VIRP_OK);
