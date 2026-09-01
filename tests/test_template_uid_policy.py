@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 test_template_uid_policy.py — the SHIPPED deployment templates must give
-every allowed uid an explicit per-uid action policy, and none of the
-four service identities may be able to invoke shutdown.
+every allowed uid an explicit per-uid action policy, none of the
+four service identities may be able to invoke shutdown, and the three
+read-only collectors (backup, evidence, netclaw) carry a GREEN ceiling.
 
 Sep 1 review, Task 2. The daemon treats a uid that is on
 socket_allowed_uids but absent from socket_uid_action_allow as
@@ -180,6 +181,29 @@ class CanonicalTemplateTests(_PolicyChecks, unittest.TestCase):
         self.assertTrue(m, "broker ALLOWED_ACTIONS not found")
         relay = set(re.findall(r'"([a-z_]+)"', m.group(1)))
         self.assertEqual(set(self.policy[UIDS["VIRP_BROKER_UID"]]), relay)
+
+    def test_backup_and_evidence_carry_a_green_tier_ceiling(self):
+        # both collectors are read-only by classification, and the
+        # template pins that per uid: like virp-netclaw, their effective
+        # gate ceiling is GREEN, so a YELLOW or RED row is proposal-only
+        # for them regardless of the node-wide gate_max_tier
+        ceilings = self.doc.get("socket_uid_tier_ceilings")
+        self.assertIsInstance(ceilings, dict)
+        for name in ("VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
+                     "VIRP_NETCLAW_UID"):
+            uid = UIDS[name]
+            with self.subTest(identity=name, uid=uid):
+                self.assertIn(uid, ceilings, "%s has no tier ceiling" % name)
+                self.assertEqual(ceilings[uid], "green")
+
+    def test_tier_ceilings_name_only_allowed_uids(self):
+        # a ceiling for a uid the accept path refuses is inert; a surviving
+        # placeholder would never match a SO_PEERCRED uid
+        ceilings = self.doc.get("socket_uid_tier_ceilings", {})
+        for uid in ceilings:
+            with self.subTest(uid=uid):
+                self.assertNotIn("${", uid)
+                self.assertIn(uid, self.allowed)
 
     def test_daemon_service_account_has_no_shutdown(self):
         # no client running as the daemon's own uid sends shutdown; the
