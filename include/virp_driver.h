@@ -172,6 +172,29 @@ typedef struct {
      * at startup — see linux_gate_set_protected_vmids().
      */
     char            protected_vmids[256];
+    /*
+     * Vendor-optional (Wazuh) — zero-initialized elsewhere.
+     *
+     * protected_agents: comma-separated decimal Wazuh agent ids that the
+     * driver refuses to touch at any tier — in practice the agent on the
+     * machine the O-Node itself runs in, and the agent on the reasoning
+     * tier's own host. An endpoint naming one of these is the SIEM being
+     * asked to stop watching the thing that is asking, and no tier
+     * arithmetic downstream can tell that apart from an ordinary read.
+     *
+     * Loaded from devices.json as a JSON array ("protected_agents":
+     * ["004", "313"]) or an equivalent comma-separated string, and
+     * normalized to CSV here to match protected_vmids. Ids are compared
+     * NUMERICALLY, so the zero-padded spelling Wazuh uses in URLs ("004")
+     * and the bare integer ("4") are the same agent.
+     *
+     * Enforced in the driver, not the classifier: the route table sees
+     * only the command bytes and cannot be handed device context, so the
+     * refusal happens at the top of wazuh_execute() — the same split
+     * FortiGate uses for FG_BLACK_COMMANDS. The loader registers the
+     * value at startup via wazuh_gate_set_protected_agents().
+     */
+    char            protected_agents[256];
 } virp_device_t;
 
 /* =========================================================================
