@@ -182,6 +182,63 @@ class ChainKeyedBackstopTests(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertEqual(len(send.requests), 1)
 
+    # ── T0.4 (Review A #6): a sidecar is not proof of chain membership ──
+    #
+    # A sidecar file can outlive the chain entry it claims to describe (a
+    # DB restored to an earlier point, a rolled-back append, a copied
+    # file). When the chain IS consultable it is authoritative: a sidecar
+    # the chain contradicts must not be honored as attestation.
+
+    def _drop_sidecar(self, body_bytes):
+        """Write a plausible sidecar for this body with no matching chain
+        entry — exactly the stale/forged residue T0.4 must not trust."""
+        body_sha = hashlib.sha256(body_bytes).hexdigest()
+        art_dir = os.path.join(self.data_dir, "artifacts")
+        os.makedirs(art_dir, mode=0o700, exist_ok=True)
+        with open(os.path.join(art_dir, body_sha + ".json"), "w") as f:
+            json.dump({"body_sha256": body_sha,
+                       "note": "orphaned receipt, no chain entry"}, f)
+        return body_sha
+
+    def test_sidecar_without_chain_entry_is_reappended(self):
+        # empty (but present/readable) chain: a definite "not on chain".
+        fake_chain_db(self.db, [])
+        name, body_bytes = self._job(0, None, b"orphan" * 12)
+        body_sha = self._drop_sidecar(body_bytes)
+        send = FakeSend()
+        n = vc.submit_spool(self.subcfg, once=True, send=send)
+        # the chain overruled the stale sidecar: the body was appended
+        self.assertEqual(len(send.requests), 1)
+        self.assertEqual(send.requests[0]["artifact_hash"], body_sha)
+        self.assertEqual(n, 1)
+        # the stale sidecar was overwritten with a real receipt
+        with open(os.path.join(self.data_dir, "artifacts",
+                               body_sha + ".json")) as f:
+            self.assertIn("chain_receipt_b64", json.load(f))
+
+    def test_sidecar_confirmed_on_chain_is_skipped(self):
+        # sidecar present AND the body genuinely on the chain: still a
+        # no-op success — idempotency is preserved, not broken.
+        name, body_bytes = self._job(0, None, b"genuine" * 12)
+        body_sha = hashlib.sha256(body_bytes).hexdigest()
+        fake_chain_db(self.db, [("camera:tapo-c100:2001-09-09", 7,
+                                 "camseg:tapo-c100:0:%d" % 10 ** 18,
+                                 body_sha, body_bytes.decode("ascii"))])
+        self._drop_sidecar(body_bytes)
+        send = FakeSend()
+        vc.submit_spool(self.subcfg, once=True, send=send)
+        self.assertEqual(len(send.requests), 0)   # confirmed: skip
+
+    def test_sidecar_trusted_when_chain_unconsultable(self):
+        # no readable DB: cannot overrule the sidecar, so the documented
+        # sidecar-only-dedup fast path still short-circuits (no re-append).
+        self.subcfg["db"] = os.path.join(self.tmp, "nonexistent.db")
+        name, body_bytes = self._job(0, None, b"noconsult" * 12)
+        self._drop_sidecar(body_bytes)
+        send = FakeSend()
+        vc.submit_spool(self.subcfg, once=True, send=send)
+        self.assertEqual(len(send.requests), 0)   # sidecar honored
+
 
 class ScriptedProc:
     """Popen stand-in whose poll() runs a per-call script: each entry is

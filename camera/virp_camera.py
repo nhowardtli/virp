@@ -2026,12 +2026,23 @@ def _spawn_ffmpeg(cfg):
 # ── O-node side: submit-spool (runs as the Phase 1 identity) ───────────
 
 def _on_chain(db_path, artifact_hash):
-    """True iff a chain entry committing to these exact body bytes
-    already exists. Read-only; ANY failure (no db, locked, schema)
-    returns False — the worst case is then the pre-existing behavior,
-    a duplicate append, never a dropped record."""
+    """Tri-state chain-membership check for these exact body bytes.
+
+      True  — the chain was queried and holds an entry committing to them.
+      False — the chain was queried and holds NO such entry (a definite
+              negative: the DB is present and readable).
+      None  — the chain could not be consulted at all (no DB path, the
+              file is absent, or it is locked/corrupt). "Unknown", not
+              "absent".
+
+    Read-only. Callers decide how to treat None: the append backstop
+    treats it as falsy and re-appends (a duplicate append, never a
+    dropped record); the sidecar fast-path treats it as "cannot override
+    the local receipt" and keeps the sidecar (the documented
+    sidecar-only-dedup degradation when the DB is unreadable). Only a
+    definite False lets the chain overrule a sidecar."""
     if not db_path or not os.path.exists(db_path):
-        return False
+        return None
     try:
         conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
         try:
@@ -2041,7 +2052,7 @@ def _on_chain(db_path, artifact_hash):
         finally:
             conn.close()
     except sqlite3.Error:
-        return False
+        return None
     return row is not None
 
 
@@ -2088,9 +2099,32 @@ def submit_one(cfg, name, seg_path, body_path, send=onode_send):
     body_sha = hashlib.sha256(body_bytes).hexdigest()
     sidecar_path = os.path.join(art_dir, body_sha + ".json")
     if os.path.exists(sidecar_path):
-        print("skip %s: this exact record already attested (body %.16s…)"
-              % (name, body_sha), flush=True)
-        return True
+        # A sidecar is a LOCAL receipt, not proof of chain membership: it
+        # can outlive the entry it describes (a chain DB restored to an
+        # earlier point, a rolled-back append, a hand-copied file). When
+        # the chain can be consulted it is AUTHORITATIVE — skip only if
+        # it confirms the body. A definite "not on chain" means the
+        # sidecar is stale and must not be trusted as attestation; fall
+        # through and re-append (the tail overwrites the stale sidecar
+        # with a real receipt). When the chain cannot be consulted
+        # (None), the sidecar remains our best local evidence and the
+        # daemon's own artifact_hash dedup backstops a re-append — the
+        # documented sidecar-only-dedup degradation.
+        on_chain = _on_chain(cfg.get("db"), body_sha)
+        if on_chain is None:
+            print("skip %s: this exact record already attested "
+                  "(sidecar; chain not consulted)" % name, flush=True)
+            return True
+        if on_chain:
+            print("skip %s: this exact record already attested "
+                  "(sidecar confirmed on chain, body %.16s…)"
+                  % (name, body_sha), flush=True)
+            return True
+        sys.stderr.write(
+            "warning: %s has a sidecar but body %.16s… is NOT on the "
+            "chain — a sidecar is not proof of membership; re-appending\n"
+            % (name, body_sha))
+        # fall through to the append path below
 
     # Chain-keyed backstop (Fix A): the sidecar can be lost to a crash
     # between append-ack and sidecar write. Before appending, ask the
