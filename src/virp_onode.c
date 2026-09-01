@@ -3022,7 +3022,10 @@ static virp_error_t chain_append_verify_observation(
  *      means NO action.
  *   2. ACTION NOT ALLOWED — a uid present in socket_uid_action_allow may
  *      request only its listed actions. A uid ABSENT from the map is
- *      unrestricted (existing principals are unchanged).
+ *      unrestricted HERE — which is why onode_start() refuses to run
+ *      when an explicitly configured allowlist names a uid the map does
+ *      not (Sep 1 review, Task 2): for any principal that can actually
+ *      connect, this fall-through is unreachable.
  */
 bool onode_uid_request_refused(const onode_state_t *state,
                                uid_t client_uid, onode_action_t action)
@@ -4968,7 +4971,8 @@ virp_error_t onode_start(onode_state_t *state)
      * effective UID only. This keeps the socket closed to every other
      * local user unless an operator opts a UID in via the config.
      */
-    if (state->socket_allowed_uids_count == 0) {
+    const bool explicit_allowlist = state->socket_allowed_uids_count > 0;
+    if (!explicit_allowlist) {
         state->socket_allowed_uids[0] = geteuid();
         state->socket_allowed_uids_count = 1;
         fprintf(stderr,
@@ -4979,6 +4983,42 @@ virp_error_t onode_start(onode_state_t *state)
         for (size_t i = 0; i < state->socket_allowed_uids_count; i++)
             fprintf(stderr, " %u", (unsigned)state->socket_allowed_uids[i]);
         fprintf(stderr, "\n");
+    }
+
+    /*
+     * Sep 1 review, Task 2 — an EXPLICIT allowlist must be fully covered
+     * by socket_uid_action_allow. onode_uid_request_refused() treats a
+     * uid absent from the map as unrestricted, so an allowlisted uid
+     * with no entry could request anything, shutdown included; the
+     * canonical template shipped four service identities exactly that
+     * way. A template that forgets a uid is therefore a BOOT FAILURE
+     * that names the uid, never a silent grant. The self-seeded default
+     * above is exempt: nothing was configured, and the only principal
+     * that can connect is the daemon itself.
+     */
+    if (explicit_allowlist) {
+        for (size_t i = 0; i < state->socket_allowed_uids_count; i++) {
+            uid_t uid = state->socket_allowed_uids[i];
+            bool mapped = false;
+            for (size_t k = 0; k < state->uid_action_count; k++)
+                if (state->uid_action_uids[k] == uid) { mapped = true; break; }
+            if (!mapped) {
+                fprintf(stderr,
+                        "[O-Node] FATAL: socket_allowed_uids names uid %u "
+                        "but socket_uid_action_allow has no entry for it. "
+                        "An allowed uid with no action set would be "
+                        "UNRESTRICTED (shutdown included), so this is a "
+                        "configuration error, not a default: add "
+                        "\"%u\": [...] to socket_uid_action_allow (an "
+                        "empty array is a valid deny-all). Refusing to "
+                        "start.\n", (unsigned)uid, (unsigned)uid);
+                return VIRP_ERR_ACTION_FORBIDDEN;
+            }
+        }
+        fprintf(stderr, "[O-Node] socket_uid_action_allow covers every "
+                        "allowed uid (%zu entr%s)\n",
+                state->uid_action_count,
+                state->uid_action_count == 1 ? "y" : "ies");
     }
 
     if (state->uid_ceiling_count > 0) {

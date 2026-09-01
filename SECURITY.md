@@ -189,7 +189,16 @@ DEPLOYED until the next rebuild.
   ceilings (`5841ec71`, `socket_uid_tier_ceilings`) and per-uid action
   allowlists (`socket_uid_action_allow`), both enforced at SO_PEERCRED
   and live in the production config; see the dated correction at that
-  TODO.
+  TODO. Sep 1 review (Task 2): the action map is now MANDATORY for
+  every uid on an explicitly configured `socket_allowed_uids` — an
+  allowed-but-unmapped uid was unrestricted (shutdown included), and
+  the tracked template shipped four service identities that way while
+  the lab host carried a hand-edited entry for netclaw only.
+  `onode_start()` refuses to run, naming the uid, when the map does
+  not cover the allowlist; both tracked templates now spell out every
+  principal's verbs, and `tests/test_template_uid_policy.py` renders
+  them in CI to assert coverage and that no service identity can
+  invoke shutdown.
 
 ## Socket Peer Authentication
 

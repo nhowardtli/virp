@@ -43,8 +43,14 @@
 #define ONODE_RECV_TIMEOUT_SEC  5
 #define ONODE_MAX_REQUEST_SIZE  24576
 #define ONODE_MAX_ALLOWED_UIDS  16
-#define ONODE_MAX_UID_ACTIONS   8   /* max actions per uid in the
-                                       socket_uid_action_allow map */
+#define ONODE_MAX_UID_ACTIONS   32  /* max actions per uid in the
+                                       socket_uid_action_allow map —
+                                       large enough to spell out the
+                                       FULL wire vocabulary for a
+                                       principal that legitimately has
+                                       it (the operator), so no entry
+                                       ever has to be "left off" to
+                                       mean unrestricted */
 #define ONODE_MAX_GATE_OVERRIDES 16   /* per-driver gate mode overrides */
 
 /*
@@ -304,9 +310,16 @@ typedef struct {
      * config's `socket_uid_action_allow` object (uid → array of action
      * names), parallel to socket_uid_tier_ceilings. A uid present here
      * may request ONLY the listed actions — anything else is refused
-     * with VIRP_ERR_ACTION_FORBIDDEN before the dispatch switch. A uid
-     * ABSENT from this map is completely unchanged: no new restriction
-     * on existing principals. An entry with zero actions is a valid
+     * with VIRP_ERR_ACTION_FORBIDDEN before the dispatch switch. At
+     * request time a uid ABSENT from this map is unrestricted — but
+     * onode_start() REFUSES TO RUN when an explicitly configured
+     * socket_allowed_uids names a uid this map does not cover (Sep 1
+     * review, Task 2), so for an allowlisted principal that
+     * fall-through is unreachable: every principal that can connect
+     * has a spelled-out action set, and a template that forgets one is
+     * a boot failure naming the uid, never a silent grant. Only the
+     * self-seeded default (no allowlist configured → the daemon's own
+     * uid alone) is exempt. An entry with zero actions is a valid
      * deny-all — the fail-closed representation the config loader
      * installs for a malformed set. A mapped uid is additionally
      * type-narrowed on chain_append to the federation triple
@@ -483,6 +496,13 @@ void onode_note_rejected(onode_state_t *state, const char *hostname,
 /*
  * Start the O-Node event loop. Blocks until shutdown.
  * Creates Unix socket, accepts connections, handles requests.
+ *
+ * Refuses (VIRP_ERR_ACTION_FORBIDDEN, nothing bound, error names the
+ * uid) when socket_allowed_uids was explicitly configured and any uid
+ * on it has no socket_uid_action_allow entry: an unmapped-but-allowed
+ * uid would be unrestricted, shutdown included, and that must be a
+ * startup failure rather than a silent grant. The self-seeded default
+ * (no allowlist → daemon uid only) is exempt.
  */
 virp_error_t onode_start(onode_state_t *state);
 
@@ -671,7 +691,9 @@ void onode_clear_uid_actions(onode_state_t *state);
  * request MUST be refused — an unknown identity (client_uid == (uid_t)-1,
  * which must never fall through to node-wide policy) or a uid present in
  * socket_uid_action_allow whose set does not list `action`. A uid absent
- * from the map is unrestricted. Exposed so the fail-open regression can
+ * from the map is unrestricted here; onode_start() guarantees no
+ * allowlisted uid of an explicitly configured allowlist is absent (see
+ * the state-field comment). Exposed so the fail-open regression can
  * drive the decision directly.
  */
 bool onode_uid_request_refused(const onode_state_t *state,

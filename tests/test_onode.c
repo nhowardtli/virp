@@ -5944,6 +5944,7 @@ TEST(test_chain_append_accepts_fed_outcome_for_commitment_only_observation)
     ASSERT_EQ(ca_count_entries("ncfed-out-oversized-1"), 1);
 }
 
+
 /* GATE 4: citing nothing is refused too. Sixteen rows on the live chain
  * carry observation_sha256: null — an outcome asserting a result while
  * naming no evidence at all is the unbacked claim in its purest form. */
@@ -7014,6 +7015,66 @@ TEST(test_uid_action_map_foreign_uid_keeps_shutdown)
     unlink(SD_SOCKET);
 }
 
+/* Sep 1 review, Task 2: a uid on socket_allowed_uids with NO entry in
+ * socket_uid_action_allow was silently UNRESTRICTED — the canonical
+ * template shipped virp-backup / virp-evidence / virp-netclaw /
+ * virp-broker exactly that way, shutdown included. An explicitly
+ * configured allowlist must now be fully covered by the action map or
+ * onode_start() refuses, synchronously, before binding, naming the uid.
+ * The self-seeded default (nothing configured → daemon uid only) stays
+ * exempt — every other test daemon in this file runs that way. */
+#define AM_SOCKET "/tmp/virp-onode-test-item8-am.sock"
+
+static onode_state_t am_state;
+
+static void *am_thread(void *arg)
+{
+    (void)arg;
+    onode_start(&am_state);
+    return NULL;
+}
+
+TEST(test_onode_start_refuses_allowlisted_uid_without_action_map)
+{
+    unlink(AM_SOCKET);
+    ASSERT_OK(onode_init(&am_state, 0x00000044, NULL, AM_SOCKET));
+    uid_t uids[2] = { getuid(), getuid() + 40001 };
+    ASSERT_OK(onode_set_allowed_uids(&am_state, uids, 2));
+    /* only the first allowed uid is mapped */
+    ASSERT_OK(onode_set_uid_actions(&am_state, getuid(), FED_ACTIONS, 4));
+
+    /* THE FIX: refused before bind — the socket never appears */
+    virp_error_t err = onode_start(&am_state);
+    ASSERT_EQ((int)err, (int)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_TRUE(access(AM_SOCKET, F_OK) != 0);
+
+    /* a deny-all entry IS an entry (the loader's fail-closed form for a
+     * malformed set): coverage is about being spelled out, not about
+     * being permissive */
+    ASSERT_OK(onode_set_uid_actions(&am_state, getuid() + 40001, NULL, 0));
+    pthread_t th;
+    ASSERT_EQ(pthread_create(&th, NULL, am_thread, NULL), 0);
+    usleep(200000);
+    ASSERT_TRUE(access(AM_SOCKET, F_OK) == 0);       /* bound: it started */
+
+    onode_shutdown(&am_state);
+    int poke = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (poke >= 0) {
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", AM_SOCKET);
+        (void)connect(poke, (struct sockaddr *)&addr, sizeof(addr));
+        close(poke);
+    }
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 15;
+    ASSERT_EQ(pthread_timedjoin_np(th, NULL, &dl), 0);
+    onode_destroy(&am_state);
+    unlink(AM_SOCKET);
+}
+
 /* =========================================================================
  * Main
  * ========================================================================= */
@@ -7250,6 +7311,7 @@ int main(void)
         RUN_TEST(test_uid_action_allowlist_narrows_chain_append_types);
         RUN_TEST(test_uid_action_map_absent_uid_fully_unchanged);
         RUN_TEST(test_uid_action_map_foreign_uid_keeps_shutdown);
+        RUN_TEST(test_onode_start_refuses_allowlisted_uid_without_action_map);
         ca_stop();
         ca_cleanup_files();
     } else {
