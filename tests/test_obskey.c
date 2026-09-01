@@ -120,6 +120,38 @@ static void test_truncated_key_distinct_error(void)
     assert(virp_obskey_load(&kp, TRUNC_PATH) == VIRP_ERR_INVALID_LENGTH);
 }
 
+static void test_mismatched_halves_refused(void)
+{
+    /* seed_A || pub_B: right size, right mode, internally inconsistent.
+     * The loader must re-derive the public half from the seed and refuse
+     * — crypto_sign_ed25519_sk_to_pk() alone would just copy pub_B out
+     * and load a key whose advertised identity does not match what the
+     * seed signs as (crypto review 2026-08-31, finding 2). */
+    virp_obskey_t a, b, kp;
+    assert(virp_obskey_generate(&a) == VIRP_OK);
+    assert(virp_obskey_generate(&b) == VIRP_OK);
+
+    uint8_t franken[VIRP_OBSKEY_SK_SIZE];
+    memcpy(franken, a.secret_key,
+           VIRP_OBSKEY_SK_SIZE - VIRP_OBSKEY_PK_SIZE);          /* seed_A */
+    memcpy(franken + VIRP_OBSKEY_SK_SIZE - VIRP_OBSKEY_PK_SIZE,
+           b.public_key, VIRP_OBSKEY_PK_SIZE);                  /* pub_B  */
+
+    const char *path = TEST_DIR "/obskey-franken.key";
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    assert(fwrite(franken, 1, sizeof(franken), f) == sizeof(franken));
+    fclose(f);
+    assert(chmod(path, 0600) == 0);
+
+    assert(virp_obskey_load(&kp, path) == VIRP_ERR_CRYPTO);
+    assert(!kp.loaded);
+
+    unlink(path);
+    virp_obskey_destroy(&a);
+    virp_obskey_destroy(&b);
+}
+
 static void test_lax_permissions_refused(void)
 {
     virp_obskey_t kp;
@@ -202,6 +234,7 @@ int main(void)
 
     RUN_TEST(test_generate_save_load_roundtrip);
     RUN_TEST(test_truncated_key_distinct_error);
+    RUN_TEST(test_mismatched_halves_refused);
     RUN_TEST(test_lax_permissions_refused);
     RUN_TEST(test_spki_export_roundtrip_key_id);
     RUN_TEST(test_harden_process_clears_dumpable);

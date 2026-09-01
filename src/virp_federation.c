@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L     /* O_NOFOLLOW, O_CLOEXEC */
 
 #include "virp_federation.h"
+#include "virp_crypto.h"            /* virp_keyfile_read */
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -82,19 +83,41 @@ virp_error_t virp_fed_load(virp_fed_keypair_t *kp,
 
     memset(kp, 0, sizeof(*kp));
 
-    /* Read public key */
-    int fd = open(pk_path, O_RDONLY);
-    if (fd < 0) return VIRP_ERR_KEY_NOT_LOADED;
-    ssize_t n = read(fd, kp->public_key, VIRP_FED_PK_SIZE);
-    close(fd);
-    if (n != VIRP_FED_PK_SIZE) return VIRP_ERR_KEY_NOT_LOADED;
+    /* Secret key first, through the shared custody gate (symlink-safe,
+     * regular file, 0600-class mode, owner, exact size, read-exactly,
+     * wipe-on-failure — this loader used to be a bare open()+read()
+     * with none of that; crypto review 2026-08-31, finding 3). */
+    uint8_t sk[VIRP_FED_SK_SIZE];
+    virp_error_t err = virp_keyfile_read(sk_path,
+                                         "[Fed] federation secret key",
+                                         true, sk, VIRP_FED_SK_SIZE);
+    if (err != VIRP_OK)
+        return err;
 
-    /* Read secret key */
-    fd = open(sk_path, O_RDONLY);
-    if (fd < 0) return VIRP_ERR_KEY_NOT_LOADED;
-    n = read(fd, kp->secret_key, VIRP_FED_SK_SIZE);
-    close(fd);
-    if (n != VIRP_FED_SK_SIZE) return VIRP_ERR_KEY_NOT_LOADED;
+    /* from_secret cross-checks the seed against the stored public half
+     * and derives the working public key from the seed. */
+    err = virp_fed_from_secret(kp, sk, key_version);
+    sodium_memzero(sk, sizeof(sk));
+    if (err != VIRP_OK)
+        return err;
+
+    /* The .pub file must BE the public key the seed derives to — a
+     * mismatched pair advertises an identity the secret cannot sign
+     * as. Public file: no mode/owner policy, everything else applies. */
+    uint8_t filed_pk[VIRP_FED_PK_SIZE];
+    err = virp_keyfile_read(pk_path, "[Fed] federation public key",
+                            false, filed_pk, VIRP_FED_PK_SIZE);
+    if (err != VIRP_OK) {
+        virp_fed_destroy(kp);
+        return err;
+    }
+    if (sodium_memcmp(filed_pk, kp->public_key, VIRP_FED_PK_SIZE) != 0) {
+        fprintf(stderr, "[Fed] %s does not match the public key derived "
+                        "from %s — mismatched pair, refusing to load\n",
+                pk_path, sk_path);
+        virp_fed_destroy(kp);
+        return VIRP_ERR_CRYPTO;
+    }
 
     virp_fed_compute_key_id(kp->public_key, kp->key_id);
     kp->key_version = key_version;
@@ -116,9 +139,27 @@ virp_error_t virp_fed_from_secret(virp_fed_keypair_t *kp,
     memset(kp, 0, sizeof(*kp));
     memcpy(kp->secret_key, sk, VIRP_FED_SK_SIZE);
 
-    /* Derive the public key from the secret key (sk = seed || pk). */
-    if (crypto_sign_ed25519_sk_to_pk(kp->public_key, kp->secret_key) != 0)
-        return VIRP_ERR_KEY_NOT_LOADED;
+    /* libsodium sk = seed(32) || pub(32). RE-DERIVE the public half
+     * from the seed and cross-check it against the stored half — a
+     * seed_A||pub_B key must not load and sign under an identity the
+     * seed does not produce. crypto_sign_ed25519_sk_to_pk() would only
+     * copy the stored half out, checking nothing (same defect class as
+     * the obskey loader; crypto review 2026-08-31, findings 2/3). */
+    uint8_t derived_pk[VIRP_FED_PK_SIZE];
+    uint8_t derived_sk[VIRP_FED_SK_SIZE];
+    int drc = crypto_sign_seed_keypair(derived_pk, derived_sk,
+                                       kp->secret_key);
+    sodium_memzero(derived_sk, VIRP_FED_SK_SIZE);
+    if (drc != 0 ||
+        sodium_memcmp(derived_pk,
+                      kp->secret_key + VIRP_FED_SK_SIZE - VIRP_FED_PK_SIZE,
+                      VIRP_FED_PK_SIZE) != 0) {
+        fprintf(stderr, "[Fed] secret key: public half does not match "
+                        "the seed — corrupt key, refusing to load\n");
+        sodium_memzero(kp->secret_key, VIRP_FED_SK_SIZE);
+        return VIRP_ERR_CRYPTO;
+    }
+    memcpy(kp->public_key, derived_pk, VIRP_FED_PK_SIZE);
 
     virp_fed_compute_key_id(kp->public_key, kp->key_id);
     kp->key_version = key_version;

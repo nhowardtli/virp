@@ -50,11 +50,11 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
 static virp_error_t chain_get_last_locked(virp_chain_state_t *state,
                                           const char *session_id,
                                           virp_chain_entry_t *entry);
-static void head_hmac_hex(virp_chain_state_t *state,
-                          const char *session_id,
-                          int64_t last_sequence,
-                          const char *last_entry_hash,
-                          char out_hex[65]);
+static virp_error_t head_hmac_hex(virp_chain_state_t *state,
+                                  const char *session_id,
+                                  int64_t last_sequence,
+                                  const char *last_entry_hash,
+                                  char out_hex[65]);
 /* Constant-time hex digest/MAC comparison — see definition for why (§4.4). */
 static bool hexdigest_eq(const char *a, const char *b);
 static void sha256_hex(const char *data, size_t len, char out[65]);
@@ -222,7 +222,15 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
      * and says so via head_authenticated=false). */
     if (state->have_chain_key) {
         char expect_mac[65];
-        head_hmac_hex(state, session_id, head_seq, head_hash, expect_mac);
+        if (head_hmac_hex(state, session_id, head_seq, head_hash,
+                          expect_mac) != VIRP_OK) {
+            result->valid = false;
+            result->to_sequence = head_seq;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "Head record HMAC could not be computed");
+            state->sig_key_unavailable_session = false;
+            return VIRP_ERR_CRYPTO;
+        }
         if (!hexdigest_eq(expect_mac, head_mac)) {
             result->valid = false;
             result->to_sequence = head_seq;
@@ -979,15 +987,21 @@ static void sha256_hex(const char *data, size_t len, char out[65])
     out[64] = '\0';
 }
 
-static void hmac_sha256_hex(const uint8_t key[VIRP_KEY_SIZE],
-                            const char *data, size_t len,
-                            char out[65])
+static virp_error_t hmac_sha256_hex(const uint8_t key[VIRP_KEY_SIZE],
+                                    const char *data, size_t len,
+                                    char out[65])
 {
     uint8_t hmac_bytes[VIRP_HMAC_SIZE];
-    virp_hmac_sha256(key, (const uint8_t *)data, len, hmac_bytes);
+    virp_error_t err = virp_hmac_sha256(key, (const uint8_t *)data, len,
+                                        hmac_bytes);
+    if (err != VIRP_OK) {
+        out[0] = '\0';   /* never let a failed MAC read as a real one */
+        return err;
+    }
     for (int i = 0; i < VIRP_HMAC_SIZE; i++)
         snprintf(out + i * 2, 3, "%02x", hmac_bytes[i]);
     out[64] = '\0';
+    return VIRP_OK;
 }
 
 static uint64_t get_wall_ns(void)
@@ -1111,16 +1125,17 @@ static int head_canonical(const char *session_id,
         session_id);
 }
 
-static void head_hmac_hex(virp_chain_state_t *state,
-                          const char *session_id,
-                          int64_t last_sequence,
-                          const char *last_entry_hash,
-                          char out_hex[65])
+static virp_error_t head_hmac_hex(virp_chain_state_t *state,
+                                  const char *session_id,
+                                  int64_t last_sequence,
+                                  const char *last_entry_hash,
+                                  char out_hex[65])
 {
     char canonical[512];
     int n = head_canonical(session_id, last_sequence, last_entry_hash,
                            canonical, sizeof(canonical));
-    hmac_sha256_hex(state->chain_key.key.key, canonical, (size_t)n, out_hex);
+    return hmac_sha256_hex(state->chain_key.key.key, canonical, (size_t)n,
+                           out_hex);
 }
 
 /*
@@ -1143,7 +1158,9 @@ static virp_error_t head_upsert_locked(virp_chain_state_t *state,
     int n = head_canonical(session_id, last_sequence, last_entry_hash,
                            canonical, sizeof(canonical));
     char hmac_hex[65];
-    hmac_sha256_hex(state->chain_key.key.key, canonical, (size_t)n, hmac_hex);
+    if (hmac_sha256_hex(state->chain_key.key.key, canonical, (size_t)n,
+                        hmac_hex) != VIRP_OK)
+        return VIRP_ERR_CRYPTO;
 
     if (state->sign_enabled) {
         uint8_t sig[VIRP_CHAINSIGN_SIG_SIZE];
@@ -1203,8 +1220,9 @@ static virp_error_t insert_milestone(virp_chain_state_t *state,
         session_id);
 
     char hmac_hex[65];
-    hmac_sha256_hex(state->chain_key.key.key,
-                    milestone_json, (size_t)n, hmac_hex);
+    if (hmac_sha256_hex(state->chain_key.key.key,
+                        milestone_json, (size_t)n, hmac_hex) != VIRP_OK)
+        return VIRP_ERR_CRYPTO;
 
     sqlite3_reset(state->stmt_insert_milestone);
     sqlite3_bind_text(state->stmt_insert_milestone, 1, session_id, -1, SQLITE_TRANSIENT);
@@ -1891,9 +1909,15 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
     /* Compute chain_entry_hash = sha256(canonical) */
     sha256_hex(canonical, (size_t)clen, entry->chain_entry_hash);
 
-    /* Compute chain_hmac = hmac_sha256(K_chain, canonical) */
-    hmac_sha256_hex(state->chain_key.key.key,
-                    canonical, (size_t)clen, entry->chain_hmac);
+    /* Compute chain_hmac = hmac_sha256(K_chain, canonical). Fail-closed
+     * like the signing path below: an entry is never stored with a MAC
+     * we could not actually compute. */
+    if (hmac_sha256_hex(state->chain_key.key.key,
+                        canonical, (size_t)clen,
+                        entry->chain_hmac) != VIRP_OK) {
+        sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+        return VIRP_ERR_CRYPTO;
+    }
 
     /* D-1: detached Ed25519 signature over the EXACT SAME canonical bytes
      * (domain-tagged VIRP-CHAIN-ENTRY-SIG-v1), stored beside — never inside
@@ -2172,8 +2196,16 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
          * check and its verdict are byte-for-byte the pre-D-1 behaviour. */
         if (state->have_chain_key) {
             char computed_hmac[65];
-            hmac_sha256_hex(state->chain_key.key.key,
-                            canonical, (size_t)clen, computed_hmac);
+            if (hmac_sha256_hex(state->chain_key.key.key,
+                                canonical, (size_t)clen,
+                                computed_hmac) != VIRP_OK) {
+                result->valid = false;
+                result->first_broken = e.sequence;
+                snprintf(result->error_detail, sizeof(result->error_detail),
+                         "HMAC could not be computed at sequence %lld",
+                         (long long)e.sequence);
+                break;
+            }
 
             if (!hexdigest_eq(computed_hmac, e.chain_hmac)) {
                 result->valid = false;
@@ -2411,9 +2443,10 @@ static virp_error_t chain_intent_store_locked(virp_chain_state_t *state,
         return VIRP_ERR_CHAIN_READONLY;
 
     /* Compute HMAC of intent_hash using K_chain */
-    hmac_sha256_hex(state->chain_key.key.key,
-                    entry->intent_hash, strlen(entry->intent_hash),
-                    entry->signature_hmac);
+    if (hmac_sha256_hex(state->chain_key.key.key,
+                        entry->intent_hash, strlen(entry->intent_hash),
+                        entry->signature_hmac) != VIRP_OK)
+        return VIRP_ERR_CRYPTO;
 
     /* Timestamps */
     entry->created_at_ns = (int64_t)get_wall_ns();

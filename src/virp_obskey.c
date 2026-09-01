@@ -115,89 +115,43 @@ virp_error_t virp_obskey_load(virp_obskey_t *kp, const char *sk_path)
 
     memset(kp, 0, sizeof(*kp));
 
-    /* Same custody gate as virp_key_load_file: no symlinks, regular
-     * file only, no group/world bits, owner must be us (or we are
-     * root). The observation-signing secret is daemon-resident, which
-     * is exactly why a lax mode must refuse: any other local reader
-     * has already become an observation forger. */
-    int fd = open(sk_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) {
-        if (errno == ELOOP)
-            fprintf(stderr, "[ObsKey] %s is a symlink — refusing to "
-                            "follow (O_NOFOLLOW)\n", sk_path);
-        else
-            fprintf(stderr, "[ObsKey] open(%s): %s\n",
-                    sk_path, strerror(errno));
-        return VIRP_ERR_KEY_NOT_LOADED;
-    }
+    /* One shared custody gate for every key type — no symlinks,
+     * regular file only, no group/world bits, owner must be us (or we
+     * are root), exact size, read-exactly, wipe-on-failure. The
+     * observation-signing secret is daemon-resident, which is exactly
+     * why a lax mode must refuse: any other local reader has already
+     * become an observation forger. */
+    virp_error_t kerr = virp_keyfile_read(sk_path,
+                                          "[ObsKey] observation signing key",
+                                          true, kp->secret_key,
+                                          VIRP_OBSKEY_SK_SIZE);
+    if (kerr != VIRP_OK)
+        return kerr;
 
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        close(fd);
-        return VIRP_ERR_KEY_NOT_LOADED;
-    }
-
-    if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "[ObsKey] %s is not a regular file\n", sk_path);
-        close(fd);
-        return VIRP_ERR_KEY_NOT_LOADED;
-    }
-
-    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
-        fprintf(stderr,
-                "[ObsKey] observation signing key %s has insecure mode "
-                "0%o — any group/world access makes every local reader "
-                "an observation forger. Refusing to load. "
-                "Run: chmod 0600 %s\n",
-                sk_path, (unsigned)(st.st_mode & 07777), sk_path);
-        close(fd);
-        return VIRP_ERR_KEY_NOT_LOADED;
-    }
-
-    uid_t euid = geteuid();
-    if (!virp_key_owner_ok(st.st_uid, euid)) {
-        fprintf(stderr,
-                "[ObsKey] observation signing key %s is owned by uid=%u, "
-                "expected %u — refusing to load\n",
-                sk_path, (unsigned)st.st_uid, (unsigned)euid);
-        close(fd);
-        return VIRP_ERR_KEY_NOT_LOADED;
-    }
-
-    if (st.st_size != (off_t)VIRP_OBSKEY_SK_SIZE) {
-        fprintf(stderr,
-                "[ObsKey] observation signing key %s is %lld bytes, "
-                "expected exactly %d (Ed25519 seed||pub) — malformed or "
-                "truncated key, refusing to load\n",
-                sk_path, (long long)st.st_size, VIRP_OBSKEY_SK_SIZE);
-        close(fd);
-        return VIRP_ERR_INVALID_LENGTH;
-    }
-
-    ssize_t got = 0;
-    while (got < (ssize_t)VIRP_OBSKEY_SK_SIZE) {
-        ssize_t r = read(fd, kp->secret_key + got,
-                         VIRP_OBSKEY_SK_SIZE - (size_t)got);
-        if (r == 0) break;
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            close(fd);
-            sodium_memzero(kp->secret_key, VIRP_OBSKEY_SK_SIZE);
-            return VIRP_ERR_KEY_NOT_LOADED;
-        }
-        got += r;
-    }
-    close(fd);
-    if (got != (ssize_t)VIRP_OBSKEY_SK_SIZE) {
-        sodium_memzero(kp->secret_key, VIRP_OBSKEY_SK_SIZE);
-        return VIRP_ERR_INVALID_LENGTH;
-    }
-
-    /* libsodium sk = seed(32) || pub(32); derive and cross-check. */
-    if (crypto_sign_ed25519_sk_to_pk(kp->public_key, kp->secret_key) != 0) {
+    /* libsodium sk = seed(32) || pub(32). RE-DERIVE the public half from
+     * the seed and cross-check it against the stored half: a file whose
+     * two halves disagree is corrupt (or hand-assembled) and must not
+     * sign. crypto_sign_ed25519_sk_to_pk() would NOT do this — it only
+     * copies the stored half — so the derivation goes through
+     * crypto_sign_seed_keypair on a scratch key, exactly as
+     * virp_chainsign_load() does. */
+    uint8_t derived_pk[VIRP_OBSKEY_PK_SIZE];
+    uint8_t derived_sk[VIRP_OBSKEY_SK_SIZE];
+    int drc = crypto_sign_seed_keypair(derived_pk, derived_sk,
+                                       kp->secret_key);
+    sodium_memzero(derived_sk, VIRP_OBSKEY_SK_SIZE);
+    if (drc != 0 ||
+        sodium_memcmp(derived_pk,
+                      kp->secret_key + VIRP_OBSKEY_SK_SIZE
+                                     - VIRP_OBSKEY_PK_SIZE,
+                      VIRP_OBSKEY_PK_SIZE) != 0) {
+        fprintf(stderr, "[ObsKey] %s: public half does not match the "
+                        "seed — corrupt key file, refusing to load\n",
+                sk_path);
         sodium_memzero(kp->secret_key, VIRP_OBSKEY_SK_SIZE);
         return VIRP_ERR_CRYPTO;
     }
+    memcpy(kp->public_key, derived_pk, VIRP_OBSKEY_PK_SIZE);
 
     obskey_key_id(kp->public_key, kp->key_id);
     kp->loaded = true;

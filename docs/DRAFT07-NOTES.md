@@ -172,3 +172,28 @@ Key custody: SECURITY.md "Detached Ed25519 Chain Signing (D-1)".
 flagged "note for draft-07" in code. It predates this file, was NOT
 incorporated into -06 (§17.7 scopes typed operations as future work),
 and is recorded here only by reference.)*
+
+---
+
+## 3. HKDF `info` purpose label for session-key derivation (deferred, 2026-08-31)
+
+**Decision (not yet implemented — wire break, rides the next canonical-
+format window).** -06 §6.1 specifies the HKDF-Expand `info` input as
+exactly the 8-octet big-endian generation counter. -07 should prefix a
+purpose label:
+
+```
+info = "VIRP-SESSION-OBS-v2" || 0x00 || u64be(generation)
+```
+
+Not fixing a current attack: today only the session observation key is
+derived from the master/transcript pair. The label makes accidental
+cross-purpose key reuse structurally impossible if anything else
+(approval, federation) is ever derived from the same inputs — the same
+domain-separation discipline the chain-signature tags already follow.
+
+Changing `info` changes the derived key, so this cannot ship alone; it
+must land with the observation-format version bump. Sequencing decision
+recorded at the deferral comment in `src/virp_transcript.c
+virp_hkdf_sha256` (crypto review 2026-08-31, finding 6, second half).
+The PRK-cleanup half of that finding is already fixed in-tree.

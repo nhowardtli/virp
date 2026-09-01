@@ -58,6 +58,8 @@ static void activate_session(virp_context_t *ctx, uint8_t nonce_byte)
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
     bind.msg_type = VIRP_MSG_SESSION_BIND;
+    snprintf(bind.client_id, sizeof(bind.client_id), "%s", "obs-v2-test");
+    memcpy(bind.server_id, ack.server_id, sizeof(bind.server_id));
     memcpy(bind.session_id,   ack.session_id,   16);
     memcpy(bind.client_nonce, ack.client_nonce,  8);
     memcpy(bind.server_nonce, ack.server_nonce,  8);
@@ -486,8 +488,8 @@ static void test_master_key_signature_rejected(void)
 
     /* Re-sign the same bytes with the MASTER key instead of the session
      * key — a v1-style signer must not be able to mint v2 observations */
-    virp_hmac_sha256(test_master_key, msg, n - VIRP_OBS_V2_SIG_SIZE,
-                     msg + (n - VIRP_OBS_V2_SIG_SIZE));
+    assert(virp_hmac_sha256(test_master_key, msg, n - VIRP_OBS_V2_SIG_SIZE,
+                            msg + (n - VIRP_OBS_V2_SIG_SIZE)) == VIRP_OK);
 
     virp_seqstore_t store;
     assert(virp_seqstore_init(&store, NULL) == VIRP_OK);

@@ -73,6 +73,8 @@ static void test_double_hello_while_active(void)
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
     bind.msg_type = VIRP_MSG_SESSION_BIND;
+    snprintf(bind.client_id, sizeof(bind.client_id), "%s", "test-client");
+    memcpy(bind.server_id, ack.server_id, sizeof(bind.server_id));
     memcpy(bind.session_id,   ack.session_id,   16);
     memcpy(bind.client_nonce, ack.client_nonce,  8);
     memcpy(bind.server_nonce, ack.server_nonce,  8);
@@ -102,6 +104,8 @@ static void test_wrong_nonce_rejected(void)
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
     bind.msg_type = VIRP_MSG_SESSION_BIND;
+    snprintf(bind.client_id, sizeof(bind.client_id), "%s", "test-client");
+    memcpy(bind.server_id, ack.server_id, sizeof(bind.server_id));
     memcpy(bind.session_id,   ack.session_id,  16);
     memcpy(bind.client_nonce, ack.client_nonce, 8);
     /* deliberately wrong server nonce */
@@ -125,6 +129,8 @@ static void test_wrong_session_id_rejected(void)
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
     bind.msg_type = VIRP_MSG_SESSION_BIND;
+    snprintf(bind.client_id, sizeof(bind.client_id), "%s", "test-client");
+    memcpy(bind.server_id, ack.server_id, sizeof(bind.server_id));
     /* wrong session_id */
     memset(bind.session_id, 0xDE, 16);
     memcpy(bind.client_nonce, ack.client_nonce, 8);
@@ -183,6 +189,8 @@ static void test_reconnect_after_close(void)
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
     bind.msg_type = VIRP_MSG_SESSION_BIND;
+    snprintf(bind.client_id, sizeof(bind.client_id), "%s", "test-client");
+    memcpy(bind.server_id, ack.server_id, sizeof(bind.server_id));
     memcpy(bind.session_id,   ack.session_id,   16);
     memcpy(bind.client_nonce, ack.client_nonce,  8);
     memcpy(bind.server_nonce, ack.server_nonce,  8);
@@ -226,6 +234,46 @@ static void test_oversized_server_id_truncated(void)
     printf("PASS\n");
 }
 
+static void test_wrong_identity_rejected(void)
+{
+    /* Correct session_id and nonces, but identities that differ from the
+     * negotiated ones. The transcript serializes client_id and server_id,
+     * so the derived key claims to bind them — a BIND carrying identities
+     * the handshake never negotiated must not reach BOUND (crypto review
+     * 2026-08-31, finding 7). */
+    printf("  test_wrong_identity_rejected... ");
+    virp_context_t *ctx = virp_context_new();
+    assert(ctx != NULL);
+    virp_session_init(ctx, "onode-test");
+
+    virp_session_hello_ack_t ack = do_hello(ctx);
+
+    virp_session_bind_t bind;
+    memset(&bind, 0, sizeof(bind));
+    bind.msg_type = VIRP_MSG_SESSION_BIND;
+    memcpy(bind.session_id,   ack.session_id,   16);
+    memcpy(bind.client_nonce, ack.client_nonce,  8);
+    memcpy(bind.server_nonce, ack.server_nonce,  8);
+
+    /* (a) client identity swap */
+    snprintf(bind.client_id, sizeof(bind.client_id), "%s", "someone-else");
+    memcpy(bind.server_id, ack.server_id, sizeof(bind.server_id));
+    assert(virp_handle_session_bind(ctx, &bind) == VIRP_ERR_CONTEXT_MISMATCH);
+
+    /* (b) server identity swap */
+    snprintf(bind.client_id, sizeof(bind.client_id), "%s", "test-client");
+    snprintf((char *)bind.server_id, sizeof(bind.server_id), "%s",
+             "impostor-onode");
+    assert(virp_handle_session_bind(ctx, &bind) == VIRP_ERR_CONTEXT_MISMATCH);
+
+    /* (c) the negotiated identities still bind */
+    memcpy(bind.server_id, ack.server_id, sizeof(bind.server_id));
+    assert(virp_handle_session_bind(ctx, &bind) == VIRP_OK);
+
+    virp_context_destroy(ctx);
+    printf("PASS\n");
+}
+
 int main(void)
 {
     printf("=== VIRP Session Negative-Path Tests ===\n");
@@ -233,10 +281,11 @@ int main(void)
     test_double_hello_while_active();
     test_wrong_nonce_rejected();
     test_wrong_session_id_rejected();
+    test_wrong_identity_rejected();
     test_sign_before_active_rejected();
     test_close_from_non_active();
     test_reconnect_after_close();
     test_oversized_server_id_truncated();
-    printf("=== All 8 session negative-path tests passed ===\n");
+    printf("=== All 9 session negative-path tests passed ===\n");
     return 0;
 }

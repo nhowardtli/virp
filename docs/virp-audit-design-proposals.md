@@ -297,5 +297,34 @@ is open, fold it in; not worth opening a revision for on its own.
   the verifier reports "never contacted" — the two are now distinguishable.
 - Reconciliation: an unresolved intent surfaces to the monitoring runbook.
 
+## Crypto review 2026-08-31 — future hardening (findings 8 and 9)
+
+Both from the source-level crypto review (findings 1–7 fixed in-tree on
+fix/crypto-review). Neither is a present crypto bug; both are recorded
+so the claims they affect are not over-stated in the meantime.
+
+### #C8 — approval client reconstructs the canonical bytes it signs
+
+`virp approve` displays the human-readable command but signs the opaque
+144-hex canonical blob the daemon supplies (`src/virp_tool.c`). It does
+not rebuild the canonical approval from the displayed fields and prove
+that hashing the displayed command yields the command_hash inside the
+blob. Under the normal threat model (O-Node trusted, agent adversarial)
+this is acceptable — but the stronger claim "even a malicious O-Node
+cannot trick the approver key into signing something other than what
+the operator saw" is NOT yet supported, and must not be made until the
+client does the reconstruction itself. Design: client-side
+`build_canonical(VAP1, proposal_id, sha256(displayed command),
+device_node_id, approved_at_ns, ttl)` + byte-compare before signing.
+
+### #C9 — enforce low-S on the P-256 approval verifier
+
+ECDSA accepts (r, s) and (r, n−s) alike unless low-S is required, so
+one legitimate P-256 approval signature has two valid byte encodings.
+Not a forgery vector, but VIRP cares about stable evidence bytes;
+enforce low-S at verification (reject s > n/2) and normalize at the
+PKCS#11 signing path. Ed25519 (libsodium) is already canonical-S and
+unaffected.
+
 ## Out of this set (tracked separately)
 - **Evidence option-1:** an approved-YELLOW collection path so AC-1/CM-2 stay *covered* (not just gap-documented). A collector + approval-flow design change; larger than the option-2 gap fix already merged.

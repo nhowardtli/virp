@@ -56,6 +56,21 @@ virp_error_t virp_key_init(virp_signing_key_t *sk,
     sk->type = type;
     compute_fingerprint(sk->key.key, sk->fingerprint);
 
+    /*
+     * Pin the key so it cannot be swapped to disk — here in init so
+     * GENERATED keys get the same lifecycle as loaded ones (generation
+     * used to skip the lock entirely; crypto review 2026-08-31,
+     * finding 5). Non-fatal: unprivileged processes often can't mlock
+     * beyond RLIMIT_MEMLOCK. The flag records whether the lock took,
+     * so virp_key_destroy munlocks exactly when it should.
+     */
+    sk->locked = (sodium_mlock(sk->key.key, VIRP_KEY_SIZE) == 0);
+    if (!sk->locked)
+        fprintf(stderr,
+                "[VIRP] Warning: sodium_mlock() failed on signing key "
+                "(type %d) — key may be swappable (errno=%d: %s)\n",
+                (int)type, errno, strerror(errno));
+
     return VIRP_OK;
 }
 
@@ -96,28 +111,29 @@ bool virp_key_owner_ok(uid_t file_owner, uid_t euid)
     return file_owner == euid || euid == 0;
 }
 
-virp_error_t virp_key_load_file(virp_signing_key_t *sk,
-                                virp_key_type_t type,
-                                const char *path)
+/*
+ * THE key-file read primitive (see virp_crypto.h). Every key loader
+ * sits on this so the next custody fix lands once, not in five subtly
+ * different copies (crypto review 2026-08-31, finding 3).
+ */
+virp_error_t virp_keyfile_read(const char *path, const char *tag,
+                               bool secret, uint8_t *out, size_t want)
 {
-    if (!sk || !path)
+    if (!path || !tag || !out || want == 0)
         return VIRP_ERR_NULL_PTR;
 
     /*
-     * O_NOFOLLOW: refuse to open through a symlink. Combined with the
-     * fstat-on-fd check below this prevents a symlink-race where a
-     * world-writable target is swapped in between lstat and open.
-     * O_CLOEXEC: we spawn worker threads that may exec(); never leak
-     * the key fd to a child.
+     * O_NOFOLLOW: refuse to open through a symlink; with fstat on the
+     * OPENED fd below this closes the swap-between-stat-and-open race.
+     * O_CLOEXEC: never leak a key fd across exec().
      */
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
-        if (errno == ELOOP) {
-            fprintf(stderr, "[VIRP] Key file %s is a symlink — refusing "
-                            "to follow (O_NOFOLLOW)\n", path);
-        } else {
-            fprintf(stderr, "[VIRP] open(%s): %s\n", path, strerror(errno));
-        }
+        if (errno == ELOOP)
+            fprintf(stderr, "%s %s is a symlink — refusing to follow "
+                            "(O_NOFOLLOW)\n", tag, path);
+        else
+            fprintf(stderr, "%s %s: open: %s\n", tag, path, strerror(errno));
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
@@ -127,97 +143,78 @@ virp_error_t virp_key_load_file(virp_signing_key_t *sk,
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
-    /*
-     * Must be a regular file. fstat on an fd opened with O_NOFOLLOW
-     * never returns S_ISLNK on Linux, but reject non-regulars as a
-     * defense in depth — a FIFO or device would have undefined read
-     * semantics for key material.
-     */
+    /* A FIFO or device has undefined read semantics for key material. */
     if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "[VIRP] Key file %s is not a regular file\n", path);
+        fprintf(stderr, "%s %s is not a regular file\n", tag, path);
         close(fd);
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
-    /*
-     * Permission gate: mode must be 0400 or 0600, owned by the
-     * effective UID of this process. Anything with group or other
-     * bits set means the key may have been read already by someone
-     * else and should not be trusted.
-     */
-    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
-        fprintf(stderr,
-                "[VIRP] Key file %s has insecure mode 0%o — refusing "
-                "to load. Run: chmod 0600 %s\n",
-                path, (unsigned)(st.st_mode & 07777), path);
+    if (secret && (st.st_mode & (S_IRWXG | S_IRWXO))) {
+        fprintf(stderr, "%s %s has insecure mode 0%o — any group/world "
+                        "access hands the key to every local reader. "
+                        "Refusing to load. Run: chmod 0600 %s\n",
+                tag, path, (unsigned)(st.st_mode & 07777), path);
         close(fd);
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
-    uid_t euid = geteuid();
-    if (!virp_key_owner_ok(st.st_uid, euid)) {
-        fprintf(stderr,
-                "[VIRP] Key file %s is owned by uid=%u, expected %u — "
-                "refusing to load\n",
-                path, (unsigned)st.st_uid, (unsigned)euid);
+    if (secret && !virp_key_owner_ok(st.st_uid, geteuid())) {
+        fprintf(stderr, "%s %s is owned by uid=%u, expected %u — "
+                        "refusing to load\n",
+                tag, path, (unsigned)st.st_uid, (unsigned)geteuid());
         close(fd);
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
-    /* File size sanity check: reject clearly-wrong sizes early. */
-    if (st.st_size != (off_t)VIRP_KEY_SIZE) {
-        fprintf(stderr,
-                "[VIRP] Key file %s is %lld bytes, expected %d\n",
-                path, (long long)st.st_size, VIRP_KEY_SIZE);
+    if (st.st_size != (off_t)want) {
+        fprintf(stderr, "%s %s is %lld bytes, expected exactly %zu — "
+                        "malformed or truncated, refusing to load\n",
+                tag, path, (long long)st.st_size, want);
         close(fd);
-        return VIRP_ERR_KEY_NOT_LOADED;
+        return VIRP_ERR_INVALID_LENGTH;
     }
+
+    ssize_t n = read_exact(fd, out, want);
+    close(fd);
+    if (n != (ssize_t)want) {
+        /* Wipe whatever partial material landed before failing. */
+        sodium_memzero(out, want);
+        if (n < 0) {
+            fprintf(stderr, "%s %s: read: %s\n", tag, path,
+                    strerror(errno));
+            return VIRP_ERR_KEY_NOT_LOADED;
+        }
+        fprintf(stderr, "%s %s truncated mid-read: got %zd bytes, "
+                        "expected %zu\n", tag, path, n, want);
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+    return VIRP_OK;
+}
+
+virp_error_t virp_key_load_file(virp_signing_key_t *sk,
+                                virp_key_type_t type,
+                                const char *path)
+{
+    if (!sk || !path)
+        return VIRP_ERR_NULL_PTR;
 
     uint8_t buf[VIRP_KEY_SIZE];
-    ssize_t n = read_exact(fd, buf, VIRP_KEY_SIZE);
-    close(fd);
-
-    if (n < 0) {
-        fprintf(stderr, "[VIRP] read(%s): %s\n", path, strerror(errno));
-        /* No partial material to wipe — read_exact returns -1 before
-         * writing usable data. */
-        return VIRP_ERR_KEY_NOT_LOADED;
-    }
-    if (n != (ssize_t)VIRP_KEY_SIZE) {
-        fprintf(stderr,
-                "[VIRP] Key file %s truncated: got %zd bytes, expected %d\n",
-                path, n, VIRP_KEY_SIZE);
-        /* Wipe the partial read before returning. */
-        volatile uint8_t *p = (volatile uint8_t *)buf;
-        for (size_t i = 0; i < VIRP_KEY_SIZE; i++) p[i] = 0;
+    virp_error_t err = virp_keyfile_read(path, "[VIRP] key file", true,
+                                         buf, VIRP_KEY_SIZE);
+    if (err != VIRP_OK) {
+        /* Documented contract (and test-pinned): every load refusal is
+         * VIRP_ERR_KEY_NOT_LOADED, including wrong-sized files. */
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
-    virp_error_t err = virp_key_init(sk, type, buf);
+    err = virp_key_init(sk, type, buf);
 
-    /* Wipe the stack copy regardless of init outcome. */
-    volatile uint8_t *zp = (volatile uint8_t *)buf;
-    for (size_t i = 0; i < VIRP_KEY_SIZE; i++) zp[i] = 0;
+    /* Wipe the stack copy regardless of init outcome; virp_key_init has
+     * copied the material into sk->key.key (mlocked there). */
+    sodium_memzero(buf, sizeof(buf));
 
-    if (err != VIRP_OK)
-        return err;
-
-    /*
-     * Pin the key page so it cannot be swapped to disk. Non-fatal:
-     * unprivileged processes often can't mlock beyond RLIMIT_MEMLOCK,
-     * and federation/session code takes the same stance. Operators
-     * who need hard guarantees should raise the rlimit or run under
-     * a systemd unit that grants CAP_IPC_LOCK.
-     */
-    if (sodium_mlock(sk->key.key, VIRP_KEY_SIZE) != 0) {
-        fprintf(stderr,
-                "[VIRP] Warning: sodium_mlock() failed on %s key — "
-                "key may be swappable (errno=%d: %s)\n",
-                (type == VIRP_KEY_TYPE_OKEY ? "O" : "R"),
-                errno, strerror(errno));
-    }
-
-    return VIRP_OK;
+    return err;
 }
 
 virp_error_t virp_key_generate(virp_signing_key_t *sk,
@@ -385,10 +382,17 @@ void virp_key_destroy(virp_signing_key_t *sk)
 {
     if (!sk) return;
 
+    bool was_locked = sk->locked;
+
     /* Explicit zeroing — don't let the compiler optimize this away */
     volatile uint8_t *p = (volatile uint8_t *)sk;
     for (size_t i = 0; i < sizeof(*sk); i++)
         p[i] = 0;
+
+    /* Release the pin virp_key_init took (munlock zeroes again before
+     * unlocking; harmless after the wipe above). */
+    if (was_locked)
+        sodium_munlock(sk->key.key, VIRP_KEY_SIZE);
 }
 
 int virp_consttime_eq(const void *a, const void *b, size_t n)
@@ -405,12 +409,21 @@ int virp_consttime_eq(const void *a, const void *b, size_t n)
  * HMAC-SHA256
  * ========================================================================= */
 
-void virp_hmac_sha256(const uint8_t key[VIRP_KEY_SIZE],
-                      const uint8_t *data, size_t data_len,
-                      uint8_t out[VIRP_HMAC_SIZE])
+virp_error_t virp_hmac_sha256(const uint8_t key[VIRP_KEY_SIZE],
+                              const uint8_t *data, size_t data_len,
+                              uint8_t out[VIRP_HMAC_SIZE])
 {
     unsigned int len = VIRP_HMAC_SIZE;
-    HMAC(EVP_sha256(), key, VIRP_KEY_SIZE, data, data_len, out, &len);
+    /* An OpenSSL HMAC failure is unusual, but it must become
+     * VIRP_ERR_CRYPTO, never "carry on using whatever is in the output
+     * buffer" — the newer v3 code already holds this line (crypto
+     * review 2026-08-31, finding 4). */
+    if (!HMAC(EVP_sha256(), key, VIRP_KEY_SIZE, data, data_len, out, &len)
+        || len != VIRP_HMAC_SIZE) {
+        memset(out, 0, VIRP_HMAC_SIZE);
+        return VIRP_ERR_CRYPTO;
+    }
+    return VIRP_OK;
 }
 
 /* =========================================================================
@@ -488,10 +501,8 @@ virp_error_t virp_sign(virp_context_t *ctx,
         memcpy(sign_buf + pre_hmac_len, msg + post_hmac_start, post_hmac_len);
 
     /* Compute and write HMAC */
-    virp_hmac_sha256(sk->key.key, sign_buf, sign_len,
-                     msg + hmac_offset);
-
-    return VIRP_OK;
+    return virp_hmac_sha256(sk->key.key, sign_buf, sign_len,
+                            msg + hmac_offset);
 }
 
 virp_error_t virp_verify(virp_context_t *ctx,
@@ -532,7 +543,9 @@ virp_error_t virp_verify(virp_context_t *ctx,
         memcpy(sign_buf + pre_hmac_len, msg + post_hmac_start, post_hmac_len);
 
     uint8_t expected[VIRP_HMAC_SIZE];
-    virp_hmac_sha256(sk->key.key, sign_buf, sign_len, expected);
+    err = virp_hmac_sha256(sk->key.key, sign_buf, sign_len, expected);
+    if (err != VIRP_OK)
+        return err;
 
     /* Constant-time comparison to prevent timing attacks */
     return virp_consttime_eq(msg + hmac_offset, expected, VIRP_HMAC_SIZE)
@@ -1009,7 +1022,10 @@ virp_error_t virp_verify_observation_v2_signature(
      * unauthenticated influences a later decision except the length. */
     size_t signed_len = msg_len - VIRP_OBS_V2_SIG_SIZE;
     uint8_t expected_sig[VIRP_OBS_V2_SIG_SIZE];
-    virp_hmac_sha256(session_key, msg, signed_len, expected_sig);
+    virp_error_t herr = virp_hmac_sha256(session_key, msg, signed_len,
+                                         expected_sig);
+    if (herr != VIRP_OK)
+        return herr;
     if (!virp_consttime_eq(msg + signed_len, expected_sig,
                            VIRP_OBS_V2_SIG_SIZE))
         return VIRP_ERR_HMAC_FAILED;
@@ -1058,8 +1074,10 @@ virp_error_t virp_verify_observation_v2(
      */
     size_t signed_len = msg_len - VIRP_OBS_V2_SIG_SIZE;
     uint8_t expected_sig[VIRP_OBS_V2_SIG_SIZE];
-    virp_hmac_sha256(ctx->session.session_key, msg, signed_len,
-                     expected_sig);
+    virp_error_t herr = virp_hmac_sha256(ctx->session.session_key, msg,
+                                         signed_len, expected_sig);
+    if (herr != VIRP_OK)
+        return herr;
     if (!virp_consttime_eq(msg + signed_len, expected_sig,
                            VIRP_OBS_V2_SIG_SIZE))
         return VIRP_ERR_HMAC_FAILED;

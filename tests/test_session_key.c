@@ -43,6 +43,8 @@ static void do_full_handshake(virp_context_t *ctx)
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
     bind.msg_type = VIRP_MSG_SESSION_BIND;
+    snprintf(bind.client_id, sizeof(bind.client_id), "%s", "test-client");
+    memcpy(bind.server_id, ack.server_id, sizeof(bind.server_id));
     memcpy(bind.session_id,   ack.session_id,   16);
     memcpy(bind.client_nonce, ack.client_nonce,  8);
     memcpy(bind.server_nonce, ack.server_nonce,  8);
@@ -138,6 +140,8 @@ static void test_sign_without_derivation_fails(void)
     virp_session_bind_t bind;
     memset(&bind, 0, sizeof(bind));
     bind.msg_type = VIRP_MSG_SESSION_BIND;
+    snprintf(bind.client_id, sizeof(bind.client_id), "%s", "test-client");
+    memcpy(bind.server_id, ack.server_id, sizeof(bind.server_id));
     memcpy(bind.session_id,   ack.session_id,   16);
     memcpy(bind.client_nonce, ack.client_nonce,  8);
     memcpy(bind.server_nonce, ack.server_nonce,  8);

@@ -37,6 +37,9 @@ typedef struct {
     virp_key_t      key;
     virp_key_type_t type;
     uint8_t         fingerprint[VIRP_HMAC_SIZE]; /* SHA-256 of the key */
+    bool            locked;      /* key bytes are sodium_mlock'd; destroy
+                                  * munlocks. Set by virp_key_init for
+                                  * BOTH loaded and generated keys. */
 } virp_signing_key_t;
 
 /*
@@ -54,6 +57,25 @@ virp_error_t virp_key_init(virp_signing_key_t *sk,
  * tests; virp_key_load_file uses it internally.
  */
 bool virp_key_owner_ok(uid_t file_owner, uid_t euid);
+
+/*
+ * Hardened key-file read — THE one loader primitive. Every key type
+ * (O/R-key, observation, chain-signing, federation, approval) reads its
+ * file through this, so a custody fix lands once, not in five copies.
+ *
+ * Enforces: O_NOFOLLOW|O_CLOEXEC open, regular file (fstat on the fd,
+ * not the path), exact size == want, read-exactly with EINTR/short-read
+ * loop, wipe of `out` on any failure after bytes may have landed.
+ * When `secret` is true it additionally requires no group/other mode
+ * bits and virp_key_owner_ok ownership; public-key files skip those
+ * two checks only.
+ *
+ * `tag` prefixes the diagnostic (e.g. "[ObsKey] observation signing
+ * key"). Returns VIRP_OK, VIRP_ERR_INVALID_LENGTH for a wrong-sized or
+ * truncated file, VIRP_ERR_KEY_NOT_LOADED for every other refusal.
+ */
+virp_error_t virp_keyfile_read(const char *path, const char *tag,
+                               bool secret, uint8_t *out, size_t want);
 
 /*
  * Durable, symlink-safe small-file write: write to <path>.tmp, fsync it,
@@ -162,14 +184,18 @@ virp_error_t virp_verify(virp_context_t *ctx,
  * Compute HMAC-SHA256 over arbitrary data.
  * Low-level utility used internally. Exposed for testing.
  *
+ * Returns VIRP_OK, or VIRP_ERR_CRYPTO if the underlying primitive
+ * failed (out is zeroed in that case — callers must propagate, never
+ * use the buffer).
+ *
  * key:      32-byte HMAC key
  * data:     Data to sign
  * data_len: Length of data
  * out:      32-byte output buffer for HMAC
  */
-void virp_hmac_sha256(const uint8_t key[VIRP_KEY_SIZE],
-                      const uint8_t *data, size_t data_len,
-                      uint8_t out[VIRP_HMAC_SIZE]);
+virp_error_t virp_hmac_sha256(const uint8_t key[VIRP_KEY_SIZE],
+                              const uint8_t *data, size_t data_len,
+                              uint8_t out[VIRP_HMAC_SIZE]);
 
 /* =========================================================================
  * V2 Command Canonicalization and Signing

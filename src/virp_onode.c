@@ -2837,8 +2837,12 @@ static bool fed_outcome_observation_hash(const char *body, char out_hex[65])
  * the signature is the 64-byte signature itself — and that is pinned
  * too: libsodium refuses a non-canonical S, and the byte-by-byte sweep
  * in tests/test_obs_ed25519_forge.c walks the signature bytes as well
- * as the signed span. v1 and v2 have deterministic HMAC trailers and
- * were never malleable.
+ * as the signed span. v2 refuses any byte its declared payload length
+ * does not account for, and v1 does too now that
+ * virp_validate_message() requires hdr.length == msg_len exactly —
+ * before that check, a v1 frame could carry an unauthenticated suffix
+ * behind a valid HMAC while artifact_hash committed to the whole
+ * thing (crypto review 2026-08-31, finding 1).
  *
  * Consequence to hold on to: hash-over-full-message is load-bearing on
  * that non-malleability. Any future format that puts an unsigned or
@@ -4147,6 +4151,14 @@ static void handle_client(onode_state_t *state, int client_fd,
 
         snprintf(bind_msg.client_id, sizeof(bind_msg.client_id),
                  "%s", req.client_id);
+
+        /* The BIND transcript must carry the identities the derived key
+         * claims to bind. server_id used to be left zero-filled here, so
+         * the transcript bound a blank server identity (crypto review
+         * 2026-08-31, finding 7). Set once at session_init, read-only
+         * afterwards, so reading it outside session_mutex is fine. */
+        snprintf(bind_msg.server_id, sizeof(bind_msg.server_id),
+                 "%s", state->ctx->session.server_id);
 
         /* session_id from hex (reuse req.session_id, 16 bytes = 32 hex) */
         if (req.session_id[0]) {
