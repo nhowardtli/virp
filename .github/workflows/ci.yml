@@ -48,11 +48,20 @@ jobs:
           make check-live-fence
           make check-socket-path
           make check-shared-readpath
+          make check-obs-build-ordering
           make lint-sprintf
           make lint-rand
           make lint-memcmp
       - name: Full test battery
+        # all-tests now carries check-obs-build-ordering and
+        # test-refusal-contract. Both guard invariants the 2026-08-29
+        # reconciliation merge had to preserve — the observation build
+        # ordering around the scrub barrier, and the five drivers'
+        # non-dispatch refusal contract — and until now neither ran in
+        # a normal battery or in CI.
         run: make all-tests
+      - name: Refusal contract (five drivers), named explicitly
+        run: make test-refusal-contract
       - name: Demo (nine security behaviors, simulated target)
         run: ./demo/run.sh --no-build
       - name: Upload demo evidence bundle

@@ -1,0 +1,613 @@
+{
+ "_note": "The 18 byte-identical segment_sha256 pairs (36 records) in camera:tapo-c100:2026-08-24 \u2014 artifacts of the producer replay defect fixed 2026-08-25, NOT forgery. Two re-shipped blocks: seqs 7-12 reappear as 14-19 after the signed driver-restart gap at seq 14, and seqs 52-63 reappear as 65-76 after the signed driver-restart gap at seq 65. `verbatim_bodies` carries BOTH blocks whole (segment_seq 7-19 and 52-76, 38 records) exactly as stored on the live chain, so the set is prev-chain self-consistent and can be audited as a standalone corpus.",
+ "pairs": [
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:7:1787611773065938316",
+    "camseg:tapo-c100:14:1787611975283166753"
+   ],
+   "byte_len": [
+    1477906
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 202.217,
+   "segment_seqs": [
+    7,
+    14
+   ],
+   "segment_sha256": "fb76bea069a18ff8a97f1ad0b9bdc1e0d0fed991ebada47137c3b460953af79b",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:8:1787611779305362843",
+    "camseg:tapo-c100:15:1787611981513410284"
+   ],
+   "byte_len": [
+    1529273
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 202.208,
+   "segment_seqs": [
+    8,
+    15
+   ],
+   "segment_sha256": "5abbb605c039fe2a9869fa290973786b8e8f02b11a3268d43a5a57fb67383250",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:9:1787611785359208332",
+    "camseg:tapo-c100:16:1787611987584397143"
+   ],
+   "byte_len": [
+    1485762
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 202.225,
+   "segment_seqs": [
+    9,
+    16
+   ],
+   "segment_sha256": "70b708949a038d00d495ad07acbfdb5c08f5041a9633add9f28dfb7d22e2b49f",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:10:1787611791414802831",
+    "camseg:tapo-c100:17:1787611993660617757"
+   ],
+   "byte_len": [
+    1541153
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 202.246,
+   "segment_seqs": [
+    10,
+    17
+   ],
+   "segment_sha256": "5d30d34306694dd408bbe5508ea0f37fc227c54af8c22c0f067af215417efdf1",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:11:1787611796956284464",
+    "camseg:tapo-c100:18:1787611999241814758"
+   ],
+   "byte_len": [
+    1490777
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 202.286,
+   "segment_seqs": [
+    11,
+    18
+   ],
+   "segment_sha256": "cfe6d535e75c7d2b8653172d3d64f05eba516771d2a70e5fced8bbf937cfad06",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:12:1787611801697990689",
+    "camseg:tapo-c100:19:1787612005299300617"
+   ],
+   "byte_len": [
+    1534120
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 203.601,
+   "segment_seqs": [
+    12,
+    19
+   ],
+   "segment_sha256": "d18a7e611df7ff4939b07687aa4b88a0fc4c1ba94d150211117ac02c2bed4eae",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:52:1787612839664195197",
+    "camseg:tapo-c100:65:1787614249851645427"
+   ],
+   "byte_len": [
+    1486427
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1410.187,
+   "segment_seqs": [
+    52,
+    65
+   ],
+   "segment_sha256": "e1b67deafda12fdb5d48707f6d539eaacf70cdb12a977b5b0935b5627263a17f",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:53:1787612846008771068",
+    "camseg:tapo-c100:66:1787614250856438964"
+   ],
+   "byte_len": [
+    1545465
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1404.848,
+   "segment_seqs": [
+    53,
+    66
+   ],
+   "segment_sha256": "044a39cfaddbd692b57144ffe017be3be76d01b2392e18dc349698107ac1d4f7",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:54:1787612851579011442",
+    "camseg:tapo-c100:67:1787614251395747222"
+   ],
+   "byte_len": [
+    1495760
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1399.817,
+   "segment_seqs": [
+    54,
+    67
+   ],
+   "segment_sha256": "ff3654151602cba97c61ee7c47357481828075661989d3d025a26284a56683ca",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:55:1787612857676560389",
+    "camseg:tapo-c100:68:1787614251949359157"
+   ],
+   "byte_len": [
+    1552928
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1394.273,
+   "segment_seqs": [
+    55,
+    68
+   ],
+   "segment_sha256": "dcea08b13da2dc022a7d9a0e07b4d4fec21cf03b12e62e095c9616aebab8b2de",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:56:1787612863724836031",
+    "camseg:tapo-c100:69:1787614252504281129"
+   ],
+   "byte_len": [
+    1502148
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1388.779,
+   "segment_seqs": [
+    56,
+    69
+   ],
+   "segment_sha256": "66c50f6582b47dbeb49ab67eca442e00f9fbd579629c1806d5c7ae304d1daffb",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:57:1787612869844886548",
+    "camseg:tapo-c100:70:1787614253056868384"
+   ],
+   "byte_len": [
+    1540017
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1383.212,
+   "segment_seqs": [
+    57,
+    70
+   ],
+   "segment_sha256": "e9fc4383f03d2d975a5d3bd7b70e040a740321bf1c9d55f51e8a26949df7655c",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:58:1787612875901235905",
+    "camseg:tapo-c100:71:1787614253607726411"
+   ],
+   "byte_len": [
+    1487923
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1377.706,
+   "segment_seqs": [
+    58,
+    71
+   ],
+   "segment_sha256": "8663db1d7148ac44f19f5d620a579e4db56d962dc1a09cafe9d8293176b4ec39",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:59:1787612881954554259",
+    "camseg:tapo-c100:72:1787614254157737023"
+   ],
+   "byte_len": [
+    1535962
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1372.203,
+   "segment_seqs": [
+    59,
+    72
+   ],
+   "segment_sha256": "ea34a7c19a22cc57269ab92744c03156c4d567b8e911d2fd217e2f85679e501b",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:60:1787612888001279027",
+    "camseg:tapo-c100:73:1787614254718236277"
+   ],
+   "byte_len": [
+    1489674
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1366.717,
+   "segment_seqs": [
+    60,
+    73
+   ],
+   "segment_sha256": "99857b89298ade9969ec0434965ac43b2ace153d560f6c91e5f040e57f1af593",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:61:1787612893593387765",
+    "camseg:tapo-c100:74:1787614255280006601"
+   ],
+   "byte_len": [
+    1533568
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1361.687,
+   "segment_seqs": [
+    61,
+    74
+   ],
+   "segment_sha256": "ecc8ff50daa5c87258a65d908c85dd2b53331feab686cbcc3bf8eb20a1a3bdb2",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:62:1787612899668782466",
+    "camseg:tapo-c100:75:1787614255835311390"
+   ],
+   "byte_len": [
+    1489332
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1356.167,
+   "segment_seqs": [
+    62,
+    75
+   ],
+   "segment_sha256": "5808c87f84beb003311578aafda8de1ce4f98252bd9e60faf7490bd41e6f18a8",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  },
+  {
+   "artifact_ids": [
+    "camseg:tapo-c100:63:1787612903910148244",
+    "camseg:tapo-c100:76:1787614256399015562"
+   ],
+   "byte_len": [
+    1535862
+   ],
+   "camera_ids": [
+    "tapo-c100"
+   ],
+   "capture_start_delta_s": 1352.489,
+   "segment_seqs": [
+    63,
+    76
+   ],
+   "segment_sha256": "1a22f656d1c91ebf6a671b507478df475f382de22c9e0a4cd8029c06346e3ef4",
+   "sessions": [
+    "camera:tapo-c100:2026-08-24"
+   ]
+  }
+ ],
+ "verbatim_bodies": [
+  {
+   "artifact_hash": "b3c85d76f99331189250ce69f9a15c08ff74d54e4dd076204ce668854d8a5742",
+   "artifact_id": "camseg:tapo-c100:7:1787611773065938316",
+   "body": "{\"byte_len\":1477906,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611773065938316,\"capture_start_utc_ns\":1787611766931938316,\"device\":\"tapo-c100\",\"duration_s\":6.134,\"encoder\":\"copy\",\"gap\":{\"after_seq\":6,\"reason\":\"driver-restart\"},\"mode\":\"live\",\"prev_segment_sha256\":\"5c3cdca48b81cbc63c138cd3111d9d5cf617e81ea45edd6debb878dc4ce81d3a\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"99f46b48c26d8705c72d0680a79976f0a073c33dc78e286e18366e1eb89f904bd680fc198e1d11064d5e3b4c9886e185f1956e9bebdd0b051d3ca43fa6247003\",\"schema\":\"camera_segment/1\",\"segment_seq\":7,\"segment_sha256\":\"fb76bea069a18ff8a97f1ad0b9bdc1e0d0fed991ebada47137c3b460953af79b\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "dbe33e45dd0db80be9f1a4099933ebb7d0416f5ba8b056f25dfbe1e50276901a",
+   "artifact_id": "camseg:tapo-c100:8:1787611779305362843",
+   "body": "{\"byte_len\":1529273,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611779305362843,\"capture_start_utc_ns\":1787611773305362843,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"fb76bea069a18ff8a97f1ad0b9bdc1e0d0fed991ebada47137c3b460953af79b\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"49a20d704ed9895995dc04b4ef27f3b4d0637d39c20ef7ac7fac126c1ac66f4958563ab932c90caa1ecbec17e03cf72fc6c63b9a732f98d50aae32f6fbafa802\",\"schema\":\"camera_segment/1\",\"segment_seq\":8,\"segment_sha256\":\"5abbb605c039fe2a9869fa290973786b8e8f02b11a3268d43a5a57fb67383250\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "72d6af15c40f1cd1ae35aa11844254a2189509d490f9cc32d9a28f9234c0aced",
+   "artifact_id": "camseg:tapo-c100:9:1787611785359208332",
+   "body": "{\"byte_len\":1485762,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611785359208332,\"capture_start_utc_ns\":1787611779359208332,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"5abbb605c039fe2a9869fa290973786b8e8f02b11a3268d43a5a57fb67383250\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"2915bdc1ea8c15be97189da57f9d3b6ea479e750ecfdfae7e478318f75477627a716adfd893e979aae73422942fb9e7bcb366ac3757c1dbd91a27e03184b4d0e\",\"schema\":\"camera_segment/1\",\"segment_seq\":9,\"segment_sha256\":\"70b708949a038d00d495ad07acbfdb5c08f5041a9633add9f28dfb7d22e2b49f\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "9d2fe48761d672645c4531e4ecb5f0c52a6fa6282e69fd3cb18ec1dfc3e8422a",
+   "artifact_id": "camseg:tapo-c100:10:1787611791414802831",
+   "body": "{\"byte_len\":1541153,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611791414802831,\"capture_start_utc_ns\":1787611785414802831,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"70b708949a038d00d495ad07acbfdb5c08f5041a9633add9f28dfb7d22e2b49f\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"d9de51ba9f37e37d320b00f979c0c73e55e99cb81696e7ba26e74345c66633f5f0432e147b70133456f45fe261d73bf1f63fc8a231eb3bd1df9e63c1529cc900\",\"schema\":\"camera_segment/1\",\"segment_seq\":10,\"segment_sha256\":\"5d30d34306694dd408bbe5508ea0f37fc227c54af8c22c0f067af215417efdf1\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "1907ef7a305813bfea9a744668916d8eec959991478066596b70bfea755b9b7c",
+   "artifact_id": "camseg:tapo-c100:11:1787611796956284464",
+   "body": "{\"byte_len\":1490777,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611796956284464,\"capture_start_utc_ns\":1787611790956284464,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"5d30d34306694dd408bbe5508ea0f37fc227c54af8c22c0f067af215417efdf1\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"245ff87053f5123e08fe9d55dea4d10942fc14c7ecac1112e32525c802e2e758b3a0c04dbf84e8c303e3755c47b8d9ec6c3bd14e418e66f3e68df9296c0d080e\",\"schema\":\"camera_segment/1\",\"segment_seq\":11,\"segment_sha256\":\"cfe6d535e75c7d2b8653172d3d64f05eba516771d2a70e5fced8bbf937cfad06\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "27df29cf5a2ca339c9cb0b56604406043605d0b503173b3015b227e1a4b24bb5",
+   "artifact_id": "camseg:tapo-c100:12:1787611801697990689",
+   "body": "{\"byte_len\":1534120,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611801697990689,\"capture_start_utc_ns\":1787611795697990689,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"cfe6d535e75c7d2b8653172d3d64f05eba516771d2a70e5fced8bbf937cfad06\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"2b8b3b277c8a07add72b59c2be5050fa22c113d0a5055ad492d8d65520f13707834d30b88ad8414af86c6eee521bb07fbdce30a7e79e02b631f315ee4a51fa0c\",\"schema\":\"camera_segment/1\",\"segment_seq\":12,\"segment_sha256\":\"d18a7e611df7ff4939b07687aa4b88a0fc4c1ba94d150211117ac02c2bed4eae\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "b5a268ae232235abf1d7234212aee3bede806260b95e8129fd9c42f3c4ceb67e",
+   "artifact_id": "camseg:tapo-c100:13:1787611802544764084",
+   "body": "{\"byte_len\":252440,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611802544764084,\"capture_start_utc_ns\":1787611801477764084,\"device\":\"tapo-c100\",\"duration_s\":1.067,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"d18a7e611df7ff4939b07687aa4b88a0fc4c1ba94d150211117ac02c2bed4eae\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"c7ba59b349bd9e3b0432e60848931612c0d05d6636dd785996e13d7c9c8fae96449860b27455490ff8cecf073d7165cf627fc6eb5702efde7ce1a1222dcfca02\",\"schema\":\"camera_segment/1\",\"segment_seq\":13,\"segment_sha256\":\"6491f7a2b1d083859802daabaeff723c07ce39d9ae4522cb8301083e9ad8f017\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "91d824b9fb0716390d5a9977c85ef121c87694c1e9856538e4f0ccc4279f624f",
+   "artifact_id": "camseg:tapo-c100:14:1787611975283166753",
+   "body": "{\"byte_len\":1477906,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611975283166753,\"capture_start_utc_ns\":1787611969149166753,\"device\":\"tapo-c100\",\"duration_s\":6.134,\"encoder\":\"copy\",\"gap\":{\"after_seq\":13,\"reason\":\"driver-restart\"},\"mode\":\"live\",\"prev_segment_sha256\":\"6491f7a2b1d083859802daabaeff723c07ce39d9ae4522cb8301083e9ad8f017\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"157403fbe76ab3678c44ff71ee802d2d7f57c20659bde757facd2f53291a604dbe56bf36e1fb0edc208b2aaca3e7cbcdfcdbb6874ea3b885abd8a8885b8bf100\",\"schema\":\"camera_segment/1\",\"segment_seq\":14,\"segment_sha256\":\"fb76bea069a18ff8a97f1ad0b9bdc1e0d0fed991ebada47137c3b460953af79b\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "e2564b012bf55c9aa56e01b44dd163303ab2cb5aa8f0f35c198e781edb34991e",
+   "artifact_id": "camseg:tapo-c100:15:1787611981513410284",
+   "body": "{\"byte_len\":1529273,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611981513410284,\"capture_start_utc_ns\":1787611975513410284,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"fb76bea069a18ff8a97f1ad0b9bdc1e0d0fed991ebada47137c3b460953af79b\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"ee9195c707883ba1b081e13dba86832ac63f61719e5d82c5fcf93dcc40e4a5b7755d019381ed787a9fc443d249de6b65cea91da63bec6e48989cb51d45d2f60d\",\"schema\":\"camera_segment/1\",\"segment_seq\":15,\"segment_sha256\":\"5abbb605c039fe2a9869fa290973786b8e8f02b11a3268d43a5a57fb67383250\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "6f6876fc0d55b0632cc397f4274c302a35de3b407bcde39a2f0d923b7f74d3de",
+   "artifact_id": "camseg:tapo-c100:16:1787611987584397143",
+   "body": "{\"byte_len\":1485762,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611987584397143,\"capture_start_utc_ns\":1787611981584397143,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"5abbb605c039fe2a9869fa290973786b8e8f02b11a3268d43a5a57fb67383250\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"8f883a3fea9068101c596e770211bdbc3b743c183bea72ade8b6a090de8d31449d4f3339aa93f0c681c895e6110a24f454f64d256e19cd03209a6a21014de205\",\"schema\":\"camera_segment/1\",\"segment_seq\":16,\"segment_sha256\":\"70b708949a038d00d495ad07acbfdb5c08f5041a9633add9f28dfb7d22e2b49f\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "417e725c2a513626ecea25e01197c42616ec1cb9adc6606745ca01f4e89990c2",
+   "artifact_id": "camseg:tapo-c100:17:1787611993660617757",
+   "body": "{\"byte_len\":1541153,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611993660617757,\"capture_start_utc_ns\":1787611987660617757,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"70b708949a038d00d495ad07acbfdb5c08f5041a9633add9f28dfb7d22e2b49f\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"bc22ae7795b19cd51031fa606c9bb9369ca819c070af71261b94234f9b7afdf00bf4bb965d3f59077498ab7c11d45864c39fa1d4cd915998f664a8584820e20b\",\"schema\":\"camera_segment/1\",\"segment_seq\":17,\"segment_sha256\":\"5d30d34306694dd408bbe5508ea0f37fc227c54af8c22c0f067af215417efdf1\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "1b8f5ddeacadbc8a66fe97469c657663d26d1f9e13f9d0594e5ca429333753b8",
+   "artifact_id": "camseg:tapo-c100:18:1787611999241814758",
+   "body": "{\"byte_len\":1490777,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787611999241814758,\"capture_start_utc_ns\":1787611993241814758,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"5d30d34306694dd408bbe5508ea0f37fc227c54af8c22c0f067af215417efdf1\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"2337a7d0736e69473ab08f1d485073879fc60de5dcaf8bad86f3e61f1e295cbe0f43c5311db8f7f096c173a6e8a8e09be03da0cba52860716358bb10ab8ea60b\",\"schema\":\"camera_segment/1\",\"segment_seq\":18,\"segment_sha256\":\"cfe6d535e75c7d2b8653172d3d64f05eba516771d2a70e5fced8bbf937cfad06\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "8b4c5499ded9cd36a296c1945b4e31bcd4a0d3a433bd8ebf6ee99029346c9a50",
+   "artifact_id": "camseg:tapo-c100:19:1787612005299300617",
+   "body": "{\"byte_len\":1534120,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612005299300617,\"capture_start_utc_ns\":1787611999299300617,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"cfe6d535e75c7d2b8653172d3d64f05eba516771d2a70e5fced8bbf937cfad06\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"34e3c7b4215a1a5b4afb0a64707baa84e7de2db6d6f067ae367f01e51b3cde2f1fbda2712b7a908599851034ca4fe9828ced3346d077668fd015f12dcb3c4304\",\"schema\":\"camera_segment/1\",\"segment_seq\":19,\"segment_sha256\":\"d18a7e611df7ff4939b07687aa4b88a0fc4c1ba94d150211117ac02c2bed4eae\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "46ab41828b28240f15b4c3e88b58655d1a485f4a78d5da571edbcba62fcf466f",
+   "artifact_id": "camseg:tapo-c100:52:1787612839664195197",
+   "body": "{\"byte_len\":1486427,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612839664195197,\"capture_start_utc_ns\":1787612833530195197,\"device\":\"tapo-c100\",\"duration_s\":6.134,\"encoder\":\"copy\",\"gap\":{\"after_seq\":51,\"reason\":\"driver-restart\"},\"mode\":\"live\",\"prev_segment_sha256\":\"70113cd43ae8d2d7e58953736c8bf92c559ab1033a73e1947105e11c525ca478\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"82d0bb5194dfd478ad1921e0419e048cbcb95032a7bd5caf7721628bb57d8f8546461df6d200a6e91ca3136e2c4cf070df206678fb97eb46522edd646e88da02\",\"schema\":\"camera_segment/1\",\"segment_seq\":52,\"segment_sha256\":\"e1b67deafda12fdb5d48707f6d539eaacf70cdb12a977b5b0935b5627263a17f\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "f6a90404b3b4301efabd42a36a1184e78fb5b08c85be12e70fa53f9bf5ea49c8",
+   "artifact_id": "camseg:tapo-c100:53:1787612846008771068",
+   "body": "{\"byte_len\":1545465,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612846008771068,\"capture_start_utc_ns\":1787612840008771068,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"e1b67deafda12fdb5d48707f6d539eaacf70cdb12a977b5b0935b5627263a17f\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"f2e82902f5ab48162fe5969e14f1eac4469d6e8a10ad8d3013e7da59b59eae5540dd94c97baf42ffd3cbd0417e329775c1321bbb6b87ea1dc8e612e8c5138d0a\",\"schema\":\"camera_segment/1\",\"segment_seq\":53,\"segment_sha256\":\"044a39cfaddbd692b57144ffe017be3be76d01b2392e18dc349698107ac1d4f7\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "35661c5a226372f0422e327e2b4a6077194f56a0984ad54bb65bcb382c02e105",
+   "artifact_id": "camseg:tapo-c100:54:1787612851579011442",
+   "body": "{\"byte_len\":1495760,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612851579011442,\"capture_start_utc_ns\":1787612845579011442,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"044a39cfaddbd692b57144ffe017be3be76d01b2392e18dc349698107ac1d4f7\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"8e70e70db29dbccdf2a7bdb9dbf1d84fe8293f4e4ab2874d9a042415a4161f7858f9132063ea61eed73c1ee4f6a6b798fdebe518c5b7007fe2b6a4b7460b4b0d\",\"schema\":\"camera_segment/1\",\"segment_seq\":54,\"segment_sha256\":\"ff3654151602cba97c61ee7c47357481828075661989d3d025a26284a56683ca\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "589ae0433325e742f2083d5aaef309842d1a9d90f3ef3a7e8eff78cbd7a3a9e0",
+   "artifact_id": "camseg:tapo-c100:55:1787612857676560389",
+   "body": "{\"byte_len\":1552928,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612857676560389,\"capture_start_utc_ns\":1787612851676560389,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"ff3654151602cba97c61ee7c47357481828075661989d3d025a26284a56683ca\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"5df0254b96cd875ed2c220b484efa4f23d4542feeae4b8b0e824c8e346eba708187df61505cf7cd2dbefb2c22870af805aa2a46ec128551accb7d61f8e399600\",\"schema\":\"camera_segment/1\",\"segment_seq\":55,\"segment_sha256\":\"dcea08b13da2dc022a7d9a0e07b4d4fec21cf03b12e62e095c9616aebab8b2de\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "e7bd9e06e1453e8303eb69938d8a13d370b34c22f08da415c9c7672302445b2c",
+   "artifact_id": "camseg:tapo-c100:56:1787612863724836031",
+   "body": "{\"byte_len\":1502148,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612863724836031,\"capture_start_utc_ns\":1787612857724836031,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"dcea08b13da2dc022a7d9a0e07b4d4fec21cf03b12e62e095c9616aebab8b2de\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"29aa66f3ad6fc7f0cc9a951c88ddaedb6224abad3ae8ee3fadc94d0e0a0eb9badf8038703f64b5931b34e99c87800a23fc2ac13f5cb6ce0542f4d87bad411a03\",\"schema\":\"camera_segment/1\",\"segment_seq\":56,\"segment_sha256\":\"66c50f6582b47dbeb49ab67eca442e00f9fbd579629c1806d5c7ae304d1daffb\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "ee2d5f9d7d6b9f6a36f9d21b0a4e32e9156539de9a456d0c1994abdc032ddb53",
+   "artifact_id": "camseg:tapo-c100:57:1787612869844886548",
+   "body": "{\"byte_len\":1540017,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612869844886548,\"capture_start_utc_ns\":1787612863844886548,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"66c50f6582b47dbeb49ab67eca442e00f9fbd579629c1806d5c7ae304d1daffb\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"1c20e9ac0a0c72f0afc5dcfce03e1e03c9726d0615b1956506747d8775dd47c7384d6e182a8792a4e6ab1f1bb9e18dfd960aff1590c7a81df6ba22dca8aca30c\",\"schema\":\"camera_segment/1\",\"segment_seq\":57,\"segment_sha256\":\"e9fc4383f03d2d975a5d3bd7b70e040a740321bf1c9d55f51e8a26949df7655c\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "3a426fe05e4643d9d3c72f082db9e5b1467aad6318b1134a1e77fdc2b918c80c",
+   "artifact_id": "camseg:tapo-c100:58:1787612875901235905",
+   "body": "{\"byte_len\":1487923,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612875901235905,\"capture_start_utc_ns\":1787612869901235905,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"e9fc4383f03d2d975a5d3bd7b70e040a740321bf1c9d55f51e8a26949df7655c\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"62bf9eb1c8f767f4fca60a97cd27357d0ae4f3c4064598b8835693f4f5d8caa60d013fddddb5a53569c08efdf1bbfade015a2e2344ebc00cbde159087f71a606\",\"schema\":\"camera_segment/1\",\"segment_seq\":58,\"segment_sha256\":\"8663db1d7148ac44f19f5d620a579e4db56d962dc1a09cafe9d8293176b4ec39\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "716f6c51c9e3b170998ee16c5e9c42b469c27c051c1229c0292a172a28986a50",
+   "artifact_id": "camseg:tapo-c100:59:1787612881954554259",
+   "body": "{\"byte_len\":1535962,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612881954554259,\"capture_start_utc_ns\":1787612875954554259,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"8663db1d7148ac44f19f5d620a579e4db56d962dc1a09cafe9d8293176b4ec39\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"a6d158e05ef050ce61cd8a173ecfbedd889fc4187e377192d30ebd0a8b3d6f600a34992bdeb0ac660d7326cb6eab99b5dfe2cc5f98d58c854c8d6440d450dc0c\",\"schema\":\"camera_segment/1\",\"segment_seq\":59,\"segment_sha256\":\"ea34a7c19a22cc57269ab92744c03156c4d567b8e911d2fd217e2f85679e501b\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "0adb7b7e54b73688d1c26aa1aa3558887204e488380b82616899a35b6d4b564f",
+   "artifact_id": "camseg:tapo-c100:60:1787612888001279027",
+   "body": "{\"byte_len\":1489674,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612888001279027,\"capture_start_utc_ns\":1787612882001279027,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"ea34a7c19a22cc57269ab92744c03156c4d567b8e911d2fd217e2f85679e501b\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"ed5185b88acf6eddb2639f10d270a9b2ebdf46c1fb2dbf2bfdfd57ae095eddba39afe63298379854b007c4d13062363a8b79efa21ee2cd7a31973338bdebe50b\",\"schema\":\"camera_segment/1\",\"segment_seq\":60,\"segment_sha256\":\"99857b89298ade9969ec0434965ac43b2ace153d560f6c91e5f040e57f1af593\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "1de62c00001848c0584fc31318153685889f21f54074aaab109ba6f32ea06163",
+   "artifact_id": "camseg:tapo-c100:61:1787612893593387765",
+   "body": "{\"byte_len\":1533568,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612893593387765,\"capture_start_utc_ns\":1787612887593387765,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"99857b89298ade9969ec0434965ac43b2ace153d560f6c91e5f040e57f1af593\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"e22ce767d22582514f612c90c935a0e7cbe591cb63ffbed7353964ba78a735e651f77fc34fc440ac0bee7c606651e89d30612253c79892d09d16b750dc2b0205\",\"schema\":\"camera_segment/1\",\"segment_seq\":61,\"segment_sha256\":\"ecc8ff50daa5c87258a65d908c85dd2b53331feab686cbcc3bf8eb20a1a3bdb2\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "8cc251e6a00e877741653415c65fec1075ac73504c47a36a9bd3ab9bf75f0ab4",
+   "artifact_id": "camseg:tapo-c100:62:1787612899668782466",
+   "body": "{\"byte_len\":1489332,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612899668782466,\"capture_start_utc_ns\":1787612893668782466,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"ecc8ff50daa5c87258a65d908c85dd2b53331feab686cbcc3bf8eb20a1a3bdb2\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"0dd012a73c39c61de21a69883585c7ebcedd37d6a9ebc77779220b9468a1ccd7ad3a3631419ed29de533357bbb0aab8fe55dc591d21569752f6f7f555fcea00a\",\"schema\":\"camera_segment/1\",\"segment_seq\":62,\"segment_sha256\":\"5808c87f84beb003311578aafda8de1ce4f98252bd9e60faf7490bd41e6f18a8\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "e1b9772750644bccb26c9e65295db01cb300ab4790ba657395e7d004933ef128",
+   "artifact_id": "camseg:tapo-c100:63:1787612903910148244",
+   "body": "{\"byte_len\":1535862,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612903910148244,\"capture_start_utc_ns\":1787612897910148244,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"5808c87f84beb003311578aafda8de1ce4f98252bd9e60faf7490bd41e6f18a8\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"65dd54465e7a38aaaf73615f9fdaac021f66785db8973993fd411d10fbb8f76052688aef2f1ab453a9f475798f9d68b8a74c37a69eb540fa598fac25b3486e0f\",\"schema\":\"camera_segment/1\",\"segment_seq\":63,\"segment_sha256\":\"1a22f656d1c91ebf6a671b507478df475f382de22c9e0a4cd8029c06346e3ef4\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "4143858844530990bae40d7d860714fd6a3c187883995ecf8c7a2662623cd006",
+   "artifact_id": "camseg:tapo-c100:64:1787612904501732538",
+   "body": "{\"byte_len\":152903,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787612904501732538,\"capture_start_utc_ns\":1787612903901732538,\"device\":\"tapo-c100\",\"duration_s\":0.6,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"1a22f656d1c91ebf6a671b507478df475f382de22c9e0a4cd8029c06346e3ef4\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"c242214876cdfda75d06f016575e5b9e790af98b109945f7dc076bcd165f8d92443561a0a31294ff21bfb419c4b8f0e3919f964b48a5412060f541770d60da0c\",\"schema\":\"camera_segment/1\",\"segment_seq\":64,\"segment_sha256\":\"ff02467c630e54623cf3d83509e44ff08f1c9d4b41b9af9f87e4c96ff144edda\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "edbaf90463ee092583909f933807105523eff611bf7ab6a29f46b0492ca4eff9",
+   "artifact_id": "camseg:tapo-c100:65:1787614249851645427",
+   "body": "{\"byte_len\":1486427,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614249851645427,\"capture_start_utc_ns\":1787614243717645427,\"device\":\"tapo-c100\",\"duration_s\":6.134,\"encoder\":\"copy\",\"gap\":{\"after_seq\":64,\"reason\":\"driver-restart\"},\"mode\":\"live\",\"prev_segment_sha256\":\"ff02467c630e54623cf3d83509e44ff08f1c9d4b41b9af9f87e4c96ff144edda\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"2b566b96df1a5849982cb10a4851593a4e74456d19875a3d4de6769e4af4e41519f0348a19a671d52005becec03e73827d4f8125324d14f3535e4241168c940a\",\"schema\":\"camera_segment/1\",\"segment_seq\":65,\"segment_sha256\":\"e1b67deafda12fdb5d48707f6d539eaacf70cdb12a977b5b0935b5627263a17f\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "5c83e13b0f8e54d1d7126119ae8337adf99fc3432b4fb1301f1b90e13188d0c9",
+   "artifact_id": "camseg:tapo-c100:66:1787614250856438964",
+   "body": "{\"byte_len\":1545465,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614250856438964,\"capture_start_utc_ns\":1787614244856438964,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"e1b67deafda12fdb5d48707f6d539eaacf70cdb12a977b5b0935b5627263a17f\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"7ec2d7ffd9fdbf7745a7b68a51e4857554f88ed861aa163ddad93fabfee12c5eefcf394aedf7b07e6fdd07d111bd52edc21ff52d3bdd8bc80419776504f85d0d\",\"schema\":\"camera_segment/1\",\"segment_seq\":66,\"segment_sha256\":\"044a39cfaddbd692b57144ffe017be3be76d01b2392e18dc349698107ac1d4f7\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "ddbaeee6db834e948baca1a0c858369653a00a248363a8aa996244ccdec41263",
+   "artifact_id": "camseg:tapo-c100:67:1787614251395747222",
+   "body": "{\"byte_len\":1495760,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614251395747222,\"capture_start_utc_ns\":1787614245395747222,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"044a39cfaddbd692b57144ffe017be3be76d01b2392e18dc349698107ac1d4f7\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"fa6543d9b5fa90ba76b87cf76641366e15a9e2129a5ad121ed65e19a2fa225bec04c39fa5cdac7297c5b25d6afdfd2f410adcc73a8188b3a209b3a58bd835f0a\",\"schema\":\"camera_segment/1\",\"segment_seq\":67,\"segment_sha256\":\"ff3654151602cba97c61ee7c47357481828075661989d3d025a26284a56683ca\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "10170a615cf4e1b38c62f5af42ea1c328d6c867c52aab4e79a17940dddc982b4",
+   "artifact_id": "camseg:tapo-c100:68:1787614251949359157",
+   "body": "{\"byte_len\":1552928,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614251949359157,\"capture_start_utc_ns\":1787614245949359157,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"ff3654151602cba97c61ee7c47357481828075661989d3d025a26284a56683ca\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"0e4368726cc88c4e7551be1c20c8a505182fab09aff8b71e8a65b1ebf8da7bfaa26aa08b6518031dd92f4b42e1cee7f7fff018446263df07c1b835b406276a05\",\"schema\":\"camera_segment/1\",\"segment_seq\":68,\"segment_sha256\":\"dcea08b13da2dc022a7d9a0e07b4d4fec21cf03b12e62e095c9616aebab8b2de\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "62ba0555d5442393e9923a2161592477ea08514e223b72f51d35efda2c52d634",
+   "artifact_id": "camseg:tapo-c100:69:1787614252504281129",
+   "body": "{\"byte_len\":1502148,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614252504281129,\"capture_start_utc_ns\":1787614246504281129,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"dcea08b13da2dc022a7d9a0e07b4d4fec21cf03b12e62e095c9616aebab8b2de\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"b696dce783d7a66ce3a9c2f825b42004776a60c2f7fbdd0e71480167b7a1544d5f56e292ab14a6aa1c93b3b97e9b3a0731a5fa6f87c51ac0c3dc1ed98d4fdb08\",\"schema\":\"camera_segment/1\",\"segment_seq\":69,\"segment_sha256\":\"66c50f6582b47dbeb49ab67eca442e00f9fbd579629c1806d5c7ae304d1daffb\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "20b61376bd0d2772df0c204a8c4c9cd0ae5274cd6ece788e23fd64518025a860",
+   "artifact_id": "camseg:tapo-c100:70:1787614253056868384",
+   "body": "{\"byte_len\":1540017,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614253056868384,\"capture_start_utc_ns\":1787614247056868384,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"66c50f6582b47dbeb49ab67eca442e00f9fbd579629c1806d5c7ae304d1daffb\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"85660fbf893eb26301fe9c9e5716d797fd2d70c367e91d756e2653200db61cde865a915543e7c09527d2c47b318e9d9d8535bc8400d525f953523d4dbafe630c\",\"schema\":\"camera_segment/1\",\"segment_seq\":70,\"segment_sha256\":\"e9fc4383f03d2d975a5d3bd7b70e040a740321bf1c9d55f51e8a26949df7655c\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "0a3a32438b40887a05d7b654cb41bea3ffaad10bec4dd97ffa7a643953099039",
+   "artifact_id": "camseg:tapo-c100:71:1787614253607726411",
+   "body": "{\"byte_len\":1487923,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614253607726411,\"capture_start_utc_ns\":1787614247607726411,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"e9fc4383f03d2d975a5d3bd7b70e040a740321bf1c9d55f51e8a26949df7655c\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"5ac3d380407fe0c9a2af0f67d65db6bdbbd87b8c6b1448ce24635b6b3df17b058f29161ed4d8fc79507128d9ea4abc739cd4d98771ad6fa92f4d6e8a6fd5be03\",\"schema\":\"camera_segment/1\",\"segment_seq\":71,\"segment_sha256\":\"8663db1d7148ac44f19f5d620a579e4db56d962dc1a09cafe9d8293176b4ec39\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "2a74bb809ad5cd921797d5a5eaadbc7f434bb6f35db9d1a63d48ff98c0ab2a65",
+   "artifact_id": "camseg:tapo-c100:72:1787614254157737023",
+   "body": "{\"byte_len\":1535962,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614254157737023,\"capture_start_utc_ns\":1787614248157737023,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"8663db1d7148ac44f19f5d620a579e4db56d962dc1a09cafe9d8293176b4ec39\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"7f4c58428365d9fa6a6d3ec7f42fe1a7f034a5a1b6ca5865b665c03753af06f9271eff1822e39079cdc7b75a8af4af2760e813782f6058d4c4f1305b3facca04\",\"schema\":\"camera_segment/1\",\"segment_seq\":72,\"segment_sha256\":\"ea34a7c19a22cc57269ab92744c03156c4d567b8e911d2fd217e2f85679e501b\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "ed306fce5724940509f2885bfe48f84c596ac6588ba458087d24f9a2ec36800a",
+   "artifact_id": "camseg:tapo-c100:73:1787614254718236277",
+   "body": "{\"byte_len\":1489674,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614254718236277,\"capture_start_utc_ns\":1787614248718236277,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"ea34a7c19a22cc57269ab92744c03156c4d567b8e911d2fd217e2f85679e501b\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"5da3f6f606d6bb1e3fe8a8d763a1de5bb8e29d06d842b5f80a5a290ee70a443c1de5c9b6228c1a0943ce634148700822ea8ff41044b5db24ffae4e5d05b59e06\",\"schema\":\"camera_segment/1\",\"segment_seq\":73,\"segment_sha256\":\"99857b89298ade9969ec0434965ac43b2ace153d560f6c91e5f040e57f1af593\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "a34af8361fac1afd54ed463c73a1130ee6c8dfe0bc65ecb3b847032eb9688de7",
+   "artifact_id": "camseg:tapo-c100:74:1787614255280006601",
+   "body": "{\"byte_len\":1533568,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614255280006601,\"capture_start_utc_ns\":1787614249280006601,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"99857b89298ade9969ec0434965ac43b2ace153d560f6c91e5f040e57f1af593\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"cdae40d33a4d13b18be728229528eec299d74ca81494f1c1a0083f7c9a8b00a138527a845c6e85b4d6bfa002f3a8ede1687613f4ff11148817850d877b818b09\",\"schema\":\"camera_segment/1\",\"segment_seq\":74,\"segment_sha256\":\"ecc8ff50daa5c87258a65d908c85dd2b53331feab686cbcc3bf8eb20a1a3bdb2\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "2fa13fde7d33aae7dfe49f0745037fb0024bc7b9505c17970bf0788fef0a85e7",
+   "artifact_id": "camseg:tapo-c100:75:1787614255835311390",
+   "body": "{\"byte_len\":1489332,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614255835311390,\"capture_start_utc_ns\":1787614249835311390,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"ecc8ff50daa5c87258a65d908c85dd2b53331feab686cbcc3bf8eb20a1a3bdb2\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"d3c61a4dc135cc4fad1f05d2b9c3ec69822e90de4682830647f2e67db1f56537c5e2b8e039eb93619eabd9c7c54b739507ddbc07e8ca3aeb7c8c7d31f5c6c503\",\"schema\":\"camera_segment/1\",\"segment_seq\":75,\"segment_sha256\":\"5808c87f84beb003311578aafda8de1ce4f98252bd9e60faf7490bd41e6f18a8\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  },
+  {
+   "artifact_hash": "13f25a87017f0f368fa84ad6f220b6cb5a1d9219e0963425fc7b9e96904c1bfa",
+   "artifact_id": "camseg:tapo-c100:76:1787614256399015562",
+   "body": "{\"byte_len\":1535862,\"camera_id\":\"tapo-c100\",\"capture_end_utc_ns\":1787614256399015562,\"capture_start_utc_ns\":1787614250399015562,\"device\":\"tapo-c100\",\"duration_s\":6.0,\"encoder\":\"copy\",\"gap\":null,\"mode\":\"live\",\"prev_segment_sha256\":\"5808c87f84beb003311578aafda8de1ce4f98252bd9e60faf7490bd41e6f18a8\",\"producer_key_id\":\"008353cf219c224e970f03455aa50e82\",\"producer_sig\":\"bb0149158e486daacc6d6d1b999ef6befe5fc840e92771de69629954ee001a8f4ad4a7d2abb7c73d6bc226c3d370d2483c37ac5e821e9e94f32f0fb06245180f\",\"schema\":\"camera_segment/1\",\"segment_seq\":76,\"segment_sha256\":\"1a22f656d1c91ebf6a671b507478df475f382de22c9e0a4cd8029c06346e3ef4\",\"time_source\":\"host-clock\"}",
+   "session_id": "camera:tapo-c100:2026-08-24"
+  }
+ ]
+}

@@ -23,6 +23,7 @@
 #include "virp_transcript.h"
 #include "virp_context.h"
 #include "virp_validator.h"
+#include "virp_scrub.h"          /* scrub-at-capture (S-1) — before sign */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1957,7 +1958,64 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * constructor appears above it — and which self-tests in both
      * directions, because a guard that cannot fail is the defect it
      * exists to catch. Do not move this marker to make the check pass. */
+
+    /* MERGE 2026-08-29 (313 <-> origin) — BOTH redaction mechanisms that
+     * landed at this barrier are kept; neither subsumes the other.
+     *
+     *   virp_body_filter_apply()   structural, config-driven ALLOWLIST
+     *     per (driver, endpoint) REST payload. Drops whole fields the
+     *     rule does not name (librenms SNMPv3 credentials, contact PII),
+     *     records the removed key NAMES in-body, and withholds a matched
+     *     payload that will not parse. Only touches result.output, and
+     *     only for a driver/endpoint a rule matches.
+     *
+     *   virp_scrub_exec_result()   textual, generic KNOWN-SHAPES
+     *     redaction of result.output AND result.error_msg, for every
+     *     driver. The safety net for a device that unexpectedly echoes a
+     *     credential in a recognized format. Fails closed to
+     *     [REDACTED: scrub-error].
+     *
+     * They do not overlap. MEASURED at merge time, not assumed: the S-1
+     * ruleset is line- and keyword-shaped for device CLI text and does
+     * not match JSON "key":"value" syntax, so on a librenms body it
+     * redacts NOTHING — not community, not authpass, not cryptopass,
+     * not even an "api_token" key. The allowlist is the only thing
+     * protecting that body. Conversely no filter rule matches a non-REST
+     * driver, so on cisco/asa/linux CLI output the filter is inert and
+     * the scrubber is the only thing protecting it. Nothing is redacted
+     * twice, and neither mechanism can be dropped as redundant.
+     *
+     * ORDER — filter first, scrub second, deliberately:
+     *   (a) the scrub must be the LAST transform before any consumer, so
+     *       the S-1 contract below holds literally: the redacted form IS
+     *       the artifact that gets hashed and signed, with nothing
+     *       rewriting it afterwards.
+     *   (b) the filter must parse the payload as JSON. A scrub marker
+     *       substituted into a value position would break that parse and
+     *       turn an ordinary body into a fail-closed WITHHOLD. That
+     *       cannot happen with today's ruleset (see above) — this order
+     *       is what keeps it from becoming possible if the S-1 rules
+     *       ever learn JSON.
+     * Do not swap them. */
     virp_body_filter_apply(drv->name, command, &result);
+
+    /* ── SCRUB-AT-CAPTURE (S-1) — this is the ONE insertion point ─────
+     * Redact secret-shaped content from the captured result BEFORE
+     * anything downstream consumes it. Every consumer sits below this
+     * line: the OUTCOME_UNKNOWN and driver-refused ERROR bodies (built
+     * from result.error_msg), gate_emit_execution's response_sha256
+     * commitment (computed over result.output), and both observation
+     * constructors (v1 tiered / v2 session-bound). The redacted form IS
+     * the artifact: the hash commits to it, the signature verifies over
+     * it, and no unredacted copy is retained anywhere. Fail-closed by
+     * contract — on any scrub failure the wrapper substitutes the whole
+     * field with [REDACTED: scrub-error], never passes it through raw.
+     * This is the generic safety net for a device unexpectedly echoing
+     * a credential; the per-driver config scrubs (cisco/asa/fortigate)
+     * remain the primary defense for known credential-bearing reads.
+     * Moving this call below gate_emit_execution would make the chain
+     * commit to unredacted bytes — do not reorder. */
+    virp_scrub_exec_result(&result);
 
     /*
      * Failure with no output and NO proof of non-dispatch: the command
