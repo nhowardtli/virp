@@ -812,5 +812,127 @@ class RecordIdentityTests(unittest.TestCase):
             [])
 
 
+
+class SpoolHostKeyPinningTests(unittest.TestCase):
+    """Sep 1 review, Task 4a: the capture host must never accept the spool
+    host's key on first contact. StrictHostKeyChecking=yes against a
+    provisioned known_hosts file, or no ship function at all."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.kh = os.path.join(self.tmp, "known_hosts")
+        with open(self.kh, "w") as f:
+            f.write("spool ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPINNED\n")
+
+    def _capture_argv(self):
+        calls = []
+
+        class P:
+            returncode = 0
+            stderr = b""
+
+        def fake_run(argv, **kw):
+            calls.append(list(argv))
+            return P()
+        orig = vc.subprocess.run
+        vc.subprocess.run = fake_run
+        self.addCleanup(setattr, vc.subprocess, "run", orig)
+        return calls
+
+    def test_refuses_without_a_known_hosts_file(self):
+        with self.assertRaises(ValueError):
+            vc.sftp_ship("virp-capture@spool")
+        with self.assertRaises(ValueError):
+            vc.sftp_ship("virp-capture@spool",
+                         known_hosts=os.path.join(self.tmp, "absent"))
+
+    def test_sftp_pins_the_host_key(self):
+        calls = self._capture_argv()
+        ship = vc.sftp_ship("virp-capture@spool", ssh_key="/k",
+                            known_hosts=self.kh)
+        seg = os.path.join(self.tmp, "a.mp4")
+        body = os.path.join(self.tmp, "a.body")
+        open(seg, "wb").close()
+        open(body, "wb").close()
+        self.assertTrue(ship(seg, body, "job"))
+        self.assertTrue(calls)
+        for argv in calls:
+            opts = [argv[i + 1] for i, a in enumerate(argv) if a == "-o"]
+            self.assertIn("StrictHostKeyChecking=yes", opts, argv)
+            self.assertIn("UserKnownHostsFile=%s" % self.kh, opts, argv)
+            self.assertNotIn("StrictHostKeyChecking=accept-new", opts)
+            self.assertNotIn("StrictHostKeyChecking=no", opts)
+
+
+class ArtifactWritebackDurabilityTests(unittest.TestCase):
+    """Sep 1 review, Task 4b: the content-addressed segment copy is
+    fsynced (file, then directory entry) BEFORE the chain append, so a
+    signed entry never commits to bytes this host may not have."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.sk_path, self.pk_path = make_keypair(self.tmp)
+        self.cfg = live_cfg(self.tmp, self.sk_path, self.pk_path)
+        self.incoming = os.path.join(self.tmp, "spool", "incoming")
+        os.makedirs(self.incoming)
+        self.data_dir = os.path.join(self.tmp, "onode-data")
+        self.subcfg = {"data_dir": self.data_dir, "sock": "/nonexistent",
+                       "incoming": self.incoming,
+                       "done": os.path.join(self.tmp, "spool", "done"),
+                       "interval": 0,
+                       "db": os.path.join(self.tmp, "nonexistent.db")}
+
+    def test_segment_copy_is_durable_before_the_append(self):
+        seg_bytes = make_mp4(pad=b"durable" * 16)
+        seg_sha = hashlib.sha256(seg_bytes).hexdigest()
+        nosig = vc.build_body("tapo-c100", "tapo-c100", 0, seg_sha, None,
+                              len(seg_bytes), 5.0, 0, 10 ** 18,
+                              "host-clock", "live", None, self.cfg["key_id"])
+        body_bytes, _ = vc.producer_sign(self.cfg["sk"], nosig)
+        seg = os.path.join(self.incoming, "j.mp4")
+        body = os.path.join(self.incoming, "j.body")
+        with open(seg, "wb") as f:
+            f.write(seg_bytes)
+        with open(body, "wb") as f:
+            f.write(body_bytes)
+
+        events = []
+        real_fsync = os.fsync
+
+        def rec_fsync(fd):
+            try:
+                target = os.readlink("/proc/self/fd/%d" % fd)
+            except OSError:
+                target = "?"
+            events.append(("fsync", target))
+            return real_fsync(fd)
+        os.fsync = rec_fsync
+        self.addCleanup(setattr, os, "fsync", real_fsync)
+
+        inner = FakeSend()
+
+        def send(request, sock_path=None):
+            events.append(("send", None))
+            return inner(request, sock_path)
+
+        self.assertTrue(vc.submit_one(self.subcfg, "j", seg, body, send=send))
+        art_dir = os.path.join(self.data_dir, "artifacts")
+        art = os.path.join(art_dir, seg_sha + ".mp4")
+        self.assertTrue(os.path.exists(art))
+        kinds = [e[0] for e in events]
+        self.assertIn("send", kinds)
+        before = events[:kinds.index("send")]
+        synced = [t for k, t in before if k == "fsync"]
+        self.assertTrue(any(t.startswith(art) for t in synced),
+                        "segment copy not fsynced before append: %s" % events)
+        self.assertIn(art_dir, synced,
+                      "artifact directory not fsynced before append: %s"
+                      % events)
+        # and the temp name is gone
+        self.assertFalse(os.path.exists(art + ".tmp"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

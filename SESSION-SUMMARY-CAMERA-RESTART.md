@@ -101,7 +101,9 @@ Operator runbook for the capture side (313 is ready and waiting):
    required: reusing the old one would make the first `tapo-c100-accept`
    record cite a `tapo-c100` segment as prev, which `audit` rightly flags.
 3. `virp_camera.py live --camera-id tapo-c100-accept --data-dir <accept-dir>
-   --spool virp-capture@10.0.0.13 --ssh-key <key> --rtsp-config <0600 file>`
+   --spool virp-capture@10.0.0.13 --ssh-key <key> --known-hosts <pinned file>
+   --rtsp-config <0600 file>` (`--known-hosts` is required as of the Sep 1
+   review: the spool host key is pinned, never accepted on first contact)
 4. During the run: two graceful stops (SIGTERM/Ctrl-C), one `kill -9`, and
    one stop of > 60 s before restarting.
 5. Then, on 313, the seven acceptance checks run read-only against

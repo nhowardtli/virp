@@ -1612,13 +1612,31 @@ def ffmpeg_cmd(cfg):
 
 # ── Capture-host delivery: ship the {segment, signed body} pair ────────
 
-def sftp_ship(spool_target, ssh_key=None, extra_opts=None):
+def sftp_ship(spool_target, ssh_key=None, extra_opts=None,
+              known_hosts=None):
     """Return ship(seg_file, body_file, name) -> bool. Uploads to the
     chrooted spool as <name>.mp4/.body via .part staging + rename, then
     a <name>.done marker LAST, so the submitter only ever sees complete
     jobs. One ssh path, key-only, sftp-only (the account is chrooted to
-    internal-sftp on the far end)."""
-    opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+    internal-sftp on the far end).
+
+    The spool host's key is PINNED (Sep 1 review, Task 4): `known_hosts`
+    is a provisioned file naming the spool host, StrictHostKeyChecking
+    is `yes`, and the user's own known_hosts is not consulted. The
+    previous `accept-new` trusted whichever host answered first and
+    then pinned THAT — a first-contact attacker became the trusted
+    spool for the life of the file. Refused at construction (before any
+    capture starts) when the file is absent or unreadable."""
+    if not known_hosts:
+        raise ValueError("sftp_ship: a provisioned known_hosts file is "
+                         "required (the spool host key is pinned, never "
+                         "accepted on first contact)")
+    if not os.path.isfile(known_hosts) or not os.access(known_hosts, os.R_OK):
+        raise ValueError("sftp_ship: known_hosts file %s is missing or "
+                         "unreadable" % known_hosts)
+    opts = ["-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "UserKnownHostsFile=%s" % known_hosts]
     if ssh_key:
         opts += ["-o", "IdentitiesOnly=yes", "-i", ssh_key]
     if extra_opts:
@@ -2173,11 +2191,19 @@ def submit_one(cfg, name, seg_path, body_path, send=onode_send):
 
     # The segment FILE is still content-addressed by its own sha (files
     # with identical bytes are stored once); only the receipt is per-body.
+    # Durable BEFORE the chain append (Sep 1 review, Task 4), the same
+    # temp -> fsync -> rename -> fsync-dir order state_save uses: once the
+    # chain commits to this segment the bytes it commits to must already
+    # be on disk, or a crash between the append and the writeback leaves
+    # a signed entry whose evidence this host cannot produce.
     art_path = os.path.join(art_dir, seg_sha + ".mp4")
     if not os.path.exists(art_path):
         with open(art_path + ".tmp", "wb") as f:
             f.write(seg_bytes)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(art_path + ".tmp", art_path)
+        _fsync_dir(art_dir)
 
     ok, receipt = chain_append_evidence(session_id, artifact_id, body_bytes,
                                         sock_path=cfg["sock"], send=send)
@@ -2290,6 +2316,10 @@ def main(argv=None):
                          "e.g. virp-capture@10.0.0.13")
     lv.add_argument("--ssh-key", default=None,
                     help="identity for the spool account (key-only)")
+    lv.add_argument("--known-hosts", required=True,
+                    help="provisioned known_hosts file naming the spool "
+                         "host (its key is pinned: StrictHostKeyChecking="
+                         "yes, no first-contact accept)")
     lv.add_argument("--segment-time", type=float, default=6.0)
     lv.add_argument("--minutes", type=float, default=None,
                     help="stop after N minutes (default: until signalled)")
@@ -2432,7 +2462,11 @@ def main(argv=None):
                 else args.segment_time,
                 args.jitter_s, args.max_unexplained_gap_s),
         }
-        ship = sftp_ship(args.spool, ssh_key=args.ssh_key)
+        try:
+            ship = sftp_ship(args.spool, ssh_key=args.ssh_key,
+                             known_hosts=args.known_hosts)
+        except ValueError as e:
+            raise SystemExit(str(e))
         stop_after = args.minutes * 60 if args.minutes else None
         print("live capture: source=%s segment_time=%ss spool=%s"
               % ("rtsp(configured)" if rtsp_url else "synthetic-test",
