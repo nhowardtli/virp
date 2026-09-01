@@ -342,6 +342,25 @@ typedef struct {
     bool                chain_enabled;
 
     /*
+     * EVIDENCE-REQUIRED execution (Sep 1 review, Task 5). Default TRUE
+     * (onode_init; the prod loader reads the config's `evidence_required`
+     * boolean). When set, every execution the gate admits is preceded by
+     * a durable gate_intent chain entry — device, command, tier, uid,
+     * session, proposal — committed BEFORE the driver is dispatched; if
+     * that append fails (chain full, read-only, absent) the operation is
+     * REFUSED with a signed ERROR observation citing evidence-unavailable
+     * and nothing reaches the device. The post-execution gate_execution /
+     * outcome entry then links back to the intent by chain_entry_hash,
+     * so a daemon that dies between the two leaves an intent with no
+     * closer, which the verifier reports as an OPEN execution — never as
+     * a broken chain. When false, today's behaviour is preserved (record
+     * after the fact, best-effort) and every dispatch logs a WARNING that
+     * it ran without a durable record. Fail-closed by default: an absent
+     * or garbled config key keeps evidence required.
+     */
+    bool                evidence_required;
+
+    /*
      * Approval flow (propose → approve → apply). Disabled until
      * onode_set_approvers() provides a store directory and an approver
      * registry (/etc/virp/approvers.json). The daemon holds ONLY public

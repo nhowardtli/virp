@@ -802,7 +802,8 @@ static void approval_emit_outcome(onode_state_t *state,
                                   const char *proposal_id,
                                   const virp_approval_rec_t *apr,
                                   const char *device_name,
-                                  bool success)
+                                  bool success,
+                                  const virp_chain_entry_t *intent)
 {
     if (!state->chain_enabled)
         return;
@@ -812,16 +813,30 @@ static void approval_emit_outcome(onode_state_t *state,
         virp_approval_load_proposal(state->approval_dir, proposal_id,
                                     &prop) == VIRP_OK;
 
+    /* EVIDENCE LINK (Sep 1 review, Task 5): the gate_intent entry this
+     * outcome closes, by its chain_entry_hash — the verifier finds the
+     * closer by this exact "intent_entry_hash":"<hex>" token, so the
+     * spelling here and in gate_emit_execution must stay identical.
+     * null when the node ran with evidence_required=false. */
+    char intent_json[80];
+    if (intent)
+        snprintf(intent_json, sizeof(intent_json), "\"%s\"",
+                 intent->chain_entry_hash);
+    else
+        snprintf(intent_json, sizeof(intent_json), "null");
+
     char content[1024];
     snprintf(content, sizeof(content),
              "{\"proposal_id\":\"%s\",\"proposal_entry_hash\":\"%s\","
              "\"approval_entry_hash\":\"%s\",\"device\":\"%s\","
-             "\"command_hash\":\"%s\",\"success\":%s}",
+             "\"command_hash\":\"%s\",\"success\":%s,"
+             "\"intent_entry_hash\":%s}",
              proposal_id,
              have_prop ? prop.chain_entry_hash : "",
              apr->chain_entry_hash,
              device_name, apr->command_hash,
-             success ? "true" : "false");
+             success ? "true" : "false",
+             intent_json);
 
     char artifact_hash[65];
     gate_sha256_hex(content, strlen(content), artifact_hash);
@@ -892,7 +907,14 @@ static void approval_emit_outcome(onode_state_t *state,
  * driver could not say what reached the device.
  *
  * Best-effort, like every other gate chain write: a chain failure is
- * logged and never alters the result already in hand.
+ * logged and never alters the result already in hand. That is exactly
+ * why this record alone was never enough (Sep 1 review, Task 5): it is
+ * written AFTER the device has acted, so a chain that cannot take writes
+ * at that moment lets an execution happen with no durable trace. Under
+ * evidence_required (the default) a gate_intent entry is committed
+ * BEFORE dispatch (gate_emit_intent) and this record links back to it
+ * via `intent` — the pair is what the verifier grades: an intent with
+ * no closer is an OPEN execution.
  * ========================================================================= */
 static void gate_emit_execution(onode_state_t *state,
                                 const char *device_name,
@@ -902,6 +924,7 @@ static void gate_emit_execution(onode_state_t *state,
                                 virp_trust_tier_t eff_max,
                                 onode_gate_mode_t mode,
                                 uid_t client_uid,
+                                const virp_chain_entry_t *intent,
                                 const virp_exec_result_t *result,
                                 const char *failure_msg)
 {
@@ -955,6 +978,24 @@ static void gate_emit_execution(onode_state_t *state,
             cJSON_AddNullToObject(o, "uid");
         else
             cJSON_AddNumberToObject(o, "uid", (double)client_uid);
+
+        /* EVIDENCE LINK (Task 5): the gate_intent entry this outcome
+         * closes. chain_entry_hash is the join key the verifier looks for
+         * (exact token "intent_entry_hash":"<hex>" in the stored body);
+         * sequence and artifact_id are for the human reader. All three
+         * null when the node ran with evidence_required=false. */
+        if (intent) {
+            cJSON_AddStringToObject(o, "intent_entry_hash",
+                                    intent->chain_entry_hash);
+            cJSON_AddNumberToObject(o, "intent_sequence",
+                                    (double)intent->sequence);
+            cJSON_AddStringToObject(o, "intent_artifact_id",
+                                    intent->artifact_id);
+        } else {
+            cJSON_AddNullToObject(o, "intent_entry_hash");
+            cJSON_AddNullToObject(o, "intent_sequence");
+            cJSON_AddNullToObject(o, "intent_artifact_id");
+        }
 
         /* "executed" uses the codebase's own proof standard: assume the
          * command reached the device UNLESS the driver proved it did not
@@ -1032,6 +1073,198 @@ static void gate_emit_execution(onode_state_t *state,
     }
 
     if (body) free(body);
+}
+
+/* =========================================================================
+ * Pre-execution RECORD — evidence-required execution (Sep 1 review, Task 5)
+ *
+ * The gate_execution entry above is written after the device has acted;
+ * gate_emit_intent is written BEFORE. It is the durable statement "this
+ * node is about to dispatch this command to this device on behalf of
+ * this principal", committed to the chain — entry, head and body in one
+ * SQLite transaction — while the driver has not yet been called. The
+ * caller (onode_execute_obs_ex) refuses the operation if this append
+ * fails: a device action VIRP cannot record is a device action VIRP does
+ * not take. That is the inversion of the best-effort rule the other gate
+ * writes follow, and it is deliberate: those records describe what
+ * already happened; this one gates what is allowed to happen.
+ *
+ * The post-execution record (gate_execution, or outcome for an approved
+ * apply) carries this entry's chain_entry_hash as intent_entry_hash. A
+ * daemon that dies between the two leaves an intent with no closer; the
+ * verifier (virp_chain_verify_session / report/verify.py) reports that
+ * as an OPEN execution — "attempted, disposition unknown" — and never as
+ * a broken chain, because the chain is not broken: every entry present
+ * still hashes, links and authenticates.
+ *
+ * Same chain and same "gate-enforce:<device>" session as the rejections
+ * and executions, so a reader sees intent → outcome in sequence order
+ * under one prev-hash linkage. The body carries no device output (there
+ * is none yet) and no credential: device, driver, command, tiers, mode,
+ * uid, the v2 session id when the request is session-bound, and the
+ * proposal id when the dispatch is an approved apply.
+ * ========================================================================= */
+
+/* Hex of the active v2 session id (32 chars), or "" when the request is
+ * not session-bound. Under session_mutex like every other ctx read. */
+static void gate_session_hex(onode_state_t *state, char out[33])
+{
+    out[0] = '\0';
+    pthread_mutex_lock(&state->session_mutex);
+    if (state->ctx &&
+        virp_session_require_active(state->ctx) == VIRP_OK) {
+        for (int i = 0; i < 16; i++)
+            snprintf(out + i * 2, 3, "%02x",
+                     state->ctx->session.session_id[i]);
+    }
+    pthread_mutex_unlock(&state->session_mutex);
+}
+
+static virp_error_t gate_emit_intent(onode_state_t *state,
+                                     const char *device_name,
+                                     const virp_driver_t *drv,
+                                     const char *command,
+                                     virp_trust_tier_t gate_tier,
+                                     virp_trust_tier_t eff_max,
+                                     onode_gate_mode_t mode,
+                                     uid_t client_uid,
+                                     int obs_version,
+                                     const char *proposal_id,
+                                     virp_chain_entry_t *out_entry)
+{
+    if (!state->chain_enabled)
+        return VIRP_ERR_EVIDENCE_UNAVAILABLE;
+
+    char session_id[96];
+    snprintf(session_id, sizeof(session_id),
+             "gate-enforce:%s", device_name);
+
+    char sess_hex[33] = "";
+    if (obs_version == 2)
+        gate_session_hex(state, sess_hex);
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t intent_ns = (uint64_t)ts.tv_sec * 1000000000ull +
+                         (uint64_t)ts.tv_nsec;
+
+    /* cJSON does the escaping: command text is arbitrary. */
+    char *body = NULL;
+    cJSON *o = cJSON_CreateObject();
+    if (o) {
+        cJSON_AddStringToObject(o, "schema", "gate_intent/1");
+        cJSON_AddStringToObject(o, "device", device_name);
+        cJSON_AddStringToObject(o, "driver", drv->name);
+        cJSON_AddStringToObject(o, "command", command);
+        cJSON_AddStringToObject(o, "classified_tier",
+                                gate_tier_name(gate_tier));
+        cJSON_AddStringToObject(o, "gate_max_tier",
+                                gate_tier_name(state->gate_max_tier));
+        cJSON_AddStringToObject(o, "effective_max_tier",
+                                gate_tier_name(eff_max));
+        cJSON_AddStringToObject(o, "ceiling_source",
+                                onode_ceiling_source(state, client_uid));
+        cJSON_AddStringToObject(o, "gate_mode",
+                                mode == GATE_MODE_ENFORCE ? "ENFORCE"
+                                                          : "SHADOW");
+        cJSON_AddStringToObject(o, "decision",
+                                proposal_id ? "approved-apply"
+                                            : "auto-execute");
+        if (client_uid == (uid_t)-1)
+            cJSON_AddNullToObject(o, "uid");
+        else
+            cJSON_AddNumberToObject(o, "uid", (double)client_uid);
+        if (sess_hex[0])
+            cJSON_AddStringToObject(o, "session", sess_hex);
+        else
+            cJSON_AddNullToObject(o, "session");
+        if (proposal_id)
+            cJSON_AddStringToObject(o, "proposal_id", proposal_id);
+        else
+            cJSON_AddNullToObject(o, "proposal_id");
+        cJSON_AddNumberToObject(o, "obs_version", (double)obs_version);
+        /* Wall clock at intent time, so two dispatches of the same command
+         * by the same principal never share a body (and so an artifact_id). */
+        cJSON_AddNumberToObject(o, "intent_ns", (double)intent_ns);
+        body = cJSON_PrintUnformatted(o);
+        cJSON_Delete(o);
+    }
+    /* Unlike the after-the-fact records there is no commitment-only
+     * fallback here: a pre-execution record that cannot be read back is
+     * not evidence, and evidence is the condition for dispatch. */
+    if (!body) {
+        fprintf(stderr, "[GATE] intent record body could not be built "
+                "for device=%s — refusing to dispatch\n", device_name);
+        return VIRP_ERR_EVIDENCE_UNAVAILABLE;
+    }
+
+    char artifact_hash[65];
+    gate_sha256_hex(body, strlen(body), artifact_hash);
+    char artifact_id[64];
+    snprintf(artifact_id, sizeof(artifact_id),
+             "gateintent-%.16s", artifact_hash);
+
+    virp_error_t cerr = virp_chain_append_with_artifact(
+                            &state->chain, session_id,
+                            "gate_intent", artifact_id,
+                            artifact_hash, body, out_entry);
+    if (cerr == VIRP_OK) {
+        fprintf(stderr, "[GATE] intent persisted: session=%s seq=%lld "
+                "hash=%.16s tier=%s decision=%s\n",
+                session_id, (long long)out_entry->sequence,
+                out_entry->chain_entry_hash, gate_tier_name(gate_tier),
+                proposal_id ? "approved-apply" : "auto-execute");
+    } else {
+        fprintf(stderr, "[GATE] intent chain append+store FAILED: %s — "
+                "refusing to dispatch device=%s command=\"%s\"\n",
+                virp_error_str(cerr), device_name, command);
+    }
+    free(body);
+    return cerr;
+}
+
+/*
+ * The signed refusal for an evidence-unavailable dispatch. Deliberately
+ * NOT chained: the chain is what just failed. The refusal reaches the
+ * caller as an O-Key-signed ERROR observation whose payload cites
+ * "evidence-unavailable" and the underlying cause, and the journal
+ * carries the same line. executed=no is literal — the driver was never
+ * called.
+ */
+static virp_error_t gate_refuse_evidence_obs(onode_state_t *state,
+                                             const char *device_name,
+                                             int dev_idx,
+                                             const char *command,
+                                             virp_trust_tier_t gate_tier,
+                                             uid_t client_uid,
+                                             virp_error_t why,
+                                             uint8_t *out_buf,
+                                             size_t out_buf_len,
+                                             size_t *out_len)
+{
+    const char *cause = state->chain_enabled
+                        ? virp_error_str(why)
+                        : "no trust chain configured";
+    char err_msg[512];
+    snprintf(err_msg, sizeof(err_msg),
+             "ERROR: evidence-unavailable: refused '%s' on '%s' (tier=%s): "
+             "pre-execution record could not be made durable (%s); "
+             "nothing was dispatched",
+             command, device_name, gate_tier_name(gate_tier), cause);
+    fprintf(stderr, "[GATE] decision=refuse reason=evidence-unavailable "
+            "device=%s tier=%s uid=%ld cause=\"%s\" command=\"%s\"\n",
+            device_name, gate_tier_name(gate_tier),
+            (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
+            cause, command);
+    log_error_obs(device_name, gate_tier, err_msg);
+    return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                  state->devices[dev_idx].node_id,
+                                  onode_next_seq(state),
+                                  VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                  gate_obs_tier(gate_tier),
+                                  (const uint8_t *)err_msg,
+                                  (uint16_t)strlen(err_msg),
+                                  &state->okey);
 }
 
 virp_error_t onode_execute(onode_state_t *state,
@@ -1860,6 +2093,51 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                       &state->okey);
     }
 
+    /* ── EVIDENCE-REQUIRED (Sep 1 review, Task 5) ─────────────────────
+     * The device is connected and the gate has admitted the command;
+     * nothing has been sent yet. Commit the pre-execution record NOW,
+     * before the driver is called. If it cannot be made durable the
+     * operation is refused with a signed ERROR observation — the driver
+     * is never dispatched, so "refused" is literally true. The cached
+     * connection is left in place: nothing about the device is suspect.
+     *
+     * An approved apply reaching this point has ALREADY consumed its
+     * single-use approval (verify_consume ran in the gate block). If the
+     * intent append fails here the approval is spent and the command did
+     * not run; the operator re-proposes. Spending an approval is the
+     * cheaper failure — the alternative is executing without a record.
+     *
+     * evidence_required=false keeps the historical shape: no pre-record,
+     * best-effort record after the fact — and says so, at WARNING, on
+     * every dispatch, because that is precisely the case where the
+     * ledger can miss an action that happened. */
+    virp_chain_entry_t intent_ce;
+    const virp_chain_entry_t *intent = NULL;
+    if (state->evidence_required) {
+        virp_error_t ierr = gate_emit_intent(state, device_name, drv,
+                                             command, gate_tier,
+                                             gate_eff_max, gate_mode,
+                                             client_uid, obs_version,
+                                             approved ? proposal_id : NULL,
+                                             &intent_ce);
+        if (ierr != VIRP_OK) {
+            pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+            return gate_refuse_evidence_obs(state, device_name, dev_idx,
+                                            command, gate_tier, client_uid,
+                                            ierr, out_buf, out_buf_len,
+                                            out_len);
+        }
+        intent = &intent_ce;
+    } else {
+        fprintf(stderr, "[GATE] WARNING: evidence_required=false — "
+                "dispatching device=%s tier=%s uid=%ld command=\"%s\" "
+                "with NO durable pre-execution record; the only ledger "
+                "entry is written after the device has acted, best-effort\n",
+                device_name, gate_tier_name(gate_tier),
+                (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
+                command);
+    }
+
     virp_exec_result_t result;
     memset(&result, 0, sizeof(result));   /* no_dispatch=false unless the
                                              driver proves otherwise */
@@ -1879,10 +2157,10 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         if (!approved)
             gate_emit_execution(state, device_name, drv, command, gate_tier,
                                 gate_eff_max, gate_mode, client_uid,
-                                NULL, err_msg);
+                                intent, NULL, err_msg);
         if (approved)
             approval_emit_outcome(state, proposal_id, &apr,
-                                  device_name, false);
+                                  device_name, false, intent);
         log_error_obs(device_name, gate_tier, err_msg);
         return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
@@ -1926,10 +2204,10 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                 if (!approved)
                     gate_emit_execution(state, device_name, drv, command,
                                         gate_tier, gate_eff_max, gate_mode,
-                                        client_uid, NULL, err_msg);
+                                        client_uid, intent, NULL, err_msg);
                 if (approved)
                     approval_emit_outcome(state, proposal_id, &apr,
-                                          device_name, false);
+                                          device_name, false, intent);
                 log_error_obs(device_name, gate_tier, err_msg);
                 return virp_build_observation_tiered(
                     out_buf, out_buf_len, out_len,
@@ -2056,10 +2334,10 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         if (!approved)
             gate_emit_execution(state, device_name, drv, command, gate_tier,
                                 gate_eff_max, gate_mode, client_uid,
-                                &result, err_msg);
+                                intent, &result, err_msg);
         if (approved)
             approval_emit_outcome(state, proposal_id, &apr,
-                                  device_name, false);
+                                  device_name, false, intent);
         fprintf(stderr, "[ERROR-OBS] device=%s tier=%s executed=unknown "
                 "disposition=%s reason=\"%s\"\n", device_name,
                 gate_tier_name(gate_tier),
@@ -2132,10 +2410,10 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         if (!approved)
             gate_emit_execution(state, device_name, drv, command, gate_tier,
                                 gate_eff_max, gate_mode, client_uid,
-                                &result, err_msg);
+                                intent, &result, err_msg);
         if (approved)
             approval_emit_outcome(state, proposal_id, &apr,
-                                  device_name, false);
+                                  device_name, false, intent);
         log_error_obs(device_name, gate_tier, err_msg);
         return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
@@ -2166,7 +2444,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     if (!approved)
         gate_emit_execution(state, device_name, drv, command, gate_tier,
                             gate_eff_max, gate_mode, client_uid,
-                            &result, NULL);
+                            intent, &result, NULL);
 
     const uint8_t *obs_data = (const uint8_t *)result.output;
     uint16_t data_len = (result.output_len > 65530) ?
@@ -2236,7 +2514,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     VIRP_FI("pre_outcome");
     if (approved)
         approval_emit_outcome(state, proposal_id, &apr,
-                              device_name, result.success);
+                              device_name, result.success, intent);
 
     if (err == VIRP_OK) {
         pthread_mutex_lock(&state->state_mutex);
@@ -3624,11 +3902,13 @@ static void handle_client(onode_state_t *state, int client_fd,
             char json_buf[1024];
             int jlen = snprintf(json_buf, sizeof(json_buf),
                 "{\"entries_checked\":%lld,"
+                "\"executions_open\":%lld,"
                 "\"first_broken\":%lld,"
                 "\"from_sequence\":%lld,"
                 "\"to_sequence\":%lld,"
                 "\"valid\":%s}",
                 (long long)vresult.entries_checked,
+                (long long)vresult.executions_open,
                 (long long)vresult.first_broken,
                 (long long)vresult.from_sequence,
                 (long long)vresult.to_sequence,
@@ -3679,12 +3959,14 @@ static void handle_client(onode_state_t *state, int client_fd,
             int jlen = snprintf(json_buf, sizeof(json_buf),
                 "{\"entries_checked\":%lld,"
                 "\"error_detail\":\"%s\","
+                "\"executions_open\":%lld,"
                 "\"first_broken\":%lld,"
                 "\"from_sequence\":%lld,"
                 "\"to_sequence\":%lld,"
                 "\"valid\":%s}",
                 (long long)vresult.entries_checked,
                 vresult.error_detail,
+                (long long)vresult.executions_open,
                 (long long)vresult.first_broken,
                 (long long)vresult.from_sequence,
                 (long long)vresult.to_sequence,
@@ -4655,6 +4937,15 @@ virp_error_t onode_init(onode_state_t *state,
     state->gate_default_mode = GATE_MODE_ENFORCE;
     state->gate_overrides_count = 0;
     state->gate_max_tier = VIRP_TIER_YELLOW;
+    /* Evidence-required execution (Sep 1 review, Task 5): TRUE by
+     * default for the same reason ENFORCE is — an absent or garbled
+     * config must fail CLOSED. A daemon that cannot make a pre-execution
+     * record durable refuses to dispatch; only an explicit
+     * "evidence_required": false in the config opts a node back into
+     * record-after-the-fact, and every dispatch then logs a WARNING. The
+     * prod loader (load_gate_config) is the only place that clears it;
+     * the dev loader parses no gate keys. */
+    state->evidence_required = true;
     state->uptime_start = (uint32_t)time(NULL);
     state->watchdog_running = false;
     pthread_mutex_init(&state->state_mutex, NULL);

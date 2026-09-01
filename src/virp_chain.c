@@ -545,6 +545,7 @@ bool virp_chain_type_is_daemon_reserved(const char *artifact_type)
         "outcome",         /* src/virp_onode.c     (gate)     */
         "gate_rejection",  /* src/virp_onode.c     (gate)     */
         "gate_execution",  /* src/virp_onode.c     (gate)     */
+        "gate_intent",     /* src/virp_onode.c     (gate, pre-dispatch) */
         "validation",      /* src/virp_validator.c            */
     };
     return type_in(artifact_type, RESERVED,
@@ -2080,6 +2081,43 @@ static int chain_verify_binding_locked(virp_chain_state_t *state,
     return verdict;
 }
 
+/*
+ * Is the gate_intent entry with this chain_entry_hash CLOSED — does a
+ * gate_execution or outcome entry, in ANY session, carry it as
+ * intent_entry_hash in its stored body? The closer is found by the exact
+ * token the daemon writes ("intent_entry_hash":"<64 hex>"), matched with
+ * instr() against bodies joined on the (artifact_id, artifact_hash) pair
+ * the closer's entry commits to — so a planted body with no entry, or a
+ * body under a different commitment, does not close anything. Cross-
+ * session on purpose: an approved apply's intent lives in
+ * gate-enforce:<device> while its outcome lives in approval:<device>.
+ * Mirrors report/verify.py grade_open_executions().
+ *
+ * A store that cannot be read yields "not closed": the honest direction,
+ * since an intent whose closer cannot be found is exactly an open one.
+ */
+static bool chain_intent_closed_locked(virp_chain_state_t *state,
+                                       const char *intent_hash)
+{
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT 1 FROM chain_entries c "
+            "JOIN artifacts a ON a.artifact_id = c.artifact_id "
+            "               AND a.artifact_hash = c.artifact_hash "
+            "WHERE c.artifact_type IN ('gate_execution', 'outcome') "
+            "  AND instr(a.artifact_content, ?) > 0 LIMIT 1",
+            -1, &st, NULL) != SQLITE_OK)
+        return false;
+
+    char needle[96];
+    snprintf(needle, sizeof(needle), "\"intent_entry_hash\":\"%s\"",
+             intent_hash);
+    sqlite3_bind_text(st, 1, needle, -1, SQLITE_TRANSIENT);
+    bool closed = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    return closed;
+}
+
 static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                                const char *session_id,
                                int64_t from_sequence,
@@ -2293,6 +2331,19 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
             }
             if (bind == 0) result->artifacts_unverifiable++;
             else           result->artifacts_bound++;
+        }
+
+        /* OPEN EXECUTIONS (Sep 1 review, Task 5). A gate_intent entry
+         * says the daemon was about to dispatch; its closer says what
+         * came of it. No closer anywhere = the daemon never got to write
+         * one = an execution whose disposition is unknown. Counted,
+         * reported, and NEVER a failure: the chain is intact, the world
+         * beyond its last entry is what is uncertain. */
+        if (strcmp(e.artifact_type, "gate_intent") == 0) {
+            if (chain_intent_closed_locked(state, e.chain_entry_hash))
+                result->executions_closed++;
+            else
+                result->executions_open++;
         }
 
         /* Advance */

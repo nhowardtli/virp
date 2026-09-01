@@ -45,6 +45,7 @@ Copyright 2026 Third Level IT LLC — Apache 2.0
 import base64
 import hashlib
 import hmac
+import json
 import struct
 
 VIRP_HEADER_SIZE = 56
@@ -176,6 +177,21 @@ NO_BODY_TYPES = frozenset(("gate_rejection",))
 # it as one, the bridge's evidence would bind by hash and never be checked
 # for a signature at all, which is the weaker claim of the two.
 OBSERVATION_TYPES = frozenset(("observation", "fed_observation"))
+
+# 4. EVIDENCE-REQUIRED execution (Sep 1 review, Task 5). Under the daemon's
+#    default posture every gate-admitted dispatch is preceded by a
+#    gate_intent entry (committed BEFORE the driver runs) and followed by a
+#    closer — gate_execution, or outcome for an approved apply — whose
+#    stored body names the intent's chain_entry_hash as intent_entry_hash.
+#    An intent with no closer anywhere in the selection is an OPEN
+#    execution: the daemon died between the two, the device may or may not
+#    have acted, and the target must be reconciled out-of-band. It is NOT
+#    a chain failure — every entry present still hashes, links and
+#    authenticates — so it is reported beside the tally, never folded into
+#    failed_entries. Mirrors chain_intent_closed_locked() in
+#    src/virp_chain.c, which asks the same question with SQL.
+INTENT_TYPE = "gate_intent"
+INTENT_CLOSER_TYPES = frozenset(("gate_execution", "outcome"))
 
 RETENTION_TRUNCATED = (
     "artifact body was truncated at the daemon's %d-byte storage limit; the "
@@ -915,6 +931,43 @@ def corroborate_v2(verifications, v2_journal):
                 "in the daemon journal for its time range" % sid)
 
 
+def grade_open_executions(verifications):
+    """Split gate_intent entries into CLOSED (a gate_execution / outcome
+    body in the selection cites their chain_entry_hash) and OPEN (none
+    does). Returns (open_list, closed_count).
+
+    Graded within the selected entries only: a filtered report that
+    excludes the closer's session (an approved apply closes its intent
+    from approval:<device>, not gate-enforce:<device>) will show that
+    intent as open. Run unfiltered to grade the whole database.
+    """
+    cited = set()
+    for v in verifications:
+        if v.entry["artifact_type"] not in INTENT_CLOSER_TYPES:
+            continue
+        if v.artifact_raw is None:
+            continue
+        try:
+            body = json.loads(v.artifact_raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(body, dict):
+            continue
+        h = body.get("intent_entry_hash")
+        if isinstance(h, str) and h:
+            cited.add(h)
+
+    open_, closed = [], 0
+    for v in verifications:
+        if v.entry["artifact_type"] != INTENT_TYPE:
+            continue
+        if v.entry["chain_entry_hash"] in cited:
+            closed += 1
+        else:
+            open_.append(v)
+    return open_, closed
+
+
 def verify_chain(entries, artifacts, okey=None, chain_key=None,
                  heads=None, selection_complete=False, v2_journal=None):
     """Verify a list of chain entries (dicts) in session/sequence order.
@@ -984,6 +1037,10 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None,
 
     summary = summarize(verifications)
     summary["heads"] = head_results
+    # Open executions (Task 5): reported, never a failure — see
+    # grade_open_executions. Kept out of failed_entries on purpose.
+    summary["open_executions"], summary["executions_closed"] = \
+        grade_open_executions(verifications)
     # Fold head FAILs into failed_entries so every consumer of the summary
     # — the PDF failure table, the printed tally, the process exit code —
     # fails when a session's length claim fails. Adversarial audit

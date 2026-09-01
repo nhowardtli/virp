@@ -458,8 +458,23 @@ static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
  *
  * ("gate_mode" is accepted as a deprecated alias for gate_default_mode.)
  *
+ *   "evidence_required": true (default) | false   -- Sep 1 review, Task 5.
+ *                        true: every gate-admitted execution is preceded
+ *                        by a durable gate_intent chain entry; if that
+ *                        append fails the operation is REFUSED (signed
+ *                        ERROR observation citing evidence-unavailable)
+ *                        and the driver is never dispatched. Requires a
+ *                        trust chain (-c/-C): the daemon refuses to START
+ *                        with evidence required and no chain.
+ *                        false: record after the fact, best-effort (the
+ *                        pre-Task-5 shape); every dispatch logs a WARNING
+ *                        that it ran without a durable record. A value
+ *                        that is not a JSON boolean is logged and IGNORED
+ *                        — the default stays true (fail closed).
+ *
  * Absent keys leave the onode_init() defaults (ENFORCE default / no
- * overrides / YELLOW) in place. Unrecognized values are logged and ignored.
+ * overrides / YELLOW / evidence required) in place. Unrecognized values
+ * are logged and ignored.
  */
 static void load_gate_config(onode_state_t *state, struct json_object *root)
 {
@@ -519,12 +534,31 @@ static void load_gate_config(onode_state_t *state, struct json_object *root)
         }
     }
 
+    /* Evidence-required execution. Only a literal JSON false clears it;
+     * a string "false", a 0, or a typo keeps the compiled-in true. */
+    if (json_object_object_get_ex(root, "evidence_required", &v)) {
+        if (json_object_is_type(v, json_type_boolean)) {
+            state->evidence_required = json_object_get_boolean(v) ? true
+                                                                  : false;
+            if (!state->evidence_required)
+                fprintf(stderr, "[O-Node] WARNING: evidence_required=false "
+                        "— executions will be recorded AFTER the device "
+                        "acts, best-effort; an action the chain cannot "
+                        "record will still run\n");
+        } else {
+            fprintf(stderr, "[O-Node] evidence_required is not a JSON "
+                            "boolean — keeping the default (true)\n");
+        }
+    }
+
     /* Log resolved posture. */
-    fprintf(stderr, "[O-Node] tier gate: default=%s max_tier=%s overrides=%zu\n",
+    fprintf(stderr, "[O-Node] tier gate: default=%s max_tier=%s overrides=%zu "
+            "evidence_required=%s\n",
             state->gate_default_mode == GATE_MODE_ENFORCE ? "ENFORCE" : "SHADOW",
             state->gate_max_tier == VIRP_TIER_GREEN  ? "GREEN"  :
             state->gate_max_tier == VIRP_TIER_RED    ? "RED"    : "YELLOW",
-            state->gate_overrides_count);
+            state->gate_overrides_count,
+            state->evidence_required ? "true" : "false");
     for (size_t i = 0; i < state->gate_overrides_count; i++)
         fprintf(stderr, "[O-Node]   override: %s=%s\n",
                 state->gate_overrides[i].driver,
@@ -1040,6 +1074,29 @@ virp_error_t onode_setup_chain_and_approvals(onode_state_t *state,
             fprintf(stderr, "[O-Node] Trust chain enabled: db=%s\n",
                     chain_db_path);
         }
+    }
+
+    /*
+     * Evidence-required execution (Sep 1 review, Task 5) needs somewhere
+     * to put the pre-execution record. Without a usable chain every
+     * execute would be refused at request time (evidence-unavailable) —
+     * correct, but a daemon that can never act is a misconfiguration
+     * best reported at boot, by name, the same way an unmapped allowed
+     * uid is (Task 2). Opting out is explicit: "evidence_required": false
+     * in the device config, which the loader logs as a WARNING.
+     */
+    if (state->evidence_required && !state->chain_enabled) {
+        fprintf(stderr, "[O-Node] FATAL: evidence_required is true (the "
+                "default) but no trust chain is %s. Every execution "
+                "would be refused as evidence-unavailable. Pass -c "
+                "<chain.db> and -C <chain.key>, or set "
+                "\"evidence_required\": false in the device config to "
+                "run WITHOUT durable pre-execution records. Refusing "
+                "to start.\n",
+                !chain_configured ? "configured"
+                                  : "usable (chain init failed)");
+        return (chain_configured && chain_err != VIRP_OK)
+               ? chain_err : VIRP_ERR_EVIDENCE_UNAVAILABLE;
     }
 
     /*

@@ -553,6 +553,13 @@ typedef enum {
      * a flow whose approve half just succeeded. */
     VIRP_ERR_APPROVAL_STORE_UNREADABLE = -52, /* store present, not
                                                  readable by this uid */
+    /* Evidence-required execution (Sep 1 review, Task 5): the gate could
+     * not make the pre-execution record durable — chain absent, read-only,
+     * full, or the record body could not be built — so the operation was
+     * REFUSED before the driver was dispatched. Nothing reached the
+     * device. Surfaced to the caller as a signed ERROR observation whose
+     * payload cites "evidence-unavailable". */
+    VIRP_ERR_EVIDENCE_UNAVAILABLE     = -53,
 
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */

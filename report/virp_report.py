@@ -579,6 +579,43 @@ def section_integrity(story, ss, summary, verifications):
             "hash of its predecessor, and each sequence 0 matches "
             "sha256(\"VIRP_CHAIN_GENESIS:\" + session_id).", ss["Note"]))
 
+    open_execs = summary.get("open_executions", [])
+    if open_execs:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(
+            '<font color="%s"><b>%d OPEN EXECUTION%s.</b></font> The daemon '
+            "committed a pre-execution record (gate_intent) and never "
+            "recorded what came of it: it died, or was killed, between "
+            "dispatching the command and writing the outcome. The device "
+            "may or may not have acted. <b>This is not a chain failure</b> "
+            "— every entry present verified — but each one below must be "
+            "reconciled against the target out-of-band:"
+            % (vhex(verify.UNVERIFIABLE), len(open_execs),
+               "" if len(open_execs) == 1 else "S"), ss["Note"]))
+        rows = [[Paragraph("<b>session</b>", ss["MonoSmall"]),
+                 Paragraph("<b>seq</b>", ss["MonoSmall"]),
+                 Paragraph("<b>intent</b>", ss["MonoSmall"])]]
+        for v in open_execs:
+            try:
+                b = json.loads((v.artifact_raw or b"").decode("utf-8"))
+                what = "%s: %s (tier %s, %s)" % (
+                    b.get("device", "?"), b.get("command", "?"),
+                    b.get("classified_tier", "?"), b.get("decision", "?"))
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                what = "(body not decodable)"
+            rows.append([Paragraph(v.entry["session_id"], ss["MonoSmall"]),
+                         Paragraph(str(v.entry["sequence"]), ss["MonoSmall"]),
+                         Paragraph(trunc(what, 120), ss["MonoSmall"])])
+        t = Table(rows, colWidths=(2.6 * inch, 0.6 * inch, 7.1 * inch),
+                  hAlign="LEFT", repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), HEAD_BG),
+            ("BACKGROUND", (0, 1), (-1, -1), UNVERIFIABLE_BG),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#c0c0c0")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(t)
+
     reasons = summary["retention_reasons"]
     if reasons:
         story.append(Spacer(1, 8))
@@ -1279,6 +1316,11 @@ def main(argv=None):
         print("  v2 session obs  : %d (at-rest unverifiable by design; "
               "journal corroboration: %s)"
               % (summary["obs_v2"], _fmt(jt)))
+    open_execs = summary.get("open_executions", [])
+    if open_execs:
+        print("  OPEN EXECUTIONS : %d (gate_intent with no linked outcome — "
+              "the daemon died mid-dispatch; reconcile against the target. "
+              "Not a chain failure.)" % len(open_execs))
     if failed:
         print("  FAILED ENTRIES  : %d" % failed)
     # Exit 1 on any verification failure so a caller can gate on it. The PDF

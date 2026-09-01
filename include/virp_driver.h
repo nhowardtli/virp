@@ -444,6 +444,10 @@ int  virp_driver_mock_probe_count(void);
 void virp_driver_mock_set_unknown_fail(const char *msg);
 /* Total execute() invocations since the last reset; resets to zero. */
 int  virp_driver_mock_exec_attempts_reset(void);
+/* Crash hook: execute() SIGKILLs the calling process. For a forked test
+ * child only — it models a daemon dying between the pre-execution record
+ * and the outcome record. */
+void virp_driver_mock_set_crash_in_execute(bool on);
 
 /* Real drivers — conditionally compiled */
 #ifdef VIRP_DRIVER_CISCO

@@ -1126,6 +1126,66 @@ I/O, not within one append. The EXECUTION_INTENT proposal
 disposition unknown"; until then an unresolved apply is genuinely ambiguous
 and must be reconciled out-of-band against the target.
 
+### Evidence-required execution (`evidence_required`, Sep 1 review, Task 5)
+
+The paragraph above described the shipped state until 2026-09-01, and it
+understated it: not only an approved apply but **every** gate-admitted
+execution was recorded only *after* the device had acted, by
+`gate_emit_execution()`, and that append was best-effort — a chain failure
+was logged and ignored. Reproduced directly (`tests/test_onode.c`,
+`test_evidence_append_failure_refuses_and_executes_nothing`, run against the
+unfixed tree): with the chain forced read-only, the mock device executed once
+and the caller received an ordinary DEVICE_OUTPUT observation while the
+journal read `[GATE] execution chain append+store failed`.
+
+The daemon now has an **evidence-required** mode, on by default
+(`onode_init()`; config key `evidence_required`, a JSON boolean, shipped as
+`true` in both deploy templates):
+
+- **Before dispatch** the gate commits a `gate_intent` chain entry — device,
+  driver, command, classified and effective tier, gate mode, uid, the v2
+  session id when session-bound, the proposal id for an approved apply — in
+  the device's `gate-enforce:<device>` session, entry + head + body in one
+  SQLite transaction. The driver is not called until that commit returns.
+- **If the append fails** (chain absent, read-only, full, body unbuildable)
+  the operation is **refused**: a signed ERROR observation whose payload
+  cites `evidence-unavailable` and the cause, `[GATE] decision=refuse
+  reason=evidence-unavailable` in the journal, and `VIRP_ERR_EVIDENCE_UNAVAILABLE`
+  as the typed reason. Nothing is dispatched. An approved apply that fails
+  here has already spent its single-use approval; the operator re-proposes.
+  Spending an approval is the cheaper failure.
+- **After execution** the `gate_execution` entry (or the `outcome` entry for
+  an approved apply) carries `intent_entry_hash` = the intent's
+  `chain_entry_hash`, plus `intent_sequence` / `intent_artifact_id` for the
+  reader. Two linked entries per dispatch.
+- **A crash between the two** leaves an intent with no closer. Both verifiers
+  — `virp_chain_verify_session()` (`executions_open` / `executions_closed`,
+  printed by `virp chain-verify` as `OPEN_EXECUTIONS=n` and returned by the
+  daemon's `chain_verify` / `chain_verify_session` actions) and
+  `report/verify.py` (`summary["open_executions"]`, rendered by the report
+  and printed by `virp-report`) — report it as an **open execution**: the
+  chain is VALID, the world after its last word is what is uncertain.
+  Reconcile against the target. Measured, not assumed: the crash test forks a
+  fresh daemon, SIGKILLs it inside the driver, and verifies the recovered
+  database.
+- **A daemon with evidence required and no usable chain refuses to start**
+  (`onode_setup_chain_and_approvals()`), naming the fix: pass `-c`/`-C`, or
+  set `"evidence_required": false`. The library-level belt refuses each
+  dispatch as evidence-unavailable if that state is ever reached anyway.
+- **`evidence_required: false`** restores the record-after-the-fact posture
+  exactly, and logs `[GATE] WARNING: evidence_required=false — dispatching …
+  with NO durable pre-execution record` on every dispatch. `gate_execution`
+  and `outcome` bodies then carry `intent_entry_hash: null`.
+
+What this changes in the claim above: an execution VIRP admitted is now either
+recorded before it happens or does not happen. The residual — an intent whose
+outcome was never written — is no longer indistinguishable from "never
+contacted the device": it is reported by name as open. The
+"recorded-happened-once" guarantee is unchanged. `gate_intent` is a
+daemon-reserved artifact type like `gate_execution`: a socket client cannot
+mint one, so it cannot plant an open execution against a device nothing
+touched.
+
 ### Crash and storage-failure durability — measured, not assumed
 
 Earlier this section could only say "SIGKILL, not power loss". That gap is now
@@ -1150,7 +1210,9 @@ own integrity guarantee held throughout:
    chain's own head/entry consistency, never from the ack.
 2. The "recorded-happened-once" gap above (a crash between device I/O and the
    OUTCOME append) is orthogonal to storage durability and is not closed by any
-   of these results; EXECUTION_INTENT is its remedy.
+   of these results. Since 2026-09-01 the evidence-required mode above makes
+   that crash *visible* — an open execution — rather than silent; it does not
+   make it impossible.
 
 ## Verifier Limitations
 

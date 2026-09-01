@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 
 /* Test hook: optional per-execute delay in milliseconds */
 static int mock_delay_ms = 0;
@@ -135,6 +136,31 @@ static void mock_count_exec_attempt(void)
     pthread_mutex_lock(&mock_hook_mutex);
     mock_exec_attempts++;
     pthread_mutex_unlock(&mock_hook_mutex);
+}
+
+/* Test hook: the process dies INSIDE execute() — after the O-Node has
+ * committed the pre-execution record and before the device could answer.
+ * SIGKILL, not exit(): what survives is what was already durable, exactly
+ * as in include/virp_fault_inject.h. Only a test child process arms it. */
+static bool mock_crash_in_execute = false;
+void virp_driver_mock_set_crash_in_execute(bool on)
+{
+    pthread_mutex_lock(&mock_hook_mutex);
+    mock_crash_in_execute = on;
+    pthread_mutex_unlock(&mock_hook_mutex);
+}
+
+static void mock_maybe_crash(void)
+{
+    pthread_mutex_lock(&mock_hook_mutex);
+    bool die = mock_crash_in_execute;
+    pthread_mutex_unlock(&mock_hook_mutex);
+    if (!die) return;
+    fprintf(stderr, "[MOCK] crash-in-execute armed — SIGKILL self pid=%d\n",
+            (int)getpid());
+    fflush(stderr);
+    kill(getpid(), SIGKILL);
+    _exit(137);
 }
 
 void virp_driver_mock_set_shared_channel(bool on)
@@ -278,6 +304,7 @@ static virp_error_t mock_execute(virp_conn_t *conn,
 
     memset(result, 0, sizeof(*result));
     mock_count_exec_attempt();
+    mock_maybe_crash();
 
     /* Test hook: simulate driver-level error (not just result.success=false) */
     if (mock_forced_error != VIRP_OK)
