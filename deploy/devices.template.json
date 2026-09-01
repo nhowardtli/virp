@@ -15,7 +15,81 @@
   ],
   "_socket_uid_tier_ceilings_note": "Per-uid tier ceilings (2026-08-09). A uid listed here has its effective gate ceiling TIGHTENED to the named tier and can NEVER raise the node-wide gate_max_tier. ${VIRP_NETCLAW_UID} (virp-netclaw, the remote netclaw requester) is pinned to GREEN: reads auto-execute, while YELLOW and RED both become proposal-only for it — local operators (uid 1000) and the autopilot keep the node-wide YELLOW ceiling. This is what makes the remote AI path read-only-by-default without lowering the whole node. Enforced in onode_execute_obs_ex via onode_effective_max_tier, on BOTH the single and batch execute paths; the connecting uid is SO_PEERCRED, not client-asserted.",
   "socket_uid_tier_ceilings": {
-    "${VIRP_NETCLAW_UID}": "green"
+    "${VIRP_NETCLAW_UID}": "green",
+    "${VIRP_BACKUP_UID}": "green",
+    "${VIRP_EVIDENCE_UID}": "green"
+  },
+  "_socket_uid_action_allow_note": "Per-uid ACTION allowlists (Item 8 mechanism 2026-08-11; config made mandatory Sep 1 review, Task 2). EVERY uid in socket_allowed_uids MUST have an entry here: the daemon treats an allowed-but-unmapped uid as unrestricted (shutdown included), so onode_start() now REFUSES TO RUN, naming the uid, when this object does not cover the allowlist \u2014 a forgotten entry is a boot failure, never a silent grant. Sets are the verbs each client actually sends, nothing more: ${VIRP_UID} is the daemon's own service account (autopilot, evidence report, camera submit-spool, virp-tool run as virp) and gets the full wire vocabulary EXCEPT shutdown \u2014 no client sends it and the unit stops on SIGTERM; 1000 is the interactive operator and keeps everything including shutdown; ${VIRP_BACKUP_UID} (autopilot/virp_config_backup.py) and ${VIRP_EVIDENCE_UID} (autopilot/virp_evidence.py) send exactly execute + chain_append \u2014 their reads go through the gate as execute, so execute cannot be withheld without ending collection; both are additionally read-only by classification (GREEN reads, per-uid GREEN ceiling); ${VIRP_NETCLAW_UID} gets what the installed virp-bridge-mcp.py on netclaw sends today (session_hello, session_bind, execute, chain_append \u2014 chain_append is type-narrowed to the federation triple for any mapped uid) and, pointedly, not shutdown, not list_fleet/health/chain_verify which that client never sends; ${VIRP_BROKER_UID} gets the broker's own relay allowlist (broker/virp_broker.py ALLOWED_ACTIONS). tests/test_template_uid_policy.py renders this file and asserts the coverage and the no-shutdown rule for the four service identities.",
+  "socket_uid_action_allow": {
+    "${VIRP_UID}": [
+      "execute",
+      "health",
+      "heartbeat",
+      "list_devices",
+      "list_fleet",
+      "sign_intent",
+      "sign_outcome",
+      "chain_append",
+      "chain_verify",
+      "chain_verify_session",
+      "intent_store",
+      "intent_get",
+      "intent_execute",
+      "batch_execute",
+      "validate_turn",
+      "approval_challenge",
+      "approval_submit",
+      "session_hello",
+      "session_bind",
+      "session_close"
+    ],
+    "1000": [
+      "execute",
+      "health",
+      "heartbeat",
+      "list_devices",
+      "list_fleet",
+      "sign_intent",
+      "sign_outcome",
+      "chain_append",
+      "chain_verify",
+      "chain_verify_session",
+      "intent_store",
+      "intent_get",
+      "intent_execute",
+      "batch_execute",
+      "validate_turn",
+      "approval_challenge",
+      "approval_submit",
+      "session_hello",
+      "session_bind",
+      "session_close",
+      "shutdown"
+    ],
+    "${VIRP_BACKUP_UID}": [
+      "execute",
+      "chain_append"
+    ],
+    "${VIRP_EVIDENCE_UID}": [
+      "execute",
+      "chain_append"
+    ],
+    "${VIRP_NETCLAW_UID}": [
+      "session_hello",
+      "session_bind",
+      "execute",
+      "chain_append"
+    ],
+    "${VIRP_BROKER_UID}": [
+      "execute",
+      "list_devices",
+      "health",
+      "heartbeat",
+      "intent_store",
+      "intent_get",
+      "approval_challenge",
+      "approval_submit"
+    ]
   },
   "gate_default_mode": "enforce",
   "gate_max_tier": "yellow",

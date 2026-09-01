@@ -430,11 +430,15 @@ class SpoolJobNamingTests(unittest.TestCase):
         os.makedirs(out)
         sha = "b" * 64
         name = vc.spool_job_name("tapo-c100", 3, sha)
-        for ext in (".mp4", ".body"):
-            open(os.path.join(out, name + ext), "wb").close()
-        pair = vc._staged_pair(out, sha)
+        open(os.path.join(out, name + ".mp4"), "wb").close()
+        with open(os.path.join(out, name + ".body"), "w") as f:
+            json.dump({"segment_sha256": sha, "capture_end_utc_ns": 5}, f)
+        # matched on content AND capture end (Task 1: record identity)
+        pair = vc._staged_pair(out, sha, 5)
         self.assertIsNotNone(pair)
         self.assertEqual(os.path.basename(pair[1]), name + ".body")
+        # a different segment with the same bytes is not this pair
+        self.assertIsNone(vc._staged_pair(out, sha, 6))
 
 
 class MultiProducerAuditTests(unittest.TestCase):

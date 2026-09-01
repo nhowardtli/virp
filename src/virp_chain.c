@@ -361,7 +361,11 @@ virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,
      * ACCEPTED; only an artifacts row proves the BODY was retained. The
      * two came apart on this very path — the entry landed and the body
      * did not — so asking the entries table here would answer the wrong
-     * question and pass exactly the case this exists to catch. */
+     * question and pass exactly the case this exists to catch.
+     *
+     * Type-blind by design (any artifact_type), which is why it is NOT
+     * a commitment check: chain_append's fed_outcome gate asks
+     * virp_chain_entry_commits_to() below instead (Sep 1 review, Task 3). */
     sqlite3_stmt *st = NULL;
     virp_error_t rc = VIRP_OK;
     if (sqlite3_prepare_v2(state->db,

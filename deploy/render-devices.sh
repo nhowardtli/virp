@@ -94,29 +94,34 @@ walk_strings(data, collect)
 # VIRP_UID resolves the daemon's own uid so socket_allowed_uids can be
 # expressed portably in the tracked template instead of hardcoding a number
 # that differs per host. The loader accepts uids as strings.
-if "VIRP_UID" in used:
+# Account lookups are LAZY — done only when autopilot.env does not
+# already carry the value — so a sandbox render (tests/test_template_
+# uid_policy.py, CI) that supplies every uid in its env file can run on
+# a host that has none of the accounts; an eager setdefault() argument
+# used to raise KeyError there before the env value was even consulted.
+# Production is unchanged: the accounts exist and the env does not name
+# them, so the lookup runs exactly as before.
+if "VIRP_UID" in used and "VIRP_UID" not in os.environ:
     import pwd
-    os.environ.setdefault("VIRP_UID", str(pwd.getpwnam("virp").pw_uid))
+    os.environ["VIRP_UID"] = str(pwd.getpwnam("virp").pw_uid)
 
 # VIRP_BACKUP_UID is the config-backup runbook's dedicated identity
 # (virp-lab only — the node2 template does not name it). Resolved the
 # same way as VIRP_UID; if the template names it, the user MUST exist,
 # so a missing account fails the render (and the daemon start) loudly
 # instead of silently shipping an allowlist that rejects the runbook.
-if "VIRP_BACKUP_UID" in used:
+if "VIRP_BACKUP_UID" in used and "VIRP_BACKUP_UID" not in os.environ:
     import pwd
-    os.environ.setdefault("VIRP_BACKUP_UID",
-                          str(pwd.getpwnam("virp-backup").pw_uid))
+    os.environ["VIRP_BACKUP_UID"] = str(pwd.getpwnam("virp-backup").pw_uid)
 
 # VIRP_EVIDENCE_UID is the compliance-evidence collector's dedicated
 # identity (virp-lab only). Resolved exactly like VIRP_BACKUP_UID: if the
 # template names it the user MUST exist, so a missing account fails the
 # render (and the daemon start) loudly instead of silently shipping an
 # allowlist that rejects the collector.
-if "VIRP_EVIDENCE_UID" in used:
+if "VIRP_EVIDENCE_UID" in used and "VIRP_EVIDENCE_UID" not in os.environ:
     import pwd
-    os.environ.setdefault("VIRP_EVIDENCE_UID",
-                          str(pwd.getpwnam("virp-evidence").pw_uid))
+    os.environ["VIRP_EVIDENCE_UID"] = str(pwd.getpwnam("virp-evidence").pw_uid)
 
 # VIRP_NETCLAW_UID is the remote requester identity for netclaw
 # (virp-lab only): the sshd child serving netclaw's streamlocal
@@ -125,19 +130,17 @@ if "VIRP_EVIDENCE_UID" in used:
 # account MUST exist, so a missing account fails the render (and the
 # daemon start) loudly instead of silently shipping an allowlist that
 # rejects the remote requester.
-if "VIRP_NETCLAW_UID" in used:
+if "VIRP_NETCLAW_UID" in used and "VIRP_NETCLAW_UID" not in os.environ:
     import pwd
-    os.environ.setdefault("VIRP_NETCLAW_UID",
-                          str(pwd.getpwnam("virp-netclaw").pw_uid))
+    os.environ["VIRP_NETCLAW_UID"] = str(pwd.getpwnam("virp-netclaw").pw_uid)
 
 # VIRP_BROKER_UID is the Stage 1 intent-broker's dedicated identity
 # (virp-lab only; see the template's broker note — Stage 1 is
 # otherwise still inert). Same rule: named in the template means the
 # account must exist, or the render fails loudly.
-if "VIRP_BROKER_UID" in used:
+if "VIRP_BROKER_UID" in used and "VIRP_BROKER_UID" not in os.environ:
     import pwd
-    os.environ.setdefault("VIRP_BROKER_UID",
-                          str(pwd.getpwnam("virp-broker").pw_uid))
+    os.environ["VIRP_BROKER_UID"] = str(pwd.getpwnam("virp-broker").pw_uid)
 
 for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             "VIRP_NETCLAW_UID", "VIRP_BROKER_UID",

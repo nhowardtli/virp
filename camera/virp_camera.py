@@ -332,15 +332,32 @@ def _fsync_dir(dirpath):
 
 # ── Durable submit checkpoint (Fix A) ──────────────────────────────────
 #
-# The record of what this capture host has HANDED OFF, keyed on content
-# (segment_sha256) plus the segment_seq it shipped under — never on a
-# workdir filename, which ffmpeg reuses from seg_000000 after every
-# restart. Append-only JSONL, fsynced before continuity advances, so it
-# survives process death: startup consults this file, not a directory
-# listing and not process memory. state.json remains the fast-path
-# continuity cursor; where the two disagree (a crash between
-# checkpoint_append and state_save) the checkpoint is authoritative —
-# see _resume_state — so a sequence number is never reused.
+# The record of what this capture host has HANDED OFF, one line per
+# shipped RECORD: segment_seq, segment_sha256, capture_end_utc_ns,
+# body_sha256 and the spool job name. Never keyed on a workdir
+# filename, which ffmpeg reuses from seg_000000 after every restart.
+# Append-only JSONL, fsynced before continuity advances, so it survives
+# process death: startup consults this file, not a directory listing
+# and not process memory. state.json remains the fast-path continuity
+# cursor; where the two disagree (a crash between checkpoint_append and
+# state_save) the checkpoint is authoritative — see _resume_state — so
+# a sequence number is never reused.
+#
+# IDENTITY (Sep 1 review, Task 1). A record is identified by
+# (segment_sha256, capture_end_utc_ns) — the content AND the capture
+# end, which is the segment file's mtime and is immutable across
+# re-offers (Fix E). Content alone is NOT an identity: two closed
+# segments with byte-identical footage (a static scene, an idle frame
+# repeated) are two segments and ship as two records with consecutive
+# sequence numbers. Keying on segment_sha256 alone deleted the second
+# one as "already attested" — a silent drop. What the identity still
+# catches is the SAME FILE seen again (crash between checkpoint_append
+# and the workdir unlink, or a reused name carrying the old bytes with
+# the old mtime): same content, same capture end, same record — settled
+# as residue, never re-shipped. body_sha256 is recorded per line for
+# audit (the handoff sidecar carries the bytes); it is not the lookup
+# key because a re-seen file's seq is unknown until the record is
+# found, and the body embeds the seq.
 #
 # Named open item, deliberately NOT designed here: the checkpoint marks
 # ship-acknowledged, not chain-append-acknowledged — there is no ack
@@ -348,10 +365,22 @@ def _fsync_dir(dirpath):
 # spool-side chain-keyed idempotency (_on_chain in submit_one) is the
 # backstop that makes any re-offer a no-op instead of a duplicate.
 
+def shipped_key(segment_sha256, capture_end_utc_ns):
+    """Record identity: content + capture end. See the IDENTITY note."""
+    return (segment_sha256, int(capture_end_utc_ns))
+
+
+def shipped_record(shipped, segment_sha256, capture_end_utc_ns):
+    """The checkpoint record for THIS file (content + mtime), or None.
+    A different file with the same bytes is not a match."""
+    return shipped.get(shipped_key(segment_sha256, capture_end_utc_ns))
+
+
 def checkpoint_load(path):
-    """{segment_sha256: record} from the shipped checkpoint. A crash
-    mid-append can leave one torn final line; complete records are kept,
-    the torn tail is ignored."""
+    """{(segment_sha256, capture_end_utc_ns): record} from the shipped
+    checkpoint. A crash mid-append can leave one torn final line;
+    complete records are kept, the torn tail is ignored. A record with
+    no capture_end_utc_ns cannot be identified and is skipped."""
     if not path or not os.path.exists(path):
         return {}
     out = {}
@@ -364,7 +393,10 @@ def checkpoint_load(path):
                 rec = json.loads(line)
             except ValueError:
                 continue
-            out[rec["segment_sha256"]] = rec
+            if "segment_sha256" not in rec or "capture_end_utc_ns" not in rec:
+                continue
+            out[shipped_key(rec["segment_sha256"],
+                            rec["capture_end_utc_ns"])] = rec
     return out
 
 
@@ -1580,13 +1612,31 @@ def ffmpeg_cmd(cfg):
 
 # ── Capture-host delivery: ship the {segment, signed body} pair ────────
 
-def sftp_ship(spool_target, ssh_key=None, extra_opts=None):
+def sftp_ship(spool_target, ssh_key=None, extra_opts=None,
+              known_hosts=None):
     """Return ship(seg_file, body_file, name) -> bool. Uploads to the
     chrooted spool as <name>.mp4/.body via .part staging + rename, then
     a <name>.done marker LAST, so the submitter only ever sees complete
     jobs. One ssh path, key-only, sftp-only (the account is chrooted to
-    internal-sftp on the far end)."""
-    opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+    internal-sftp on the far end).
+
+    The spool host's key is PINNED (Sep 1 review, Task 4): `known_hosts`
+    is a provisioned file naming the spool host, StrictHostKeyChecking
+    is `yes`, and the user's own known_hosts is not consulted. The
+    previous `accept-new` trusted whichever host answered first and
+    then pinned THAT — a first-contact attacker became the trusted
+    spool for the life of the file. Refused at construction (before any
+    capture starts) when the file is absent or unreadable."""
+    if not known_hosts:
+        raise ValueError("sftp_ship: a provisioned known_hosts file is "
+                         "required (the spool host key is pinned, never "
+                         "accepted on first contact)")
+    if not os.path.isfile(known_hosts) or not os.access(known_hosts, os.R_OK):
+        raise ValueError("sftp_ship: known_hosts file %s is missing or "
+                         "unreadable" % known_hosts)
+    opts = ["-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "UserKnownHostsFile=%s" % known_hosts]
     if ssh_key:
         opts += ["-o", "IdentitiesOnly=yes", "-i", ssh_key]
     if extra_opts:
@@ -1704,6 +1754,7 @@ def process_live_segment(path, cfg, state, gap, ship):
             "segment_seq": seq,
             "segment_sha256": seg_sha,
             "capture_end_utc_ns": end_ns,
+            "body_sha256": handoff["body_sha256"],
             "shipped_as": name,
         })
 
@@ -1778,13 +1829,24 @@ def _stat_sig(path):
     return (st.st_size, st.st_mtime_ns)
 
 
-def _staged_pair(outbox, sha):
-    """The staged {segment, signed body} pair for this content, if a
-    previous run built one before dying: (seg_path, body_path) or None."""
+def _staged_pair(outbox, sha, end_ns):
+    """The staged {segment, signed body} pair for THIS segment, if a
+    previous run built one before dying: (seg_path, body_path) or None.
+    Matched on content AND capture end: two identical-content segments
+    stage two pairs, and the one that belongs to this file is the one
+    whose signed body names this file's capture_end_utc_ns."""
     bodies = sorted(glob.glob(os.path.join(outbox, "*.%s.body" % sha)))
     for body_path in reversed(bodies):
         seg_path = body_path[:-len(".body")] + ".mp4"
-        if os.path.exists(seg_path):
+        if not os.path.exists(seg_path):
+            continue
+        try:
+            with open(body_path, "rb") as f:
+                body = json.loads(f.read())
+        except (OSError, ValueError):
+            continue
+        if body.get("segment_sha256") == sha and \
+                int(body.get("capture_end_utc_ns", -1)) == int(end_ns):
             return seg_path, body_path
     return None
 
@@ -1797,8 +1859,9 @@ def _reconcile_workdir(cfg, state, shipped, ship):
     that dies without one. So every start walks the workdir and settles
     each file by CONTENT:
 
-      already in the shipped checkpoint -> residue of a handled
-        segment: remove it (never replay it)
+      already in the shipped checkpoint (same content AND same
+        capture end — the same file, not merely the same bytes) ->
+        residue of a handled segment: remove it (never replay it)
       closed but never shipped -> footage that closed and then the
         process died: attest and ship it NOW, before any new capture,
         so segment_seq order stays capture order (the 2026-08-24
@@ -1821,10 +1884,12 @@ def _reconcile_workdir(cfg, state, shipped, ship):
         path = os.path.join(cfg["workdir"], name)
         with open(path, "rb") as f:
             sha = hashlib.sha256(f.read()).hexdigest()
-        if sha in shipped:
-            sys.stderr.write("reconcile %s: content already attested "
-                             "(%.16s… seq=%s); removing residue\n"
-                             % (name, sha, shipped[sha]["segment_seq"]))
+        end_ns = os.stat(path).st_mtime_ns
+        prior = shipped_record(shipped, sha, end_ns)
+        if prior is not None:
+            sys.stderr.write("reconcile %s: already attested as seq=%s "
+                             "(%.16s… end=%d); removing residue\n"
+                             % (name, prior["segment_seq"], sha, end_ns))
             _unlink_quiet(path)
             continue
         try:
@@ -1835,12 +1900,13 @@ def _reconcile_workdir(cfg, state, shipped, ship):
                              % (name, e))
             _unlink_quiet(path)
             continue
-        staged = _staged_pair(cfg["outbox"], sha)
+        staged = _staged_pair(cfg["outbox"], sha, end_ns)
         if staged:
             seg_out, body_out = staged
             job = os.path.basename(body_out)[:-len(".body")]
             with open(body_out, "rb") as f:
-                body = json.loads(f.read())
+                body_bytes = f.read()
+            body = json.loads(body_bytes)
             if not ship(seg_out, body_out, job):
                 raise SubmitError("%s: re-ship of staged pair %s failed "
                                   "(unshipped residue; refusing to start "
@@ -1849,19 +1915,22 @@ def _reconcile_workdir(cfg, state, shipped, ship):
                 "segment_seq": body["segment_seq"],
                 "segment_sha256": sha,
                 "capture_end_utc_ns": body["capture_end_utc_ns"],
+                "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
                 "shipped_as": job,
             }
             if cfg.get("checkpoint_path"):
                 checkpoint_append(cfg["checkpoint_path"], rec)
-            shipped[sha] = rec
-            state = _resume_state(state, {sha: rec}, cfg["camera_id"])
+            key = shipped_key(sha, body["capture_end_utc_ns"])
+            shipped[key] = rec
+            state = _resume_state(state, {key: rec}, cfg["camera_id"])
             state_save(cfg["state_path"], state)
             sys.stderr.write("reconcile %s: re-shipped staged pair %s "
                              "(seq=%d, original body bytes)\n"
                              % (name, job, body["segment_seq"]))
         else:
             state = process_live_segment(path, cfg, state, None, ship)
-            shipped[state["last_segment_sha256"]] = {
+            shipped[shipped_key(state["last_segment_sha256"],
+                                state["last_end_ns"])] = {
                 "segment_seq": state["segment_seq"],
                 "segment_sha256": state["last_segment_sha256"],
                 "capture_end_utc_ns": state["last_end_ns"],
@@ -1911,11 +1980,14 @@ def _run_live_locked(cfg, ship, stop_after_s, poll_s, _spawn, _clock):
     old_term = signal.signal(signal.SIGTERM, _sig)
 
     # Per-file bookkeeping is keyed on (name, stat signature) so a name
-    # ffmpeg reuses with NEW bytes is seen as new work, and on content
-    # (`shipped`) so bytes already attested are never re-offered. The
-    # old name-keyed set silently dropped ~72 s of real footage when a
-    # restarted ffmpeg renumbered into just-drained names (the gap:null
-    # hole at seg 77 of the 2026-08-24 session).
+    # ffmpeg reuses with NEW bytes is seen as new work, and on record
+    # identity (`shipped`: content + capture end) so a file already
+    # attested is never re-offered while a NEW file with the same bytes
+    # still is. The old name-keyed set silently dropped ~72 s of real
+    # footage when a restarted ffmpeg renumbered into just-drained names
+    # (the gap:null hole at seg 77 of the 2026-08-24 session); the
+    # content-only key that replaced it dropped every segment whose
+    # bytes repeated an earlier one (Sep 1 review, Task 1).
     handled = {}    # name -> sig it was handled at (attested or skipped)
     tried = {}      # name -> sig that failed to parse (retry on change)
     seen = {}       # name -> last observed sig (quiescence gate)
@@ -1947,11 +2019,12 @@ def _run_live_locked(cfg, ship, stop_after_s, poll_s, _spawn, _clock):
                         sha = hashlib.sha256(f.read()).hexdigest()
                 except OSError:
                     continue
-                if sha in shipped:
-                    sys.stderr.write("skip %s: content already attested "
-                                     "(%.16s… seq=%s)\n"
-                                     % (name, sha,
-                                        shipped[sha]["segment_seq"]))
+                prior = shipped_record(shipped, sha, sig[1])
+                if prior is not None:
+                    sys.stderr.write("skip %s: already attested as seq=%s "
+                                     "(%.16s… end=%d)\n"
+                                     % (name, prior["segment_seq"], sha,
+                                        sig[1]))
                     handled[name] = sig
                     _unlink_quiet(path)
                     continue
@@ -1970,7 +2043,8 @@ def _run_live_locked(cfg, ship, stop_after_s, poll_s, _spawn, _clock):
                 except SubmitError as e:
                     sys.stderr.write("SUBMIT REFUSED: %s\n" % e)
                     break                    # retry this segment next poll
-                shipped[state["last_segment_sha256"]] = {
+                shipped[shipped_key(state["last_segment_sha256"],
+                                    state["last_end_ns"])] = {
                     "segment_seq": state["segment_seq"],
                     "segment_sha256": state["last_segment_sha256"],
                     "capture_end_utc_ns": state["last_end_ns"],
@@ -2117,11 +2191,19 @@ def submit_one(cfg, name, seg_path, body_path, send=onode_send):
 
     # The segment FILE is still content-addressed by its own sha (files
     # with identical bytes are stored once); only the receipt is per-body.
+    # Durable BEFORE the chain append (Sep 1 review, Task 4), the same
+    # temp -> fsync -> rename -> fsync-dir order state_save uses: once the
+    # chain commits to this segment the bytes it commits to must already
+    # be on disk, or a crash between the append and the writeback leaves
+    # a signed entry whose evidence this host cannot produce.
     art_path = os.path.join(art_dir, seg_sha + ".mp4")
     if not os.path.exists(art_path):
         with open(art_path + ".tmp", "wb") as f:
             f.write(seg_bytes)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(art_path + ".tmp", art_path)
+        _fsync_dir(art_dir)
 
     ok, receipt = chain_append_evidence(session_id, artifact_id, body_bytes,
                                         sock_path=cfg["sock"], send=send)
@@ -2234,6 +2316,10 @@ def main(argv=None):
                          "e.g. virp-capture@10.0.0.13")
     lv.add_argument("--ssh-key", default=None,
                     help="identity for the spool account (key-only)")
+    lv.add_argument("--known-hosts", required=True,
+                    help="provisioned known_hosts file naming the spool "
+                         "host (its key is pinned: StrictHostKeyChecking="
+                         "yes, no first-contact accept)")
     lv.add_argument("--segment-time", type=float, default=6.0)
     lv.add_argument("--minutes", type=float, default=None,
                     help="stop after N minutes (default: until signalled)")
@@ -2376,7 +2462,11 @@ def main(argv=None):
                 else args.segment_time,
                 args.jitter_s, args.max_unexplained_gap_s),
         }
-        ship = sftp_ship(args.spool, ssh_key=args.ssh_key)
+        try:
+            ship = sftp_ship(args.spool, ssh_key=args.ssh_key,
+                             known_hosts=args.known_hosts)
+        except ValueError as e:
+            raise SystemExit(str(e))
         stop_after = args.minutes * 60 if args.minutes else None
         print("live capture: source=%s segment_time=%ss spool=%s"
               % ("rtsp(configured)" if rtsp_url else "synthetic-test",
