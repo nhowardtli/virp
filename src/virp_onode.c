@@ -2838,43 +2838,64 @@ static bool peer_uid_allowed(onode_state_t *state, int client_fd,
 /*
  * Extract a fed_outcome's "observation_sha256" into out_hex.
  *
- * Deliberately a narrow scanner, not a JSON parser: the only thing
- * GATE 4 needs is one 64-hex-character string under one known key, and
- * pulling a parser onto the append path to get it would be a far larger
- * surface than the question justifies. Anything that is not a quoted
- * 64-char lowercase-hex value — key absent, JSON null, wrong length,
- * non-hex byte — returns false, and the caller treats false as a
- * refusal. Fail-closed: a body this cannot read is a body whose citation
- * cannot be checked, which is the case the gate exists to stop.
+ * The body is PARSED (cJSON — the same parser every request field
+ * already goes through) and the citation must be EXACTLY ONE root-level
+ * member named observation_sha256 whose value is a 64-character
+ * lowercase-hex string. Anything else returns false and the caller
+ * refuses: body not a JSON object, key absent, JSON null or non-string,
+ * wrong length, non-hex byte, the key appearing only inside a nested
+ * object, or the key appearing MORE THAN ONCE at the root.
  *
- * Scans the literal body bytes. fed_outcome bodies are plain JSON (the
- * base64: form is for signed wire messages), so no decode step is needed
- * and none is done — a decoder here could disagree with the one GATE 2
- * hashed with, and then the field checked would not be the field stored.
+ * Sep 1 review, Task 3 — this used to be a strstr() scan of the raw
+ * bytes, and a byte scan is not a reader: it matched the key inside a
+ * nested object (which no consumer treats as the outcome's citation),
+ * and with duplicate root keys it took the FIRST value while every JSON
+ * reader downstream returns the LAST, so the gate could vouch for a
+ * hash nobody would ever read. Duplicates are refused outright rather
+ * than resolved either way: an ambiguous citation is not a citation.
+ *
+ * Parses the literal body bytes. fed_outcome bodies are plain JSON (the
+ * base64: form is for signed wire messages), so no decode step is
+ * needed and none is done — a decoder here could disagree with the one
+ * GATE 2 hashed with, and then the field checked would not be the
+ * field stored. Fail-closed throughout: a body this cannot read is a
+ * body whose citation cannot be checked, which is the case the gate
+ * exists to stop.
  */
 static bool fed_outcome_observation_hash(const char *body, char out_hex[65])
 {
-    static const char KEY[] = "\"observation_sha256\"";
-    const char *p = strstr(body, KEY);
-    if (!p) return false;
-    p += sizeof(KEY) - 1;
+    if (!body) return false;
+    cJSON *root = cJSON_Parse(body);
+    if (!root) return false;
 
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != ':') return false;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != '"') return false;   /* null, or anything not a string */
-    p++;
-
-    for (int i = 0; i < 64; i++) {
-        char c = p[i];
-        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-        if (!hex) return false;
-        out_hex[i] = c;
+    bool ok = false;
+    if (cJSON_IsObject(root)) {
+        const cJSON *cite = NULL;
+        int matches = 0;
+        for (const cJSON *m = root->child; m; m = m->next) {
+            if (m->string && strcmp(m->string, "observation_sha256") == 0) {
+                matches++;
+                cite = m;
+            }
+        }
+        if (matches == 1 && cJSON_IsString(cite) && cite->valuestring) {
+            const char *v = cite->valuestring;
+            size_t len = strlen(v);
+            if (len == 64) {
+                ok = true;
+                for (size_t i = 0; i < 64; i++) {
+                    char c = v[i];
+                    bool hex = (c >= '0' && c <= '9') ||
+                               (c >= 'a' && c <= 'f');
+                    if (!hex) { ok = false; break; }
+                    out_hex[i] = c;
+                }
+                if (ok) out_hex[64] = '\0';
+            }
+        }
     }
-    if (p[64] != '"') return false;  /* longer than 64 — not a SHA-256 hex */
-    out_hex[64] = '\0';
-    return true;
+    cJSON_Delete(root);
+    return ok;
 }
 
 /*
@@ -3462,66 +3483,57 @@ static void handle_client(onode_state_t *state, int client_fd,
          * Scoped to fed_outcome. Other types are unaffected, and an
          * outcome with no body at all is refused too: an outcome that
          * cites nothing is the unbacked claim in its purest form (16
-         * such rows exist on the live chain, all inside the window). */
+         * such rows exist on the live chain, all inside the window).
+         *
+         * THE QUESTION IS TYPE-BOUND (Sep 1 review, Task 3): does a
+         * chain entry OF AN OBSERVATION TYPE (observation /
+         * fed_observation) commit to the cited hash? That single probe
+         * — virp_chain_entry_commits_to() — is the whole gate. It used
+         * to be the FALLBACK behind a type-blind "is a body with this
+         * hash in artifacts" probe, so a fed_request body with hash H
+         * satisfied an outcome citing H: request bodies are stored in
+         * artifacts too, and the type-restricted check never ran for a
+         * hash that was stored. An outcome may be backed by an
+         * observation and by nothing else. Whether the observation's
+         * BYTES were retained is deliberately not asked here: a
+         * commitment-only (oversized) observation is backed by its
+         * signed entry and its outcome must land (2026-08-18
+         * regression, correlations 42b7b9dc / c5373129); a reader
+         * grades the un-retained body UNVERIFIABLE, not PASS. */
         if (strcmp(req.artifact_type, "fed_outcome") == 0) {
             char cited[65];
             if (req.artifact_content[0] == '\0' ||
                 !fed_outcome_observation_hash(req.artifact_content, cited)) {
                 fprintf(stderr, "[O-Node] chain_append REJECTED: fed_outcome "
                         "carries no readable observation_sha256 — an outcome "
-                        "must cite the signed body it reports on "
-                        "(session=%s id=%s)\n",
+                        "must cite the signed body it reports on, as exactly "
+                        "one root-level 64-hex string (session=%s id=%s)\n",
                         req.session_id, req.artifact_id);
                 send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
                 break;
             }
-            bool body_stored = false;
-            virp_error_t cerr = virp_chain_artifact_body_exists(
-                                    &state->chain, cited, &body_stored);
-            if (cerr != VIRP_OK) {
-                fprintf(stderr, "[O-Node] chain_append REJECTED: could not "
-                        "check whether fed_outcome's cited observation %s is "
-                        "stored (session=%s id=%s err=%s)\n",
-                        cited, req.session_id, req.artifact_id,
-                        virp_error_str(cerr));
-                send_framed_error(client_fd, cerr);
+            bool committed = false;
+            virp_error_t eerr = virp_chain_entry_commits_to(
+                                    &state->chain, cited, &committed);
+            if (eerr != VIRP_OK) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: could "
+                        "not check whether the chain commits to "
+                        "fed_outcome's cited observation %s (session=%s "
+                        "id=%s err=%s)\n", cited, req.session_id,
+                        req.artifact_id, virp_error_str(eerr));
+                send_framed_error(client_fd, eerr);
                 break;
             }
-            if (!body_stored) {
-                /* The cited body is not in artifacts. That is LEGITIMATE for
-                 * an oversized observation: a GREEN output past the daemon's
-                 * 8192-byte inline field is chained commitment-only (the
-                 * bridge / autopilot omits artifact_content). It is only an
-                 * UNBACKED claim if no observation entry commits to the cited
-                 * hash at all. If one does, the outcome is backed by the
-                 * chain and the un-retained body is graded UNVERIFIABLE (not
-                 * PASS) by every reader — an honest record, not a dangling
-                 * pointer. (2026-08-18 regression: requiring the body here
-                 * left oversized GREEN observations' outcomes unappendable —
-                 * correlations 42b7b9dc / c5373129.) */
-                bool committed = false;
-                virp_error_t eerr = virp_chain_entry_commits_to(
-                                        &state->chain, cited, &committed);
-                if (eerr != VIRP_OK) {
-                    fprintf(stderr, "[O-Node] chain_append REJECTED: could "
-                            "not check whether the chain commits to "
-                            "fed_outcome's cited observation %s (session=%s "
-                            "id=%s err=%s)\n", cited, req.session_id,
-                            req.artifact_id, virp_error_str(eerr));
-                    send_framed_error(client_fd, eerr);
-                    break;
-                }
-                if (!committed) {
-                    fprintf(stderr, "[O-Node] chain_append REJECTED: "
-                            "fed_outcome cites observation %s, which no chain "
-                            "entry commits to — append the fed_observation "
-                            "before the outcome that names it (session=%s "
-                            "id=%s)\n",
-                            cited, req.session_id, req.artifact_id);
-                    send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
-                    break;
-                }
-                /* commitment-only observation, backed by the chain: accept */
+            if (!committed) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: "
+                        "fed_outcome cites %s, which no observation entry "
+                        "commits to — append the fed_observation before "
+                        "the outcome that names it; a request or any other "
+                        "type carrying that hash does not count "
+                        "(session=%s id=%s)\n",
+                        cited, req.session_id, req.artifact_id);
+                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+                break;
             }
         }
 

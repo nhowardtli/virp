@@ -506,11 +506,15 @@ virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
 
 /*
  * Set *exists to true iff a BODY with the given artifact_hash is stored
- * in the artifacts table. Distinct from virp_chain_artifact_exists()
- * above in both the table it reads and the question it answers: that one
- * asks whether an entry was appended, this one whether the bytes it
- * committed to were retained. Used by chain_append's fed_outcome gate to
- * refuse an outcome citing an observation the chain cannot produce.
+ * in the artifacts table — of ANY artifact_type. Distinct from
+ * virp_chain_artifact_exists() above in both the table it reads and the
+ * question it answers: that one asks whether an entry was appended, this
+ * one whether the bytes it committed to were retained. NOT a commitment
+ * check and no longer consulted by chain_append's fed_outcome gate (Sep
+ * 1 review, Task 3): being type-blind, it let a fed_request body stand
+ * in for the observation an outcome cited. GATE 4 asks
+ * virp_chain_entry_commits_to() only. Retained for the atomicity fault-
+ * injection test, which asks precisely the bytes-retained question.
  * Returns VIRP_OK on a successful query (whether or not it matched).
  */
 virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,

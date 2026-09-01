@@ -5945,6 +5945,116 @@ TEST(test_chain_append_accepts_fed_outcome_for_commitment_only_observation)
 }
 
 
+/* ── Sep 1 review, Task 3: GATE 4 must be TYPE-BOUND and JSON-EXACT ── */
+
+/* The reviewer's three-step bypass. GATE 4's first probe was
+ * virp_chain_artifact_body_exists(): SELECT 1 FROM artifacts WHERE
+ * artifact_hash = ? — no type restriction. So a fed_REQUEST body with
+ * hash H satisfied an outcome citing H, and the type-restricted probe
+ * (observation / fed_observation entries only) never ran because it
+ * was only the fallback for a body that was NOT stored. An outcome may
+ * be backed by an observation and nothing else. */
+TEST(test_gate4_refuses_fed_outcome_citing_a_request_body)
+{
+    const char *req_body = "{\"schema\":\"federated_request/1\",\"peer\":\"netclaw\","
+                           "\"command\":\"show version\",\"nonce\":\"g4-req-1\"}";
+    char hr[65];
+    ca_sha256_hex(req_body, hr);
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("ncfed-g4-typeblind", "fed_request",
+                          "g4-req-1", hr, req_body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("g4-req-1"), 1);   /* body IS in artifacts */
+
+    /* the outcome cites the REQUEST's hash as its observation */
+    char out_body[512];
+    snprintf(out_body, sizeof(out_body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"executed\","
+             "\"observation_sha256\":\"%s\"}", hr);
+    char ho[65];
+    ca_sha256_hex(out_body, ho);
+    n = ca_append("ncfed-g4-typeblind", "fed_outcome",
+                  "g4-out-cites-request", ho, out_body, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("g4-out-cites-request"), 0);
+}
+
+/* A citation is ONE root-level "observation_sha256" string. The old
+ * strstr() scan took the first byte-match anywhere in the body: a
+ * nested object's key satisfied it, and with duplicate root keys it
+ * checked the FIRST value while every JSON reader downstream returns
+ * the LAST — the gate would have vouched for a hash no consumer sees.
+ * Each of these bodies carries the hash of a genuinely committed
+ * observation somewhere; none of them may pass. */
+TEST(test_gate4_requires_exactly_one_root_level_citation)
+{
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9104);
+    ASSERT_TRUE(olen > 0);
+    char hobs[65];   ca_sha256_hex_bin(obs, olen, hobs);
+    char obs_body[2048]; ca_b64_body(obs, olen, obs_body, sizeof(obs_body));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_append("ncfed-g4-shape", "fed_observation",
+                          "g4-obs-shape", hobs, obs_body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("g4-obs-shape"), 1);
+
+    char body[768];
+    char h[65];
+
+    /* (1) the key inside another string VALUE — a body that only
+     *     mentions a citation does not make one */
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"ok\","
+             "\"note\":\"cites \\\"observation_sha256\\\":\\\"%s\\\"\"}", hobs);
+    ca_sha256_hex(body, h);
+    n = ca_append("ncfed-g4-shape", "fed_outcome", "g4-out-in-string",
+                  h, body, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("g4-out-in-string"), 0);
+
+    /* (2) the key NESTED in a sub-object, not at the root */
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"ok\","
+             "\"meta\":{\"observation_sha256\":\"%s\"}}", hobs);
+    ca_sha256_hex(body, h);
+    n = ca_append("ncfed-g4-shape", "fed_outcome", "g4-out-nested",
+                  h, body, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("g4-out-nested"), 0);
+
+    /* (3) DUPLICATE root keys: first = committed, last = dangling. A
+     *     first-match scan passes it; every JSON reader returns the
+     *     dangling one. Ambiguous citation → refused. */
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"ok\","
+             "\"observation_sha256\":\"%s\","
+             "\"observation_sha256\":\"%s\"}", hobs,
+             "0000000000000000000000000000000000000000000000000000000000000004");
+    ca_sha256_hex(body, h);
+    n = ca_append("ncfed-g4-shape", "fed_outcome", "g4-out-dup",
+                  h, body, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("g4-out-dup"), 0);
+
+    /* (4) the same committed hash cited PROPERLY still lands — the
+     *     legitimate fed_observation citation is untouched */
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"ok\","
+             "\"observation_sha256\":\"%s\"}", hobs);
+    ca_sha256_hex(body, h);
+    n = ca_append("ncfed-g4-shape", "fed_outcome", "g4-out-proper",
+                  h, body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("g4-out-proper"), 1);
+}
+
 /* GATE 4: citing nothing is refused too. Sixteen rows on the live chain
  * carry observation_sha256: null — an outcome asserting a result while
  * naming no evidence at all is the unbacked claim in its purest form. */
@@ -7286,6 +7396,8 @@ int main(void)
         RUN_TEST(test_chain_append_still_accepts_json_evidence_item);
         RUN_TEST(test_chain_append_accepts_federated_provenance);
         RUN_TEST(test_chain_append_refuses_fed_outcome_citing_unstored_observation);
+        RUN_TEST(test_gate4_refuses_fed_outcome_citing_a_request_body);
+        RUN_TEST(test_gate4_requires_exactly_one_root_level_citation);
         RUN_TEST(test_chain_append_accepts_fed_outcome_for_commitment_only_observation);
         RUN_TEST(test_chain_append_refuses_fed_outcome_without_observation_hash);
         RUN_TEST(test_chain_append_fed_observation_must_be_signed);
