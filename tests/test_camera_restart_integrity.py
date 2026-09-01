@@ -69,10 +69,15 @@ class CheckpointTests(unittest.TestCase):
         state = vc.process_live_segment(p, self.cfg, None, None,
                                         ShipRecorder())
         shipped = vc.checkpoint_load(self.cfg["checkpoint_path"])
-        self.assertIn(sha, shipped)
-        rec = shipped[sha]
+        # keyed on record identity: content + capture end (Task 1)
+        key = vc.shipped_key(sha, state["last_end_ns"])
+        self.assertIn(key, shipped)
+        rec = shipped[key]
         self.assertEqual(rec["segment_seq"], 0)
         self.assertEqual(rec["capture_end_utc_ns"], state["last_end_ns"])
+        with open(os.path.join(self.cfg["outbox"],
+                               rec["shipped_as"] + ".handoff.json")) as f:
+            self.assertEqual(rec["body_sha256"], json.load(f)["body_sha256"])
 
     def test_failed_ship_writes_no_checkpoint(self):
         p = self._seg("seg_000000.mp4", b"nock" * 32)
@@ -92,7 +97,7 @@ class CheckpointTests(unittest.TestCase):
         with open(path, "a") as f:
             f.write('{"segment_seq": 1, "segment_sha')   # torn
         shipped = vc.checkpoint_load(path)
-        self.assertEqual(list(shipped), ["aa" * 32])
+        self.assertEqual(list(shipped), [vc.shipped_key("aa" * 32, 1)])
 
     def test_checkpoint_authoritative_over_stale_state(self):
         # crash window: checkpoint_append succeeded, state_save did not.
@@ -236,15 +241,18 @@ class ContentIdentityTests(unittest.TestCase):
         old_b = make_mp4(pad=b"old-b" * 40)
         new = make_mp4(pad=b"new-frames" * 40)
         # a prior run shipped old_a/old_b (durable checkpoint says so),
-        # but died before removing them from the workdir
+        # but died before removing them from the workdir. The checkpoint
+        # records name the FILES: their capture end is the file mtime
+        # (Fix E), so the fixture pins the mtimes to what was recorded.
         for i, data in enumerate((old_a, old_b)):
             sha = hashlib.sha256(data).hexdigest()
             vc.checkpoint_append(self.cfg["checkpoint_path"],
                                  {"segment_seq": i, "segment_sha256": sha,
                                   "capture_end_utc_ns": 10 ** 18 + i,
                                   "shipped_as": "%06d.%s" % (i, sha)})
-        self._write("seg_000000.mp4", old_a)
-        self._write("seg_000001.mp4", old_b)
+        for i, name in enumerate(("seg_000000.mp4", "seg_000001.mp4")):
+            p = self._write(name, (old_a, old_b)[i])
+            os.utime(p, ns=(10 ** 18 + i, 10 ** 18 + i))
 
         # the restarted ffmpeg renumbers from seg_000000 and reuses the
         # name for NEW footage mid-run
@@ -433,9 +441,11 @@ class ReconcileTests(unittest.TestCase):
         vc.run_live(self.cfg, ship, _spawn=lambda cfg: FakeProc())
         self.assertEqual(len(ship.calls), 1)
         self.assertEqual(ship.calls[0]["body_bytes"], staged)
-        # and the checkpoint now covers it
+        # and the checkpoint now covers it, under the record's identity
         shipped = vc.checkpoint_load(self.cfg["checkpoint_path"])
-        self.assertIn(json.loads(staged)["segment_sha256"], shipped)
+        sb = json.loads(staged)
+        self.assertIn(vc.shipped_key(sb["segment_sha256"],
+                                     sb["capture_end_utc_ns"]), shipped)
 
     def test_unshippable_residue_refuses_to_start(self):
         # unshipped residue + a dead spool: starting capture would bury
@@ -677,6 +687,129 @@ class InstanceLockTests(unittest.TestCase):
         # second run afterwards also succeeds)
         vc.run_live(cfg, ShipRecorder(), _spawn=lambda cfg: FakeProc())
         vc.run_live(cfg, ShipRecorder(), _spawn=lambda cfg: FakeProc())
+
+
+
+class RecordIdentityTests(unittest.TestCase):
+    """Sep 1 review, Task 1: attestation identity is the RECORD, not the
+    content hash alone. Two closed segments with byte-identical content
+    (a static scene, a test pattern, a camera that repeats its idle
+    frame) are two segments of footage and must ship as two records with
+    consecutive sequence numbers. Before this fix checkpoint_load,
+    the live loop and reconcile all keyed on segment_sha256 only, so the
+    second identical segment was deleted as "already attested" — a
+    silent drop dressed up as a dedup. What dedup MUST still catch is the
+    SAME FILE seen again after a crash between checkpoint_append and the
+    workdir unlink: same bytes AND the same capture end (the file's
+    mtime, immutable across re-offers per Fix E)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.sk_path, self.pk_path = make_keypair(self.tmp)
+        self.cfg = restart_cfg(self.tmp, self.sk_path, self.pk_path)
+        os.makedirs(self.cfg["workdir"])
+        os.makedirs(self.cfg["outbox"])
+
+    def _write(self, name, data, mtime_ns=None):
+        p = os.path.join(self.cfg["workdir"], name)
+        with open(p, "wb") as f:
+            f.write(data)
+        if mtime_ns is not None:
+            os.utime(p, ns=(mtime_ns, mtime_ns))
+        return p
+
+    def _bodies(self, ship):
+        return [json.loads(c["body_bytes"]) for c in ship.calls]
+
+    def test_two_identical_closed_segments_ship_as_two_records(self):
+        # reconcile path: both files closed and present at startup,
+        # different names, different mtimes, identical bytes
+        same = make_mp4(pad=b"static-scene" * 20)
+        t0 = 10 ** 18
+        self._write("seg_000000.mp4", same, t0)
+        self._write("seg_000001.mp4", same, t0 + 6 * 10 ** 9)
+        ship = ShipRecorder()
+        vc.run_live(self.cfg, ship, _spawn=lambda cfg: FakeProc())
+        bodies = self._bodies(ship)
+        self.assertEqual(len(bodies), 2,
+                         "second identical segment was dropped as "
+                         "'already attested'")
+        self.assertEqual([b["segment_seq"] for b in bodies], [0, 1])
+        sha = hashlib.sha256(same).hexdigest()
+        self.assertEqual([b["segment_sha256"] for b in bodies], [sha, sha])
+        self.assertEqual([b["capture_end_utc_ns"] for b in bodies],
+                         [t0, t0 + 6 * 10 ** 9])
+        # two distinct records in the durable checkpoint, and nothing
+        # left in the workdir
+        shipped = vc.checkpoint_load(self.cfg["checkpoint_path"])
+        self.assertEqual(sorted(r["segment_seq"] for r in shipped.values()),
+                         [0, 1])
+        self.assertEqual(
+            [n for n in os.listdir(self.cfg["workdir"]) if n.endswith(".mp4")],
+            [])
+
+    def test_identical_segment_arriving_live_is_a_new_record(self):
+        # live-loop path: seq 0 ships at startup (reconcile), then ffmpeg
+        # closes a NEW file with the same bytes mid-run
+        same = make_mp4(pad=b"idle-frame" * 24)
+        t0 = 10 ** 18
+        self._write("seg_000000.mp4", same, t0)
+        proc = ScriptedProc([
+            (None, None), (None, None),
+            (None, lambda: self._write("seg_000001.mp4", same,
+                                       t0 + 6 * 10 ** 9)),
+            (None, None), (None, None),
+            (0, None),
+        ])
+        ship = ShipRecorder()
+        vc.run_live(self.cfg, ship, poll_s=0, _spawn=lambda cfg: proc)
+        bodies = self._bodies(ship)
+        self.assertEqual(len(bodies), 2,
+                         "identical live segment was skipped")
+        self.assertEqual([b["segment_seq"] for b in bodies], [0, 1])
+        self.assertEqual(bodies[1]["prev_segment_sha256"],
+                         bodies[0]["segment_sha256"])
+
+    def test_same_file_reseen_after_restart_is_not_reshipped(self):
+        # crash window: checkpoint_append succeeded, the workdir unlink
+        # did not. The next start sees the SAME file (same bytes, same
+        # mtime) and must settle it as residue, not ship it again.
+        data = make_mp4(pad=b"once" * 32)
+        p = self._write("seg_000000.mp4", data, 10 ** 18)
+        ship1 = ShipRecorder()
+        vc.process_live_segment(p, self.cfg, None, None, ship1)
+        self.assertEqual(len(ship1.calls), 1)
+        self.assertTrue(os.path.exists(p))       # no unlink: the crash
+        ship2 = ShipRecorder()
+        state = vc.run_live(self.cfg, ship2, _spawn=lambda cfg: FakeProc())
+        self.assertEqual(ship2.calls, [], "same file re-shipped after "
+                                          "restart (dedup broken)")
+        self.assertFalse(os.path.exists(p))
+        self.assertEqual(state["segment_seq"], 0)
+        self.assertEqual(
+            len(vc.checkpoint_load(self.cfg["checkpoint_path"])), 1)
+
+    def test_same_file_reseen_live_is_skipped(self):
+        # the live-loop guard for the same window: a checkpointed file
+        # that reappears under a reused name with the same bytes AND the
+        # same capture end is the same file, not new footage
+        data = make_mp4(pad=b"twice" * 32)
+        p = self._write("seg_000000.mp4", data, 10 ** 18)
+        vc.process_live_segment(p, self.cfg, None, None, ShipRecorder())
+        os.unlink(p)
+        proc = ScriptedProc([
+            (None, None), (None, None),
+            (None, lambda: self._write("seg_000000.mp4", data, 10 ** 18)),
+            (None, None), (None, None),
+            (0, None),
+        ])
+        ship = ShipRecorder()
+        vc.run_live(self.cfg, ship, poll_s=0, _spawn=lambda cfg: proc)
+        self.assertEqual(ship.calls, [])
+        self.assertEqual(
+            [n for n in os.listdir(self.cfg["workdir"]) if n.endswith(".mp4")],
+            [])
 
 
 if __name__ == "__main__":
