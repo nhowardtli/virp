@@ -80,7 +80,6 @@ jobs:
           name: test-attestation-${{ github.sha }}
           path: test-attestation.json
           retention-days: 90
->>>>>>> 1d76af9 (ci/release: exact-head test attestation + signed release manifest)
       - name: Demo (nine security behaviors, simulated target)
         run: ./demo/run.sh --no-build
       - name: Upload demo evidence bundle
