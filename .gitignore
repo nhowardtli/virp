@@ -30,3 +30,6 @@ demo/output/
 
 # libFuzzer build tree (make fuzz-obs-ed25519) — instrumented artifacts, never tracked
 build-fuzz/
+
+# Release bundles (make release-bundle / release.yml build outputs)
+dist/

@@ -36,8 +36,9 @@ jobs:
         # make all-tests ends with check-test-deps, which fails the run if any
         # suite would have silently skipped: test-api needs fastapi/httpx/pytest,
         # test-virp-report needs reportlab, test-chainsign-vectors uses pynacl or
-        # cryptography. Without this step the battery has never been green here.
-        run: python3 -m pip install --quiet pynacl fastapi httpx pytest reportlab
+        # cryptography; gen-test-attestation.sh needs pyyaml. Without this step
+        # the battery has never been green here.
+        run: python3 -m pip install --quiet pynacl fastapi httpx pytest pyyaml reportlab
       # CFLAGS already carry -Wall -Wextra -Werror -pedantic -std=c11, so a
       # warning is a build failure without any extra flag here.
       - name: Build (warnings are errors)
@@ -52,16 +53,34 @@ jobs:
           make lint-sprintf
           make lint-rand
           make lint-memcmp
-      - name: Full test battery
-        # all-tests now carries check-obs-build-ordering and
-        # test-refusal-contract. Both guard invariants the 2026-08-29
-        # reconciliation merge had to preserve — the observation build
-        # ordering around the scrub barrier, and the five drivers'
-        # non-dispatch refusal contract — and until now neither ran in
-        # a normal battery or in CI.
-        run: make all-tests
+      # Same throwaway-key dance as the python-suites job: bridge suites
+      # read a signing key at the fixed dev path.
+      - name: Generate throwaway bridge key
+        run: |
+          sudo mkdir -p /opt/virp/keys
+          sudo ./build/virp-tool keygen okey /opt/virp/keys/onode.key
+          sudo chown "$(id -u):$(id -g)" /opt/virp/keys/onode.key
+          sudo chmod 600 /opt/virp/keys/onode.key
+      # The battery runs under gen-test-attestation.sh so every push
+      # publishes a machine-readable, commit-pinned test result — the
+      # artifact below is the exact-head evidence a release (or reviewer)
+      # can bind to, instead of a hand-written report for a nearby tree.
+      # all-tests carries check-obs-build-ordering and test-refusal-contract:
+      # both guard invariants the 2026-08-29 reconciliation merge had to
+      # preserve — the observation build ordering around the scrub barrier,
+      # and the five drivers' non-dispatch refusal contract.
+      - name: Full test battery (attested to the exact commit)
+        run: scripts/gen-test-attestation.sh --out test-attestation.json "make all-tests"
       - name: Refusal contract (five drivers), named explicitly
         run: make test-refusal-contract
+      - name: Upload exact-head test attestation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-attestation-${{ github.sha }}
+          path: test-attestation.json
+          retention-days: 90
+>>>>>>> 1d76af9 (ci/release: exact-head test attestation + signed release manifest)
       - name: Demo (nine security behaviors, simulated target)
         run: ./demo/run.sh --no-build
       - name: Upload demo evidence bundle

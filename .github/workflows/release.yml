@@ -1,0 +1,148 @@
+# VIRP release pipeline.
+#
+# Exists to close a provenance gap a reviewer found: the release ZIP was a
+# git archive of one tree (cd351af6) while the committed full-suite report
+# had tested a nearby tree (f200e621) — evidence for "roughly this code",
+# not "exactly this archive". This workflow makes that gap impossible for
+# anything it publishes:
+#
+#   1. the FULL battery runs against the exact commit being packaged, under
+#      scripts/gen-test-attestation.sh, which pins the commit + tree hash
+#      and real exit codes into test-attestation.json;
+#   2. the bundle is cut from that same commit by
+#      scripts/make-release-bundle.sh, which REFUSES an attestation for any
+#      other commit and writes MANIFEST.sha256 over every bundled file;
+#   3. the manifest (which pins bundle bytes, contents, commit, and test
+#      evidence) is signed two ways: a keyless Sigstore attestation from
+#      this workflow's OIDC identity (always), and a detached ed25519 ssh
+#      signature with the operator release key (only when the
+#      RELEASE_SIGNING_KEY secret is configured — CI never generates keys);
+#   4. scripts/verify-release-bundle.sh must pass on the exact artifacts
+#      about to be published, or nothing is published.
+#
+# Downloader verification: docs/RELEASE-PROVENANCE.md.
+#
+# Copyright (c) 2026 Third Level IT LLC — Apache 2.0
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # A manual run on a branch proves the pipeline end-to-end (test, bundle,
+  # sign, verify) and uploads the artifacts, but only a tag publishes.
+  workflow_dispatch:
+
+permissions:
+  contents: write        # gh release create
+  id-token: write        # Sigstore keyless signing
+  attestations: write    # actions/attest-build-provenance
+
+env:
+  DEPS: >-
+    build-essential libssl-dev libsodium-dev libsqlite3-dev
+    libssh2-1-dev libcurl4-openssl-dev libjson-c-dev
+
+jobs:
+  release:
+    name: Test exact commit, bundle, sign, publish
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so git describe and tag verification work.
+          fetch-depth: 0
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.DEPS }}
+          python3 -m pip install --quiet fastapi httpx pytest pyyaml reportlab
+      - name: Build
+        run: make all && make prod
+      # tests/test_virp_verify.py and the ctypes bridge suites read a
+      # signing key at the fixed dev path; same throwaway-key dance as
+      # ci.yml's python-suites job.
+      - name: Generate throwaway bridge key
+        run: |
+          sudo mkdir -p /opt/virp/keys
+          sudo ./build/virp-tool keygen okey /opt/virp/keys/onode.key
+          sudo chown "$(id -u):$(id -g)" /opt/virp/keys/onode.key
+          sudo chmod 600 /opt/virp/keys/onode.key
+      # The full battery — the same three canonical targets the committed
+      # full-suite reports cite (all-tests, asan-test, asan-drivers) plus
+      # the static checks and lints — attested to THIS commit. A dirty
+      # tree or any nonzero exit kills the release here.
+      - name: Full battery, attested to the exact release commit
+        run: |
+          scripts/gen-test-attestation.sh --out test-attestation.json \
+            "make check-deploy-unit check-live-fence check-socket-path check-shared-readpath" \
+            "make lint-sprintf lint-rand lint-memcmp" \
+            "make all-tests" \
+            "make asan-test" \
+            "make asan-drivers"
+      - name: Cut bundle and manifest from the exact commit
+        run: |
+          scripts/make-release-bundle.sh --ref "$GITHUB_SHA" --out dist \
+            --name "virp-$TAG" --attestation test-attestation.json
+      - name: Sign manifest with operator release key (if configured)
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "RELEASE_SIGNING_KEY secret not configured — skipping the"
+            echo "ssh signature. The Sigstore attestation still signs this"
+            echo "release; the operator can also sign the downloaded"
+            echo "manifest offline with: make release-sign MANIFEST=..."
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/release.key"
+          ssh-keygen -Y sign -f "$RUNNER_TEMP/release.key" -n virp-release \
+            "dist/virp-$TAG.MANIFEST.sha256"
+          rm -f "$RUNNER_TEMP/release.key"
+      - name: Sigstore attestation (keyless, workflow OIDC identity)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+      - name: Verify the exact artifacts about to be published
+        run: |
+          SIG_ARGS=""
+          if [ -f "dist/virp-$TAG.MANIFEST.sha256.sig" ]; then
+            SIG_ARGS="--signature dist/virp-$TAG.MANIFEST.sha256.sig \
+                      --signers keys/release/allowed_signers"
+          fi
+          scripts/verify-release-bundle.sh \
+            --bundle "dist/virp-$TAG.zip" \
+            --manifest "dist/virp-$TAG.MANIFEST.sha256" \
+            --attestation "dist/virp-$TAG.test-attestation.json" \
+            --expect-commit "$GITHUB_SHA" $SIG_ARGS
+      - name: Upload release artifacts (also for non-tag pipeline proofs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle-${{ github.sha }}
+          path: dist/
+          retention-days: 90
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --title "VIRP $TAG" \
+            --notes "Commit: \`$GITHUB_SHA\`
+
+          Every asset here is bound by \`virp-$TAG.MANIFEST.sha256\`: sha256
+          of the ZIP, of every file inside it, and of the full-suite test
+          attestation that ran against exactly this commit. Verify with:
+
+              scripts/verify-release-bundle.sh \\
+                --bundle virp-$TAG.zip \\
+                --manifest virp-$TAG.MANIFEST.sha256 \\
+                --attestation virp-$TAG.test-attestation.json
+
+          See docs/RELEASE-PROVENANCE.md for signature and Sigstore checks."
