@@ -277,3 +277,15 @@ for them in one place:
    `gate_rejection` is not a closed enum in the schema — a reader must know
    the daemon's spellings (`auto-execute`, `approved-apply`) rather than
    validate against a declared list.
+
+## 6. Backlog (no code yet, Sep 1 review Phase 2)
+
+- **Replay-guard cost.** `virp_chain_count_intents_for_approval` scans every
+  `gate_intent` body and cJSON-parses it to match `approval_entry_hash`
+  (`src/virp_chain.c`), and it runs under the consume lock on the apply
+  path — O(N) in the number of intents per apply. Fine at current chain
+  sizes; at scale a SQLite expression index over
+  `json_extract(artifact_content, '$.approval_entry_hash')` (with the body
+  stored where the index can reach it) turns the guard into an indexed
+  lookup and shortens the lock hold. Deferred: it is a performance change
+  to a hot path and wants its own measurement, not a fold-in.

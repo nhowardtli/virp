@@ -1200,7 +1200,10 @@ touched.
   refuses `approval_reused` on a hit — closing the crash window between an
   intent commit and the cache write, since the chain entry survives. Two
   intents citing one approval entry hash is a verifier FAIL (double-spend),
-  in both the C and Python verifiers.
+  in both the C and Python verifiers. When `evidence_required` is **false**
+  there is no `gate_intent` to be the consumption event, so `consumed.list`
+  is the sole authority on single-use (the pre-Task-5 behaviour) and a
+  persist failure there fails the apply closed.
 - **Closer binding is type-checked (1.2).** A closer's `intent_entry_hash`
   must resolve to a `gate_intent` entry (wrong type or absent = FAIL); two
   closers for one intent = FAIL; a closer whose binding disagrees with its
