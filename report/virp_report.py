@@ -1316,6 +1316,20 @@ def main(argv=None):
         print("  v2 session obs  : %d (at-rest unverifiable by design; "
               "journal corroboration: %s)"
               % (summary["obs_v2"], _fmt(jt)))
+    ncs = summary.get("node_configs", [])
+    if ncs:
+        for b in ncs:
+            print("  NODE CONFIG     : build=%s evidence_required=%s "
+                  "gate=%s/%s%s" % (
+                      b.get("build_id", "?"),
+                      b.get("evidence_required", "?"),
+                      b.get("gate_default_mode", "?"),
+                      b.get("gate_max_tier", "?"),
+                      "  <-- UNRECORDED EXECUTION WINDOW"
+                      if b.get("evidence_required") is False else ""))
+    else:
+        print("  NODE CONFIG     : none on chain — tier ceiling and "
+              "evidence posture UNKNOWN for this bundle")
     open_execs = summary.get("open_executions", [])
     if open_execs:
         print("  OPEN EXECUTIONS : %d (gate_intent with no linked outcome — "

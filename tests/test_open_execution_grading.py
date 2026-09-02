@@ -77,25 +77,29 @@ class ChainBuilder:
         return e
 
     def intent(self, session=GATE_SESSION, decision="auto-execute",
-               proposal_id=None):
+               proposal_id=None, approval_entry_hash=None, uid=None,
+               device="PVE-LAB", command="show version"):
         body = json.dumps({
-            "schema": "gate_intent/1", "device": "PVE-LAB",
-            "driver": "mock", "command": "show version",
+            "schema": "gate_intent/1", "device": device,
+            "driver": "mock", "command": command,
             "classified_tier": "GREEN", "gate_max_tier": "GREEN",
             "effective_max_tier": "GREEN", "ceiling_source": "node-wide",
-            "gate_mode": "ENFORCE", "decision": decision, "uid": None,
-            "session": None, "proposal_id": proposal_id, "obs_version": 1,
+            "gate_mode": "ENFORCE", "decision": decision, "uid": uid,
+            "session": None, "proposal_id": proposal_id,
+            "approval_entry_hash": approval_entry_hash,
+            "proposal_entry_hash": None, "obs_version": 1,
             "intent_ns": 1756684800000000000 + len(self.entries),
         }, separators=(",", ":"))
         return self.append(session, "gate_intent",
                            "gateintent-" + _sha(body)[:16], body)
 
-    def execution(self, intent, session=GATE_SESSION):
+    def execution(self, intent, session=GATE_SESSION, device="PVE-LAB",
+                  command="show version", uid=None):
         body = json.dumps({
-            "schema": "gate_execution/1", "device": "PVE-LAB",
-            "driver": "mock", "command": "show version",
+            "schema": "gate_execution/1", "device": device,
+            "driver": "mock", "command": command,
             "classified_tier": "GREEN", "decision": "auto-execute",
-            "uid": None,
+            "uid": uid, "session": None,
             "intent_entry_hash": (intent["chain_entry_hash"]
                                   if intent else None),
             "intent_sequence": intent["sequence"] if intent else None,
@@ -106,18 +110,38 @@ class ChainBuilder:
         return self.append(session, "gate_execution",
                            "gateexec-" + _sha(body)[:16], body)
 
-    def outcome(self, intent, proposal_id="prop-1"):
+    def outcome(self, intent, proposal_id="prop-1",
+                approval_entry_hash="b" * 64, device="PVE-LAB"):
         # The daemon's outcome body is hand-formatted snprintf JSON with
         # intent_entry_hash LAST; the verifier must not care about order.
         body = ('{"proposal_id":"%s","proposal_entry_hash":"%s",'
-                '"approval_entry_hash":"%s","device":"PVE-LAB",'
+                '"approval_entry_hash":"%s","device":"%s",'
                 '"command_hash":"%s","success":true,'
                 '"intent_entry_hash":%s}'
-                % (proposal_id, "a" * 64, "b" * 64, "c" * 64,
+                % (proposal_id, "a" * 64, approval_entry_hash, device,
+                   "c" * 64,
                    '"%s"' % intent["chain_entry_hash"] if intent
                    else "null"))
         return self.append(APPROVAL_SESSION, "outcome",
                            "outcome:" + proposal_id, body)
+
+    def raw_execution_citing(self, intent_hash, session=GATE_SESSION,
+                             device="PVE-LAB", command="show version"):
+        """A gate_execution whose intent_entry_hash is set to an arbitrary
+        hash (for crafting a second closer, or a closer citing a
+        non-intent)."""
+        body = json.dumps({
+            "schema": "gate_execution/1", "device": device,
+            "driver": "mock", "command": command,
+            "classified_tier": "GREEN", "decision": "auto-execute",
+            "uid": None, "session": None,
+            "intent_entry_hash": intent_hash,
+            "intent_sequence": 0, "intent_artifact_id": "x",
+            "executed": True, "executed_reported": True, "success": True,
+            "response_sha256": "e" * 64, "response_len": 12, "error": None,
+        }, separators=(",", ":"))
+        return self.append(session, "gate_execution",
+                           "gateexec-" + _sha(body)[:16], body)
 
     def verify(self):
         return verify.verify_chain(self.entries, self.artifacts,
@@ -212,6 +236,71 @@ class TestOpenExecutionGrading(unittest.TestCase):
         self._assert_chain_clean(verifications, summary)
         self.assertEqual(summary["executions_closed"], 0)
         self.assertEqual(len(summary["open_executions"]), 1)
+
+    def _fail_reasons(self, summary):
+        return [f.failures[0][1] for f in summary["failed_entries"]
+                if getattr(f, "is_evidence", False)]
+
+    def test_two_intents_one_approval_is_double_spend_fail(self):
+        b = ChainBuilder()
+        aeh = "d" * 64
+        b.intent(decision="approved-apply", proposal_id="p1",
+                 approval_entry_hash=aeh)
+        b.intent(decision="approved-apply", proposal_id="p1",
+                 approval_entry_hash=aeh)
+        _, summary = b.verify()
+        reasons = self._fail_reasons(summary)
+        self.assertTrue(any("double-spend" in r for r in reasons), reasons)
+
+    def test_two_closers_one_intent_is_fail(self):
+        b = ChainBuilder()
+        i = b.intent()
+        b.execution(i)
+        b.raw_execution_citing(i["chain_entry_hash"])
+        _, summary = b.verify()
+        reasons = self._fail_reasons(summary)
+        self.assertTrue(any("two closers" in r.lower() for r in reasons),
+                        reasons)
+
+    def test_closer_citing_non_intent_is_fail(self):
+        b = ChainBuilder()
+        # cite an observation-shaped entry's hash, not a gate_intent
+        obs = b.append(GATE_SESSION, "gate_execution", "gateexec-decoy",
+                       '{"schema":"gate_execution/1","device":"PVE-LAB"}')
+        b.raw_execution_citing(obs["chain_entry_hash"])
+        _, summary = b.verify()
+        reasons = self._fail_reasons(summary)
+        self.assertTrue(any("not a gate_intent" in r for r in reasons),
+                        reasons)
+
+    def test_closer_binding_mismatch_device_is_fail(self):
+        b = ChainBuilder()
+        i = b.intent(device="PVE-LAB")
+        b.execution(i, device="OTHER-DEVICE")
+        _, summary = b.verify()
+        reasons = self._fail_reasons(summary)
+        self.assertTrue(any("device mismatch" in r for r in reasons), reasons)
+
+    def test_outcome_binding_mismatch_approval_is_fail(self):
+        b = ChainBuilder()
+        i = b.intent(decision="approved-apply", proposal_id="p1",
+                     approval_entry_hash="d" * 64)
+        # outcome cites the right intent but a different approval hash
+        b.outcome(i, "p1", approval_entry_hash="f" * 64)
+        _, summary = b.verify()
+        reasons = self._fail_reasons(summary)
+        self.assertTrue(
+            any("approval_entry_hash mismatch" in r for r in reasons), reasons)
+
+    def test_matched_approved_apply_is_clean(self):
+        b = ChainBuilder()
+        i = b.intent(decision="approved-apply", proposal_id="p1",
+                     approval_entry_hash="d" * 64)
+        b.outcome(i, "p1", approval_entry_hash="d" * 64)
+        verifications, summary = b.verify()
+        self._assert_chain_clean(verifications, summary)
+        self.assertEqual(self._fail_reasons(summary), [])
+        self.assertEqual(summary["executions_closed"], 1)
 
     def test_gate_intent_is_not_an_external_type(self):
         """A socket client must not be able to mint an intent (and so an

@@ -2871,6 +2871,71 @@ TEST(test_blocked_address_text_scan)
 
 #define EXCLUSION_CFG "/tmp/virp-onode-exclusion.json"
 
+TEST(test_load_devices_refuses_nonboolean_evidence_required)
+{
+    /* 1.4: evidence_required set to anything other than a JSON boolean is
+     * a FATAL config error (naming the key), not a silent ignore. A
+     * string "false" is the trap the strictness closes — always truthy,
+     * so a silent default of true would look like the operator got what
+     * they asked for while meaning the opposite. */
+    const char *CFG = "/tmp/virp-onode-evreq-bad.json";
+    FILE *f = fopen(CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"evidence_required\": \"false\",\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"ok\", \"host\": \"10.0.10.12\", \"vendor\": \"mock\" }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0031, NULL,
+                         "/tmp/virp-onode-evreq-bad.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    int loaded = load_devices(&tmp, CFG);
+    ASSERT_EQ(loaded, -1);
+    ASSERT_EQ(tmp.device_count, 0);
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(CFG);
+}
+
+TEST(test_load_devices_accepts_boolean_evidence_required)
+{
+    /* The valid form still loads and sets the flag from the boolean. */
+    const char *CFG = "/tmp/virp-onode-evreq-ok.json";
+    FILE *f = fopen(CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"evidence_required\": false,\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"ok\", \"host\": \"10.0.0.55\", \"vendor\": \"mock\",\n"
+        "      \"node_id\": \"0A0A0A37\" }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0032, NULL,
+                         "/tmp/virp-onode-evreq-ok.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    int loaded = load_devices(&tmp, CFG);
+    ASSERT_TRUE(loaded >= 1);
+    ASSERT_EQ((int)tmp.evidence_required, 0);   /* the boolean took effect */
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(CFG);
+}
+
 TEST(test_load_devices_refuses_blocked_address)
 {
     /* A config that is VALID in every respect except the blocked host:
@@ -3846,6 +3911,78 @@ TEST(test_evidence_normal_path_leaves_two_linked_entries)
     snprintf(linkid, sizeof(linkid), "\"intent_artifact_id\":\"%s\"", rows[0].id);
     ASSERT_TRUE(strstr(rows[1].body, linkid) != NULL);
     ASSERT_TRUE(strstr(rows[1].body, "\"executed\":true") != NULL);
+}
+
+/* 1.3 — an outcome append that fails AFTER the device acted must NOT be
+ * silent: the caller gets an ERROR citing unchained-execution and the
+ * open intent, the daemon latches degraded and refuses the next dispatch
+ * at the intent step, and the crashed-window intent verifies as OPEN. */
+TEST(test_evidence_outcome_append_failure_is_marked_and_degrades)
+{
+    onode_state_t st;
+    ASSERT_OK(ev_setup(&st));
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+
+    /* One clean execution first, so there is a normal pair on the chain. */
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+
+    /* Arm the closer-append failure: the NEXT execution's intent commits,
+     * the device runs, and the gate_execution append fails. */
+    st.evidence_fail_closer_once = true;
+    (void)virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    int ran = virp_driver_mock_exec_attempts_reset();
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+    virp_observation_t o;
+    const uint8_t *data; uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE, &o, &data,
+                                     &data_len));
+    char payload[600];
+    snprintf(payload, sizeof(payload), "%.*s", (int)data_len,
+             (const char *)data);
+
+    /* The device DID act (execute attempted) and the caller is TOLD the
+     * outcome is unchained — not handed a normal DEVICE_OUTPUT. */
+    ASSERT_EQ(ran, 1);
+    ASSERT_EQ(o.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr(payload, "unchained-execution") != NULL);
+    ASSERT_TRUE(strstr(payload, "evidence-degraded") != NULL);
+
+    /* Degraded now: the next execution refuses at the intent step and
+     * nothing reaches the device. */
+    ASSERT_EQ((int)st.evidence_degraded, 1);
+    (void)virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    int ran2 = virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE, &o, &data,
+                                     &data_len));
+    snprintf(payload, sizeof(payload), "%.*s", (int)data_len,
+             (const char *)data);
+    ASSERT_EQ(ran2, 0);
+    ASSERT_EQ(o.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr(payload, "evidence-unavailable") != NULL);
+
+    /* The whole session still VERIFIES — nothing about the chain is
+     * broken — and reports exactly one OPEN execution (the closer that
+     * never landed). The first command closed normally. */
+    virp_chain_verify_result_t vr;
+    ASSERT_OK(virp_chain_verify_session(&st.chain, GX_SESSION, &vr));
+    gx_teardown(&st);
+    gx_cleanup();
+
+    ASSERT_TRUE(vr.valid);
+    ASSERT_EQ((int)vr.first_broken, -1);
+    ASSERT_EQ((int)vr.executions_open, 1);
+    ASSERT_EQ((int)vr.executions_closed, 1);
 }
 
 /* Child-process body for the crash test: a fresh daemon state on the GX
@@ -7626,6 +7763,8 @@ int main(int argc, char **argv)
 
     printf("\n[Autopilot hard exclusions (10.0.10.1 / 10.0.10.10)]\n");
     RUN_TEST(test_blocked_address_text_scan);
+    RUN_TEST(test_load_devices_refuses_nonboolean_evidence_required);
+    RUN_TEST(test_load_devices_accepts_boolean_evidence_required);
     RUN_TEST(test_load_devices_refuses_blocked_address);
     RUN_TEST(test_load_devices_allows_neighbor_addresses);
 
@@ -7651,6 +7790,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_evidence_required_without_chain_refuses_dispatch);
     RUN_TEST(test_evidence_normal_path_leaves_two_linked_entries);
     RUN_TEST(test_evidence_crash_between_intent_and_outcome_is_open_execution);
+    RUN_TEST(test_evidence_outcome_append_failure_is_marked_and_degrades);
     RUN_TEST(test_execution_record_commits_to_digest_not_response_body);
     RUN_TEST(test_errored_execution_still_chains_no_gap);
     RUN_TEST(test_refused_action_still_chains_gate_rejection);

@@ -15,6 +15,10 @@
 
 #include "virp_chain.h"
 #include "virp_fault_inject.h"
+#include "cJSON.h"
+
+static virp_error_t chain_count_intents_for_approval_locked(
+        virp_chain_state_t *state, const char *aeh, int *count);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -430,6 +434,29 @@ virp_error_t virp_chain_entry_commits_to(virp_chain_state_t *state,
     return rc;
 }
 
+/*
+ * Apply-time replay guard (Sep 1 review, Task 5 / 1.1). Count committed
+ * gate_intent entries whose body cites this approval entry hash. The
+ * daemon calls this BEFORE appending a new intent for an approved apply:
+ * a count >= 1 means this approval was already spent on a committed
+ * intent (the chain is the authority — this closes the crash window
+ * between an intent commit and the consumed.list write, where the cache
+ * could be lost but the chain entry survives). The verifier uses the same
+ * count internally to flag a double-spend (count > 1). cJSON-parsed
+ * citation, type-restricted query — GATE 4 discipline, never instr().
+ */
+virp_error_t virp_chain_count_intents_for_approval(virp_chain_state_t *state,
+                                                   const char *approval_entry_hash,
+                                                   int *count)
+{
+    if (!state || !approval_entry_hash || !count) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_count_intents_for_approval_locked(
+                          state, approval_entry_hash, count);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
 virp_error_t virp_chain_artifact_id_conflict(virp_chain_state_t *state,
                                              const char *artifact_id,
                                              const char *artifact_hash,
@@ -546,6 +573,7 @@ bool virp_chain_type_is_daemon_reserved(const char *artifact_type)
         "gate_rejection",  /* src/virp_onode.c     (gate)     */
         "gate_execution",  /* src/virp_onode.c     (gate)     */
         "gate_intent",     /* src/virp_onode.c     (gate, pre-dispatch) */
+        "node_config",     /* src/virp_onode.c     (startup posture) */
         "validation",      /* src/virp_validator.c            */
     };
     return type_in(artifact_type, RESERVED,
@@ -2096,26 +2124,272 @@ static int chain_verify_binding_locked(virp_chain_state_t *state,
  * A store that cannot be read yields "not closed": the honest direction,
  * since an intent whose closer cannot be found is exactly an open one.
  */
-static bool chain_intent_closed_locked(virp_chain_state_t *state,
-                                       const char *intent_hash)
+/* ── Evidence-required grading helpers (Sep 1 review, Task 5 / 1.1-1.2) ──
+ * These grade the gate_intent / closer relationship the daemon writes
+ * under evidence_required. GATE 4 discipline throughout: a citation is a
+ * cJSON-parsed field, NEVER an instr() scan of the raw body (a substring
+ * match would let "intent_entry_hash" appear inside some other quoted
+ * value close an intent it never named). Type-restricted queries only.
+ *
+ * A closer is a gate_execution (an auto-executed dispatch) or an outcome
+ * (an approved apply), which names its intent by chain_entry_hash in the
+ * body field intent_entry_hash. An intent is closed by exactly one such
+ * closer; zero is an OPEN execution (reported, not a failure); TWO is
+ * tampering (one intent cannot have two dispositions). */
+
+/* cJSON string field, copied into out (NUL-terminated). Returns true iff
+ * present as a string. A null/absent field yields false and out=="".*/
+static bool cj_str(const cJSON *o, const char *key, char *out, size_t cap)
+{
+    out[0] = '\0';
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, key);
+    if (!cJSON_IsString(v) || !v->valuestring) return false;
+    snprintf(out, cap, "%s", v->valuestring);
+    return true;
+}
+
+/* Load the stored body for the entry whose chain_entry_hash == h. The
+ * body is looked up through the entry's own (artifact_id, artifact_hash)
+ * so a colliding id cannot substitute a different body. Returns a
+ * malloc'd NUL-terminated string the caller frees, or NULL. */
+static char *chain_body_by_entry_hash_locked(virp_chain_state_t *state,
+                                             const char *h)
 {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(state->db,
-            "SELECT 1 FROM chain_entries c "
+            "SELECT a.artifact_content FROM chain_entries c "
             "JOIN artifacts a ON a.artifact_id = c.artifact_id "
             "               AND a.artifact_hash = c.artifact_hash "
-            "WHERE c.artifact_type IN ('gate_execution', 'outcome') "
-            "  AND instr(a.artifact_content, ?) > 0 LIMIT 1",
-            -1, &st, NULL) != SQLITE_OK)
-        return false;
-
-    char needle[96];
-    snprintf(needle, sizeof(needle), "\"intent_entry_hash\":\"%s\"",
-             intent_hash);
-    sqlite3_bind_text(st, 1, needle, -1, SQLITE_TRANSIENT);
-    bool closed = (sqlite3_step(st) == SQLITE_ROW);
+            "WHERE c.chain_entry_hash = ? LIMIT 1", -1, &st, NULL) != SQLITE_OK)
+        return NULL;
+    sqlite3_bind_text(st, 1, h, -1, SQLITE_TRANSIENT);
+    char *body = NULL;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *b = sqlite3_column_text(st, 0);
+        if (b) {
+            size_t n = strlen((const char *)b) + 1;
+            body = malloc(n);
+            if (body) memcpy(body, b, n);
+        }
+    }
     sqlite3_finalize(st);
-    return closed;
+    return body;
+}
+
+/* Does a gate_intent entry with this exact chain_entry_hash exist?
+ * chain_entry_hash is unique per entry, so this both resolves the hash
+ * and type-checks it: a closer citing a hash that is present but NOT a
+ * gate_intent gets *is_intent=false. *found is whether ANY entry has the
+ * hash. Returns VIRP_OK on a clean query. */
+static virp_error_t chain_hash_is_intent_locked(virp_chain_state_t *state,
+                                                const char *h,
+                                                bool *found, bool *is_intent)
+{
+    *found = false; *is_intent = false;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT artifact_type FROM chain_entries "
+            "WHERE chain_entry_hash = ? LIMIT 1", -1, &st, NULL) != SQLITE_OK)
+        return VIRP_ERR_CHAIN_DB;
+    sqlite3_bind_text(st, 1, h, -1, SQLITE_TRANSIENT);
+    int step = sqlite3_step(st);
+    if (step == SQLITE_ROW) {
+        *found = true;
+        const unsigned char *t = sqlite3_column_text(st, 0);
+        *is_intent = (t && strcmp((const char *)t, "gate_intent") == 0);
+    }
+    sqlite3_finalize(st);
+    return (step == SQLITE_ROW || step == SQLITE_DONE) ? VIRP_OK
+                                                       : VIRP_ERR_CHAIN_DB;
+}
+
+/* Count gate_intent entries whose body's approval_entry_hash == aeh (a
+ * non-empty approval entry hash). Parses each body with cJSON. Used both
+ * by the verifier (two intents for one approval is tampering) and,
+ * publicly below, by the daemon's apply-time replay guard. */
+static virp_error_t chain_count_intents_for_approval_locked(
+        virp_chain_state_t *state, const char *aeh, int *count)
+{
+    *count = 0;
+    if (!aeh || !aeh[0]) return VIRP_OK;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT a.artifact_content FROM chain_entries c "
+            "JOIN artifacts a ON a.artifact_id = c.artifact_id "
+            "               AND a.artifact_hash = c.artifact_hash "
+            "WHERE c.artifact_type = 'gate_intent'", -1, &st, NULL) != SQLITE_OK)
+        return VIRP_ERR_CHAIN_DB;
+    int n = 0, step;
+    while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+        const unsigned char *b = sqlite3_column_text(st, 0);
+        if (!b) continue;
+        cJSON *o = cJSON_Parse((const char *)b);
+        if (!o) continue;
+        char got[65];
+        if (cj_str(o, "approval_entry_hash", got, sizeof(got)) &&
+            strcmp(got, aeh) == 0)
+            n++;
+        cJSON_Delete(o);
+    }
+    sqlite3_finalize(st);
+    if (step != SQLITE_DONE) return VIRP_ERR_CHAIN_DB;
+    *count = n;
+    return VIRP_OK;
+}
+
+/* Compare a closer body against the intent body it cites, field by field,
+ * over the binding fields BOTH carry. Present-on-both-and-differ is the
+ * failure; a field only one side carries is not compared (gate_execution
+ * carries command/uid/session; outcome carries proposal_id/
+ * approval_entry_hash; both carry device). Returns true on a mismatch and
+ * writes a reason. */
+static bool closer_binding_mismatch(const cJSON *intent, const char *closer_type,
+                                    const cJSON *closer, char *why, size_t cap)
+{
+    char a[96], b[96];
+    #define CMP(field) do {                                                      bool pa = cj_str(intent, field, a, sizeof(a));                           bool pb = cj_str(closer, field, b, sizeof(b));                           if (pa && pb && strcmp(a, b) != 0) {                                         snprintf(why, cap, "%s mismatch (intent='%s' closer='%s')",                       field, a, b); return true; }                            } while (0)
+    CMP("device");
+    if (strcmp(closer_type, "gate_execution") == 0) {
+        CMP("command");
+        CMP("session");
+        /* uid is a JSON number (or null); compare numerically when both
+         * are present as numbers. */
+        const cJSON *ui = cJSON_GetObjectItemCaseSensitive(intent, "uid");
+        const cJSON *uc = cJSON_GetObjectItemCaseSensitive(closer, "uid");
+        if (cJSON_IsNumber(ui) && cJSON_IsNumber(uc) &&
+            ui->valuedouble != uc->valuedouble) {
+            snprintf(why, cap, "uid mismatch (intent=%g closer=%g)",
+                     ui->valuedouble, uc->valuedouble);
+            return true;
+        }
+    } else { /* outcome */
+        CMP("proposal_id");
+        CMP("approval_entry_hash");
+    }
+    #undef CMP
+    return false;
+}
+
+/* Grade one gate_intent entry (body already loaded). Sets *is_open, and on
+ * tampering sets result->valid=false + first_broken + error_detail and
+ * returns false. Tampering = two closers cite this intent, or the single
+ * closer's binding disagrees, or two intents share this approval. */
+static bool chain_grade_intent_locked(virp_chain_state_t *state,
+                                      const virp_chain_entry_t *e,
+                                      const char *intent_body,
+                                      bool *is_open,
+                                      virp_chain_verify_result_t *result)
+{
+    *is_open = true;
+    cJSON *intent = intent_body ? cJSON_Parse(intent_body) : NULL;
+
+    /* Two intents for one approval entry hash → tampering. */
+    if (intent) {
+        char aeh[65];
+        if (cj_str(intent, "approval_entry_hash", aeh, sizeof(aeh)) && aeh[0]) {
+            int nintents = 0;
+            if (chain_count_intents_for_approval_locked(state, aeh,
+                                                        &nintents) == VIRP_OK &&
+                nintents > 1) {
+                result->valid = false;
+                result->first_broken = e->sequence;
+                snprintf(result->error_detail, sizeof(result->error_detail),
+                         "Two gate_intent entries cite approval %.16s "
+                         "(double-spend) at sequence %lld",
+                         aeh, (long long)e->sequence);
+                cJSON_Delete(intent);
+                return false;
+            }
+        }
+    }
+
+    /* Find closers that cite THIS intent by chain_entry_hash. */
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT c.artifact_type, a.artifact_content FROM chain_entries c "
+            "JOIN artifacts a ON a.artifact_id = c.artifact_id "
+            "               AND a.artifact_hash = c.artifact_hash "
+            "WHERE c.artifact_type IN ('gate_execution','outcome')",
+            -1, &st, NULL) != SQLITE_OK) {
+        if (intent) cJSON_Delete(intent);
+        return true;   /* cannot read: report OPEN, never fail on a read error */
+    }
+    int nclosers = 0;
+    bool binding_bad = false; char why[288] = "";
+    int step;
+    while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+        const unsigned char *ct = sqlite3_column_text(st, 0);
+        const unsigned char *cb = sqlite3_column_text(st, 1);
+        if (!ct || !cb) continue;
+        cJSON *closer = cJSON_Parse((const char *)cb);
+        if (!closer) continue;
+        char cited[65];
+        if (cj_str(closer, "intent_entry_hash", cited, sizeof(cited)) &&
+            strcmp(cited, e->chain_entry_hash) == 0) {
+            nclosers++;
+            if (intent && !binding_bad &&
+                closer_binding_mismatch(intent, (const char *)ct, closer,
+                                        why, sizeof(why)))
+                binding_bad = true;
+        }
+        cJSON_Delete(closer);
+    }
+    sqlite3_finalize(st);
+    if (intent) cJSON_Delete(intent);
+
+    if (step != SQLITE_DONE)
+        return true;   /* read error: OPEN, not a failure */
+
+    if (nclosers > 1) {
+        result->valid = false;
+        result->first_broken = e->sequence;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "Two closers cite gate_intent at sequence %lld "
+                 "(one intent, two dispositions)", (long long)e->sequence);
+        return false;
+    }
+    if (nclosers == 1 && binding_bad) {
+        result->valid = false;
+        result->first_broken = e->sequence;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "Closer binding disagrees with gate_intent at sequence "
+                 "%lld: %s", (long long)e->sequence, why);
+        return false;
+    }
+    *is_open = (nclosers == 0);
+    return true;
+}
+
+/* Grade one closer (gate_execution / outcome) entry: if it cites an intent
+ * (intent_entry_hash present and non-null), that hash MUST resolve to a
+ * gate_intent entry. A hash that is absent, or present as some other type,
+ * is tampering. Returns false + sets result on failure. */
+static bool chain_grade_closer_locked(virp_chain_state_t *state,
+                                      const virp_chain_entry_t *e,
+                                      const char *closer_body,
+                                      virp_chain_verify_result_t *result)
+{
+    if (!closer_body) return true;
+    cJSON *o = cJSON_Parse(closer_body);
+    if (!o) return true;
+    char cited[65];
+    bool has = cj_str(o, "intent_entry_hash", cited, sizeof(cited)) && cited[0];
+    cJSON_Delete(o);
+    if (!has) return true;   /* evidence_required=false closer: no citation */
+
+    bool found = false, is_intent = false;
+    if (chain_hash_is_intent_locked(state, cited, &found, &is_intent) != VIRP_OK)
+        return true;         /* read error: do not manufacture a failure */
+    if (!found || !is_intent) {
+        result->valid = false;
+        result->first_broken = e->sequence;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "Closer at sequence %lld cites intent %.16s which is %s",
+                 (long long)e->sequence, cited,
+                 found ? "not a gate_intent entry" : "absent from the chain");
+        return false;
+    }
+    return true;
 }
 
 static virp_error_t chain_verify_locked(virp_chain_state_t *state,
@@ -2333,17 +2607,30 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
             else           result->artifacts_bound++;
         }
 
-        /* OPEN EXECUTIONS (Sep 1 review, Task 5). A gate_intent entry
-         * says the daemon was about to dispatch; its closer says what
-         * came of it. No closer anywhere = the daemon never got to write
-         * one = an execution whose disposition is unknown. Counted,
-         * reported, and NEVER a failure: the chain is intact, the world
-         * beyond its last entry is what is uncertain. */
+        /* EVIDENCE-REQUIRED grading (Sep 1 review, Task 5 / 1.1-1.2).
+         * A gate_intent is CLOSED by exactly one type-checked, binding-
+         * matched closer, OPEN with none (reported, never a failure), and
+         * TAMPERING with two, a mismatched binding, or a shared approval.
+         * A closer must cite a hash that resolves to a gate_intent. Both
+         * checks are structural integrity: a failure clears valid and
+         * sets first_broken like any other tamper signal. */
         if (strcmp(e.artifact_type, "gate_intent") == 0) {
-            if (chain_intent_closed_locked(state, e.chain_entry_hash))
-                result->executions_closed++;
-            else
-                result->executions_open++;
+            char *ibody = chain_body_by_entry_hash_locked(state,
+                                                          e.chain_entry_hash);
+            bool is_open = true;
+            bool ok = chain_grade_intent_locked(state, &e, ibody, &is_open,
+                                                result);
+            if (ibody) free(ibody);
+            if (!ok) break;
+            if (is_open) result->executions_open++;
+            else         result->executions_closed++;
+        } else if (strcmp(e.artifact_type, "gate_execution") == 0 ||
+                   strcmp(e.artifact_type, "outcome") == 0) {
+            char *cbody = chain_body_by_entry_hash_locked(state,
+                                                          e.chain_entry_hash);
+            bool ok = chain_grade_closer_locked(state, &e, cbody, result);
+            if (cbody) free(cbody);
+            if (!ok) break;
         }
 
         /* Advance */

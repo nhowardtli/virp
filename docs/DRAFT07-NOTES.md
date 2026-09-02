@@ -197,3 +197,81 @@ must land with the observation-format version bump. Sequencing decision
 recorded at the deferral comment in `src/virp_transcript.c
 virp_hkdf_sha256` (crypto review 2026-08-31, finding 6, second half).
 The PRK-cleanup half of that finding is already fixed in-tree.
+
+---
+
+## 4. Evidence-required execution — chain-visible surface (Sep 1 review, Task 5 / 1.1–1.6)
+
+Landed in `fix/evidence-required`. These are the protocol- and chain-visible
+elements a draft-07 reader must know; the mechanism and rationale are in
+`SECURITY.md` "Evidence-required execution".
+
+- **`gate_intent` chain entry (type, daemon-reserved).** Written before the
+  driver runs, in session `gate-enforce:<device>`. Body (`gate_intent/1`):
+  `device, driver, command, classified_tier, gate_max_tier,
+  effective_max_tier, ceiling_source, gate_mode, decision
+  (auto-execute|approved-apply), uid, session (v2 hex or null), proposal_id,
+  approval_entry_hash, proposal_entry_hash (both null for an auto-execute),
+  obs_version, intent_ns`. A socket client may not mint one.
+
+- **Closer link.** `gate_execution` and `outcome` bodies carry
+  `intent_entry_hash` (+ `intent_sequence`, `intent_artifact_id`) naming the
+  intent they close. `gate_execution` also now carries `session` for the
+  binding check. `intent_entry_hash: null` marks a closer written with
+  `evidence_required=false`.
+
+- **Open-execution verdict.** A `gate_intent` with no closer citing its
+  `chain_entry_hash` is an OPEN execution: reported by
+  `virp_chain_verify_session` (`executions_open`/`executions_closed`), by
+  `virp chain-verify` (`OPEN_EXECUTIONS=n`), by the daemon's `chain_verify`
+  actions, and by `report/verify.py` (`summary["open_executions"]`). It is
+  **not** a chain failure — the chain is intact; the world after its last
+  entry is uncertain. Reconcile against the target.
+
+- **Closer binding rules (verifier FAIL, both C and Python).** A closer's
+  `intent_entry_hash` must resolve to a `gate_intent` entry (wrong type or
+  absent = FAIL). Two closers for one intent = FAIL. Two intents citing one
+  `approval_entry_hash` = FAIL (double-spend). A closer whose binding
+  fields disagree with its intent = FAIL, compared over the fields both
+  carry: `device` always; `command`/`session`/`uid` for `gate_execution`;
+  `proposal_id`/`approval_entry_hash` for `outcome`. All checks use the
+  GATE 4 pattern (type-restricted query + cJSON parse, never `instr`/
+  `strstr`).
+
+- **`node_config` chain entry (type, daemon-reserved).** Written once at
+  startup in session `node-config:<node_id>`. Body (`node_config/1`):
+  `node_id, build_id, evidence_required, gate_default_mode, gate_max_tier,
+  uid_ceilings[], emitted_ns`. Lets a reader bound the window in which
+  unrecorded execution was permitted, and lets Docket read the tier ceiling
+  from the bundle. Verifiers accept it present or absent with no grading
+  change.
+
+- **Evidence-required mode / degraded state.** `evidence_required` (config
+  boolean, default true) gates dispatch on a durable pre-execution record;
+  a non-boolean value is a FATAL config error (1.4). When a closer append
+  fails *after* the device acted, the caller receives a signed ERROR citing
+  `unchained-execution` and the open intent, and the daemon latches
+  **evidence-degraded**, refusing further dispatch at the intent step until
+  restart (1.3). The durable late-closer spool that would recover such an
+  outcome is deferred — see `docs/PROPOSAL-LATE-CLOSER-SPOOL.md`.
+
+## 5. Three body-level truth gaps still open (recorded together)
+
+These are pre-existing honesty gaps in the daemon's own record bodies, NOT
+introduced by the evidence-required work, tracked here so draft-07 accounts
+for them in one place:
+
+1. **`gate_execution.executed`** is three-valued in intent
+   (EXECUTED / REFUSED / UNKNOWN) but an undeclared `!success` driver
+   result still resolves to `executed:true` and is signed as
+   DEVICE_OUTPUT. Pinned by the two deliberately-PENDING tests in
+   `tests/test_onode.c` (`test_refusal_with_body_is_not_an_execution`,
+   `test_refusal_with_body_is_not_recorded_executed`). No shipping driver
+   emits that shape today; the O-Node is what remains to be held to account.
+2. **`gate_rejection`** records `gate_mode` but the SHADOW-vs-ENFORCE
+   distinction in the body can still be read ambiguously by a consumer that
+   keys on tier alone; the field is present but under-used.
+3. **`decision` value set** across `gate_intent` / `gate_execution` /
+   `gate_rejection` is not a closed enum in the schema — a reader must know
+   the daemon's spellings (`auto-execute`, `approved-apply`) rather than
+   validate against a declared list.

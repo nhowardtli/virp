@@ -929,15 +929,15 @@ static virp_error_t consume_once(const char *dir, const char *proposal_id)
     return err;   /* persist failure → non-OK → caller rejects (fail closed) */
 }
 
-virp_error_t virp_approval_verify_consume(const char *dir,
-                                          const virp_approver_registry_t *reg,
-                                          const char *proposal_id,
-                                          const char *device,
-                                          uint32_t device_node_id,
-                                          const char *command,
-                                          const char *typed_profile,
-                                          uint64_t now_ns,
-                                          virp_approval_rec_t *out)
+virp_error_t virp_approval_verify(const char *dir,
+                                  const virp_approver_registry_t *reg,
+                                  const char *proposal_id,
+                                  const char *device,
+                                  uint32_t device_node_id,
+                                  const char *command,
+                                  const char *typed_profile,
+                                  uint64_t now_ns,
+                                  virp_approval_rec_t *out)
 {
     if (!dir || !reg || !device || !command || !out)
         return VIRP_ERR_NULL_PTR;
@@ -989,11 +989,40 @@ virp_error_t virp_approval_verify_consume(const char *dir,
         out->approved_at_ns > now_ns + 60ULL * 1000000000ULL)
         return VIRP_ERR_APPROVAL_EXPIRED;
 
-    /* 6. Single-use consume (durable; persist failure fails closed). */
+    return VIRP_OK;
+}
+
+virp_error_t virp_approval_commit_consume(const char *dir,
+                                          const char *proposal_id)
+{
+    if (!dir) return VIRP_ERR_NULL_PTR;
+    if (!proposal_id_valid(proposal_id))
+        return VIRP_ERR_APPROVAL_NOT_FOUND;
     VIRP_FI("pre_consume");
-    {
-        virp_error_t _c = consume_once(dir, proposal_id);
-        if (_c == VIRP_OK) VIRP_FI("post_consume");
-        return _c;
-    }
+    virp_error_t _c = consume_once(dir, proposal_id);
+    if (_c == VIRP_OK) VIRP_FI("post_consume");
+    return _c;
+}
+
+/*
+ * Backward-compatible verify-then-consume in one call (steps 1..6). The
+ * evidence-required apply path does NOT use this — it verifies, commits
+ * the intent, then consumes — but negative-path tests and any caller not
+ * on the evidence path still get the atomic form.
+ */
+virp_error_t virp_approval_verify_consume(const char *dir,
+                                          const virp_approver_registry_t *reg,
+                                          const char *proposal_id,
+                                          const char *device,
+                                          uint32_t device_node_id,
+                                          const char *command,
+                                          const char *typed_profile,
+                                          uint64_t now_ns,
+                                          virp_approval_rec_t *out)
+{
+    virp_error_t err = virp_approval_verify(dir, reg, proposal_id, device,
+                                            device_node_id, command,
+                                            typed_profile, now_ns, out);
+    if (err != VIRP_OK) return err;
+    return virp_approval_commit_consume(dir, proposal_id);
 }

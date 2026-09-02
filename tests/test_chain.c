@@ -887,6 +887,10 @@ static void test_artifact_type_policy(void)
     ASSERT(strlen("gate_intent") < 16, "gate_intent fits untruncated");
     ASSERT(!virp_chain_type_is_external_allowed("gate_intent"),
            "gate_intent is not externally submittable");
+    ASSERT(virp_chain_type_is_daemon_reserved("node_config"), "node_config");
+    ASSERT(strlen("node_config") < 16, "node_config fits untruncated");
+    ASSERT(!virp_chain_type_is_external_allowed("node_config"),
+           "node_config is not externally submittable");
     ASSERT(virp_chain_type_is_daemon_reserved("validation"), "validation");
     ASSERT(!virp_chain_type_is_daemon_reserved("observation"), "observation");
     /* Both gate verdict names must survive the 16-byte artifact_type field

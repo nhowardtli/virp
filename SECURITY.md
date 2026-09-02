@@ -1186,6 +1186,56 @@ daemon-reserved artifact type like `gate_execution`: a socket client cannot
 mint one, so it cannot plant an open execution against a device nothing
 touched.
 
+#### Refinements (Sep 1 review, 1.1–1.5)
+
+- **Consumption is the intent (1.1).** An approved apply's approval is
+  **consumed iff a committed `gate_intent` entry names it** (the entry
+  carries `approval_entry_hash` and `proposal_entry_hash`). The gate now
+  VERIFIES the approval without consuming; the intent commit is the
+  consumption event, and the consume record (`consumed.list`) is written
+  after it as a cache. A refused intent consumes nothing — the operator
+  re-applies and it executes exactly once. Before appending an intent for
+  an approved apply the daemon queries the chain, type-restricted to
+  `gate_intent`, for one already citing that approval entry hash and
+  refuses `approval_reused` on a hit — closing the crash window between an
+  intent commit and the cache write, since the chain entry survives. Two
+  intents citing one approval entry hash is a verifier FAIL (double-spend),
+  in both the C and Python verifiers.
+- **Closer binding is type-checked (1.2).** A closer's `intent_entry_hash`
+  must resolve to a `gate_intent` entry (wrong type or absent = FAIL); two
+  closers for one intent = FAIL; a closer whose binding disagrees with its
+  intent = FAIL (device always; command/session/uid for `gate_execution`;
+  proposal_id/approval_entry_hash for `outcome`). All via the GATE 4
+  pattern — type-restricted query, cJSON parse, never `strstr`. The daemon
+  builds each closer from the intent it holds in memory, so a real closer
+  always matches; the checks are the adversarial backstop for a crafted
+  chain. Crafted-chain fixtures: `tests/test_evidence_binding.c` (C) and
+  `tests/test_open_execution_grading.py` (Python).
+- **Outcome append fails after execution (1.3).** The one window the
+  pre-execution intent cannot close is *between* the two chain appends,
+  across the device I/O: the intent commits, the device acts, the closer
+  append fails. This is now **never silent** — the caller gets a signed
+  ERROR citing `unchained-execution` and the open intent hash; the daemon
+  latches **evidence-degraded** and refuses every further dispatch at the
+  intent step until restart; the intent stays OPEN and the verifiers report
+  it. The durable late-closer spool that would *recover* the outcome (retry
+  + a late-append marker) is deferred to its own branch — see
+  `docs/PROPOSAL-LATE-CLOSER-SPOOL.md`. The degraded-refuse behaviour is the
+  fail-safe, not the recovery.
+- **Strict loader (1.4).** `evidence_required` set to anything but a JSON
+  boolean is a FATAL config error naming the key and the received type —
+  the daemon refuses to load rather than run with a guessed posture. A
+  string `"false"` (always truthy) is the trap this closes.
+- **`node_config` on the chain (1.5).** The daemon records its posture at
+  startup — `evidence_required`, gate mode, node-wide and per-uid tier
+  ceilings, and the build id — as a daemon-reserved `node_config` chain
+  entry. A reader can now bound, from the chain alone, the window in which
+  unrecorded execution was permitted (`evidence_required=false`, or a build
+  predating this work), and Docket answers the tier-ceiling question from
+  the bundle rather than from a `devices.json` it may not have. A bundle
+  with no `node_config` reports the ceiling and posture UNKNOWN rather than
+  guessing.
+
 ### Crash and storage-failure durability — measured, not assumed
 
 Earlier this section could only say "SIGKILL, not power loss". That gap is now

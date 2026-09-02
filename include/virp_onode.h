@@ -361,6 +361,27 @@ typedef struct {
     bool                evidence_required;
 
     /*
+     * EVIDENCE-DEGRADED (Sep 1 review, 1.3). Set true when an execution's
+     * outcome record (gate_execution / outcome) could not be committed to
+     * the chain AFTER the device had already acted — the one window the
+     * pre-execution intent cannot close, because it sits between two chain
+     * appends across device I/O. The command ran; its closer did not land.
+     * When set, gate_emit_intent refuses every further execution at the
+     * intent step (evidence-unavailable / degraded), so the daemon stops
+     * dispatching rather than pile up more unchained actions. The prior
+     * execution's intent stays OPEN and the verifier reports it as such.
+     * Cleared only by a restart (a clean chain reopen). Guarded by
+     * state_mutex.
+     *
+     * evidence_fail_closer_once is a TEST-ONLY injection: when set, the
+     * next closer append (gate_execution / outcome) is skipped and
+     * reported failed, modelling a chain that goes read-only in exactly
+     * that window. Never set in production.
+     */
+    bool                evidence_degraded;
+    bool                evidence_fail_closer_once;
+
+    /*
      * Approval flow (propose → approve → apply). Disabled until
      * onode_set_approvers() provides a store directory and an approver
      * registry (/etc/virp/approvers.json). The daemon holds ONLY public

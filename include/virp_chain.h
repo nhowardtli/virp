@@ -557,6 +557,18 @@ virp_error_t virp_chain_entry_commits_to(virp_chain_state_t *state,
                                          bool *exists);
 
 /*
+ * Count committed gate_intent entries whose body cites approval_entry_hash
+ * (Sep 1 review, Task 5 / 1.1). The daemon's apply-time replay guard: a
+ * count >= 1 before appending a new intent for an approved apply means the
+ * approval was already spent (chain is authority; closes the crash window
+ * between intent commit and the consumed.list cache write). The verifier
+ * flags count > 1 as a double-spend. Returns VIRP_OK on a clean query.
+ */
+virp_error_t virp_chain_count_intents_for_approval(virp_chain_state_t *state,
+                                                   const char *approval_entry_hash,
+                                                   int *count);
+
+/*
  * Set *conflict to true iff the artifacts table already holds a body
  * under the given artifact_id whose artifact_hash DIFFERS from the one
  * supplied; a byte-identical resubmission (same id, same hash) is NOT a

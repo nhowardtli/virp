@@ -193,6 +193,14 @@ OBSERVATION_TYPES = frozenset(("observation", "fed_observation"))
 INTENT_TYPE = "gate_intent"
 INTENT_CLOSER_TYPES = frozenset(("gate_execution", "outcome"))
 
+# 5. NODE_CONFIG (Sep 1 review, 1.5). A daemon-minted per-boot posture
+#    record: evidence_required, gate mode, tier ceiling, per-uid ceilings,
+#    build id. Verified structurally like any body-bearing entry (its
+#    sha256 binds it); it needs no closer and is neither an intent nor a
+#    closer, so grading ignores it. Present OR absent is fine — an old
+#    bundle simply has none, and the report marks the ceiling UNKNOWN then.
+NODE_CONFIG_TYPE = "node_config"
+
 RETENTION_TRUNCATED = (
     "artifact body was truncated at the daemon's %d-byte storage limit; the "
     "entry commits to the full message, only a prefix was retained"
@@ -931,41 +939,144 @@ def corroborate_v2(verifications, v2_journal):
                 "in the daemon journal for its time range" % sid)
 
 
-def grade_open_executions(verifications):
-    """Split gate_intent entries into CLOSED (a gate_execution / outcome
-    body in the selection cites their chain_entry_hash) and OPEN (none
-    does). Returns (open_list, closed_count).
+class EvidenceFailure:
+    """A gate_intent/closer integrity failure (double-spend, two closers
+    for one intent, a closer citing a non-intent, or a closer whose
+    binding disagrees with its intent). Shaped like HeadFailure so it
+    rides the same failed_entries plumbing — .entry/.ok/.failures — and so
+    a rollup with one cannot render clean."""
 
-    Graded within the selected entries only: a filtered report that
-    excludes the closer's session (an approved apply closes its intent
-    from approval:<device>, not gate-enforce:<device>) will show that
-    intent as open. Run unfiltered to grade the whole database.
+    is_evidence = True
+
+    def __init__(self, entry, detail):
+        self.entry = {"session_id": entry["session_id"],
+                      "sequence": entry["sequence"],
+                      "artifact_type": entry["artifact_type"]}
+        self.ok = False
+        self.failures = [("evidence integrity", detail)]
+
+
+def _intent_body(v):
+    """Parsed dict body of a verification, or None."""
+    if v.artifact_raw is None:
+        return None
+    try:
+        b = json.loads(v.artifact_raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return b if isinstance(b, dict) else None
+
+
+def _closer_binding_mismatch(intent_body, closer_type, closer_body):
+    """Compare a closer against the intent it cites over the fields BOTH
+    carry (device always; command/uid/session for gate_execution;
+    proposal_id/approval_entry_hash for outcome). Returns a reason string
+    on the first present-on-both-and-differ, else None. Mirrors
+    closer_binding_mismatch() in src/virp_chain.c."""
+    def cmp(field):
+        a, b = intent_body.get(field), closer_body.get(field)
+        if isinstance(a, str) and isinstance(b, str) and a != b:
+            return "%s mismatch (intent=%r closer=%r)" % (field, a, b)
+        return None
+    r = cmp("device")
+    if r:
+        return r
+    if closer_type == "gate_execution":
+        for f in ("command", "session"):
+            r = cmp(f)
+            if r:
+                return r
+        a, b = intent_body.get("uid"), closer_body.get("uid")
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) \
+                and a != b:
+            return "uid mismatch (intent=%s closer=%s)" % (a, b)
+    else:  # outcome
+        for f in ("proposal_id", "approval_entry_hash"):
+            r = cmp(f)
+            if r:
+                return r
+    return None
+
+
+def grade_open_executions(verifications):
+    """Grade gate_intent / closer relationships (Sep 1 review, Task 5 /
+    1.1-1.2). Returns (open_list, closed_count, fail_list):
+
+      open_list    intents with no closer citing them — reported, NOT a
+                   failure (the daemon died mid-dispatch).
+      closed_count intents closed by exactly one type-checked closer.
+      fail_list    EvidenceFailure objects (tampering): two closers for
+                   one intent, a closer citing a hash that is not a
+                   gate_intent, a closer whose binding disagrees with its
+                   intent, or two intents sharing one approval entry hash.
+
+    Graded within the selected entries; run unfiltered to grade the whole
+    database. Mirrors the C verifier (chain_grade_intent_locked /
+    chain_grade_closer_locked) so both accounts agree.
     """
-    cited = set()
-    for v in verifications:
-        if v.entry["artifact_type"] not in INTENT_CLOSER_TYPES:
+    by_hash = {v.entry["chain_entry_hash"]: v for v in verifications}
+    intents = [v for v in verifications
+               if v.entry["artifact_type"] == INTENT_TYPE]
+    closers = [v for v in verifications
+               if v.entry["artifact_type"] in INTENT_CLOSER_TYPES]
+
+    fails = []
+
+    # closers grouped by the intent hash they cite; and closer-target type.
+    citers = {}
+    for cv in closers:
+        cb = _intent_body(cv)
+        if cb is None:
             continue
-        if v.artifact_raw is None:
-            continue
-        try:
-            body = json.loads(v.artifact_raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            continue
-        if not isinstance(body, dict):
-            continue
-        h = body.get("intent_entry_hash")
-        if isinstance(h, str) and h:
-            cited.add(h)
+        h = cb.get("intent_entry_hash")
+        if not (isinstance(h, str) and h):
+            continue          # evidence_required=false closer: no citation
+        # target must resolve to a gate_intent entry
+        tgt = by_hash.get(h)
+        if tgt is None:
+            fails.append(EvidenceFailure(cv.entry,
+                "closer cites intent %.16s absent from the selection" % h))
+        elif tgt.entry["artifact_type"] != INTENT_TYPE:
+            fails.append(EvidenceFailure(cv.entry,
+                "closer cites %.16s which is a %s, not a gate_intent"
+                % (h, tgt.entry["artifact_type"])))
+        citers.setdefault(h, []).append((cv, cb))
+
+    # two intents sharing one approval entry hash → double-spend.
+    by_approval = {}
+    for iv in intents:
+        ib = _intent_body(iv)
+        aeh = ib.get("approval_entry_hash") if ib else None
+        if isinstance(aeh, str) and aeh:
+            by_approval.setdefault(aeh, []).append(iv)
+    for aeh, group in by_approval.items():
+        if len(group) > 1:
+            for iv in group:
+                fails.append(EvidenceFailure(iv.entry,
+                    "two gate_intent entries cite approval %.16s "
+                    "(double-spend)" % aeh))
 
     open_, closed = [], 0
-    for v in verifications:
-        if v.entry["artifact_type"] != INTENT_TYPE:
-            continue
-        if v.entry["chain_entry_hash"] in cited:
-            closed += 1
+    for iv in intents:
+        h = iv.entry["chain_entry_hash"]
+        cs = citers.get(h, [])
+        if len(cs) == 0:
+            open_.append(iv)
+        elif len(cs) > 1:
+            fails.append(EvidenceFailure(iv.entry,
+                "two closers cite this gate_intent (one intent, two "
+                "dispositions)"))
         else:
-            open_.append(v)
-    return open_, closed
+            closed += 1
+            ib = _intent_body(iv)
+            cv, cb = cs[0]
+            if ib is not None:
+                why = _closer_binding_mismatch(
+                    ib, cv.entry["artifact_type"], cb)
+                if why:
+                    fails.append(EvidenceFailure(iv.entry,
+                        "closer binding disagrees with intent: " + why))
+    return open_, closed, fails
 
 
 def verify_chain(entries, artifacts, okey=None, chain_key=None,
@@ -1037,10 +1148,27 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None,
 
     summary = summarize(verifications)
     summary["heads"] = head_results
-    # Open executions (Task 5): reported, never a failure — see
-    # grade_open_executions. Kept out of failed_entries on purpose.
-    summary["open_executions"], summary["executions_closed"] = \
-        grade_open_executions(verifications)
+    # Open executions (Task 5): reported, never a failure. Evidence-
+    # integrity failures (double-spend, two closers, wrong-type or
+    # mismatched closer) ARE failures and fold into failed_entries so the
+    # rollup cannot render clean — see grade_open_executions.
+    summary["open_executions"], summary["executions_closed"], \
+        _ev_fails = grade_open_executions(verifications)
+    summary["failed_entries"].extend(_ev_fails)
+    # Node-config posture records (1.5): parsed bodies, newest first, so a
+    # reader can see the window each posture applied and, in particular,
+    # any evidence_required=false boot.
+    ncs = []
+    for v in verifications:
+        if v.entry["artifact_type"] != NODE_CONFIG_TYPE or v.artifact_raw is None:
+            continue
+        try:
+            b = json.loads(v.artifact_raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(b, dict):
+            ncs.append(b)
+    summary["node_configs"] = ncs
     # Fold head FAILs into failed_entries so every consumer of the summary
     # — the PDF failure table, the printed tally, the process exit code —
     # fails when a session's length claim fails. Adversarial audit

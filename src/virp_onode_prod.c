@@ -476,7 +476,7 @@ static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
  * overrides / YELLOW / evidence required) in place. Unrecognized values
  * are logged and ignored.
  */
-static void load_gate_config(onode_state_t *state, struct json_object *root)
+static int load_gate_config(onode_state_t *state, struct json_object *root)
 {
     struct json_object *v;
 
@@ -546,8 +546,17 @@ static void load_gate_config(onode_state_t *state, struct json_object *root)
                         "acts, best-effort; an action the chain cannot "
                         "record will still run\n");
         } else {
-            fprintf(stderr, "[O-Node] evidence_required is not a JSON "
-                            "boolean — keeping the default (true)\n");
+            /* STRICT (Sep 1 review, 1.4): a non-boolean here is a config
+             * error, not something to paper over with the default. Silent
+             * ignore would let "evidence_required": "false" (a string,
+             * always truthy) read as ON to a careless operator and OFF to
+             * no one — the value must mean exactly what it says or the
+             * daemon must refuse to load. FATAL, naming the key and the
+             * received JSON type. */
+            fprintf(stderr, "[O-Node] FATAL: evidence_required must be a JSON "
+                    "boolean (true/false), got %s. Refusing to load the "
+                    "config.\n", json_type_to_name(json_object_get_type(v)));
+            return -1;
         }
     }
 
@@ -564,6 +573,7 @@ static void load_gate_config(onode_state_t *state, struct json_object *root)
                 state->gate_overrides[i].driver,
                 state->gate_overrides[i].mode == GATE_MODE_ENFORCE
                     ? "ENFORCE" : "SHADOW");
+    return 0;
 }
 
 /*
@@ -599,8 +609,13 @@ int load_devices(onode_state_t *state, const char *path)
     load_uid_action_allow(state, root);
 
     /* Tier-enforcement gate (Phase B): override SHADOW/YELLOW defaults
-     * from config if present. Installed before onode_start(). */
-    load_gate_config(state, root);
+     * from config if present. Installed before onode_start(). A strict
+     * failure here (e.g. a non-boolean evidence_required, 1.4) aborts the
+     * load rather than running with a guessed posture. */
+    if (load_gate_config(state, root) != 0) {
+        json_object_put(root);
+        return -1;
+    }
 
     /*
      * Optional socket_path override from config. Takes precedence over

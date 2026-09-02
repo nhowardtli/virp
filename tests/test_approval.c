@@ -39,6 +39,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>   /* chmod — L2 unreadable-store regression */
+#include <errno.h>
 #include <sqlite3.h>
 
 static int tests_passed = 0;
@@ -888,6 +889,205 @@ static void test_concurrent_submit_attribution_two_approvers(void)
 }
 
 /* =========================================================================
+ * Evidence-required consumption invariant (Sep 1 review, Task 5 / 1.1)
+ *
+ * "An approval is consumed iff a committed gate_intent entry names its
+ * proposal id and approval entry hash. A refused intent consumes nothing.
+ * The chain is the authority; the consumed list is a cache." These tests
+ * drive the in-process apply path with the chain forced read-only at the
+ * moment of the intent append, and with the consumed.list cache emptied
+ * out from under the daemon, to show the chain — not the cache — decides.
+ * ========================================================================= */
+
+/* Force every chain write to fail (PRAGMA query_only) / restore it. */
+static void ev_chain_ro(onode_state_t *st, int on)
+{
+    pthread_mutex_lock(&st->chain.lock);
+    sqlite3_exec(st->chain.db, on ? "PRAGMA query_only=ON"
+                                  : "PRAGMA query_only=OFF",
+                 NULL, NULL, NULL);
+    pthread_mutex_unlock(&st->chain.lock);
+}
+
+/* Count committed gate_intent entries citing this approval entry hash, by
+ * reading the chain db the way the daemon's own guard does. */
+static int ev_intents_for_approval(const char *approval_hash)
+{
+    int n = 0;
+    if (virp_chain_count_intents_for_approval(&g.chain, approval_hash, &n)
+            != VIRP_OK)
+        return -1;
+    return n;
+}
+
+/* Is proposal_id present in consumed.list? */
+static int ev_in_consumed_list(const char *pid)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/consumed.list", DIR);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[128];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (strcmp(line, pid) == 0) { found = 1; break; }
+    }
+    fclose(f);
+    return found;
+}
+
+/* (a) Forced intent-append failure on an approved apply refuses, consumes
+ * nothing, and a later apply (chain restored) executes EXACTLY once with
+ * one intent and one closer. */
+static void test_evidence_intent_fail_leaves_approval_consumable(void)
+{
+    TEST("1.1(a): intent-append failure refuses, approval still consumable");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_approval_rec_t apr;
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "approve");
+    ASSERT(apr.chain_entry_hash[0] != '\0', "approval entry hash");
+
+    uint8_t ot, tier;
+    char payload[2048];
+
+    /* Intent append fails: refuse, nothing consumed, no intent committed. */
+    ev_chain_ro(&g, 1);
+    ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                   sizeof(payload)) == 0, "apply call");
+    ev_chain_ro(&g, 0);
+    ASSERT(ot == VIRP_OBS_ERROR, "must be refused");
+    ASSERT(strstr(payload, "evidence-unavailable") != NULL,
+           "must cite evidence-unavailable");
+    ASSERT(strstr(payload, "R-APP#") == NULL, "must not execute");
+    ASSERT(ev_intents_for_approval(apr.chain_entry_hash) == 0,
+           "no intent may be committed on a refused apply");
+    ASSERT(ev_in_consumed_list(pid) == 0, "approval must NOT be consumed");
+
+    /* Chain restored: the same approval applies, executes once, one intent
+     * and one closer (outcome). */
+    ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                   sizeof(payload)) == 0, "second apply call");
+    ASSERT(strstr(payload, "R-APP#reload") != NULL, "must execute now");
+    ASSERT(strstr(payload, "apply rejected") == NULL, "not rejected");
+    ASSERT(ev_intents_for_approval(apr.chain_entry_hash) == 1,
+           "exactly one intent for the approval");
+    ASSERT(ev_in_consumed_list(pid) == 1, "approval now consumed");
+
+    virp_chain_entry_t ce;
+    char want_id[64];
+    snprintf(want_id, sizeof(want_id), "outcome:%s", pid);
+    ASSERT(virp_chain_get_last(&g.chain, "approval:R-APP", &ce) == VIRP_OK,
+           "outcome present");
+    ASSERT(strcmp(ce.artifact_id, want_id) == 0, "outcome closes this apply");
+    PASS();
+}
+
+/* (b) Consumed list emptied but the chain holds an intent for the
+ * approval: apply refused. The chain is the authority. */
+static void test_evidence_chain_beats_emptied_cache(void)
+{
+    TEST("1.1(b): emptied consumed.list, chain intent still refuses replay");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_approval_rec_t apr;
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "approve");
+
+    uint8_t ot, tier;
+    char payload[2048];
+    ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                   sizeof(payload)) == 0, "first apply");
+    ASSERT(strstr(payload, "R-APP#reload") != NULL, "first apply ran");
+    ASSERT(ev_intents_for_approval(apr.chain_entry_hash) == 1, "one intent");
+
+    /* Blow away the cache the daemon relies on for the fast path. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/consumed.list", DIR);
+    ASSERT(unlink(path) == 0 || errno == ENOENT, "empty consumed.list");
+    ASSERT(ev_in_consumed_list(pid) == 0, "cache is empty");
+
+    /* Replay must still be refused — from the chain, not the cache. */
+    ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                   sizeof(payload)) == 0, "replay apply");
+    ASSERT(ot == VIRP_OBS_ERROR, "replay refused");
+    ASSERT(strstr(payload, "R-APP#") == NULL, "replay must not execute");
+    ASSERT(ev_intents_for_approval(apr.chain_entry_hash) == 1,
+           "still exactly one intent (no second)");
+    PASS();
+}
+
+/* (c) Two applies on one approval with the chain read-only: nothing
+ * executes, no intent, approval unconsumed. (Serialized stand-in for the
+ * concurrent race — the per-device exec_mutex serializes real threads to
+ * exactly this, and the invariant is what matters.) */
+static void test_evidence_readonly_double_apply_executes_nothing(void)
+{
+    TEST("1.1(c): two applies, chain read-only -> nothing runs, unconsumed");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_approval_rec_t apr;
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "approve");
+
+    uint8_t ot, tier;
+    char payload[2048];
+    ev_chain_ro(&g, 1);
+    for (int i = 0; i < 2; i++) {
+        ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                       sizeof(payload)) == 0, "apply call");
+        ASSERT(ot == VIRP_OBS_ERROR, "refused under read-only chain");
+        ASSERT(strstr(payload, "R-APP#") == NULL, "nothing executes");
+    }
+    ev_chain_ro(&g, 0);
+    ASSERT(ev_intents_for_approval(apr.chain_entry_hash) == 0, "no intent");
+    ASSERT(ev_in_consumed_list(pid) == 0, "approval unconsumed");
+
+    /* And the approval is still good: one real apply now executes once. */
+    ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                   sizeof(payload)) == 0, "recovery apply");
+    ASSERT(strstr(payload, "R-APP#reload") != NULL, "executes after recovery");
+    ASSERT(ev_intents_for_approval(apr.chain_entry_hash) == 1, "one intent");
+    PASS();
+}
+
+/* 1.5 — the daemon records its posture on the chain at startup, so an
+ * auditor can bound the window in which unrecorded execution was allowed
+ * from the chain alone. onode_start (serve_thread) ran with the chain
+ * enabled, so a node_config entry must be present and carry the posture. */
+static void test_node_config_recorded_at_startup(void)
+{
+    TEST("1.5: node_config posture entry recorded at startup");
+    char session[64];
+    snprintf(session, sizeof(session), "node-config:%08X", g.node_id);
+    virp_chain_entry_t ce;
+    ASSERT(virp_chain_get_last(&g.chain, session, &ce) == VIRP_OK,
+           "node_config entry present");
+    ASSERT(strcmp(ce.artifact_type, "node_config") == 0, "type is node_config");
+
+    /* Read the body back and confirm it carries the posture fields. */
+    sqlite3 *db = NULL;
+    ASSERT(sqlite3_open_v2(CHAIN_DB, &db, SQLITE_OPEN_READONLY, NULL)
+               == SQLITE_OK, "open chain ro");
+    sqlite3_stmt *st = NULL;
+    ASSERT(sqlite3_prepare_v2(db,
+        "SELECT a.artifact_content FROM chain_entries c "
+        "JOIN artifacts a ON a.artifact_id=c.artifact_id "
+        "               AND a.artifact_hash=c.artifact_hash "
+        "WHERE c.artifact_type='node_config' ORDER BY c.id DESC LIMIT 1",
+        -1, &st, NULL) == SQLITE_OK, "prepare");
+    ASSERT(sqlite3_step(st) == SQLITE_ROW, "row");
+    const char *body = (const char *)sqlite3_column_text(st, 0);
+    ASSERT(body != NULL, "body present");
+    ASSERT(strstr(body, "\"schema\":\"node_config/1\"") != NULL, "schema");
+    ASSERT(strstr(body, "\"evidence_required\":") != NULL, "evidence_required");
+    ASSERT(strstr(body, "\"gate_max_tier\":") != NULL, "gate_max_tier");
+    ASSERT(strstr(body, "\"build_id\":") != NULL, "build_id");
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    PASS();
+}
+
+/* =========================================================================
  * CLI tests — `virp exec` and `virp chain tail` against the served
  * daemon. The CLI is a client: everything goes through the framed
  * socket and the same tier gate as any other submission.
@@ -1317,6 +1517,9 @@ int main(void)
     test_reuse_survives_restart();
     test_concurrent_submit_one_entry();
     test_concurrent_submit_attribution_two_approvers();
+    test_evidence_intent_fail_leaves_approval_consumable();
+    test_evidence_chain_beats_emptied_cache();
+    test_evidence_readonly_double_apply_executes_nothing();
 
     /* Serve the daemon socket for the CLI client tests. */
     pthread_t srv;
@@ -1329,6 +1532,7 @@ int main(void)
     test_cli_keygen_key_loads();
     test_cli_approve_key_diagnostics();
     test_cli_chain_tail_format();
+    test_node_config_recorded_at_startup();
     onode_shutdown(&g);
     pthread_join(srv, NULL);
 
