@@ -1099,6 +1099,19 @@ $(TEST_SESSION_NEG): tests/test_session_negative.c $(LIB)
 	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
+# Session ownership is bound to the SO_PEERCRED peer uid (V39 item 3).
+# Drives the decision function directly (the socket path cannot be exercised
+# from two uids without root) and runs the netclaw bridge's exact action
+# sequence end to end over a real socket as one uid.
+TEST_SESSION_OWNER = $(BUILD_DIR)/test_session_owner
+$(TEST_SESSION_OWNER): tests/test_session_owner.c $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-session-owner
+test-session-owner: $(TEST_SESSION_OWNER)
+	./$(TEST_SESSION_OWNER)
+
 test-session: $(TEST_SESSION_NEG)
 	./$(TEST_SESSION_NEG)
 
@@ -1973,7 +1986,7 @@ test-release-tools:
 	@scripts/gen-test-attestation.sh --selftest
 	@scripts/verify-release-bundle.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-owner test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

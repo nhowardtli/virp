@@ -426,6 +426,35 @@ typedef struct {
     pthread_mutex_t     session_mutex;
 
     /*
+     * SESSION OWNERSHIP (V39 item 3, from the Aug 4 all-or-nothing
+     * finding). There is exactly ONE v2 session per daemon, and until now
+     * it was global in the strong sense: any uid the socket allowlist
+     * admits could SESSION_HELLO over the top of another uid's live
+     * session, BIND it, execute v2 commands against it, or CLOSE it. The
+     * session key derives from the O-Key and the handshake transcript, not
+     * from the peer, so nothing downstream distinguished the two callers.
+     *
+     * `session_owner_uid` is the kernel-authenticated SO_PEERCRED uid that
+     * completed the HELLO, recorded when the handshake succeeds.
+     * `session_owner_valid` says whether it means anything (false before
+     * the first HELLO and after a CLOSE). Both are guarded by
+     * `session_mutex`, the same lock that serializes the handshake itself,
+     * so ownership cannot be read across a half-completed HELLO.
+     *
+     * Ownership lapses when the session does: an expired or torn-down
+     * session is not owned, so a fresh HELLO from any allowed uid takes it.
+     * That is deliberate — ownership is a guard against CONCURRENT misuse,
+     * not a durable lease.
+     *
+     * (uid_t)-1 — an internal caller with no peer credential (the watchdog,
+     * the health action, a test) — is NOT subject to the check. Socket
+     * requests can never carry it: onode_uid_request_refused() refuses an
+     * unknown identity before the dispatch switch.
+     */
+    uid_t               session_owner_uid;
+    bool                session_owner_valid;
+
+    /*
      * Per-device execution mutex.
      *
      * virp_conn_t is not thread-safe: libssh2 sessions and channels
@@ -754,6 +783,25 @@ void onode_clear_uid_actions(onode_state_t *state);
  */
 bool onode_uid_request_refused(const onode_state_t *state,
                                uid_t client_uid, onode_action_t action);
+
+/*
+ * SESSION-OWNERSHIP decision (V39 item 3). Returns true if `client_uid`
+ * must be refused access to the daemon's current v2 session — i.e. an
+ * owner is recorded and it is somebody else. Returns false when no owner
+ * is recorded (nothing to protect yet), when the caller IS the owner, and
+ * for the internal (uid_t)-1 caller.
+ *
+ * Callers must hold `session_mutex`; the _locked suffix says so. It is not
+ * const because it also EXPIRES a stale record: ownership lapses with the
+ * session, so a DISCONNECTED or CLOSED session is cleared here rather than
+ * in each of the five call sites. Non-static
+ * so the cross-uid regression can drive the decision directly, exactly as
+ * onode_uid_request_refused() is driven — the socket path cannot be tested
+ * from two uids without root, and a guard that can only be exercised by
+ * hand is a guard that rots.
+ */
+bool onode_session_owner_refused_locked(onode_state_t *state,
+                                        uid_t client_uid);
 
 /*
  * Map an action name from the wire ("list_fleet", "shutdown", …) to

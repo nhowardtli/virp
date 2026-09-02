@@ -135,6 +135,18 @@ DEPLOYED until the next rebuild.
 
 ### OPEN
 
+- **The session's evidence does not yet name both identities.** The v2
+  session is now OWNED by the SO_PEERCRED peer uid (see "Session ownership"
+  below), and `gate_intent` / `gate_execution` already record that kernel
+  uid as `uid` and the session as `session`. What they do NOT record is the
+  identity the client ASSERTED — the `client_id` string it sent in
+  SESSION_HELLO ("netclaw-bridge", and so on). A reader of the chain can
+  therefore say which local uid acted, but not which application that uid
+  claimed to be. Closing it means adding a field to the `gate_intent/1` and
+  `gate_execution/1` bodies, which changes the canonical bytes of two
+  existing entry types, so it waits for the next format window along with
+  the `gate_execution/2` bump. Design recorded in `OVERNIGHT-REPORT-2.md`
+  §3.
 - Audit §4.2 — an ABBREVIATED BLACK command falls through to RED
   (approvable) because BLACK matching is a literal full-token prefix
   compare with no abbreviation expansion, at the gate and in every
@@ -1294,6 +1306,65 @@ touched.
   production daemon has neither the field nor the check. The test that uses
   them is `tests/test_evidence_fi.c`, built into `build-fi/` by
   `make test-evidence-fi`.
+
+### Session ownership — the v2 session belongs to one local uid
+
+**The finding (V39 item 3, from the Aug 4 "all-or-nothing" work, one layer
+up).** A daemon has exactly ONE v2 session, and it used to belong to nobody.
+The session key is derived from the O-Key and the handshake transcript, never
+from the peer, so nothing downstream distinguished two callers. Any uid the
+socket allowlist admits could:
+
+- `SESSION_HELLO` over another uid's live session, destroying it;
+- `SESSION_BIND` a handshake another uid had started;
+- run a v2 `EXECUTE` inside another uid's session, so that one principal's
+  action was attested under another's session id and consumed that session's
+  sequence numbers;
+- `SESSION_CLOSE` a session it did not open — a denial of service with no
+  other name.
+
+**What it is now.** The kernel-authenticated peer uid that completes the
+HELLO is recorded as `session_owner_uid` (guarded by `session_mutex`, the
+same lock that serializes the handshake, so ownership cannot be read across a
+half-completed HELLO). HELLO, BIND, v2 EXECUTE and CLOSE all consult
+`onode_session_owner_refused_locked()`; a mismatch is refused with
+`VIRP_ERR_SESSION_FORBIDDEN` (-54) and nothing is dispatched. On the EXECUTE
+path the check runs BEFORE the gate, so a refused request costs nothing on
+the wire — the same L1 discipline as an over-tier refusal.
+
+**What the refusal does not say.** It names the session; it does not name the
+owning uid. Telling caller B which local principal holds the session hands it
+the one fact a refusal should not leak. The daemon's own stderr may carry
+more, because that is not the other caller's channel.
+
+**Ownership lapses with the session,** deliberately: a DISCONNECTED or CLOSED
+session is owned by nobody, so the ordinary serial workflow (uid A opens,
+uses and closes; uid B then opens its own) is unchanged. This is a guard
+against CONCURRENT misuse, not a durable lease. There is no reaper: an
+abandoned ACTIVE session holds ownership until `virp_session_check_timeouts()`
+resets it or the daemon restarts.
+
+**Not gated:** v1 EXECUTE (signed with the O-Key, carries no session, so
+there is no session to misattribute it to); `chain_append` and the other
+non-session actions (governed by the per-uid action allowlist instead); and
+the internal `(uid_t)-1` caller — the watchdog and the health probe, which
+have no peer credential. A SOCKET request can never carry `-1`:
+`onode_uid_request_refused()` refuses an unknown identity before the dispatch
+switch runs.
+
+**Distinct from its neighbours by design.** `VIRP_ERR_SESSION_INVALID` (-30)
+means there is no usable session; `VIRP_ERR_ACTION_FORBIDDEN` (-50) means the
+uid may not perform this ACTION at all. -54 means the action is allowed to
+this uid and the session is perfectly valid — it is simply not this caller's.
+Collapsing them would send an operator hunting a dead session that is alive.
+
+Tests: `tests/test_session_owner.c` (`make test-session-owner`) — the
+decision function driven directly for both uids (the socket path cannot be
+exercised from two uids without root, the same reason
+`onode_uid_request_refused()` is exported), the v2 EXECUTE refusal with the
+device proved untouched, the unchanged same-uid and v1 paths, and the netclaw
+bridge's exact action sequence (`session_hello`, `session_bind`, `execute`,
+`chain_append`, `session_close`) end to end over a real socket as one uid.
 
 ### Crash and storage-failure durability — measured, not assumed
 

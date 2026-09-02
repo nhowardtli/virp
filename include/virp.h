@@ -561,6 +561,17 @@ typedef enum {
      * payload cites "evidence-unavailable". */
     VIRP_ERR_EVIDENCE_UNAVAILABLE     = -53,
 
+    /* Session ownership (V39 item 3). A v2 session belongs to the
+     * SO_PEERCRED uid that opened it with SESSION_HELLO. Another local uid
+     * on the allowlist asked to bind, execute against, or close it — or to
+     * open a new one over the top of it. Distinct from
+     * VIRP_ERR_SESSION_INVALID (-30: there is no usable session) and from
+     * VIRP_ERR_ACTION_FORBIDDEN (-50: the uid may not perform this ACTION
+     * at all). Here the action is allowed to the uid and the session is
+     * perfectly valid — it just is not this caller's. The refusal
+     * deliberately does not reveal WHICH uid owns it. */
+    VIRP_ERR_SESSION_FORBIDDEN        = -54,
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency

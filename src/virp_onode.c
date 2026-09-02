@@ -2041,11 +2041,22 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * could never be delivered in the requested form.
      */
     if (obs_version == 2) {
+        /* SESSION OWNERSHIP (V39 item 3): a v2 execute is signed with the
+         * session key, numbered from the session's own sequence, and
+         * verified against that session's replay high-water mark. Letting a
+         * second local uid drive it means one principal's actions are
+         * attested inside another's session. Checked under the same lock
+         * acquisition as the liveness test, and BEFORE the gate — a refused
+         * request must cost nothing on the wire, exactly like an over-tier
+         * refusal (L1). */
         pthread_mutex_lock(&state->session_mutex);
+        bool forbidden = onode_session_owner_refused_locked(state, client_uid);
         bool ok = state->ctx &&
                   virp_session_require_active(state->ctx) == VIRP_OK &&
                   state->ctx->session.session_key_valid;
         pthread_mutex_unlock(&state->session_mutex);
+        if (forbidden)
+            return VIRP_ERR_SESSION_FORBIDDEN;
         if (!ok)
             return VIRP_ERR_SESSION_INVALID;
 
@@ -3719,6 +3730,62 @@ bool onode_uid_request_refused(const onode_state_t *state,
     return false;                       /* uid not in map — unrestricted */
 }
 
+/*
+ * SESSION-OWNERSHIP decision (V39 item 3). See the header for the contract.
+ * Caller holds session_mutex.
+ *
+ * Ownership lapses with the session: a DISCONNECTED or CLOSED session is
+ * owned by nobody, so the record is dropped here rather than in five
+ * separate places. That is what makes a normal serial workflow — uid A
+ * opens, uses and closes a session, uid B then opens its own — work
+ * unchanged, while a CONCURRENT second uid is refused.
+ */
+bool onode_session_owner_refused_locked(onode_state_t *state,
+                                        uid_t client_uid)
+{
+    if (!state)
+        return true;
+
+    if (state->session_owner_valid && state->ctx) {
+        virp_session_state_t sst = virp_session_state(state->ctx);
+        if (sst == VIRP_SESSION_DISCONNECTED || sst == VIRP_SESSION_CLOSED)
+            state->session_owner_valid = false;
+    }
+
+    /* An internal caller (watchdog, health probe, in-process test) has no
+     * peer credential. It is not a second principal and is not gated here;
+     * a SOCKET request can never carry it, because
+     * onode_uid_request_refused() refuses an unknown identity before the
+     * dispatch switch ever runs. */
+    if (client_uid == (uid_t)-1)
+        return false;
+
+    if (!state->session_owner_valid)
+        return false;                      /* nothing owned yet */
+
+    return state->session_owner_uid != client_uid;
+}
+
+/* Refusal log for the above. The SESSION is named; the OWNER uid is not —
+ * telling caller B which local principal holds the session hands it the
+ * one fact it should not learn from a refusal. The daemon's own stderr is
+ * not the other caller's channel, so the owner may be logged there, but
+ * nothing that reaches the wire carries it. */
+static void log_session_owner_refusal(onode_state_t *state,
+                                      const char *what, uid_t client_uid)
+{
+    char sid_hex[33] = "(none)";
+    if (state->ctx) {
+        for (int i = 0; i < 16; i++)
+            snprintf(sid_hex + i * 2, 3, "%02x",
+                     state->ctx->session.session_id[i]);
+    }
+    fprintf(stderr, "[O-Node] SESSION REFUSAL: uid %ld may not %s session "
+            "%s — it belongs to another local uid\n",
+            (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
+            what, sid_hex);
+}
+
 static void handle_client(onode_state_t *state, int client_fd,
                           uid_t client_uid)
 {
@@ -4838,10 +4905,28 @@ static void handle_client(onode_state_t *state, int client_fd,
         }
 
         /* Process handshake — serialized: only one handshake may drive
-         * the shared ctx at a time. */
+         * the shared ctx at a time.
+         *
+         * SESSION OWNERSHIP (V39 item 3). There is one session per daemon,
+         * so a HELLO from a second local uid while another uid's session is
+         * live does not open a second session — it destroys the first. The
+         * ownership check and the handshake happen under ONE acquisition of
+         * session_mutex so the two cannot be interleaved; a check that
+         * released the lock before calling virp_handle_hello() would be the
+         * race it exists to close. */
         virp_session_hello_ack_t ack;
         pthread_mutex_lock(&state->session_mutex);
+        if (onode_session_owner_refused_locked(state, client_uid)) {
+            log_session_owner_refusal(state, "open over", client_uid);
+            pthread_mutex_unlock(&state->session_mutex);
+            send_framed_error(client_fd, VIRP_ERR_SESSION_FORBIDDEN);
+            break;
+        }
         err = virp_handle_hello(state->ctx, &hello, &ack);
+        if (err == VIRP_OK && client_uid != (uid_t)-1) {
+            state->session_owner_uid = client_uid;
+            state->session_owner_valid = true;
+        }
         pthread_mutex_unlock(&state->session_mutex);
         if (err != VIRP_OK) {
             send_framed_error(client_fd, err);
@@ -4911,6 +4996,12 @@ static void handle_client(onode_state_t *state, int client_fd,
          * concurrent HELLO on another worker can't observe a half-
          * bound session. */
         pthread_mutex_lock(&state->session_mutex);
+        if (onode_session_owner_refused_locked(state, client_uid)) {
+            log_session_owner_refusal(state, "bind", client_uid);
+            pthread_mutex_unlock(&state->session_mutex);
+            send_framed_error(client_fd, VIRP_ERR_SESSION_FORBIDDEN);
+            break;
+        }
         err = virp_handle_session_bind(state->ctx, &bind_msg);
         if (err == VIRP_OK) {
             err = virp_session_derive_key(state->ctx, state->okey.key.key);
@@ -4929,8 +5020,18 @@ static void handle_client(onode_state_t *state, int client_fd,
     }
 
     case ONODE_ACTION_SESSION_CLOSE:
+        /* Closing somebody else's session is a denial of service with no
+         * other name: the owner's next v2 execute fails SESSION_INVALID and
+         * its in-flight seq numbering is gone. */
         pthread_mutex_lock(&state->session_mutex);
+        if (onode_session_owner_refused_locked(state, client_uid)) {
+            log_session_owner_refusal(state, "close", client_uid);
+            pthread_mutex_unlock(&state->session_mutex);
+            send_framed_error(client_fd, VIRP_ERR_SESSION_FORBIDDEN);
+            break;
+        }
         virp_handle_session_close(state->ctx);
+        state->session_owner_valid = false;
         pthread_mutex_unlock(&state->session_mutex);
         fprintf(stderr, "[O-Node] Session closed by client\n");
         {
@@ -5322,6 +5423,9 @@ virp_error_t onode_init(onode_state_t *state,
      * the dev loader parses no gate keys. */
     state->evidence_required = true;
     state->evidence_degraded = false;
+    /* No session, so no owner (V39 item 3). */
+    state->session_owner_uid = (uid_t)-1;
+    state->session_owner_valid = false;
 #ifdef VIRP_FAULT_INJECT
     state->evidence_fail_closer_once = false;
     state->evidence_ttl_now_override_ns = 0;

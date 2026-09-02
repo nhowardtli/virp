@@ -257,6 +257,34 @@ elements a draft-07 reader must know; the mechanism and rationale are in
   restart (1.3). The durable late-closer spool that would recover such an
   outcome is deferred — see `docs/PROPOSAL-LATE-CLOSER-SPOOL.md`.
 
+## 4a. Session ownership and `VIRP_ERR_SESSION_FORBIDDEN` (V39 item 3)
+
+Protocol-visible, but **not** a wire-format change: no message layout, no
+canonical body and no signed field is altered. What changes is which caller
+the daemon will answer.
+
+- **The v2 session is owned by the SO_PEERCRED uid that completed HELLO.**
+  `SESSION_HELLO`, `SESSION_BIND`, `SESSION_CLOSE` and an `EXECUTE` with
+  `obs_version: 2` are refused when they come from a different local uid.
+  Ownership lapses when the session reaches DISCONNECTED or CLOSED, so the
+  serial "A opens, A closes, B opens" workflow is unchanged.
+- **New typed error `VIRP_ERR_SESSION_FORBIDDEN = -54`**, returned in the
+  existing framed 4-byte error response for the three session actions and as
+  the return code of the execute path. Deliberately distinct from -30
+  (`SESSION_INVALID`: there is no usable session) and -50
+  (`ACTION_FORBIDDEN`: the uid may not perform this action at all). A client
+  that already handles unknown negative codes needs no change; a client that
+  wants to tell "not mine" from "not there" reads -54.
+- **The refusal names the session, never the owner uid.** Implementations
+  must not add the owner to any client-visible refusal.
+- Not gated: v1 EXECUTE, `chain_append`, and every non-session action.
+
+Still open, and recorded in `SECURITY.md` under OPEN: the session's evidence
+records the KERNEL uid (`uid`) and the session (`session`) but not the
+identity the client ASSERTED in HELLO (`client_id`). Adding it changes the
+canonical bytes of `gate_intent/1` and `gate_execution/1`, so it belongs with
+the `gate_execution/2` bump in section 5 rather than here.
+
 ## 5. Three body-level truth gaps still open (recorded together)
 
 These are pre-existing honesty gaps in the daemon's own record bodies, NOT
