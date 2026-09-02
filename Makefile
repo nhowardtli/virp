@@ -1053,6 +1053,19 @@ test-commitment-grading:
 	@echo "=== commitment-only observation grading ==="
 	python3 tests/test_commitment_only_grading.py
 
+# Per-uid chain_append TYPE policy (v0.2.1). Replays the real 30-day
+# (uid, action, artifact_type) traffic exported from the production
+# reference node against the canonical template and asserts the v0.2.1
+# policy admits all of it while the v0.2.0 blanket fed-narrowing refuses
+# the local service appends -- the regression this release fixes,
+# reproduced from real traffic rather than asserted in prose. Also pins
+# the boot invariant at the template level and lints that uid 1000's list
+# covers every artifact_type virp-tool can emit. Pure stdlib; no daemon.
+.PHONY: test-chain-append-policy
+test-chain-append-policy:
+	@echo "=== per-uid chain_append type policy (v0.2.1) ==="
+	python3 tests/test_chain_append_policy.py
+
 # Evidence-required execution (Sep 1 review, Task 5): report/verify.py must
 # grade a gate_intent with no linked gate_execution/outcome as an OPEN
 # execution and never as a failure — the Python half of what
@@ -1973,7 +1986,7 @@ test-release-tools:
 	@scripts/gen-test-attestation.sh --selftest
 	@scripts/verify-release-bundle.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

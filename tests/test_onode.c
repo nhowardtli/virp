@@ -7456,6 +7456,20 @@ static const onode_action_t FED_ACTIONS[4] = {
     ONODE_ACTION_CHAIN_VERIFY, ONODE_ACTION_CHAIN_APPEND,
 };
 
+/* v0.2.1: the federation reach is now an explicit TYPE POLICY row, not an
+ * inference from "this uid has an action map". FED_ACTIONS includes
+ * chain_append, so every test that maps it AND starts the daemon must also
+ * install a type policy or the boot invariant refuses to start. */
+static const char *const FED_CAPP[3] = {
+    "fed_request", "fed_observation", "fed_outcome",
+};
+/* What a LOCAL service account legitimately appends (the shape the v0.2.0
+ * blanket fed-narrowing silently refused in production). */
+static const char *const SERVICE_CAPP[5] = {
+    "observation", "comparator_verd", "chainwalk_summa",
+    "no_drift", "evidence_item",
+};
+
 /* M1 (2026-08-18): a failed second SO_PEERCRED read in the worker used to
  * yield (uid_t)-1, which is absent from socket_uid_action_allow and so
  * SKIPPED the per-uid map — the request then took the node-wide ceiling
@@ -7542,9 +7556,67 @@ TEST(test_uid_action_allowlist_blocks_unlisted_actions)
     onode_clear_uid_actions(&ca_state);
 }
 
-TEST(test_uid_action_allowlist_narrows_chain_append_types)
+/* v0.2.1 HANDLER REPLAY. A local service account carrying an explicit
+ * type policy may append exactly the types production actually appends
+ * (the fixture shape: observation, comparator_verd, chainwalk_summa,
+ * no_drift, evidence_item) and nothing else. This is the test that FAILS
+ * against the v0.2.0 handler: there, any uid with an action map was
+ * inferred to be federated and every one of these appends was refused
+ * with ACTION_FORBIDDEN. Revert the handler block alone to see it fail. */
+TEST(test_chain_append_type_policy_admits_service_types)
 {
     ASSERT_OK(onode_set_uid_actions(&ca_state, getuid(), FED_ACTIONS, 4));
+    ASSERT_OK(onode_set_uid_chain_append_types(&ca_state, getuid(),
+                                               SERVICE_CAPP, 5));
+
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    const char *types[5] = { "observation", "comparator_verd",
+                             "chainwalk_summa", "no_drift", "evidence_item" };
+    for (int i = 0; i < 5; i++) {
+        char seed[128], h[65], id[64];
+        snprintf(seed, sizeof(seed), "capp-admit-seed-%s", types[i]);
+        ca_sha256_hex(seed, h);
+        snprintf(id, sizeof(id), "capp-admit-%d", i);
+        /* "observation" goes commitment-only: a body-bearing one would
+         * additionally have to be a real signed observation wire message
+         * (GATE 3), a different gate than the TYPE policy under test.
+         * The indirect-commitment types (comparator_verd, chainwalk_summa)
+         * must carry a body, so every other type gets one. */
+        const char *body = NULL;
+        char jb[128];
+        if (strcmp(types[i], "observation") != 0) {
+            snprintf(jb, sizeof(jb), "{\"t\":\"%s\"}", types[i]);
+            ca_sha256_hex(jb, h);
+            body = jb;
+        }
+        ssize_t n = ca_append("autopilot:capp", types[i], id, h, body,
+                              resp, sizeof(resp));
+        ASSERT_TRUE(n > 4);                       /* admitted, not refused */
+        ASSERT_EQ(ca_count_entries(id), 1);
+    }
+
+    /* A type OUTSIDE this uid's policy is refused — the policy narrows
+     * in both directions, it is not a blanket grant. */
+    char h2[65];
+    ca_sha256_hex("capp-refuse-seed", h2);
+    ssize_t n = ca_append("autopilot:capp", "fed_request",
+                          "capp-refuse-fed", h2, NULL, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("capp-refuse-fed"), 0);
+
+    onode_clear_uid_actions(&ca_state);
+    onode_clear_uid_chain_append_types(&ca_state);
+}
+
+TEST(test_uid_chain_append_type_policy_narrows_types)
+{
+    /* v0.2.1: narrowing comes from the uid's explicit
+     * socket_uid_chain_append_types row, NOT from the mere presence of an
+     * action map. The federation reach below is that row. */
+    ASSERT_OK(onode_set_uid_actions(&ca_state, getuid(), FED_ACTIONS, 4));
+    ASSERT_OK(onode_set_uid_chain_append_types(&ca_state, getuid(),
+                                               FED_CAPP, 3));
 
     uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
 
@@ -7600,9 +7672,13 @@ TEST(test_uid_action_allowlist_narrows_chain_append_types)
     ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
     ASSERT_EQ(ca_count_entries("item8-evi-refused-1"), 0);
 
+    /* v0.2.1: the action map and the chain_append TYPE policy are two
+     * separate policies, so a test that wants full reach back must clear
+     * both. Clearing only the action map leaves the type policy in force. */
     onode_clear_uid_actions(&ca_state);
+    onode_clear_uid_chain_append_types(&ca_state);
 
-    /* map cleared → the same observation commitment lands again */
+    /* map and type policy cleared → the same observation commitment lands */
     n = ca_append("autopilot:item8", "observation",
                   "item8-obs-unrestricted-1", h, NULL, resp, sizeof(resp));
     ASSERT_TRUE(n > 4);
@@ -7718,6 +7794,36 @@ static void *am_thread(void *arg)
     return NULL;
 }
 
+/* v0.2.1 boot invariant: a uid that may chain_append must declare which
+ * artifact types it may append. Without the declaration the daemon would
+ * have to guess the reach (v0.2.0 guessed fed_* and silently refused the
+ * local service accounts), so it refuses to start and names the uid. */
+TEST(test_onode_start_refuses_chain_append_uid_without_type_policy)
+{
+    unlink(AM_SOCKET);
+    ASSERT_OK(onode_init(&am_state, 0x00000045, NULL, AM_SOCKET));
+    uid_t uids[1] = { getuid() };
+    ASSERT_OK(onode_set_allowed_uids(&am_state, uids, 1));
+    /* mapped WITH chain_append, but no type policy */
+    ASSERT_OK(onode_set_uid_actions(&am_state, getuid(), FED_ACTIONS, 4));
+
+    virp_error_t err = onode_start(&am_state);
+    ASSERT_EQ((int)err, (int)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_TRUE(access(AM_SOCKET, F_OK) != 0);    /* refused before bind */
+
+    /* declaring the types clears the invariant (started/stopped by the
+     * sibling test; here we only assert the predicate flips) */
+    ASSERT_OK(onode_set_uid_chain_append_types(&am_state, getuid(),
+                                               FED_CAPP, 3));
+    ASSERT_TRUE(onode_uid_has_capp_policy(&am_state, getuid()));
+    ASSERT_TRUE(onode_uid_capp_type_allowed(&am_state, getuid(),
+                                            "fed_request"));
+    ASSERT_TRUE(!onode_uid_capp_type_allowed(&am_state, getuid(),
+                                             "observation"));
+    onode_destroy(&am_state);
+    unlink(AM_SOCKET);
+}
+
 TEST(test_onode_start_refuses_allowlisted_uid_without_action_map)
 {
     unlink(AM_SOCKET);
@@ -7736,6 +7842,11 @@ TEST(test_onode_start_refuses_allowlisted_uid_without_action_map)
      * malformed set): coverage is about being spelled out, not about
      * being permissive */
     ASSERT_OK(onode_set_uid_actions(&am_state, getuid() + 40001, NULL, 0));
+    /* v0.2.1: getuid() is mapped with FED_ACTIONS, which includes
+     * chain_append, so it also needs an explicit type policy or the new
+     * boot invariant refuses (that invariant has its own test below). */
+    ASSERT_OK(onode_set_uid_chain_append_types(&am_state, getuid(),
+                                               FED_CAPP, 3));
     pthread_t th;
     ASSERT_EQ(pthread_create(&th, NULL, am_thread, NULL), 0);
     usleep(200000);
@@ -8015,9 +8126,11 @@ int main(int argc, char **argv)
         printf("\n  -- Item 8: per-uid action allowlist --\n");
         RUN_TEST(test_uid_request_refused_rejects_unknown_identity);
         RUN_TEST(test_uid_action_allowlist_blocks_unlisted_actions);
-        RUN_TEST(test_uid_action_allowlist_narrows_chain_append_types);
+        RUN_TEST(test_chain_append_type_policy_admits_service_types);
+    RUN_TEST(test_uid_chain_append_type_policy_narrows_types);
         RUN_TEST(test_uid_action_map_absent_uid_fully_unchanged);
         RUN_TEST(test_uid_action_map_foreign_uid_keeps_shutdown);
+        RUN_TEST(test_onode_start_refuses_chain_append_uid_without_type_policy);
         RUN_TEST(test_onode_start_refuses_allowlisted_uid_without_action_map);
         ca_stop();
         ca_cleanup_files();
