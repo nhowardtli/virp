@@ -179,12 +179,37 @@ class CanonicalTemplateTests(_PolicyChecks, unittest.TestCase):
                 self.assertEqual(set(self.policy[UIDS[name]]),
                                  {"execute", "chain_append"})
 
-    def test_netclaw_gets_only_what_the_bridge_sends(self):
-        # the installed netclaw bridge (virp-bridge-mcp.py) sends exactly
-        # session_hello, session_bind, execute, chain_append
+    def test_netclaw_matches_the_deployed_verb_set(self):
+        # uid 993 carries the verb set the reference node actually runs, NOT
+        # the set this test previously pinned. Until 2026-09-02 it asserted
+        # {session_hello, session_bind, execute, chain_append} on the premise
+        # that this is what virp-bridge-mcp.py sends. The deployed node has
+        # {list_fleet, health, chain_verify, chain_append, execute}, and the
+        # two are DISJOINT in four verbs: the old expectation drops
+        # list_fleet/health/chain_verify and grants session_hello/session_bind,
+        # a grant the bridge has never held. So the old assertion was not a
+        # tightening of the deployed set, it was a different set, and shipping
+        # it would have changed a live remote client's reach in both directions
+        # as a side effect of an unrelated deploy.
+        #
+        # The template now tracks what is deployed. Reconciling the two is a
+        # deliberate change of its own, gated on virp-bridge-mcp.py being
+        # tested against whatever set is chosen; see the template's
+        # _socket_uid_netclaw_verbs_followup note. When that happens, change
+        # the expectation here in the same commit.
         self.assertEqual(set(self.policy[UIDS["VIRP_NETCLAW_UID"]]),
-                         {"session_hello", "session_bind", "execute",
-                          "chain_append"})
+                         {"list_fleet", "health", "chain_verify",
+                          "chain_append", "execute"})
+
+    def test_netclaw_chain_append_is_the_federation_triple(self):
+        # whatever the verb set, 993's chain_append reach is the fed_* triple
+        # and nothing else. Measured against 30 days of the reference node's
+        # own chain on 2026-09-02: since 2026-08-11, when 993 entered
+        # socket_uid_action_allow, it has appended only these three types.
+        types = self.doc.get("socket_uid_chain_append_types")
+        self.assertIsInstance(types, dict)
+        self.assertEqual(set(types[UIDS["VIRP_NETCLAW_UID"]]),
+                         {"fed_request", "fed_observation", "fed_outcome"})
 
     def test_broker_matches_its_own_relay_allowlist(self):
         src = open(os.path.join(ROOT, "broker", "virp_broker.py")).read()
