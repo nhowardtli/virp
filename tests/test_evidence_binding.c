@@ -229,6 +229,34 @@ static void t_binding_mismatch_fail(void)
     virp_chain_destroy(ch);
 }
 
+/* item 7 — a pre-intent chain (gate_execution/1 bodies with no intent
+ * citation, NO gate_intent entries, NO node_config) must grade exactly as
+ * it did BEFORE this branch: VALID, zero open executions, zero closed,
+ * zero failures. The open/closed grading and the closer-binding checks
+ * must be inert on a legacy chain. */
+static void t_legacy_pre_intent_chain_unchanged(void)
+{
+    BEGIN("legacy pre-intent chain grades VALID, no open/closed, no FAIL");
+    virp_chain_state_t *ch = fresh();
+    CHECK(ch != NULL, "chain init");
+    /* Two gate_execution/1 entries with intent_entry_hash null — the shape
+     * the daemon wrote before gate_intent existed. */
+    char e1[512], e2[512];
+    exec_body(e1, sizeof(e1), NULL, "R-LEG");
+    exec_body(e2, sizeof(e2), NULL, "R-LEG2");
+    CHECK(craft(ch, SESSION, "gate_execution", "gateexec1", e1, NULL) == 0, "e1");
+    CHECK(craft(ch, SESSION, "gate_execution", "gateexec2", e2, NULL) == 0, "e2");
+    /* And a plain observation, for good measure. */
+    CHECK(craft(ch, SESSION, "observation", "obs:R-LEG",
+                "{\"schema\":\"observation/1\"}", NULL) == 0, "obs");
+    virp_chain_verify_result_t r = verify(ch, SESSION);
+    CHECK(r.valid, "VALID");
+    CHECK(r.first_broken == -1, "no broken link");
+    CHECK(r.executions_open == 0, "no open executions on a legacy chain");
+    CHECK(r.executions_closed == 0, "no closed executions on a legacy chain");
+    virp_chain_destroy(ch);
+}
+
 int main(void)
 {
     printf("\n=== VIRP evidence-required binding (1.1-1.2) ===\n");
@@ -238,6 +266,7 @@ int main(void)
     t_two_closers_fail();
     t_closer_wrong_type_fail();
     t_binding_mismatch_fail();
+    t_legacy_pre_intent_chain_unchanged();
     cleanup();
     printf("=== Results: %d tests, %d failed ===\n", tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;

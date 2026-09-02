@@ -302,6 +302,22 @@ class TestOpenExecutionGrading(unittest.TestCase):
         self.assertEqual(self._fail_reasons(summary), [])
         self.assertEqual(summary["executions_closed"], 1)
 
+    def test_legacy_pre_intent_chain_grades_unchanged(self):
+        """item 7 — a chain with gate_execution/1 bodies that carry no
+        intent citation, no gate_intent entries and no node_config grades
+        exactly as before this branch: clean, nothing open, nothing closed,
+        no evidence failures."""
+        b = ChainBuilder()
+        b.execution(None)          # intent_entry_hash: null
+        b.execution(None)
+        b.append(GATE_SESSION, "observation", "obs:leg",
+                 '{"schema":"observation/1"}')
+        verifications, summary = b.verify()
+        self._assert_chain_clean(verifications, summary)
+        self.assertEqual(summary["open_executions"], [])
+        self.assertEqual(summary["executions_closed"], 0)
+        self.assertEqual(self._fail_reasons(summary), [])
+
     def test_gate_intent_is_not_an_external_type(self):
         """A socket client must not be able to mint an intent (and so an
         open execution against an untouched device). verify.py has no

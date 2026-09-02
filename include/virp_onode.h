@@ -379,7 +379,23 @@ typedef struct {
      * that window. Never set in production.
      */
     bool                evidence_degraded;
+
+#ifdef VIRP_FAULT_INJECT
+    /*
+     * LAB-ONLY fault injection (Sep 1 review, Phase 1 item 6). Compiled
+     * ONLY under -DVIRP_FAULT_INJECT, exactly like the VIRP_FI() crash
+     * points (include/virp_fault_inject.h): the production daemon has no
+     * such field and no way to set it. `evidence_fail_closer_once` makes
+     * the next closer append (gate_execution / outcome) report failure
+     * without appending, modelling a chain that goes read-only in the
+     * window after the intent committed and the device acted.
+     * `evidence_ttl_now_override_ns`, when non-zero, is the clock the
+     * apply-time TTL re-check uses instead of CLOCK_REALTIME, so a test
+     * can make an approval expire "during connect" deterministically.
+     */
     bool                evidence_fail_closer_once;
+    uint64_t            evidence_ttl_now_override_ns;
+#endif
 
     /*
      * Approval flow (propose → approve → apply). Disabled until

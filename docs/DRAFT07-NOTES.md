@@ -216,7 +216,9 @@ elements a draft-07 reader must know; the mechanism and rationale are in
 
 - **Closer link.** `gate_execution` and `outcome` bodies carry
   `intent_entry_hash` (+ `intent_sequence`, `intent_artifact_id`) naming the
-  intent they close. `gate_execution` also now carries `session` for the
+  intent they close. `gate_execution` also now carries `session` (an ADDITIVE field on the
+  existing `gate_execution/1` body — it folds into the `/2` bump when the
+  three-valued `executed` lands, gap 1 in section 5 below) for the
   binding check. `intent_entry_hash: null` marks a closer written with
   `evidence_required=false`.
 

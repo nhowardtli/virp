@@ -255,4 +255,16 @@ virp_error_t virp_approval_verify(const char *dir,
 virp_error_t virp_approval_commit_consume(const char *dir,
                                           const char *proposal_id);
 
+/* Make the daemon's apply-time chain replay guard and the gate_intent
+ * commit atomic against other consumers (Sep 1 review, Phase 1 item 1):
+ * hold this lock across the guard query and the intent append, then commit
+ * the consume with the _locked variant below before releasing. Nothing is
+ * held across connect (get_connection precedes the guarded block). Lock
+ * order: consume_lock -> chain lock (never the reverse).
+ */
+void virp_approval_consume_lock(void);
+void virp_approval_consume_unlock(void);
+virp_error_t virp_approval_commit_consume_locked(const char *dir,
+                                                 const char *proposal_id);
+
 #endif /* VIRP_APPROVAL_H */

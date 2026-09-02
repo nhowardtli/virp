@@ -1236,6 +1236,62 @@ touched.
   with no `node_config` reports the ceiling and posture UNKNOWN rather than
   guessing.
 
+#### Pre-merge hardening (Sep 1 review, Phase 1 second commit)
+
+- **The replay guard is atomic with the intent append.** For an approved
+  apply the daemon holds one lock (`virp_approval_consume_lock`) across the
+  TTL re-check, the replay-guard chain query, the `gate_intent` commit and
+  the `consumed.list` write, so the guard and the append cannot be
+  interleaved by another consumer. Nothing is held across `get_connection`
+  (connect precedes the locked block). In practice a single approval already
+  resolves to a single device — the signed binding is the node id and the
+  apply verify also matches the device NAME, and device names are unique at
+  load, so the per-device `exec_mutex` already serializes every apply of one
+  approval; the shared lock is the belt to that suspenders. Tested by two
+  concurrent applies of one approval to one device: exactly one executes,
+  one intent lands, the other refuses `approval_reused`.
+- **TTL is re-checked at dispatch.** `virp_approval_verify` runs before
+  connect, and connect can take seconds on a dead device, so the approval
+  TTL is re-checked under the same lock immediately before the intent
+  commit. An approval that lapsed during connect refuses with
+  `approval_expired` and consumes nothing.
+- **A cache-write failure after the intent commit does not stop
+  execution.** The `gate_intent` commit is the authoritative consumption;
+  if the `consumed.list` cache write then fails, the daemon logs at error
+  level and executes anyway. The next apply of that approval is refused by
+  the chain replay guard (which reads the chain, not the cache), so
+  single-use is not lost — the cache is only an optimisation.
+- **`node_config` is FATAL under `evidence_required`.** A node that cannot
+  commit its startup posture record would refuse its first intent anyway
+  (every dispatch needs a durable chain), so that is stated at boot, by
+  name, and the daemon refuses to start. With `evidence_required` false the
+  record is best-effort — logged and continued.
+- **The evidence-degraded latch clears on restart only.** Once a closer
+  append fails after the device acted, the daemon refuses further dispatch
+  at the intent step for the life of the process; there is no automatic
+  recovery on this branch (that is the deferred late-closer spool). A clean
+  restart re-opens the chain, writes a fresh `node_config`, and clears the
+  latch — so `node_config` is not rewritten on recovery within a run,
+  because there is no in-run recovery.
+- **Approved-apply outcome-fail is a known limitation.** The
+  unchained-execution marker is returned on the auto-execute path. For an
+  approved apply the `outcome` record is written after the observation is
+  already built (the `pre_outcome` ordering the adversarial crash test
+  pins), so an `outcome`-append failure there still latches
+  evidence-degraded and leaves the intent OPEN, but that one caller may
+  receive a normal observation rather than the marker. Exact shape: the
+  approved-apply caller may get a normal observation while its outcome is
+  unrecorded; the daemon latches; the intent grades OPEN and must be
+  reconciled against the target. Closing it means moving the `outcome`
+  append ahead of the observation build, which is entangled with the
+  `pre_outcome` fault point and deferred with the late-closer spool.
+- **The fault hook is compile-gated.** The `evidence_fail_closer_once` /
+  `evidence_ttl_now_override_ns` injection fields exist ONLY under
+  `-DVIRP_FAULT_INJECT`, exactly like the `VIRP_FI()` crash points — the
+  production daemon has neither the field nor the check. The test that uses
+  them is `tests/test_evidence_fi.c`, built into `build-fi/` by
+  `make test-evidence-fi`.
+
 ### Crash and storage-failure durability — measured, not assumed
 
 Earlier this section could only say "SIGKILL, not power loss". That gap is now

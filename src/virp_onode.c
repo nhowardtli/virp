@@ -870,18 +870,20 @@ static void approval_emit_outcome(onode_state_t *state,
     char chain_session[96];
     snprintf(chain_session, sizeof(chain_session), "approval:%s", device_name);
 
-    /* TEST-ONLY (1.3): inject a closer-append failure after execution. */
+#ifdef VIRP_FAULT_INJECT
+    /* LAB-ONLY (item 6): inject a closer-append failure after execution. */
     pthread_mutex_lock(&state->state_mutex);
     bool fail_once = state->evidence_fail_closer_once;
     state->evidence_fail_closer_once = false;
     pthread_mutex_unlock(&state->state_mutex);
     if (fail_once) {
-        fprintf(stderr, "[GATE] TEST outcome-append fault injected for "
+        fprintf(stderr, "[GATE] FI outcome-append fault injected for "
                 "proposal=%s — reporting outcome-chain failure\n",
                 proposal_id);
         onode_mark_evidence_degraded(state, device_name, "outcome record");
         return;
     }
+#endif
 
     /* Entry and body commit in one transaction; the mid_outcome fault
      * point lives inside virp_chain_append_with_artifact() now, between
@@ -973,22 +975,24 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
     if (!state->chain_enabled)
         return VIRP_OK;   /* no chain: nothing to fail, best-effort no-op */
 
-    /* TEST-ONLY (1.3): model the chain going read-only in the window
+#ifdef VIRP_FAULT_INJECT
+    /* LAB-ONLY (item 6): model the chain going read-only in the window
      * between the intent commit and this closer append — the device has
      * already acted. Consume the one-shot and report the failure without
-     * appending. */
+     * appending. Compiled out of the production daemon entirely. */
     pthread_mutex_lock(&state->state_mutex);
     bool fail_once = state->evidence_fail_closer_once;
     state->evidence_fail_closer_once = false;
     pthread_mutex_unlock(&state->state_mutex);
     if (fail_once) {
-        fprintf(stderr, "[GATE] TEST closer-append fault injected for "
+        fprintf(stderr, "[GATE] FI closer-append fault injected for "
                 "device=%s — reporting outcome-chain failure\n", device_name);
         if (intent)
             onode_mark_evidence_degraded(state, device_name,
                                          "gate_execution record");
         return VIRP_ERR_CHAIN_DB;
     }
+#endif
 
     /* Same chain and same session as the rejections, so executions and
      * refusals interleave under one continuous prev-hash linkage and a
@@ -1349,10 +1353,10 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
  * says so; it does NOT gate execution the way the pre-execution intent
  * does (the intent is per-action, this is per-boot metadata).
  * ========================================================================= */
-static void onode_emit_node_config(onode_state_t *state)
+static virp_error_t onode_emit_node_config(onode_state_t *state)
 {
     if (!state->chain_enabled)
-        return;
+        return VIRP_ERR_CHAIN_DB;
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -1392,9 +1396,8 @@ static void onode_emit_node_config(onode_state_t *state)
         cJSON_Delete(o);
     }
     if (!body) {
-        fprintf(stderr, "[O-Node] node_config body could not be built — "
-                "skipping the startup config record\n");
-        return;
+        fprintf(stderr, "[O-Node] node_config body could not be built\n");
+        return VIRP_ERR_CHAIN_DB;
     }
 
     char session_id[96];
@@ -1418,9 +1421,10 @@ static void onode_emit_node_config(onode_state_t *state)
                 gate_tier_name(state->gate_max_tier),
                 (long long)ce.sequence);
     else
-        fprintf(stderr, "[O-Node] node_config append failed: %s "
-                "(continuing)\n", virp_error_str(cerr));
+        fprintf(stderr, "[O-Node] node_config append failed: %s\n",
+                virp_error_str(cerr));
     free(body);
+    return cerr;
 }
 
 /*
@@ -2318,50 +2322,126 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * ledger can miss an action that happened. */
     virp_chain_entry_t intent_ce;
     const virp_chain_entry_t *intent = NULL;
-    if (state->evidence_required) {
-        /* APPLY-TIME REPLAY GUARD (Sep 1 review, 1.1). Before committing
-         * an intent for an approved apply, ask the chain — the authority —
-         * whether a committed intent already cites this approval entry
-         * hash. If so the approval was already spent, even if the
-         * consumed.list cache lost the write to a crash in the window
-         * between that intent's commit and its cache update. Refuse as
-         * reused, executing nothing. Type-restricted, cJSON-parsed query
-         * (GATE 4 pattern). A query error fails closed. */
-        if (approved && apr.chain_entry_hash[0]) {
+    if (state->evidence_required && approved) {
+        /* ── EVIDENCE-REQUIRED, APPROVED APPLY (Sep 1 review, Phase 1) ────
+         * The device is connected but nothing has been dispatched. The
+         * approval was VERIFIED in the gate but NOT consumed; the
+         * gate_intent commit here IS the consumption. Three checks and the
+         * commit run under consume_lock so they are atomic against any
+         * other consumer of this approval — the guard and the append share
+         * one lock (item 1). Nothing is held across connect: get_connection
+         * ran above, and consume_lock is taken only now.
+         *
+         *   item 2  TTL re-check: connect can take seconds on a dead
+         *           device, so an approval valid at verify may have expired
+         *           by now. Refuse expired here, consuming nothing.
+         *   item 1  replay guard: a committed gate_intent already citing
+         *           this approval entry hash means it was already spent
+         *           (the chain is the authority; this survives a lost
+         *           consumed.list cache write). Refuse reused.
+         *           gate_emit_intent then commits under the same lock.
+         *   item 3  consume: the intent is durable, so update the cache.
+         *           A cache-write failure AFTER the intent committed is
+         *           logged at error level and execution CONTINUES — the
+         *           chain already records the consumption and the replay
+         *           guard reads the chain, not the cache. */
+        virp_error_t refuse_err = VIRP_OK;
+        char refuse_msg[416];
+        refuse_msg[0] = '\0';
+
+        virp_approval_consume_lock();
+
+        /* item 2 — TTL at the moment of dispatch. */
+        struct timespec nowts;
+        clock_gettime(CLOCK_REALTIME, &nowts);
+        uint64_t now_ns = (uint64_t)nowts.tv_sec * 1000000000ull +
+                          (uint64_t)nowts.tv_nsec;
+#ifdef VIRP_FAULT_INJECT
+        if (state->evidence_ttl_now_override_ns)
+            now_ns = state->evidence_ttl_now_override_ns;
+#endif
+        uint64_t expiry = apr.approved_at_ns +
+                          (uint64_t)apr.ttl_seconds * 1000000000ull;
+        if (now_ns > expiry) {
+            refuse_err = VIRP_ERR_APPROVAL_EXPIRED;
+            snprintf(refuse_msg, sizeof(refuse_msg),
+                     "ERROR: apply rejected (%s, err=%d) for proposal %s on "
+                     "'%s': approval expired during connect (tier=%s)",
+                     virp_approval_err_name(refuse_err), (int)refuse_err,
+                     proposal_id, device_name, gate_tier_name(gate_tier));
+        }
+
+        /* item 1 — replay guard, atomic with the append below. */
+        if (refuse_err == VIRP_OK && apr.chain_entry_hash[0]) {
             int prior = 0;
             virp_error_t qe = virp_chain_count_intents_for_approval(
                     &state->chain, apr.chain_entry_hash, &prior);
             if (qe != VIRP_OK || prior > 0) {
-                pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
-                char err_msg[384];
-                snprintf(err_msg, sizeof(err_msg),
-                         "ERROR: apply rejected (%s, err=%d) for proposal "
-                         "%s on '%s': approval already consumed by a "
-                         "committed intent (tier=%s)",
-                         virp_approval_err_name(VIRP_ERR_APPROVAL_REUSED),
-                         (int)VIRP_ERR_APPROVAL_REUSED,
+                refuse_err = VIRP_ERR_APPROVAL_REUSED;
+                snprintf(refuse_msg, sizeof(refuse_msg),
+                         "ERROR: apply rejected (%s, err=%d) for proposal %s "
+                         "on '%s': approval already consumed by a committed "
+                         "intent (tier=%s)",
+                         virp_approval_err_name(refuse_err), (int)refuse_err,
                          proposal_id, device_name, gate_tier_name(gate_tier));
-                fprintf(stderr, "[GATE] apply rejected: proposal=%s "
-                        "device=%s reason=intent-already-committed "
-                        "(query_rc=%d prior=%d)\n",
-                        proposal_id, device_name, (int)qe, prior);
-                log_error_obs(device_name, gate_tier, err_msg);
-                return virp_build_observation_tiered(out_buf, out_buf_len,
-                                      out_len, state->devices[dev_idx].node_id,
-                                      onode_next_seq(state),
-                                      VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
-                                      gate_obs_tier(gate_tier),
-                                      (const uint8_t *)err_msg,
-                                      (uint16_t)strlen(err_msg), &state->okey);
+                fprintf(stderr, "[GATE] apply rejected: proposal=%s device=%s "
+                        "reason=intent-already-committed (query_rc=%d "
+                        "prior=%d)\n", proposal_id, device_name,
+                        (int)qe, prior);
             }
         }
+
+        /* item 1 — the intent commit is the consumption event. */
+        virp_error_t ierr = VIRP_OK;
+        if (refuse_err == VIRP_OK) {
+            ierr = gate_emit_intent(state, device_name, drv, command,
+                                    gate_tier, gate_eff_max, gate_mode,
+                                    client_uid, obs_version, proposal_id,
+                                    &apr, &intent_ce);
+            if (ierr == VIRP_OK) {
+                intent = &intent_ce;
+                /* item 3 — cache update; failure is logged, not fatal. */
+                virp_error_t ce = virp_approval_commit_consume_locked(
+                        state->approval_dir, proposal_id);
+                if (ce != VIRP_OK)
+                    fprintf(stderr, "[GATE] ERROR: consumed.list cache write "
+                            "failed for proposal=%s (%s) AFTER the intent "
+                            "committed; the committed intent is the authority "
+                            "and the apply-time chain guard still blocks "
+                            "replay — continuing to execute\n",
+                            proposal_id, virp_error_str(ce));
+            }
+        }
+
+        virp_approval_consume_unlock();
+
+        if (refuse_err != VIRP_OK) {
+            pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+            log_error_obs(device_name, gate_tier, refuse_msg);
+            return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                  state->devices[dev_idx].node_id,
+                                  onode_next_seq(state),
+                                  VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                  gate_obs_tier(gate_tier),
+                                  (const uint8_t *)refuse_msg,
+                                  (uint16_t)strlen(refuse_msg), &state->okey);
+        }
+        if (ierr != VIRP_OK) {
+            pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+            return gate_refuse_evidence_obs(state, device_name, dev_idx,
+                                            command, gate_tier, client_uid,
+                                            ierr, out_buf, out_buf_len,
+                                            out_len);
+        }
+    } else if (state->evidence_required) {
+        /* ── EVIDENCE-REQUIRED, AUTO-EXECUTE (no approval) ───────────────
+         * A GREEN read admitted on its own consumes no approval, so no
+         * consume_lock is needed: just the pre-execution intent. */
         virp_error_t ierr = gate_emit_intent(state, device_name, drv,
                                              command, gate_tier,
                                              gate_eff_max, gate_mode,
                                              client_uid, obs_version,
-                                             approved ? proposal_id : NULL,
-                                             approved ? &apr : NULL,
-                                             &intent_ce);
+                                             NULL, NULL, &intent_ce);
         if (ierr != VIRP_OK) {
             pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
             return gate_refuse_evidence_obs(state, device_name, dev_idx,
@@ -2370,22 +2450,6 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                             out_len);
         }
         intent = &intent_ce;
-
-        /* CONSUME NOW — the intent is durable. This updates the
-         * consumed.list cache; the chain (the intent just committed) is
-         * the authority. A cache-write failure here is logged, not fatal:
-         * the replay guard above reads the chain, not the cache, so the
-         * approval cannot be replayed regardless. */
-        if (approved) {
-            virp_error_t ce = virp_approval_commit_consume(state->approval_dir,
-                                                           proposal_id);
-            if (ce != VIRP_OK)
-                fprintf(stderr, "[GATE] WARNING: consumed.list cache write "
-                        "failed for proposal=%s (%s); the committed intent "
-                        "is the authority and the apply-time chain guard "
-                        "still blocks replay\n",
-                        proposal_id, virp_error_str(ce));
-        }
     } else {
         /* evidence_required=false: no intent to be the consumption event,
          * so consume here (the pre-Task-5 point was the gate). Fail closed
@@ -5258,7 +5322,10 @@ virp_error_t onode_init(onode_state_t *state,
      * the dev loader parses no gate keys. */
     state->evidence_required = true;
     state->evidence_degraded = false;
+#ifdef VIRP_FAULT_INJECT
     state->evidence_fail_closer_once = false;
+    state->evidence_ttl_now_override_ns = 0;
+#endif
     state->uptime_start = (uint32_t)time(NULL);
     state->watchdog_running = false;
     pthread_mutex_init(&state->state_mutex, NULL);
@@ -5648,8 +5715,28 @@ virp_error_t onode_start(onode_state_t *state)
 
     /* Record the node's posture on the chain before serving (1.5), so an
      * auditor can bound the window in which unrecorded execution was
-     * permitted from the chain alone. */
-    onode_emit_node_config(state);
+     * permitted from the chain alone. When evidence_required is true this
+     * is FATAL on failure (item 5): a node that cannot write its own
+     * posture would refuse its very first intent anyway (every dispatch
+     * needs a durable chain), so the same rule is stated at boot, by name,
+     * rather than one request in. When evidence_required is false the
+     * record is best-effort — logged and continued, since dispatch does
+     * not depend on the chain in that mode. */
+    if (state->chain_enabled) {
+        virp_error_t ncerr = onode_emit_node_config(state);
+        if (ncerr != VIRP_OK && state->evidence_required) {
+            fprintf(stderr, "[O-Node] FATAL: evidence_required is true but "
+                    "the node_config posture record could not be committed "
+                    "(%s). The chain is unusable and every execution would "
+                    "be refused as evidence-unavailable. Refusing to "
+                    "start.\n", virp_error_str(ncerr));
+            return ncerr;
+        }
+        if (ncerr != VIRP_OK)
+            fprintf(stderr, "[O-Node] node_config not recorded (%s); "
+                    "evidence_required is false, continuing best-effort\n",
+                    virp_error_str(ncerr));
+    }
 
     /* Remove stale socket */
     unlink(state->socket_path);

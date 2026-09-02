@@ -712,6 +712,22 @@ $(TEST_CHAIN_ATOM_FI): tests/test_chain_atomicity_fi.c
 test-chain-atomicity-fi: $(TEST_CHAIN_ATOM_FI)
 	./$(TEST_CHAIN_ATOM_FI)
 
+# LAB-ONLY: evidence-required outcome-append failure (Phase 1 item 3 / 1.3).
+# Builds tests/test_evidence_fi.c AND libvirp.a with -DVIRP_FAULT_INJECT into
+# build-fi/ so the evidence_fail_closer_once injection field exists and its
+# check fires. Same isolation contract as onode-fi: build-fi/ only, never
+# build/, never installed. Private /tmp chain.
+TEST_EVIDENCE_FI = build-fi/test_evidence_fi
+.PHONY: test-evidence-fi
+$(TEST_EVIDENCE_FI): tests/test_evidence_fi.c
+	$(MAKE) BUILD_DIR=build-fi CFLAGS_EXTRA=-DVIRP_FAULT_INJECT \
+	        LINUX=1 build-fi/libvirp.a
+	rm -f $@
+	$(CC) $(CFLAGS) -DVIRP_FAULT_INJECT $< build-fi/libvirp.a $(LDFLAGS) -o $@
+
+test-evidence-fi: $(TEST_EVIDENCE_FI)
+	./$(TEST_EVIDENCE_FI)
+
 # 'make prod' builds the prod O-Node with all production drivers enabled,
 # including PAN-OS. Uses recursive $(MAKE) because the driver guards are
 # `ifdef PANOS` / `ifdef CISCO` / etc., which are evaluated at Makefile
@@ -1957,7 +1973,7 @@ test-release-tools:
 	@scripts/gen-test-attestation.sh --selftest
 	@scripts/verify-release-bundle.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

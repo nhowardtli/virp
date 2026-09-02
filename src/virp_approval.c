@@ -886,12 +886,15 @@ static virp_error_t approval_record_load(const char *dir,
  * every call, so consumed state survives daemon restarts by
  * construction.
  */
-static virp_error_t consume_once(const char *dir, const char *proposal_id)
+/* The consume read-modify-write, WITHOUT taking consume_mu. The caller
+ * must already hold it. Split out (Sep 1 review, Phase 1 pre-merge item 1)
+ * so the daemon can hold consume_mu across the apply-time chain replay
+ * guard AND the consume, making the two atomic w.r.t. other consumers. */
+static virp_error_t consume_once_locked(const char *dir,
+                                        const char *proposal_id)
 {
     char path[VIRP_APPROVAL_DIR_MAX + 32];
     snprintf(path, sizeof(path), "%s/consumed.list", dir);
-
-    pthread_mutex_lock(&consume_mu);
 
     char existing[65536];
     existing[0] = '\0';
@@ -901,10 +904,8 @@ static virp_error_t consume_once(const char *dir, const char *proposal_id)
         fclose(f);
         existing[got] = '\0';
         /* An over-full store would silently truncate below — refuse. */
-        if (got == sizeof(existing) - 1) {
-            pthread_mutex_unlock(&consume_mu);
+        if (got == sizeof(existing) - 1)
             return VIRP_ERR_CHAIN_DB;
-        }
     }
 
     /* Already consumed? Exact line match. */
@@ -913,21 +914,30 @@ static virp_error_t consume_once(const char *dir, const char *proposal_id)
     while (*p) {
         const char *nl = strchr(p, '\n');
         size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
-        if (linelen == idlen && strncmp(p, proposal_id, idlen) == 0) {
-            pthread_mutex_unlock(&consume_mu);
+        if (linelen == idlen && strncmp(p, proposal_id, idlen) == 0)
             return VIRP_ERR_APPROVAL_REUSED;
-        }
         if (!nl) break;
         p = nl + 1;
     }
 
     char updated[65536 + 64];
     snprintf(updated, sizeof(updated), "%s%s\n", existing, proposal_id);
-    virp_error_t err = write_file_durable(path, 0600, updated);
-
-    pthread_mutex_unlock(&consume_mu);
-    return err;   /* persist failure → non-OK → caller rejects (fail closed) */
+    return write_file_durable(path, 0600, updated);
 }
+
+/* consume_mu wrapper — the standalone consume used off the atomic path. */
+static virp_error_t consume_once(const char *dir, const char *proposal_id)
+{
+    pthread_mutex_lock(&consume_mu);
+    virp_error_t err = consume_once_locked(dir, proposal_id);
+    pthread_mutex_unlock(&consume_mu);
+    return err;
+}
+
+/* Expose consume_mu so the daemon can make the apply-time chain replay
+ * guard and the intent commit atomic against other consumers (item 1). */
+void virp_approval_consume_lock(void)   { pthread_mutex_lock(&consume_mu); }
+void virp_approval_consume_unlock(void) { pthread_mutex_unlock(&consume_mu); }
 
 virp_error_t virp_approval_verify(const char *dir,
                                   const virp_approver_registry_t *reg,
@@ -1000,6 +1010,19 @@ virp_error_t virp_approval_commit_consume(const char *dir,
         return VIRP_ERR_APPROVAL_NOT_FOUND;
     VIRP_FI("pre_consume");
     virp_error_t _c = consume_once(dir, proposal_id);
+    if (_c == VIRP_OK) VIRP_FI("post_consume");
+    return _c;
+}
+
+/* commit_consume assuming the caller already holds consume_lock (item 1). */
+virp_error_t virp_approval_commit_consume_locked(const char *dir,
+                                                 const char *proposal_id)
+{
+    if (!dir) return VIRP_ERR_NULL_PTR;
+    if (!proposal_id_valid(proposal_id))
+        return VIRP_ERR_APPROVAL_NOT_FOUND;
+    VIRP_FI("pre_consume");
+    virp_error_t _c = consume_once_locked(dir, proposal_id);
     if (_c == VIRP_OK) VIRP_FI("post_consume");
     return _c;
 }

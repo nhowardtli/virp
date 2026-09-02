@@ -1087,6 +1087,135 @@ static void test_node_config_recorded_at_startup(void)
     PASS();
 }
 
+/* Apply thread for the item-1 concurrency test. */
+struct apply_arg { char pid[33]; const char *device; const char *cmd;
+                   int rc; uint8_t ot; int executed; };
+static void *apply_thread(void *a)
+{
+    struct apply_arg *x = a;
+    uint8_t tier; char payload[2048];
+    x->rc = run_cmd(&g, x->device, x->cmd, x->pid, &x->ot, &tier,
+                    payload, sizeof(payload));
+    x->executed = (strstr(payload, "#") != NULL &&
+                   strstr(payload, "R-") != NULL &&
+                   strstr(payload, "apply rejected") == NULL &&
+                   strstr(payload, "ERROR") == NULL);
+    return NULL;
+}
+
+/* item 1 — two concurrent applies of ONE approval to ONE device execute
+ * exactly once. The per-device exec_mutex serializes them and the loser's
+ * apply-time chain guard (now atomic with the intent append under
+ * consume_lock) finds the winner's committed intent and refuses reused.
+ * Exactly one intent, exactly one outcome. */
+static void test_evidence_concurrent_apply_executes_once(void)
+{
+    TEST("1.1(item1): two concurrent applies, one approval -> exactly once");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_approval_rec_t apr;
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "approve");
+
+    struct apply_arg a1, a2;
+    memset(&a1, 0, sizeof(a1)); memset(&a2, 0, sizeof(a2));
+    snprintf(a1.pid, sizeof(a1.pid), "%s", pid);
+    snprintf(a2.pid, sizeof(a2.pid), "%s", pid);
+    a1.device = a2.device = "R-APP";
+    a1.cmd = a2.cmd = "reload";
+
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, apply_thread, &a1);
+    pthread_create(&t2, NULL, apply_thread, &a2);
+    pthread_join(t1, NULL); pthread_join(t2, NULL);
+
+    ASSERT(a1.executed + a2.executed == 1, "exactly one execution");
+    ASSERT(ev_intents_for_approval(apr.chain_entry_hash) == 1,
+           "exactly one intent for the approval");
+
+    /* The loser saw a reused refusal (from the chain guard), not a crash. */
+    struct apply_arg *lose = a1.executed ? &a2 : &a1;
+    ASSERT(lose->ot == VIRP_OBS_ERROR, "loser refused with an ERROR obs");
+    PASS();
+}
+
+/* item 2 — an approval valid at verify but expired by the time connect
+ * returns is refused at the re-check, consuming nothing. A per-connect
+ * delay makes the TTL lapse deterministically during a fresh connect. */
+static void test_evidence_ttl_rechecked_after_connect(void)
+{
+    TEST("1.1(item2): TTL re-checked after connect -> expired, unconsumed");
+    /* A fresh device with no cached connection, so this apply must connect
+     * (and hit the delay). */
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "R-TTL");
+    snprintf(dev.host, sizeof(dev.host), "10.255.9.9");
+    dev.port = 22; dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0xA0A0A0AA; dev.enabled = true;
+    ASSERT(onode_add_device(&g, &dev) == VIRP_OK, "add R-TTL");
+
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-TTL", "reload", pid) == 0, "propose");
+    virp_proposal_rec_t prop;
+    ASSERT(virp_approval_load_proposal(DIR, pid, &prop) == VIRP_OK, "prop");
+
+    /* ttl=1s, approved 800ms ago -> ~200ms remaining at verify (passes),
+     * then a 500ms connect delay pushes the re-check past expiry. */
+    uint64_t approved_at = now_ns() - 800ULL * 1000000ULL;
+    ASSERT(craft_record(pid, &g_kp, prop.command_hash, prop.device,
+                        prop.device_node_id, approved_at, 1) == VIRP_OK,
+           "craft near-expiry approval");
+
+    virp_driver_mock_set_connect_delay(500);
+    uint8_t ot, tier; char payload[2048];
+    int rc = run_cmd(&g, "R-TTL", "reload", pid, &ot, &tier, payload,
+                     sizeof(payload));
+    virp_driver_mock_set_connect_delay(0);
+    ASSERT(rc == 0, "apply call");
+
+    ASSERT(ot == VIRP_OBS_ERROR, "must be refused");
+    ASSERT(strstr(payload, "approval_expired") != NULL, "expired at re-check");
+    ASSERT(strstr(payload, "R-TTL#") == NULL, "nothing executed");
+    ASSERT(ev_in_consumed_list(pid) == 0, "approval unconsumed");
+    PASS();
+}
+
+/* item 3 — a consumed.list cache write that fails AFTER the intent has
+ * committed must NOT refuse and must NOT stop execution: the intent is the
+ * authority. The next apply of the same approval is refused via the chain
+ * guard, proving the cache miss did not lose single-use. */
+static void test_evidence_cache_failure_after_intent_still_executes(void)
+{
+    TEST("1.1(item3): cache write fails after intent -> executes, replay blocked");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    virp_approval_rec_t apr;
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "approve");
+
+    /* Make the approval dir unwritable so the consumed.list temp-create in
+     * commit_consume fails, while the record stays readable for verify. */
+    ASSERT(chmod(DIR, 0500) == 0, "chmod dir read-only");
+    uint8_t ot, tier; char payload[2048];
+    int rc = run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                     sizeof(payload));
+    ASSERT(chmod(DIR, 0700) == 0, "restore dir");
+    ASSERT(rc == 0, "apply call");
+
+    /* Executed despite the cache-write failure. */
+    ASSERT(strstr(payload, "R-APP#reload") != NULL, "executed");
+    ASSERT(strstr(payload, "apply rejected") == NULL, "not rejected");
+    ASSERT(ev_intents_for_approval(apr.chain_entry_hash) == 1, "one intent");
+    ASSERT(ev_in_consumed_list(pid) == 0, "cache write did fail");
+
+    /* Replay refused from the chain, not the (empty) cache. */
+    ASSERT(run_cmd(&g, "R-APP", "reload", pid, &ot, &tier, payload,
+                   sizeof(payload)) == 0, "replay apply");
+    ASSERT(ot == VIRP_OBS_ERROR, "replay refused");
+    ASSERT(strstr(payload, "R-APP#") == NULL, "replay must not execute");
+    ASSERT(ev_intents_for_approval(apr.chain_entry_hash) == 1, "still one intent");
+    PASS();
+}
+
 /* =========================================================================
  * CLI tests — `virp exec` and `virp chain tail` against the served
  * daemon. The CLI is a client: everything goes through the framed
@@ -1520,6 +1649,9 @@ int main(void)
     test_evidence_intent_fail_leaves_approval_consumable();
     test_evidence_chain_beats_emptied_cache();
     test_evidence_readonly_double_apply_executes_nothing();
+    test_evidence_concurrent_apply_executes_once();
+    test_evidence_ttl_rechecked_after_connect();
+    test_evidence_cache_failure_after_intent_still_executes();
 
     /* Serve the daemon socket for the CLI client tests. */
     pthread_t srv;

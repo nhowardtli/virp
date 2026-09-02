@@ -20,6 +20,12 @@
 /* Test hook: optional per-execute delay in milliseconds */
 static int mock_delay_ms = 0;
 void virp_driver_mock_set_delay(int ms) { mock_delay_ms = ms; }
+/* Test hook: a per-CONNECT delay (ms), so a test can make an approval's
+ * TTL lapse "during connect" (Sep 1 review, Phase 1 item 2). Not gated by
+ * VIRP_FAULT_INJECT — it is an ordinary mock timing knob like the delay
+ * above, inert unless a test sets it, and the mock driver never ships. */
+static int mock_connect_delay_ms = 0;
+void virp_driver_mock_set_connect_delay(int ms) { mock_connect_delay_ms = ms; }
 
 /* Test hook: force drv->execute() to return this error code (0 = disabled) */
 static virp_error_t mock_forced_error = VIRP_OK;
@@ -284,6 +290,11 @@ static virp_conn_t *mock_connect(const virp_device_t *device)
 {
     if (mock_connect_fail)
         return NULL;
+    if (mock_connect_delay_ms > 0) {
+        struct timespec d = { mock_connect_delay_ms / 1000,
+                              (long)(mock_connect_delay_ms % 1000) * 1000000L };
+        nanosleep(&d, NULL);
+    }
 
     virp_conn_t *conn = calloc(1, sizeof(*conn));
     if (!conn) return NULL;
