@@ -26,6 +26,45 @@ collector.
 
 ---
 
+## Releases and deployment status
+
+**v0.2.0 is published but WITHDRAWN from deployment. Do not deploy it.**
+
+v0.2.0 ran on the production reference node for ten minutes on
+2026-09-02 and was rolled back. Its `chain_append` handler infers that
+any uid present in the socket action allowlist is a restricted federated
+principal and narrows it to the `fed_*` types. Combined with that same
+release's requirement that every allowlisted uid have an action map, the
+daemon refuses its own service accounts' evidence appends. No
+configuration avoids it; the inference is in the daemon.
+
+Executions in that window were not affected: every `gate_intent` had its
+closer, and the chain is intact. What was refused was evidence appends.
+The window is recorded as a dated anomaly in [`DEPLOYED.md`](DEPLOYED.md).
+
+v0.2.1, which replaces the inference with a declared per-uid type policy
+and fixes the `build_id="unknown"` defect in the same release, is in
+preparation and is not yet tagged.
+
+### The live instance
+
+Numbers from the production reference node, read-only, 2026-09-02, after
+the rollback:
+
+| | |
+|---|---|
+| chain entries | 273239 |
+| artifacts | 214115 |
+| sessions | 406 |
+| devices configured | 43 |
+
+These are what one long-running instance has accumulated. They are a
+measure of volume, not of correctness: nothing in this table says the
+records are right, only that they exist and are hash-linked. The claim
+ceiling above still applies.
+
+---
+
 ## What is proven and what is not
 
 **Implemented and tested.** The record layer. Observations are
