@@ -35,3 +35,78 @@ Aug 7 review findings:
   deterministic concurrency regression test
   (test_chain_fed_id_conflict_check_is_inside_append_txn). Not yet
   running in the installed daemon until the next restart window.
+
+## 2. Tracked-template errors found by the v0.2.1 deploy (2026-09-02)
+
+Both were found by deploying `f269455c` to the reference node and
+comparing the tracked template against what the node actually runs.
+Neither is fixed; both are recorded in `deploy/devices.template.json`
+next to the field they concern.
+
+### 2a. uid 993 (netclaw) — the tracked verb set was never the deployed one
+
+The tracked template proposed
+`{session_hello, session_bind, execute, chain_append}` for
+`${VIRP_NETCLAW_UID}`, on the stated premise that this is what the
+installed `virp-bridge-mcp.py` sends. The node runs
+`{list_fleet, health, chain_verify, chain_append, execute}`.
+
+The two sets are **disjoint in four verbs**. The proposal drops
+`list_fleet`/`health`/`chain_verify` and grants
+`session_hello`/`session_bind`, a grant the bridge has never held. So
+this was never a tightening of the deployed set that could be shipped
+quietly — it changes a live remote client's reach in both directions.
+The deploy therefore kept the node's set and the template now tracks it.
+
+To close: decide the set from what `virp-bridge-mcp.py` on netclaw
+actually sends, test the bridge against it, and change the template,
+`tests/test_template_uid_policy.py`
+(`test_netclaw_matches_the_deployed_verb_set`) and the bridge in one
+window. The chain_append TYPE policy is independent and already
+correct — 30 days of the node's own chain show 993 appending only
+`fed_request`/`fed_observation`/`fed_outcome` since 2026-08-11, when it
+entered `socket_uid_action_allow`.
+
+### 2b. wazuh-lab `protected_agents` named the HOME manager's agent ids
+
+The tracked template carried `"protected_agents": ["004","313"]` on
+`wazuh-lab`, which is the **colo** manager at 10.0.20.10. Those ids are
+the home Wazuh's. Read back from the colo manager through the gate as a
+GREEN `GET /agents` on 2026-09-02, it has seven agents and neither id is
+among them:
+
+| id | agent |
+|-----|-------|
+| 000 | wazuh (the manager itself) |
+| 001 | pve1 |
+| 006 | librenms |
+| 007 | pbs |
+| 008 | thirdlevel-ai-web |
+| 009 | ironclaw-onode |
+| 011 | netclaw |
+
+A BLACK never-class list of ids that do not exist protects nothing while
+reading as protection, which is worse than an honest omission — so the
+deploy kept the node's omission rather than installing the wrong ids.
+
+To close: decide which of the seven real ids belong on the never-class
+list and set them. Note the driver compares ids numerically, so `"004"`
+and `4` are one agent; the ids above are the colo manager's own
+spellings.
+
+### 2c. `make all-tests` no longer completes on the reference node
+
+Not a template error, found in the same window. `tests/test_virp_report.py`
+carries a `TestAgainstLiveChain` tier gated on
+`os.path.exists("/var/lib/virp/chain.db")`, so it runs by design on a
+deployed node. The chain is now 426 MB / 277k entries and the tier burned
+30 minutes at 100% CPU without finishing. The suite is therefore
+unrunnable as a deploy gate on the one host where it matters most, and it
+competes with the daemon for CPU.
+
+Separately, `tests/test_approval.c`'s
+`1.1(item3): cache write fails after intent` induces its failure with
+`chmod(DIR, 0500)`, which does not constrain uid 0. It FAILS when the
+suite is run under `sudo` — the way the install procedure implies — and
+PASSES as a normal user. Either bound the test to non-root or induce the
+write failure by a means root cannot bypass.
