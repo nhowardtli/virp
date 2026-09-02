@@ -728,6 +728,23 @@ $(TEST_EVIDENCE_FI): tests/test_evidence_fi.c
 test-evidence-fi: $(TEST_EVIDENCE_FI)
 	./$(TEST_EVIDENCE_FI)
 
+# LAB-ONLY: APPROVED-APPLY outcome-append failure (V39 item 1). The approved
+# half of the Sep 1 review 1.3 window that SECURITY.md carried as a known
+# limitation: an approved RED apply whose `outcome` closer cannot be chained
+# after the device has already acted. Same isolation contract as the other
+# fault-injected targets: build-fi/ only, never build/, never installed.
+# Private /tmp chain, spool and approver registry.
+TEST_APPROVED_OUTCOME_FI = build-fi/test_approved_outcome_fi
+.PHONY: test-approved-outcome-fi
+$(TEST_APPROVED_OUTCOME_FI): tests/test_approved_outcome_fi.c
+	$(MAKE) BUILD_DIR=build-fi CFLAGS_EXTRA=-DVIRP_FAULT_INJECT \
+	        LINUX=1 build-fi/libvirp.a
+	rm -f $@
+	$(CC) $(CFLAGS) -DVIRP_FAULT_INJECT $< build-fi/libvirp.a $(LDFLAGS) -o $@
+
+test-approved-outcome-fi: $(TEST_APPROVED_OUTCOME_FI)
+	./$(TEST_APPROVED_OUTCOME_FI)
+
 # 'make prod' builds the prod O-Node with all production drivers enabled,
 # including PAN-OS. Uses recursive $(MAKE) because the driver guards are
 # `ifdef PANOS` / `ifdef CISCO` / etc., which are evaluated at Makefile

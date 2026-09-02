@@ -798,9 +798,14 @@ static onode_gate_mode_t gate_effective_mode(const onode_state_t *state,
 /*
  * Emit the OUTCOME chain entry for an approved apply, linking the
  * PROPOSAL and APPROVAL entries (by their chain entry hashes and by the
- * shared "approval:<device>" chain session). Best-effort like the other
- * gate chain writes: a chain failure is logged and never alters the
- * execution result already in hand.
+ * shared "approval:<device>" chain session).
+ *
+ * Returns the append's error (V39 item 1). It used to return void, which
+ * is precisely how an approved apply could succeed on the device, fail to
+ * chain its outcome, and still hand the caller an ordinary success. Every
+ * caller must now treat a non-VIRP_OK return as unchained-execution: the
+ * device may have acted and the ledger does not say so. The append itself
+ * is unchanged — this is a reporting change, not a chain-format one.
  */
 /* EVIDENCE-DEGRADED latch (Sep 1 review, 1.3). A closer append failed
  * after the device had acted; under evidence_required that is the one
@@ -823,15 +828,15 @@ static void onode_mark_evidence_degraded(onode_state_t *state,
                 "reconciled against the target)\n", what, device_name);
 }
 
-static void approval_emit_outcome(onode_state_t *state,
-                                  const char *proposal_id,
-                                  const virp_approval_rec_t *apr,
-                                  const char *device_name,
-                                  bool success,
-                                  const virp_chain_entry_t *intent)
+static virp_error_t approval_emit_outcome(onode_state_t *state,
+                                          const char *proposal_id,
+                                          const virp_approval_rec_t *apr,
+                                          const char *device_name,
+                                          bool success,
+                                          const virp_chain_entry_t *intent)
 {
     if (!state->chain_enabled)
-        return;
+        return VIRP_OK;   /* no chain: nothing to fail, best-effort no-op */
 
     virp_proposal_rec_t prop;
     bool have_prop = state->approval_dir[0] &&
@@ -881,7 +886,7 @@ static void approval_emit_outcome(onode_state_t *state,
                 "proposal=%s — reporting outcome-chain failure\n",
                 proposal_id);
         onode_mark_evidence_degraded(state, device_name, "outcome record");
-        return;
+        return VIRP_ERR_CHAIN_DB;
     }
 #endif
 
@@ -904,6 +909,7 @@ static void approval_emit_outcome(onode_state_t *state,
                 virp_error_str(cerr));
         onode_mark_evidence_degraded(state, device_name, "outcome record");
     }
+    return cerr;
 }
 
 /* =========================================================================
@@ -1972,6 +1978,76 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
                                   &state->okey);
 }
 
+/* =========================================================================
+ * UNCHAINED-EXECUTION observation (Sep 1 review 1.3; approved half closed
+ * by V39 item 1).
+ *
+ * The device has acted and the closer that records what it did could not be
+ * committed. The one thing the caller must never receive here is an
+ * ordinary success: the response says, in words, that the command executed,
+ * that its outcome is not on the chain, which intent is OPEN and must be
+ * reconciled against the target, and that the daemon has stopped
+ * dispatching. `onode_mark_evidence_degraded()` has already latched by the
+ * time this is called — this function only reports.
+ *
+ * `proposal_id`/`apr` are NULL on the auto-execute path and name the
+ * approval on the approved-apply path. With both NULL the message is
+ * byte-identical to the auto-execute wording this helper replaced; the
+ * approved wording adds the approval reference and states explicitly that
+ * the response cannot tell the caller whether the device changed. That
+ * sentence is not decoration: on the approved path this error is returned
+ * from four sites where the driver ALSO reported a failure, and the caller
+ * must not read "the outcome was not chained" as "nothing happened".
+ * ========================================================================= */
+static virp_error_t gate_unchained_execution_obs(onode_state_t *state,
+                                                 int dev_idx,
+                                                 const char *device_name,
+                                                 const char *command,
+                                                 virp_trust_tier_t gate_tier,
+                                                 const virp_chain_entry_t *intent,
+                                                 const char *proposal_id,
+                                                 const virp_approval_rec_t *apr,
+                                                 virp_error_t cause,
+                                                 uint8_t *out_buf,
+                                                 size_t out_buf_len,
+                                                 size_t *out_len)
+{
+    char err_msg[768];
+    if (proposal_id && proposal_id[0]) {
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: unchained-execution: '%s' was applied on '%s' under "
+                 "approval %s (approval entry %.16s) but its outcome could "
+                 "not be committed to the chain (%s); intent %.16s is OPEN "
+                 "and must be reconciled against the target; whether the "
+                 "device changed cannot be determined from this response; "
+                 "the approval is consumed and will not be retried; the "
+                 "daemon is now refusing further executions "
+                 "(evidence-degraded) until restart",
+                 command, device_name, proposal_id,
+                 (apr && apr->chain_entry_hash[0]) ? apr->chain_entry_hash
+                                                   : "(none)",
+                 virp_error_str(cause), intent->chain_entry_hash);
+    } else {
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: unchained-execution: '%s' executed on '%s' but "
+                 "its outcome could not be committed to the chain (%s); "
+                 "intent %.16s is OPEN and must be reconciled against the "
+                 "target; the daemon is now refusing further executions "
+                 "(evidence-degraded) until restart",
+                 command, device_name, virp_error_str(cause),
+                 intent->chain_entry_hash);
+    }
+    log_error_obs(device_name, gate_tier, err_msg);
+    return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                  state->devices[dev_idx].node_id,
+                                  onode_next_seq(state),
+                                  VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                  gate_obs_tier(gate_tier),
+                                  (const uint8_t *)err_msg,
+                                  (uint16_t)strlen(err_msg),
+                                  &state->okey);
+}
+
 virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                   const char *device_name,
                                   const char *command,
@@ -2505,9 +2581,19 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             gate_emit_execution(state, device_name, drv, command, gate_tier,
                                 gate_eff_max, gate_mode, client_uid,
                                 obs_version, intent, NULL, err_msg);
-        if (approved)
-            approval_emit_outcome(state, proposal_id, &apr,
-                                  device_name, false, intent);
+        if (approved) {
+            virp_error_t oerr = approval_emit_outcome(state, proposal_id,
+                                    &apr, device_name, false, intent);
+            /* The device may have acted even on this path — the driver
+             * reported a failure, not proof of non-dispatch. An unchained
+             * outcome here is reported as unchained-execution, and the
+             * message says the response cannot settle what the device did. */
+            if (state->evidence_required && intent && oerr != VIRP_OK)
+                return gate_unchained_execution_obs(state, dev_idx,
+                                    device_name, command, gate_tier, intent,
+                                    proposal_id, &apr, oerr,
+                                    out_buf, out_buf_len, out_len);
+        }
         log_error_obs(device_name, gate_tier, err_msg);
         return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
@@ -2552,9 +2638,16 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                     gate_emit_execution(state, device_name, drv, command,
                                         gate_tier, gate_eff_max, gate_mode,
                                         client_uid, obs_version, intent, NULL, err_msg);
-                if (approved)
-                    approval_emit_outcome(state, proposal_id, &apr,
-                                          device_name, false, intent);
+                if (approved) {
+                    virp_error_t oerr = approval_emit_outcome(state,
+                                            proposal_id, &apr, device_name,
+                                            false, intent);
+                    if (state->evidence_required && intent && oerr != VIRP_OK)
+                        return gate_unchained_execution_obs(state, dev_idx,
+                                            device_name, command, gate_tier,
+                                            intent, proposal_id, &apr, oerr,
+                                            out_buf, out_buf_len, out_len);
+                }
                 log_error_obs(device_name, gate_tier, err_msg);
                 return virp_build_observation_tiered(
                     out_buf, out_buf_len, out_len,
@@ -2682,9 +2775,19 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             gate_emit_execution(state, device_name, drv, command, gate_tier,
                                 gate_eff_max, gate_mode, client_uid,
                                 obs_version, intent, &result, err_msg);
-        if (approved)
-            approval_emit_outcome(state, proposal_id, &apr,
-                                  device_name, false, intent);
+        if (approved) {
+            virp_error_t oerr = approval_emit_outcome(state, proposal_id,
+                                    &apr, device_name, false, intent);
+            /* The device may have acted even on this path — the driver
+             * reported a failure, not proof of non-dispatch. An unchained
+             * outcome here is reported as unchained-execution, and the
+             * message says the response cannot settle what the device did. */
+            if (state->evidence_required && intent && oerr != VIRP_OK)
+                return gate_unchained_execution_obs(state, dev_idx,
+                                    device_name, command, gate_tier, intent,
+                                    proposal_id, &apr, oerr,
+                                    out_buf, out_buf_len, out_len);
+        }
         fprintf(stderr, "[ERROR-OBS] device=%s tier=%s executed=unknown "
                 "disposition=%s reason=\"%s\"\n", device_name,
                 gate_tier_name(gate_tier),
@@ -2758,9 +2861,19 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             gate_emit_execution(state, device_name, drv, command, gate_tier,
                                 gate_eff_max, gate_mode, client_uid,
                                 obs_version, intent, &result, err_msg);
-        if (approved)
-            approval_emit_outcome(state, proposal_id, &apr,
-                                  device_name, false, intent);
+        if (approved) {
+            virp_error_t oerr = approval_emit_outcome(state, proposal_id,
+                                    &apr, device_name, false, intent);
+            /* The device may have acted even on this path — the driver
+             * reported a failure, not proof of non-dispatch. An unchained
+             * outcome here is reported as unchained-execution, and the
+             * message says the response cannot settle what the device did. */
+            if (state->evidence_required && intent && oerr != VIRP_OK)
+                return gate_unchained_execution_obs(state, dev_idx,
+                                    device_name, command, gate_tier, intent,
+                                    proposal_id, &apr, oerr,
+                                    out_buf, out_buf_len, out_len);
+        }
         log_error_obs(device_name, gate_tier, err_msg);
         return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
                                       state->devices[dev_idx].node_id,
@@ -2799,26 +2912,15 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
          * its outcome could not be committed, naming the open intent to
          * reconcile. gate_emit_execution has already latched the daemon
          * degraded, so the next request refuses at the intent step. */
-        if (state->evidence_required && intent && xerr != VIRP_OK) {
-            char err_msg[512];
-            snprintf(err_msg, sizeof(err_msg),
-                     "ERROR: unchained-execution: '%s' executed on '%s' but "
-                     "its outcome could not be committed to the chain (%s); "
-                     "intent %.16s is OPEN and must be reconciled against the "
-                     "target; the daemon is now refusing further executions "
-                     "(evidence-degraded) until restart",
-                     command, device_name, virp_error_str(xerr),
-                     intent->chain_entry_hash);
-            log_error_obs(device_name, gate_tier, err_msg);
-            return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
-                                          state->devices[dev_idx].node_id,
-                                          onode_next_seq(state),
-                                          VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
-                                          gate_obs_tier(gate_tier),
-                                          (const uint8_t *)err_msg,
-                                          (uint16_t)strlen(err_msg),
-                                          &state->okey);
-        }
+        /* Wording unchanged — gate_unchained_execution_obs() carries the
+         * same format string for the auto-execute case (proposal_id NULL),
+         * so tests/test_evidence_fi.c sees exactly the payload it did
+         * before. The approved half now shares it. */
+        if (state->evidence_required && intent && xerr != VIRP_OK)
+            return gate_unchained_execution_obs(state, dev_idx, device_name,
+                                    command, gate_tier, intent,
+                                    NULL, NULL, xerr,
+                                    out_buf, out_buf_len, out_len);
     }
 
     const uint8_t *obs_data = (const uint8_t *)result.output;
@@ -2886,10 +2988,25 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
 
     /* Approved apply reached execution: link PROPOSAL + APPROVAL to the
      * outcome, whatever the device reported. */
+    /* The pre_outcome fault point stays exactly where it was, and so does
+     * the append below it: the adversarial crash transcript
+     * (tests/adversarial/transcripts/02-crash-around-execution.md) pins
+     * this ordering, and moving the append ahead of the observation build
+     * would change which artefacts survive a kill here. What V39 item 1
+     * changes is only what the CALLER is told when the append fails: the
+     * observation built above is discarded and replaced by the signed
+     * unchained-execution error. The success path is byte-for-byte
+     * untouched. */
     VIRP_FI("pre_outcome");
-    if (approved)
-        approval_emit_outcome(state, proposal_id, &apr,
-                              device_name, result.success, intent);
+    if (approved) {
+        virp_error_t oerr = approval_emit_outcome(state, proposal_id, &apr,
+                                    device_name, result.success, intent);
+        if (state->evidence_required && intent && oerr != VIRP_OK)
+            return gate_unchained_execution_obs(state, dev_idx, device_name,
+                                    command, gate_tier, intent,
+                                    proposal_id, &apr, oerr,
+                                    out_buf, out_buf_len, out_len);
+    }
 
     if (err == VIRP_OK) {
         pthread_mutex_lock(&state->state_mutex);
