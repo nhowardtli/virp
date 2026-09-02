@@ -64,6 +64,69 @@ are now stale on two counts:
 2. The deployed commit has advanced through the update log below and is now
    `b6e9602c`, not `0c9c7338`.
 
+## Anomaly 2026-09-02 02:16:00-02:26:14 UTC — v0.2.0 deployed, refused its own evidence, rolled back
+
+**v0.2.0 is WITHDRAWN from deployment.** It ran on this host for ten
+minutes and fourteen seconds and was rolled back. Do not deploy it. The
+replacement is v0.2.1.
+
+### What happened
+
+v0.2.0 carried the Task 2 boot invariant (every allowlisted uid must have
+an action map) on top of a pre-existing inference in the chain_append
+handler: any uid present in `socket_uid_action_allow` was treated as a
+restricted federated principal and narrowed to `fed_request` /
+`fed_observation` / `fed_outcome`.
+
+Mapping the daemon's own service accounts — required by the new invariant
+— therefore reclassified them as federated principals, and the node began
+refusing its own appends (`observation`, `comparator_verd`,
+`chainwalk_summa`, `no_drift`, `evidence_item`) with the handler's
+"restricted principal may append only fed_request/fed_observation/fed_outcome"
+refusal.
+
+Two individually correct changes combined into a refusal of the node's
+own evidence. There was no template-only mitigation: the inference was in
+the daemon, so no configuration could exempt the service accounts. The
+node was rolled back to the 2026-08-27 binary and the previous template.
+
+### What the window actually wrote
+
+Measured on this host by read-only export, 2026-09-02:
+
+| entry type    | count | seq range       |
+|---------------|-------|-----------------|
+| `gate_intent`    | 16 | 8759..18030 |
+| `gate_execution` | 16 | 8760..18031 |
+| `node_config`    |  2 | 0..1        |
+
+Sixteen intents and sixteen closers: **every execution in the window
+closed.** No open executions, no chain break, no gap. The refusals were
+of *appends*, not of executions, so the ledger is intact for what ran.
+The evidence-degraded latch did not trip.
+
+Both `node_config` bodies in the window read `"build_id":"unknown"` —
+the separate v0.2.0 defect fixed by v0.2.1 Fix 2. For the whole window
+the chain could not say which source produced the daemon that wrote it.
+
+Chain totals after rollback: 273239 chain entries, 214115 artifacts,
+406 sessions.
+
+### Two lessons, both from the rollback rather than the deploy
+
+**1. Snapshot and restore with `tar -p` or `rsync -a`, never `cp -a`.**
+The rollback restored the install tree with `cp -a`, which did not
+preserve the autopilot directory's mode. The directory came back `0700`
+and the autopilot failed with permission denied *after* the rollback was
+believed complete. `cp -a` preserves mode on the files it copies but is
+not a faithful tree-restore primitive here. Use `tar -p` or `rsync -a`.
+
+**2. Verify a rollback by one full cycle and an advancing head — never
+by service status.** `systemctl status` reported the daemon active and
+healthy while the autopilot could not write. "Running" is not "working".
+A rollback is verified when a complete cycle has run and the chain head
+has advanced; nothing weaker counts.
+
 ## Update 2026-08-17 — `85b3d9e2` INSTALLED, NOT RESTARTED (chain_append concurrency: verify buffer + GATE 5 in-txn)
 
 **Status: installed 02:28 UTC; RESTARTED 23:42:11 UTC — acceptance

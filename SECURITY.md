@@ -219,6 +219,73 @@ The socket itself is created mode 0660 atomically via `umask(0117)` set
 around `bind()` (with a belt-and-suspenders `chmod(0660)` after), so
 there is no window in which a world-accessible node exists on disk.
 
+## chain_append Authorization — Declared Types, Never Inferred (v0.2.1, 2026-09-02)
+
+Two independent policies govern the O-Node control socket. Confusing them
+is what broke v0.2.0.
+
+1. **`socket_uid_action_allow`** — which *verbs* a uid may issue
+   (`execute`, `chain_append`, `list_devices`, `sign_intent`, ...). Since
+   the Task 2 boot invariant, every allowlisted uid must have an entry;
+   an allowlisted uid with no action map is a boot failure, not a silent
+   grant.
+
+2. **`socket_uid_chain_append_types`** — which *artifact types* a uid may
+   append. Enforcement is an **exact string match** against the uid's
+   list. No substring matching, no prefix matching, no wildcards.
+
+### The rule
+
+**A uid's chain_append reach is declared, never inferred.** A uid whose
+action set includes `chain_append` and which has no type list is a FATAL
+boot failure that names the uid, refused *before* the socket is bound.
+
+### What v0.2.0 did instead, and why it failed
+
+v0.2.0 inferred the reach. Any uid merely *present* in
+`socket_uid_action_allow` was treated as a "restricted federated
+principal" and narrowed to the `fed_request` / `fed_observation` /
+`fed_outcome` triple. That inference was written when the only mapped
+uid was the netclaw bridge, and it was true of that uid by accident of
+configuration rather than by declaration.
+
+Task 2 then made an action map **mandatory** for every allowlisted uid.
+The daemon's own service accounts — the autopilot, the config-backup
+writer, the evidence writer — were mapped for the first time, and the
+inference immediately reclassified them as restricted federated
+principals. Their real appends (`observation`, `comparator_verd`,
+`chainwalk_summa`, `no_drift`, `evidence_item`) were refused with:
+
+```
+[O-Node] POLICY REFUSAL: uid <N> chain_append artifact_type '<type>' — a
+restricted principal may append only fed_request/fed_observation/fed_outcome
+```
+
+Two correct changes, each defensible alone, combined into a refusal of
+the node's own evidence. **There was no template-only fix**: the
+inference lived in the daemon, so no configuration could exempt the
+service accounts. That is the property being removed — a policy you
+cannot see in the config and cannot override from it.
+
+The bridge's `fed_*` reach still exists. It is now exactly one row of
+the type policy, with no special status in the code.
+
+### Type spellings match the wire, not the source
+
+The `artifact_type` field is 16 bytes. Longer names arrive truncated, so
+the policy lists the **truncated** spellings — `comparator_verd` (from
+`comparator_verdict`) and `chainwalk_summa` (from `chainwalk_summary`).
+A policy written with the untruncated names would silently refuse the
+traffic it was meant to admit. The list matches what is on the wire.
+
+### What this does not do
+
+The type policy authorizes *which* types a uid may append. It does not
+weaken any gate that validates the *content* of an append: an
+`observation` must still be a signed observation wire message, and the
+indirect-commitment types must still carry a body. Being on the list is
+permission to submit, never a waiver of verification.
+
 ## Trust Boundaries and Transport Paths
 
 **The trusted request boundary for 1.0 is the local Unix domain socket,
