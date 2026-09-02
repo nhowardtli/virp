@@ -66,6 +66,21 @@ GitHub's infrastructure, independent of any operator key):
 gh attestation verify virp-<tag>.zip --repo nhowardtli/virp
 ```
 
+`gh attestation verify` requires **gh 2.49 or newer** (the `attestation`
+subcommand does not exist on older gh, including the 2.45 shipped by some
+distributions). On an older gh, fetch a current one from
+`github.com/cli/cli/releases`, or verify the Sigstore attestation with
+`cosign`, or read it straight from the attestations API:
+
+```sh
+gh api repos/nhowardtli/virp/attestations/sha256:<zip-sha256>
+```
+
+A successful `gh attestation verify` prints `✓ Verification succeeded!` and
+names the build workflow (`.github/workflows/release.yml@refs/tags/<tag>`),
+the SLSA provenance predicate, and the GitHub Actions OIDC issuer. A stranger
+verified v0.2.0 this way with gh 2.99.0.
+
 ## Continuous exact-head evidence
 
 Independently of releases, every CI push runs the full battery under
