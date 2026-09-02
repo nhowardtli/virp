@@ -19,9 +19,6 @@
 #include "virp_onode.h"
 #include "virp_fault_inject.h"
 
-#ifndef VIRP_BUILD_ID
-#define VIRP_BUILD_ID "unknown"
-#endif   /* lab-only; compiles away without -DVIRP_FAULT_INJECT */
 #include "virp_message.h"
 #include "virp_handshake.h"
 #include "virp_transcript.h"
@@ -1370,7 +1367,7 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
         char nid[16];
         snprintf(nid, sizeof(nid), "%08X", state->node_id);
         cJSON_AddStringToObject(o, "node_id", nid);
-        cJSON_AddStringToObject(o, "build_id", VIRP_BUILD_ID);
+        cJSON_AddStringToObject(o, "build_id", virp_build_id());
         cJSON_AddBoolToObject(o, "evidence_required",
                               state->evidence_required);
         cJSON_AddStringToObject(o, "gate_default_mode",
@@ -1415,7 +1412,7 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
     if (cerr == VIRP_OK)
         fprintf(stderr, "[O-Node] node_config recorded: build=%s "
                 "evidence_required=%s gate=%s/%s seq=%lld\n",
-                VIRP_BUILD_ID, state->evidence_required ? "true" : "false",
+                virp_build_id(), state->evidence_required ? "true" : "false",
                 state->gate_default_mode == GATE_MODE_ENFORCE ? "ENFORCE"
                                                               : "SHADOW",
                 gate_tier_name(state->gate_max_tier),
@@ -3977,27 +3974,29 @@ static void handle_client(onode_state_t *state, int client_fd,
          * letting the evidence land. GATE 3 below verifies its
          * signature, so the name is a namespace, not a waiver.
          */
-        {
-            bool uid_restricted = false;
-            for (size_t i = 0; i < state->uid_action_count; i++) {
-                if (state->uid_action_uids[i] == client_uid) {
-                    uid_restricted = true;
-                    break;
-                }
-            }
-            if (uid_restricted &&
-                strcmp(req.artifact_type, "fed_request") != 0 &&
-                strcmp(req.artifact_type, "fed_observation") != 0 &&
-                strcmp(req.artifact_type, "fed_outcome") != 0) {
-                fprintf(stderr, "[O-Node] POLICY REFUSAL: uid %u "
-                        "chain_append artifact_type '%s' — a restricted "
-                        "principal may append only fed_request/"
-                        "fed_observation/fed_outcome (session=%s id=%s)\n",
-                        (unsigned)client_uid, req.artifact_type,
-                        req.session_id, req.artifact_id);
-                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
-                break;
-            }
+        /*
+         * v0.2.1 per-uid chain_append TYPE policy. A uid carrying an
+         * explicit socket_uid_chain_append_types list may append only
+         * those types. This replaces the v0.2.0 "any mapped uid is
+         * federated -> fed_* only" inference: the netclaw bridge (993)
+         * now gets its fed_* reach as a policy ROW, and the local service
+         * accounts get their real types (observation, evidence_item,
+         * no_drift, comparator_verd, ...) instead of a silent refusal.
+         * A uid with no policy is unrestricted here — the onode_start
+         * boot invariant guarantees every allowlisted uid that may
+         * chain_append has one, so at runtime a policy is always present
+         * for a mapped appender.
+         */
+        if (onode_uid_has_capp_policy(state, client_uid) &&
+            !onode_uid_capp_type_allowed(state, client_uid,
+                                         req.artifact_type)) {
+            fprintf(stderr, "[O-Node] POLICY REFUSAL: uid %u chain_append "
+                    "artifact_type '%s' — not in this uid's "
+                    "socket_uid_chain_append_types policy (session=%s "
+                    "id=%s)\n", (unsigned)client_uid, req.artifact_type,
+                    req.session_id, req.artifact_id);
+            send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+            break;
         }
         if (req.session_id[0] == '\0' || req.artifact_type[0] == '\0' ||
             req.artifact_id[0] == '\0' || req.artifact_hash[0] == '\0') {
@@ -5621,6 +5620,75 @@ void onode_clear_uid_actions(onode_state_t *state)
     state->uid_action_count = 0;
 }
 
+bool onode_uid_action_set_has(const onode_state_t *state, uid_t uid,
+                              onode_action_t action)
+{
+    if (!state) return false;
+    for (size_t i = 0; i < state->uid_action_count; i++) {
+        if (state->uid_action_uids[i] != uid) continue;
+        for (size_t j = 0; j < state->uid_action_set_counts[i]; j++)
+            if (state->uid_action_sets[i][j] == action) return true;
+        return false;
+    }
+    return false;
+}
+
+virp_error_t onode_set_uid_chain_append_types(onode_state_t *state, uid_t uid,
+                                              const char *const *types,
+                                              size_t count)
+{
+    if (!state || (count > 0 && !types))
+        return VIRP_ERR_NULL_PTR;
+    if (count > ONODE_MAX_UID_CAPP_TYPES)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+
+    ssize_t idx = -1;
+    for (size_t i = 0; i < state->uid_capp_count; i++)
+        if (state->uid_capp_uids[i] == uid) { idx = (ssize_t)i; break; }
+    if (idx < 0) {
+        if (state->uid_capp_count >= ONODE_MAX_ALLOWED_UIDS)
+            return VIRP_ERR_MESSAGE_TOO_LARGE;
+        idx = (ssize_t)state->uid_capp_count++;
+        state->uid_capp_uids[idx] = uid;
+    }
+    for (size_t i = 0; i < count; i++) {
+        /* Truncated to the wire artifact_type width, so the stored policy
+         * compares equal to req.artifact_type (also truncated on receipt). */
+        snprintf(state->uid_capp_types[idx][i], ONODE_CHAIN_TYPE_MAX,
+                 "%s", types[i] ? types[i] : "");
+    }
+    state->uid_capp_type_counts[idx] = count;   /* 0 = deny-all-types */
+    return VIRP_OK;
+}
+
+void onode_clear_uid_chain_append_types(onode_state_t *state)
+{
+    if (!state) return;
+    state->uid_capp_count = 0;
+}
+
+bool onode_uid_has_capp_policy(const onode_state_t *state, uid_t uid)
+{
+    if (!state) return false;
+    for (size_t i = 0; i < state->uid_capp_count; i++)
+        if (state->uid_capp_uids[i] == uid) return true;
+    return false;
+}
+
+bool onode_uid_capp_type_allowed(const onode_state_t *state, uid_t uid,
+                                 const char *artifact_type)
+{
+    if (!state || !artifact_type) return false;
+    for (size_t i = 0; i < state->uid_capp_count; i++) {
+        if (state->uid_capp_uids[i] != uid) continue;
+        for (size_t j = 0; j < state->uid_capp_type_counts[i]; j++)
+            if (strcmp(state->uid_capp_types[i][j], artifact_type) == 0)
+                return true;
+        return false;   /* uid has a policy; type not in it */
+    }
+    return false;       /* no policy for this uid */
+}
+
 virp_error_t onode_start(onode_state_t *state)
 {
     if (!state)
@@ -5702,6 +5770,39 @@ virp_error_t onode_start(onode_state_t *state)
                         "allowed uid (%zu entr%s)\n",
                 state->uid_action_count,
                 state->uid_action_count == 1 ? "y" : "ies");
+
+        /*
+         * v0.2.1 boot invariant: any allowlisted uid whose action set
+         * includes chain_append MUST carry an explicit
+         * socket_uid_chain_append_types policy. Without it the daemon
+         * would have to GUESS the type reach (v0.2.0 guessed "fed_* only",
+         * which silently refused the local service accounts' real
+         * appends). A forgotten type list is a boot failure naming the
+         * uid, never a silent fed_* narrowing.
+         */
+        for (size_t i = 0; i < state->socket_allowed_uids_count; i++) {
+            uid_t uid = state->socket_allowed_uids[i];
+            if (!onode_uid_action_set_has(state, uid,
+                                          ONODE_ACTION_CHAIN_APPEND))
+                continue;
+            if (!onode_uid_has_capp_policy(state, uid)) {
+                fprintf(stderr,
+                        "[O-Node] FATAL: uid %u may chain_append but has no "
+                        "socket_uid_chain_append_types policy. A uid that "
+                        "can append to the chain must name the artifact "
+                        "types it may append (the netclaw bridge is "
+                        "\"%u\": [\"fed_request\",\"fed_observation\","
+                        "\"fed_outcome\"]; the autopilot is [\"observation"
+                        "\",\"comparator_verd\",\"chainwalk_summa\"]). "
+                        "Refusing to start.\n",
+                        (unsigned)uid, (unsigned)uid);
+                return VIRP_ERR_ACTION_FORBIDDEN;
+            }
+        }
+        if (state->uid_capp_count > 0)
+            fprintf(stderr, "[O-Node] socket_uid_chain_append_types: %zu "
+                    "uid(s) have an explicit chain_append type policy\n",
+                    state->uid_capp_count);
     }
 
     if (state->uid_ceiling_count > 0) {

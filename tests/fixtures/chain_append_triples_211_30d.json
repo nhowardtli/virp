@@ -1,0 +1,23 @@
+{
+  "_comment": "Empirical distinct (uid, action, artifact_type) triples observed on the production reference node over the 30 days ending 2026-09-02, exported read-only from the daemon journal (gate log, for execute) and the trust chain (for chain_append). Deliberately carries NO hostnames, NO IP addresses and NO artifact bodies. uid is attributed from the session-prefix -> owning client mapping; daemon-minted types (gate_intent/gate_execution/gate_rejection/outcome/node_config/proposal) are excluded because the daemon writes them internally rather than through a socket chain_append. This is the real traffic v0.2.0's blanket fed-narrowing refuses; the v0.2.1 socket_uid_chain_append_types policy must admit every chain_append row here.",
+  "source": "production reference node, 30d ending 2026-09-02, read-only export",
+  "attribution_caveat": "196 'observation' entries also sit in the federation bridge's session prefix. They are NOT attributed to uid 993 here: 993's chain_append has been narrowed to the fed_* triple since 2026-08-11 and its bridge has worked throughout, so those rows are almost certainly pre-narrowing history written by another principal. Their timestamps could not be re-queried (the export session's keys were removed immediately after). Recorded so the exclusion is visible rather than silent.",
+  "triples": [
+    {"uid": 999,  "action": "execute",      "artifact_type": null,              "count_30d": 111086},
+    {"uid": 997,  "action": "execute",      "artifact_type": null,              "count_30d": 2296},
+    {"uid": 995,  "action": "execute",      "artifact_type": null,              "count_30d": 480},
+    {"uid": 993,  "action": "execute",      "artifact_type": null,              "count_30d": 334},
+    {"uid": 1000, "action": "execute",      "artifact_type": null,              "count_30d": 18},
+
+    {"uid": 999,  "action": "chain_append", "artifact_type": "observation",     "count_30d": 166403},
+    {"uid": 999,  "action": "chain_append", "artifact_type": "comparator_verd", "count_30d": 4318},
+    {"uid": 999,  "action": "chain_append", "artifact_type": "chainwalk_summa", "count_30d": 30},
+    {"uid": 997,  "action": "chain_append", "artifact_type": "observation",     "count_30d": 2880},
+    {"uid": 997,  "action": "chain_append", "artifact_type": "no_drift",        "count_30d": 2880},
+    {"uid": 995,  "action": "chain_append", "artifact_type": "observation",     "count_30d": 424},
+    {"uid": 995,  "action": "chain_append", "artifact_type": "evidence_item",   "count_30d": 424},
+    {"uid": 993,  "action": "chain_append", "artifact_type": "fed_request",     "count_30d": 286},
+    {"uid": 993,  "action": "chain_append", "artifact_type": "fed_observation", "count_30d": 97},
+    {"uid": 993,  "action": "chain_append", "artifact_type": "fed_outcome",     "count_30d": 277}
+  ]
+}

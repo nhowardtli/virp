@@ -43,6 +43,8 @@
 #define ONODE_RECV_TIMEOUT_SEC  5
 #define ONODE_MAX_REQUEST_SIZE  24576
 #define ONODE_MAX_ALLOWED_UIDS  16
+#define ONODE_MAX_UID_CAPP_TYPES 16 /* max chain_append types per uid (v0.2.1) */
+#define ONODE_CHAIN_TYPE_MAX     16 /* artifact_type field width incl NUL   */
 #define ONODE_MAX_UID_ACTIONS   32  /* max actions per uid in the
                                        socket_uid_action_allow map —
                                        large enough to spell out the
@@ -499,6 +501,32 @@ typedef struct {
      * with virp_context_destroy() after onode_destroy().
      */
     virp_context_t      *ctx;
+
+    /*
+     * Per-uid chain_append TYPE policy (v0.2.1). A uid that may
+     * chain_append is restricted to the artifact types named here, and
+     * to nothing else. This REPLACES the v0.2.0 inference that any uid
+     * with an action map was a federated principal narrowed to fed_*:
+     * that conflated "has an action map" (which Task 2 makes mandatory
+     * for every allowlisted uid) with "is a restricted federated
+     * principal", so mapping the local service accounts (999 autopilot,
+     * 997 config-backup, 995 evidence) — which Task 2 requires — silently
+     * refused their legitimate observation/evidence_item/no_drift
+     * appends. The fed_* narrowing for the netclaw bridge (993) is now
+     * one ROW of this policy, not a code path. Boot invariant
+     * (onode_start): any allowlisted uid whose action set includes
+     * chain_append MUST have an entry here, or the daemon refuses to
+     * start naming the uid. Parsed from the config's
+     * socket_uid_chain_append_types object (uid -> [type, ...]). A uid
+     * absent here is unrestricted by this policy (the self-seeded default
+     * only; every mapped uid is covered by the boot invariant).
+     */
+    uid_t               uid_capp_uids[ONODE_MAX_ALLOWED_UIDS];
+    char                uid_capp_types[ONODE_MAX_ALLOWED_UIDS]
+                                      [ONODE_MAX_UID_CAPP_TYPES]
+                                      [ONODE_CHAIN_TYPE_MAX];
+    size_t              uid_capp_type_counts[ONODE_MAX_ALLOWED_UIDS];
+    size_t              uid_capp_count;
 } onode_state_t;
 
 /* =========================================================================
@@ -741,6 +769,40 @@ virp_error_t onode_set_uid_actions(onode_state_t *state, uid_t uid,
 
 /* Drop every per-uid action allowlist entry (tests / config reload). */
 void onode_clear_uid_actions(onode_state_t *state);
+
+/*
+ * Per-uid chain_append TYPE allowlist (v0.2.1). `types`/`count` name the
+ * ONLY artifact types this uid may chain_append; each is copied (and
+ * truncated to the 16-byte artifact_type field width the wire uses).
+ * count == 0 is a valid deny-all-types entry. Returns
+ * VIRP_ERR_MESSAGE_TOO_LARGE when count exceeds ONODE_MAX_UID_CAPP_TYPES
+ * or the table is full. A uid never passed here has NO type policy and is
+ * unrestricted by it (see the onode_start boot invariant, which forbids
+ * that for any allowlisted uid whose action set includes chain_append).
+ */
+virp_error_t onode_set_uid_chain_append_types(onode_state_t *state, uid_t uid,
+                                              const char *const *types,
+                                              size_t count);
+void onode_clear_uid_chain_append_types(onode_state_t *state);
+
+/* True iff `uid` has an explicit chain_append type policy. */
+bool onode_uid_has_capp_policy(const onode_state_t *state, uid_t uid);
+/* True iff `uid` may chain_append `artifact_type` under its policy. Only
+ * meaningful when onode_uid_has_capp_policy() is true. */
+bool onode_uid_capp_type_allowed(const onode_state_t *state, uid_t uid,
+                                 const char *artifact_type);
+/* True iff `uid`'s action set includes `action` (used by the boot
+ * invariant to find uids that may chain_append). */
+/* The build id this binary was compiled from, as a generated translation
+ * unit (build/virp_build_id.c from scripts/gen-build-id.sh), NOT a macro.
+ * v0.2.0 reported build_id="unknown" because -DVIRP_BUILD_ID was placed on
+ * the prod compile line while the code that used it lived in libvirp.a,
+ * compiled without the define. A function every consumer links cannot go
+ * silently missing the way a per-TU macro can. */
+const char *virp_build_id(void);
+
+bool onode_uid_action_set_has(const onode_state_t *state, uid_t uid,
+                              onode_action_t action);
 
 /*
  * Per-uid action-allowlist decision for a SOCKET request: true iff the

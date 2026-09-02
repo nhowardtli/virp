@@ -44,6 +44,7 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_ssh_io.o \
              $(BUILD_DIR)/virp_scrub.o \
              $(BUILD_DIR)/virp_body_filter.o \
+             $(BUILD_DIR)/virp_build_id.o \
              $(BUILD_DIR)/cJSON.o
 
 # Optional Cisco driver (requires libssh2)
@@ -246,6 +247,24 @@ $(BUILD_DIR)/driver_pbs.o: src/drivers/driver_pbs.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/driver_zammad.o: src/drivers/driver_zammad.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Build-id translation unit (v0.2.1 Fix 2).
+#
+# v0.2.0 reported build_id="unknown" because -DVIRP_BUILD_ID was on the
+# virp_onode_prod.c compile line while the code that used it (virp_onode.c)
+# is archived into libvirp.a, compiled WITHOUT the define. The macro never
+# reached the code and the "unknown" fallback won silently. The value is
+# now a generated TU inside the library, so every consumer links the same
+# id and there is no per-TU define to misplace.
+#
+# FORCE: the id must track HEAD and the dirty bit, so it is regenerated on
+# every make. The generator rewrites the file only when the value actually
+# changed, so this does not force a relink each time.
+$(BUILD_DIR)/virp_build_id.c: FORCE | $(BUILD_DIR)
+	@scripts/gen-build-id.sh $@
+
+$(BUILD_DIR)/virp_build_id.o: $(BUILD_DIR)/virp_build_id.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/virp_ssh_hostkey.o: src/virp_ssh_hostkey.c | $(BUILD_DIR)
@@ -661,7 +680,7 @@ test-live: $(LIVE_TEST)
 ONODE_PROD = $(BUILD_DIR)/virp-onode-prod
 
 $(ONODE_PROD): src/virp_onode_prod.c $(LIB) FORCE
-	$(CC) $(CFLAGS) -DVIRP_BUILD_ID='"$(GIT_HASH)"' $< $(LIB) $(LDFLAGS) -ljson-c -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -ljson-c -o $@
 
 # ---------------------------------------------------------------------------
 # LAB-ONLY fault-injection daemon (adversarial test program, test #2).
@@ -1052,6 +1071,28 @@ test-camera:
 test-commitment-grading:
 	@echo "=== commitment-only observation grading ==="
 	python3 tests/test_commitment_only_grading.py
+
+# Build id provenance (v0.2.1 Fix 2). The prod binary must self-report the
+# id the tree describes -- v0.2.0 reported "unknown" because the define sat
+# on a translation unit that did not use it. Also pins the generator's
+# resolution order, including that it REFUSES to emit a provenance-free
+# build rather than falling back to a placeholder.
+.PHONY: test-build-id
+test-build-id: $(ONODE_PROD)
+	@scripts/check-build-id.sh ./$(ONODE_PROD)
+
+# Per-uid chain_append TYPE policy (v0.2.1). Replays the real 30-day
+# (uid, action, artifact_type) traffic exported from the production
+# reference node against the canonical template and asserts the v0.2.1
+# policy admits all of it while the v0.2.0 blanket fed-narrowing refuses
+# the local service appends -- the regression this release fixes,
+# reproduced from real traffic rather than asserted in prose. Also pins
+# the boot invariant at the template level and lints that uid 1000's list
+# covers every artifact_type virp-tool can emit. Pure stdlib; no daemon.
+.PHONY: test-chain-append-policy
+test-chain-append-policy:
+	@echo "=== per-uid chain_append type policy (v0.2.1) ==="
+	python3 tests/test_chain_append_policy.py
 
 # Evidence-required execution (Sep 1 review, Task 5): report/verify.py must
 # grade a gate_intent with no linked gate_execution/outcome as an OPEN
@@ -1645,7 +1686,21 @@ check-pbs-pin:
 # that, by construction — so the drift comparison is now part of the
 # same target rather than an optional extra somebody remembers to run.
 .PHONY: check-deploy-unit
-check-deploy-unit: check-deploy-unit-source check-unit-drift
+check-deploy-unit: check-deploy-unit-source check-unit-drift check-deploy-build-id
+
+# Does the INSTALLED binary come from the deploy tree that is checked out?
+# Only answerable since v0.2.1 Fix 2 gave the binary a real self-reported
+# build id (v0.2.0 said "unknown"). Self-skips on a build host; the
+# selftest proves the rule can actually fail, against a local fixture,
+# because the deploy host is not reachable from here.
+.PHONY: check-deploy-build-id
+check-deploy-build-id:
+	@$(MAKE) --no-print-directory check-deploy-build-id-selftest
+	@scripts/check-deploy-build-id.sh
+
+.PHONY: check-deploy-build-id-selftest
+check-deploy-build-id-selftest:
+	@scripts/check-deploy-build-id.sh --selftest
 
 # Installed vs tracked. Expected to FAIL on virp-lab today: the daemon
 # unit carries VIRP_WAZUH_INSECURE=1 inline and virp-netclaw-egress.service
@@ -1973,7 +2028,7 @@ test-release-tools:
 	@scripts/gen-test-attestation.sh --selftest
 	@scripts/verify-release-bundle.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

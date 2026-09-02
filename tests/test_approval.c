@@ -1082,6 +1082,18 @@ static void test_node_config_recorded_at_startup(void)
     ASSERT(strstr(body, "\"evidence_required\":") != NULL, "evidence_required");
     ASSERT(strstr(body, "\"gate_max_tier\":") != NULL, "gate_max_tier");
     ASSERT(strstr(body, "\"build_id\":") != NULL, "build_id");
+    /* v0.2.1 Fix 2. Asserting only that the FIELD EXISTS is what let
+     * v0.2.0 ship node_config entries reading build_id="unknown" for the
+     * whole deploy window: the key was there, the provenance was not.
+     * The recorded id must be the real one this binary was built from. */
+    ASSERT(strstr(body, "\"build_id\":\"unknown\"") == NULL,
+           "build_id is not \"unknown\" (the v0.2.0 defect)");
+    {
+        char want[128];
+        snprintf(want, sizeof(want), "\"build_id\":\"%s\"", virp_build_id());
+        ASSERT(strstr(body, want) != NULL,
+               "build_id equals this binary's linked build id");
+    }
     sqlite3_finalize(st);
     sqlite3_close(db);
     PASS();

@@ -438,6 +438,76 @@ static char *load_socket_path_override(struct json_object *root)
 }
 
 /* Parse a gate mode string ("shadow"/"enforce"). Returns true on success. */
+/*
+ * Parse the optional per-uid chain_append TYPE policy (v0.2.1):
+ *
+ *   "socket_uid_chain_append_types": {
+ *       "999": ["observation", "comparator_verd", "chainwalk_summa"],
+ *       "997": ["observation", "no_drift", "baseline_set", "drift_alert"],
+ *       "995": ["observation", "evidence_item"],
+ *       "993": ["fed_request", "fed_observation", "fed_outcome"]
+ *   }
+ *
+ * A uid that may chain_append is restricted to exactly these artifact
+ * types. onode_start() refuses to boot if any allowlisted uid whose
+ * action set includes chain_append has no entry here. A malformed entry
+ * installs a deny-all-types policy (fail closed) for that uid.
+ */
+static void load_uid_chain_append_types(onode_state_t *state,
+                                        struct json_object *root)
+{
+    struct json_object *obj;
+    if (!json_object_object_get_ex(root, "socket_uid_chain_append_types",
+                                   &obj) ||
+        !json_object_is_type(obj, json_type_object)) {
+        return;  /* optional; the boot invariant catches a missing one */
+    }
+
+    json_object_object_foreach(obj, key, val) {
+        char *end = NULL;
+        unsigned long uidv = strtoul(key, &end, 10);
+        if (!end || *end != '\0') {
+            fprintf(stderr, "[O-Node] ERROR: socket_uid_chain_append_types "
+                            "key '%s' is not a numeric uid\n", key);
+            continue;
+        }
+        const char *types[ONODE_MAX_UID_CAPP_TYPES];
+        size_t count = 0;
+        bool malformed = false;
+        if (!json_object_is_type(val, json_type_array)) {
+            malformed = true;
+        } else {
+            size_t alen = (size_t)json_object_array_length(val);
+            if (alen > ONODE_MAX_UID_CAPP_TYPES) {
+                malformed = true;
+            } else {
+                for (size_t i = 0; i < alen; i++) {
+                    struct json_object *a = json_object_array_get_idx(val, i);
+                    if (!json_object_is_type(a, json_type_string)) {
+                        malformed = true; break;
+                    }
+                    types[count++] = json_object_get_string(a);
+                }
+            }
+        }
+        if (malformed) {
+            fprintf(stderr, "[O-Node] ERROR: socket_uid_chain_append_types"
+                            "['%s'] malformed — installing DENY-ALL-TYPES "
+                            "for uid %lu (fail closed)\n", key, uidv);
+            count = 0;
+        }
+        virp_error_t err = onode_set_uid_chain_append_types(
+                state, (uid_t)uidv, types, count);
+        if (err != VIRP_OK) {
+            fprintf(stderr, "[O-Node] onode_set_uid_chain_append_types(uid "
+                            "%lu) failed: %d\n", uidv, (int)err);
+            continue;
+        }
+        fprintf(stderr, "[O-Node] uid %lu chain_append types: %zu%s\n",
+                uidv, count, count == 0 ? " (DENY-ALL)" : "");
+    }
+}
+
 static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
 {
     if (strcasecmp(s, "enforce") == 0) { *out = GATE_MODE_ENFORCE; return true; }
@@ -607,6 +677,7 @@ int load_devices(onode_state_t *state, const char *path)
      * is not allowed to connect. */
     load_uid_tier_ceilings(state, root);
     load_uid_action_allow(state, root);
+    load_uid_chain_append_types(state, root);
 
     /* Tier-enforcement gate (Phase B): override SHADOW/YELLOW defaults
      * from config if present. Installed before onode_start(). A strict
@@ -1198,6 +1269,21 @@ int main(int argc, char **argv)
     const char *approval_dir = "/var/lib/virp/approvals";
     const char *approvers_path = "/etc/virp/approvers.json";
     uint32_t node_id = 0x00000001;
+
+    /* --version / -V: print the build id and exit.
+     *
+     * Handled before getopt on purpose: it must need no config file, no
+     * keys, no socket and no chain. "What is this binary?" has to be
+     * answerable of an INSTALLED binary in isolation, which is exactly
+     * what the check-deploy-build-id drift rule asks it. Prints the bare
+     * id and nothing else so the comparison needs no parsing. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 ||
+            strcmp(argv[i], "-V") == 0) {
+            printf("%s\n", virp_build_id());
+            return 0;
+        }
+    }
 
     int opt;
     while ((opt = getopt(argc, argv, "k:K:W:s:d:n:c:C:S:a:A:h")) != -1) {
