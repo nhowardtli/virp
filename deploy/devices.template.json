@@ -20,6 +20,7 @@
     "${VIRP_EVIDENCE_UID}": "green"
   },
   "_socket_uid_action_allow_note": "Per-uid ACTION allowlists (Item 8 mechanism 2026-08-11; config made mandatory Sep 1 review, Task 2). EVERY uid in socket_allowed_uids MUST have an entry here: the daemon treats an allowed-but-unmapped uid as unrestricted (shutdown included), so onode_start() now REFUSES TO RUN, naming the uid, when this object does not cover the allowlist \u2014 a forgotten entry is a boot failure, never a silent grant. Sets are the verbs each client actually sends, nothing more: ${VIRP_UID} is the daemon's own service account (autopilot, evidence report, camera submit-spool, virp-tool run as virp) and gets the full wire vocabulary EXCEPT shutdown \u2014 no client sends it and the unit stops on SIGTERM; 1000 is the interactive operator and keeps everything including shutdown; ${VIRP_BACKUP_UID} (autopilot/virp_config_backup.py) and ${VIRP_EVIDENCE_UID} (autopilot/virp_evidence.py) send exactly execute + chain_append \u2014 their reads go through the gate as execute, so execute cannot be withheld without ending collection; both are additionally read-only by classification (GREEN reads, per-uid GREEN ceiling); ${VIRP_NETCLAW_UID} gets what the installed virp-bridge-mcp.py on netclaw sends today (session_hello, session_bind, execute, chain_append \u2014 chain_append is type-narrowed to the federation triple for any mapped uid) and, pointedly, not shutdown, not list_fleet/health/chain_verify which that client never sends; ${VIRP_BROKER_UID} gets the broker's own relay allowlist (broker/virp_broker.py ALLOWED_ACTIONS). tests/test_template_uid_policy.py renders this file and asserts the coverage and the no-shutdown rule for the four service identities.",
+  "_socket_uid_netclaw_verbs_followup": "FOLLOW-UP (2026-09-02, v0.2.1 deploy). ${VIRP_NETCLAW_UID} carries the verb set the RUNNING node has today \u2014 list_fleet, health, chain_verify, chain_append, execute \u2014 not the set this file previously proposed (session_hello, session_bind, execute, chain_append). The two sets are DISJOINT in four verbs: the proposal drops list_fleet/health/chain_verify and adds session_hello/session_bind. Reconciling them changes what a live remote client may send in BOTH directions and must be its own change, with virp-bridge-mcp.py on netclaw tested against it \u2014 not a side effect of a v0.2.1 correctness deploy. The chain_append TYPE policy below is unaffected: 30 days of this node's own traffic show uid 993 appending only fed_request/fed_observation/fed_outcome since 2026-08-11, so the fed_* triple is a no-op restatement of its live reach.",
   "socket_uid_action_allow": {
     "${VIRP_UID}": [
       "execute",
@@ -75,10 +76,11 @@
       "chain_append"
     ],
     "${VIRP_NETCLAW_UID}": [
-      "session_hello",
-      "session_bind",
-      "execute",
-      "chain_append"
+      "list_fleet",
+      "health",
+      "chain_verify",
+      "chain_append",
+      "execute"
     ],
     "${VIRP_BROKER_UID}": [
       "execute",
@@ -167,6 +169,7 @@
     {
       "_comment": "Wazuh manager. protected_agents names the agents the driver refuses to touch at ANY tier \u2014 enforced in wazuh_execute() and returned as VIRP_TIER_BLACK by the gate hook, so the refusal files no proposal and no approval reaches it. Ids compare numerically, so \"004\" and 4 are one agent. Do NOT rely on the API credential's RBAC for this: Wazuh denies at resource level by returning HTTP 200 with the agent simply absent from affected_items, which is indistinguishable from the agent not existing.",
       "_tls_note": "The driver verifies the certificate by default. A stock Wazuh manager presents a self-signed cert whose only SAN is DNS:localhost, so addressing it by IP fails hostname verification even with that cert trusted as a CA. Fix the CERTIFICATE (reissue with an IP or DNS SAN via wazuh-certs-tool.sh) and point VIRP_CA_BUNDLE at its signer. The VIRP_WAZUH_INSECURE drop-in disables verification entirely and is a lab-only last resort.",
+      "_protected_agents_status": "protected_agents is DELIBERATELY UNSET for this device (2026-09-02). The ids previously listed here, 004 and 313, are the HOME Wazuh manager's agent ids. Read back from the colo manager at 10.0.20.10 through the gate as a GREEN \"GET /agents\", it has seven agents and neither id is among them: 000 wazuh, 001 pve1, 006 librenms, 007 pbs, 008 thirdlevel-ai-web, 009 ironclaw-onode, 011 netclaw. Listing ids that do not exist protects nothing and reads as protection that is not there, so the running node's omission is kept. Decide which of the seven real ids belong on the never-class list and set them in their own change.",
       "hostname": "wazuh-lab",
       "host": "10.0.20.10",
       "vendor": "wazuh",
@@ -174,10 +177,6 @@
       "api_port": 55000,
       "username": "${WAZUH_USER}",
       "password": "${WAZUH_PASS}",
-      "protected_agents": [
-        "004",
-        "313"
-      ],
       "node_id": "0A00140A"
     },
     {
@@ -227,6 +226,347 @@
       "tls_fingerprint": "${PBS_FINGERPRINT}",
       "tls_servername": "${PBS_SERVERNAME}",
       "datastore_allow": "${PBS_DATASTORES}"
+    },
+    {
+      "_comment": "IronClaw colo fleet stage 1. PAN-OS op mode has full read access \u2014 no enable mode exists, so the LAB_ENABLE placeholder (dollar-brace form) must NOT be named on this row (render policy: a placeholder named here loads a secret into the daemon that no driver will ever read).",
+      "hostname": "pa-850",
+      "node_id": "0A0000FA",
+      "host": "10.0.0.250",
+      "vendor": "panos",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "port": 22
+    },
+    {
+      "_comment": "IronClaw colo fleet stage 1. The only stage-1 row with enable: the ASA driver enters (and re-enters) enable mode. ssh_legacy is deliberately NOT set \u2014 verified 2026-08-09 from this node that the driver's default algorithm set negotiates with this unit (kex diffie-hellman-group14-sha1, hostkey ssh-rsa, cipher aes256-ctr; the ASA offers nothing newer and all three are in the default preference list).",
+      "hostname": "ASA-5525",
+      "node_id": "0A0000FD",
+      "host": "10.0.0.253",
+      "vendor": "cisco_asa",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "_comment": "IronClaw colo fleet stage 1. JunOS has a flat privilege model \u2014 no enable. IronClaw's own inventory carries ssh_legacy=true for this device, but that is stale: the unit runs OpenSSH 6.9 and offers ecdh-sha2-nistp256, first in the juniper driver's default kex list (verified 2026-08-09 from this node), so it is imported without ssh_legacy.",
+      "hostname": "srx-300",
+      "node_id": "0A0000FE",
+      "host": "10.0.0.254",
+      "vendor": "juniper",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "port": 22
+    },
+    {
+      "hostname": "R1",
+      "node_id": "0A000032",
+      "host": "10.0.0.50",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R2",
+      "node_id": "0A000033",
+      "host": "10.0.0.51",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R3",
+      "node_id": "0A000034",
+      "host": "10.0.0.52",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R4",
+      "node_id": "0A000035",
+      "host": "10.0.0.53",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R5",
+      "node_id": "0A000036",
+      "host": "10.0.0.54",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R7",
+      "node_id": "0A000038",
+      "host": "10.0.0.56",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R8",
+      "node_id": "0A000039",
+      "host": "10.0.0.57",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R10",
+      "node_id": "0A00003B",
+      "host": "10.0.0.59",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R11",
+      "node_id": "0A00003C",
+      "host": "10.0.0.60",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R12",
+      "node_id": "0A00003D",
+      "host": "10.0.0.61",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R13",
+      "node_id": "0A00003E",
+      "host": "10.0.0.62",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R14",
+      "node_id": "0A00003F",
+      "host": "10.0.0.63",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R15",
+      "node_id": "0A000040",
+      "host": "10.0.0.64",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R17",
+      "node_id": "0A000042",
+      "host": "10.0.0.66",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R18",
+      "node_id": "0A000043",
+      "host": "10.0.0.67",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R19",
+      "node_id": "0A000044",
+      "host": "10.0.0.68",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R20",
+      "node_id": "0A000045",
+      "host": "10.0.0.69",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R21",
+      "node_id": "0A000046",
+      "host": "10.0.0.70",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R22",
+      "node_id": "0A000047",
+      "host": "10.0.0.71",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R23",
+      "node_id": "0A000048",
+      "host": "10.0.0.72",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R24",
+      "node_id": "0A000049",
+      "host": "10.0.0.73",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R25",
+      "node_id": "0A00004A",
+      "host": "10.0.0.74",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R26",
+      "node_id": "0A00004B",
+      "host": "10.0.0.75",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R27",
+      "node_id": "0A00004C",
+      "host": "10.0.0.76",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R28",
+      "node_id": "0A00004D",
+      "host": "10.0.0.77",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R29",
+      "node_id": "0A00004E",
+      "host": "10.0.0.78",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R30",
+      "node_id": "0A00004F",
+      "host": "10.0.0.79",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R31",
+      "node_id": "0A000050",
+      "host": "10.0.0.80",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R33",
+      "node_id": "0A000052",
+      "host": "10.0.0.82",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R34",
+      "node_id": "0A000053",
+      "host": "10.0.0.83",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
+    },
+    {
+      "hostname": "R35",
+      "node_id": "0A000054",
+      "host": "10.0.0.84",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${LAB_PASSWORD}",
+      "enable": "${LAB_ENABLE}",
+      "port": 22
     }
   ]
 }
