@@ -121,6 +121,22 @@ typedef struct {
     char     sig_key_id[VIRP_CHAINSIGN_KEYID_HEX]; /* the session's signing
                                  * key_id as read from the head/entries, or
                                  * "" if the session is unsigned            */
+
+    /* =====================================================================
+     * OPEN EXECUTIONS (Sep 1 review, Task 5). PURE ADDITION, never a
+     * failure. Under evidence_required the daemon commits a gate_intent
+     * entry BEFORE dispatching a command and a closer (gate_execution, or
+     * outcome for an approved apply) AFTER, the closer naming the intent's
+     * chain_entry_hash as intent_entry_hash in its stored body. An intent
+     * whose closer exists anywhere in the database is CLOSED; one with no
+     * closer is OPEN: the daemon died (or was killed) between the two —
+     * "attempted, disposition unknown" — and the target must be reconciled
+     * out-of-band. valid stays true: every entry present still hashes,
+     * links and authenticates; an open execution is a gap in what
+     * happened AFTER the chain's last word, not a gap in the chain.
+     * ===================================================================== */
+    int64_t  executions_open;
+    int64_t  executions_closed;
 } virp_chain_verify_result_t;
 
 /* =========================================================================
@@ -142,6 +158,11 @@ typedef struct {
  * the device returned (by digest). A client able to mint one could
  * manufacture evidence of an execution that never happened, or of a
  * response body it chooses the digest for.
+ *
+ * "gate_intent" (Sep 1 review, Task 5) is the pre-execution record that
+ * gates dispatch under evidence_required. Reserved because a client able
+ * to mint one could plant an OPEN execution the verifier would then
+ * report against a device nothing ever touched.
  */
 bool virp_chain_type_is_daemon_reserved(const char *artifact_type);
 
@@ -534,6 +555,18 @@ virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,
 virp_error_t virp_chain_entry_commits_to(virp_chain_state_t *state,
                                          const char *artifact_hash,
                                          bool *exists);
+
+/*
+ * Count committed gate_intent entries whose body cites approval_entry_hash
+ * (Sep 1 review, Task 5 / 1.1). The daemon's apply-time replay guard: a
+ * count >= 1 before appending a new intent for an approved apply means the
+ * approval was already spent (chain is authority; closes the crash window
+ * between intent commit and the consumed.list cache write). The verifier
+ * flags count > 1 as a double-spend. Returns VIRP_OK on a clean query.
+ */
+virp_error_t virp_chain_count_intents_for_approval(virp_chain_state_t *state,
+                                                   const char *approval_entry_hash,
+                                                   int *count);
 
 /*
  * Set *conflict to true iff the artifacts table already holds a body

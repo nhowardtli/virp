@@ -444,6 +444,13 @@ int  virp_driver_mock_probe_count(void);
 void virp_driver_mock_set_unknown_fail(const char *msg);
 /* Total execute() invocations since the last reset; resets to zero. */
 int  virp_driver_mock_exec_attempts_reset(void);
+/* Per-connect delay in ms (0 disables): make an approval TTL lapse during
+ * connect for the evidence-required re-check test (Phase 1 item 2). */
+void virp_driver_mock_set_connect_delay(int ms);
+/* Crash hook: execute() SIGKILLs the calling process. For a forked test
+ * child only — it models a daemon dying between the pre-execution record
+ * and the outcome record. */
+void virp_driver_mock_set_crash_in_execute(bool on);
 
 /* Real drivers — conditionally compiled */
 #ifdef VIRP_DRIVER_CISCO

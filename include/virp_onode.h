@@ -342,6 +342,62 @@ typedef struct {
     bool                chain_enabled;
 
     /*
+     * EVIDENCE-REQUIRED execution (Sep 1 review, Task 5). Default TRUE
+     * (onode_init; the prod loader reads the config's `evidence_required`
+     * boolean). When set, every execution the gate admits is preceded by
+     * a durable gate_intent chain entry — device, command, tier, uid,
+     * session, proposal — committed BEFORE the driver is dispatched; if
+     * that append fails (chain full, read-only, absent) the operation is
+     * REFUSED with a signed ERROR observation citing evidence-unavailable
+     * and nothing reaches the device. The post-execution gate_execution /
+     * outcome entry then links back to the intent by chain_entry_hash,
+     * so a daemon that dies between the two leaves an intent with no
+     * closer, which the verifier reports as an OPEN execution — never as
+     * a broken chain. When false, today's behaviour is preserved (record
+     * after the fact, best-effort) and every dispatch logs a WARNING that
+     * it ran without a durable record. Fail-closed by default: an absent
+     * or garbled config key keeps evidence required.
+     */
+    bool                evidence_required;
+
+    /*
+     * EVIDENCE-DEGRADED (Sep 1 review, 1.3). Set true when an execution's
+     * outcome record (gate_execution / outcome) could not be committed to
+     * the chain AFTER the device had already acted — the one window the
+     * pre-execution intent cannot close, because it sits between two chain
+     * appends across device I/O. The command ran; its closer did not land.
+     * When set, gate_emit_intent refuses every further execution at the
+     * intent step (evidence-unavailable / degraded), so the daemon stops
+     * dispatching rather than pile up more unchained actions. The prior
+     * execution's intent stays OPEN and the verifier reports it as such.
+     * Cleared only by a restart (a clean chain reopen). Guarded by
+     * state_mutex.
+     *
+     * evidence_fail_closer_once is a TEST-ONLY injection: when set, the
+     * next closer append (gate_execution / outcome) is skipped and
+     * reported failed, modelling a chain that goes read-only in exactly
+     * that window. Never set in production.
+     */
+    bool                evidence_degraded;
+
+#ifdef VIRP_FAULT_INJECT
+    /*
+     * LAB-ONLY fault injection (Sep 1 review, Phase 1 item 6). Compiled
+     * ONLY under -DVIRP_FAULT_INJECT, exactly like the VIRP_FI() crash
+     * points (include/virp_fault_inject.h): the production daemon has no
+     * such field and no way to set it. `evidence_fail_closer_once` makes
+     * the next closer append (gate_execution / outcome) report failure
+     * without appending, modelling a chain that goes read-only in the
+     * window after the intent committed and the device acted.
+     * `evidence_ttl_now_override_ns`, when non-zero, is the clock the
+     * apply-time TTL re-check uses instead of CLOCK_REALTIME, so a test
+     * can make an approval expire "during connect" deterministically.
+     */
+    bool                evidence_fail_closer_once;
+    uint64_t            evidence_ttl_now_override_ns;
+#endif
+
+    /*
      * Approval flow (propose → approve → apply). Disabled until
      * onode_set_approvers() provides a store directory and an approver
      * registry (/etc/virp/approvers.json). The daemon holds ONLY public

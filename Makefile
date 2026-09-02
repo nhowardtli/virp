@@ -522,22 +522,57 @@ TEST_FG_REFUSAL   = $(BUILD_DIR)/test_driver_fortigate_refusal
 TEST_PANOS_REFUSAL = $(BUILD_DIR)/test_driver_panos_refusal
 
 $(TEST_ASA_REFUSAL): tests/test_driver_asa_refusal.c tests/refusal_contract.h $(LIB)
+	@ar t $(LIB) 2>/dev/null | grep -q '^virp_ssh_hostkey.o$$' || { \
+	  echo "ERROR: $@ needs virp_ssh_hostkey.o (virp_ssh_verify_hostkey) in"; \
+	  echo "       $(LIB), which is only built when an SSH driver flag is set"; \
+	  echo "       (CISCO/FORTIGATE/PANOS/ASA/JUNIPER/LINUX). This is the"; \
+	  echo "       driverless-tree link failure. Run 'make prod' (or e.g."; \
+	  echo "       'make ASA=1 $@') to build libvirp.a with drivers first."; \
+	  false; }
 	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
 
 $(TEST_CISCO_REFUSAL): tests/test_driver_cisco_refusal.c tests/refusal_contract.h $(LIB)
+	@ar t $(LIB) 2>/dev/null | grep -q '^virp_ssh_hostkey.o$$' || { \
+	  echo "ERROR: $@ needs virp_ssh_hostkey.o (virp_ssh_verify_hostkey) in"; \
+	  echo "       $(LIB), which is only built when an SSH driver flag is set"; \
+	  echo "       (CISCO/FORTIGATE/PANOS/ASA/JUNIPER/LINUX). This is the"; \
+	  echo "       driverless-tree link failure. Run 'make prod' (or e.g."; \
+	  echo "       'make ASA=1 $@') to build libvirp.a with drivers first."; \
+	  false; }
 	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
 
 $(TEST_JUNIPER_REFUSAL): tests/test_driver_juniper_refusal.c tests/refusal_contract.h $(LIB)
+	@ar t $(LIB) 2>/dev/null | grep -q '^virp_ssh_hostkey.o$$' || { \
+	  echo "ERROR: $@ needs virp_ssh_hostkey.o (virp_ssh_verify_hostkey) in"; \
+	  echo "       $(LIB), which is only built when an SSH driver flag is set"; \
+	  echo "       (CISCO/FORTIGATE/PANOS/ASA/JUNIPER/LINUX). This is the"; \
+	  echo "       driverless-tree link failure. Run 'make prod' (or e.g."; \
+	  echo "       'make ASA=1 $@') to build libvirp.a with drivers first."; \
+	  false; }
 	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
 
 $(TEST_FG_REFUSAL): tests/test_driver_fortigate_refusal.c tests/refusal_contract.h $(LIB)
+	@ar t $(LIB) 2>/dev/null | grep -q '^virp_ssh_hostkey.o$$' || { \
+	  echo "ERROR: $@ needs virp_ssh_hostkey.o (virp_ssh_verify_hostkey) in"; \
+	  echo "       $(LIB), which is only built when an SSH driver flag is set"; \
+	  echo "       (CISCO/FORTIGATE/PANOS/ASA/JUNIPER/LINUX). This is the"; \
+	  echo "       driverless-tree link failure. Run 'make prod' (or e.g."; \
+	  echo "       'make ASA=1 $@') to build libvirp.a with drivers first."; \
+	  false; }
 	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -lcurl -o $@
 
 $(TEST_PANOS_REFUSAL): tests/test_driver_panos_refusal.c tests/refusal_contract.h $(LIB)
+	@ar t $(LIB) 2>/dev/null | grep -q '^virp_ssh_hostkey.o$$' || { \
+	  echo "ERROR: $@ needs virp_ssh_hostkey.o (virp_ssh_verify_hostkey) in"; \
+	  echo "       $(LIB), which is only built when an SSH driver flag is set"; \
+	  echo "       (CISCO/FORTIGATE/PANOS/ASA/JUNIPER/LINUX). This is the"; \
+	  echo "       driverless-tree link failure. Run 'make prod' (or e.g."; \
+	  echo "       'make ASA=1 $@') to build libvirp.a with drivers first."; \
+	  false; }
 	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
 
@@ -565,6 +600,17 @@ $(TEST_FED): tests/test_federation.c $(LIB)
 
 test-chain: $(TEST_CHAIN)
 	./$(TEST_CHAIN)
+
+# Evidence-required intent/closer binding fixtures (Sep 1 review, 1.1-1.2)
+TEST_EVBIND = $(BUILD_DIR)/test_evidence_binding
+
+$(TEST_EVBIND): tests/test_evidence_binding.c $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-evidence-binding
+test-evidence-binding: $(TEST_EVBIND)
+	./$(TEST_EVBIND)
 
 # Chain canonical-bytes INVARIANT (D-1 gate). #includes src/virp_chain.c to
 # reach the static canonical builders and locks them to the D-0 Appendix A
@@ -614,8 +660,8 @@ test-live: $(LIVE_TEST)
 # Production O-Node (with device config loading via json-c)
 ONODE_PROD = $(BUILD_DIR)/virp-onode-prod
 
-$(ONODE_PROD): src/virp_onode_prod.c $(LIB)
-	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -ljson-c -o $@
+$(ONODE_PROD): src/virp_onode_prod.c $(LIB) FORCE
+	$(CC) $(CFLAGS) -DVIRP_BUILD_ID='"$(GIT_HASH)"' $< $(LIB) $(LDFLAGS) -ljson-c -o $@
 
 # ---------------------------------------------------------------------------
 # LAB-ONLY fault-injection daemon (adversarial test program, test #2).
@@ -665,6 +711,22 @@ $(TEST_CHAIN_ATOM_FI): tests/test_chain_atomicity_fi.c
 
 test-chain-atomicity-fi: $(TEST_CHAIN_ATOM_FI)
 	./$(TEST_CHAIN_ATOM_FI)
+
+# LAB-ONLY: evidence-required outcome-append failure (Phase 1 item 3 / 1.3).
+# Builds tests/test_evidence_fi.c AND libvirp.a with -DVIRP_FAULT_INJECT into
+# build-fi/ so the evidence_fail_closer_once injection field exists and its
+# check fires. Same isolation contract as onode-fi: build-fi/ only, never
+# build/, never installed. Private /tmp chain.
+TEST_EVIDENCE_FI = build-fi/test_evidence_fi
+.PHONY: test-evidence-fi
+$(TEST_EVIDENCE_FI): tests/test_evidence_fi.c
+	$(MAKE) BUILD_DIR=build-fi CFLAGS_EXTRA=-DVIRP_FAULT_INJECT \
+	        LINUX=1 build-fi/libvirp.a
+	rm -f $@
+	$(CC) $(CFLAGS) -DVIRP_FAULT_INJECT $< build-fi/libvirp.a $(LDFLAGS) -o $@
+
+test-evidence-fi: $(TEST_EVIDENCE_FI)
+	./$(TEST_EVIDENCE_FI)
 
 # 'make prod' builds the prod O-Node with all production drivers enabled,
 # including PAN-OS. Uses recursive $(MAKE) because the driver guards are
@@ -990,6 +1052,15 @@ test-camera:
 test-commitment-grading:
 	@echo "=== commitment-only observation grading ==="
 	python3 tests/test_commitment_only_grading.py
+
+# Evidence-required execution (Sep 1 review, Task 5): report/verify.py must
+# grade a gate_intent with no linked gate_execution/outcome as an OPEN
+# execution and never as a failure — the Python half of what
+# tests/test_onode.c pins for the C verifier. Pure-Python; no daemon.
+.PHONY: test-open-execution-grading
+test-open-execution-grading:
+	@echo "=== open-execution grading (report/verify.py) ==="
+	python3 tests/test_open_execution_grading.py
 
 # Every fed_outcome must cite an observation body that is actually in the
 # artifacts table. The bridge appends the signed observation and the
@@ -1902,7 +1973,7 @@ test-release-tools:
 	@scripts/gen-test-attestation.sh --selftest
 	@scripts/verify-release-bundle.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-commitment-grading test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

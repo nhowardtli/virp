@@ -222,4 +222,49 @@ virp_error_t virp_approval_verify_consume(const char *dir,
                                           uint64_t now_ns,
                                           virp_approval_rec_t *out);
 
+/*
+ * Steps 1..5 of virp_approval_verify_consume WITHOUT step 6 (the durable
+ * single-use consume). Same argument list, same error codes for the
+ * checks it does run; on VIRP_OK *out is filled and NOTHING has been
+ * consumed. Split out for evidence-required execution (Sep 1 review,
+ * Task 5 / 1.1): the gate must verify an approval before it commits the
+ * gate_intent entry, and CONSUME only after that entry is durable, so
+ * that the invariant "an approval is consumed iff a committed gate_intent
+ * names it" holds. A refused intent then consumes nothing.
+ */
+virp_error_t virp_approval_verify(const char *dir,
+                                  const virp_approver_registry_t *reg,
+                                  const char *proposal_id,
+                                  const char *device,
+                                  uint32_t device_node_id,
+                                  const char *command,
+                                  const char *typed_profile,
+                                  uint64_t now_ns,
+                                  virp_approval_rec_t *out);
+
+/*
+ * Step 6 alone: durably record proposal_id in consumed.list (temp-write,
+ * fsync, rename). Returns VIRP_ERR_APPROVAL_REUSED if it was already
+ * present, VIRP_OK on a fresh consume, non-OK on persist failure. The
+ * consumed list is a CACHE — the authority on whether an approval was
+ * spent is a committed gate_intent that names its approval entry hash
+ * (see onode_execute_obs_ex). A persist failure here AFTER the intent
+ * committed is therefore logged, not fatal: the chain already records
+ * the consumption and the apply-time chain check will see it.
+ */
+virp_error_t virp_approval_commit_consume(const char *dir,
+                                          const char *proposal_id);
+
+/* Make the daemon's apply-time chain replay guard and the gate_intent
+ * commit atomic against other consumers (Sep 1 review, Phase 1 item 1):
+ * hold this lock across the guard query and the intent append, then commit
+ * the consume with the _locked variant below before releasing. Nothing is
+ * held across connect (get_connection precedes the guarded block). Lock
+ * order: consume_lock -> chain lock (never the reverse).
+ */
+void virp_approval_consume_lock(void);
+void virp_approval_consume_unlock(void);
+virp_error_t virp_approval_commit_consume_locked(const char *dir,
+                                                 const char *proposal_id);
+
 #endif /* VIRP_APPROVAL_H */

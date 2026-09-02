@@ -1605,6 +1605,11 @@ static void chain_verify_print(const char *sess,
         printf(" head=UNAUTHENTICATED");
     if (r->sig_key_unavailable)
         printf(" sig=KEY_UNAVAILABLE(%s)", r->sig_key_id);
+    /* An intent with no closer: the daemon died between committing "about
+     * to dispatch" and recording what the device did. Not a chain break —
+     * printed on VALID chains too, because that is where it matters. */
+    if (r->executions_open > 0)
+        printf(" OPEN_EXECUTIONS=%lld", (long long)r->executions_open);
 
     if (!r->valid) {
         if (r->first_broken >= 0)
@@ -1686,6 +1691,8 @@ static int chain_verify_socket(const char *sock_path, const char *session)
     if (cJSON_IsNumber(j)) r.to_sequence = (int64_t)j->valuedouble;
     j = cJSON_GetObjectItemCaseSensitive(o, "first_broken");
     r.first_broken = cJSON_IsNumber(j) ? (int64_t)j->valuedouble : -1;
+    j = cJSON_GetObjectItemCaseSensitive(o, "executions_open");
+    if (cJSON_IsNumber(j)) r.executions_open = (int64_t)j->valuedouble;
     j = cJSON_GetObjectItemCaseSensitive(o, "error_detail");
     if (cJSON_IsString(j) && j->valuestring)
         snprintf(r.error_detail, sizeof(r.error_detail), "%s",

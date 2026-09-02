@@ -92,6 +92,9 @@ int main(void)
         fprintf(stderr, "onode_init failed: %s\n", virp_error_str(err));
         return 1;
     }
+    /* Chainless fixture: opt out of evidence-required execution (the
+     * compiled-in default), which would refuse every dispatch here. */
+    g_state.evidence_required = false;
 
     for (int i = 0; i < DEVICE_COUNT; i++) {
         virp_device_t d;

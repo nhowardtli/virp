@@ -1126,6 +1126,172 @@ I/O, not within one append. The EXECUTION_INTENT proposal
 disposition unknown"; until then an unresolved apply is genuinely ambiguous
 and must be reconciled out-of-band against the target.
 
+### Evidence-required execution (`evidence_required`, Sep 1 review, Task 5)
+
+The paragraph above described the shipped state until 2026-09-01, and it
+understated it: not only an approved apply but **every** gate-admitted
+execution was recorded only *after* the device had acted, by
+`gate_emit_execution()`, and that append was best-effort — a chain failure
+was logged and ignored. Reproduced directly (`tests/test_onode.c`,
+`test_evidence_append_failure_refuses_and_executes_nothing`, run against the
+unfixed tree): with the chain forced read-only, the mock device executed once
+and the caller received an ordinary DEVICE_OUTPUT observation while the
+journal read `[GATE] execution chain append+store failed`.
+
+The daemon now has an **evidence-required** mode, on by default
+(`onode_init()`; config key `evidence_required`, a JSON boolean, shipped as
+`true` in both deploy templates):
+
+- **Before dispatch** the gate commits a `gate_intent` chain entry — device,
+  driver, command, classified and effective tier, gate mode, uid, the v2
+  session id when session-bound, the proposal id for an approved apply — in
+  the device's `gate-enforce:<device>` session, entry + head + body in one
+  SQLite transaction. The driver is not called until that commit returns.
+- **If the append fails** (chain absent, read-only, full, body unbuildable)
+  the operation is **refused**: a signed ERROR observation whose payload
+  cites `evidence-unavailable` and the cause, `[GATE] decision=refuse
+  reason=evidence-unavailable` in the journal, and `VIRP_ERR_EVIDENCE_UNAVAILABLE`
+  as the typed reason. Nothing is dispatched. An approved apply that fails
+  here has already spent its single-use approval; the operator re-proposes.
+  Spending an approval is the cheaper failure.
+- **After execution** the `gate_execution` entry (or the `outcome` entry for
+  an approved apply) carries `intent_entry_hash` = the intent's
+  `chain_entry_hash`, plus `intent_sequence` / `intent_artifact_id` for the
+  reader. Two linked entries per dispatch.
+- **A crash between the two** leaves an intent with no closer. Both verifiers
+  — `virp_chain_verify_session()` (`executions_open` / `executions_closed`,
+  printed by `virp chain-verify` as `OPEN_EXECUTIONS=n` and returned by the
+  daemon's `chain_verify` / `chain_verify_session` actions) and
+  `report/verify.py` (`summary["open_executions"]`, rendered by the report
+  and printed by `virp-report`) — report it as an **open execution**: the
+  chain is VALID, the world after its last word is what is uncertain.
+  Reconcile against the target. Measured, not assumed: the crash test forks a
+  fresh daemon, SIGKILLs it inside the driver, and verifies the recovered
+  database.
+- **A daemon with evidence required and no usable chain refuses to start**
+  (`onode_setup_chain_and_approvals()`), naming the fix: pass `-c`/`-C`, or
+  set `"evidence_required": false`. The library-level belt refuses each
+  dispatch as evidence-unavailable if that state is ever reached anyway.
+- **`evidence_required: false`** restores the record-after-the-fact posture
+  exactly, and logs `[GATE] WARNING: evidence_required=false — dispatching …
+  with NO durable pre-execution record` on every dispatch. `gate_execution`
+  and `outcome` bodies then carry `intent_entry_hash: null`.
+
+What this changes in the claim above: an execution VIRP admitted is now either
+recorded before it happens or does not happen. The residual — an intent whose
+outcome was never written — is no longer indistinguishable from "never
+contacted the device": it is reported by name as open. The
+"recorded-happened-once" guarantee is unchanged. `gate_intent` is a
+daemon-reserved artifact type like `gate_execution`: a socket client cannot
+mint one, so it cannot plant an open execution against a device nothing
+touched.
+
+#### Refinements (Sep 1 review, 1.1–1.5)
+
+- **Consumption is the intent (1.1).** An approved apply's approval is
+  **consumed iff a committed `gate_intent` entry names it** (the entry
+  carries `approval_entry_hash` and `proposal_entry_hash`). The gate now
+  VERIFIES the approval without consuming; the intent commit is the
+  consumption event, and the consume record (`consumed.list`) is written
+  after it as a cache. A refused intent consumes nothing — the operator
+  re-applies and it executes exactly once. Before appending an intent for
+  an approved apply the daemon queries the chain, type-restricted to
+  `gate_intent`, for one already citing that approval entry hash and
+  refuses `approval_reused` on a hit — closing the crash window between an
+  intent commit and the cache write, since the chain entry survives. Two
+  intents citing one approval entry hash is a verifier FAIL (double-spend),
+  in both the C and Python verifiers.
+- **Closer binding is type-checked (1.2).** A closer's `intent_entry_hash`
+  must resolve to a `gate_intent` entry (wrong type or absent = FAIL); two
+  closers for one intent = FAIL; a closer whose binding disagrees with its
+  intent = FAIL (device always; command/session/uid for `gate_execution`;
+  proposal_id/approval_entry_hash for `outcome`). All via the GATE 4
+  pattern — type-restricted query, cJSON parse, never `strstr`. The daemon
+  builds each closer from the intent it holds in memory, so a real closer
+  always matches; the checks are the adversarial backstop for a crafted
+  chain. Crafted-chain fixtures: `tests/test_evidence_binding.c` (C) and
+  `tests/test_open_execution_grading.py` (Python).
+- **Outcome append fails after execution (1.3).** The one window the
+  pre-execution intent cannot close is *between* the two chain appends,
+  across the device I/O: the intent commits, the device acts, the closer
+  append fails. This is now **never silent** — the caller gets a signed
+  ERROR citing `unchained-execution` and the open intent hash; the daemon
+  latches **evidence-degraded** and refuses every further dispatch at the
+  intent step until restart; the intent stays OPEN and the verifiers report
+  it. The durable late-closer spool that would *recover* the outcome (retry
+  + a late-append marker) is deferred to its own branch — see
+  `docs/PROPOSAL-LATE-CLOSER-SPOOL.md`. The degraded-refuse behaviour is the
+  fail-safe, not the recovery.
+- **Strict loader (1.4).** `evidence_required` set to anything but a JSON
+  boolean is a FATAL config error naming the key and the received type —
+  the daemon refuses to load rather than run with a guessed posture. A
+  string `"false"` (always truthy) is the trap this closes.
+- **`node_config` on the chain (1.5).** The daemon records its posture at
+  startup — `evidence_required`, gate mode, node-wide and per-uid tier
+  ceilings, and the build id — as a daemon-reserved `node_config` chain
+  entry. A reader can now bound, from the chain alone, the window in which
+  unrecorded execution was permitted (`evidence_required=false`, or a build
+  predating this work), and Docket answers the tier-ceiling question from
+  the bundle rather than from a `devices.json` it may not have. A bundle
+  with no `node_config` reports the ceiling and posture UNKNOWN rather than
+  guessing.
+
+#### Pre-merge hardening (Sep 1 review, Phase 1 second commit)
+
+- **The replay guard is atomic with the intent append.** For an approved
+  apply the daemon holds one lock (`virp_approval_consume_lock`) across the
+  TTL re-check, the replay-guard chain query, the `gate_intent` commit and
+  the `consumed.list` write, so the guard and the append cannot be
+  interleaved by another consumer. Nothing is held across `get_connection`
+  (connect precedes the locked block). In practice a single approval already
+  resolves to a single device — the signed binding is the node id and the
+  apply verify also matches the device NAME, and device names are unique at
+  load, so the per-device `exec_mutex` already serializes every apply of one
+  approval; the shared lock is the belt to that suspenders. Tested by two
+  concurrent applies of one approval to one device: exactly one executes,
+  one intent lands, the other refuses `approval_reused`.
+- **TTL is re-checked at dispatch.** `virp_approval_verify` runs before
+  connect, and connect can take seconds on a dead device, so the approval
+  TTL is re-checked under the same lock immediately before the intent
+  commit. An approval that lapsed during connect refuses with
+  `approval_expired` and consumes nothing.
+- **A cache-write failure after the intent commit does not stop
+  execution.** The `gate_intent` commit is the authoritative consumption;
+  if the `consumed.list` cache write then fails, the daemon logs at error
+  level and executes anyway. The next apply of that approval is refused by
+  the chain replay guard (which reads the chain, not the cache), so
+  single-use is not lost — the cache is only an optimisation.
+- **`node_config` is FATAL under `evidence_required`.** A node that cannot
+  commit its startup posture record would refuse its first intent anyway
+  (every dispatch needs a durable chain), so that is stated at boot, by
+  name, and the daemon refuses to start. With `evidence_required` false the
+  record is best-effort — logged and continued.
+- **The evidence-degraded latch clears on restart only.** Once a closer
+  append fails after the device acted, the daemon refuses further dispatch
+  at the intent step for the life of the process; there is no automatic
+  recovery on this branch (that is the deferred late-closer spool). A clean
+  restart re-opens the chain, writes a fresh `node_config`, and clears the
+  latch — so `node_config` is not rewritten on recovery within a run,
+  because there is no in-run recovery.
+- **Approved-apply outcome-fail is a known limitation.** The
+  unchained-execution marker is returned on the auto-execute path. For an
+  approved apply the `outcome` record is written after the observation is
+  already built (the `pre_outcome` ordering the adversarial crash test
+  pins), so an `outcome`-append failure there still latches
+  evidence-degraded and leaves the intent OPEN, but that one caller may
+  receive a normal observation rather than the marker. Exact shape: the
+  approved-apply caller may get a normal observation while its outcome is
+  unrecorded; the daemon latches; the intent grades OPEN and must be
+  reconciled against the target. Closing it means moving the `outcome`
+  append ahead of the observation build, which is entangled with the
+  `pre_outcome` fault point and deferred with the late-closer spool.
+- **The fault hook is compile-gated.** The `evidence_fail_closer_once` /
+  `evidence_ttl_now_override_ns` injection fields exist ONLY under
+  `-DVIRP_FAULT_INJECT`, exactly like the `VIRP_FI()` crash points — the
+  production daemon has neither the field nor the check. The test that uses
+  them is `tests/test_evidence_fi.c`, built into `build-fi/` by
+  `make test-evidence-fi`.
+
 ### Crash and storage-failure durability — measured, not assumed
 
 Earlier this section could only say "SIGKILL, not power loss". That gap is now
@@ -1150,7 +1316,9 @@ own integrity guarantee held throughout:
    chain's own head/entry consistency, never from the ack.
 2. The "recorded-happened-once" gap above (a crash between device I/O and the
    OUTCOME append) is orthogonal to storage durability and is not closed by any
-   of these results; EXECUTION_INTENT is its remedy.
+   of these results. Since 2026-09-01 the evidence-required mode above makes
+   that crash *visible* — an open execution — rather than silent; it does not
+   make it impossible.
 
 ## Verifier Limitations
 

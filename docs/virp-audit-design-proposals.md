@@ -214,6 +214,20 @@ advisory client clearly marked EXPERIMENTAL (done in M2) until it lands.
 
 ## EXECUTION_INTENT — durable "attempted, disposition unknown" record (-07 material)
 
+> **STATUS 2026-09-01 (Sep 1 review, Task 5): LANDED, in general form.** The
+> daemon now commits a `gate_intent` chain entry immediately before
+> `drv->execute()` for **every** gate-admitted execution — auto-executed
+> GREEN reads as well as approved applies (for which the body carries the
+> `proposal_id`) — and refuses to dispatch if that append fails
+> (`evidence_required`, default true; `SECURITY.md` "Evidence-required
+> execution"). The closer (`gate_execution` / `outcome`) links back by
+> `intent_entry_hash`; the verifiers report an unclosed intent as an OPEN
+> execution. The placement constraint below is honoured exactly: after
+> `consume_once()`, after the connection is up, before the driver is called.
+> The body differs from the sketch (device, driver, command text, tiers,
+> mode, uid, v2 session, proposal, `intent_ns`; no `daemon_build_id`,
+> no separate `command_hash` — the command is in the body).
+
 Origin: the adversarial test program, test #2 (crash around execution); see
 `tests/adversarial/MEMO-execution-intent.md`.
 

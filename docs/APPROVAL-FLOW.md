@@ -24,10 +24,12 @@ execute "configure…"  →  gate: block (RED > YELLOW)
                               ← APPROVAL_SUBMIT {sig, key_id} ─────────
                          verify sig vs registry
                          + APPROVAL chain entry (key_id + operator)
-execute + proposal_id →  gate: verify approval
-                         sig → hash → device → TTL → consume
+execute + proposal_id →  gate: VERIFY approval (no consume yet)
+                         sig → hash → device → TTL
+                         → connect → gate_intent chain entry
+                           (names approval_entry_hash) → CONSUME
                          → execute → OUTCOME chain entry
-                           (links PROPOSAL + APPROVAL)
+                           (links PROPOSAL + APPROVAL + intent)
 ```
 
 ## Canonical payload (the signed bytes)
@@ -78,9 +80,25 @@ Signatures are a fixed 64 bytes on the wire for both algorithms:
 | single-use consume                      | `VIRP_ERR_APPROVAL_REUSED` (-37)          |
 | no approval record / proposal           | `VIRP_ERR_APPROVAL_NOT_FOUND` (-41)       |
 
-Single-use consumption is persisted to `<dir>/consumed.list` (write-temp →
-fsync → rename); a failed persist REJECTS the apply (fail closed). Consumed
-state survives restarts.
+Single-use consumption changed with evidence-required execution (Sep 1
+review, 1.1). The **invariant** is now: *an approval is consumed iff a
+committed `gate_intent` entry names its proposal id and approval entry
+hash.* The apply path VERIFIES the approval (sig → hash → device → TTL) in
+the gate, then commits the pre-execution `gate_intent` entry — which
+carries `approval_entry_hash` — and only then records the consume. So a
+refused intent (chain read-only, disk full) consumes **nothing**: the
+operator re-applies the same approval and it executes exactly once.
+
+The chain is the authority; `<dir>/consumed.list` (write-temp → fsync →
+rename) is a **cache**. Before appending an intent for an approved apply
+the daemon queries the chain, type-restricted to `gate_intent`, for one
+already citing that approval entry hash
+(`virp_chain_count_intents_for_approval`); a hit refuses the apply as
+`approval_reused` (-37) regardless of the cache. That closes the crash
+window between an intent commit and the consumed.list write — the entry
+survives, so the replay is caught from the chain even if the cache write
+was lost. Two `gate_intent` entries citing one approval entry hash is a
+verifier FAIL (double-spend) in both the C and Python verifiers.
 
 ### L1 — RESOLVED
 
@@ -216,8 +234,14 @@ All three entries share chain session `approval:<device>`:
   device, command_hash, success
 
 An approved apply that reaches execution ALWAYS emits an OUTCOME, even if
-the device itself then fails the command — the approval is consumed by the
-attempt, not by success.
+the device itself then fails the command. Under evidence-required execution
+the approval is consumed by the committed **intent** (which precedes the
+dispatch), not by the device's success — and a dispatch whose intent could
+not be committed consumes nothing and does not run. The OUTCOME body also
+carries `intent_entry_hash`, linking it to that intent; a crash between the
+intent and the OUTCOME leaves the intent OPEN, which the verifiers report
+as an open execution (reconcile against the target), never as a broken
+chain.
 
 ## PKCS#11 note
 

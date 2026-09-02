@@ -55,6 +55,8 @@
   },
   "gate_default_mode": "enforce",
   "gate_max_tier": "yellow",
+  "_evidence_required_note": "Evidence-required execution (Sep 1 review, Task 5). true (the daemon's compiled-in default, restated here so the posture is visible in the rendered config): every execution the gate admits is preceded by a durable gate_intent chain entry \u2014 device, command, tier, uid, v2 session, proposal \u2014 committed BEFORE the driver is dispatched; if that append fails (chain read-only, disk full, chain absent) the operation is REFUSED with a signed ERROR observation citing evidence-unavailable and nothing reaches the device. The gate_execution / outcome entry written afterwards links back to the intent by chain_entry_hash; a daemon that dies between the two leaves an intent with no closer, which `virp chain-verify` and report/verify.py report as an OPEN EXECUTION (reconcile against the target) and never as a broken chain. Requires the trust chain (-c/-C in the unit); the daemon refuses to START with evidence required and no usable chain. Set to false ONLY to restore the pre-Task-5 record-after-the-fact posture \u2014 the daemon then logs a WARNING on every dispatch that it ran without a durable record. Must be a JSON boolean: any other value is logged and ignored (default stays true).",
+  "evidence_required": true,
   "devices": [
     {
       "hostname": "wazuh-lab",

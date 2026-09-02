@@ -38,6 +38,7 @@
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/wait.h>
 #include <sqlite3.h>
 #include <openssl/evp.h>
 
@@ -530,6 +531,7 @@ static int shadow_state_init(onode_state_t *tmp, uint32_t node_id,
     if (onode_init(tmp, node_id, NULL, sock) != VIRP_OK) return -1;
     tmp->ctx = virp_context_new();
     if (!tmp->ctx) return -1;
+    tmp->evidence_required = false;      /* chainless fixture, see main() */
 
     virp_device_t dev;
     memset(&dev, 0, sizeof(dev));
@@ -2086,6 +2088,7 @@ static int errobs_setup(onode_state_t *tmp, const char *hostname,
     if (!tmp->ctx)
         return -1;
     /* compiled-in defaults: ENFORCE, max_tier=YELLOW — the live posture */
+    tmp->evidence_required = false;      /* chainless fixture, see main() */
 
     virp_device_t dev;
     memset(&dev, 0, sizeof(dev));
@@ -2496,6 +2499,7 @@ TEST(test_shadow_executes_unclassified_with_honest_tier)
     tmp.ctx = virp_context_new();
     ASSERT_TRUE(tmp.ctx != NULL);
     tmp.gate_default_mode = GATE_MODE_SHADOW;    /* explicit opt-in */
+    tmp.evidence_required = false;       /* chainless fixture, see main() */
 
     virp_device_t dev;
     memset(&dev, 0, sizeof(dev));
@@ -2866,6 +2870,159 @@ TEST(test_blocked_address_text_scan)
 }
 
 #define EXCLUSION_CFG "/tmp/virp-onode-exclusion.json"
+
+/* item 5 — node_config recording is FATAL at startup when evidence_required
+ * is true (a node that cannot write its posture would refuse its first
+ * intent anyway) and best-effort when false. The chain is forced read-only
+ * so the node_config append fails; onode_start must refuse to start with
+ * the flag true and must start with it false. */
+#define NC_CHAIN_DB  "/tmp/virp-onode-nc.db"
+#define NC_CHAIN_KEY "/tmp/virp-onode-nc.key"
+#define NC_SOCKET    "/tmp/virp-onode-nc.sock"
+
+static void nc_cleanup(void)
+{
+    unlink(NC_CHAIN_DB); unlink(NC_CHAIN_DB "-wal");
+    unlink(NC_CHAIN_DB "-shm"); unlink(NC_CHAIN_KEY); unlink(NC_SOCKET);
+}
+
+static onode_state_t nc_state;
+static void *nc_start_thread(void *arg) { (void)arg; onode_start(&nc_state); return NULL; }
+
+/* Bring up nc_state with a chain, then force the chain read-only so any
+ * append (the node_config record) fails. Returns 0 on setup success. */
+static int nc_setup(bool evidence_required)
+{
+    nc_cleanup();
+    virp_signing_key_t ck;
+    if (virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN) != VIRP_OK) return -1;
+    if (virp_key_save_file(&ck, NC_CHAIN_KEY) != VIRP_OK) return -1;
+    virp_key_destroy(&ck);
+    if (onode_init(&nc_state, 0xDEAD00C0, NULL, NC_SOCKET) != VIRP_OK) return -1;
+    nc_state.ctx = virp_context_new();
+    if (!nc_state.ctx) return -1;
+    nc_state.evidence_required = evidence_required;
+    if (virp_chain_init(&nc_state.chain, NC_CHAIN_DB, NC_CHAIN_KEY,
+                        0xDEAD00C0, "local") != VIRP_OK) return -1;
+    nc_state.chain_enabled = true;
+    /* Force every chain write to fail from here on. */
+    pthread_mutex_lock(&nc_state.chain.lock);
+    sqlite3_exec(nc_state.chain.db, "PRAGMA query_only=ON", NULL, NULL, NULL);
+    pthread_mutex_unlock(&nc_state.chain.lock);
+    return 0;
+}
+
+TEST(test_node_config_fatal_when_evidence_required)
+{
+    ASSERT_EQ(nc_setup(true), 0);
+    /* onode_start emits node_config BEFORE binding the socket; with the
+     * chain read-only and evidence_required true it must return an error
+     * and never create the socket. Call it synchronously — it returns
+     * before the accept loop. */
+    virp_error_t rc = onode_start(&nc_state);
+    ASSERT_TRUE(rc != VIRP_OK);
+    ASSERT_EQ(access(NC_SOCKET, F_OK), -1);   /* never bound */
+    onode_destroy(&nc_state);
+    virp_context_destroy(nc_state.ctx);
+    nc_cleanup();
+}
+
+TEST(test_node_config_best_effort_when_not_required)
+{
+    ASSERT_EQ(nc_setup(false), 0);
+    /* evidence_required false: the same node_config failure is logged and
+     * startup CONTINUES, so the daemon binds and serves. Run in a thread
+     * (onode_start blocks in accept) and confirm the socket appears. */
+    pthread_t th;
+    ASSERT_EQ(pthread_create(&th, NULL, nc_start_thread, NULL), 0);
+    /* Wait for the bind. */
+    int bound = 0;
+    for (int i = 0; i < 100; i++) {
+        if (access(NC_SOCKET, F_OK) == 0) { bound = 1; break; }
+        usleep(20000);
+    }
+    ASSERT_TRUE(bound);
+    onode_shutdown(&nc_state);
+    /* Poke the socket so the accept loop wakes and the thread returns. */
+    int poke = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (poke >= 0) {
+        struct sockaddr_un a; memset(&a, 0, sizeof(a));
+        a.sun_family = AF_UNIX;
+        snprintf(a.sun_path, sizeof(a.sun_path), "%s", NC_SOCKET);
+        (void)connect(poke, (struct sockaddr *)&a, sizeof(a));
+        close(poke);
+    }
+    struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 15;
+    ASSERT_EQ(pthread_timedjoin_np(th, NULL, &dl), 0);
+    onode_destroy(&nc_state);
+    virp_context_destroy(nc_state.ctx);
+    nc_cleanup();
+}
+
+TEST(test_load_devices_refuses_nonboolean_evidence_required)
+{
+    /* 1.4: evidence_required set to anything other than a JSON boolean is
+     * a FATAL config error (naming the key), not a silent ignore. A
+     * string "false" is the trap the strictness closes — always truthy,
+     * so a silent default of true would look like the operator got what
+     * they asked for while meaning the opposite. */
+    const char *CFG = "/tmp/virp-onode-evreq-bad.json";
+    FILE *f = fopen(CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"evidence_required\": \"false\",\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"ok\", \"host\": \"10.0.10.12\", \"vendor\": \"mock\" }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0031, NULL,
+                         "/tmp/virp-onode-evreq-bad.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    int loaded = load_devices(&tmp, CFG);
+    ASSERT_EQ(loaded, -1);
+    ASSERT_EQ(tmp.device_count, 0);
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(CFG);
+}
+
+TEST(test_load_devices_accepts_boolean_evidence_required)
+{
+    /* The valid form still loads and sets the flag from the boolean. */
+    const char *CFG = "/tmp/virp-onode-evreq-ok.json";
+    FILE *f = fopen(CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"evidence_required\": false,\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"ok\", \"host\": \"10.0.0.55\", \"vendor\": \"mock\",\n"
+        "      \"node_id\": \"0A0A0A37\" }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0032, NULL,
+                         "/tmp/virp-onode-evreq-ok.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    int loaded = load_devices(&tmp, CFG);
+    ASSERT_TRUE(loaded >= 1);
+    ASSERT_EQ((int)tmp.evidence_required, 0);   /* the boolean took effect */
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(CFG);
+}
 
 TEST(test_load_devices_refuses_blocked_address)
 {
@@ -3304,6 +3461,12 @@ static virp_error_t gx_setup(onode_state_t *st)
     if (!st->ctx) return VIRP_ERR_NULL_PTR;
     st->gate_default_mode = GATE_MODE_ENFORCE;
     st->gate_max_tier = VIRP_TIER_GREEN;
+    /* The gx_* tests pin the exact row shape of the record-after-the-fact
+     * posture (one gate_execution per dispatch, nothing before it), so
+     * they run with evidence_required OFF. The evidence-required posture
+     * — the compiled-in default — has its own fixture, ev_setup(), and
+     * its own tests below. */
+    st->evidence_required = false;
 
     e = onode_setup_chain_and_approvals(st, 0xDEAD0008,
                                         GX_CHAIN_DB, GX_CHAIN_KEY,
@@ -3580,6 +3743,375 @@ TEST(test_green_execution_chains_signed_observation)
     ASSERT_TRUE(strstr(rows[1].body, "\"response_sha256\":\"") != NULL);
 
     gx_cleanup();
+}
+
+/* =========================================================================
+ * EVIDENCE-REQUIRED EXECUTION (Sep 1 review, Task 5)
+ *
+ * REPRODUCTION FIRST. gate_emit_execution() runs AFTER the device has
+ * acted, and its chain failure is logged and ignored ("best-effort, like
+ * every other gate chain write"). So a chain that cannot accept writes at
+ * the moment of dispatch lets the device execute the command with NO
+ * durable record of it anywhere. The chain handle is put into
+ * query_only mode here — the same failure shape as a full disk or a
+ * read-only remount — and the mock driver's execute() counter says what
+ * reached the device.
+ * ========================================================================= */
+
+/* Force every chain write to fail from now on: PRAGMA query_only makes
+ * BEGIN IMMEDIATE / INSERT return SQLITE_READONLY, which
+ * virp_chain_append_with_artifact() surfaces as VIRP_ERR_CHAIN_DB. */
+static void ev_break_chain(onode_state_t *st)
+{
+    pthread_mutex_lock(&st->chain.lock);
+    sqlite3_exec(st->chain.db, "PRAGMA query_only=ON", NULL, NULL, NULL);
+    pthread_mutex_unlock(&st->chain.lock);
+}
+
+/* gx_setup with the compiled-in posture restored: evidence REQUIRED. */
+static virp_error_t ev_setup(onode_state_t *st)
+{
+    virp_error_t e = gx_setup(st);
+    if (e == VIRP_OK) st->evidence_required = true;
+    return e;
+}
+
+/* Capture everything written to stderr while fn runs, into buf. */
+#define EV_STDERR_CAP "/tmp/virp-onode-test-ev-stderr.txt"
+static int ev_stderr_begin(void)
+{
+    fflush(stderr);
+    int saved = dup(2);
+    int fd = open(EV_STDERR_CAP, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (saved < 0 || fd < 0) return -1;
+    dup2(fd, 2);
+    close(fd);
+    return saved;
+}
+static void ev_stderr_end(int saved, char *buf, size_t cap)
+{
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    buf[0] = '\0';
+    FILE *f = fopen(EV_STDERR_CAP, "rb");
+    if (f) {
+        size_t n = fread(buf, 1, cap - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+    }
+    unlink(EV_STDERR_CAP);
+}
+
+TEST(test_evidence_append_failure_refuses_and_executes_nothing)
+{
+    onode_state_t st;
+    ASSERT_OK(ev_setup(&st));
+
+    ev_break_chain(&st);
+    (void)virp_driver_mock_exec_attempts_reset();
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    int attempts = virp_driver_mock_exec_attempts_reset();
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+    virp_observation_t o;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE,
+                                     &o, &data, &data_len));
+    char payload[512];
+    snprintf(payload, sizeof(payload), "%.*s", (int)data_len,
+             (const char *)data);
+
+    gx_teardown(&st);
+    gx_cleanup();
+
+    printf("\n      [repro] execute attempts=%d obs_type=%u payload=\"%.80s\"\n",
+           attempts, (unsigned)o.obs_type, payload);
+
+    /* Nothing may reach the device when its record cannot be written. */
+    ASSERT_EQ(attempts, 0);
+    ASSERT_EQ(o.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr(payload, "evidence-unavailable") != NULL);
+    ASSERT_TRUE(strstr(payload, "nothing was dispatched") != NULL);
+}
+
+/* Same failure, opted out: today's behaviour is preserved — the command
+ * runs, the caller gets DEVICE_OUTPUT, the after-the-fact append fails
+ * and is logged — and the daemon SAYS SO at warning level before it
+ * dispatches. */
+TEST(test_evidence_not_required_runs_and_warns)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));           /* evidence_required = false */
+    ev_break_chain(&st);
+    (void)virp_driver_mock_exec_attempts_reset();
+
+    static char log[1 << 16];
+    int saved = ev_stderr_begin();
+    ASSERT_TRUE(saved >= 0);
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+                                     obs, sizeof(obs), &olen);
+    ev_stderr_end(saved, log, sizeof(log));
+    ASSERT_OK(err);
+    int attempts = virp_driver_mock_exec_attempts_reset();
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+    virp_observation_t o;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE,
+                                     &o, &data, &data_len));
+    gx_teardown(&st);
+    gx_cleanup();
+
+    ASSERT_EQ(attempts, 1);
+    ASSERT_EQ(o.obs_type, VIRP_OBS_DEVICE_OUTPUT);
+    ASSERT_TRUE(strstr(log, "[GATE] WARNING: evidence_required=false") != NULL);
+    ASSERT_TRUE(strstr(log, "NO durable pre-execution record") != NULL);
+    ASSERT_TRUE(strstr(log, "execution chain append+store failed") != NULL);
+}
+
+/* No chain at all is the same condition as a chain that cannot be
+ * written: with evidence required, nothing is dispatched. (The prod
+ * loader refuses to boot this shape; this is the library-level belt.) */
+TEST(test_evidence_required_without_chain_refuses_dispatch)
+{
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0019, NULL,
+                         "/tmp/virp-onode-evnochain.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+    ASSERT_EQ((int)tmp.evidence_required, 1);       /* the default */
+    ASSERT_EQ((int)tmp.chain_enabled, 0);
+    tmp.gate_max_tier = VIRP_TIER_GREEN;
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "EV-NOCHAIN");
+    snprintf(dev.host, sizeof(dev.host), "10.255.0.9");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0E770001;
+    dev.enabled = true;
+    ASSERT_OK(onode_add_device(&tmp, &dev));
+
+    (void)virp_driver_mock_exec_attempts_reset();
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&tmp, "EV-NOCHAIN", "show version",
+                            obs, sizeof(obs), &olen));
+    int attempts = virp_driver_mock_exec_attempts_reset();
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &tmp.okey, &hdr));
+    virp_observation_t o;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE,
+                                     &o, &data, &data_len));
+    int cites = memmem(data, data_len, "evidence-unavailable", 20) != NULL;
+    int names_cause = memmem(data, data_len, "no trust chain configured",
+                             25) != NULL;
+    virp_context_t *ctx = tmp.ctx;
+    onode_destroy(&tmp);
+    virp_context_destroy(ctx);
+
+    ASSERT_EQ(attempts, 0);
+    ASSERT_EQ(o.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(cites);
+    ASSERT_TRUE(names_cause);
+}
+
+/* The normal path: one dispatch leaves TWO linked entries in the device's
+ * gate-enforce session — the intent committed before the driver ran and
+ * the execution record after — and the whole session verifies with the
+ * execution CLOSED. */
+TEST(test_evidence_normal_path_leaves_two_linked_entries)
+{
+    onode_state_t st;
+    ASSERT_OK(ev_setup(&st));
+    (void)virp_driver_mock_exec_attempts_reset();
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 1);
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    virp_chain_verify_result_t vr;
+    ASSERT_OK(virp_chain_verify_session(&st.chain, GX_SESSION, &vr));
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+    gx_cleanup();
+
+    ASSERT_TRUE(vr.valid);
+    ASSERT_EQ((int)vr.entries_checked, 2);
+    ASSERT_EQ((int)vr.executions_open, 0);
+    ASSERT_EQ((int)vr.executions_closed, 1);
+
+    ASSERT_EQ(n, 2);
+    ASSERT_EQ(strcmp(rows[0].type, "gate_intent"), 0);
+    ASSERT_EQ(strcmp(rows[1].type, "gate_execution"), 0);
+    ASSERT_EQ((int)rows[0].seq, 0);
+    ASSERT_EQ((int)rows[1].seq, 1);
+    ASSERT_EQ(strcmp(rows[1].prev, rows[0].ehash), 0);
+
+    /* The intent: retained, bound, and says what it was about to do. */
+    ASSERT_TRUE(rows[0].have_body);
+    char recomputed[65];
+    gr_sha256_hex(rows[0].body, recomputed);
+    ASSERT_EQ(strcmp(recomputed, rows[0].ahash), 0);
+    ASSERT_TRUE(strncmp(rows[0].id, "gateintent-", 11) == 0);
+    ASSERT_TRUE(strstr(rows[0].body, "\"schema\":\"gate_intent/1\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"device\":\"PVE-LAB\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"command\":\"show version\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"classified_tier\":\"GREEN\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"decision\":\"auto-execute\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"uid\":null") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"session\":null") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"proposal_id\":null") != NULL);
+    /* No device output existed yet, so none can be in here. */
+    ASSERT_TRUE(strstr(rows[0].body, "response") == NULL);
+
+    /* The execution record links back by the intent's entry hash. */
+    char link[128];
+    snprintf(link, sizeof(link), "\"intent_entry_hash\":\"%s\"", rows[0].ehash);
+    ASSERT_TRUE(rows[1].have_body);
+    ASSERT_TRUE(strstr(rows[1].body, link) != NULL);
+    ASSERT_TRUE(strstr(rows[1].body, "\"intent_sequence\":0") != NULL);
+    char linkid[128];
+    snprintf(linkid, sizeof(linkid), "\"intent_artifact_id\":\"%s\"", rows[0].id);
+    ASSERT_TRUE(strstr(rows[1].body, linkid) != NULL);
+    ASSERT_TRUE(strstr(rows[1].body, "\"executed\":true") != NULL);
+}
+
+/* 1.3 (non-FI half) — once the daemon has latched evidence-degraded (a
+ * prior outcome could not be chained), every further execution refuses at
+ * the intent step and nothing reaches the device. The latch itself is set
+ * here directly; the closer-append INJECTION that latches it in the wild
+ * is fault-injected and lives in tests/test_evidence_fi.c (built with
+ * -DVIRP_FAULT_INJECT), so the production daemon carries no such hook. */
+TEST(test_evidence_degraded_latch_refuses_further_dispatch)
+{
+    onode_state_t st;
+    ASSERT_OK(ev_setup(&st));
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    /* Clean execution first. */
+    (void)virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 1);
+
+    /* Latch degraded (as a closer-append failure would). */
+    pthread_mutex_lock(&st.state_mutex);
+    st.evidence_degraded = true;
+    pthread_mutex_unlock(&st.state_mutex);
+
+    (void)virp_driver_mock_exec_attempts_reset();
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+                            obs, sizeof(obs), &olen));
+    int ran = virp_driver_mock_exec_attempts_reset();
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+    virp_observation_t o;
+    const uint8_t *data; uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(obs + VIRP_HEADER_SIZE,
+                                     olen - VIRP_HEADER_SIZE, &o, &data,
+                                     &data_len));
+    char payload[400];
+    snprintf(payload, sizeof(payload), "%.*s", (int)data_len,
+             (const char *)data);
+    gx_teardown(&st);
+    gx_cleanup();
+
+    ASSERT_EQ(ran, 0);                       /* nothing dispatched */
+    ASSERT_EQ(o.obs_type, VIRP_OBS_ERROR);
+    ASSERT_TRUE(strstr(payload, "evidence-unavailable") != NULL);
+}
+
+/* Child-process body for the crash test: a fresh daemon state on the GX
+ * chain, evidence required, with the mock driver armed to SIGKILL the
+ * process INSIDE execute() — after the intent committed, before any
+ * outcome could. Reached via `test_onode --evidence-crash-child`. */
+static int ev_crash_child(void)
+{
+    virp_driver_mock_init();
+    onode_state_t st;
+    if (ev_setup(&st) != VIRP_OK) return 90;
+    virp_driver_mock_set_crash_in_execute(true);
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    (void)onode_execute(&st, "PVE-LAB", "show version",
+                        obs, sizeof(obs), &olen);
+    return 91;                          /* not reached: the mock killed us */
+}
+
+/* A daemon that dies between the pre-record and the outcome leaves an
+ * intent with no closer. The reopened chain must VERIFY — nothing about
+ * it is broken — and report exactly one OPEN execution. fork+exec so the
+ * crash happens in a single-threaded fresh process, not in this one. */
+TEST(test_evidence_crash_between_intent_and_outcome_is_open_execution)
+{
+    gx_cleanup();
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        /* Send the child's chatter to /dev/null; the assertions are on
+         * what it left on disk. */
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        execl("/proc/self/exe", "test_onode", "--evidence-crash-child",
+              (char *)NULL);
+        _exit(98);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFSIGNALED(status));
+    ASSERT_EQ(WTERMSIG(status), SIGKILL);
+
+    /* Reopen the crashed database the way the daemon would on restart
+     * (WAL recovery runs here), then verify the session against its
+     * signed head. */
+    virp_chain_state_t chain;
+    ASSERT_OK(virp_chain_init(&chain, GX_CHAIN_DB, GX_CHAIN_KEY,
+                              0xDEAD0008, "local"));
+    virp_chain_verify_result_t vr;
+    ASSERT_OK(virp_chain_verify_session(&chain, GX_SESSION, &vr));
+    virp_chain_destroy(&chain);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+    gx_cleanup();
+
+    ASSERT_TRUE(vr.valid);                       /* not a broken chain */
+    ASSERT_EQ((int)vr.first_broken, -1);
+    ASSERT_EQ((int)vr.entries_checked, 1);
+    ASSERT_EQ((int)vr.executions_open, 1);       /* an OPEN execution */
+    ASSERT_EQ((int)vr.executions_closed, 0);
+
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(strcmp(rows[0].type, "gate_intent"), 0);
+    ASSERT_TRUE(rows[0].have_body);
+    ASSERT_TRUE(strstr(rows[0].body, "\"command\":\"show version\"") != NULL);
 }
 
 /*
@@ -4534,10 +5066,14 @@ TEST(test_approval_mode_with_chain_starts)
 TEST(test_no_approvers_no_chain_still_starts)
 {
     /* Registry absent → approval mode disabled → chainless startup is
-     * still allowed (unchanged non-approval behavior). */
+     * still allowed (unchanged non-approval behavior) — for a node that
+     * has explicitly opted OUT of evidence-required execution. With the
+     * default (evidence required) a chainless start is refused; see
+     * test_evidence_required_without_chain_refuses_start. */
     onode_state_t tmp;
     ASSERT_OK(onode_init(&tmp, 0xDEAD0007, NULL,
                          "/tmp/virp-onode-apchain.sock"));
+    tmp.evidence_required = false;
 
     virp_error_t rc = onode_setup_chain_and_approvals(&tmp, 0xDEAD0007,
                                                       NULL, NULL,
@@ -4549,13 +5085,50 @@ TEST(test_no_approvers_no_chain_still_starts)
     onode_destroy(&tmp);
 }
 
+/* Evidence-required execution (Task 5) is the compiled-in default, and a
+ * daemon that cannot make a pre-execution record durable can never act.
+ * That is a misconfiguration to report at boot, by name, not one request
+ * at a time: both chainless shapes — no chain configured, chain init
+ * failed — must refuse to start unless the config opted out. */
+TEST(test_evidence_required_without_chain_refuses_start)
+{
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0017, NULL,
+                         "/tmp/virp-onode-apchain.sock"));
+    ASSERT_EQ((int)tmp.evidence_required, 1);       /* the default */
+
+    virp_error_t rc = onode_setup_chain_and_approvals(&tmp, 0xDEAD0017,
+                                                      NULL, NULL,
+                                                      AP_DIR, AP_MISSING);
+    ASSERT_EQ(rc, VIRP_ERR_EVIDENCE_UNAVAILABLE);
+    ASSERT_EQ((int)tmp.chain_enabled, 0);
+    onode_destroy(&tmp);
+}
+
+TEST(test_evidence_required_chain_failure_refuses_start)
+{
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0018, NULL,
+                         "/tmp/virp-onode-apchain.sock"));
+
+    virp_error_t rc = onode_setup_chain_and_approvals(&tmp, 0xDEAD0018,
+                                                      AP_CHAIN_DB, AP_MISSING,
+                                                      AP_DIR, AP_MISSING);
+    ASSERT_TRUE(rc != VIRP_OK);
+    ASSERT_EQ((int)tmp.chain_enabled, 0);
+    onode_destroy(&tmp);
+    ap_cleanup_files();
+}
+
 TEST(test_no_approvers_chain_failure_still_starts)
 {
     /* Chain init fails but approval mode is off: historical
-     * "continuing without chain" tolerance must be preserved. */
+     * "continuing without chain" tolerance must be preserved — again only
+     * for a node that opted out of evidence-required execution. */
     onode_state_t tmp;
     ASSERT_OK(onode_init(&tmp, 0xDEAD0008, NULL,
                          "/tmp/virp-onode-apchain.sock"));
+    tmp.evidence_required = false;
 
     virp_error_t rc = onode_setup_chain_and_approvals(&tmp, 0xDEAD0008,
                                                       AP_CHAIN_DB, AP_MISSING,
@@ -4596,6 +5169,7 @@ TEST(test_watchdog_health_check_serialized_with_execute)
                          "/tmp/virp-onode-wdrace.sock"));
     tmp.ctx = virp_context_new();
     ASSERT_TRUE(tmp.ctx != NULL);
+    tmp.evidence_required = false;       /* chainless fixture, see main() */
 
     virp_device_t dev;
     memset(&dev, 0, sizeof(dev));
@@ -7189,8 +7763,12 @@ TEST(test_onode_start_refuses_allowlisted_uid_without_action_map)
  * Main
  * ========================================================================= */
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* Re-executed self as the crash-test child (see ev_crash_child). */
+    if (argc >= 2 && strcmp(argv[1], "--evidence-crash-child") == 0)
+        return ev_crash_child();
+
     printf("\n");
     printf("================================================================\n");
     printf("  VIRP O-Node Integration Tests\n");
@@ -7207,6 +7785,11 @@ int main(void)
         fprintf(stderr, "Failed to init O-Node: %s\n", virp_error_str(err));
         return 1;
     }
+    /* No chain in this fixture, so evidence-required execution (the
+     * compiled-in default, Task 5) would refuse every dispatch as
+     * evidence-unavailable. Opt out explicitly: this fixture pins the
+     * record-after-the-fact posture. */
+    g_state.evidence_required = false;
 
     /* Allocate the protocol context owned by this test process. */
     g_state.ctx = virp_context_new();
@@ -7243,6 +7826,10 @@ int main(void)
 
     printf("\n[Autopilot hard exclusions (10.0.10.1 / 10.0.10.10)]\n");
     RUN_TEST(test_blocked_address_text_scan);
+    RUN_TEST(test_node_config_fatal_when_evidence_required);
+    RUN_TEST(test_node_config_best_effort_when_not_required);
+    RUN_TEST(test_load_devices_refuses_nonboolean_evidence_required);
+    RUN_TEST(test_load_devices_accepts_boolean_evidence_required);
     RUN_TEST(test_load_devices_refuses_blocked_address);
     RUN_TEST(test_load_devices_allows_neighbor_addresses);
 
@@ -7263,6 +7850,12 @@ int main(void)
     PENDING_TEST(test_refusal_with_body_is_not_recorded_executed,
                  "gate_execution/2 three-valued executed (EXECUTED / REFUSED / UNKNOWN): an undeclared !success result must resolve to UNKNOWN, never EXECUTED, and must not be signed as DEVICE_OUTPUT");
     RUN_TEST(test_green_execution_chains_signed_observation);
+    RUN_TEST(test_evidence_append_failure_refuses_and_executes_nothing);
+    RUN_TEST(test_evidence_not_required_runs_and_warns);
+    RUN_TEST(test_evidence_required_without_chain_refuses_dispatch);
+    RUN_TEST(test_evidence_normal_path_leaves_two_linked_entries);
+    RUN_TEST(test_evidence_crash_between_intent_and_outcome_is_open_execution);
+    RUN_TEST(test_evidence_degraded_latch_refuses_further_dispatch);
     RUN_TEST(test_execution_record_commits_to_digest_not_response_body);
     RUN_TEST(test_errored_execution_still_chains_no_gap);
     RUN_TEST(test_refused_action_still_chains_gate_rejection);
@@ -7300,6 +7893,8 @@ int main(void)
     RUN_TEST(test_approval_mode_with_chain_starts);
     RUN_TEST(test_no_approvers_no_chain_still_starts);
     RUN_TEST(test_no_approvers_chain_failure_still_starts);
+    RUN_TEST(test_evidence_required_without_chain_refuses_start);
+    RUN_TEST(test_evidence_required_chain_failure_refuses_start);
 
     printf("\n[O-Node Pipeline Tests]\n");
     RUN_TEST(test_execute_show_ip_route);

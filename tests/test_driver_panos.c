@@ -644,6 +644,9 @@ static void gate_black_one_mode(onode_gate_mode_t mode, const char *sock,
     assert(onode_init(&st, 0xDEAD0B1A, NULL, sock) == VIRP_OK);
     st.gate_default_mode = mode;
     st.gate_max_tier = VIRP_TIER_RED;      /* even the widest ceiling */
+    st.evidence_required = false;          /* chainless fixture: the gate
+                                              verdict is what is under test,
+                                              not the evidence refusal */
 
     virp_device_t dev;
     memset(&dev, 0, sizeof(dev));

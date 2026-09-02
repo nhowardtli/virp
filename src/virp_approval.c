@@ -886,12 +886,15 @@ static virp_error_t approval_record_load(const char *dir,
  * every call, so consumed state survives daemon restarts by
  * construction.
  */
-static virp_error_t consume_once(const char *dir, const char *proposal_id)
+/* The consume read-modify-write, WITHOUT taking consume_mu. The caller
+ * must already hold it. Split out (Sep 1 review, Phase 1 pre-merge item 1)
+ * so the daemon can hold consume_mu across the apply-time chain replay
+ * guard AND the consume, making the two atomic w.r.t. other consumers. */
+static virp_error_t consume_once_locked(const char *dir,
+                                        const char *proposal_id)
 {
     char path[VIRP_APPROVAL_DIR_MAX + 32];
     snprintf(path, sizeof(path), "%s/consumed.list", dir);
-
-    pthread_mutex_lock(&consume_mu);
 
     char existing[65536];
     existing[0] = '\0';
@@ -901,10 +904,8 @@ static virp_error_t consume_once(const char *dir, const char *proposal_id)
         fclose(f);
         existing[got] = '\0';
         /* An over-full store would silently truncate below — refuse. */
-        if (got == sizeof(existing) - 1) {
-            pthread_mutex_unlock(&consume_mu);
+        if (got == sizeof(existing) - 1)
             return VIRP_ERR_CHAIN_DB;
-        }
     }
 
     /* Already consumed? Exact line match. */
@@ -913,31 +914,40 @@ static virp_error_t consume_once(const char *dir, const char *proposal_id)
     while (*p) {
         const char *nl = strchr(p, '\n');
         size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
-        if (linelen == idlen && strncmp(p, proposal_id, idlen) == 0) {
-            pthread_mutex_unlock(&consume_mu);
+        if (linelen == idlen && strncmp(p, proposal_id, idlen) == 0)
             return VIRP_ERR_APPROVAL_REUSED;
-        }
         if (!nl) break;
         p = nl + 1;
     }
 
     char updated[65536 + 64];
     snprintf(updated, sizeof(updated), "%s%s\n", existing, proposal_id);
-    virp_error_t err = write_file_durable(path, 0600, updated);
-
-    pthread_mutex_unlock(&consume_mu);
-    return err;   /* persist failure → non-OK → caller rejects (fail closed) */
+    return write_file_durable(path, 0600, updated);
 }
 
-virp_error_t virp_approval_verify_consume(const char *dir,
-                                          const virp_approver_registry_t *reg,
-                                          const char *proposal_id,
-                                          const char *device,
-                                          uint32_t device_node_id,
-                                          const char *command,
-                                          const char *typed_profile,
-                                          uint64_t now_ns,
-                                          virp_approval_rec_t *out)
+/* consume_mu wrapper — the standalone consume used off the atomic path. */
+static virp_error_t consume_once(const char *dir, const char *proposal_id)
+{
+    pthread_mutex_lock(&consume_mu);
+    virp_error_t err = consume_once_locked(dir, proposal_id);
+    pthread_mutex_unlock(&consume_mu);
+    return err;
+}
+
+/* Expose consume_mu so the daemon can make the apply-time chain replay
+ * guard and the intent commit atomic against other consumers (item 1). */
+void virp_approval_consume_lock(void)   { pthread_mutex_lock(&consume_mu); }
+void virp_approval_consume_unlock(void) { pthread_mutex_unlock(&consume_mu); }
+
+virp_error_t virp_approval_verify(const char *dir,
+                                  const virp_approver_registry_t *reg,
+                                  const char *proposal_id,
+                                  const char *device,
+                                  uint32_t device_node_id,
+                                  const char *command,
+                                  const char *typed_profile,
+                                  uint64_t now_ns,
+                                  virp_approval_rec_t *out)
 {
     if (!dir || !reg || !device || !command || !out)
         return VIRP_ERR_NULL_PTR;
@@ -989,11 +999,53 @@ virp_error_t virp_approval_verify_consume(const char *dir,
         out->approved_at_ns > now_ns + 60ULL * 1000000000ULL)
         return VIRP_ERR_APPROVAL_EXPIRED;
 
-    /* 6. Single-use consume (durable; persist failure fails closed). */
+    return VIRP_OK;
+}
+
+virp_error_t virp_approval_commit_consume(const char *dir,
+                                          const char *proposal_id)
+{
+    if (!dir) return VIRP_ERR_NULL_PTR;
+    if (!proposal_id_valid(proposal_id))
+        return VIRP_ERR_APPROVAL_NOT_FOUND;
     VIRP_FI("pre_consume");
-    {
-        virp_error_t _c = consume_once(dir, proposal_id);
-        if (_c == VIRP_OK) VIRP_FI("post_consume");
-        return _c;
-    }
+    virp_error_t _c = consume_once(dir, proposal_id);
+    if (_c == VIRP_OK) VIRP_FI("post_consume");
+    return _c;
+}
+
+/* commit_consume assuming the caller already holds consume_lock (item 1). */
+virp_error_t virp_approval_commit_consume_locked(const char *dir,
+                                                 const char *proposal_id)
+{
+    if (!dir) return VIRP_ERR_NULL_PTR;
+    if (!proposal_id_valid(proposal_id))
+        return VIRP_ERR_APPROVAL_NOT_FOUND;
+    VIRP_FI("pre_consume");
+    virp_error_t _c = consume_once_locked(dir, proposal_id);
+    if (_c == VIRP_OK) VIRP_FI("post_consume");
+    return _c;
+}
+
+/*
+ * Backward-compatible verify-then-consume in one call (steps 1..6). The
+ * evidence-required apply path does NOT use this — it verifies, commits
+ * the intent, then consumes — but negative-path tests and any caller not
+ * on the evidence path still get the atomic form.
+ */
+virp_error_t virp_approval_verify_consume(const char *dir,
+                                          const virp_approver_registry_t *reg,
+                                          const char *proposal_id,
+                                          const char *device,
+                                          uint32_t device_node_id,
+                                          const char *command,
+                                          const char *typed_profile,
+                                          uint64_t now_ns,
+                                          virp_approval_rec_t *out)
+{
+    virp_error_t err = virp_approval_verify(dir, reg, proposal_id, device,
+                                            device_node_id, command,
+                                            typed_profile, now_ns, out);
+    if (err != VIRP_OK) return err;
+    return virp_approval_commit_consume(dir, proposal_id);
 }

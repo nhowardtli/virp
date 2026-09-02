@@ -142,6 +142,17 @@ class _PolicyChecks:
                                               "(loader → DENY-ALL): %s"
                                  % unknown)
 
+    def test_evidence_required_is_true_and_a_real_boolean(self):
+        # Sep 1 review, Task 5: the shipped templates opt IN to
+        # evidence-required execution explicitly — a literal JSON true,
+        # not a string — so a reader of the rendered config sees the
+        # posture stated rather than inferring it from a default. (The
+        # daemon's compiled-in default is also true; the key is here so
+        # an operator who needs to opt out edits a line that exists.)
+        self.assertIn("evidence_required", self.doc,
+                      "template ships no evidence_required key")
+        self.assertIs(self.doc["evidence_required"], True)
+
     def test_no_placeholder_survives_in_the_policy(self):
         for uid in self.policy:
             self.assertNotIn("${", uid)
