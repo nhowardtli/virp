@@ -1270,6 +1270,21 @@ int main(int argc, char **argv)
     const char *approvers_path = "/etc/virp/approvers.json";
     uint32_t node_id = 0x00000001;
 
+    /* --version / -V: print the build id and exit.
+     *
+     * Handled before getopt on purpose: it must need no config file, no
+     * keys, no socket and no chain. "What is this binary?" has to be
+     * answerable of an INSTALLED binary in isolation, which is exactly
+     * what the check-deploy-build-id drift rule asks it. Prints the bare
+     * id and nothing else so the comparison needs no parsing. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 ||
+            strcmp(argv[i], "-V") == 0) {
+            printf("%s\n", virp_build_id());
+            return 0;
+        }
+    }
+
     int opt;
     while ((opt = getopt(argc, argv, "k:K:W:s:d:n:c:C:S:a:A:h")) != -1) {
         switch (opt) {

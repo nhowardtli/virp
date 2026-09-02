@@ -19,9 +19,6 @@
 #include "virp_onode.h"
 #include "virp_fault_inject.h"
 
-#ifndef VIRP_BUILD_ID
-#define VIRP_BUILD_ID "unknown"
-#endif   /* lab-only; compiles away without -DVIRP_FAULT_INJECT */
 #include "virp_message.h"
 #include "virp_handshake.h"
 #include "virp_transcript.h"
@@ -1370,7 +1367,7 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
         char nid[16];
         snprintf(nid, sizeof(nid), "%08X", state->node_id);
         cJSON_AddStringToObject(o, "node_id", nid);
-        cJSON_AddStringToObject(o, "build_id", VIRP_BUILD_ID);
+        cJSON_AddStringToObject(o, "build_id", virp_build_id());
         cJSON_AddBoolToObject(o, "evidence_required",
                               state->evidence_required);
         cJSON_AddStringToObject(o, "gate_default_mode",
@@ -1415,7 +1412,7 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
     if (cerr == VIRP_OK)
         fprintf(stderr, "[O-Node] node_config recorded: build=%s "
                 "evidence_required=%s gate=%s/%s seq=%lld\n",
-                VIRP_BUILD_ID, state->evidence_required ? "true" : "false",
+                virp_build_id(), state->evidence_required ? "true" : "false",
                 state->gate_default_mode == GATE_MODE_ENFORCE ? "ENFORCE"
                                                               : "SHADOW",
                 gate_tier_name(state->gate_max_tier),

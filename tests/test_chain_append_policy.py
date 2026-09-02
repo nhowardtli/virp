@@ -46,7 +46,8 @@ def _subst_keys(obj):
 
 
 def load_template():
-    d = json.load(open(CANON))
+    with open(CANON) as f:
+        d = json.load(f)
     return {
         "allowed": [str(SUBST.get(u, u)) for u in d.get("socket_allowed_uids", [])],
         "action_allow": _subst_keys(d.get("socket_uid_action_allow", {})),
@@ -58,13 +59,16 @@ def load_fixture():
     """Only the chain_append rows are replayed against the type policy;
     the execute rows are carried in the fixture for the action-allowlist
     side and have no artifact_type."""
-    return [t for t in json.load(open(FIXTURE))["triples"]
+    with open(FIXTURE) as f:
+        triples = json.load(f)["triples"]
+    return [t for t in triples
             if t["action"] == "chain_append" and t["artifact_type"]]
 
 
 def load_fixture_execute():
-    return [t for t in json.load(open(FIXTURE))["triples"]
-            if t["action"] == "execute"]
+    with open(FIXTURE) as f:
+        triples = json.load(f)["triples"]
+    return [t for t in triples if t["action"] == "execute"]
 
 
 def v021_allows(tmpl, uid, atype):
@@ -142,7 +146,8 @@ class TestChainAppendPolicy(unittest.TestCase):
         its source and assert 1000's policy covers every one, so adding a
         new type to the tool cannot silently make it unappendable."""
         tool = os.path.join(ROOT, "src", "virp_tool.c")
-        src = open(tool).read()
+        with open(tool) as f:
+            src = f.read()
         # the tool builds requests as  \"artifact_type\":\"<type>\"
         emitted = set(re.findall(r'\\"artifact_type\\":\\"([a-z_]+)\\"', src))
         self.assertTrue(emitted, "found no artifact_type literals in virp_tool.c "

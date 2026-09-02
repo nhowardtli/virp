@@ -793,6 +793,14 @@ bool onode_uid_capp_type_allowed(const onode_state_t *state, uid_t uid,
                                  const char *artifact_type);
 /* True iff `uid`'s action set includes `action` (used by the boot
  * invariant to find uids that may chain_append). */
+/* The build id this binary was compiled from, as a generated translation
+ * unit (build/virp_build_id.c from scripts/gen-build-id.sh), NOT a macro.
+ * v0.2.0 reported build_id="unknown" because -DVIRP_BUILD_ID was placed on
+ * the prod compile line while the code that used it lived in libvirp.a,
+ * compiled without the define. A function every consumer links cannot go
+ * silently missing the way a per-TU macro can. */
+const char *virp_build_id(void);
+
 bool onode_uid_action_set_has(const onode_state_t *state, uid_t uid,
                               onode_action_t action);
 
