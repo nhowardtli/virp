@@ -289,3 +289,22 @@ for them in one place:
   stored where the index can reach it) turns the guard into an indexed
   lookup and shortens the lock hold. Deferred: it is a performance change
   to a hot path and wants its own measurement, not a fold-in.
+
+- **Chain power-loss durability.** The chain db runs SQLite WAL with
+  `synchronous=NORMAL` (`src/virp_chain.c`), which survives a process
+  crash but not power loss: an intent committed before `drv->execute` can
+  be lost by a power cut while the device has already acted. `synchronous=
+  FULL` (one fsync per append, negligible at this volume) closes that, but
+  the PRAGMA is chain-wide (it also governs the autopilot's writes) and the
+  power-loss / torn-write behaviour is exercised only by the manual
+  `tests/adversarial/fi-run.sh` suite, not by `all-tests`. Do it on its own
+  branch and re-run that suite; do not fold it into a feature change. Named
+  as a v0.2.0 release limitation.
+- **SHADOW would-block verdict.** Under SHADOW a would-block command
+  executes and its intent + gate_execution are recorded (with the
+  classified and effective tiers), but no verdict entry states that the
+  gate would have blocked it — only ENFORCE writes a `gate_rejection`. The
+  fix is a `gate_rejection/2` written under SHADOW too, carrying a
+  `gate_mode` field (SHADOW/ENFORCE) and a `would_block` boolean, so the
+  gate's judgment is an explicit record rather than something a reader must
+  infer from the tiers. Relates to gap 2 in section 5.
