@@ -126,6 +126,18 @@ jobs:
           name: release-bundle-${{ github.sha }}
           path: dist/
           retention-days: 90
+      - name: Refuse to publish unless the tag can BE the Release body
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # The publish step below uses --notes-from-tag, so the Release
+          # body is whatever the tag carries. A LIGHTWEIGHT tag resolves to
+          # a commit, and asking git for its message returns the COMMIT
+          # message -- so publishing one would not produce an empty body,
+          # it would produce a release whose body is the last commit
+          # subject, with the known-limitations section silently missing.
+          # The selftest proves the checker can actually fail.
+          scripts/check-release-tag.sh --selftest
+          scripts/check-release-tag.sh "$TAG"
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         env:
