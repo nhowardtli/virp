@@ -131,18 +131,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The Release body IS the annotated tag's message (which carries
+          # the feature summary, the known limitations, and the verify
+          # commands). --notes-from-tag, never auto-generated notes.
           gh release create "$TAG" dist/* \
             --verify-tag \
             --title "VIRP $TAG" \
-            --notes "Commit: \`$GITHUB_SHA\`
-
-          Every asset here is bound by \`virp-$TAG.MANIFEST.sha256\`: sha256
-          of the ZIP, of every file inside it, and of the full-suite test
-          attestation that ran against exactly this commit. Verify with:
-
-              scripts/verify-release-bundle.sh \\
-                --bundle virp-$TAG.zip \\
-                --manifest virp-$TAG.MANIFEST.sha256 \\
-                --attestation virp-$TAG.test-attestation.json
-
-          See docs/RELEASE-PROVENANCE.md for signature and Sigstore checks."
+            --notes-from-tag
