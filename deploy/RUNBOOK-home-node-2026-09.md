@@ -191,6 +191,55 @@ policy are already complete.
 
 ---
 
+## Read this before touching any other node
+
+Two traps this deploy walked into. Both are silent — nothing logs a
+warning, and in one case the daemon simply never starts.
+
+### 1. Check the daemon version before adding a uid action map
+
+On a **pre-v0.2.1** daemon, any uid that appears in
+`socket_uid_action_allow` is inferred to be a restricted federated
+principal and its `chain_append` is narrowed to `fed_request` /
+`fed_observation` / `fed_outcome` **and nothing else**. `observation` and
+`evidence_item` are refused with `err=-50`.
+
+So on such a node, **adding an action map silently kills that uid's
+ability to append anything**. Giving uid 999 a map to take away its
+`shutdown` also takes away the autopilot's and the reporter's writes, and
+the only sign is a refusal at submit time. v0.2.1 replaced the inference
+with the explicit `socket_uid_chain_append_types` policy, so on v0.2.1+
+the two are separable — but only there.
+
+Check first:
+
+    strings /usr/local/lib/virp/virp-onode-prod       | grep -c socket_uid_chain_append_types      # 0 = pre-v0.2.1
+
+**This applies to virp-lab too.** Confirm its binary before changing its
+action maps.
+
+Related, same era: `ONODE_MAX_UID_ACTIONS` is **8** before `13ec426` and
+**32** after. A longer list overflows and `virp_onode_prod.c` fails closed
+by installing DENY-ALL for that uid. The cap raise and the boot invariant
+landed in the same commit, so config and binary are coupled.
+
+### 2. `install-prod` overwrites `render-devices.sh`
+
+It is in `VIRP_INSTALL_SCRIPTS`. Installing from **any ref that predates
+this merge** reverts both the home node's four credential names and the
+`[A-Z0-9_]+` placeholder fix. The next render then fails and **the daemon
+does not start**. Observed 2026-09-03: `47abe98f…` replaced by
+`4990ede6…`.
+
+Anyone installing on virp-onode-home from an older ref must re-install
+that script and re-render before restarting:
+
+    install -m 0755 deploy/render-devices.sh         /usr/local/lib/virp/render-devices.sh
+    VIRP_RENDER_OUT=/tmp/probe.json /usr/local/lib/virp/render-devices.sh
+    rm -f /tmp/probe.json
+
+---
+
 ## Not in this runbook
 
 - **Producer key `008353cf`**, whose private half is on two machines.
@@ -202,5 +251,9 @@ policy are already complete.
   node that stores them. Copying its `producer.pub` across closes it.
 - **The stale ssh aliases.** `ct211` and `ironclaw-onode` still resolve
   to the decommissioned 10.0.0.211.
+- **`install-prod`'s dirty-tree guard**, which is a no-op on a
+  user-owned tree. Deliberately left unfixed and tracked as TODO.md
+  section 3 — it is a fail-open guard and deserves a test, not a patch
+  at the end of a deploy.
 - **Five failed timers on virp-lab** — autopilot, comparator, corpus,
   config-backup, evidence. Unrelated to this work and unaddressed.

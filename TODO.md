@@ -110,3 +110,47 @@ Separately, `tests/test_approval.c`'s
 suite is run under `sudo` — the way the install procedure implies — and
 PASSES as a normal user. Either bound the test to non-root or induce the
 write failure by a means root cannot bypass.
+
+## 3. `install-prod`'s dirty-tree guard is a no-op on a user-owned tree (2026-09-03)
+
+**Deliberately NOT fixed in the deployed-state merge.** It is the same
+fail-open shape as any guard that reads empty output as a safe state, and
+it deserves a test rather than a patch written at the end of a deploy.
+Its own branch.
+
+`install-prod` refuses to install from a dirty tree:
+
+    @st=$$(git status --porcelain 2>/dev/null); \
+     if [ -n "$$st" ]; then ... exit 1; fi
+
+On virp-lab the deploy tree is `/opt/virp`, root-owned, and `sudo make
+install-prod` runs git as its owner, so the guard works. On
+virp-onode-home the tree is `/home/nhoward/virp`, owned by a normal user.
+Under `sudo`, git refuses the repository for dubious ownership, writes
+its complaint to **stderr**, and exits non-zero with **empty stdout**.
+`2>/dev/null` discards the complaint, `$$st` is empty, and the guard
+concludes the tree is clean.
+
+So on any node whose deploy tree is not owned by the installing user, the
+check that exists to guarantee "what gets deployed is exactly what a
+commit hash names" passes unconditionally — including when the tree is
+genuinely dirty. It reads as a strong check and is a no-op precisely
+where a non-`/opt` layout puts it.
+
+Worked around during the 2026-09-03 home-node upgrade with
+
+    sudo git config --global --add safe.directory /home/nhoward/virp
+
+which makes the guard real again on that node, and is a per-host
+mitigation, not the fix.
+
+**To close.** The guard must distinguish "git said nothing because the
+tree is clean" from "git said nothing because it failed". Capture the
+exit status, not only the output; a non-zero git is a hard failure, not
+a clean tree. The same pattern appears anywhere else `$(git ... 2>/dev/null)`
+is tested for emptiness — audit for it rather than fixing this one site.
+And it needs a **test**: a fixture with a deliberately dirty tree owned
+by another uid, asserting install-prod refuses. A guard that has never
+been observed to fail is indistinguishable from one that cannot, which is
+the argument this repo already makes for every other checker's
+`--selftest`.
