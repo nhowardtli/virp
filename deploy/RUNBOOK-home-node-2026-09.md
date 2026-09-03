@@ -77,6 +77,22 @@ running it:
 4. **Moves the device config to tmpfs.** `/etc/virp/devices.json` stops
    being read. Leave the file in place until step 3 confirms.
 
+**PREREQUISITE, or every device fails.** `ProtectHome=yes` hides `/home`
+from the service. If the `virp` account's home is under `/home`, the SSH
+driver cannot read `~/.virp/known_hosts` and every ssh device fails host
+key verification — observed on this node, connected 2/38 -> 0/38. Do
+this BEFORE the restart (both services run as `virp`, so both must stop
+for `usermod`):
+
+    systemctl stop virp-onode virp-witness-tunnel
+    cp -a /home/virp/.virp /home/virp/.ssh /var/lib/virp/
+    chmod 0700 /var/lib/virp/.virp
+    chmod 0600 /var/lib/virp/.virp/known_hosts*      # they were 0664
+    usermod -d /var/lib/virp virp
+    systemctl start virp-onode virp-witness-tunnel
+
+Done on virp-onode-home 2026-09-03. virp-lab already had it.
+
 Verify:
 
     systemctl is-active virp-onode
