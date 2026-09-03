@@ -37,7 +37,16 @@ SUBST = {
     "${VIRP_NETCLAW_UID}": "993",
     "${VIRP_BROKER_UID}": "994",
 }
+# The types the v0.2.0 CODE PATH narrowed a mapped uid to. Historical and
+# fixed: it models what that binary did, so it must not drift with policy.
 FED_TYPES = {"fed_request", "fed_observation", "fed_outcome"}
+
+# What 993's policy row grants TODAY. "fed_error" (2026-09-03) is the body
+# an outcome cites when the exchange died before an observation existed —
+# the type that lets a request/outcome pair close on an error path instead
+# of being left open. It has no v0.2.0 equivalent, which is exactly why
+# these two sets are separate constants.
+NETCLAW_POLICY_TYPES = FED_TYPES | {"fed_error"}
 
 
 def _subst_keys(obj):
@@ -167,8 +176,13 @@ class TestChainAppendPolicy(unittest.TestCase):
 
     def test_netclaw_fed_narrowing_is_now_a_policy_row(self):
         """993's fed_* reach — the whole point of the old code path — is now
-        exactly one row of the type policy."""
-        self.assertEqual(set(self.tmpl["capp"]["993"]), FED_TYPES)
+        exactly one row of the type policy, and the row is where it grows:
+        fed_error was added by editing this row, not by editing a code
+        path, which is the difference v0.2.1 was for."""
+        self.assertEqual(set(self.tmpl["capp"]["993"]), NETCLAW_POLICY_TYPES)
+        self.assertTrue(FED_TYPES < NETCLAW_POLICY_TYPES,
+                        "the policy row must still admit everything the "
+                        "old code path did")
 
 
 if __name__ == "__main__":

@@ -435,6 +435,51 @@ virp_error_t virp_chain_entry_commits_to(virp_chain_state_t *state,
 }
 
 /*
+ * The same question as virp_chain_entry_commits_to(), asked about the
+ * OTHER thing a fed_outcome may be backed by: a 'fed_error' entry.
+ *
+ * A separate function rather than a type argument on the sibling, on
+ * purpose. These two are not interchangeable and must never become so by
+ * a caller passing the wrong string: one asks "is this backed by signed
+ * evidence", the other "is this backed by the bridge's own account of a
+ * failure". GATE 4 picks between them from the citation FIELD NAME in
+ * the body, so which question gets asked is decided by what the outcome
+ * claims, not by anything the caller of this function chooses.
+ *
+ * Restricted to 'fed_error' for the same reason the sibling is
+ * restricted to observation types: an outcome must not be "backed" by an
+ * unrelated entry that happens to share a hash.
+ * Returns VIRP_OK on a successful query (whether or not it matched).
+ */
+virp_error_t virp_chain_error_entry_commits_to(virp_chain_state_t *state,
+                                               const char *artifact_hash,
+                                               bool *exists)
+{
+    if (!state || !artifact_hash || !exists) return VIRP_ERR_NULL_PTR;
+    *exists = false;
+
+    pthread_mutex_lock(&state->lock);
+    sqlite3_stmt *st = NULL;
+    virp_error_t rc = VIRP_OK;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT 1 FROM chain_entries WHERE artifact_hash = ? "
+            "AND artifact_type = 'fed_error' LIMIT 1",
+            -1, &st, NULL) != SQLITE_OK) {
+        rc = VIRP_ERR_CHAIN_DB;
+    } else {
+        sqlite3_bind_text(st, 1, artifact_hash, -1, SQLITE_TRANSIENT);
+        int step = sqlite3_step(st);
+        if (step == SQLITE_ROW)
+            *exists = true;
+        else if (step != SQLITE_DONE)
+            rc = VIRP_ERR_CHAIN_DB;
+    }
+    if (st) sqlite3_finalize(st);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+/*
  * Apply-time replay guard (Sep 1 review, Task 5 / 1.1). Count committed
  * gate_intent entries whose body cites this approval entry hash. The
  * daemon calls this BEFORE appending a new intent for an approved apply:
@@ -628,6 +673,27 @@ bool virp_chain_type_is_external_allowed(const char *artifact_type)
         "fed_request",     /* broker/virp_bridge_mcp.py (request provenance) */
         "fed_observation", /* broker/virp_bridge_mcp.py (the signed body)    */
         "fed_outcome",     /* broker/virp_bridge_mcp.py (outcome record)     */
+        /*
+         * "fed_error" — why an exchange terminated with no observation.
+         * A COMMITMENT like fed_request, deliberately NOT an observation
+         * type: it carries no signature and claims none, so it is not
+         * held to GATE 3 and can never be mistaken for signed evidence.
+         *
+         * It exists because GATE 4 (correctly) refuses a fed_outcome that
+         * cites nothing, which left the bridge structurally unable to
+         * close a pair that died before an observation existed — a
+         * device-not-found, a typed error, a socket that vanished. The
+         * fed_request landed and no outcome ever could, and a verifier
+         * reading that could not tell an honest refusal from a bridge
+         * that died mid-call. Both are open pairs; only one is a fault.
+         *
+         * An outcome backed by one of these cites it as `error_sha256`
+         * and may NOT claim execution (GATE 4). So the worst it can say
+         * is "this did not happen, and here is why" — which is a claim
+         * the bridge is entitled to make about its own failure, and the
+         * only claim it can make without a key.
+         */
+        "fed_error",       /* broker/virp_bridge_mcp.py (why it ended)      */
     };
     if (virp_chain_type_is_indirect(artifact_type)) return true;
     return type_in(artifact_type, EXTERNAL,
@@ -637,7 +703,7 @@ bool virp_chain_type_is_external_allowed(const char *artifact_type)
 bool virp_chain_type_is_federation(const char *artifact_type)
 {
     static const char *const FEDERATION[] = {
-        "fed_request", "fed_observation", "fed_outcome",
+        "fed_request", "fed_observation", "fed_outcome", "fed_error",
     };
     return type_in(artifact_type, FEDERATION,
                    sizeof(FEDERATION) / sizeof(FEDERATION[0]));

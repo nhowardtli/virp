@@ -26,6 +26,14 @@ This test is that check. It is a data-integrity assertion over the live
 chain, not a unit test of a function: it self-skips when no chain database
 is present, so it is safe on a build host.
 
+TWO CITATIONS (2026-09-03). An outcome is backed by an observation
+(`observation_sha256`) or, when the exchange died before an observation
+existed, by a `fed_error` body (`error_sha256`) that says why. The
+question this file asks is unchanged and now asked of both: does the
+cited body resolve, and does it resolve to the RIGHT TYPE. The extra
+rule for the error-backed form is that it may never claim execution —
+"it ran" is a claim only signed evidence can carry.
+
     VIRP_CHAIN_DB   path to chain.db (default /var/lib/virp/chain.db)
     VIRP_FED_SINCE  only audit outcomes completed on/after this ISO date
                     (default: audit everything in the chain)
@@ -47,6 +55,31 @@ DEFAULT_DB = "/var/lib/virp/chain.db"
 # from the ncfed bridge cites one by design (tests/test_onode.c appends the
 # cited body as 'fed_observation' under artifact_id ncfed-obs-*).
 OBSERVATION_TYPES = frozenset(("observation", "fed_observation"))
+
+# The type an `error_sha256` citation must resolve to. Deliberately its own
+# set: a fed_error carries no signature and claims none, so it may back an
+# outcome that says a command did NOT run and nothing else. Mirrors
+# src/virp_chain.c (artifact_type = 'fed_error') and the daemon's GATE 4.
+ERROR_TYPES = frozenset(("fed_error",))
+
+# artifact_hash field name -> the types it may resolve to.
+CITATIONS = {"observation_sha256": OBSERVATION_TYPES,
+             "error_sha256": ERROR_TYPES}
+
+
+def citation_of(body):
+    """(field, hash) for the ONE citation this outcome carries.
+
+    (None, None) when there is no usable citation — absent, malformed, or
+    BOTH present, which is not extra evidence but an outcome that cannot
+    be graded. The daemon refuses all three at GATE 4; this audit reads
+    the same rule off the stored bodies."""
+    found = []
+    for field in CITATIONS:
+        h = body.get(field)
+        if isinstance(h, str) and len(h) == 64:
+            found.append((field, h))
+    return found[0] if len(found) == 1 else (None, None)
 
 
 def chain_db_path():
@@ -112,11 +145,16 @@ def load_committed_observation_hashes(conn):
     is not retrievable (the reader grades that entry UNVERIFIABLE, not PASS).
     This mirrors the daemon's fed_outcome gate (virp_chain_entry_commits_to).
     """
-    placeholders = ",".join("?" * len(OBSERVATION_TYPES))
+    return load_committed_hashes(conn, OBSERVATION_TYPES)
+
+
+def load_committed_hashes(conn, types):
+    """Every artifact_hash a chain ENTRY of one of `types` commits to."""
+    placeholders = ",".join("?" * len(types))
     return {h for (h,) in conn.execute(
         "SELECT artifact_hash FROM chain_entries "
         "WHERE artifact_type IN (%s)" % placeholders,
-        tuple(sorted(OBSERVATION_TYPES)))}
+        tuple(sorted(types)))}
 
 
 class TestFedOutcomeObservationResolves(unittest.TestCase):
@@ -130,7 +168,11 @@ class TestFedOutcomeObservationResolves(unittest.TestCase):
         cls.since = os.environ.get("VIRP_FED_SINCE") or None
         cls.outcomes = load_fed_outcomes(cls.conn, cls.since)
         cls.hashes = load_artifact_hashes(cls.conn)
-        cls.committed = load_committed_observation_hashes(cls.conn)
+        cls.committed = {
+            "observation_sha256": load_committed_hashes(cls.conn,
+                                                        OBSERVATION_TYPES),
+            "error_sha256": load_committed_hashes(cls.conn, ERROR_TYPES),
+        }
         cls.hash_types = load_hash_types(cls.conn)
 
     @classmethod
@@ -143,51 +185,62 @@ class TestFedOutcomeObservationResolves(unittest.TestCase):
         bad = [rowid for rowid, body in self.outcomes if body is None]
         self.assertEqual(bad, [], "fed_outcome rows whose body is not JSON: %r" % bad)
 
-    def test_every_outcome_cites_an_observation(self):
-        """The pointer field must be present and well-formed."""
+    def test_every_outcome_carries_exactly_one_citation(self):
+        """The pointer field must be present, well-formed, and singular.
+
+        Both citations at once is refused as hard as neither: an outcome
+        that names signed evidence AND an account of why there is none
+        cannot be graded, and a reader would have to guess which half to
+        believe."""
         missing = []
         for rowid, body in self.outcomes:
             if body is None:
                 continue
-            h = body.get("observation_sha256")
-            if not isinstance(h, str) or len(h) != 64:
-                missing.append((rowid, body.get("completed_at"), h))
+            field, _ = citation_of(body)
+            if field is None:
+                missing.append((rowid, body.get("completed_at"),
+                                {f: body.get(f) for f in CITATIONS
+                                 if f in body}))
         self.assertEqual(
             missing, [],
-            "fed_outcome rows with no usable observation_sha256:\n" +
-            "\n".join("  id=%s completed=%s value=%r" % m for m in missing))
+            "fed_outcome rows with no single usable citation "
+            "(observation_sha256 or error_sha256):\n" +
+            "\n".join("  id=%s completed=%s fields=%r" % m for m in missing))
 
-    def test_every_cited_observation_resolves(self):
-        """THE assertion: the cited observation must be BACKED by the chain —
-        either its body is retrievable from artifacts, OR an observation
-        entry commits to the hash (an oversized, commitment-only
-        observation, whose body was legitimately not retained). Only a hash
-        that NEITHER stores a body NOR is committed by any observation entry
-        is a dangling pointer — evidence the chain cannot produce."""
+    def test_every_cited_body_resolves(self):
+        """THE assertion: the cited body must be BACKED by the chain —
+        either its bytes are retrievable from artifacts, OR an entry of
+        the citing field's type commits to the hash (an oversized,
+        commitment-only observation, whose body was legitimately not
+        retained). Only a hash that NEITHER stores a body NOR is
+        committed by such an entry is a dangling pointer — evidence the
+        chain cannot produce."""
         dangling = []
         for rowid, body in self.outcomes:
             if body is None:
                 continue
-            h = body.get("observation_sha256")
-            if not isinstance(h, str) or len(h) != 64:
+            field, h = citation_of(body)
+            if field is None:
                 continue          # covered by the previous test
-            if h not in self.hashes and h not in self.committed:
+            if h not in self.hashes and h not in self.committed[field]:
                 dangling.append((
                     body.get("completed_at"), body.get("device"),
-                    body.get("command"), h))
+                    body.get("command"), field, h))
 
         if dangling:
-            lines = ["%d of %d fed_outcome artifacts cite an observation "
-                     "that is NEITHER stored as a body NOR committed by an "
-                     "observation entry." %
+            lines = ["%d of %d fed_outcome artifacts cite a body that is "
+                     "NEITHER stored NOR committed by an entry of the type "
+                     "the citation requires." %
                      (len(dangling), len(self.outcomes)),
                      "The chain claims evidence it cannot produce.",
                      "First 10:"]
-            for completed, device, command, h in dangling[:10]:
-                lines.append("  %s  %-24s %-40s %s"
-                             % (completed, device, str(command)[:40], h))
+            for completed, device, command, field, h in dangling[:10]:
+                lines.append("  %s  %-24s %-40s %s=%s"
+                             % (completed, device, str(command)[:40],
+                                field, h))
             lines.append("Check the daemon log for POLICY REFUSAL on "
-                         "chain_append artifact_type 'observation'.")
+                         "chain_append artifact_type 'observation' / "
+                         "'fed_observation' / 'fed_error'.")
             lines.append("")
             lines.append(
                 "NOTE ON HISTORY: entries written before the 2026-08-16 fix "
@@ -199,26 +252,55 @@ class TestFedOutcomeObservationResolves(unittest.TestCase):
                 "history including the damage.")
             self.fail("\n".join(lines))
 
-    def test_cited_hash_names_an_observation(self):
-        """A resolving pointer must resolve to an observation type
-        (observation or fed_observation), not to some other artifact that
-        happens to share the hash. fed_observation counts: it is the
-        federation bridge's signed observation and the designed citation
-        target — see OBSERVATION_TYPES."""
+    def test_cited_hash_names_the_right_type(self):
+        """A resolving pointer must resolve to the type its FIELD NAME
+        promises, not to some other artifact that happens to share the
+        hash. `observation_sha256` must name an observation type;
+        `error_sha256` must name a fed_error. Swapping them would let an
+        unsigned body stand in for signed evidence, which is the whole
+        thing GATE 3 and GATE 4 exist to prevent."""
         wrong = []
         for rowid, body in self.outcomes:
             if body is None:
                 continue
-            h = body.get("observation_sha256")
-            if not isinstance(h, str) or h not in self.hash_types:
+            field, h = citation_of(body)
+            if field is None or h not in self.hash_types:
                 continue          # absent is the previous test's failure
-            if not (OBSERVATION_TYPES & self.hash_types[h]):
-                wrong.append((body.get("completed_at"), h,
+            if not (CITATIONS[field] & self.hash_types[h]):
+                wrong.append((body.get("completed_at"), field, h,
                               sorted(self.hash_types[h])))
         self.assertEqual(
             wrong, [],
-            "observation_sha256 resolves to a non-observation artifact:\n" +
-            "\n".join("  %s %s -> %r" % w for w in wrong))
+            "a citation resolves to the wrong artifact type:\n" +
+            "\n".join("  %s %s=%s -> %r" % w for w in wrong))
+
+    def test_error_backed_outcomes_never_claim_execution(self):
+        """An outcome backed only by a fed_error may report that a command
+        did NOT run and why. It may not report that one did.
+
+        The bridge holds no key and can never produce signed evidence.
+        Without this rule it could write executed:true into the chain
+        backed by nothing but its own account of a failure, and a reader
+        joining outcomes to observations would see a completed command
+        with no observation — indistinguishable from a retention gap.
+        The daemon refuses this at GATE 4; this is the same rule read
+        back off the live chain."""
+        claiming = []
+        for rowid, body in self.outcomes:
+            if body is None:
+                continue
+            field, h = citation_of(body)
+            if field != "error_sha256":
+                continue
+            if body.get("executed") or body.get("outcome") == "executed":
+                claiming.append((body.get("completed_at"),
+                                 body.get("device"), body.get("command"),
+                                 body.get("outcome"), body.get("executed")))
+        self.assertEqual(
+            claiming, [],
+            "error-backed fed_outcome claims a command executed:\n" +
+            "\n".join("  %s %s %r outcome=%r executed=%r" % c
+                       for c in claiming))
 
 
 def main():
