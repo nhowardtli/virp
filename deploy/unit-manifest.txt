@@ -62,6 +62,40 @@ broker/virp-broker.service /etc/systemd/system/virp-broker.service
 deploy/virp-netclaw-egress.service /etc/systemd/system/virp-netclaw-egress.service
 deploy/nftables-virp-netclaw-egress.nft /etc/nftables-virp-netclaw-egress.nft
 
+# ── virp-onode-home (10.0.0.13), tracked 2026-09-03 ───────────────────
+# The home node runs the SAME base unit as the colo node — deploy/
+# virp-onode.service above — and expresses its three differences in a
+# drop-in, per this file's own policy. There is no second tracked unit
+# for the same installed path, so nothing here is ambiguous about which
+# source a host is compared against.
+#
+# The device TEMPLATES are deliberately absent from this manifest, both
+# of them. deploy/devices.template.json and
+# deploy/devices.home.template.json install to the same path,
+# /etc/virp/devices.template.json, on their respective nodes — the exact
+# one-tracked-file-per-installed-path collision the drop-in above
+# avoids, and one a drop-in cannot solve because a device template is
+# data, not a unit with an override mechanism.
+#
+# Listing either one alone would make this file assert that every node
+# runs that node's fleet, which is false and would report the other node
+# as drifted forever. Templates are compared instead by
+# tools/state/drift-check.sh, which reads the node's OWN state document
+# and therefore knows which template that node was rendered from. That
+# is the right place for a per-node comparison; this file is for
+# comparisons that are the same everywhere.
+deploy/virp-onode-home.dropin.conf /etc/systemd/system/virp-onode.service.d/40-home.conf
+
+# ── deployed-state reporter ───────────────────────────────────────────
+# Tracked 2026-09-02, installed nowhere yet. Listed from the start
+# rather than when it is first deployed, because "the unit exists only
+# on the host" is precisely the condition that hid the netclaw egress
+# ruleset above, and a manifest that only learns about a unit after
+# someone remembers to add it is the same check that passed green for
+# eight days.
+deploy/virp-deployed-state.service /etc/systemd/system/virp-deployed-state.service
+deploy/virp-deployed-state.timer /etc/systemd/system/virp-deployed-state.timer
+
 # ── optional integrations ─────────────────────────────────────────────
 # Not installed on virp-lab. Listed so that a node which DOES install it
 # gets the same comparison as everything else — an optional component is

@@ -1,0 +1,23 @@
+# Daily. Deployed state changes when someone deploys, and a deploy is a
+# deliberate act with a human behind it — a tighter cadence would add
+# chain volume without adding an answer anyone is waiting on.
+#
+# Persistent=true so a node that was down at the trigger reports on its
+# next boot rather than silently skipping a day. A gap in this series is
+# itself evidence, and it should mean "the node was down", not "the
+# timer shrugged".
+#
+# NOT INSTALLED ON ANY NODE as of 2026-09-02.
+
+[Unit]
+Description=Daily VIRP deployed-state report
+Documentation=file:/opt/virp/tools/state/README.md
+
+[Timer]
+OnCalendar=daily
+# Spread across the hour so several nodes do not all append at once.
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

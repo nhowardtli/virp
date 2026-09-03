@@ -48,7 +48,18 @@ template_path, out_path = sys.argv[1], sys.argv[2]
 with open(template_path) as f:
     data = json.load(f)   # template must be valid JSON before substitution
 
-PLACEHOLDER_RE = re.compile(r"\$\{([A-Z_]+)\}")
+# [A-Z0-9_], not [A-Z_]. A digit in a placeholder name used to make it
+# INVISIBLE TO BOTH HALVES of this script: ${VIRP_GNS3_PASSWORD} was
+# neither substituted nor reported as leftover, so it would have been
+# written into the rendered config verbatim and the daemon would have
+# authenticated to 35 routers with the literal string
+# "${VIRP_GNS3_PASSWORD}". Found 2026-09-03 while tracking the home
+# node's fleet, by rendering a new template and watching one credential
+# silently pass through. The FATAL-on-leftover guarantee below is only
+# as wide as this pattern, and a name the pattern cannot see is a name
+# it cannot fail on. Neither existing template used a digit, so
+# widening it changes nothing for virp-lab or node2.
+PLACEHOLDER_RE = re.compile(r"\$\{([A-Z0-9_]+)\}")
 
 # Keys beginning with "_" (_comment, _ironclaw_fleet_note, ...) are
 # annotations for humans, and their values are NEVER rendered: a
@@ -181,7 +192,21 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             # (panos) must name only ${LAB_PASSWORD} — naming ${LAB_ENABLE}
             # on such a row loads a secret into the daemon's address space
             # that no driver will ever read.
-            "LAB_PASSWORD", "LAB_ENABLE"):
+            "LAB_PASSWORD", "LAB_ENABLE",
+            # virp-onode-home (10.0.0.13), added 2026-09-03 when that
+            # node's fleet was first tracked. Four values, confirmed by
+            # hashing every credential in its live config and its eleven
+            # backups: no fifth exists. VIRP_LABNET_PASSWORD is the
+            # aiops-svc login shared by ALL 35 GNS3 routers — one name
+            # rather than 35 for the same reason LAB_PASSWORD is one name
+            # for the colo fleet, and the sharing is a property of the lab
+            # that the single placeholder makes visible rather than hides.
+            # The home fleet needs no enable secret: its routers are
+            # reached for show-reads only and the template names no
+            # equivalent of LAB_ENABLE, so no enable secret is loaded into
+            # the daemon's address space.
+            "VIRP_PVE_PASSWORD", "VIRP_LABNET_PASSWORD",
+            "VIRP_WAZUH_HOME_PASSWORD", "VIRP_FORTIGATE_HOME_PASSWORD"):
     if var not in used:
         continue
     val = os.environ.get(var)

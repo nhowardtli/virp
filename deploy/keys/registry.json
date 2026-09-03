@@ -1,0 +1,288 @@
+{
+  "_schema": "virp-key-registry/1",
+  "_what_this_is": "Every asymmetric key this system trusts, or has trusted, with its key_id RE-DERIVED FROM ITS OWN PUBLIC KEY BYTES and never taken from a label. It exists because two distinct Ed25519 keys both carried the comment 'claude-code@ct211', from a build host that no longer exists, and telling them apart took a fingerprint comparison against a backup file. A label is a claim; a key_id is a fact about the bytes. Both are recorded here, and where they disagree the bytes win.",
+  "_key_id_derivation": "key_id = SHA-256(raw public key)[0:16], lowercase hex ('sha256-raw-16'). Identical to virp_fed_compute_key_id() in src/virp_federation.c, to include/virp_chainsign.h, and to the scheme the Docket verifier and the witness submitter registry already use. public_key_hex is the RAW 32-byte Ed25519 public key \u2014 the exact bytes the hash is taken over \u2014 so scripts/check-key-registry.sh can re-derive every id in this file from this file alone. Where a key is normally seen in another encoding (approvers.json uses base64 DER SPKI, SSH uses the ssh-ed25519 wire blob, minisign uses its own 2+8+32 blob), the raw bytes here are the last 32 bytes of that structure and the entry says so.",
+  "_append_only": "ENTRIES ARE NEVER REMOVED AND NEVER REWRITTEN. A receipt, an approval or a chain head signed under a key must stay verifiable after that key is retired, and a verifier that cannot find the key it needs reports UNVERIFIABLE rather than 'not signed by anyone'. Retiring a key is a status change and a note, not a deletion. A key whose host is decommissioned keeps its entry with the real status, because 'this key was trusted on a machine that no longer exists' is exactly the fact that was expensive to reconstruct the last time. Correcting a mistake means adding a note, not editing history: the only field that legitimately changes after an entry is written is `status`, plus an appended note explaining the change.",
+  "_roles": {
+    "chain-signing": "Ed25519 signature over a chain head. The chain head's head_sig_key_id names this key.",
+    "witness-submitter": "the identity a node presents when submitting heads to the witness. On the home node this is the SAME key as its chain-signing key, by design \u2014 the witness leaf's key_id then matches the head's head_sig_key_id and a reader can bind them without a second registry lookup.",
+    "witness": "the witness log's own key, signing STHs.",
+    "approver": "an operator identity in a node's approvers.json, authorising gate-blocked proposals.",
+    "seal": "signs a periodic seal over the chain (tools/seal). Held as a minisign key.",
+    "producer": "an evidence producer outside the daemon \u2014 camera segments, detection records \u2014 signing bodies the chain then commits to.",
+    "deploy": "an SSH key used to reach or deploy to a node. Not a VIRP protocol key; recorded here because the ct211 incident was an SSH-key incident and a registry that omits them would not have caught it."
+  },
+  "_roles_is_an_array": "Deviation, stated rather than hidden: `roles` is a list, not a single string. c1104805 both signs the home node's chain heads and is the identity it submits them under. Splitting that into two entries would put the same key_id in the file twice, and key_id is this registry's primary key \u2014 the one thing that must be unique. One key with two jobs is one entry.",
+  "_public_half_seen_at": "Where the PUBLIC half is enrolled or present, host:path. Not in the original field list, added because without it the registry cannot answer the question that motivated it. 'Where is this key trusted?' is what took a fingerprint sweep across two hosts and four containerlab directories to answer for the ct211 keys; a file that records the key but not its reach would have to be swept again.",
+  "_what_is_deliberately_absent": "SYMMETRIC keys, and only those. /etc/virp/keys/onode.key (the O-Key, HMAC over v1 observations) and /etc/virp/keys/chain.key (K_chain, HMAC over chain entries) have NO public half. Their key_id under the same scheme is SHA-256 of the SECRET bytes, so deriving one means reading the secret, and a registry entry for it would be a hash of a live secret sitting in git. They are named here so their absence reads as a decision rather than an oversight. NOTHING ELSE IS DELIBERATELY ABSENT: an earlier version of this file also excluded key 4727a5b94680ba53812ec49a42fe77ad as 'trusted nowhere', which was wrong \u2014 it had signed 32 chain records. See its entry. A key is in scope if it is pinned anywhere OR has signed anything.",
+  "_provenance": "Populated 2026-09-03 by reading the public halves on virp-lab (10.0.10.211), virp-onode-home (10.0.0.13), the Spark (10.0.0.15) and this laptop, read-only. Every key_id below was derived from the bytes read, not copied from any declaration. valid_from is the mtime of the public-key file on the host that holds it, in UTC \u2014 it is the earliest hard evidence available, NOT a certificate validity date, and for keys copied between hosts it is the earliest mtime seen. Where a derived id confirmed an independently recorded one, the entry says so.",
+  "keys": [
+    {
+      "key_id": "a88c58a65fc41b01de933ba6e803cf7a",
+      "algorithm": "ed25519",
+      "public_key_hex": "2fc58cc6efe40e73837ed1c2d589fc2476dd8666701245109ff8603b4e977e84",
+      "roles": [
+        "approver"
+      ],
+      "private_half_host": "virp-lab (10.0.10.211), /etc/virp/keys/approval.key, owned by nhoward",
+      "public_half_seen_at": [
+        "virp-lab:/etc/virp/keys/approval.pub",
+        "virp-lab:/etc/virp/approvers.json (as base64 DER SPKI, operator nhoward, enabled)"
+      ],
+      "valid_from": "2026-07-29",
+      "status": "active",
+      "note": "The colo node's only enrolled approver. Derived id matches the key_id declared in virp-lab's approvers.json exactly. NOTE that the private half lives ON THE NODE IT APPROVES FOR, not on an operator machine \u2014 an approval and the thing it approves are one root compromise apart. Recorded, not fixed here."
+    },
+    {
+      "key_id": "155a9b963b4e1a293f009ff63134d686",
+      "algorithm": "ed25519",
+      "public_key_hex": "77c14101f7a3a8194d2dc04e2d51154a74e6fe3b38538dd9102d6c5021392e3e",
+      "roles": [
+        "approver"
+      ],
+      "private_half_host": "this laptop, ~/.virp/nhoward-laptop.key",
+      "public_half_seen_at": [
+        "virp-onode-home:/etc/virp/approvers.json (operator nhoward-laptop, enabled)"
+      ],
+      "valid_from": "2026-08-13",
+      "status": "active",
+      "note": "Minted 2026-08-13 to replace ead98d80 after its private half was lost. Unlike a88c58a6 the private half is off-node, which is the shape an approver key should have. Derived id matches the declaration in approvers.json."
+    },
+    {
+      "key_id": "ead98d807804c85e9e43c446d90dcec0",
+      "algorithm": "ed25519",
+      "public_key_hex": "5926626c2fbffc54001c6a333ccef7ca9723425e7ad491d2ff068a42363c14ad",
+      "roles": [
+        "approver"
+      ],
+      "private_half_host": "LOST \u2014 never located after 2026-08-12",
+      "public_half_seen_at": [
+        "virp-onode-home:/etc/virp/approvers.json (operator nhoward-laptop-ORPHANED-20260812, enabled=false)"
+      ],
+      "valid_from": "2026-08-12",
+      "status": "retired",
+      "note": "Retired, not deleted, and the entry is the point. The public half is still enrolled on the home node with enabled=false, so anything signed under it before 2026-08-13 remains checkable. Deleting the entry would make those signatures unattributable rather than merely un-honoured. Derived id matches the declaration."
+    },
+    {
+      "key_id": "c1104805e1044d63a0c531eb7a025e68",
+      "algorithm": "ed25519",
+      "public_key_hex": "dd8b32538ff2019e876062e70fc2a71c0447c50c7e142497b7a96499d213bea9",
+      "roles": [
+        "chain-signing",
+        "witness-submitter"
+      ],
+      "private_half_host": "virp-onode-home (10.0.0.13), /etc/virp/keys/chain-sign.key",
+      "public_half_seen_at": [
+        "virp-onode-home:/etc/virp/keys/chain-sign.pub"
+      ],
+      "valid_from": "2026-08-23",
+      "status": "active",
+      "note": "CONFIRMED AGAINST LIVE DATA, not just against a file: every chain head in virp-onode-home's chain.db carries head_sig_key_id=c1104805e1044d63a0c531eb7a025e68, derived independently here from chain-sign.pub. virp-witness-submit signs with this same key, which is why its roles list has two entries. The colo node has no counterpart: it signs chain entries with a symmetric K_chain and has no chain-signing keypair at all."
+    },
+    {
+      "key_id": "2a771e12a299a1b19d4afe3d62677d9a",
+      "algorithm": "ed25519",
+      "public_key_hex": "2ea75d4bd8ed439ee154fe77352243273d63adb55c9199d63d1fe030293efef9",
+      "roles": [
+        "witness"
+      ],
+      "private_half_host": "witness.virp.systems (EC2 18.217.153.230)",
+      "public_half_seen_at": [
+        "virp-onode-home:/etc/virp/witness.pub",
+        "this laptop:~/virp-witness-keys/witness.virp.systems.pub"
+      ],
+      "valid_from": "2026-09-02",
+      "status": "active",
+      "note": "The witness log's STH-signing key. WORTH READING TWICE: the value that has been circulating in notes as 'witness pub 2ea75d4b...' is the RAW PUBLIC KEY, not a key_id in this scheme \u2014 the key_id is 2a771e12a299a1b19d4afe3d62677d9a. Two 32-hex-ish strings for one key, and only one of them is a key_id. This is the exact confusion the registry exists to end, and it was already in circulation before the registry was written. Independence caveat unchanged: the witness is same-operator, so it buys durability, not third-party evidence."
+    },
+    {
+      "key_id": "0fa3db44605bdb38b7eeb6264ded7d95",
+      "algorithm": "ed25519",
+      "public_key_hex": "9854c1d8a3193488cb8ee19a8037523b25da4c706d8c1ee7a46d15eba8118bf2",
+      "roles": [
+        "producer"
+      ],
+      "private_half_host": "Spark (10.0.0.15), ~/.virp-detect/producer.key",
+      "public_half_seen_at": [
+        "Spark:~/.virp-detect/producer.pub",
+        "virp-onode-home:/var/lib/virp/detect/producer-spark.pub"
+      ],
+      "valid_from": "2026-08-25",
+      "status": "active",
+      "note": "Signs camera_detection/1 records. Private half has never left the Spark; only the public half travelled to the home node, which is the shape a producer key should have and the one the camera producer below does not. Derived id matches the value recorded when the key was minted."
+    },
+    {
+      "key_id": "a2d2dc0fac250b722c6a77c87be9e341",
+      "algorithm": "ed25519",
+      "public_key_hex": "1bb217d09fa262ca52a979cf8776f87fd06d8867f843365da284d676313944e4",
+      "roles": [
+        "producer"
+      ],
+      "private_half_host": "virp-onode-home (10.0.0.13), /var/lib/virp/camera/producer.key",
+      "public_half_seen_at": [
+        "virp-onode-home:/var/lib/virp/camera/producer.pub"
+      ],
+      "valid_from": "2026-08-24",
+      "status": "active",
+      "note": "The home node's own camera producer key, used for the replay path. Derived id matches the value recorded in the Spark's detection_key.py header."
+    },
+    {
+      "key_id": "008353cf219c224e970f03455aa50e82",
+      "algorithm": "ed25519",
+      "public_key_hex": "ea8c1d799815b5dcf205f7feb5a592ed736f2f0964e01857ad302154c7f8bd30",
+      "roles": [
+        "producer"
+      ],
+      "private_half_host": "TWO HOSTS \u2014 this laptop (~/camera-live/producer.key, and byte-identical copies at ~/camera-accept/ and ~/camera-accept-synthetic/) AND the Spark (10.0.0.15, ~/camera-live/producer.key)",
+      "public_half_seen_at": [
+        "virp-onode-home:/var/lib/virp/camera/producer-laptop.pub",
+        "this laptop:~/camera-live/producer.pub (+ 2 copies)",
+        "Spark:~/camera-live/producer.pub"
+      ],
+      "valid_from": "2026-08-24",
+      "status": "active",
+      "note": "FINDING, recorded rather than resolved: the private half of this key is on TWO machines, and it is enrolled on the home node under the name 'producer-laptop' \u2014 a label that now claims a host that is only half the truth. A signature under 008353cf cannot be attributed to a host, so the camera evidence it signs identifies a KEY, not a capture point. The three laptop copies are the same key, not three keys. Nothing here is changed on any box; deciding whether to split these into per-host identities or to retire this one and re-enrol is an operator call, and this entry is the record that it is outstanding.  ADDENDUM 2026-09-03, appended not rewritten, per _append_only: the blast radius is now measured. 2537 camera_segment/1 records on the home node's chain (2026-08-24 to 08-26) are signed under this key. Retiring it and issuing per-machine keys would fix what future records bind and would change NOTHING about those 2537 \u2014 a signature cannot be retroactively narrowed. So the two options are not alternatives: the claim about the existing records has to change whatever is done about the key. What these 2537 records prove is that a body was signed by the holder of 008353cf and has not been altered since. They do not identify WHICH host produced it, and no future action can make them."
+    },
+    {
+      "key_id": "981e8d9b8c5b2f5b7b70f99bca906868",
+      "algorithm": "ed25519",
+      "public_key_hex": "71622502a38314f06dcb28253efd287110502b8b33847459c4509541db64e901",
+      "roles": [
+        "seal"
+      ],
+      "private_half_host": "not located during this survey \u2014 the minisign secret is not on any of the four hosts read",
+      "public_half_seen_at": [
+        "this repo:tools/seal/virp-seal-2026.pub (minisign format)"
+      ],
+      "valid_from": "2026-08-23",
+      "status": "active",
+      "note": "Signs tools/seal/seal-2026-08.json.minisig. Stored as a minisign public key, whose blob is 2 bytes of algorithm ('Ed'), 8 bytes of minisign key id, then the 32-byte Ed25519 public key; public_key_hex above is those last 32 bytes. Minisign's own key id for it is 4F0B72D4DA341448 \u2014 a DIFFERENT identifier scheme for the same key, and a second example of why an id is only meaningful next to the scheme that produced it. The private half was not found on any host read here; where it lives is an open question, not an assertion."
+    },
+    {
+      "key_id": "d74c7e020f4c6a512c2166976088144b",
+      "algorithm": "ed25519",
+      "public_key_hex": "95b8391706a3686b5bfc00fc959012d1c81bddc53317c40e0740b927bcc847a4",
+      "roles": [
+        "deploy"
+      ],
+      "private_half_host": "UNLOCATED \u2014 never found. The key granted nhoward@ on two hosts and nobody has ever held its private half knowingly.",
+      "public_half_seen_at": [
+        "virp-lab:~/frr-ospf-lab/clab-frr-ospf/authorized_keys.bak-2026-08-01 (backup only)",
+        "virp-lab:~/frr-spine-leaf-lab/clab-frr-clos/authorized_keys.bak-2026-08-01 (backup only)",
+        "virp-lab:~/.ssh/authorized_keys.bak-2026-07-31 (backup only)",
+        "REMOVED 2026-08-01 from virp-lab and node2 ~/.ssh/authorized_keys and from both live containerlab authorized_keys files"
+      ],
+      "valid_from": "2026-07-29",
+      "status": "retired",
+      "note": "THE KEY THIS WHOLE FILE EXISTS FOR. SSH fingerprint SHA256:rA3gTRbKD+qwolC1VdPBfk8SOXGY2iAxsMORlCTj33w, comment 'claude-code@ct211' from the decommissioned CT 211 build host. It read as 'an unknown key' on virp-lab because its authorized_keys line carried no comment at all; only node2's copy, which did carry the comment, identified it. Removed everywhere 2026-08-01. Its only source was ~/.ssh/authorized_keys, now cleaned, so containerlab will not regenerate it. The public bytes above were recovered from the retained backups so the id could be derived rather than guessed \u2014 without those backups this entry could have recorded a fingerprint and no key_id at all."
+    },
+    {
+      "key_id": "bc3f27db5a4b4b2654bd189bc3136db4",
+      "algorithm": "ed25519",
+      "public_key_hex": "27548c1431872f232935810c1f555627223db05a641d0b0809df26ebcf80ec53",
+      "roles": [
+        "deploy"
+      ],
+      "private_half_host": "virp-lab (10.0.10.211), ~/.ssh/virp-lab",
+      "public_half_seen_at": [
+        "virp-lab:~/.ssh/virp-lab.pub",
+        "virp-lab:both containerlab authorized_keys backups (removed from the live files 2026-08-01)"
+      ],
+      "valid_from": "2026-07-29",
+      "status": "retired",
+      "note": "The OTHER 'claude-code@ct211'. Same comment as d74c7e02, different key \u2014 SHA256:jVrtKaNzH/Razo84hboNM06bHEg4tadCtaLNYKzpfXs. Two keys, one label, from a host that no longer exists: identical by comment, unmistakable by key_id, which is the entire argument for deriving ids from bytes. Retired because it is authorised on nothing today. It is NOT inert forever: ~/.ssh/virp-lab.pub still exists on virp-lab and containerlab 0.77.0 harvests .pub files from ~/.ssh at deploy time, so the next `clab deploy` re-adds it to the lab authorized_keys files. If that happens the status changes with an appended note; it does not become a new entry."
+    },
+    {
+      "key_id": "5799cff5736c46f962f6d6e8361f13d4",
+      "algorithm": "ed25519",
+      "public_key_hex": "18f6957884153a13396cd171f48b8b2c2eff6a4f6c975d0dcac13f276075e3e2",
+      "roles": [
+        "deploy"
+      ],
+      "private_half_host": "virp-lab (10.0.10.211), ~/.ssh/claude-code-virp-lab",
+      "public_half_seen_at": [
+        "virp-lab:~/.ssh/claude-code-virp-lab.pub"
+      ],
+      "valid_from": "2026-07-31",
+      "status": "active",
+      "note": "Comment 'claude-code@virp-lab'. Created 2026-07-31, i.e. after both ct211 keys, and correctly absent from the containerlab authorized_keys files, which were generated on 2026-07-29 before it existed. Named here so the third similarly-commented key is not mistaken for a third ct211 key."
+    },
+    {
+      "key_id": "011fa7e97cf23bd73d0dedfd5167bcb4",
+      "algorithm": "ed25519",
+      "public_key_hex": "33d4bcc55efacec698395d16be2525db640ef3cab8baa9052442a44f2bf2ce4b",
+      "roles": [
+        "deploy"
+      ],
+      "private_half_host": "this laptop, ~/.ssh/id_ed25519",
+      "public_half_seen_at": [
+        "virp-lab:~/.ssh/authorized_keys (the ONLY key authorised there today)",
+        "virp-onode-home:~/.ssh/authorized_keys",
+        "virp-lab:both containerlab authorized_keys files"
+      ],
+      "valid_from": "2026-03-14",
+      "status": "active",
+      "note": "The operator laptop key, comment nhoward@thirdlevelit.com. SHA256:85OdOtNlRzONuQFmvKo3VMoeEM7A/1H7DUNwWq1C2lQ. After the 2026-08-01 cleanup this is the single key in virp-lab's authorized_keys \u2014 every session in this repo reaches both nodes as this key."
+    },
+    {
+      "key_id": "f1d54cda6e46df365bdfe0ba5d7dfaf0",
+      "algorithm": "ed25519",
+      "public_key_hex": "fc527976370d45a3928aec40c12b813829b36cd7cd8caf3be34c54be04cce9d4",
+      "roles": [
+        "deploy"
+      ],
+      "private_half_host": "this laptop, ~/.ssh/id_virp_capture",
+      "public_half_seen_at": [
+        "this laptop:~/.ssh/id_virp_capture.pub"
+      ],
+      "valid_from": "2026-08-24",
+      "status": "active",
+      "note": "Comment 'virp-capture@laptop-iot'. The chrooted sftp identity the camera capture path ships segments over. A transport key, not a signing key: it moves bytes that key 008353cf has already signed, and compromising it would let an attacker withhold or replay segments but not forge one."
+    },
+    {
+      "key_id": "3dc3121355f4c2a4a166a71f60f46748",
+      "algorithm": "ed25519",
+      "public_key_hex": "a73b118462f60cd032cfd7aa3e706a199273b788053a93c518837e0229d7ab00",
+      "roles": [
+        "deploy"
+      ],
+      "private_half_host": "this laptop, ~/.ssh/id_virp_gate",
+      "public_half_seen_at": [
+        "this laptop:~/.ssh/id_virp_gate.pub"
+      ],
+      "valid_from": "2026-08-13",
+      "status": "active",
+      "note": "Comment 'virp-approve-gate@nhoward-laptop'. Carries the forwarded O-Node socket the laptop approver identity (155a9b96) reaches the home node through. Same day as that approver key, and the pair is deliberate: one key moves the connection, the other signs the approval, and only the second one authorises anything."
+    },
+    {
+      "key_id": "535954f59075bba2ac6ab0b95bc7a24e",
+      "algorithm": "ed25519",
+      "public_key_hex": "cd3dfbc447ac001e3bc034b4007d72b353f9de9b270db8da4cf26d7fc3ddca0c",
+      "roles": [
+        "deploy"
+      ],
+      "private_half_host": "this laptop, ~/.ssh/ironclaw_deploy_ed25519",
+      "public_half_seen_at": [
+        "this laptop:~/.ssh/ironclaw_deploy_ed25519.pub"
+      ],
+      "valid_from": "2026-04-28",
+      "status": "retired",
+      "note": "Comment 'ironclaw-deploy@...'. The deploy key for CT 210 and CT 211, both decommissioned. Retired because its hosts are gone, not because the key was withdrawn \u2014 the private half is still on the laptop and ~/.ssh/config still carries ct210/ct211/ironclaw-onode entries pointing at the dead 10.0.0.211. A live key for dead hosts sitting behind live-looking ssh aliases is how a session declared the colo unreachable; the entry records it so pruning those aliases is a decision someone takes, not a thing that happens by accident."
+    },
+    {
+      "key_id": "4727a5b94680ba53812ec49a42fe77ad",
+      "algorithm": "ed25519",
+      "public_key_hex": "d35ec41c5381e031cb4f824656bebc9a99f293dbceea74d47c134eae7681b1c7",
+      "roles": [
+        "producer"
+      ],
+      "private_half_host": "this laptop, ~/camera-reolink-sub/producer.key",
+      "public_half_seen_at": [
+        "this laptop:~/camera-reolink-sub/producer.pub"
+      ],
+      "valid_from": "2026-08-29",
+      "status": "active",
+      "note": "CORRECTS AN ERROR IN THIS FILE'S OWN FIRST VERSION, written earlier the same day. That version named this key in _what_is_deliberately_absent and declined to register it, on the stated grounds that it was 'trusted nowhere' and therefore not the ct211 case. That was wrong. It is not PINNED anywhere \u2014 but it has SIGNED 32 camera_segment records on the home node's chain (9 of schema /1, 23 of /2, 2026-08-29 to 08-31), which are the most RECENT camera evidence that node holds. Its public half is absent from /var/lib/virp/camera/, so those 32 records cannot be verified on the node that stores them: signed evidence with no reachable trust root, which reads as UNVERIFIABLE rather than as anything false. Copying its producer.pub to the node closes it and is named as an open item in SESSION-SUMMARY-COVERAGE-TRUST.md. The lesson is the one the registry was built to teach and then briefly failed to apply to itself: 'trusted nowhere' was inferred from where the key was ENROLLED, and the chain is the other place to look. Completeness is checked by sweeping what has SIGNED, not only what is pinned."
+    }
+  ]
+}

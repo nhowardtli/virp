@@ -1,0 +1,425 @@
+{
+  "_comment": "virp-onode-home device template (node_id 0x0000000D, 10.0.0.13). TRACKED 2026-09-03. Until then this node's fleet existed ONLY as /etc/virp/devices.json on the box: no template, no render step, no unit-manifest row, 38 devices and four plaintext credentials that no commit described. A rebuild would have lost the whole fleet silently. That is the same failure the colo node had with its 43 devices, one node over. Rendered to /run/virp/devices.json at daemon start by deploy/render-devices.sh, substituting ${...} from /etc/virp/autopilot.env (0600 root). This template carries NO credentials.",
+  "_credentials_required": "autopilot.env on this node must define exactly four values, and render-devices.sh is FATAL on any placeholder it cannot resolve \u2014 the daemon refuses to start rather than authenticate as a literal ${TOKEN}. VIRP_PVE_PASSWORD (pve-lab root), VIRP_LABNET_PASSWORD (aiops-svc, shared by all 35 GNS3 routers), VIRP_WAZUH_HOME_PASSWORD (virp-ro on wazuh-home), VIRP_FORTIGATE_HOME_PASSWORD (virp-gate on fortigate-home). Confirmed by hashing every credential in the live config and its eleven backups on 2026-09-03: four distinct values, no more. NOTE the 35 routers share ONE credential \u2014 compromise of any one of them is compromise of all thirty-five, which is a property of the lab, recorded here rather than fixed here.",
+  "_socket_allowlist_policy": "uid 0 is EXCLUDED, same as the colo node: a client running as root is rejected at the peercred gate. 999 is the daemon's own service account, 1000 the interactive operator, 997 virp-spark (the Spark's requester identity), 1001 virp-laptop (the laptop approver identity, reaching the socket over a forwarded stream).",
+  "socket_allowed_uids": [
+    "${VIRP_UID}",
+    1000,
+    997,
+    1001
+  ],
+  "socket_uid_tier_ceilings": {
+    "${VIRP_UID}": "green",
+    "1000": "green",
+    "997": "green",
+    "1001": "green"
+  },
+  "_socket_uid_action_allow_note": "FIXES A LIVE DEPLOY BLOCKER (Phase 0 D4). Until 2026-09-03 only 997 and 1001 had action maps; 999 and 1000 were allowlisted with NO entry, which this node's binary treats as unrestricted and origin/main treats as a boot failure. Both now have one, and 999 loses the shutdown it implicitly held. EIGHT VERBS EACH, NOT TWENTY, AND THE NUMBER IS LOAD-BEARING: ONODE_MAX_UID_ACTIONS is 8 in the binary this node runs and only became 32 in 13ec426 (2026-09-01) \u2014 the very commit that added the boot invariant. A longer list overflows the cap and virp_onode_prod.c fails closed by installing DENY-ALL for that uid, which is what happened on the first attempt here: 'uid 999 action allowlist: 0 action(s) (DENY-ALL)', reverted. So the colo node's 20-verb list is NOT portable to this node, and copying it here was the mistake. Eight is also simply the better answer: this node runs no comparator, no netclaw bridge and no v2 sessions, so the session_*, intent_*, batch_execute and validate_turn verbs it was granted were reach nothing here uses. Expanding past 8 becomes possible after the binary upgrade and should be justified by a workload, not by symmetry with virp-lab.",
+  "socket_uid_action_allow": {
+    "${VIRP_UID}": [
+      "chain_append",
+      "chain_verify",
+      "health",
+      "heartbeat",
+      "list_devices",
+      "list_fleet",
+      "execute",
+      "sign_outcome"
+    ],
+    "1000": [
+      "execute",
+      "health",
+      "list_fleet",
+      "list_devices",
+      "chain_append",
+      "chain_verify",
+      "approval_challenge",
+      "approval_submit"
+    ],
+    "997": [
+      "execute",
+      "list_fleet",
+      "health",
+      "chain_verify"
+    ],
+    "1001": [
+      "approval_challenge",
+      "approval_submit",
+      "list_fleet",
+      "execute",
+      "health"
+    ]
+  },
+  "_socket_uid_chain_append_types_note": "Second half of the same blocker: absent entirely on this node until now. A uid whose action set includes chain_append MUST appear here or the daemon refuses to start naming it. Only 999 and 1000 may chain_append; 997 and 1001 have no chain_append verb and correctly have no entry. `evidence_item` is present so the deployed-state reporter can land its document as a real body rather than a commitment-only hash every reader would grade UNVERIFIABLE \u2014 see the matching note in deploy/devices.template.json. Types use the 16-byte-truncated spellings the wire delivers.",
+  "socket_uid_chain_append_types": {
+    "${VIRP_UID}": [
+      "observation",
+      "comparator_verd",
+      "chainwalk_summa",
+      "evidence_item"
+    ],
+    "1000": [
+      "observation",
+      "comparator_verd",
+      "chainwalk_summa",
+      "evidence_item"
+    ]
+  },
+  "_gate_posture_note": "gate_max_tier is GREEN here, tighter than the colo node's YELLOW, and deliberately unchanged by this file. pve-lab has NO Proxmox classifier, so its commands land RED-by-absence and are proposal-only and fail-closed. Tracking a config is not the moment to change what it permits: this template is byte-for-byte the posture the node was already running, plus the two policy objects whose ABSENCE was the bug.",
+  "gate_default_mode": "enforce",
+  "gate_max_tier": "green",
+  "devices": [
+    {
+      "host": "10.0.0.35",
+      "hostname": "pve-lab",
+      "node_id": 167772195,
+      "password": "${VIRP_PVE_PASSWORD}",
+      "port": 22,
+      "protected_vmids": [
+        313
+      ],
+      "username": "root",
+      "vendor": "linux"
+    },
+    {
+      "host": "10.0.0.1",
+      "hostname": "fortigate-home",
+      "node_id": 167772161,
+      "password": "${VIRP_FORTIGATE_HOME_PASSWORD}",
+      "port": 22,
+      "username": "virp-gate",
+      "vendor": "fortinet"
+    },
+    {
+      "_comment": "Wazuh manager. protected_agents are refused by the driver at any tier and classify VIRP_TIER_BLACK at the gate hook, so the refusal files no proposal and no approval reaches it. Enforced on the endpoint bytes, NOT via the API credential's RBAC: Wazuh denies at resource level with HTTP 200 and the agent simply absent from affected_items, which is indistinguishable from the agent not existing.",
+      "_tls_note": "Running on the lab insecure drop-in (VIRP_WAZUH_INSECURE=1) pending cert reissue. The manager presents the stock self-signed cert (CN=wazuh.com, only SAN DNS:localhost), so addressing it by IP cannot pass hostname verification even with that cert trusted as a CA. Fix is to reissue the API cert with IP:10.0.0.44 in the SAN and point VIRP_CA_BUNDLE at its signer, then remove the drop-in.",
+      "api_port": 55000,
+      "host": "10.0.0.44",
+      "hostname": "wazuh-home",
+      "node_id": 167772204,
+      "password": "${VIRP_WAZUH_HOME_PASSWORD}",
+      "port": 55000,
+      "protected_agents": [
+        "004",
+        "313"
+      ],
+      "username": "virp-ro",
+      "vendor": "wazuh"
+    },
+    {
+      "host": "10.0.0.55",
+      "hostname": "R6",
+      "node_id": 167772215,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.50",
+      "hostname": "R1",
+      "node_id": 167772210,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.51",
+      "hostname": "R2",
+      "node_id": 167772211,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.52",
+      "hostname": "R3",
+      "node_id": 167772212,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.53",
+      "hostname": "R4",
+      "node_id": 167772213,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.54",
+      "hostname": "R5",
+      "node_id": 167772214,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.56",
+      "hostname": "R7",
+      "node_id": 167772216,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.57",
+      "hostname": "R8",
+      "node_id": 167772217,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.58",
+      "hostname": "R9",
+      "node_id": 167772218,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.59",
+      "hostname": "R10",
+      "node_id": 167772219,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.60",
+      "hostname": "R11",
+      "node_id": 167772220,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.61",
+      "hostname": "R12",
+      "node_id": 167772221,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.62",
+      "hostname": "R13",
+      "node_id": 167772222,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.63",
+      "hostname": "R14",
+      "node_id": 167772223,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.64",
+      "hostname": "R15",
+      "node_id": 167772224,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.65",
+      "hostname": "R16",
+      "node_id": 167772225,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.66",
+      "hostname": "R17",
+      "node_id": 167772226,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.67",
+      "hostname": "R18",
+      "node_id": 167772227,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.68",
+      "hostname": "R19",
+      "node_id": 167772228,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.69",
+      "hostname": "R20",
+      "node_id": 167772229,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.70",
+      "hostname": "R21",
+      "node_id": 167772230,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.71",
+      "hostname": "R22",
+      "node_id": 167772231,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.72",
+      "hostname": "R23",
+      "node_id": 167772232,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.73",
+      "hostname": "R24",
+      "node_id": 167772233,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.74",
+      "hostname": "R25",
+      "node_id": 167772234,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.75",
+      "hostname": "R26",
+      "node_id": 167772235,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.76",
+      "hostname": "R27",
+      "node_id": 167772236,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.77",
+      "hostname": "R28",
+      "node_id": 167772237,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.78",
+      "hostname": "R29",
+      "node_id": 167772238,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.79",
+      "hostname": "R30",
+      "node_id": 167772239,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.80",
+      "hostname": "R31",
+      "node_id": 167772240,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.81",
+      "hostname": "R32",
+      "node_id": 167772241,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.82",
+      "hostname": "R33",
+      "node_id": 167772242,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.83",
+      "hostname": "R34",
+      "node_id": 167772243,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    },
+    {
+      "host": "10.0.0.84",
+      "hostname": "R35",
+      "node_id": 167772244,
+      "password": "${VIRP_LABNET_PASSWORD}",
+      "port": 22,
+      "username": "aiops-svc",
+      "vendor": "cisco_ios"
+    }
+  ]
+}

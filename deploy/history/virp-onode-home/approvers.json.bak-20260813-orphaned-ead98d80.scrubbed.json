@@ -1,0 +1,9 @@
+[
+  {
+    "algorithm": "ed25519",
+    "enabled": true,
+    "key_id": "ead98d807804c85e9e43c446d90dcec0",
+    "operator": "nhoward-laptop",
+    "public_key": "MCowBQYDK2VwAyEAWSZibC+//FQAHGozPM73ypcjQl561JHS/waKQjY8FK0="
+  }
+]

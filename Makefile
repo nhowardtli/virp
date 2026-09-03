@@ -1686,7 +1686,7 @@ check-pbs-pin:
 # that, by construction — so the drift comparison is now part of the
 # same target rather than an optional extra somebody remembers to run.
 .PHONY: check-deploy-unit
-check-deploy-unit: check-deploy-unit-source check-unit-drift check-deploy-build-id
+check-deploy-unit: check-deploy-unit-source check-unit-drift check-deploy-build-id check-key-registry
 
 # Does the INSTALLED binary come from the deploy tree that is checked out?
 # Only answerable since v0.2.1 Fix 2 gave the binary a real self-reported
@@ -1718,6 +1718,16 @@ check-unit-drift:
 check-unit-drift-selftest:
 	@echo "=== self-testing the unit drift checker ==="
 	@scripts/check-unit-drift.sh --selftest
+
+# Every key_id in deploy/keys/registry.json must derive from that entry's
+# own public key bytes. Two ed25519 keys once shared the comment
+# 'claude-code@ct211' and telling them apart took a fingerprint sweep
+# across two hosts; this is what keeps the registry's ids facts rather
+# than a second set of labels. Selftest first, same reason as the drift
+# checker: a check that cannot fail is not a check.
+.PHONY: check-key-registry
+check-key-registry:
+	@scripts/check-key-registry.sh --selftest
 
 .PHONY: check-deploy-unit-source
 check-deploy-unit-source:

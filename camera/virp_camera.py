@@ -47,6 +47,20 @@ Key custody (the trust boundary, stated plainly):
   - What all this proves: the footage is unaltered SINCE capture-side
     ingest. It says nothing about scene authenticity or injection
     upstream of the capture host. Tamper-EVIDENT, not tamper-proof.
+  - AND IT BINDS A KEY, NOT A HOST. The wording above ("generated on the
+    capture host", "the capture host's key") describes the intended
+    shape, not an enforced one. A producer signature identifies a host
+    only if that key is on exactly ONE host, and nothing here checks
+    that. Measured 2026-09-03: producer key 008353cf is on TWO machines
+    — the laptop, in three byte-identical copies, and the Spark — and
+    2537 camera_segment/1 records on the home node's chain are signed
+    under it. Those records prove a body was signed by the holder of
+    008353cf and is unaltered; they do NOT say which machine produced
+    it, and no later key rotation can make them say so, because a
+    signature cannot be retroactively narrowed. Issuing per-machine keys
+    fixes what FUTURE records bind. Any claim about the existing ones
+    has to be the weaker statement regardless. See
+    deploy/keys/registry.json, which records custody per key.
   - RTSP credentials (live mode) come from the environment or a 0600
     config file only, and never appear in bodies, logs, or reports.
     Replay mode touches no credentials at all.
