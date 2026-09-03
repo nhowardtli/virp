@@ -1058,10 +1058,19 @@ test-evidence:
 # chainwalk_summary regression), the producer signature, prev-hash
 # continuity, gap honesty, and the chain_append/evidence_item-only
 # vocabulary. Needs the `cryptography` package (Ed25519).
+# The sensor-signature suite additionally exercises the real
+# signed-video-framework validator against a real Axis clip when both
+# are present (VIRP_SVF_VALIDATOR / VIRP_AXIS_CLIP), and skips those two
+# tests otherwise; every parse and schema test runs unconditionally off
+# the frozen validator output in tests/fixtures/.
 .PHONY: test-camera
 test-camera:
 	@echo "=== camera driver ==="
 	python3 tests/test_camera_driver.py
+	python3 tests/test_camera_phase2.py
+	python3 tests/test_camera_trust_and_coverage.py
+	python3 tests/test_camera_restart_integrity.py
+	python3 tests/test_camera_sensor_signature.py
 
 # Commitment-only observation grading. Pins the chain_append GATE 3
 # decision that a body-less observation registers but grades

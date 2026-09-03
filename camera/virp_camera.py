@@ -90,12 +90,51 @@ import time
 
 SCHEMA_V1 = "camera_segment/1"
 SCHEMA_V2 = "camera_segment/2"
+SCHEMA_V3 = "camera_segment/3"
 # What this producer emits when a capture policy is declared (always,
 # from the CLI). SCHEMA_V1 remains emitted only by callers that pass no
 # policy, and remains READABLE forever: 2553 live records carry it and
-# nothing here may re-sign or rewrite them.
-SCHEMA = SCHEMA_V2
-SCHEMAS = (SCHEMA_V1, SCHEMA_V2)
+# nothing here may re-sign or rewrite them. SCHEMA_V2 is /1 plus the
+# signed capture_policy; SCHEMA_V3 is /2 plus the sensor_signature —
+# what the CAMERA asserts about its own video, which is a different
+# fact from anything this host can observe.
+SCHEMA = SCHEMA_V3
+SCHEMAS = (SCHEMA_V1, SCHEMA_V2, SCHEMA_V3)
+
+# ── The sensor's own claim ─────────────────────────────────────────────
+#
+# A signing camera (Axis signed video) asserts that the bitstream is the
+# one its sensor emitted, and stamps its OWN clock on the first and last
+# frame. Both are the camera's claim and are labelled as such
+# everywhere: the M3085-V in the lab has a wrong clock and stamps
+# 2024-08-15 onto 2026 footage. capture_end_utc_ns stays this host's
+# observation and the chain entry's own timestamp stays the O-node's
+# receipt; the three are never collapsed.
+#
+# The verdict vocabulary is CLOSED, and no failure may leave the object
+# out. "The validator was missing" and "the video verified" must never
+# be the same shape on the wire, because a verifier that tests for the
+# field's presence would read the first as the second.
+SENSOR_VALID = "VALID"
+SENSOR_INVALID = "INVALID"
+SENSOR_UNSIGNED = "UNSIGNED"          # this camera does not sign at all
+SENSOR_UNVERIFIED = "UNVERIFIED"      # we could not judge; see ruling #1
+SENSOR_VERDICTS = (SENSOR_VALID, SENSOR_INVALID, SENSOR_UNSIGNED,
+                   SENSOR_UNVERIFIED)
+
+# The field set IS the schema, one level down: every key is present in
+# every record, and an unavailable value is null. Nothing optional.
+SENSOR_SIGNATURE_KEYS = (
+    "vendor", "validator", "verdict", "public_key",
+    "gops_valid", "gops_valid_with_missing", "gops_invalid",
+    "gops_unsigned", "device_serial", "device_firmware",
+    "asserted_first_frame", "asserted_last_frame",
+    "validator_output_sha256",
+)
+
+VALIDATOR_NAME = "signed-video-framework"
+VALIDATOR_RESULTS_FILE = "validation_results.txt"
+VALIDATOR_TIMEOUT_S = 300
 ONODE_SOCKET = "/run/virp/onode.sock"
 CHAIN_DB = "/var/lib/virp/chain.db"
 DATA_DIR = "/var/lib/virp/camera"
@@ -588,11 +627,225 @@ def gap_defect(gap, segment_seq, prev_seq):
     return None
 
 
+# ── The sensor signature: parse the FILE, never the console ────────────
+#
+# The validator prints a per-BU trace to stdout and writes a summary to
+# validation_results.txt. Only the file is parsed. A verdict scraped
+# from a log is a verdict that silently changes the next time logging
+# changes, and the trace lines carry no stable interface promise.
+#
+# Every branch the tool can write is handled explicitly
+# (apps/validator/main.c:464-526). An unrecognised file raises, and the
+# caller turns that into UNVERIFIED — it never guesses.
+
+def _sensor_blank():
+    """The object with every key present and nothing asserted."""
+    return {k: None for k in SENSOR_SIGNATURE_KEYS}
+
+
+def sensor_signature_unsigned():
+    """A camera that does not sign its video at all (Tapo, Reolink).
+    vendor is null and the verdict is UNSIGNED — an explicit statement,
+    not an omission."""
+    s = _sensor_blank()
+    s["verdict"] = SENSOR_UNSIGNED
+    return s
+
+
+def sensor_signature_unverified(vendor, validator_version=None):
+    """Ruling #1: a missing validator, a crash, or an unparseable result
+    all land here. The record still ships; the verdict never upgrades."""
+    s = _sensor_blank()
+    s["vendor"] = vendor
+    s["verdict"] = SENSOR_UNVERIFIED
+    s["validator"] = {"name": VALIDATOR_NAME, "version": validator_version}
+    return s
+
+
+_VIDEO_VERDICTS = {
+    "VIDEO IS VALID!": SENSOR_VALID,
+    "VIDEO IS VALID, BUT HAS MISSING FRAMES!": SENSOR_VALID,
+    "VIDEO IS INVALID!": SENSOR_INVALID,
+    "VIDEO IS NOT SIGNED!": SENSOR_UNSIGNED,
+    # too short to hold one complete GOP: not judged, and NOT the same
+    # statement as "this video carries no signature"
+    "NO COMPLETE GOPS FOUND!": SENSOR_UNVERIFIED,
+}
+
+_KEY_STATES = {
+    "PUBLIC KEY IS VALID!": "VALID",
+    "PUBLIC KEY IS NOT VALID!": "NOT_VALID",
+    "PUBLIC KEY COULD NOT BE VALIDATED!": "COULD_NOT_BE_VALIDATED",
+}
+
+_COUNT_FIELDS = (
+    ("Number of valid GOPs with missing BUs:", "gops_valid_with_missing"),
+    ("Number of valid GOPs:", "gops_valid"),
+    ("Number of invalid GOPs:", "gops_invalid"),
+    ("Number of GOPs without signature:", "gops_unsigned"),
+)
+
+_TEXT_FIELDS = (
+    ("Serial Number:", "device_serial"),
+    ("Firmware version:", "device_firmware"),
+    ("First frame:", "asserted_first_frame"),
+    ("Last validated frame:", "asserted_last_frame"),
+)
+
+
+def parse_validation_results(text):
+    """Parse a validation_results.txt into the sensor_signature object
+    (vendor and validator_output_sha256 left for the caller). Raises
+    ValueError when the file carries no recognisable verdict — the
+    caller must not guess one."""
+    out = _sensor_blank()
+    key_state = None
+    video = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line in _KEY_STATES:
+            key_state = _KEY_STATES[line]
+            continue
+        if line in _VIDEO_VERDICTS:
+            video = _VIDEO_VERDICTS[line]
+            continue
+        for prefix, field in _COUNT_FIELDS:
+            if line.startswith(prefix):
+                try:
+                    out[field] = int(line[len(prefix):].strip())
+                except ValueError:
+                    pass
+                break
+        else:
+            for prefix, field in _TEXT_FIELDS:
+                if line.startswith(prefix):
+                    val = line[len(prefix):].strip()
+                    out[field] = None if val in ("", "N/A") else val
+                    break
+            else:
+                if line.startswith("Validator (") and " runs:" in line:
+                    ver = line.split(" runs:", 1)[1].strip()
+                    out["validator"] = {
+                        "name": VALIDATOR_NAME,
+                        "version": ver[1:] if ver.startswith("v") else ver}
+    if video is None:
+        raise ValueError("no recognisable verdict line in validator output")
+    if out["validator"] is None:
+        out["validator"] = {"name": VALIDATOR_NAME, "version": None}
+    out["public_key"] = key_state
+
+    # The key state can only ever DOWNGRADE the video verdict. Signatures
+    # checked against a key the framework rejected prove nothing, and a
+    # key that could not be validated cannot support a clean VALID.
+    if key_state == "NOT_VALID":
+        video = SENSOR_INVALID
+    elif key_state == "COULD_NOT_BE_VALIDATED" and video == SENSOR_VALID:
+        video = SENSOR_UNVERIFIED
+    out["verdict"] = video
+    return out
+
+
+def run_sensor_validator(seg_path, vendor=None, validator=None,
+                         lib_path=None, log=None):
+    """Validate ONE segment before its record is signed. Returns
+    (sensor_signature, raw_validation_text_or_None).
+
+    RULING #1 (Aug 28) is the whole contract: a missing validator, a
+    validator that crashes, and a result that cannot be parsed each
+    yield UNVERIFIED and the record still ships. This function never
+    raises, never returns None, and never omits the object."""
+    if vendor is None:
+        return sensor_signature_unsigned(), None
+
+    def _unverified(why):
+        if log:
+            log("sensor-signature UNVERIFIED (%s): %s"
+                % (os.path.basename(seg_path), why))
+        return sensor_signature_unverified(vendor), None
+
+    if not validator or not os.path.exists(validator):
+        return _unverified("no validator at %r" % validator)
+
+    env = dict(os.environ)
+    if lib_path:
+        env["LD_LIBRARY_PATH"] = (
+            lib_path + os.pathsep + env.get("LD_LIBRARY_PATH", ""))
+
+    import tempfile as _tempfile
+    with _tempfile.TemporaryDirectory() as work:
+        # the tool writes validation_results.txt into its CWD, so give it
+        # a private one rather than whatever directory we happen to be in
+        try:
+            subprocess.run([validator, "-c", "h264",
+                            os.path.abspath(seg_path)],
+                           cwd=work, env=env,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL,
+                           timeout=VALIDATOR_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return _unverified("validator timed out after %ds"
+                               % VALIDATOR_TIMEOUT_S)
+        except OSError as e:
+            return _unverified("validator could not be run: %s" % e)
+        # a nonzero / signalled exit is NOT itself a verdict: the tool
+        # exits nonzero for an invalid video too. What matters is whether
+        # it left a parseable result.
+        results = os.path.join(work, VALIDATOR_RESULTS_FILE)
+        if not os.path.exists(results):
+            return _unverified("validator wrote no %s"
+                               % VALIDATOR_RESULTS_FILE)
+        with open(results, "rb") as f:
+            raw_bytes = f.read()
+
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    try:
+        text = raw_bytes.decode("utf-8", "replace")
+        sensor = parse_validation_results(text)
+    except ValueError as e:
+        # the bytes exist and are kept: that is what makes this
+        # UNVERIFIED auditable after the fact
+        s = sensor_signature_unverified(vendor)
+        s["validator_output_sha256"] = digest
+        if log:
+            log("sensor-signature UNVERIFIED (%s): %s"
+                % (os.path.basename(seg_path), e))
+        return s, raw_bytes.decode("utf-8", "replace")
+    sensor["vendor"] = vendor
+    sensor["validator_output_sha256"] = digest
+    return sensor, text
+
+
+def sensor_for_segment(path, cfg, log=None):
+    """The sensor claim for one segment, or (None, None) for a producer
+    that emits pre-/3 bodies (no capture policy declared)."""
+    if not cfg.get("capture_policy"):
+        return None, None
+    return run_sensor_validator(
+        path, vendor=cfg.get("sensor_vendor"),
+        validator=cfg.get("validator"),
+        lib_path=cfg.get("validator_lib_path"), log=log)
+
+
+def sensor_defect(sensor):
+    """Why this object may not be signed into a body, or None."""
+    if not isinstance(sensor, dict):
+        return "sensor_signature must be an object"
+    if set(sensor) != set(SENSOR_SIGNATURE_KEYS):
+        missing = sorted(set(SENSOR_SIGNATURE_KEYS) - set(sensor))
+        extra = sorted(set(sensor) - set(SENSOR_SIGNATURE_KEYS))
+        return ("sensor_signature field set is the schema (missing=%s "
+                "extra=%s)" % (missing, extra))
+    if sensor.get("verdict") not in SENSOR_VERDICTS:
+        return ("sensor_signature verdict %r is not one of %s"
+                % (sensor.get("verdict"), ", ".join(SENSOR_VERDICTS)))
+    return None
+
+
 # ── Body construction ──────────────────────────────────────────────────
 
 def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
                duration_s, start_ns, end_ns, time_source, mode, gap,
-               key_id, policy=None):
+               key_id, policy=None, sensor=None):
     """The camera_segment record, WITHOUT producer_sig (added by
     producer_sign). Field set is the schema — nothing optional, nothing
     extra, no credentials, no URLs.
@@ -606,7 +859,14 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
                    included — can loosen the gap tolerance afterwards to
                    make a bad window look clean; doing so would require
                    the producer key and would produce a different
-                   record."""
+                   record.
+    + sensor     → camera_segment/3: /2 plus sensor_signature, what the
+                   CAMERA claims about its own video. It is signed for
+                   the same reason the policy is: an operator who could
+                   edit a verdict afterwards could launder INVALID
+                   footage into VALID footage without touching a pixel.
+                   There is no version carrying the sensor claim but not
+                   the cadence declaration."""
     # The producer always cites the record it just emitted, so the
     # external-predecessor form and the ordinary form coincide here at
     # segment_seq - 1. A body whose gap would grade FAILED is never
@@ -615,8 +875,24 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
     if defect:
         raise ValueError("refusing to build a camera_segment body: %s"
                          % defect)
+    if sensor is not None:
+        if policy is None:
+            raise ValueError("refusing to build a camera_segment body: a "
+                             "sensor_signature needs a capture_policy — "
+                             "there is no schema with one and not the "
+                             "other")
+        defect = sensor_defect(sensor)
+        if defect:
+            raise ValueError("refusing to build a camera_segment body: %s"
+                             % defect)
+    if policy is None:
+        schema = SCHEMA_V1
+    elif sensor is None:
+        schema = SCHEMA_V2
+    else:
+        schema = SCHEMA_V3
     body = {
-        "schema": SCHEMA_V1 if policy is None else SCHEMA_V2,
+        "schema": schema,
         "camera_id": camera_id,
         "device": device,
         "segment_seq": seq,
@@ -634,6 +910,8 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
     }
     if policy is not None:
         body["capture_policy"] = policy
+    if sensor is not None:
+        body["sensor_signature"] = sensor
     return body
 
 
@@ -803,10 +1081,21 @@ def process_segment(path, cfg, state, gap, send=onode_send):
     prev = state["last_segment_sha256"] if state else None
     gap = continuity_gap(state, start_ns, gap)
 
+    # The sensor claim is established BEFORE the record is signed: a
+    # verdict that arrived after the signature would be a verdict nobody
+    # could bind to these bytes.
+    sensor, sensor_raw = sensor_for_segment(
+        path, cfg, log=lambda m: print(m, flush=True))
+    if sensor_raw is not None:
+        with open(os.path.join(art_dir, seg_sha + ".validation.txt"),
+                  "w") as f:
+            f.write(sensor_raw)
+
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
                             end_ns, time_source, cfg["mode"], gap,
-                            cfg["key_id"], cfg.get("capture_policy"))
+                            cfg["key_id"], cfg.get("capture_policy"),
+                            sensor)
     body_bytes, body = producer_sign(cfg["sk"], body_nosig)
 
     session_id = session_for(cfg["camera_id"], end_ns)
@@ -1143,9 +1432,25 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
                                 "pass it"
                                 % (session_id, artifact_id, schema))
             continue
-        if schema == SCHEMA_V2 and _body_policy(body) is None:
+        if (schema in (SCHEMA_V2, SCHEMA_V3)
+                and _body_policy(body) is None):
             failures.append("%s %s: %s carries no usable capture_policy"
                             % (session_id, artifact_id, schema))
+        # The camera_id/capture_policy precedent: the object is REQUIRED
+        # at its own version and REQUIRED ABSENT at every earlier one. A
+        # /1 body that has grown a sensor_signature was not built by this
+        # producer, and grading it as though it were would let anyone
+        # append a verdict to frozen history.
+        if schema == SCHEMA_V3:
+            if _body_sensor(body) is None:
+                failures.append("%s %s: %s carries no usable "
+                                "sensor_signature"
+                                % (session_id, artifact_id, schema))
+        elif "sensor_signature" in body:
+            failures.append("%s %s: %s carries a sensor_signature, which "
+                            "exists only at %s — this record was not "
+                            "built by this producer"
+                            % (session_id, artifact_id, schema, SCHEMA_V3))
         cam_bodies.append((session_id, artifact_id, body))
 
     # Pass 2 — the prev-hash continuity chain, walked in segment_seq
@@ -1220,6 +1525,7 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
         report["coverage"] = grade_coverage(cam_bodies)
         report["reuse_axis"], report["reuse"] = \
             grade_content_reuse(cam_bodies)
+        report["sensor"] = grade_sensor(cam_bodies)
     return checked, failures
 
 
@@ -1250,7 +1556,7 @@ _COVERAGE_RANK = {COVERAGE_CONTINUOUS: 0, COVERAGE_ACCOUNTED: 1,
 def _body_policy(body):
     """The usable capture_policy of a body, or None. A /1 record has
     none by construction — that is UNDECLARED, not zero tolerance."""
-    if body.get("schema") != SCHEMA_V2:
+    if body.get("schema") not in (SCHEMA_V2, SCHEMA_V3):
         return None
     p = body.get("capture_policy")
     if not isinstance(p, dict):
@@ -1265,6 +1571,71 @@ def _body_policy(body):
         return None
     return {"nominal_segment_s": nominal, "jitter_s": jitter,
             "max_unexplained_gap_s": max_gap}
+
+
+SENSOR_AXIS_NONE = "NONE CLAIMED (no /3 records in scope)"
+
+
+def sensor_axis(sensor):
+    """One line for the whole scope. Worst verdict wins, and UNVERIFIED
+    is never folded into VALID: `we could not check` is not `it passed`."""
+    if not sensor:
+        return SENSOR_AXIS_NONE
+    tot = {v: 0 for v in SENSOR_VERDICTS}
+    for c in sensor.values():
+        for v, n in c["verdicts"].items():
+            tot[v] = tot.get(v, 0) + n
+    if tot[SENSOR_INVALID]:
+        return "INVALID (%d record(s))" % tot[SENSOR_INVALID]
+    if tot[SENSOR_UNVERIFIED]:
+        return "UNVERIFIED (%d record(s) could not be checked)" \
+            % tot[SENSOR_UNVERIFIED]
+    if tot[SENSOR_VALID] and not tot[SENSOR_UNSIGNED]:
+        return "VALID (%d record(s), camera-asserted)" % tot[SENSOR_VALID]
+    if tot[SENSOR_UNSIGNED] and not tot[SENSOR_VALID]:
+        return "UNSIGNED (%d record(s); this camera does not sign)" \
+            % tot[SENSOR_UNSIGNED]
+    return "MIXED (valid=%d unsigned=%d)" % (tot[SENSOR_VALID],
+                                             tot[SENSOR_UNSIGNED])
+
+
+def grade_sensor(cam_bodies):
+    """{camera_id: {...}} over the /3 records in scope. Records at older
+    versions are not counted as UNSIGNED — they predate the question."""
+    out = {}
+    for _, _, body in cam_bodies:
+        s = _body_sensor(body)
+        if s is None:
+            continue
+        cam = body.get("camera_id")
+        c = out.setdefault(cam, {
+            "verdicts": {v: 0 for v in SENSOR_VERDICTS},
+            "vendor": None, "device_serial": None,
+            "device_firmware": None, "validator": None,
+            "asserted_first_frame": None, "asserted_last_frame": None})
+        c["verdicts"][s["verdict"]] += 1
+        for k in ("vendor", "device_serial", "device_firmware"):
+            if s.get(k) and not c[k]:
+                c[k] = s[k]
+        v = s.get("validator") or {}
+        if v.get("name") and not c["validator"]:
+            c["validator"] = "%s %s" % (v.get("name"), v.get("version"))
+        # the span of what the CAMERA claims, in the camera's own words
+        if s.get("asserted_first_frame") and not c["asserted_first_frame"]:
+            c["asserted_first_frame"] = s["asserted_first_frame"]
+        if s.get("asserted_last_frame"):
+            c["asserted_last_frame"] = s["asserted_last_frame"]
+    return out
+
+
+def _body_sensor(body):
+    """The usable sensor_signature of a body, or None. A /1 or /2 record
+    has none by construction — that is not "unsigned video", it is a
+    record from before the question was asked."""
+    if body.get("schema") != SCHEMA_V3:
+        return None
+    s = body.get("sensor_signature")
+    return None if sensor_defect(s) else s
 
 
 def grade_coverage(cam_bodies):
@@ -1716,10 +2087,16 @@ def process_live_segment(path, cfg, state, gap, ship):
     prev = state["last_segment_sha256"] if state else None
     gap = continuity_gap(state, start_ns, gap)
 
+    # Established BEFORE the signature, for the same reason as above.
+    # Whatever it says — including "the validator was missing" — the
+    # segment is still attested and still ships (ruling #1).
+    sensor, sensor_raw = sensor_for_segment(
+        path, cfg, log=lambda m: print(m, flush=True))
+
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
                             end_ns, time_source, "live", gap, cfg["key_id"],
-                            cfg.get("capture_policy"))
+                            cfg.get("capture_policy"), sensor)
     body_bytes, body = producer_sign(cfg["sk"], body_nosig)
     if len(body_bytes) >= ARTIFACT_LIMIT:
         raise SubmitError("%s: body is %d bytes, at/past the daemon's "
@@ -1741,6 +2118,14 @@ def process_live_segment(path, cfg, state, gap, ship):
     with open(body_out + ".tmp", "wb") as f:
         f.write(body_bytes)
     os.replace(body_out + ".tmp", body_out)
+    # The raw validator output, kept beside the segment it judged: the
+    # body carries only its sha256, so the bytes have to survive
+    # somewhere for that hash to be checkable.
+    if sensor_raw is not None:
+        val_out = os.path.join(out, name + ".validation.txt")
+        with open(val_out + ".tmp", "w") as f:
+            f.write(sensor_raw)
+        os.replace(val_out + ".tmp", val_out)
 
     if not ship(seg_out, body_out, name):
         raise SubmitError("%s: ship to spool failed (continuity not "
@@ -2314,6 +2699,7 @@ def main(argv=None):
     rp.add_argument("--data-dir", default=DATA_DIR)
     rp.add_argument("--sock", default=ONODE_SOCKET)
     _add_policy_args(rp)
+    _add_sensor_args(rp)
 
     lv = sub.add_parser("live",
                         help="CAPTURE HOST: capture live segments, "
@@ -2341,6 +2727,7 @@ def main(argv=None):
                     help="0600 file holding the rtsp:// URL (else "
                          "$VIRP_CAMERA_RTSP_URL)")
     _add_policy_args(lv)
+    _add_sensor_args(lv)
     lv.add_argument("--test-source", action="store_true",
                     help="no camera credential: capture a real-time "
                          "synthetic 720p source to exercise the path")
@@ -2425,6 +2812,9 @@ def main(argv=None):
             "sk": sk,
             "key_id": key_id,
             "capture_policy": policy,
+            "sensor_vendor": args.sensor_vendor,
+            "validator": args.validator,
+            "validator_lib_path": args.validator_lib_path,
         }
         try:
             run_replay(args.dir, cfg)
@@ -2475,6 +2865,9 @@ def main(argv=None):
                 if args.nominal_segment_s is not None
                 else args.segment_time,
                 args.jitter_s, args.max_unexplained_gap_s),
+            "sensor_vendor": args.sensor_vendor,
+            "validator": args.validator,
+            "validator_lib_path": args.validator_lib_path,
         }
         try:
             ship = sftp_ship(args.spool, ssh_key=args.ssh_key,
@@ -2559,6 +2952,22 @@ def main(argv=None):
     return 2
 
 
+def _add_sensor_args(sp):
+    """Where the per-segment sensor validator lives. Absent --sensor-
+    vendor the producer states UNSIGNED (Tapo, Reolink); present but
+    unrunnable it states UNVERIFIED (ruling #1). It never states
+    nothing."""
+    sp.add_argument("--sensor-vendor", default=None,
+                    help="vendor whose signed-video the camera emits, "
+                         "e.g. `axis`. Omit for a camera that does not "
+                         "sign (the record then says UNSIGNED).")
+    sp.add_argument("--validator", default=None,
+                    help="signed-video-framework validator binary; run "
+                         "per segment BEFORE the record is signed")
+    sp.add_argument("--validator-lib-path", default=None,
+                    help="prepended to LD_LIBRARY_PATH for the validator")
+
+
 def _add_policy_args(sp):
     """The signed capture-session policy, declared per run and remembered
     per data_dir (see capture_policy_resolve)."""
@@ -2612,6 +3021,31 @@ def _audit_axes_text(report, have_pubkey):
                          "(no time uncovered)"
                          % ("OVERLAP", o["after_seq"], o["seq"],
                             o["overlap_s"]))
+    sensor = report.get("sensor") or {}
+    if sensor:
+        lines.append("SENSOR SIGNATURE: %s" % sensor_axis(sensor))
+        for cam in sorted(sensor):
+            c = sensor[cam]
+            lines.append("  %-24s %s"
+                         % (cam, "  ".join(
+                             "%s=%d" % (v.lower(), c["verdicts"][v])
+                             for v in SENSOR_VERDICTS
+                             if c["verdicts"].get(v))))
+            if c["vendor"] or c["device_serial"]:
+                lines.append("      vendor=%s serial=%s firmware=%s "
+                             "validator=%s"
+                             % (c["vendor"], c["device_serial"],
+                                c["device_firmware"], c["validator"]))
+            if c["asserted_first_frame"] or c["asserted_last_frame"]:
+                # NEVER presented as a time this node observed. The
+                # camera's clock is the camera's claim; the O-node's
+                # receipt time is a different fact and lives elsewhere.
+                lines.append("      CAMERA-ASSERTED frame times (the "
+                             "camera's own clock, NOT observed here, "
+                             "NOT the O-node receipt time):")
+                lines.append("        first=%s  last=%s"
+                             % (c["asserted_first_frame"],
+                                c["asserted_last_frame"]))
     lines.append("CONTENT REUSE: %s" % report.get("reuse_axis", REUSE_NONE))
     for g in report.get("reuse") or []:
         lines.append("  %-22s %.16s… x%d  cam=%s seqs=%s Δseq=%d "
