@@ -1,0 +1,92 @@
+# virp-deployed-state.service — record what this node is actually
+# running, as a chained observation instead of a memory.
+#
+# NOT INSTALLED ON ANY NODE as of 2026-09-02. Tracked here, and listed
+# in unit-manifest.txt, so that a node which DOES install it gets the
+# same byte-identical comparison as every other unit.
+#
+# ── Why two ExecStart lines with different identities ────────────────
+#
+# Collection needs root and submission must not be root, and neither
+# can do the other's job:
+#
+#   The daemon sets PR_SET_DUMPABLE=0 as a key-exposure mitigation.
+#   That makes /proc/<pid>/exe unreadable to every uid but root — the
+#   daemon's OWN uid included, verified on virp-lab 2026-09-02. The
+#   running-binary hash is the single fact that exposes a rollback
+#   hiding behind an up-to-date binary on disk, so collection is
+#   root-only as a direct consequence of a mitigation we want.
+#
+#   uid 0 is deliberately excluded from socket_allowed_uids. A root
+#   client is refused at the peercred gate with "peer uid=0 not in
+#   socket_allowed_uids", so submission must run as the service user.
+#
+# systemd's `+` prefix runs one ExecStart as root regardless of User=,
+# which is exactly the split needed and is already the idiom
+# virp-onode.service uses for its ExecStartPre render step.
+#
+# ── What lands on the chain ──────────────────────────────────────────
+#
+# One deployed_state/1 document per run, appended as artifact_type
+# evidence_item. It requires `evidence_item` in ${VIRP_UID}'s
+# socket_uid_chain_append_types — see the note beside that key in
+# deploy/devices.template.json. Without it the daemon refuses the
+# append with -50 and this unit fails loudly, which is correct: a
+# reporter that silently stops reporting is worse than no reporter.
+#
+# ── What it does NOT do ──────────────────────────────────────────────
+#
+# It does not judge. Comparing a document against origin/main or
+# against yesterday's document is drift-check.sh's job, deliberately a
+# separate program that never touches a node and can therefore run from
+# a bundle, on a laptop, or in CI.
+
+[Unit]
+Description=VIRP deployed-state reporter — record what this node is actually running
+Documentation=file:/usr/local/lib/virp/deployed-state.sh
+After=virp-onode.service
+# Reporting on a daemon that is not running would mean reporting a
+# running binary for a process that does not exist. The collector
+# refuses that case on its own; this makes the ordering explicit too.
+Requires=virp-onode.service
+
+[Service]
+Type=oneshot
+User=virp
+Group=virp
+
+# The output directory, created narrowly and explicitly.
+#
+# StateDirectory= is deliberately NOT used: `StateDirectory=virp/state`
+# makes systemd manage /var/lib/virp itself, and on virp-lab that
+# directory carries a non-default mode and POSIX ACLs granting the
+# runbook accounts their reach. A reporter must not restat the tree it
+# reports on, and silently resetting an ACL is exactly the kind of
+# invisible change this whole tool exists to make visible.
+ExecStartPre=+/usr/bin/install -d -o virp -g virp -m 0755 /var/lib/virp/state
+
+# Collection: root, because /proc/<pid>/exe is root-only here.
+ExecStart=+/usr/local/lib/virp/deployed-state.sh --collect --out /var/lib/virp/state/deployed-state.json
+
+# Submission: the service user, because uid 0 cannot reach the socket.
+ExecStart=/usr/local/lib/virp/deployed-state.sh --submit --in /var/lib/virp/state/deployed-state.json
+
+# The reporter reads hashes and identifiers. It never opens the
+# credential store; this makes that structural rather than merely true
+# of the code as written today.
+InaccessiblePaths=-/etc/virp/autopilot.env
+
+PrivateTmp=true
+
+# ProtectHome is deliberately OFF. The home node's deploy tree is
+# /home/nhoward/virp, so hiding /home would make the collector report
+# "no deploy tree" on a node that plainly has one — a confident, wrong
+# report, which is the exact failure mode being fixed here.
+ProtectHome=false
+
+# NoNewPrivileges must stay off: the `+` ExecStart lines regain root
+# from User=virp, which NoNewPrivileges=yes would forbid.
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

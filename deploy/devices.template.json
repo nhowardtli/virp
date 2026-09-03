@@ -94,11 +94,13 @@
     ]
   },
   "_socket_uid_chain_append_types_note": "Per-uid chain_append TYPE policy (v0.2.1). A uid that may chain_append is restricted to exactly these artifact types; any allowlisted uid whose action set includes chain_append MUST appear here or the daemon refuses to start naming the uid. This REPLACES the v0.2.0 inference that any action-mapped uid was a federated principal narrowed to fed_* \u2014 which silently refused the local service accounts' real appends. The netclaw bridge's fed_* reach is now one row here, not a code path. Types use the 16-byte-truncated spellings the wire delivers (comparator_verdict -> comparator_verd, chainwalk_summary -> chainwalk_summa). Broker is absent because its relay allowlist has no chain_append.",
+  "_socket_uid_deployed_state_note": "${VIRP_UID} gains 'evidence_item' (2026-09-02) so the deployed-state reporter (tools/state/deployed-state.sh, unit virp-deployed-state.service) can land its deployed_state/1 document as a real BODY rather than a commitment-only hash that every reader would correctly grade UNVERIFIABLE. It is a deliberate, small widening and it is written here rather than reused from another identity: 'observation' WITH a body needs a GATE 3 signature under the O-Key the reporter does not hold, and a purpose-built 'deployed_state' type would mean editing the fixed C array in virp_chain_type_is_external_allowed(), rebuilding and redeploying every node. ${VIRP_UID} is the node's OWN service account and a deployed-state document is the node's self-report, which is why it is the right identity here rather than virp-evidence's \u2014 each automation owning its own identity is the standing policy, and borrowing the evidence collector's would break it. ${VIRP_UID} could already append 'observation', the type GATE 3 guards most strictly, so this adds a plain-JSON evidence body to an account that is strictly more privileged than virp-evidence, which has held exactly this type since 2026-07-30. NOT YET ON ANY BOX: this row lands at the next deploy.",
   "socket_uid_chain_append_types": {
     "${VIRP_UID}": [
       "observation",
       "comparator_verd",
-      "chainwalk_summa"
+      "chainwalk_summa",
+      "evidence_item"
     ],
     "1000": [
       "observation",
