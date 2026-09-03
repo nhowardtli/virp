@@ -3512,40 +3512,75 @@ static bool peer_uid_allowed(onode_state_t *state, int client_fd,
  * body whose citation cannot be checked, which is the case the gate
  * exists to stop.
  */
-static bool fed_outcome_observation_hash(const char *body, char out_hex[65])
-{
-    if (!body) return false;
-    cJSON *root = cJSON_Parse(body);
-    if (!root) return false;
+/* Which body a fed_outcome says it is backed by. Exactly one citation
+ * may be present: an outcome cannot be backed by signed evidence AND by
+ * an account of why there is no signed evidence. */
+typedef enum {
+    FED_CITE_NONE = 0,
+    FED_CITE_OBSERVATION,  /* observation_sha256 -> observation types  */
+    FED_CITE_ERROR         /* error_sha256       -> fed_error          */
+} fed_cite_kind_t;
 
-    bool ok = false;
-    if (cJSON_IsObject(root)) {
-        const cJSON *cite = NULL;
-        int matches = 0;
-        for (const cJSON *m = root->child; m; m = m->next) {
-            if (m->string && strcmp(m->string, "observation_sha256") == 0) {
-                matches++;
-                cite = m;
-            }
+/* Read one root-level member as a 64-hex string. Root-level and
+ * exactly-once by design: a nested or repeated field would let an
+ * outcome carry a citation an auditor reading the top of the body does
+ * not see. */
+static bool fed_hash_member(const cJSON *root, const char *name,
+                            char out_hex[65])
+{
+    const cJSON *cite = NULL;
+    int matches = 0;
+    for (const cJSON *m = root->child; m; m = m->next) {
+        if (m->string && strcmp(m->string, name) == 0) {
+            matches++;
+            cite = m;
         }
-        if (matches == 1 && cJSON_IsString(cite) && cite->valuestring) {
-            const char *v = cite->valuestring;
-            size_t len = strlen(v);
-            if (len == 64) {
-                ok = true;
-                for (size_t i = 0; i < 64; i++) {
-                    char c = v[i];
-                    bool hex = (c >= '0' && c <= '9') ||
-                               (c >= 'a' && c <= 'f');
-                    if (!hex) { ok = false; break; }
-                    out_hex[i] = c;
-                }
-                if (ok) out_hex[64] = '\0';
-            }
+    }
+    if (matches != 1 || !cJSON_IsString(cite) || !cite->valuestring)
+        return false;
+    const char *v = cite->valuestring;
+    if (strlen(v) != 64) return false;
+    for (size_t i = 0; i < 64; i++) {
+        char c = v[i];
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!hex) return false;
+        out_hex[i] = c;
+    }
+    out_hex[64] = '\0';
+    return true;
+}
+
+static fed_cite_kind_t fed_outcome_citation(const char *body,
+                                            char out_hex[65],
+                                            bool *claims_executed)
+{
+    if (claims_executed) *claims_executed = false;
+    if (!body) return FED_CITE_NONE;
+    cJSON *root = cJSON_Parse(body);
+    if (!root) return FED_CITE_NONE;
+
+    fed_cite_kind_t kind = FED_CITE_NONE;
+    if (cJSON_IsObject(root)) {
+        char obs[65], err[65];
+        bool has_obs = fed_hash_member(root, "observation_sha256", obs);
+        bool has_err = fed_hash_member(root, "error_sha256", err);
+        /* Both present is not "more evidence", it is an outcome that
+         * cannot be graded — refused, same as neither. */
+        if (has_obs && !has_err) {
+            memcpy(out_hex, obs, 65);
+            kind = FED_CITE_OBSERVATION;
+        } else if (has_err && !has_obs) {
+            memcpy(out_hex, err, 65);
+            kind = FED_CITE_ERROR;
+        }
+        if (claims_executed) {
+            const cJSON *ex = cJSON_GetObjectItemCaseSensitive(root,
+                                                               "executed");
+            *claims_executed = cJSON_IsTrue(ex);
         }
     }
     cJSON_Delete(root);
-    return ok;
+    return kind;
 }
 
 /*
@@ -4145,45 +4180,94 @@ static void handle_client(onode_state_t *state, int client_fd,
          * hash in artifacts" probe, so a fed_request body with hash H
          * satisfied an outcome citing H: request bodies are stored in
          * artifacts too, and the type-restricted check never ran for a
-         * hash that was stored. An outcome may be backed by an
-         * observation and by nothing else. Whether the observation's
+         * hash that was stored. Whether the observation's
          * BYTES were retained is deliberately not asked here: a
          * commitment-only (oversized) observation is backed by its
          * signed entry and its outcome must land (2026-08-18
          * regression, correlations 42b7b9dc / c5373129); a reader
-         * grades the un-retained body UNVERIFIABLE, not PASS. */
+         * grades the un-retained body UNVERIFIABLE, not PASS.
+         *
+         * TWO CITATIONS, ONE RULE (2026-09-03). An outcome is backed by
+         * an observation (`observation_sha256`) or by a fed_error
+         * (`error_sha256`), never both and never neither — and the
+         * error-backed form may not claim execution. The rule that
+         * matters has not moved: an outcome must name a body the chain
+         * actually commits to, of the type its claim requires. What
+         * changed is that "the exchange ended before an observation
+         * existed" is now a claim the bridge can make ON the chain
+         * instead of a pair it has to leave open. */
         if (strcmp(req.artifact_type, "fed_outcome") == 0) {
             char cited[65];
-            if (req.artifact_content[0] == '\0' ||
-                !fed_outcome_observation_hash(req.artifact_content, cited)) {
+            bool claims_executed = false;
+            fed_cite_kind_t kind = FED_CITE_NONE;
+            if (req.artifact_content[0] != '\0')
+                kind = fed_outcome_citation(req.artifact_content, cited,
+                                            &claims_executed);
+            if (kind == FED_CITE_NONE) {
                 fprintf(stderr, "[O-Node] chain_append REJECTED: fed_outcome "
-                        "carries no readable observation_sha256 — an outcome "
-                        "must cite the signed body it reports on, as exactly "
-                        "one root-level 64-hex string (session=%s id=%s)\n",
+                        "carries no readable citation — an outcome must name "
+                        "the body it reports on as exactly ONE root-level "
+                        "64-hex string, either observation_sha256 (the "
+                        "signed observation) or error_sha256 (the fed_error "
+                        "saying why there is none), never both and never "
+                        "null (session=%s id=%s)\n",
                         req.session_id, req.artifact_id);
                 send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
                 break;
             }
+
+            /* An error-backed outcome may report that something did NOT
+             * happen and why. It may not report that something DID.
+             *
+             * This is the whole reason fed_error is safe to admit. The
+             * bridge holds no key and can never produce signed evidence;
+             * without this line it could nonetheless write "executed:
+             * true" into the chain backed by nothing but its own account
+             * of a failure, and a reader joining outcomes to observations
+             * would see a completed command with no observation and no
+             * way to tell that from a retention gap. Execution is a claim
+             * only a signed observation can carry. */
+            if (kind == FED_CITE_ERROR && claims_executed) {
+                fprintf(stderr, "[O-Node] chain_append REJECTED: fed_outcome "
+                        "cites error_sha256 %s but claims executed:true — an "
+                        "outcome backed only by a fed_error may not claim a "
+                        "command ran; that claim requires a signed "
+                        "observation (session=%s id=%s)\n",
+                        cited, req.session_id, req.artifact_id);
+                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+                break;
+            }
+
             bool committed = false;
-            virp_error_t eerr = virp_chain_entry_commits_to(
-                                    &state->chain, cited, &committed);
+            virp_error_t eerr =
+                (kind == FED_CITE_ERROR)
+                    ? virp_chain_error_entry_commits_to(&state->chain, cited,
+                                                        &committed)
+                    : virp_chain_entry_commits_to(&state->chain, cited,
+                                                  &committed);
             if (eerr != VIRP_OK) {
                 fprintf(stderr, "[O-Node] chain_append REJECTED: could "
                         "not check whether the chain commits to "
-                        "fed_outcome's cited observation %s (session=%s "
-                        "id=%s err=%s)\n", cited, req.session_id,
+                        "fed_outcome's cited %s %s (session=%s "
+                        "id=%s err=%s)\n",
+                        kind == FED_CITE_ERROR ? "error body" : "observation",
+                        cited, req.session_id,
                         req.artifact_id, virp_error_str(eerr));
                 send_framed_error(client_fd, eerr);
                 break;
             }
             if (!committed) {
                 fprintf(stderr, "[O-Node] chain_append REJECTED: "
-                        "fed_outcome cites %s, which no observation entry "
-                        "commits to — append the fed_observation before "
-                        "the outcome that names it; a request or any other "
-                        "type carrying that hash does not count "
+                        "fed_outcome cites %s, which no %s entry "
+                        "commits to — append the %s before the outcome "
+                        "that names it; a request or any other type "
+                        "carrying that hash does not count "
                         "(session=%s id=%s)\n",
-                        cited, req.session_id, req.artifact_id);
+                        cited,
+                        kind == FED_CITE_ERROR ? "fed_error" : "observation",
+                        kind == FED_CITE_ERROR ? "fed_error"
+                                               : "fed_observation",
+                        req.session_id, req.artifact_id);
                 send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
                 break;
             }
@@ -5792,7 +5876,8 @@ virp_error_t onode_start(onode_state_t *state)
                         "can append to the chain must name the artifact "
                         "types it may append (the netclaw bridge is "
                         "\"%u\": [\"fed_request\",\"fed_observation\","
-                        "\"fed_outcome\"]; the autopilot is [\"observation"
+                        "\"fed_outcome\",\"fed_error\"]; the autopilot "
+                        "is [\"observation"
                         "\",\"comparator_verd\",\"chainwalk_summa\"]). "
                         "Refusing to start.\n",
                         (unsigned)uid, (unsigned)uid);

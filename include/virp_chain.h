@@ -557,6 +557,20 @@ virp_error_t virp_chain_entry_commits_to(virp_chain_state_t *state,
                                          bool *exists);
 
 /*
+ * Set *exists to true iff a chain ENTRY of type 'fed_error' commits to
+ * the given artifact_hash. The other half of GATE 4's question: an
+ * outcome that cites `error_sha256` is backed by the bridge's own
+ * hash-committed account of why the exchange ended, never by signed
+ * evidence — such an outcome may not claim execution. Deliberately a
+ * separate entry point from virp_chain_entry_commits_to() so the two
+ * questions cannot be confused by passing a type string.
+ * Returns VIRP_OK on a successful query (matched or not).
+ */
+virp_error_t virp_chain_error_entry_commits_to(virp_chain_state_t *state,
+                                               const char *artifact_hash,
+                                               bool *exists);
+
+/*
  * Count committed gate_intent entries whose body cites approval_entry_hash
  * (Sep 1 review, Task 5 / 1.1). The daemon's apply-time replay guard: a
  * count >= 1 before appending a new intent for an approved apply means the

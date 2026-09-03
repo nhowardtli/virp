@@ -6655,6 +6655,115 @@ TEST(test_chain_append_refuses_fed_outcome_without_observation_hash)
     ASSERT_EQ(ca_count_entries("ncfed-out-null-1"), 0);
 }
 
+/*
+ * GATE 4, error-backed form (2026-09-03). An exchange that dies before an
+ * observation exists — device not found on a daemon that answers with a
+ * typed error, a socket that vanishes mid-call — used to leave a
+ * fed_request on the chain with no outcome, because there was nothing the
+ * outcome could legally cite. A verifier reading that could not tell an
+ * honest terminal refusal from a bridge that died halfway.
+ *
+ * A `fed_error` closes it: a commitment body, no signature and none
+ * claimed, cited by the outcome as error_sha256. Everything GATE 4
+ * already enforced still holds — the cited body must be committed to, by
+ * an entry of the type the FIELD NAME promises — plus one rule that is
+ * the whole reason this is safe to admit: an error-backed outcome may
+ * never claim a command ran.
+ */
+TEST(test_gate4_error_backed_outcome_closes_the_pair)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    char body[1024], h[65], hout[65];
+
+    /* The error body itself. Plain JSON, no signature — and it lands,
+     * because fed_error is a commitment type and GATE 3 does not apply
+     * to it. That is the difference from fed_observation, which carries
+     * a signature and is verified. */
+    const char *err_body =
+        "{\"schema\":\"federated_error/1\",\"device\":\"nope\","
+        "\"payload\":{\"error_class\":\"transport\","
+        "\"error_code\":-30,\"message\":\"typed error\"}}";
+    ca_sha256_hex(err_body, h);
+    ssize_t n = ca_append("ncfed-g4-err", "fed_error", "g4-err-1", h,
+                          err_body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("g4-err-1"), 1);
+
+    /* (1) the close: cites the error body, claims nothing ran. Lands. */
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"failed\","
+             "\"executed\":false,\"error_sha256\":\"%s\"}", h);
+    ca_sha256_hex(body, hout);
+    n = ca_append("ncfed-g4-err", "fed_outcome", "g4-err-out", hout, body,
+                  resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+    ASSERT_EQ(ca_count_entries("g4-err-out"), 1);
+
+    /* (2) the same citation claiming EXECUTION. Refused: "it ran" is a
+     *     claim only a signed observation can carry, and the bridge that
+     *     writes these holds no key. */
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"executed\","
+             "\"executed\":true,\"error_sha256\":\"%s\"}", h);
+    ca_sha256_hex(body, hout);
+    n = ca_append("ncfed-g4-err", "fed_outcome", "g4-err-claims-exec", hout,
+                  body, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("g4-err-claims-exec"), 0);
+
+    /* (3) an error citation nothing committed to. The dangling-pointer
+     *     rule is not relaxed for the new field. */
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"failed\","
+             "\"executed\":false,\"error_sha256\":\"%s\"}",
+             "00000000000000000000000000000000000000000000000000000000000000ff");
+    ca_sha256_hex(body, hout);
+    n = ca_append("ncfed-g4-err", "fed_outcome", "g4-err-dangling", hout,
+                  body, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("g4-err-dangling"), 0);
+
+    /* (4) CROSS-TYPE: the error body's hash cited as observation_sha256.
+     *     The field name promises signed evidence; a fed_error is not
+     *     that, and letting this pass would make the new type a way to
+     *     launder an unsigned body into an observation citation. */
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"failed\","
+             "\"executed\":false,\"observation_sha256\":\"%s\"}", h);
+    ca_sha256_hex(body, hout);
+    n = ca_append("ncfed-g4-err", "fed_outcome", "g4-err-crosstype", hout,
+                  body, resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("g4-err-crosstype"), 0);
+
+    /* (5) BOTH citations. Not more evidence — an outcome that cannot be
+     *     graded, so refused exactly as hard as citing neither. The
+     *     observation half is a genuinely committed one, so this fails
+     *     only on the ambiguity. */
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = ca_mint_v1_obs(obs, sizeof(obs), 9105);
+    ASSERT_TRUE(olen > 0);
+    char hobs[65];  ca_sha256_hex_bin(obs, olen, hobs);
+    char obs_body[2048]; ca_b64_body(obs, olen, obs_body, sizeof(obs_body));
+    n = ca_append("ncfed-g4-err", "fed_observation", "g4-err-obs", hobs,
+                  obs_body, resp, sizeof(resp));
+    ASSERT_TRUE(n > 4);
+
+    snprintf(body, sizeof(body),
+             "{\"schema\":\"federated_outcome/1\",\"outcome\":\"failed\","
+             "\"executed\":false,\"observation_sha256\":\"%s\","
+             "\"error_sha256\":\"%s\"}", hobs, h);
+    ca_sha256_hex(body, hout);
+    n = ca_append("ncfed-g4-err", "fed_outcome", "g4-err-both", hout, body,
+                  resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    ASSERT_EQ(ca_count_entries("g4-err-both"), 0);
+}
+
 /* GATE 3 covers fed_observation exactly as it covers observation. The
  * new type is a namespace for a restricted principal, not an exemption:
  * arbitrary JSON that hashes to its own commitment is still not a signed
@@ -8106,6 +8215,7 @@ int main(int argc, char **argv)
         RUN_TEST(test_gate4_requires_exactly_one_root_level_citation);
         RUN_TEST(test_chain_append_accepts_fed_outcome_for_commitment_only_observation);
         RUN_TEST(test_chain_append_refuses_fed_outcome_without_observation_hash);
+        RUN_TEST(test_gate4_error_backed_outcome_closes_the_pair);
         RUN_TEST(test_chain_append_fed_observation_must_be_signed);
         RUN_TEST(test_chain_append_refuses_fed_retry_with_different_bytes);
         RUN_TEST(test_chain_append_refuses_fed_outcome_retry_with_different_bytes);
