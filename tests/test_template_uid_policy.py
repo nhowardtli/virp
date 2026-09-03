@@ -201,15 +201,20 @@ class CanonicalTemplateTests(_PolicyChecks, unittest.TestCase):
                          {"list_fleet", "health", "chain_verify",
                           "chain_append", "execute"})
 
-    def test_netclaw_chain_append_is_the_federation_triple(self):
-        # whatever the verb set, 993's chain_append reach is the fed_* triple
-        # and nothing else. Measured against 30 days of the reference node's
-        # own chain on 2026-09-02: since 2026-08-11, when 993 entered
-        # socket_uid_action_allow, it has appended only these three types.
+    def test_netclaw_chain_append_is_the_federation_set(self):
+        # whatever the verb set, 993's chain_append reach is the federation
+        # types and nothing else. The first three were measured against 30
+        # days of the reference node's own chain on 2026-09-02: since
+        # 2026-08-11, when 993 entered socket_uid_action_allow, it appended
+        # only those. "fed_error" (2026-09-03) is the one addition that was
+        # NOT measured but designed — the body a fed_outcome cites when the
+        # exchange died before an observation existed, so an error path
+        # closes its pair instead of leaving a request standing alone.
         types = self.doc.get("socket_uid_chain_append_types")
         self.assertIsInstance(types, dict)
         self.assertEqual(set(types[UIDS["VIRP_NETCLAW_UID"]]),
-                         {"fed_request", "fed_observation", "fed_outcome"})
+                         {"fed_request", "fed_observation", "fed_outcome",
+                          "fed_error"})
 
     def test_broker_matches_its_own_relay_allowlist(self):
         src = open(os.path.join(ROOT, "broker", "virp_broker.py")).read()

@@ -445,7 +445,8 @@ static char *load_socket_path_override(struct json_object *root)
  *       "999": ["observation", "comparator_verd", "chainwalk_summa"],
  *       "997": ["observation", "no_drift", "baseline_set", "drift_alert"],
  *       "995": ["observation", "evidence_item"],
- *       "993": ["fed_request", "fed_observation", "fed_outcome"]
+ *       "993": ["fed_request", "fed_observation", "fed_outcome",
+ *                "fed_error"]
  *   }
  *
  * A uid that may chain_append is restricted to exactly these artifact
