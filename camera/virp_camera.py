@@ -80,6 +80,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -91,6 +92,7 @@ import time
 SCHEMA_V1 = "camera_segment/1"
 SCHEMA_V2 = "camera_segment/2"
 SCHEMA_V3 = "camera_segment/3"
+SCHEMA_V4 = "camera_segment/4"
 # What this producer emits when a capture policy is declared (always,
 # from the CLI). SCHEMA_V1 remains emitted only by callers that pass no
 # policy, and remains READABLE forever: 2553 live records carry it and
@@ -98,8 +100,8 @@ SCHEMA_V3 = "camera_segment/3"
 # signed capture_policy; SCHEMA_V3 is /2 plus the sensor_signature —
 # what the CAMERA asserts about its own video, which is a different
 # fact from anything this host can observe.
-SCHEMA = SCHEMA_V3
-SCHEMAS = (SCHEMA_V1, SCHEMA_V2, SCHEMA_V3)
+SCHEMA = SCHEMA_V4
+SCHEMAS = (SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4)
 
 # ── The sensor's own claim ─────────────────────────────────────────────
 #
@@ -124,13 +126,45 @@ SENSOR_VERDICTS = (SENSOR_VALID, SENSOR_INVALID, SENSOR_UNSIGNED,
 
 # The field set IS the schema, one level down: every key is present in
 # every record, and an unavailable value is null. Nothing optional.
-SENSOR_SIGNATURE_KEYS = (
+# The field set IS the schema one level down, so GROWING THIS OBJECT IS
+# A VERSION BUMP. /3 records are already signed and on the chain with
+# the 13-key form; they can never gain a field, and a verifier that
+# quietly accepted both sizes would have given up the very rule that
+# stops anyone appending a verdict to frozen history. /4 adds the leaf
+# pin. /3 stays READABLE forever and is never emitted again.
+SENSOR_SIGNATURE_KEYS_V3 = (
     "vendor", "validator", "verdict", "public_key",
     "gops_valid", "gops_valid_with_missing", "gops_invalid",
     "gops_unsigned", "device_serial", "device_firmware",
     "asserted_first_frame", "asserted_last_frame",
     "validator_output_sha256",
 )
+SENSOR_SIGNATURE_KEYS = SENSOR_SIGNATURE_KEYS_V3 + (
+    "public_key_pin", "sensor_key_sha256",
+)
+SENSOR_KEYS_BY_SCHEMA = {
+    SCHEMA_V3: frozenset(SENSOR_SIGNATURE_KEYS_V3),
+    SCHEMA_V4: frozenset(SENSOR_SIGNATURE_KEYS),
+}
+
+# The leaf pin. `public_key` is the FRAMEWORK's opinion of the key it
+# used; `public_key_pin` is OURS — whether the key in the stream is the
+# one we pinned out of band for this camera. They are separate questions
+# and a record carries both.
+#
+# A MISMATCH IS NOT A TAMPER CLAIM. The bytes may be perfectly authentic
+# footage from a camera we did not pin; calling that INVALID would accuse
+# a device of tampering when the honest statement is "this is not the
+# device we pinned". So a mismatch grades UNVERIFIED — we could not
+# establish the source — and the key state is recorded either way.
+PIN_MATCH = "MATCH"
+PIN_MISMATCH = "MISMATCH"
+PIN_NO_KEY_IN_STREAM = "NO_KEY_IN_STREAM"
+PIN_UNREADABLE = "PIN_UNREADABLE"
+SENSOR_PUBKEY_FILE = "sensor_pubkey.pem"
+
+_PEM_PUBLIC_KEY = re.compile(
+    rb"-----BEGIN PUBLIC KEY-----.*?-----END PUBLIC KEY-----", re.S)
 
 VALIDATOR_NAME = "signed-video-framework"
 VALIDATOR_RESULTS_FILE = "validation_results.txt"
@@ -639,7 +673,8 @@ def gap_defect(gap, segment_seq, prev_seq):
 # caller turns that into UNVERIFIED — it never guesses.
 
 def _sensor_blank():
-    """The object with every key present and nothing asserted."""
+    """The object with every key present and nothing asserted, in the
+    shape this producer currently emits (%s)."""
     return {k: None for k in SENSOR_SIGNATURE_KEYS}
 
 
@@ -691,6 +726,42 @@ _TEXT_FIELDS = (
     ("First frame:", "asserted_first_frame"),
     ("Last validated frame:", "asserted_last_frame"),
 )
+
+
+def extract_sensor_public_key(path):
+    """The signing public key as carried in the stream's SEI, PEM text,
+    or None. Axis writes it in the clear once per signed GOP; every copy
+    in a segment is the same key, and this returns the first.
+
+    This is deliberately OUR OWN read of the bitstream rather than
+    something asked of the framework: the validation API has no getter
+    for the key it used, so a producer that wanted to know WHICH key
+    verified would otherwise have to take the framework's word for it."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    m = _PEM_PUBLIC_KEY.search(data)
+    return m.group(0).decode("ascii", "replace") if m else None
+
+
+def _pin_state(observed_pem, pin_path):
+    """(pin_state, pinned_pem_or_None). Never raises."""
+    if pin_path is None:
+        return None, None
+    try:
+        with open(pin_path, "r") as f:
+            pinned = f.read()
+    except OSError:
+        return PIN_UNREADABLE, None
+    if _PEM_PUBLIC_KEY.search(pinned.encode()) is None:
+        return PIN_UNREADABLE, None
+    if observed_pem is None:
+        return PIN_NO_KEY_IN_STREAM, pinned
+    a = "".join(observed_pem.split())
+    b = "".join(pinned.split())
+    return (PIN_MATCH if a == b else PIN_MISMATCH), pinned
 
 
 def parse_validation_results(text):
@@ -746,7 +817,7 @@ def parse_validation_results(text):
 
 
 def run_sensor_validator(seg_path, vendor=None, validator=None,
-                         lib_path=None, log=None):
+                         lib_path=None, log=None, sensor_pubkey=None):
     """Validate ONE segment before its record is signed. Returns
     (sensor_signature, raw_validation_text_or_None).
 
@@ -757,11 +828,36 @@ def run_sensor_validator(seg_path, vendor=None, validator=None,
     if vendor is None:
         return sensor_signature_unsigned(), None
 
+    # Our own read of the stream's key, decided BEFORE the framework is
+    # asked anything — so a wrong-camera clip is never mistaken for a
+    # tampered one.
+    observed = extract_sensor_public_key(seg_path)
+    key_sha = (hashlib.sha256(observed.encode()).hexdigest()
+               if observed else None)
+    pin, _pinned = _pin_state(observed, sensor_pubkey)
+
     def _unverified(why):
         if log:
             log("sensor-signature UNVERIFIED (%s): %s"
                 % (os.path.basename(seg_path), why))
-        return sensor_signature_unverified(vendor), None
+        s = sensor_signature_unverified(vendor)
+        s["public_key_pin"] = pin
+        s["sensor_key_sha256"] = key_sha
+        return s, None
+
+    if pin == PIN_UNREADABLE:
+        return _unverified("pinned key %r is missing or not a PEM public "
+                           "key — refusing to fall back to whatever key "
+                           "the stream carries" % sensor_pubkey)
+    if pin == PIN_NO_KEY_IN_STREAM:
+        return _unverified("a key is pinned for this camera but the "
+                           "segment carries none")
+    if pin == PIN_MISMATCH:
+        # NOT INVALID: authentic footage from an unpinned device looks
+        # exactly like this, and we will not call that tampering.
+        return _unverified("the segment is signed by a key that is not "
+                           "the one pinned for this camera (observed "
+                           "sha256 %s)" % (key_sha or "none"))
 
     if not validator or not os.path.exists(validator):
         return _unverified("no validator at %r" % validator)
@@ -776,8 +872,13 @@ def run_sensor_validator(seg_path, vendor=None, validator=None,
         # the tool writes validation_results.txt into its CWD, so give it
         # a private one rather than whatever directory we happen to be in
         try:
-            subprocess.run([validator, "-c", "h264",
-                            os.path.abspath(seg_path)],
+            argv = [validator, "-c", "h264"]
+            if sensor_pubkey:
+                # verify against the key WE hold, not one the framework
+                # lifted out of the stream it is judging
+                argv += ["-p", os.path.abspath(sensor_pubkey)]
+            argv.append(os.path.abspath(seg_path))
+            subprocess.run(argv,
                            cwd=work, env=env,
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL,
@@ -806,12 +907,16 @@ def run_sensor_validator(seg_path, vendor=None, validator=None,
         # UNVERIFIED auditable after the fact
         s = sensor_signature_unverified(vendor)
         s["validator_output_sha256"] = digest
+        s["public_key_pin"] = pin
+        s["sensor_key_sha256"] = key_sha
         if log:
             log("sensor-signature UNVERIFIED (%s): %s"
                 % (os.path.basename(seg_path), e))
         return s, raw_bytes.decode("utf-8", "replace")
     sensor["vendor"] = vendor
     sensor["validator_output_sha256"] = digest
+    sensor["public_key_pin"] = pin
+    sensor["sensor_key_sha256"] = key_sha
     return sensor, text
 
 
@@ -823,18 +928,23 @@ def sensor_for_segment(path, cfg, log=None):
     return run_sensor_validator(
         path, vendor=cfg.get("sensor_vendor"),
         validator=cfg.get("validator"),
-        lib_path=cfg.get("validator_lib_path"), log=log)
+        lib_path=cfg.get("validator_lib_path"),
+        sensor_pubkey=cfg.get("sensor_pubkey"), log=log)
 
 
-def sensor_defect(sensor):
-    """Why this object may not be signed into a body, or None."""
+def sensor_defect(sensor, schema=SCHEMA_V4):
+    """Why this object may not be signed into (or read out of) a body at
+    `schema`, or None. Each version has ONE permitted field set."""
     if not isinstance(sensor, dict):
         return "sensor_signature must be an object"
-    if set(sensor) != set(SENSOR_SIGNATURE_KEYS):
-        missing = sorted(set(SENSOR_SIGNATURE_KEYS) - set(sensor))
-        extra = sorted(set(sensor) - set(SENSOR_SIGNATURE_KEYS))
-        return ("sensor_signature field set is the schema (missing=%s "
-                "extra=%s)" % (missing, extra))
+    want = SENSOR_KEYS_BY_SCHEMA.get(schema)
+    if want is None:
+        return "%s carries no sensor_signature field set" % schema
+    if set(sensor) != want:
+        missing = sorted(want - set(sensor))
+        extra = sorted(set(sensor) - want)
+        return ("sensor_signature field set is the schema at %s "
+                "(missing=%s extra=%s)" % (schema, missing, extra))
     if sensor.get("verdict") not in SENSOR_VERDICTS:
         return ("sensor_signature verdict %r is not one of %s"
                 % (sensor.get("verdict"), ", ".join(SENSOR_VERDICTS)))
@@ -890,7 +1000,7 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
     elif sensor is None:
         schema = SCHEMA_V2
     else:
-        schema = SCHEMA_V3
+        schema = SCHEMA_V4
     body = {
         "schema": schema,
         "camera_id": camera_id,
@@ -1432,7 +1542,7 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
                                 "pass it"
                                 % (session_id, artifact_id, schema))
             continue
-        if (schema in (SCHEMA_V2, SCHEMA_V3)
+        if (schema in (SCHEMA_V2, SCHEMA_V3, SCHEMA_V4)
                 and _body_policy(body) is None):
             failures.append("%s %s: %s carries no usable capture_policy"
                             % (session_id, artifact_id, schema))
@@ -1441,15 +1551,15 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
         # /1 body that has grown a sensor_signature was not built by this
         # producer, and grading it as though it were would let anyone
         # append a verdict to frozen history.
-        if schema == SCHEMA_V3:
+        if schema in SENSOR_KEYS_BY_SCHEMA:
             if _body_sensor(body) is None:
                 failures.append("%s %s: %s carries no usable "
                                 "sensor_signature"
                                 % (session_id, artifact_id, schema))
         elif "sensor_signature" in body:
             failures.append("%s %s: %s carries a sensor_signature, which "
-                            "exists only at %s — this record was not "
-                            "built by this producer"
+                            "exists only at %s and later — this record "
+                            "was not built by this producer"
                             % (session_id, artifact_id, schema, SCHEMA_V3))
         cam_bodies.append((session_id, artifact_id, body))
 
@@ -1556,7 +1666,7 @@ _COVERAGE_RANK = {COVERAGE_CONTINUOUS: 0, COVERAGE_ACCOUNTED: 1,
 def _body_policy(body):
     """The usable capture_policy of a body, or None. A /1 record has
     none by construction — that is UNDECLARED, not zero tolerance."""
-    if body.get("schema") not in (SCHEMA_V2, SCHEMA_V3):
+    if body.get("schema") not in (SCHEMA_V2, SCHEMA_V3, SCHEMA_V4):
         return None
     p = body.get("capture_policy")
     if not isinstance(p, dict):
@@ -1629,13 +1739,15 @@ def grade_sensor(cam_bodies):
 
 
 def _body_sensor(body):
-    """The usable sensor_signature of a body, or None. A /1 or /2 record
-    has none by construction — that is not "unsigned video", it is a
-    record from before the question was asked."""
-    if body.get("schema") != SCHEMA_V3:
+    """The usable sensor_signature of a body, or None, judged against the
+    field set of the body's OWN version. A /1 or /2 record has none by
+    construction — that is not "unsigned video", it is a record from
+    before the question was asked."""
+    schema = body.get("schema")
+    if schema not in SENSOR_KEYS_BY_SCHEMA:
         return None
     s = body.get("sensor_signature")
-    return None if sensor_defect(s) else s
+    return None if sensor_defect(s, schema) else s
 
 
 def grade_coverage(cam_bodies):
@@ -2815,6 +2927,7 @@ def main(argv=None):
             "sensor_vendor": args.sensor_vendor,
             "validator": args.validator,
             "validator_lib_path": args.validator_lib_path,
+            "sensor_pubkey": _resolve_sensor_pubkey(args),
         }
         try:
             run_replay(args.dir, cfg)
@@ -2868,6 +2981,7 @@ def main(argv=None):
             "sensor_vendor": args.sensor_vendor,
             "validator": args.validator,
             "validator_lib_path": args.validator_lib_path,
+            "sensor_pubkey": _resolve_sensor_pubkey(args),
         }
         try:
             ship = sftp_ship(args.spool, ssh_key=args.ssh_key,
@@ -2952,6 +3066,16 @@ def main(argv=None):
     return 2
 
 
+def _resolve_sensor_pubkey(args):
+    """--sensor-pubkey, else the data_dir's pinned key if one is there.
+    A pin that exists is never ignored just because it was not named on
+    the command line."""
+    if args.sensor_pubkey:
+        return args.sensor_pubkey
+    default = os.path.join(args.data_dir, SENSOR_PUBKEY_FILE)
+    return default if os.path.exists(default) else None
+
+
 def _add_sensor_args(sp):
     """Where the per-segment sensor validator lives. Absent --sensor-
     vendor the producer states UNSIGNED (Tapo, Reolink); present but
@@ -2966,6 +3090,13 @@ def _add_sensor_args(sp):
                          "per segment BEFORE the record is signed")
     sp.add_argument("--validator-lib-path", default=None,
                     help="prepended to LD_LIBRARY_PATH for the validator")
+    sp.add_argument("--sensor-pubkey", default=None,
+                    help="PEM public key PINNED for this camera, obtained "
+                         "out of band (default: <data-dir>/%s if present). "
+                         "The validator verifies against THIS key, and a "
+                         "segment signed by any other grades UNVERIFIED — "
+                         "never INVALID, which would call an unpinned "
+                         "camera a tampered one." % SENSOR_PUBKEY_FILE)
 
 
 def _add_policy_args(sp):

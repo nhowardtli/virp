@@ -57,6 +57,11 @@ VALIDATOR = os.environ.get(
     os.path.expanduser("~/svf-examples/build/apps/validator/validator"))
 VALIDATOR_LIB = os.environ.get(
     "VIRP_SVF_LIB", "/usr/local/lib/x86_64-linux-gnu")
+# a real signed clip whose signing key is NOT the camera's
+OTHER_CLIP = os.environ.get(
+    "VIRP_OTHER_CLIP",
+    os.path.expanduser("~/svf-examples/test-files/signed_test_h264.mp4"))
+have_other = os.path.exists(OTHER_CLIP)
 
 have_clip = os.path.exists(AXIS_CLIP)
 have_validator = os.path.exists(VALIDATOR)
@@ -304,6 +309,98 @@ class RealValidatorTests(unittest.TestCase):
         self.assertEqual(s["verdict"], vc.SENSOR_INVALID)
 
 
+# ── The leaf pin: is this OUR camera's key? ────────────────────────────
+
+class KeyExtractionTests(unittest.TestCase):
+    """The signing public key travels in the clear in the SEI, once per
+    signed GOP. Reading it is what lets the producer answer a question
+    the framework does not: not "did this verify", but "did this verify
+    under the key WE pinned, out of band, for THIS camera"."""
+
+    @unittest.skipUnless(have_clip, "needs the real Axis clip")
+    def test_the_key_is_recoverable_from_the_sei(self):
+        pem = vc.extract_sensor_public_key(AXIS_CLIP)
+        self.assertIsNotNone(pem)
+        self.assertTrue(pem.startswith("-----BEGIN PUBLIC KEY-----"))
+        self.assertTrue(pem.rstrip().endswith("-----END PUBLIC KEY-----"))
+
+    @unittest.skipUnless(have_clip and have_other,
+                         "needs both signed clips")
+    def test_two_cameras_two_keys(self):
+        self.assertNotEqual(vc.extract_sensor_public_key(AXIS_CLIP),
+                            vc.extract_sensor_public_key(OTHER_CLIP))
+
+    def test_an_unsigned_file_yields_no_key(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        f = os.path.join(tmp, "plain.mp4")
+        with open(f, "wb") as fh:
+            fh.write(make_mp4(pad=b"nokey" * 40))
+        self.assertIsNone(vc.extract_sensor_public_key(f))
+
+
+@unittest.skipUnless(have_clip and have_validator,
+                     "needs the real Axis clip and validator binary")
+class LeafPinTests(unittest.TestCase):
+    """A pin mismatch is NOT a tamper claim. The video may be perfectly
+    authentic footage from a camera we did not pin — reporting INVALID
+    would accuse a camera of tampering when the honest statement is
+    `this is not the device we pinned`. So the producer decides the pin
+    question ITSELF, from the key in the stream, and reports UNVERIFIED
+    with the key state recorded rather than passing off the framework's
+    INVALID as evidence of tampering."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.pin = os.path.join(self.tmp, "sensor_pubkey.pem")
+        with open(self.pin, "w") as f:
+            f.write(vc.extract_sensor_public_key(AXIS_CLIP) + "\n")
+
+    def _run(self, clip, pin):
+        return vc.run_sensor_validator(
+            clip, vendor="axis", validator=VALIDATOR,
+            lib_path=VALIDATOR_LIB, sensor_pubkey=pin)
+
+    def test_the_pinned_key_matches_and_the_verdict_stands(self):
+        s, _ = self._run(AXIS_CLIP, self.pin)
+        self.assertEqual(s["public_key_pin"], "MATCH")
+        self.assertEqual(s["verdict"], vc.SENSOR_VALID)
+        self.assertEqual(s["gops_valid"], 18)
+
+    @unittest.skipUnless(have_other, "needs the other-key clip")
+    def test_a_clip_signed_by_a_different_key_reads_unverified(self):
+        """The test you cannot skip: real signed video, real validator,
+        wrong camera."""
+        s, _ = self._run(OTHER_CLIP, self.pin)
+        self.assertEqual(s["verdict"], vc.SENSOR_UNVERIFIED)
+        self.assertEqual(s["public_key_pin"], "MISMATCH")
+        # the key state is RECORDED, not just the downgrade
+        self.assertIsNotNone(s["sensor_key_sha256"])
+        self.assertNotEqual(
+            s["sensor_key_sha256"],
+            hashlib.sha256(
+                (vc.extract_sensor_public_key(AXIS_CLIP) + "\n").encode()
+            ).hexdigest())
+
+    def test_a_mismatch_is_never_reported_as_tampering(self):
+        s, _ = self._run(OTHER_CLIP, self.pin) if have_other else (None, None)
+        if s is None:
+            self.skipTest("needs the other-key clip")
+        self.assertNotEqual(s["verdict"], vc.SENSOR_INVALID)
+
+    def test_without_a_pin_the_key_is_recorded_but_not_judged(self):
+        s, _ = self._run(AXIS_CLIP, None)
+        self.assertIsNone(s["public_key_pin"])
+        self.assertIsNotNone(s["sensor_key_sha256"])
+        self.assertEqual(s["verdict"], vc.SENSOR_VALID)
+
+    def test_a_missing_pin_file_is_unverified_not_a_silent_skip(self):
+        s, _ = self._run(AXIS_CLIP, os.path.join(self.tmp, "absent.pem"))
+        self.assertEqual(s["verdict"], vc.SENSOR_UNVERIFIED)
+        self.assertEqual(s["public_key_pin"], "PIN_UNREADABLE")
+
+
 # ── The schema bump ────────────────────────────────────────────────────
 
 class SchemaV3Tests(unittest.TestCase):
@@ -322,15 +419,34 @@ class SchemaV3Tests(unittest.TestCase):
                              1, 2, "host-clock", "live", None,
                              self.key_id, policy, sensor)
 
-    def test_sensor_signature_makes_a_v3_body(self):
+    def test_sensor_signature_makes_a_v4_body(self):
         s = vc.sensor_signature_unsigned()
         body = self._body(sensor=s)
-        self.assertEqual(body["schema"], "camera_segment/3")
+        self.assertEqual(body["schema"], "camera_segment/4")
         self.assertEqual(body["sensor_signature"], s)
 
-    def test_v3_is_what_this_producer_now_emits(self):
-        self.assertEqual(vc.SCHEMA, "camera_segment/3")
-        self.assertIn("camera_segment/3", vc.SCHEMAS)
+    def test_v4_is_what_this_producer_now_emits(self):
+        self.assertEqual(vc.SCHEMA, "camera_segment/4")
+        self.assertIn("camera_segment/4", vc.SCHEMAS)
+
+    def test_growing_the_object_was_a_version_bump(self):
+        """/3 records are signed and on the chain with 13 fields. The
+        leaf pin added two; accepting both sizes at one version would
+        have surrendered the rule that keeps frozen history frozen."""
+        self.assertEqual(len(vc.SENSOR_SIGNATURE_KEYS_V3), 13)
+        self.assertEqual(len(vc.SENSOR_SIGNATURE_KEYS), 15)
+        self.assertEqual(
+            set(vc.SENSOR_SIGNATURE_KEYS) - set(vc.SENSOR_SIGNATURE_KEYS_V3),
+            {"public_key_pin", "sensor_key_sha256"})
+
+    def test_a_v3_object_is_refused_at_v4_and_vice_versa(self):
+        v3 = {k: None for k in vc.SENSOR_SIGNATURE_KEYS_V3}
+        v3["verdict"] = vc.SENSOR_UNSIGNED
+        self.assertIsNone(vc.sensor_defect(v3, "camera_segment/3"))
+        self.assertIsNotNone(vc.sensor_defect(v3, "camera_segment/4"))
+        v4 = vc.sensor_signature_unsigned()
+        self.assertIsNone(vc.sensor_defect(v4, "camera_segment/4"))
+        self.assertIsNotNone(vc.sensor_defect(v4, "camera_segment/3"))
 
     def test_without_a_sensor_object_it_is_still_v2(self):
         body = self._body()
@@ -367,6 +483,8 @@ class SchemaV3Tests(unittest.TestCase):
         self.assertIsNone(s["device_serial"])
         self.assertIsNone(s["asserted_first_frame"])
         self.assertIsNone(s["validator_output_sha256"])
+        self.assertIsNone(s["public_key_pin"])
+        self.assertIsNone(s["sensor_key_sha256"])
         self.assertEqual(set(s), set(vc.SENSOR_SIGNATURE_KEYS))
 
     def test_a_v3_body_still_fits_the_daemon_artifact_field(self):
@@ -414,12 +532,13 @@ class VersionGateTests(unittest.TestCase):
              "capture_end_utc_ns": 2, "encoder": "copy",
              "time_source": "host-clock", "mode": "live", "gap": None,
              "producer_key_id": "k"}
-        if schema in ("camera_segment/2", "camera_segment/3"):
+        if schema in ("camera_segment/2", "camera_segment/3",
+                      "camera_segment/4"):
             b["capture_policy"] = POLICY_6S
         return b
 
-    def test_v3_without_the_sensor_object_is_a_failure(self):
-        rc, out = self._audit(self._base("camera_segment/3"))
+    def test_v4_without_the_sensor_object_is_a_failure(self):
+        rc, out = self._audit(self._base("camera_segment/4"))
         self.assertEqual(rc, 1)
         self.assertIn("no usable sensor_signature", out)
 
@@ -438,7 +557,7 @@ class VersionGateTests(unittest.TestCase):
         self.assertIn("sensor_signature", out)
 
     def test_an_unknown_verdict_is_a_failure(self):
-        b = self._base("camera_segment/3")
+        b = self._base("camera_segment/4")
         s = vc.sensor_signature_unsigned()
         s["verdict"] = "PROBABLY_FINE"
         b["sensor_signature"] = s
@@ -446,11 +565,29 @@ class VersionGateTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("no usable sensor_signature", out)
 
-    def test_a_well_formed_v3_body_audits_clean(self):
-        b = self._base("camera_segment/3")
+    def test_a_well_formed_v4_body_audits_clean(self):
+        b = self._base("camera_segment/4")
         b["sensor_signature"] = vc.sensor_signature_unsigned()
         rc, out = self._audit(b)
         self.assertEqual(rc, 0)
+
+    def test_the_already_signed_v3_records_still_audit_clean(self):
+        """The six /3 records on the live chain (seqs 6-11) carry the
+        13-field object. They are immutable and must keep passing."""
+        b = self._base("camera_segment/3")
+        v3 = {k: None for k in vc.SENSOR_SIGNATURE_KEYS_V3}
+        v3["verdict"] = vc.SENSOR_VALID
+        v3["vendor"] = "axis"
+        b["sensor_signature"] = v3
+        rc, out = self._audit(b)
+        self.assertEqual(rc, 0, out)
+
+    def test_a_v3_body_carrying_the_v4_object_is_a_failure(self):
+        b = self._base("camera_segment/3")
+        b["sensor_signature"] = vc.sensor_signature_unsigned()   # 15 keys
+        rc, out = self._audit(b)
+        self.assertEqual(rc, 1)
+        self.assertIn("no usable sensor_signature", out)
 
 
 # ── The record ships regardless ────────────────────────────────────────
@@ -487,13 +624,13 @@ class ShipsAnywayTests(unittest.TestCase):
         self.cfg["sensor_vendor"] = "axis"
         self.cfg["validator"] = "/nonexistent/validator"
         body, _ = self._run()
-        self.assertEqual(body["schema"], "camera_segment/3")
+        self.assertEqual(body["schema"], "camera_segment/4")
         self.assertEqual(body["sensor_signature"]["verdict"],
                          vc.SENSOR_UNVERIFIED)
 
     def test_unconfigured_vendor_ships_an_unsigned_record(self):
         body, _ = self._run()
-        self.assertEqual(body["schema"], "camera_segment/3")
+        self.assertEqual(body["schema"], "camera_segment/4")
         self.assertEqual(body["sensor_signature"]["verdict"],
                          vc.SENSOR_UNSIGNED)
         self.assertIsNone(body["sensor_signature"]["vendor"])
