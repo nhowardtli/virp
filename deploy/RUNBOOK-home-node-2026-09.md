@@ -124,7 +124,29 @@ Now, and not before, the node can move off `de95f80` (22 commits
 behind). The socket policy from step 1 is what makes this safe.
 
     git fetch && git checkout main && git pull
-    make install-prod && systemctl restart virp-onode
+    sudo git config --global --add safe.directory <tree>   # or the
+        # dirty-tree guard in install-prod sees an empty status under
+        # sudo (dubious ownership) and passes without checking anything
+    make prod && sudo make install-prod
+
+**`install-prod` OVERWRITES `render-devices.sh` from the tree.** It is in
+`VIRP_INSTALL_SCRIPTS`, so installing from a ref that does not carry the
+home node's four credential names (`VIRP_PVE_PASSWORD`,
+`VIRP_LABNET_PASSWORD`, `VIRP_WAZUH_HOME_PASSWORD`,
+`VIRP_FORTIGATE_HOME_PASSWORD`) or the `[A-Z0-9_]+` placeholder fix
+silently reverts both. The next render then fails and the daemon does
+not start. Observed 2026-09-03: install-prod from `origin/main` replaced
+`47abe98f…` with `4990ede6…`.
+
+Until this branch is merged, re-install it and re-render BEFORE
+restarting:
+
+    install -m 0755 deploy/render-devices.sh \
+        /usr/local/lib/virp/render-devices.sh
+    VIRP_RENDER_OUT=/tmp/probe.json /usr/local/lib/virp/render-devices.sh
+    rm -f /tmp/probe.json
+
+    systemctl restart virp-onode
 
 Verify the daemon now attests itself — this node has never emitted a
 `node_config/1` entry, and after this it should:
