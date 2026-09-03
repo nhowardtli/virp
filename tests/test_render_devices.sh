@@ -242,6 +242,36 @@ assert "${LAB_ENABLE}" in json.loads(raw)["devices"][0]["_comment"]
 PY
 then pass=$((pass + 1)); printf "PASS\n"; else printf "FAIL\n"; fi
 
+# ── a placeholder name containing a DIGIT ────────────────────────────
+#
+# Regression for a hole found 2026-09-03 while tracking the home node's
+# fleet. PLACEHOLDER_RE was [A-Z_]+, so ${VIRP_GNS3_PASSWORD} was
+# invisible to BOTH halves of the script: not substituted, and not
+# reported by the leftover check either. It would have been written into
+# the rendered config verbatim and the daemon would have authenticated
+# to 35 routers with the literal string "${VIRP_GNS3_PASSWORD}" — an
+# auth failure that reads like a bad credential rather than a bad
+# render, which is precisely the failure the FATAL check exists to
+# prevent. The guarantee is only ever as wide as the pattern.
+
+cat > "$T/tmpl.json" <<'EOF'
+{ "devices": [
+  { "hostname": "r1", "host": "10.0.0.55", "vendor": "cisco_ios",
+    "password": "${SOME_NAME_WITH_9_DIGITS}" }
+]}
+EOF
+printf 'UNRELATED=x\n' > "$T/env"
+# The harness reuses one temp dir, so an earlier PASSING render has left
+# an out.json here. Clear it, or the next assertion would pass on a
+# stale file rather than on this render's behaviour.
+rm -f "$T/out.json"
+check "digit-bearing placeholder -> FATAL, not rendered literally" \
+      1 "unsubstituted placeholders: SOME_NAME_WITH_9_DIGITS"
+
+run=$((run + 1)); printf "  [%d] ... and no output file was written ... " "$run"
+if [ ! -f "$T/out.json" ]; then pass=$((pass + 1)); printf "PASS\n"
+else printf "FAIL (a fatal render left a file behind)\n"; fi
+
 echo ""
 echo "=== Results: $pass/$run passed ==="
 [ "$pass" = "$run" ]

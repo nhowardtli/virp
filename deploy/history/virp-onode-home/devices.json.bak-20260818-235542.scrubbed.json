@@ -1,0 +1,45 @@
+{
+  "_comment": "Fresh home O-node governing pve-lab (10.0.0.35) as a testbed. Spark requester uid 997: CLIENT-only, GREEN ceiling, action-allowlisted propose-only. pve-lab has NO Proxmox classifier, so all commands land RED-by-absence = proposal-only, fail-closed. | virp-laptop uid 1001: laptop approver identity (restricted SSH forward-only account), approve/apply actions only, no tier ceiling \u2014 approval reference governs apply.",
+  "devices": [
+    {
+      "host": "10.0.0.35",
+      "hostname": "pve-lab",
+      "password": "${VIRP_PVE_PASSWORD}",
+      "port": 22,
+      "protected_vmids": [
+        313
+      ],
+      "username": "root",
+      "vendor": "linux"
+    }
+  ],
+  "gate_default_mode": "enforce",
+  "gate_max_tier": "green",
+  "socket_allowed_uids": [
+    999,
+    1000,
+    997,
+    1001
+  ],
+  "socket_uid_action_allow": {
+    "1001": [
+      "approval_challenge",
+      "approval_submit",
+      "list_fleet",
+      "execute",
+      "health"
+    ],
+    "997": [
+      "execute",
+      "list_fleet",
+      "health",
+      "chain_verify"
+    ]
+  },
+  "socket_uid_tier_ceilings": {
+    "1000": "green",
+    "1001": "green",
+    "997": "green",
+    "999": "green"
+  }
+}

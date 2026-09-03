@@ -1,0 +1,125 @@
+{
+  "_schema": "virp-config-history/1",
+  "_what_this_is": "The eleven .bak files that sat beside /etc/virp/devices.json and /etc/virp/approvers.json on virp-onode-home (10.0.0.13) until 2026-09-03, captured before they were deleted from the box. They are the only record of how that node's fleet grew from one device to thirty-eight, and they existed nowhere but on the machine they described.",
+  "_they_are_scrubbed": "SCRUBBED, NOT VERBATIM. Every credential-bearing value was replaced with the ${...} placeholder that the tracked template uses for it, on the box, before any byte crossed the wire \u2014 no plaintext credential ever left the host, and none is in this repo or its history. The same value maps to the same placeholder in every file, so who shared a credential with whom survives the scrub even though the value does not. Four distinct values across all twelve files.",
+  "_therefore_the_hashes_do_not_match": "original_sha256 below is the hash of the file AS IT WAS ON THE BOX, credentials included. Hashing the tracked copy beside it will NOT reproduce it, and that is the intended, permanent state \u2014 recorded so a future reader who tries the comparison learns why it fails instead of concluding the history was tampered with. The originals were deleted after this capture, so these hashes are now unverifiable against anything: they identify what was there, they do not prove it.",
+  "_captured": "2026-09-03, read-only, by piping a scrubber over ssh stdin",
+  "_duplicates": {
+    "da79ecb9da3fd468111f7194c74ab6f3764b02381ff68b5046bb61a1bdefdd7b": [
+      "devices.json.bak.20260814-140234.scrubbed.json",
+      "devices.json.bak.20260814-140240.scrubbed.json"
+    ]
+  },
+  "files": [
+    {
+      "tracked_file": "devices.json.bak.scrubbed.json",
+      "original_path": "/etc/virp/devices.json.bak",
+      "original_sha256": "72a6d4e859431131cf0b7fe87b2105ccde9dc8fafe57b958144c011575aa80f9",
+      "original_bytes": 716,
+      "mtime_utc": "2026-08-12T12:02:45Z",
+      "owner": "root:root",
+      "mode": "0o640",
+      "devices": 1
+    },
+    {
+      "tracked_file": "devices.json.bak-20260813-pre-virp-laptop.scrubbed.json",
+      "original_path": "/etc/virp/devices.json.bak-20260813-pre-virp-laptop",
+      "original_sha256": "8123385956b36f3b2e164660701d4b8c15638271d6a7ca41bd52a85b6afafb52",
+      "original_bytes": 748,
+      "mtime_utc": "2026-08-12T12:04:34Z",
+      "owner": "virp:virp",
+      "mode": "0o640",
+      "devices": 1
+    },
+    {
+      "tracked_file": "approvers.json.bak-20260813-orphaned-ead98d80.scrubbed.json",
+      "original_path": "/etc/virp/approvers.json.bak-20260813-orphaned-ead98d80",
+      "original_sha256": "1b4d2e42e5ccd728017e99c7625a0eb1eaea9f53a61d3cca7bda7a8b978381d6",
+      "original_bytes": 193,
+      "mtime_utc": "2026-08-12T23:27:14Z",
+      "owner": "virp:virp",
+      "mode": "0o640",
+      "devices": null
+    },
+    {
+      "tracked_file": "devices.json.bak.20260813-193934.scrubbed.json",
+      "original_path": "/etc/virp/devices.json.bak.20260813-193934",
+      "original_sha256": "917f1266a47e85c8890cd17cee9e5e1474291b0d09507030e353dccb4b5a202a",
+      "original_bytes": 1024,
+      "mtime_utc": "2026-08-13T18:24:11Z",
+      "owner": "virp:virp",
+      "mode": "0o640",
+      "devices": 1
+    },
+    {
+      "tracked_file": "devices.json.bak.20260814-140234.scrubbed.json",
+      "original_path": "/etc/virp/devices.json.bak.20260814-140234",
+      "original_sha256": "da79ecb9da3fd468111f7194c74ab6f3764b02381ff68b5046bb61a1bdefdd7b",
+      "original_bytes": 1079,
+      "mtime_utc": "2026-08-14T14:02:34Z",
+      "owner": "root:root",
+      "mode": "0o640",
+      "devices": 1
+    },
+    {
+      "tracked_file": "devices.json.bak.20260814-140240.scrubbed.json",
+      "original_path": "/etc/virp/devices.json.bak.20260814-140240",
+      "original_sha256": "da79ecb9da3fd468111f7194c74ab6f3764b02381ff68b5046bb61a1bdefdd7b",
+      "original_bytes": 1079,
+      "mtime_utc": "2026-08-14T14:02:40Z",
+      "owner": "root:root",
+      "mode": "0o640",
+      "devices": 1
+    },
+    {
+      "tracked_file": "devices.json.bak-20260818-235542.scrubbed.json",
+      "original_path": "/etc/virp/devices.json.bak-20260818-235542",
+      "original_sha256": "929758c41597679511a46a3761cac15347764feb8469ac455d04d4b990547771",
+      "original_bytes": 1096,
+      "mtime_utc": "2026-08-14T14:03:16Z",
+      "owner": "virp:virp",
+      "mode": "0o640",
+      "devices": 1
+    },
+    {
+      "tracked_file": "devices.json.bak-20260819-175441.scrubbed.json",
+      "original_path": "/etc/virp/devices.json.bak-20260819-175441",
+      "original_sha256": "a998f46b4958a35425894ffaf774af22eda1e04a013931183c520ebc93cb7c28",
+      "original_bytes": 1121,
+      "mtime_utc": "2026-08-19T17:54:41Z",
+      "owner": "root:root",
+      "mode": "0o640",
+      "devices": 1
+    },
+    {
+      "tracked_file": "devices.json.bak-20260819-223355.scrubbed.json",
+      "original_path": "/etc/virp/devices.json.bak-20260819-223355",
+      "original_sha256": "9e70256977bd4c0a0bd6ee21f7cd5b87a3ced79203b16d1aca2ca1e21a8ae7d1",
+      "original_bytes": 1313,
+      "mtime_utc": "2026-08-19T17:59:49Z",
+      "owner": "virp:virp",
+      "mode": "0o640",
+      "devices": 2
+    },
+    {
+      "tracked_file": "devices.json.bak-pre-gns3-20260822-201741.scrubbed.json",
+      "original_path": "/etc/virp/devices.json.bak-pre-gns3-20260822-201741",
+      "original_sha256": "9e79bd0a14657a2c868b49815df2eb487a6d803b22184f4e02499df10dc09711",
+      "original_bytes": 2395,
+      "mtime_utc": "2026-08-21T00:00:48Z",
+      "owner": "virp:virp",
+      "mode": "0o640",
+      "devices": 3
+    },
+    {
+      "tracked_file": "devices.json.bak-pre-batch-20260822-202704.scrubbed.json",
+      "original_path": "/etc/virp/devices.json.bak-pre-batch-20260822-202704",
+      "original_sha256": "319580989529acf85e4f1899d207f974b6f24a1df1b7a89a78a5f754fd24c5b6",
+      "original_bytes": 2770,
+      "mtime_utc": "2026-08-22T20:20:01Z",
+      "owner": "virp:virp",
+      "mode": "0o640",
+      "devices": 4
+    }
+  ]
+}
