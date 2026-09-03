@@ -301,9 +301,26 @@ for dr in cur["unit"].get("dropins", []):
 # unit-manifest.txt: node2 maps a DIFFERENT tracked template to the same
 # installed path, and that manifest is one tracked file per installed
 # path. The mapping lives here instead, declared rather than guessed.
+# KEYED ON NODE_ID, not on the installed path alone. Every node renders
+# from /etc/virp/devices.template.json, but they render DIFFERENT tracked
+# templates into it — virp-lab's 43-device fleet, the home node's 38.
+# A path-only map has to pick one, and then reports every other node as
+# having drifted by the whole difference between two fleets: the first
+# run of this check against the home node claimed its device count had
+# moved 43 -> 38, which is two nodes being compared to each other, not
+# drift.
+#
+# unit-manifest.txt cannot express this, which is why the templates are
+# deliberately absent from it: that file maps one tracked file per
+# installed path and has no notion of which host it is talking about.
+# This program does — the state document names its node — so the
+# per-node comparison belongs here.
 TEMPLATE_MAP = {
-    "/etc/virp/devices.template.json": "deploy/devices.template.json",
-    "/etc/virp/devices.node2.template.json":
+    ("00000001", "/etc/virp/devices.template.json"):
+        "deploy/devices.template.json",
+    ("0000000D", "/etc/virp/devices.template.json"):
+        "deploy/devices.home.template.json",
+    ("00000002", "/etc/virp/devices.template.json"):
         "deploy/devices.node2.template.json",
 }
 
@@ -322,12 +339,16 @@ if tmpl_installed is None:
         "checked against a previous document."
         % (dev["path"], dev["device_count"], dev.get("source")))
 else:
-    tracked_path = TEMPLATE_MAP.get(tmpl_installed)
+    node_id = cur["node"].get("node_id", "")
+    tracked_path = TEMPLATE_MAP.get((node_id, tmpl_installed))
     if tracked_path is None:
         add(UNCHECKED, "repo", "device template",
-            "installed template %s has no entry in this program's "
-            "TEMPLATE_MAP, so it cannot be compared. Add one rather than "
-            "letting it pass unchecked." % tmpl_installed)
+            "node %s installs a template at %s, and this program's "
+            "TEMPLATE_MAP has no entry for that pair, so it cannot be "
+            "compared. Add one rather than letting it pass unchecked — "
+            "and do NOT reuse another node's tracked template, which "
+            "would report the difference between two fleets as drift."
+            % (node_id or "(unknown)", tmpl_installed))
     else:
         b = blob(tracked_path)
         if b is None:
