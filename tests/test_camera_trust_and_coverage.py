@@ -471,6 +471,10 @@ class SchemaTableTests(unittest.TestCase):
                 row = vc.SCHEMA_TABLE[value]
                 self.assertIsInstance(row["policy"], bool)
                 self.assertIn("sensor", row)
+                # /6 grew `chain` while leaving `sensor` alone, so a row
+                # missing this column is a version the table can no longer
+                # fully describe.
+                self.assertIn("chain", row)
                 self.assertIn(value, vc.SCHEMAS)
 
     def test_derived_sets_are_derived_and_not_retyped(self):
@@ -481,6 +485,18 @@ class SchemaTableTests(unittest.TestCase):
         self.assertEqual(
             set(vc.SENSOR_KEYS_BY_SCHEMA),
             {s for s, d in vc.SCHEMA_TABLE.items() if d["sensor"] is not None})
+        self.assertEqual(
+            set(vc.DEVICE_CHAIN_KEYS_BY_SCHEMA),
+            {s for s, d in vc.SCHEMA_TABLE.items() if d["chain"] is not None})
+
+    def test_a_version_carrying_a_chain_also_carries_a_sensor(self):
+        """device_chain lives INSIDE sensor_signature: a row claiming one
+        without the other describes a shape that cannot exist."""
+        for schema, row in vc.SCHEMA_TABLE.items():
+            with self.subTest(schema=schema):
+                if row["chain"] is not None:
+                    self.assertIsNotNone(row["sensor"], schema)
+                    self.assertIn("device_chain", row["sensor"])
 
     def test_only_v1_declares_no_capture_policy(self):
         self.assertEqual(set(vc.SCHEMAS) - vc.POLICY_SCHEMAS,
@@ -493,10 +509,10 @@ class SchemaTableTests(unittest.TestCase):
         self.assertIn(vc.SCHEMA, vc.SCHEMA_TABLE)
         self.assertIn(vc.SCHEMA, vc.POLICY_SCHEMAS)
 
-    def test_a_v5_body_declares_its_policy(self):
+    def test_a_sensor_bearing_body_declares_its_policy(self):
         chain = SignedChain(self.tmp, camera="v5cam")
         body = chain.add(sensor=vc.sensor_signature_unsigned())
-        self.assertEqual(body["schema"], vc.SCHEMA_V5)
+        self.assertEqual(body["schema"], vc.SCHEMA)
         self.assertEqual(vc._body_policy(body), POLICY_6S)
 
     def test_v5_records_grade_accounted_not_undeclared(self):

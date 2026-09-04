@@ -23,7 +23,8 @@ How a segment becomes evidence:
      chain_append. evidence_item is the established externally
      submittable, hash-bound record type (autopilot/virp_evidence.py);
      "camera_segment/1" is the schema INSIDE the body, per that
-     convention. The daemon stores the body and D-1 Ed25519-signs the
+     convention. The current version is camera_segment/6; every
+     earlier one stays readable forever and is never re-emitted. The daemon stores the body and D-1 Ed25519-signs the
      chain entry with its own chain-signing key.
 
 Continuity is committed INSIDE the bodies: each record carries
@@ -94,6 +95,7 @@ SCHEMA_V2 = "camera_segment/2"
 SCHEMA_V3 = "camera_segment/3"
 SCHEMA_V4 = "camera_segment/4"
 SCHEMA_V5 = "camera_segment/5"
+SCHEMA_V6 = "camera_segment/6"
 # What this producer emits when a capture policy is declared (always,
 # from the CLI). SCHEMA_V1 remains emitted only by callers that pass no
 # policy, and remains READABLE forever: 2553 live records carry it and
@@ -101,10 +103,11 @@ SCHEMA_V5 = "camera_segment/5"
 # signed capture_policy; SCHEMA_V3 is /2 plus the sensor_signature —
 # what the CAMERA asserts about its own video, which is a different
 # fact from anything this host can observe.
-SCHEMA = SCHEMA_V5
-# SCHEMAS, POLICY_SCHEMAS and SENSOR_KEYS_BY_SCHEMA are all DERIVED, from
-# the one table below — see SCHEMA_TABLE, after the sensor field sets it
-# needs. Nothing in this module may hand-type a set of schema names.
+SCHEMA = SCHEMA_V6
+# SCHEMAS, POLICY_SCHEMAS, SENSOR_KEYS_BY_SCHEMA and
+# DEVICE_CHAIN_KEYS_BY_SCHEMA are all DERIVED, from the one table below —
+# see SCHEMA_TABLE, after the field sets it needs. Nothing in this module
+# may hand-type a set of schema names.
 
 # ── The sensor's own claim ─────────────────────────────────────────────
 #
@@ -135,6 +138,11 @@ SENSOR_VERDICTS = (SENSOR_VALID, SENSOR_INVALID, SENSOR_UNSIGNED,
 # quietly accepted both sizes would have given up the very rule that
 # stops anyone appending a verdict to frozen history. /4 adds the leaf
 # pin. /3 stays READABLE forever and is never emitted again.
+#
+# /5 and /6 share this 16-key set: /6 grows device_chain, one level
+# DEEPER, so the set below cannot tell them apart and the version gate
+# for that pair lives in DEVICE_CHAIN_KEYS_BY_SCHEMA instead. A bump is
+# not always visible at the level you last looked at.
 SENSOR_SIGNATURE_KEYS_V3 = (
     "vendor", "validator", "verdict", "public_key",
     "gops_valid", "gops_valid_with_missing", "gops_invalid",
@@ -146,48 +154,6 @@ SENSOR_SIGNATURE_KEYS_V4 = SENSOR_SIGNATURE_KEYS_V3 + (
     "public_key_pin", "sensor_key_sha256",
 )
 SENSOR_SIGNATURE_KEYS = SENSOR_SIGNATURE_KEYS_V4 + ("device_chain",)
-
-# ── The schema table: ONE row per version, and every set derived ───────
-#
-# What each version carries, stated once. Before this table the same
-# facts were spelled out as hand-typed tuples in five places, and the /5
-# bump reached four of them: `_body_policy` still tested
-# `schema in (V2, V3, V4)`, so every /5 record graded UNDECLARED while
-# carrying a perfectly good capture_policy, and audit reported them as
-# `camera_segment/1` — the one version that legitimately has none. The
-# audit disagreed with virp-verify about coverage on live records for as
-# long as that tuple was stale, and the tool reading the producer's own
-# records was the wrong one.
-#
-# So a version bump is ADDING A ROW HERE. If a set has to be updated
-# somewhere else too, that place is a bug waiting for the next bump —
-# which is the whole reason the /5 omission was possible.
-#
-#   policy: the body carries capture_policy (the signed cadence)
-#   sensor: the sensor_signature field set at that version, or None for
-#           the versions from before the camera's own claim existed
-SCHEMA_TABLE = {
-    SCHEMA_V1: {"policy": False, "sensor": None},
-    SCHEMA_V2: {"policy": True, "sensor": None},
-    SCHEMA_V3: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V3},
-    SCHEMA_V4: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V4},
-    SCHEMA_V5: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS},
-}
-
-# Every schema this auditor can read, oldest first. A schema absent here
-# is one it will not judge, and says so rather than passing it.
-SCHEMAS = tuple(SCHEMA_TABLE)
-# The versions whose bodies carry a capture_policy. /1 is the only one
-# that does not, and that is UNDECLARED coverage, not zero tolerance.
-POLICY_SCHEMAS = frozenset(s for s, d in SCHEMA_TABLE.items()
-                           if d["policy"])
-# The sensor_signature field set REQUIRED at each version that has one.
-# The field set IS the schema one level down: an exact match, never a
-# subset, because reading the fields we recognise and ignoring the rest
-# is how a record of an unexpected shape ends up inside a clean result.
-SENSOR_KEYS_BY_SCHEMA = {s: frozenset(d["sensor"])
-                         for s, d in SCHEMA_TABLE.items()
-                         if d["sensor"] is not None}
 
 # ── The device certificate chain, anchored at a CA WE pinned ───────────
 #
@@ -212,13 +178,105 @@ SENSOR_KEYS_BY_SCHEMA = {s: frozenset(d["sensor"])
 # "root" only when a genuinely out-of-band root is pinned.
 ANCHOR_INTERMEDIATE = "intermediate_pinned"
 ANCHOR_ROOT = "root"
-DEVICE_CHAIN_KEYS = (
+#
+# THE LEAF IS RECORDED BY DIGEST, AND THAT IS NOT A PIN. /5 bound the
+# anchor by digest and the leaf by four assertions —
+# chain_to_anchor_verified, leaf_serial_matches_device, leaf_not_after,
+# and the key indirectly through sensor_key_sha256. So a later reader
+# could not re-derive ANY of them: the certificate those booleans are
+# about did not travel, and nothing committed to its bytes. `leaf_sha256`
+# closes that, for the same reason `anchor_sha256` exists — which
+# certificate was actually in this segment's stream is its own fact, and
+# a record that asserts things about a certificate should say WHICH one.
+#
+# It is a RECORD, not a check. A leaf that rotates within the same CA is
+# expected and legitimate, so nothing compares this digest across
+# segments and a change in it is not a defect. What it buys is that the
+# three assertions beside it stop being unfalsifiable.
+#
+# Over the DER, not the PEM. PEM is a transport wrapper whose line
+# breaks and trailing whitespace can differ while the certificate is
+# byte-identical; DER is the certificate. sensor_key_sha256 hashes PEM
+# text because the SEI hands us text and nothing parses it; here the
+# leaf is already an x509 object, so the unambiguous form is available
+# and is the one to commit to.
+#
+# GROWING THIS OBJECT IS A VERSION BUMP, exactly as growing
+# sensor_signature is — this object rides inside it. /5's five-key form
+# is frozen and stays READABLE forever; /6 is the six-key form and is
+# what this producer now emits.
+DEVICE_CHAIN_KEYS_V5 = (
     "anchor", "anchor_sha256", "chain_to_anchor_verified",
     "leaf_serial_matches_device", "leaf_not_after",
 )
+DEVICE_CHAIN_KEYS = DEVICE_CHAIN_KEYS_V5 + ("leaf_sha256",)
 SENSOR_ANCHOR_FILE = os.path.join("trust", "axis-edge-vault-attestation-ca.pem")
 _PEM_CERT = re.compile(
     rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+
+
+# ── The schema table: ONE row per version, and every set derived ───────
+#
+# What each version carries, stated once. Before this table the same
+# facts were spelled out as hand-typed tuples in five places, and the /5
+# bump reached four of them: `_body_policy` still tested
+# `schema in (V2, V3, V4)`, so every /5 record graded UNDECLARED while
+# carrying a perfectly good capture_policy, and audit reported them as
+# `camera_segment/1` — the one version that legitimately has none. The
+# audit disagreed with virp-verify about coverage on live records for as
+# long as that tuple was stale, and the tool reading the producer's own
+# records was the wrong one.
+#
+# So a version bump is ADDING A ROW HERE. If a set has to be updated
+# somewhere else too, that place is a bug waiting for the next bump —
+# which is the whole reason the /5 omission was possible.
+#
+#   policy: the body carries capture_policy (the signed cadence)
+#   sensor: the sensor_signature field set at that version, or None for
+#           the versions from before the camera's own claim existed
+#   chain:  the device_chain field set at that version, or None for the
+#           versions from before the certificate chain existed. It is a
+#           column here and not a constant beside DEVICE_CHAIN_KEYS
+#           because /6 grows THIS set while leaving `sensor` untouched:
+#           the two move independently, and a table that could only
+#           describe one of them would have made the /6 bump invisible.
+SCHEMA_TABLE = {
+    SCHEMA_V1: {"policy": False, "sensor": None, "chain": None},
+    SCHEMA_V2: {"policy": True, "sensor": None, "chain": None},
+    SCHEMA_V3: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V3, "chain": None},
+    SCHEMA_V4: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V4, "chain": None},
+    SCHEMA_V5: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS,
+                "chain": DEVICE_CHAIN_KEYS_V5},
+    SCHEMA_V6: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS,
+                "chain": DEVICE_CHAIN_KEYS},
+}
+
+# Every schema this auditor can read, oldest first. A schema absent here
+# is one it will not judge, and says so rather than passing it.
+SCHEMAS = tuple(SCHEMA_TABLE)
+# The versions whose bodies carry a capture_policy. /1 is the only one
+# that does not, and that is UNDECLARED coverage, not zero tolerance.
+POLICY_SCHEMAS = frozenset(s for s, d in SCHEMA_TABLE.items()
+                           if d["policy"])
+# The sensor_signature field set REQUIRED at each version that has one.
+# The field set IS the schema one level down: an exact match, never a
+# subset, because reading the fields we recognise and ignoring the rest
+# is how a record of an unexpected shape ends up inside a clean result.
+SENSOR_KEYS_BY_SCHEMA = {s: frozenset(d["sensor"])
+                         for s, d in SCHEMA_TABLE.items()
+                         if d["sensor"] is not None}
+# The device_chain field set REQUIRED at each version that has one.
+#
+# /5 and /6 carry the SAME sensor_signature keys — the growth is one
+# level deeper, inside device_chain — so this is the only set that can
+# tell the two versions apart. Without it the bump would be cosmetic: a
+# /5 object would validate as /6 and a /6 object as /5, which is exactly
+# the "quietly accepted both sizes" failure the field-set rule exists to
+# stop. Before /6 nothing checked this object's shape at all.
+DEVICE_CHAIN_KEYS_BY_SCHEMA = {s: frozenset(d["chain"])
+                               for s, d in SCHEMA_TABLE.items()
+                               if d["chain"] is not None}
+
 
 # The leaf pin. `public_key` is the FRAMEWORK's opinion of the key it
 # used; `public_key_pin` is OURS — whether the key in the stream is the
@@ -916,6 +974,19 @@ def device_chain_check(seg_path, anchor_path, device_serial):
     except Exception:
         dc["chain_to_anchor_verified"] = False
 
+    # WHICH certificate the three assertions above are about. Over the
+    # DER: PEM is a transport wrapper whose whitespace can differ while
+    # the certificate is byte-identical, and the leaf is already parsed
+    # here, so the unambiguous form is the one to commit to.
+    try:
+        from cryptography.hazmat.primitives.serialization import Encoding
+        dc["leaf_sha256"] = hashlib.sha256(
+            leaf.public_bytes(Encoding.DER)).hexdigest()
+    except Exception:
+        # Recorded as absent rather than guessed. A null here is the same
+        # honest shape every other unavailable value in this object has.
+        dc["leaf_sha256"] = None
+
     serial = _leaf_serial(leaf)
     dc["leaf_serial_matches_device"] = bool(
         serial and device_serial
@@ -1132,7 +1203,7 @@ def sensor_for_segment(path, cfg, log=None):
         device_serial=cfg.get("sensor_device_serial"), log=log)
 
 
-def sensor_defect(sensor, schema=SCHEMA_V5):
+def sensor_defect(sensor, schema=SCHEMA):
     """Why this object may not be signed into (or read out of) a body at
     `schema`, or None. Each version has ONE permitted field set."""
     if not isinstance(sensor, dict):
@@ -1148,6 +1219,29 @@ def sensor_defect(sensor, schema=SCHEMA_V5):
     if sensor.get("verdict") not in SENSOR_VERDICTS:
         return ("sensor_signature verdict %r is not one of %s"
                 % (sensor.get("verdict"), ", ".join(SENSOR_VERDICTS)))
+    return device_chain_defect(sensor.get("device_chain"), schema)
+
+
+def device_chain_defect(chain, schema):
+    """Why this device_chain may not sit inside a body at `schema`, or
+    None. The field set is the schema one level DEEPER, and at /5 vs /6
+    it is the only thing that distinguishes the two versions — their
+    sensor_signature key sets are identical.
+
+    A null chain stays legal at every version that has the field: an
+    unsigning camera, or one with no anchor configured, records the
+    absence rather than an object full of nulls, and that is an honest
+    statement, not a defective one."""
+    want = DEVICE_CHAIN_KEYS_BY_SCHEMA.get(schema)
+    if want is None or chain is None:
+        return None
+    if not isinstance(chain, dict):
+        return "device_chain must be an object or null"
+    if set(chain) != want:
+        missing = sorted(want - set(chain))
+        extra = sorted(set(chain) - want)
+        return ("device_chain field set is the schema at %s "
+                "(missing=%s extra=%s)" % (schema, missing, extra))
     return None
 
 
@@ -1194,7 +1288,10 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
     elif sensor is None:
         schema = SCHEMA_V2
     else:
-        schema = SCHEMA_V5
+        # SCHEMA, not a literal: /5 was hardcoded here and the next bump
+        # would have had to remember this line. It is the same class of
+        # staleness that left _body_policy on (V2, V3, V4).
+        schema = SCHEMA
     if sensor is not None:
         # judged against the version this body will actually claim
         defect = sensor_defect(sensor, schema)
