@@ -80,6 +80,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -90,12 +91,157 @@ import time
 
 SCHEMA_V1 = "camera_segment/1"
 SCHEMA_V2 = "camera_segment/2"
+SCHEMA_V3 = "camera_segment/3"
+SCHEMA_V4 = "camera_segment/4"
+SCHEMA_V5 = "camera_segment/5"
 # What this producer emits when a capture policy is declared (always,
 # from the CLI). SCHEMA_V1 remains emitted only by callers that pass no
 # policy, and remains READABLE forever: 2553 live records carry it and
-# nothing here may re-sign or rewrite them.
-SCHEMA = SCHEMA_V2
-SCHEMAS = (SCHEMA_V1, SCHEMA_V2)
+# nothing here may re-sign or rewrite them. SCHEMA_V2 is /1 plus the
+# signed capture_policy; SCHEMA_V3 is /2 plus the sensor_signature —
+# what the CAMERA asserts about its own video, which is a different
+# fact from anything this host can observe.
+SCHEMA = SCHEMA_V5
+# SCHEMAS, POLICY_SCHEMAS and SENSOR_KEYS_BY_SCHEMA are all DERIVED, from
+# the one table below — see SCHEMA_TABLE, after the sensor field sets it
+# needs. Nothing in this module may hand-type a set of schema names.
+
+# ── The sensor's own claim ─────────────────────────────────────────────
+#
+# A signing camera (Axis signed video) asserts that the bitstream is the
+# one its sensor emitted, and stamps its OWN clock on the first and last
+# frame. Both are the camera's claim and are labelled as such
+# everywhere: the M3085-V in the lab has a wrong clock and stamps
+# 2024-08-15 onto 2026 footage. capture_end_utc_ns stays this host's
+# observation and the chain entry's own timestamp stays the O-node's
+# receipt; the three are never collapsed.
+#
+# The verdict vocabulary is CLOSED, and no failure may leave the object
+# out. "The validator was missing" and "the video verified" must never
+# be the same shape on the wire, because a verifier that tests for the
+# field's presence would read the first as the second.
+SENSOR_VALID = "VALID"
+SENSOR_INVALID = "INVALID"
+SENSOR_UNSIGNED = "UNSIGNED"          # this camera does not sign at all
+SENSOR_UNVERIFIED = "UNVERIFIED"      # we could not judge; see ruling #1
+SENSOR_VERDICTS = (SENSOR_VALID, SENSOR_INVALID, SENSOR_UNSIGNED,
+                   SENSOR_UNVERIFIED)
+
+# The field set IS the schema, one level down: every key is present in
+# every record, and an unavailable value is null. Nothing optional.
+# The field set IS the schema one level down, so GROWING THIS OBJECT IS
+# A VERSION BUMP. /3 records are already signed and on the chain with
+# the 13-key form; they can never gain a field, and a verifier that
+# quietly accepted both sizes would have given up the very rule that
+# stops anyone appending a verdict to frozen history. /4 adds the leaf
+# pin. /3 stays READABLE forever and is never emitted again.
+SENSOR_SIGNATURE_KEYS_V3 = (
+    "vendor", "validator", "verdict", "public_key",
+    "gops_valid", "gops_valid_with_missing", "gops_invalid",
+    "gops_unsigned", "device_serial", "device_firmware",
+    "asserted_first_frame", "asserted_last_frame",
+    "validator_output_sha256",
+)
+SENSOR_SIGNATURE_KEYS_V4 = SENSOR_SIGNATURE_KEYS_V3 + (
+    "public_key_pin", "sensor_key_sha256",
+)
+SENSOR_SIGNATURE_KEYS = SENSOR_SIGNATURE_KEYS_V4 + ("device_chain",)
+
+# ── The schema table: ONE row per version, and every set derived ───────
+#
+# What each version carries, stated once. Before this table the same
+# facts were spelled out as hand-typed tuples in five places, and the /5
+# bump reached four of them: `_body_policy` still tested
+# `schema in (V2, V3, V4)`, so every /5 record graded UNDECLARED while
+# carrying a perfectly good capture_policy, and audit reported them as
+# `camera_segment/1` — the one version that legitimately has none. The
+# audit disagreed with virp-verify about coverage on live records for as
+# long as that tuple was stale, and the tool reading the producer's own
+# records was the wrong one.
+#
+# So a version bump is ADDING A ROW HERE. If a set has to be updated
+# somewhere else too, that place is a bug waiting for the next bump —
+# which is the whole reason the /5 omission was possible.
+#
+#   policy: the body carries capture_policy (the signed cadence)
+#   sensor: the sensor_signature field set at that version, or None for
+#           the versions from before the camera's own claim existed
+SCHEMA_TABLE = {
+    SCHEMA_V1: {"policy": False, "sensor": None},
+    SCHEMA_V2: {"policy": True, "sensor": None},
+    SCHEMA_V3: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V3},
+    SCHEMA_V4: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V4},
+    SCHEMA_V5: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS},
+}
+
+# Every schema this auditor can read, oldest first. A schema absent here
+# is one it will not judge, and says so rather than passing it.
+SCHEMAS = tuple(SCHEMA_TABLE)
+# The versions whose bodies carry a capture_policy. /1 is the only one
+# that does not, and that is UNDECLARED coverage, not zero tolerance.
+POLICY_SCHEMAS = frozenset(s for s, d in SCHEMA_TABLE.items()
+                           if d["policy"])
+# The sensor_signature field set REQUIRED at each version that has one.
+# The field set IS the schema one level down: an exact match, never a
+# subset, because reading the fields we recognise and ignoring the rest
+# is how a record of an unexpected shape ends up inside a clean result.
+SENSOR_KEYS_BY_SCHEMA = {s: frozenset(d["sensor"])
+                         for s, d in SCHEMA_TABLE.items()
+                         if d["sensor"] is not None}
+
+# ── The device certificate chain, anchored at a CA WE pinned ───────────
+#
+# THE ANCHOR IS A KEY, NOT A CERTIFICATE. Axis has issued at least two
+# certificates for `Axis Edge Vault Attestation CA ECC 1` — identical
+# subject and identical public key, different serial numbers and
+# different notAfter (2032-10-25 and 2055-06-01). Both are legitimate.
+# Pinning certificate BYTES would reject a real device whose stream
+# happens to carry the other one, so what is checked is the signature
+# under the anchor's PUBLIC KEY. `anchor_sha256` still records the exact
+# file pinned, because which bytes an operator installed is its own fact.
+#
+# WHAT THIS PROVES, AND WHAT IT DOES NOT. The anchor was taken from the
+# camera's own stream: it is trust on first use one level up from the
+# leaf. It detects a leaf issued by any other CA, and it survives leaf
+# rotation within this CA — both real gains over pinning the leaf key
+# alone. It is NOT a chain to a root delivered out of band, because Axis
+# does not publish the Edge Vault Attestation root: the PKI repository
+# carries only the Device ID hierarchy, and their own Certificate Policy
+# names "Axis Edge Vault Root CA" as a separate CA it does not publish.
+# The `anchor` field says which of those two things happened, and reads
+# "root" only when a genuinely out-of-band root is pinned.
+ANCHOR_INTERMEDIATE = "intermediate_pinned"
+ANCHOR_ROOT = "root"
+DEVICE_CHAIN_KEYS = (
+    "anchor", "anchor_sha256", "chain_to_anchor_verified",
+    "leaf_serial_matches_device", "leaf_not_after",
+)
+SENSOR_ANCHOR_FILE = os.path.join("trust", "axis-edge-vault-attestation-ca.pem")
+_PEM_CERT = re.compile(
+    rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+
+# The leaf pin. `public_key` is the FRAMEWORK's opinion of the key it
+# used; `public_key_pin` is OURS — whether the key in the stream is the
+# one we pinned out of band for this camera. They are separate questions
+# and a record carries both.
+#
+# A MISMATCH IS NOT A TAMPER CLAIM. The bytes may be perfectly authentic
+# footage from a camera we did not pin; calling that INVALID would accuse
+# a device of tampering when the honest statement is "this is not the
+# device we pinned". So a mismatch grades UNVERIFIED — we could not
+# establish the source — and the key state is recorded either way.
+PIN_MATCH = "MATCH"
+PIN_MISMATCH = "MISMATCH"
+PIN_NO_KEY_IN_STREAM = "NO_KEY_IN_STREAM"
+PIN_UNREADABLE = "PIN_UNREADABLE"
+SENSOR_PUBKEY_FILE = "sensor_pubkey.pem"
+
+_PEM_PUBLIC_KEY = re.compile(
+    rb"-----BEGIN PUBLIC KEY-----.*?-----END PUBLIC KEY-----", re.S)
+
+VALIDATOR_NAME = "signed-video-framework"
+VALIDATOR_RESULTS_FILE = "validation_results.txt"
+VALIDATOR_TIMEOUT_S = 300
 ONODE_SOCKET = "/run/virp/onode.sock"
 CHAIN_DB = "/var/lib/virp/chain.db"
 DATA_DIR = "/var/lib/virp/camera"
@@ -588,11 +734,428 @@ def gap_defect(gap, segment_seq, prev_seq):
     return None
 
 
+# ── The sensor signature: parse the FILE, never the console ────────────
+#
+# The validator prints a per-BU trace to stdout and writes a summary to
+# validation_results.txt. Only the file is parsed. A verdict scraped
+# from a log is a verdict that silently changes the next time logging
+# changes, and the trace lines carry no stable interface promise.
+#
+# Every branch the tool can write is handled explicitly
+# (apps/validator/main.c:464-526). An unrecognised file raises, and the
+# caller turns that into UNVERIFIED — it never guesses.
+
+def _sensor_blank():
+    """The object with every key present and nothing asserted, in the
+    shape this producer currently emits (%s)."""
+    return {k: None for k in SENSOR_SIGNATURE_KEYS}
+
+
+def sensor_signature_unsigned():
+    """A camera that does not sign its video at all (Tapo, Reolink).
+    vendor is null and the verdict is UNSIGNED — an explicit statement,
+    not an omission."""
+    s = _sensor_blank()
+    s["verdict"] = SENSOR_UNSIGNED
+    return s
+
+
+def sensor_signature_unverified(vendor, validator_version=None):
+    """Ruling #1: a missing validator, a crash, or an unparseable result
+    all land here. The record still ships; the verdict never upgrades."""
+    s = _sensor_blank()
+    s["vendor"] = vendor
+    s["verdict"] = SENSOR_UNVERIFIED
+    s["validator"] = {"name": VALIDATOR_NAME, "version": validator_version}
+    return s
+
+
+_VIDEO_VERDICTS = {
+    "VIDEO IS VALID!": SENSOR_VALID,
+    "VIDEO IS VALID, BUT HAS MISSING FRAMES!": SENSOR_VALID,
+    "VIDEO IS INVALID!": SENSOR_INVALID,
+    "VIDEO IS NOT SIGNED!": SENSOR_UNSIGNED,
+    # too short to hold one complete GOP: not judged, and NOT the same
+    # statement as "this video carries no signature"
+    "NO COMPLETE GOPS FOUND!": SENSOR_UNVERIFIED,
+}
+
+_KEY_STATES = {
+    "PUBLIC KEY IS VALID!": "VALID",
+    "PUBLIC KEY IS NOT VALID!": "NOT_VALID",
+    "PUBLIC KEY COULD NOT BE VALIDATED!": "COULD_NOT_BE_VALIDATED",
+}
+
+_COUNT_FIELDS = (
+    ("Number of valid GOPs with missing BUs:", "gops_valid_with_missing"),
+    ("Number of valid GOPs:", "gops_valid"),
+    ("Number of invalid GOPs:", "gops_invalid"),
+    ("Number of GOPs without signature:", "gops_unsigned"),
+)
+
+_TEXT_FIELDS = (
+    ("Serial Number:", "device_serial"),
+    ("Firmware version:", "device_firmware"),
+    ("First frame:", "asserted_first_frame"),
+    ("Last validated frame:", "asserted_last_frame"),
+)
+
+
+def extract_sensor_public_key(path):
+    """The signing public key as carried in the stream's SEI, PEM text,
+    or None. Axis writes it in the clear once per signed GOP; every copy
+    in a segment is the same key, and this returns the first.
+
+    This is deliberately OUR OWN read of the bitstream rather than
+    something asked of the framework: the validation API has no getter
+    for the key it used, so a producer that wanted to know WHICH key
+    verified would otherwise have to take the framework's word for it."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    m = _PEM_PUBLIC_KEY.search(data)
+    return m.group(0).decode("ascii", "replace") if m else None
+
+
+def extract_sensor_cert_chain(path):
+    """Every distinct certificate the stream's SEI carries, PEM text, in
+    the order first seen (leaf, then issuing CA). Empty when the stream
+    carries no chain — some signing implementations ship only a bare
+    public key, and that is a different situation from a broken chain."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+    out = []
+    for m in _PEM_CERT.finditer(data):
+        pem = m.group(0).decode("ascii", "replace")
+        if pem not in out:
+            out.append(pem)
+    return out
+
+
+def _x509():
+    from cryptography import x509
+    return x509
+
+
+def _load_anchor(anchor_path):
+    """(anchor_certificate, sha256_of_the_pinned_file) or (None, None).
+    Never raises: an unreadable anchor is a state to report, not a crash,
+    and it must NEVER fall back to the CA the stream itself supplies —
+    that would check the evidence against itself."""
+    if not anchor_path:
+        return None, None
+    try:
+        with open(anchor_path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None, None
+    try:
+        cert = _x509().load_pem_x509_certificate(raw)
+    except Exception:
+        return None, None
+    return cert, hashlib.sha256(raw).hexdigest()
+
+
+def _leaf_serial(cert):
+    """The device serial the leaf asserts (X.520 serialNumber in the
+    subject), or None."""
+    x509 = _x509()
+    try:
+        vals = cert.subject.get_attributes_for_oid(
+            x509.oid.NameOID.SERIAL_NUMBER)
+    except Exception:
+        return None
+    return vals[0].value if vals else None
+
+
+def device_chain_check(seg_path, anchor_path, device_serial):
+    """Grade the SEI's certificate chain against the pinned anchor.
+    Returns the device_chain object; never raises, never omits a key."""
+    dc = {k: None for k in DEVICE_CHAIN_KEYS}
+    dc["anchor"] = ANCHOR_INTERMEDIATE
+    dc["chain_to_anchor_verified"] = False
+    dc["leaf_serial_matches_device"] = False
+
+    anchor, anchor_sha = _load_anchor(anchor_path)
+    dc["anchor_sha256"] = anchor_sha
+    if anchor is None:
+        return dc
+
+    chain = extract_sensor_cert_chain(seg_path)
+    if not chain:
+        return dc
+    try:
+        leaf = _x509().load_pem_x509_certificate(chain[0].encode())
+    except Exception:
+        return dc
+
+    try:
+        dc["leaf_not_after"] = leaf.not_valid_after_utc.strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    except AttributeError:                       # cryptography < 42
+        dc["leaf_not_after"] = leaf.not_valid_after.strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+
+    # The leaf must be signed by the anchor's KEY. One signature check,
+    # not a path build: there is exactly one hop between them.
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ec, padding
+        pub = anchor.public_key()
+        if isinstance(pub, ec.EllipticCurvePublicKey):
+            pub.verify(leaf.signature, leaf.tbs_certificate_bytes,
+                       ec.ECDSA(leaf.signature_hash_algorithm))
+        else:
+            pub.verify(leaf.signature, leaf.tbs_certificate_bytes,
+                       padding.PKCS1v15(), leaf.signature_hash_algorithm)
+        dc["chain_to_anchor_verified"] = True
+    except Exception:
+        dc["chain_to_anchor_verified"] = False
+
+    serial = _leaf_serial(leaf)
+    dc["leaf_serial_matches_device"] = bool(
+        serial and device_serial
+        and serial.strip().upper() == str(device_serial).strip().upper())
+    return dc
+
+
+def _pin_state(observed_pem, pin_path):
+    """(pin_state, pinned_pem_or_None). Never raises."""
+    if pin_path is None:
+        return None, None
+    try:
+        with open(pin_path, "r") as f:
+            pinned = f.read()
+    except OSError:
+        return PIN_UNREADABLE, None
+    if _PEM_PUBLIC_KEY.search(pinned.encode()) is None:
+        return PIN_UNREADABLE, None
+    if observed_pem is None:
+        return PIN_NO_KEY_IN_STREAM, pinned
+    a = "".join(observed_pem.split())
+    b = "".join(pinned.split())
+    return (PIN_MATCH if a == b else PIN_MISMATCH), pinned
+
+
+def parse_validation_results(text):
+    """Parse a validation_results.txt into the sensor_signature object
+    (vendor and validator_output_sha256 left for the caller). Raises
+    ValueError when the file carries no recognisable verdict — the
+    caller must not guess one."""
+    out = _sensor_blank()
+    key_state = None
+    video = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line in _KEY_STATES:
+            key_state = _KEY_STATES[line]
+            continue
+        if line in _VIDEO_VERDICTS:
+            video = _VIDEO_VERDICTS[line]
+            continue
+        for prefix, field in _COUNT_FIELDS:
+            if line.startswith(prefix):
+                try:
+                    out[field] = int(line[len(prefix):].strip())
+                except ValueError:
+                    pass
+                break
+        else:
+            for prefix, field in _TEXT_FIELDS:
+                if line.startswith(prefix):
+                    val = line[len(prefix):].strip()
+                    out[field] = None if val in ("", "N/A") else val
+                    break
+            else:
+                if line.startswith("Validator (") and " runs:" in line:
+                    ver = line.split(" runs:", 1)[1].strip()
+                    out["validator"] = {
+                        "name": VALIDATOR_NAME,
+                        "version": ver[1:] if ver.startswith("v") else ver}
+    if video is None:
+        raise ValueError("no recognisable verdict line in validator output")
+    if out["validator"] is None:
+        out["validator"] = {"name": VALIDATOR_NAME, "version": None}
+    out["public_key"] = key_state
+
+    # The key state can only ever DOWNGRADE the video verdict. Signatures
+    # checked against a key the framework rejected prove nothing, and a
+    # key that could not be validated cannot support a clean VALID.
+    if key_state == "NOT_VALID":
+        video = SENSOR_INVALID
+    elif key_state == "COULD_NOT_BE_VALIDATED" and video == SENSOR_VALID:
+        video = SENSOR_UNVERIFIED
+    out["verdict"] = video
+    return out
+
+
+def run_sensor_validator(seg_path, vendor=None, validator=None,
+                         lib_path=None, log=None, sensor_pubkey=None,
+                         sensor_anchor=None, device_serial=None):
+    """Validate ONE segment before its record is signed. Returns
+    (sensor_signature, raw_validation_text_or_None).
+
+    RULING #1 (Aug 28) is the whole contract: a missing validator, a
+    validator that crashes, and a result that cannot be parsed each
+    yield UNVERIFIED and the record still ships. This function never
+    raises, never returns None, and never omits the object."""
+    if vendor is None:
+        return sensor_signature_unsigned(), None
+
+    # Our own read of the stream's key, decided BEFORE the framework is
+    # asked anything — so a wrong-camera clip is never mistaken for a
+    # tampered one.
+    observed = extract_sensor_public_key(seg_path)
+    key_sha = (hashlib.sha256(observed.encode()).hexdigest()
+               if observed else None)
+    pin, _pinned = _pin_state(observed, sensor_pubkey)
+    chain = (device_chain_check(seg_path, sensor_anchor, device_serial)
+             if sensor_anchor else None)
+
+    def _unverified(why):
+        if log:
+            log("sensor-signature UNVERIFIED (%s): %s"
+                % (os.path.basename(seg_path), why))
+        s = sensor_signature_unverified(vendor)
+        s["public_key_pin"] = pin
+        s["sensor_key_sha256"] = key_sha
+        s["device_chain"] = chain
+        return s, None
+
+    # Identity questions are decided HERE, before the validator is asked
+    # anything, and they downgrade to UNVERIFIED — never INVALID. A leaf
+    # from another CA, or a genuine camera that is not this one, is not
+    # tampered footage; saying INVALID would accuse a device of altering
+    # video it signed honestly.
+    if chain is not None:
+        if not chain["chain_to_anchor_verified"]:
+            return _unverified(
+                "the segment's certificate chain does not verify to the "
+                "pinned anchor (%s)" % (sensor_anchor,))
+        if not chain["leaf_serial_matches_device"]:
+            return _unverified(
+                "the chain verifies to the pinned anchor but the leaf is "
+                "not this device (expected serial %r)" % (device_serial,))
+
+    if pin == PIN_UNREADABLE:
+        return _unverified("pinned key %r is missing or not a PEM public "
+                           "key — refusing to fall back to whatever key "
+                           "the stream carries" % sensor_pubkey)
+    if pin == PIN_NO_KEY_IN_STREAM:
+        return _unverified("a key is pinned for this camera but the "
+                           "segment carries none")
+    if pin == PIN_MISMATCH:
+        # NOT INVALID: authentic footage from an unpinned device looks
+        # exactly like this, and we will not call that tampering.
+        return _unverified("the segment is signed by a key that is not "
+                           "the one pinned for this camera (observed "
+                           "sha256 %s)" % (key_sha or "none"))
+
+    if not validator or not os.path.exists(validator):
+        return _unverified("no validator at %r" % validator)
+
+    env = dict(os.environ)
+    if lib_path:
+        env["LD_LIBRARY_PATH"] = (
+            lib_path + os.pathsep + env.get("LD_LIBRARY_PATH", ""))
+
+    import tempfile as _tempfile
+    with _tempfile.TemporaryDirectory() as work:
+        # the tool writes validation_results.txt into its CWD, so give it
+        # a private one rather than whatever directory we happen to be in
+        try:
+            argv = [validator, "-c", "h264"]
+            if sensor_pubkey:
+                # verify against the key WE hold, not one the framework
+                # lifted out of the stream it is judging
+                argv += ["-p", os.path.abspath(sensor_pubkey)]
+            argv.append(os.path.abspath(seg_path))
+            subprocess.run(argv,
+                           cwd=work, env=env,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL,
+                           timeout=VALIDATOR_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return _unverified("validator timed out after %ds"
+                               % VALIDATOR_TIMEOUT_S)
+        except OSError as e:
+            return _unverified("validator could not be run: %s" % e)
+        # a nonzero / signalled exit is NOT itself a verdict: the tool
+        # exits nonzero for an invalid video too. What matters is whether
+        # it left a parseable result.
+        results = os.path.join(work, VALIDATOR_RESULTS_FILE)
+        if not os.path.exists(results):
+            return _unverified("validator wrote no %s"
+                               % VALIDATOR_RESULTS_FILE)
+        with open(results, "rb") as f:
+            raw_bytes = f.read()
+
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    try:
+        text = raw_bytes.decode("utf-8", "replace")
+        sensor = parse_validation_results(text)
+    except ValueError as e:
+        # the bytes exist and are kept: that is what makes this
+        # UNVERIFIED auditable after the fact
+        s = sensor_signature_unverified(vendor)
+        s["validator_output_sha256"] = digest
+        s["public_key_pin"] = pin
+        s["sensor_key_sha256"] = key_sha
+        s["device_chain"] = chain
+        if log:
+            log("sensor-signature UNVERIFIED (%s): %s"
+                % (os.path.basename(seg_path), e))
+        return s, raw_bytes.decode("utf-8", "replace")
+    sensor["vendor"] = vendor
+    sensor["validator_output_sha256"] = digest
+    sensor["public_key_pin"] = pin
+    sensor["sensor_key_sha256"] = key_sha
+    sensor["device_chain"] = chain
+    return sensor, text
+
+
+def sensor_for_segment(path, cfg, log=None):
+    """The sensor claim for one segment, or (None, None) for a producer
+    that emits pre-/3 bodies (no capture policy declared)."""
+    if not cfg.get("capture_policy"):
+        return None, None
+    return run_sensor_validator(
+        path, vendor=cfg.get("sensor_vendor"),
+        validator=cfg.get("validator"),
+        lib_path=cfg.get("validator_lib_path"),
+        sensor_pubkey=cfg.get("sensor_pubkey"),
+        sensor_anchor=cfg.get("sensor_anchor"),
+        device_serial=cfg.get("sensor_device_serial"), log=log)
+
+
+def sensor_defect(sensor, schema=SCHEMA_V5):
+    """Why this object may not be signed into (or read out of) a body at
+    `schema`, or None. Each version has ONE permitted field set."""
+    if not isinstance(sensor, dict):
+        return "sensor_signature must be an object"
+    want = SENSOR_KEYS_BY_SCHEMA.get(schema)
+    if want is None:
+        return "%s carries no sensor_signature field set" % schema
+    if set(sensor) != want:
+        missing = sorted(want - set(sensor))
+        extra = sorted(set(sensor) - want)
+        return ("sensor_signature field set is the schema at %s "
+                "(missing=%s extra=%s)" % (schema, missing, extra))
+    if sensor.get("verdict") not in SENSOR_VERDICTS:
+        return ("sensor_signature verdict %r is not one of %s"
+                % (sensor.get("verdict"), ", ".join(SENSOR_VERDICTS)))
+    return None
+
+
 # ── Body construction ──────────────────────────────────────────────────
 
 def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
                duration_s, start_ns, end_ns, time_source, mode, gap,
-               key_id, policy=None):
+               key_id, policy=None, sensor=None):
     """The camera_segment record, WITHOUT producer_sig (added by
     producer_sign). Field set is the schema — nothing optional, nothing
     extra, no credentials, no URLs.
@@ -606,7 +1169,14 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
                    included — can loosen the gap tolerance afterwards to
                    make a bad window look clean; doing so would require
                    the producer key and would produce a different
-                   record."""
+                   record.
+    + sensor     → camera_segment/3: /2 plus sensor_signature, what the
+                   CAMERA claims about its own video. It is signed for
+                   the same reason the policy is: an operator who could
+                   edit a verdict afterwards could launder INVALID
+                   footage into VALID footage without touching a pixel.
+                   There is no version carrying the sensor claim but not
+                   the cadence declaration."""
     # The producer always cites the record it just emitted, so the
     # external-predecessor form and the ordinary form coincide here at
     # segment_seq - 1. A body whose gap would grade FAILED is never
@@ -615,8 +1185,24 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
     if defect:
         raise ValueError("refusing to build a camera_segment body: %s"
                          % defect)
+    if sensor is not None and policy is None:
+        raise ValueError("refusing to build a camera_segment body: a "
+                         "sensor_signature needs a capture_policy — "
+                         "there is no schema with one and not the other")
+    if policy is None:
+        schema = SCHEMA_V1
+    elif sensor is None:
+        schema = SCHEMA_V2
+    else:
+        schema = SCHEMA_V5
+    if sensor is not None:
+        # judged against the version this body will actually claim
+        defect = sensor_defect(sensor, schema)
+        if defect:
+            raise ValueError("refusing to build a camera_segment body: %s"
+                             % defect)
     body = {
-        "schema": SCHEMA_V1 if policy is None else SCHEMA_V2,
+        "schema": schema,
         "camera_id": camera_id,
         "device": device,
         "segment_seq": seq,
@@ -634,6 +1220,8 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
     }
     if policy is not None:
         body["capture_policy"] = policy
+    if sensor is not None:
+        body["sensor_signature"] = sensor
     return body
 
 
@@ -803,10 +1391,21 @@ def process_segment(path, cfg, state, gap, send=onode_send):
     prev = state["last_segment_sha256"] if state else None
     gap = continuity_gap(state, start_ns, gap)
 
+    # The sensor claim is established BEFORE the record is signed: a
+    # verdict that arrived after the signature would be a verdict nobody
+    # could bind to these bytes.
+    sensor, sensor_raw = sensor_for_segment(
+        path, cfg, log=lambda m: print(m, flush=True))
+    if sensor_raw is not None:
+        with open(os.path.join(art_dir, seg_sha + ".validation.txt"),
+                  "w") as f:
+            f.write(sensor_raw)
+
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
                             end_ns, time_source, cfg["mode"], gap,
-                            cfg["key_id"], cfg.get("capture_policy"))
+                            cfg["key_id"], cfg.get("capture_policy"),
+                            sensor)
     body_bytes, body = producer_sign(cfg["sk"], body_nosig)
 
     session_id = session_for(cfg["camera_id"], end_ns)
@@ -898,12 +1497,46 @@ def _run_replay_locked(replay_dir, names, cfg, send):
 
 # ── verify-segment: recompute-and-compare, not a second judge ──────────
 
+# ── What a camera_segment body commits to by hash, and under which name ─
+#
+# A /3-and-later record cites TWO artifacts by digest: the video, and the
+# validator's own output about that video. Checking only the first is
+# what made this command useless on the second: a validation_results.txt
+# read NO MATCH whether it had been tampered with or not, because it was
+# being compared against segment_sha256, which it was never going to
+# equal. An answer that is identical for clean and altered input is
+# worse than no answer, since it has the shape of one.
+#
+# The field name goes in the verdict. "MATCH" alone would not say WHICH
+# of a record's commitments the file satisfied.
+CITED_SEGMENT = "segment_sha256"
+CITED_VALIDATOR_OUTPUT = "sensor_signature.validator_output_sha256"
+
+
+def _cited_digests(body):
+    """{field: digest} for every artifact this body commits to by hash.
+
+    The sensor object is read through _body_sensor, so a record whose
+    sensor_signature does not match its own version's field set cites
+    nothing here — a malformed object is not a digest to check against.
+    """
+    out = {}
+    if body.get(CITED_SEGMENT):
+        out[CITED_SEGMENT] = body[CITED_SEGMENT]
+    sensor = _body_sensor(body)
+    if sensor and sensor.get("validator_output_sha256"):
+        out[CITED_VALIDATOR_OUTPUT] = sensor["validator_output_sha256"]
+    return out
+
+
 def verify_segment(file_path, db_path, pubkey_path=None):
     """Recompute sha256 over the file's CURRENT bytes and report whether
-    any camera_segment/1 body stored on the chain commits to that hash.
-    This helper renders the verdict from the signed body — it recomputes
-    ONE hash and compares. It does not verify chain entry signatures or
-    sequencing; that is Docket's job. Returns process exit code.
+    any camera_segment body stored on the chain commits to that hash —
+    as its segment, or as its validator output. This helper renders the
+    verdict from the signed body: it recomputes ONE hash and compares
+    against both cited digests. It does not verify chain entry
+    signatures or sequencing; that is Docket's job. Returns process exit
+    code.
 
     If a pubkey was asked for, it is established FIRST: a trust root
     that cannot be loaded raises TrustRootError before the file is read,
@@ -918,31 +1551,35 @@ def verify_segment(file_path, db_path, pubkey_path=None):
     print("sha256 of current file bytes: %s" % file_sha)
 
     rows = _camera_bodies(db_path)
+    # segment first: a file handed to this command is far more often the
+    # video than the validator's note about it. Both are checked either
+    # way; the order only decides which is reported when a digest
+    # collision would otherwise be ambiguous.
     match = None
-    for session_id, artifact_id, body_raw, body in rows:
-        if body.get("segment_sha256") == file_sha:
-            match = (session_id, artifact_id, body_raw, body)
+    for field in (CITED_SEGMENT, CITED_VALIDATOR_OUTPUT):
+        for session_id, artifact_id, body_raw, body in rows:
+            if _cited_digests(body).get(field) == file_sha:
+                match = (field, session_id, artifact_id, body_raw, body)
+                break
+        if match:
             break
+
     if match is None:
-        claimed = [b for _, _, _, b in rows
-                   if os.path.basename(file_path).startswith(
-                       b.get("segment_sha256", "")[:16])]
         print("VERDICT: NO MATCH — no camera_segment body on this chain "
-              "commits to the file's current bytes.")
-        if claimed:
-            b = claimed[0]
-            print("  (a chain body DOES commit to a segment whose hash "
-                  "matches this FILENAME: seq=%s segment_sha256=%s —\n"
-                  "   the file's bytes have changed since that record "
-                  "was made)" % (b["segment_seq"], b["segment_sha256"]))
-        print("checked: sha256 recompute of the file vs the "
-              "segment_sha256 field of every camera_segment/1 body in "
-              "%s. Nothing more." % db_path)
+              "commits to the file's current bytes, as a segment or as a "
+              "validator output.")
+        _print_filename_hint(file_path, rows)
+        print("checked: sha256 recompute of the file vs the %s and %s "
+              "fields of every camera_segment body in %s (schemas %s). "
+              "Nothing more."
+              % (CITED_SEGMENT, CITED_VALIDATOR_OUTPUT, db_path,
+                 ", ".join(SCHEMAS)))
         return 1
 
-    session_id, artifact_id, body_raw, body = match
-    print("VERDICT: MATCH — the file's current bytes are exactly the "
-          "bytes committed by a chain-stored body:")
+    field, session_id, artifact_id, body_raw, body = match
+    what = ("segment" if field == CITED_SEGMENT else "validator_output")
+    print("VERDICT: MATCH %s — the file's current bytes are exactly the "
+          "bytes committed by a chain-stored body's %s:" % (what, field))
     print("  session=%s seq=%s artifact_id=%s"
           % (session_id, body["segment_seq"], artifact_id))
     if pk is not None:
@@ -953,11 +1590,36 @@ def verify_segment(file_path, db_path, pubkey_path=None):
         if not ok:
             return 1
     print("checked: sha256 recompute of the file vs the signed body's "
-          "segment_sha256%s. Chain entry signatures and sequencing are "
-          "Docket's verdict, not this tool's."
-          % (", plus the body's producer signature" if pubkey_path
+          "%s%s. Chain entry signatures and sequencing are Docket's "
+          "verdict, not this tool's."
+          % (field,
+             ", plus the body's producer signature" if pubkey_path
              else ""))
     return 0
+
+
+def _print_filename_hint(file_path, rows):
+    """On NO MATCH, say whether the FILENAME points at a record anyway.
+
+    The outbox names both artifacts after the segment digest
+    (<camera>.<seq>.<segment_sha256>.mp4 and .validation.txt), and the
+    content-addressed layout names the segment <sha>.mp4. Either way a
+    16-hex-digit prefix appearing in the basename identifies the record
+    the file CLAIMS to be part of, which is what turns a bare NO MATCH
+    into "these bytes changed since that record was made"."""
+    base = os.path.basename(file_path)
+    for _, _, _, b in rows:
+        sha = b.get(CITED_SEGMENT) or ""
+        if len(sha) < 16 or sha[:16] not in base:
+            continue
+        cited = _cited_digests(b)
+        print("  (a chain body DOES commit to the segment named by this "
+              "FILENAME: seq=%s — the file's bytes are not any artifact "
+              "that record cites, so they have changed since it was "
+              "made)" % b["segment_seq"])
+        for field, digest in sorted(cited.items()):
+            print("    that record's %s = %s" % (field, digest))
+        return
 
 
 def _camera_bodies(db_path):
@@ -1070,7 +1732,7 @@ def _load_pubkeys(pubkey_paths):
 
 
 def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
-                report=None):
+                report=None, artifact_dir=None):
     """For every camera_segment entry: recompute sha256 over the body
     bytes AS STORED in the chain and match artifact_hash (the
     chainwalk_summary defect was exactly this failing); check the
@@ -1079,11 +1741,18 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
     path or a list of paths (multi-producer chains). Returns
     (checked, failures:list).
 
-    If `report` is a dict it is filled in with the two axes that are NOT
-    chain integrity — coverage completeness and content reuse — which
-    are reported separately because they are different properties: a
-    chain can be perfectly intact across an outage it never claimed to
-    cover.
+    If `report` is a dict it is filled in with the axes that are NOT
+    chain integrity — coverage completeness, content reuse, the sensor's
+    own claim, and (with artifact_dir) the segment payload — which are
+    reported separately because they are different properties: a chain
+    can be perfectly intact across an outage it never claimed to cover,
+    and equally intact while the file it was written about has changed
+    underneath it.
+
+    artifact_dir, when given, is a directory of the referenced artifacts
+    (a capture-host outbox, or a content-addressed artifacts/). Every
+    cited digest of every record whose file is found there is recomputed.
+    A file that is not there is ABSENT, never a pass.
 
     The pinned keys are established FIRST, before a single row is read:
     a requested trust root that cannot be established raises
@@ -1143,9 +1812,24 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
                                 "pass it"
                                 % (session_id, artifact_id, schema))
             continue
-        if schema == SCHEMA_V2 and _body_policy(body) is None:
+        if schema in POLICY_SCHEMAS and _body_policy(body) is None:
             failures.append("%s %s: %s carries no usable capture_policy"
                             % (session_id, artifact_id, schema))
+        # The camera_id/capture_policy precedent: the object is REQUIRED
+        # at its own version and REQUIRED ABSENT at every earlier one. A
+        # /1 body that has grown a sensor_signature was not built by this
+        # producer, and grading it as though it were would let anyone
+        # append a verdict to frozen history.
+        if schema in SENSOR_KEYS_BY_SCHEMA:
+            if _body_sensor(body) is None:
+                failures.append("%s %s: %s carries no usable "
+                                "sensor_signature"
+                                % (session_id, artifact_id, schema))
+        elif "sensor_signature" in body:
+            failures.append("%s %s: %s carries a sensor_signature, which "
+                            "exists only at %s and later — this record "
+                            "was not built by this producer"
+                            % (session_id, artifact_id, schema, SCHEMA_V3))
         cam_bodies.append((session_id, artifact_id, body))
 
     # Pass 2 — the prev-hash continuity chain, walked in segment_seq
@@ -1220,6 +1904,12 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
         report["coverage"] = grade_coverage(cam_bodies)
         report["reuse_axis"], report["reuse"] = \
             grade_content_reuse(cam_bodies)
+        report["sensor"] = grade_sensor(cam_bodies)
+        # None, not {} — "no directory was given" and "a directory was
+        # given and held nothing" are different facts and must not print
+        # the same way.
+        report["payload"] = (grade_segment_payload(cam_bodies, artifact_dir)
+                             if artifact_dir else None)
     return checked, failures
 
 
@@ -1250,7 +1940,7 @@ _COVERAGE_RANK = {COVERAGE_CONTINUOUS: 0, COVERAGE_ACCOUNTED: 1,
 def _body_policy(body):
     """The usable capture_policy of a body, or None. A /1 record has
     none by construction — that is UNDECLARED, not zero tolerance."""
-    if body.get("schema") != SCHEMA_V2:
+    if body.get("schema") not in POLICY_SCHEMAS:
         return None
     p = body.get("capture_policy")
     if not isinstance(p, dict):
@@ -1265,6 +1955,73 @@ def _body_policy(body):
         return None
     return {"nominal_segment_s": nominal, "jitter_s": jitter,
             "max_unexplained_gap_s": max_gap}
+
+
+SENSOR_AXIS_NONE = "NONE CLAIMED (no /3 records in scope)"
+
+
+def sensor_axis(sensor):
+    """One line for the whole scope. Worst verdict wins, and UNVERIFIED
+    is never folded into VALID: `we could not check` is not `it passed`."""
+    if not sensor:
+        return SENSOR_AXIS_NONE
+    tot = {v: 0 for v in SENSOR_VERDICTS}
+    for c in sensor.values():
+        for v, n in c["verdicts"].items():
+            tot[v] = tot.get(v, 0) + n
+    if tot[SENSOR_INVALID]:
+        return "INVALID (%d record(s))" % tot[SENSOR_INVALID]
+    if tot[SENSOR_UNVERIFIED]:
+        return "UNVERIFIED (%d record(s) could not be checked)" \
+            % tot[SENSOR_UNVERIFIED]
+    if tot[SENSOR_VALID] and not tot[SENSOR_UNSIGNED]:
+        return "VALID (%d record(s), camera-asserted)" % tot[SENSOR_VALID]
+    if tot[SENSOR_UNSIGNED] and not tot[SENSOR_VALID]:
+        return "UNSIGNED (%d record(s); this camera does not sign)" \
+            % tot[SENSOR_UNSIGNED]
+    return "MIXED (valid=%d unsigned=%d)" % (tot[SENSOR_VALID],
+                                             tot[SENSOR_UNSIGNED])
+
+
+def grade_sensor(cam_bodies):
+    """{camera_id: {...}} over the /3 records in scope. Records at older
+    versions are not counted as UNSIGNED — they predate the question."""
+    out = {}
+    for _, _, body in cam_bodies:
+        s = _body_sensor(body)
+        if s is None:
+            continue
+        cam = body.get("camera_id")
+        c = out.setdefault(cam, {
+            "verdicts": {v: 0 for v in SENSOR_VERDICTS},
+            "vendor": None, "device_serial": None,
+            "device_firmware": None, "validator": None,
+            "asserted_first_frame": None, "asserted_last_frame": None})
+        c["verdicts"][s["verdict"]] += 1
+        for k in ("vendor", "device_serial", "device_firmware"):
+            if s.get(k) and not c[k]:
+                c[k] = s[k]
+        v = s.get("validator") or {}
+        if v.get("name") and not c["validator"]:
+            c["validator"] = "%s %s" % (v.get("name"), v.get("version"))
+        # the span of what the CAMERA claims, in the camera's own words
+        if s.get("asserted_first_frame") and not c["asserted_first_frame"]:
+            c["asserted_first_frame"] = s["asserted_first_frame"]
+        if s.get("asserted_last_frame"):
+            c["asserted_last_frame"] = s["asserted_last_frame"]
+    return out
+
+
+def _body_sensor(body):
+    """The usable sensor_signature of a body, or None, judged against the
+    field set of the body's OWN version. A /1 or /2 record has none by
+    construction — that is not "unsigned video", it is a record from
+    before the question was asked."""
+    schema = body.get("schema")
+    if schema not in SENSOR_KEYS_BY_SCHEMA:
+        return None
+    s = body.get("sensor_signature")
+    return None if sensor_defect(s, schema) else s
 
 
 def grade_coverage(cam_bodies):
@@ -1323,9 +2080,16 @@ def grade_coverage(cam_bodies):
         info["policies"] = seen
         if undeclared:
             info["verdict"] = COVERAGE_UNDECLARED
+            # Name the versions actually seen rather than asserting /1.
+            # The hardcoded "(camera_segment/1)" told a reader the four
+            # /5 records in front of it were /1 records, which is how a
+            # stale schema tuple reads from the outside: not as a bug,
+            # as a fact about the evidence.
+            seen_schemas = sorted({str(b.get("schema")) for b in undeclared})
             info["reason"] = ("%d of %d records declare no capture "
-                              "policy (camera_segment/1)"
-                              % (len(undeclared), len(lst)))
+                              "policy (%s)"
+                              % (len(undeclared), len(lst),
+                                 ", ".join(seen_schemas)))
             out[cam] = info
             continue
         worst = COVERAGE_CONTINUOUS
@@ -1537,6 +2301,151 @@ def grade_content_reuse(cam_bodies):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Segment payload — the referenced bytes, a SEPARATE axis again
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Chain integrity answers "are these records unaltered and in order".
+# Coverage answers "was the camera recording the whole time". Neither
+# answers "is the file on disk still the file the record was written
+# about", and until this axis existed nothing an examiner was likely to
+# run did: a byte flipped in a segment mp4, and a byte flipped in a
+# validation_results.txt, both survived `virp-verify` and `audit` with
+# output byte-identical to the untampered run.
+#
+# It stays its own axis for the same reason coverage does. A record
+# whose payload is missing is not a broken chain, and a broken chain
+# with every payload present is not a clean one. Collapsing them would
+# make each verdict less useful, and would let a present, matching file
+# soften a real integrity failure.
+#
+# ABSENT IS NEVER A PASS. A file that is not under the directory was not
+# checked, and "not checked" and "verified" must never be the same shape
+# on the wire — the rule the sensor verdict vocabulary was closed for.
+# A record grades VERIFIED only when EVERY artifact it cites was found
+# and matched.
+PAYLOAD_VERIFIED = "VERIFIED"
+PAYLOAD_ABSENT = "ABSENT"
+PAYLOAD_FAILED = "FAILED"
+PAYLOAD_NOT_CHECKED = "NOT CHECKED (no --artifact-dir)"
+
+_PAYLOAD_RANK = {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 1,
+                 PAYLOAD_FAILED: 2}
+
+
+def _payload_patterns(field, seg_sha, digest):
+    """Filename patterns under which this cited artifact may be found.
+
+    Two layouts, both keyed on a digest so that a file which IS present
+    but altered is found and graded FAILED rather than vanishing into
+    ABSENT — which would turn tampering into absence, the one confusion
+    this axis cannot afford:
+
+      outbox           <camera>.<seq>.<segment_sha256>.mp4
+                       <camera>.<seq>.<segment_sha256>.validation.txt
+      content-addressed  <digest>.<ext>, the artifacts/ convention
+
+    Note both outbox names key on the SEGMENT digest: that is how the
+    driver names a segment's whole file set, so a tampered validation
+    output is still located through the segment it belongs to."""
+    if field == CITED_SEGMENT:
+        return ("*.%s.mp4" % seg_sha, "%s.mp4" % seg_sha)
+    return ("*.%s.validation.txt" % seg_sha,
+            "*.%s.validation_results.txt" % seg_sha,
+            "%s.txt" % digest)
+
+
+def _find_payload(artifact_dir, field, seg_sha, digest):
+    """The first file under artifact_dir matching this artifact's naming,
+    or None. Digests are hex, so they carry no glob metacharacters."""
+    for pat in _payload_patterns(field, seg_sha, digest):
+        hits = sorted(glob.glob(os.path.join(artifact_dir, pat)))
+        if hits:
+            return hits[0]
+    return None
+
+
+def grade_segment_payload(cam_bodies, artifact_dir):
+    """{camera_id: {...}} — for every record, recompute the digest of
+    each artifact it cites that is present under artifact_dir.
+
+    Per record: FAILED if any present file's digest does not match,
+    ABSENT if any cited artifact was not found (and none mismatched),
+    VERIFIED only when every cited artifact was found AND matched."""
+    out = {}
+    for _, _, body in sorted(cam_bodies,
+                             key=lambda t: (t[2]["camera_id"],
+                                            t[2]["segment_seq"])):
+        cam = body["camera_id"]
+        c = out.setdefault(cam, {
+            "dir": artifact_dir, "records": 0,
+            "verdicts": {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 0,
+                         PAYLOAD_FAILED: 0},
+            "items": [],
+        })
+        c["records"] += 1
+        seg_sha = body.get(CITED_SEGMENT) or ""
+        states = []
+        for field, digest in sorted(_cited_digests(body).items()):
+            path = _find_payload(artifact_dir, field, seg_sha, digest)
+            if path is None:
+                state, actual = PAYLOAD_ABSENT, None
+            else:
+                actual = _sha256_file(path)
+                state = (PAYLOAD_VERIFIED if actual == digest
+                         else PAYLOAD_FAILED)
+            states.append(state)
+            if state != PAYLOAD_VERIFIED:
+                c["items"].append({
+                    "seq": body["segment_seq"], "field": field,
+                    "state": state, "path": path,
+                    "expected": digest, "actual": actual})
+        # a record citing nothing checkable is ABSENT, never VERIFIED:
+        # there is no evidence here that anything was confirmed
+        verdict = (max(states, key=lambda s: _PAYLOAD_RANK[s])
+                   if states else PAYLOAD_ABSENT)
+        c["verdicts"][verdict] += 1
+    for c in out.values():
+        c["verdict"] = max(
+            (v for v, n in c["verdicts"].items() if n),
+            key=lambda v: _PAYLOAD_RANK[v], default=PAYLOAD_ABSENT)
+    return out
+
+
+def payload_axis(payload):
+    """The one-line worst case across cameras. Worst wins, and ABSENT is
+    never folded into VERIFIED."""
+    if payload is None:
+        return PAYLOAD_NOT_CHECKED
+    if not payload:
+        return PAYLOAD_ABSENT
+    tot = {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 0, PAYLOAD_FAILED: 0}
+    for c in payload.values():
+        for v, n in c["verdicts"].items():
+            tot[v] += n
+    worst = max((v for v, n in tot.items() if n),
+                key=lambda v: _PAYLOAD_RANK[v], default=PAYLOAD_ABSENT)
+    return ("%s (%d verified, %d absent, %d failed)"
+            % (worst, tot[PAYLOAD_VERIFIED], tot[PAYLOAD_ABSENT],
+               tot[PAYLOAD_FAILED]))
+
+
+def payload_worst(payload):
+    """The bare worst verdict, for the exit code. None when unchecked."""
+    if not payload:
+        return None
+    return max((c["verdict"] for c in payload.values()),
+               key=lambda v: _PAYLOAD_RANK[v])
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Phase 2 — live capture over the Option B split
 # ═══════════════════════════════════════════════════════════════════════
 #
@@ -1716,10 +2625,16 @@ def process_live_segment(path, cfg, state, gap, ship):
     prev = state["last_segment_sha256"] if state else None
     gap = continuity_gap(state, start_ns, gap)
 
+    # Established BEFORE the signature, for the same reason as above.
+    # Whatever it says — including "the validator was missing" — the
+    # segment is still attested and still ships (ruling #1).
+    sensor, sensor_raw = sensor_for_segment(
+        path, cfg, log=lambda m: print(m, flush=True))
+
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
                             end_ns, time_source, "live", gap, cfg["key_id"],
-                            cfg.get("capture_policy"))
+                            cfg.get("capture_policy"), sensor)
     body_bytes, body = producer_sign(cfg["sk"], body_nosig)
     if len(body_bytes) >= ARTIFACT_LIMIT:
         raise SubmitError("%s: body is %d bytes, at/past the daemon's "
@@ -1741,6 +2656,14 @@ def process_live_segment(path, cfg, state, gap, ship):
     with open(body_out + ".tmp", "wb") as f:
         f.write(body_bytes)
     os.replace(body_out + ".tmp", body_out)
+    # The raw validator output, kept beside the segment it judged: the
+    # body carries only its sha256, so the bytes have to survive
+    # somewhere for that hash to be checkable.
+    if sensor_raw is not None:
+        val_out = os.path.join(out, name + ".validation.txt")
+        with open(val_out + ".tmp", "w") as f:
+            f.write(sensor_raw)
+        os.replace(val_out + ".tmp", val_out)
 
     if not ship(seg_out, body_out, name):
         raise SubmitError("%s: ship to spool failed (continuity not "
@@ -2314,6 +3237,7 @@ def main(argv=None):
     rp.add_argument("--data-dir", default=DATA_DIR)
     rp.add_argument("--sock", default=ONODE_SOCKET)
     _add_policy_args(rp)
+    _add_sensor_args(rp)
 
     lv = sub.add_parser("live",
                         help="CAPTURE HOST: capture live segments, "
@@ -2341,6 +3265,7 @@ def main(argv=None):
                     help="0600 file holding the rtsp:// URL (else "
                          "$VIRP_CAMERA_RTSP_URL)")
     _add_policy_args(lv)
+    _add_sensor_args(lv)
     lv.add_argument("--test-source", action="store_true",
                     help="no camera credential: capture a real-time "
                          "synthetic 720p source to exercise the path")
@@ -2389,6 +3314,26 @@ def main(argv=None):
                          "INTERRUPTED / UNEXPLAINED (chain integrity and "
                          "coverage are separate properties; by default "
                          "only integrity drives the exit code)")
+    au.add_argument("--artifact-dir", default=None,
+                    help="directory of the REFERENCED artifacts (a "
+                         "capture-host outbox, or a content-addressed "
+                         "artifacts/). Every cited digest — the segment "
+                         "and the validator output — is recomputed for "
+                         "every record whose file is found there, and "
+                         "reported on its own SEGMENT PAYLOAD axis. A "
+                         "file that is not there grades ABSENT, never a "
+                         "pass. Without this flag the axis reads NOT "
+                         "CHECKED: the chain cannot say whether the file "
+                         "on disk is still the file it was written "
+                         "about")
+    au.add_argument("--fail-on-payload", action="store_true",
+                    help="also exit nonzero (4) when the SEGMENT PAYLOAD "
+                         "axis grades FAILED — a referenced file was "
+                         "found and does not hash to what the signed "
+                         "record commits to. Opt-in for the same reason "
+                         "--fail-on-coverage is: payload and chain "
+                         "integrity are separate properties and neither "
+                         "stands in for the other")
 
     args = p.parse_args(argv)
 
@@ -2425,6 +3370,12 @@ def main(argv=None):
             "sk": sk,
             "key_id": key_id,
             "capture_policy": policy,
+            "sensor_vendor": args.sensor_vendor,
+            "validator": args.validator,
+            "validator_lib_path": args.validator_lib_path,
+            "sensor_pubkey": _resolve_sensor_pubkey(args),
+            "sensor_anchor": _resolve_sensor_anchor(args),
+            "sensor_device_serial": args.sensor_device_serial,
         }
         try:
             run_replay(args.dir, cfg)
@@ -2475,6 +3426,12 @@ def main(argv=None):
                 if args.nominal_segment_s is not None
                 else args.segment_time,
                 args.jitter_s, args.max_unexplained_gap_s),
+            "sensor_vendor": args.sensor_vendor,
+            "validator": args.validator,
+            "validator_lib_path": args.validator_lib_path,
+            "sensor_pubkey": _resolve_sensor_pubkey(args),
+            "sensor_anchor": _resolve_sensor_anchor(args),
+            "sensor_device_serial": args.sensor_device_serial,
         }
         try:
             ship = sftp_ship(args.spool, ssh_key=args.ssh_key,
@@ -2517,7 +3474,8 @@ def main(argv=None):
         report = {}
         try:
             checked, failures = audit_chain(args.db, args.session_prefix,
-                                            args.pubkey, report=report)
+                                            args.pubkey, report=report,
+                                            artifact_dir=args.artifact_dir)
         except TrustRootError as e:
             print("TRUST ROOT NOT ESTABLISHED: %s" % e, file=sys.stderr)
             print("no evidence was evaluated; this is NOT a clean audit.",
@@ -2554,9 +3512,63 @@ def main(argv=None):
         if (args.fail_on_coverage
                 and coverage_axis(report["coverage"]) == COVERAGE_UNEXPLAINED):
             return 3
+        if (args.fail_on_payload
+                and payload_worst(report.get("payload")) == PAYLOAD_FAILED):
+            return 4
         return 0
 
     return 2
+
+
+def _resolve_sensor_pubkey(args):
+    """--sensor-pubkey, else the data_dir's pinned key if one is there.
+    A pin that exists is never ignored just because it was not named on
+    the command line."""
+    if args.sensor_pubkey:
+        return args.sensor_pubkey
+    default = os.path.join(args.data_dir, SENSOR_PUBKEY_FILE)
+    return default if os.path.exists(default) else None
+
+
+def _resolve_sensor_anchor(args):
+    """--sensor-anchor, else the data_dir's pinned CA if one is there. An
+    anchor that exists is never ignored for want of a flag."""
+    if args.sensor_anchor:
+        return args.sensor_anchor
+    default = os.path.join(args.data_dir, SENSOR_ANCHOR_FILE)
+    return default if os.path.exists(default) else None
+
+
+def _add_sensor_args(sp):
+    """Where the per-segment sensor validator lives. Absent --sensor-
+    vendor the producer states UNSIGNED (Tapo, Reolink); present but
+    unrunnable it states UNVERIFIED (ruling #1). It never states
+    nothing."""
+    sp.add_argument("--sensor-vendor", default=None,
+                    help="vendor whose signed-video the camera emits, "
+                         "e.g. `axis`. Omit for a camera that does not "
+                         "sign (the record then says UNSIGNED).")
+    sp.add_argument("--validator", default=None,
+                    help="signed-video-framework validator binary; run "
+                         "per segment BEFORE the record is signed")
+    sp.add_argument("--validator-lib-path", default=None,
+                    help="prepended to LD_LIBRARY_PATH for the validator")
+    sp.add_argument("--sensor-pubkey", default=None,
+                    help="PEM public key PINNED for this camera, obtained "
+                         "out of band (default: <data-dir>/%s if present). "
+                         "The validator verifies against THIS key, and a "
+                         "segment signed by any other grades UNVERIFIED — "
+                         "never INVALID, which would call an unpinned "
+                         "camera a tampered one." % SENSOR_PUBKEY_FILE)
+    sp.add_argument("--sensor-anchor", default=None,
+                    help="PEM certificate of the CA the device's leaf must "
+                         "chain to (default: <data-dir>/%s if present). The "
+                         "anchor's KEY is what is checked, so a re-issued "
+                         "certificate for the same CA still verifies."
+                         % SENSOR_ANCHOR_FILE)
+    sp.add_argument("--sensor-device-serial", default=None,
+                    help="serial the leaf certificate must assert for this "
+                         "camera, e.g. B8A44FDD572C")
 
 
 def _add_policy_args(sp):
@@ -2612,6 +3624,54 @@ def _audit_axes_text(report, have_pubkey):
                          "(no time uncovered)"
                          % ("OVERLAP", o["after_seq"], o["seq"],
                             o["overlap_s"]))
+    sensor = report.get("sensor") or {}
+    if sensor:
+        lines.append("SENSOR SIGNATURE: %s" % sensor_axis(sensor))
+        for cam in sorted(sensor):
+            c = sensor[cam]
+            lines.append("  %-24s %s"
+                         % (cam, "  ".join(
+                             "%s=%d" % (v.lower(), c["verdicts"][v])
+                             for v in SENSOR_VERDICTS
+                             if c["verdicts"].get(v))))
+            if c["vendor"] or c["device_serial"]:
+                lines.append("      vendor=%s serial=%s firmware=%s "
+                             "validator=%s"
+                             % (c["vendor"], c["device_serial"],
+                                c["device_firmware"], c["validator"]))
+            if c["asserted_first_frame"] or c["asserted_last_frame"]:
+                # NEVER presented as a time this node observed. The
+                # camera's clock is the camera's claim; the O-node's
+                # receipt time is a different fact and lives elsewhere.
+                lines.append("      CAMERA-ASSERTED frame times (the "
+                             "camera's own clock, NOT observed here, "
+                             "NOT the O-node receipt time):")
+                lines.append("        first=%s  last=%s"
+                             % (c["asserted_first_frame"],
+                                c["asserted_last_frame"]))
+    payload = report.get("payload")
+    lines.append("SEGMENT PAYLOAD: %s" % payload_axis(payload))
+    for cam in sorted(payload or {}):
+        c = payload[cam]
+        lines.append("  %-24s %-24s %s (%d record(s), dir=%s)"
+                     % (cam,
+                        c["verdict"],
+                        "  ".join("%s=%d" % (v.lower(), c["verdicts"][v])
+                                  for v in (PAYLOAD_VERIFIED,
+                                            PAYLOAD_ABSENT, PAYLOAD_FAILED)
+                                  if c["verdicts"][v]),
+                        c["records"], c["dir"]))
+        for it in c["items"]:
+            lines.append("      %-8s seq %-4d %s"
+                         % (it["state"], it["seq"], it["field"]))
+            if it["state"] == PAYLOAD_FAILED:
+                lines.append("               expected %.16s…  recomputed "
+                             "%.16s…" % (it["expected"], it["actual"]))
+                lines.append("               file %s" % it["path"])
+            else:
+                lines.append("               no file under the directory "
+                             "for digest %.16s… — NOT a pass"
+                             % it["expected"])
     lines.append("CONTENT REUSE: %s" % report.get("reuse_axis", REUSE_NONE))
     for g in report.get("reuse") or []:
         lines.append("  %-22s %.16s… x%d  cam=%s seqs=%s Δseq=%d "

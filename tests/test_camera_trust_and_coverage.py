@@ -27,6 +27,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -79,10 +80,15 @@ class SignedChain:
         self.end_ns = 1_700_000_000_000_000_000
 
     def add(self, policy=POLICY_6S, gap=None, hole_s=0.0, duration_s=6.0,
-            seg_sha=None, camera=None, bump_seq=1, raw_gap=_UNSET):
+            seg_sha=None, camera=None, bump_seq=1, raw_gap=_UNSET,
+            sensor=None):
         """raw_gap substitutes the gap AFTER build_body, bypassing the
         emission guard — the only way to produce the signed-but-invalid
-        record the pre-hardening producer could emit."""
+        record the pre-hardening producer could emit.
+
+        sensor promotes the record to the version that carries a
+        sensor_signature (/5), which is how a chain of CURRENT records
+        is built here rather than of /2 ones."""
         cam = camera or self.camera
         self.seq += bump_seq
         start_ns = self.end_ns + int(hole_s * 1e9)
@@ -92,7 +98,7 @@ class SignedChain:
         nosig = vc.build_body(cam, cam, self.seq, sha, self.prev, 1000,
                               duration_s, start_ns, end_ns, "host-clock",
                               "live", None if raw_gap is not _UNSET else gap,
-                              self.key_id, policy)
+                              self.key_id, policy, sensor)
         if raw_gap is not _UNSET:
             nosig["gap"] = raw_gap
         body_bytes, body = vc.producer_sign(self.sk, nosig)
@@ -434,6 +440,415 @@ class CapturePolicyTests(unittest.TestCase):
             vc.capture_policy_new(0.0, 1.0, 0.0)
         with self.assertRaises(SystemExit):
             vc.capture_policy_new(6.0, 1.0, -1.0)
+
+
+class SchemaTableTests(unittest.TestCase):
+    """One table decides what every version carries. These tests exist
+    because the /5 bump did not reach a hand-typed tuple in
+    `_body_policy`, so four live records carrying a perfectly good
+    capture_policy graded UNDECLARED and were reported as /1."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def _schema_constants(self):
+        """Every SCHEMA_V<n> the module defines, by introspection — so a
+        /6 added tomorrow is caught by this test on the day it appears,
+        not on the day someone notices a wrong verdict."""
+        return {name: getattr(vc, name) for name in dir(vc)
+                if re.fullmatch(r"SCHEMA_V\d+", name)}
+
+    def test_every_schema_constant_is_classified(self):
+        consts = self._schema_constants()
+        self.assertGreaterEqual(len(consts), 5)
+        for name, value in sorted(consts.items()):
+            with self.subTest(schema=name):
+                self.assertIn(value, vc.SCHEMA_TABLE,
+                              "%s is not classified in SCHEMA_TABLE — a "
+                              "version this module cannot say whether it "
+                              "carries a policy" % name)
+                row = vc.SCHEMA_TABLE[value]
+                self.assertIsInstance(row["policy"], bool)
+                self.assertIn("sensor", row)
+                self.assertIn(value, vc.SCHEMAS)
+
+    def test_derived_sets_are_derived_and_not_retyped(self):
+        self.assertEqual(set(vc.SCHEMAS), set(vc.SCHEMA_TABLE))
+        self.assertEqual(
+            vc.POLICY_SCHEMAS,
+            frozenset(s for s, d in vc.SCHEMA_TABLE.items() if d["policy"]))
+        self.assertEqual(
+            set(vc.SENSOR_KEYS_BY_SCHEMA),
+            {s for s, d in vc.SCHEMA_TABLE.items() if d["sensor"] is not None})
+
+    def test_only_v1_declares_no_capture_policy(self):
+        self.assertEqual(set(vc.SCHEMAS) - vc.POLICY_SCHEMAS,
+                         {vc.SCHEMA_V1})
+        self.assertIn(vc.SCHEMA_V5, vc.POLICY_SCHEMAS)
+
+    def test_the_current_schema_is_classified(self):
+        # the bump that started this: whatever this producer emits today
+        # must be a version the auditor can grade
+        self.assertIn(vc.SCHEMA, vc.SCHEMA_TABLE)
+        self.assertIn(vc.SCHEMA, vc.POLICY_SCHEMAS)
+
+    def test_a_v5_body_declares_its_policy(self):
+        chain = SignedChain(self.tmp, camera="v5cam")
+        body = chain.add(sensor=vc.sensor_signature_unsigned())
+        self.assertEqual(body["schema"], vc.SCHEMA_V5)
+        self.assertEqual(vc._body_policy(body), POLICY_6S)
+
+    def test_v5_records_grade_accounted_not_undeclared(self):
+        """The lab case, in miniature: /5 records across a signed gap.
+        Before the table this read UNDECLARED and disagreed with
+        virp-verify about the same records."""
+        s = vc.sensor_signature_unsigned()
+        chain = SignedChain(self.tmp, camera="v5cam")
+        for _ in range(3):
+            chain.add(hole_s=0.3, sensor=s)
+        chain.add(hole_s=400.0, gap={"after_seq": 2, "reason": "driver-restart"},
+                  sensor=s)
+        chain.add(hole_s=0.3, sensor=s)
+        bodies = [(sid, aid, json.loads(content))
+                  for sid, _, aid, _, content in chain.rows]
+        info = vc.grade_coverage(bodies)["v5cam"]
+        self.assertEqual(info["verdict"], vc.COVERAGE_ACCOUNTED)
+        self.assertEqual(info["undeclared_records"], 0)
+
+    def test_the_undeclared_reason_names_the_versions_it_saw(self):
+        chain = SignedChain(self.tmp, camera="mixed")
+        chain.add()
+        chain.add(policy=None)
+        bodies = [(sid, aid, json.loads(content))
+                  for sid, _, aid, _, content in chain.rows]
+        info = vc.grade_coverage(bodies)["mixed"]
+        self.assertEqual(info["verdict"], vc.COVERAGE_UNDECLARED)
+        # names the version actually seen, never asserts /1 on faith
+        self.assertIn(vc.SCHEMA_V1, info["reason"])
+        self.assertNotIn(vc.SCHEMA_V5, info["reason"])
+
+    def test_a_v5_body_with_a_broken_policy_is_still_flagged(self):
+        """The second stale tuple: audit's own policy check skipped /5
+        too, so a /5 record with an unusable capture_policy would have
+        passed silently."""
+        chain = SignedChain(self.tmp, camera="v5cam")
+        chain.add(sensor=vc.sensor_signature_unsigned())
+        sid, seq, aid, _, content = chain.rows[0]
+        body = json.loads(content)
+        body["capture_policy"]["nominal_segment_s"] = 0.0   # unusable
+        content = json.dumps(body)
+        # rehash so the body-hash check passes and the POLICY check is
+        # what this test is actually reading
+        ahash = hashlib.sha256(content.encode()).hexdigest()
+        chain.rows[0] = (sid, seq, aid, ahash, content)
+        db = chain.write("broken.db")
+        rc, out, _ = run_main(["audit", "--db", db,
+                               "--session-prefix", "camera:"])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("carries no usable capture_policy", out)
+
+
+class VerifySegmentCitedArtifactTests(unittest.TestCase):
+    """A /3-and-later record cites TWO artifacts by digest. Checking only
+    the segment made this command return the SAME verdict for a clean
+    and a tampered validation_results.txt — an answer with no signal,
+    which is worse than none because it has the shape of one."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.chain = SignedChain(self.tmp, camera="cited")
+        self.pk = self.chain.pk_path
+
+        self.seg = os.path.join(self.tmp, "seg.mp4")
+        self._write(self.seg, b"\x00\x00\x00\x18ftypisom" + b"video" * 64)
+        self.val = os.path.join(self.tmp, "validation_results.txt")
+        self._write(self.val, b"VIDEO IS VALID!\nNumber of invalid GOPs: 0\n")
+
+        sensor = vc.sensor_signature_unsigned()
+        sensor["validator_output_sha256"] = self._sha(self.val)
+        self.body = self.chain.add(seg_sha=self._sha(self.seg),
+                                   sensor=sensor)
+        self.db = self.chain.write()
+
+    def _write(self, path, data):
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def _sha(self, path):
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def _run(self, path):
+        return run_main(["verify-segment", path, "--db", self.db,
+                         "--pubkey", self.pk])
+
+    def test_the_record_cites_both_artifacts(self):
+        cited = vc._cited_digests(self.body)
+        self.assertEqual(cited[vc.CITED_SEGMENT], self._sha(self.seg))
+        self.assertEqual(cited[vc.CITED_VALIDATOR_OUTPUT],
+                         self._sha(self.val))
+
+    def test_intact_segment_reads_match_segment(self):
+        rc, out, _ = self._run(self.seg)
+        self.assertEqual(rc, 0)
+        self.assertIn("VERDICT: MATCH segment", out)
+        self.assertNotIn("MATCH validator_output", out)
+
+    def test_intact_validator_output_reads_match_validator_output(self):
+        """The case that returned zero signal before this change."""
+        rc, out, _ = self._run(self.val)
+        self.assertEqual(rc, 0)
+        self.assertIn("VERDICT: MATCH validator_output", out)
+        self.assertIn(vc.CITED_VALIDATOR_OUTPUT, out)
+
+    def test_tampered_validator_output_reads_no_match(self):
+        """The other half of the pair. A clean and a tampered file must
+        not produce the same verdict — that was the whole defect."""
+        _, clean, _ = self._run(self.val)
+        with open(self.val, "rb") as f:
+            data = f.read()
+        self._write(self.val, data.replace(b"GOPs: 0", b"GOPs: 1"))
+        rc, out, _ = self._run(self.val)
+        self.assertEqual(rc, 1)
+        self.assertIn("VERDICT: NO MATCH", out)
+        self.assertNotIn("VERDICT: MATCH", out)
+        self.assertNotEqual(clean, out)
+
+    def test_tampered_segment_reads_no_match(self):
+        with open(self.seg, "rb") as f:
+            data = bytearray(f.read())
+        data[len(data) // 2] ^= 0x01
+        self._write(self.seg, bytes(data))
+        rc, out, _ = self._run(self.seg)
+        self.assertEqual(rc, 1)
+        self.assertIn("VERDICT: NO MATCH", out)
+
+    def test_no_match_says_both_fields_were_checked(self):
+        stranger = os.path.join(self.tmp, "stranger.mp4")
+        self._write(stranger, b"not any artifact this chain cites")
+        rc, out, _ = self._run(stranger)
+        self.assertEqual(rc, 1)
+        self.assertIn(vc.CITED_SEGMENT, out)
+        self.assertIn(vc.CITED_VALIDATOR_OUTPUT, out)
+
+    def test_the_filename_hint_names_the_record_and_both_digests(self):
+        """Outbox naming puts the SEGMENT digest in both files' names, so
+        a tampered validation.txt can still be tied to its record."""
+        named = os.path.join(
+            self.tmp, "cam.000000.%s.validation.txt" % self._sha(self.seg))
+        self._write(named, b"altered validator output\n")
+        rc, out, _ = self._run(named)
+        self.assertEqual(rc, 1)
+        self.assertIn("named by this FILENAME", out)
+        self.assertIn(self._sha(self.val), out)
+
+    def test_a_malformed_sensor_object_cites_no_validator_digest(self):
+        """_cited_digests reads the sensor through _body_sensor, so an
+        object that does not match its own version's field set is not
+        trusted to supply a digest to check against."""
+        body = json.loads(json.dumps(self.body))
+        del body["sensor_signature"]["device_chain"]     # /4 shape at /5
+        cited = vc._cited_digests(body)
+        self.assertIn(vc.CITED_SEGMENT, cited)
+        self.assertNotIn(vc.CITED_VALIDATOR_OUTPUT, cited)
+
+
+class SegmentPayloadAxisTests(unittest.TestCase):
+    """The axis the tamper pass exists for: is the file on disk still the
+    file the signed record was written about. Its own axis, never folded
+    into chain integrity — a record whose payload is missing is not a
+    broken chain, and a broken chain with every payload present is not a
+    clean one."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.outbox = os.path.join(self.tmp, "outbox")
+        os.makedirs(self.outbox)
+        self.chain = SignedChain(self.tmp, camera="cam-p")
+        self.pk = self.chain.pk_path
+        self.bodies = [self._segment(i) for i in range(3)]
+        self.db = self.chain.write()
+
+    def _segment(self, i, with_validation=True):
+        """One record plus the two files it cites, named the way the
+        driver's outbox names them."""
+        video = b"video-%d" % i + b"\x00" * 64
+        seg_sha = hashlib.sha256(video).hexdigest()
+        self._write("cam-p.%06d.%s.mp4" % (i, seg_sha), video)
+        sensor = vc.sensor_signature_unsigned()
+        if with_validation:
+            val = b"VIDEO IS VALID!\nsegment %d\n" % i
+            self._write("cam-p.%06d.%s.validation.txt" % (i, seg_sha), val)
+            sensor["validator_output_sha256"] = hashlib.sha256(val).hexdigest()
+        return self.chain.add(hole_s=0.3, seg_sha=seg_sha, sensor=sensor)
+
+    def _write(self, name, data):
+        with open(os.path.join(self.outbox, name), "wb") as f:
+            f.write(data)
+
+    def _path(self, glob_pat):
+        import glob as _g
+        return _g.glob(os.path.join(self.outbox, glob_pat))[0]
+
+    def _audit(self, *extra, artifact_dir=_UNSET):
+        argv = ["audit", "--db", self.db, "--session-prefix", "camera:",
+                "--pubkey", self.pk]
+        d = self.outbox if artifact_dir is _UNSET else artifact_dir
+        if d is not None:
+            argv += ["--artifact-dir", d]
+        return run_main(argv + list(extra))
+
+    # ── the clean case ────────────────────────────────────────────────
+
+    def test_all_present_and_matching_reads_verified(self):
+        rc, out, _ = self._audit()
+        self.assertEqual(rc, 0)
+        self.assertIn("SEGMENT PAYLOAD: VERIFIED", out)
+        self.assertIn("INTEGRITY: OK", out)
+
+    def test_the_content_addressed_layout_is_found_too(self):
+        alt = os.path.join(self.tmp, "artifacts")
+        os.makedirs(alt)
+        for b in self.bodies:
+            src = self._path("*.%s.mp4" % b["segment_sha256"])
+            shutil.copy(src, os.path.join(alt, b["segment_sha256"] + ".mp4"))
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], alt)["cam-p"]
+        # segments verify; the validator outputs are simply not there
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_ABSENT], 3)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_FAILED], 0)
+        fields = {it["field"] for it in payload["items"]}
+        self.assertEqual(fields, {vc.CITED_VALIDATOR_OUTPUT})
+
+    # ── the two tamper points, on DIFFERENT fields ────────────────────
+
+    def test_a_flipped_byte_in_the_mp4_fails_the_segment_field(self):
+        target = self._path("*.%s.mp4" % self.bodies[1]["segment_sha256"])
+        with open(target, "rb") as f:
+            data = bytearray(f.read())
+        data[len(data) // 2] ^= 0x01
+        with open(target, "wb") as f:
+            f.write(bytes(data))
+        rc, out, _ = self._audit()
+        self.assertIn("SEGMENT PAYLOAD: FAILED", out)
+        self.assertIn(vc.CITED_SEGMENT, out)
+        # a payload failure is NOT a chain failure
+        self.assertIn("INTEGRITY: OK", out)
+        self.assertEqual(rc, 0)
+
+    def test_a_flipped_byte_in_the_validation_fails_the_other_field(self):
+        target = self._path(
+            "*.%s.validation.txt" % self.bodies[1]["segment_sha256"])
+        with open(target, "rb") as f:
+            data = f.read()
+        with open(target, "wb") as f:
+            f.write(data.replace(b"VALID", b"VALLD"))
+        rc, out, _ = self._audit()
+        self.assertIn("SEGMENT PAYLOAD: FAILED", out)
+        self.assertIn(vc.CITED_VALIDATOR_OUTPUT, out)
+        self.assertIn("INTEGRITY: OK", out)
+        self.assertEqual(rc, 0)
+
+    def test_the_two_points_fail_different_fields(self):
+        """The requirement the tamper pass was run against, pinned."""
+        seg = self._path("*.%s.mp4" % self.bodies[0]["segment_sha256"])
+        val = self._path(
+            "*.%s.validation.txt" % self.bodies[1]["segment_sha256"])
+        for p, old, new in ((seg, b"video-0", b"video-X"),
+                            (val, b"VALID", b"VALLD")):
+            with open(p, "rb") as f:
+                data = f.read()
+            with open(p, "wb") as f:
+                f.write(data.replace(old, new))
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], self.outbox)["cam-p"]
+        failed = {(it["seq"], it["field"]) for it in payload["items"]
+                  if it["state"] == vc.PAYLOAD_FAILED}
+        self.assertEqual(len(failed), 2)
+        self.assertEqual({f for _, f in failed},
+                         {vc.CITED_SEGMENT, vc.CITED_VALIDATOR_OUTPUT})
+
+    # ── absent is never a pass ────────────────────────────────────────
+
+    def test_a_missing_file_is_absent_never_verified(self):
+        os.remove(self._path("*.%s.mp4" % self.bodies[2]["segment_sha256"]))
+        rc, out, _ = self._audit()
+        self.assertIn("SEGMENT PAYLOAD: ABSENT", out)
+        self.assertNotIn("SEGMENT PAYLOAD: VERIFIED", out)
+        self.assertIn("NOT a pass", out)
+        self.assertEqual(rc, 0)
+
+    def test_an_empty_directory_grades_every_record_absent(self):
+        empty = os.path.join(self.tmp, "empty")
+        os.makedirs(empty)
+        _, out, _ = self._audit(artifact_dir=empty)
+        self.assertIn("SEGMENT PAYLOAD: ABSENT", out)
+        # counted per RECORD, not per artifact: 3 records, 6 cited files
+        self.assertIn("0 verified, 3 absent, 0 failed", out)
+        self.assertEqual(out.count("NOT a pass"), 6)
+
+    def test_one_present_artifact_does_not_carry_a_record(self):
+        """Segment present and matching, validator output missing: the
+        record is ABSENT, not VERIFIED. Partial evidence is not proof."""
+        os.remove(self._path(
+            "*.%s.validation.txt" % self.bodies[0]["segment_sha256"]))
+        payload = vc.grade_segment_payload(
+            [("s", "a", self.bodies[0])], self.outbox)["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_ABSENT)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_VERIFIED], 0)
+
+    def test_a_failure_outranks_an_absence(self):
+        os.remove(self._path("*.%s.mp4" % self.bodies[2]["segment_sha256"]))
+        target = self._path("*.%s.mp4" % self.bodies[1]["segment_sha256"])
+        with open(target, "wb") as f:
+            f.write(b"replaced entirely")
+        _, out, _ = self._audit()
+        self.assertIn("SEGMENT PAYLOAD: FAILED", out)
+
+    # ── the axis stays separate from chain integrity ──────────────────
+
+    def test_without_the_flag_the_axis_reads_not_checked(self):
+        _, out, _ = self._audit(artifact_dir=None)
+        self.assertIn("SEGMENT PAYLOAD: NOT CHECKED", out)
+        self.assertNotIn("SEGMENT PAYLOAD: VERIFIED", out)
+
+    def test_a_broken_chain_with_good_payloads_reports_both_truthfully(self):
+        """Copy C of the tamper pass: the body was altered, the files
+        were not. Integrity FAILED, payload VERIFIED — neither verdict
+        softens the other."""
+        sid, seq, aid, _, content = self.chain.rows[1]
+        body = json.loads(content)
+        body["duration_s"] = 99.0
+        content = json.dumps(body)
+        self.chain.rows[1] = (sid, seq, aid,
+                              hashlib.sha256(content.encode()).hexdigest(),
+                              content)
+        self.db = self.chain.write("broken.db")
+        rc, out, _ = self._audit()
+        self.assertEqual(rc, 1)
+        self.assertIn("INTEGRITY: FAILED", out)
+        self.assertIn("SEGMENT PAYLOAD: VERIFIED", out)
+
+    def test_fail_on_payload_is_opt_in(self):
+        target = self._path("*.%s.mp4" % self.bodies[1]["segment_sha256"])
+        with open(target, "wb") as f:
+            f.write(b"replaced entirely")
+        self.assertEqual(self._audit()[0], 0)
+        self.assertEqual(self._audit("--fail-on-payload")[0], 4)
+
+    def test_integrity_still_outranks_the_payload_exit_code(self):
+        sid, seq, aid, ahash, content = self.chain.rows[1]
+        self.chain.rows[1] = (sid, seq, aid, ahash, content + " ")
+        self.db = self.chain.write("broken.db")
+        target = self._path("*.%s.mp4" % self.bodies[1]["segment_sha256"])
+        with open(target, "wb") as f:
+            f.write(b"replaced entirely")
+        rc, out, _ = self._audit("--fail-on-payload")
+        self.assertEqual(rc, 1)
+        self.assertIn("INTEGRITY: FAILED", out)
 
 
 class CoverageGradingTests(unittest.TestCase):
