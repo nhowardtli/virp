@@ -65,13 +65,21 @@ have_other = os.path.exists(OTHER_CLIP)
 # Real Axis-signed video from a DIFFERENT M-series camera: same Edge Vault
 # attestation CA, serial B8A44F27E6D1. The genuine "right CA, wrong device"
 # case, which no synthetic fixture would have caught as honestly.
-VENDOR_CLIP = os.environ.get(
-    "VIRP_VENDOR_CLIP",
-    os.path.expanduser("~/svf-examples/test-files/signed_vendor_axis.h264"))
+# COMMITTED, so this runs everywhere. 131 KB of real Axis-signed H.264
+# from a second M-series camera, and the CA certificate our M3085-V's own
+# stream carries. Together they are the "right CA, wrong device" case,
+# which is the one a hand-built fixture would be least likely to get
+# right: the chain genuinely verifies and the device genuinely is not
+# ours, and only the serial check separates them.
+VENDOR_CLIP = os.path.join(FIXTURES, "axis_vendor_sample_B8A44F27E6D1.h264")
+VENDOR_SERIAL = "B8A44F27E6D1"
+# The pinned anchor, as a FIXTURE. The operational copy lives in the
+# camera's data_dir (<data-dir>/trust/); this one exists so the chain
+# tests need no machine-specific state.
+ANCHOR = os.path.join(FIXTURES, "axis-edge-vault-attestation-ca.pem")
 have_vendor = os.path.exists(VENDOR_CLIP)
-ANCHOR = os.path.expanduser(
-    "~/camera-axis-m3085v/trust/axis-edge-vault-attestation-ca.pem")
 have_anchor = os.path.exists(ANCHOR)
+# our camera
 DEVICE_SERIAL = "B8A44FDD572C"
 
 have_clip = os.path.exists(AXIS_CLIP)
@@ -414,8 +422,62 @@ class LeafPinTests(unittest.TestCase):
 
 # ── The certificate chain, anchored at a pinned CA ─────────────────────
 
+# ── The committed second-camera fixture ────────────────────────────────
+
+class VendorFixtureTests(unittest.TestCase):
+    """Both inputs are COMMITTED, so this class runs anywhere — no lab
+    machine, no reference clip, no validator binary.
+
+    `axis_vendor_sample_B8A44F27E6D1.h264` is real Axis-signed H.264 from
+    a second M-series camera, issued by the same Edge Vault attestation
+    CA as ours. It is the case the whole anchored-chain design turns on:
+    the certificate chain genuinely verifies and the device genuinely is
+    not ours. A verifier that stopped at "the chain checks out" would
+    accept another building's camera as this one."""
+
+    def test_right_ca_wrong_device_fails_only_the_serial_check(self):
+        dc = vc.device_chain_check(VENDOR_CLIP, ANCHOR, DEVICE_SERIAL)
+        self.assertTrue(dc["chain_to_anchor_verified"],
+                        "the fixture is issued by the pinned CA and must "
+                        "verify under its key")
+        self.assertFalse(dc["leaf_serial_matches_device"],
+                         "serial %s is not our camera %s"
+                         % (VENDOR_SERIAL, DEVICE_SERIAL))
+        self.assertEqual(dc["anchor"], "intermediate_pinned")
+
+    def test_the_fixture_is_that_other_camera_and_ours_is_not_it(self):
+        """Both halves pinned, so neither can drift into agreeing by
+        accident: the fixture's leaf asserts B8A44F27E6D1, and the same
+        check against that serial passes."""
+        dc_ours = vc.device_chain_check(VENDOR_CLIP, ANCHOR, DEVICE_SERIAL)
+        dc_theirs = vc.device_chain_check(VENDOR_CLIP, ANCHOR, VENDOR_SERIAL)
+        self.assertFalse(dc_ours["leaf_serial_matches_device"])
+        self.assertTrue(dc_theirs["leaf_serial_matches_device"])
+        self.assertTrue(dc_theirs["chain_to_anchor_verified"])
+
+    def test_a_wrong_device_never_reads_as_tampering(self):
+        """The rule this fixture is really here to defend. This camera
+        signed its own footage honestly; INVALID would say it did not."""
+        dc = vc.device_chain_check(VENDOR_CLIP, ANCHOR, DEVICE_SERIAL)
+        self.assertFalse(dc["leaf_serial_matches_device"])
+        s = vc.sensor_signature_unverified("axis")
+        s["device_chain"] = dc
+        self.assertEqual(s["verdict"], vc.SENSOR_UNVERIFIED)
+        self.assertNotEqual(s["verdict"], vc.SENSOR_INVALID)
+
+    def test_the_committed_anchor_is_the_ca_that_issued_the_fixture(self):
+        """If the anchor fixture were ever replaced with an unrelated CA,
+        the two tests above would pass vacuously (nothing verifies, and
+        the serial check is what fails). Pin the positive direction."""
+        self.assertTrue(
+            vc.device_chain_check(
+                VENDOR_CLIP, ANCHOR, VENDOR_SERIAL)["chain_to_anchor_verified"])
+
+
+# ── The chain, against the lab reference clip ──────────────────────────
+
 @unittest.skipUnless(have_clip and have_anchor,
-                     "needs the Axis clip and the pinned anchor")
+                     "needs the Axis reference clip")
 class DeviceChainTests(unittest.TestCase):
     """THE ANCHOR IS A KEY, NOT A CERTIFICATE. Axis has issued at least two
     certificates for `Axis Edge Vault Attestation CA ECC 1` — same subject,
@@ -444,15 +506,13 @@ class DeviceChainTests(unittest.TestCase):
             hashlib.sha256(open(ANCHOR, "rb").read()).hexdigest())
         self.assertEqual(set(dc), set(vc.DEVICE_CHAIN_KEYS))
 
-    @unittest.skipUnless(have_vendor, "needs the vendor sample clip")
-    def test_right_ca_wrong_device_fails_only_the_serial_check(self):
-        """The chain verifies — it is a genuine Axis camera under the same
-        attestation CA — and the device is still not ours. Those are two
-        different answers and the record keeps them apart."""
-        dc = vc.device_chain_check(VENDOR_CLIP, ANCHOR, DEVICE_SERIAL)
-        self.assertTrue(dc["chain_to_anchor_verified"],
-                        "same CA key should verify")
-        self.assertFalse(dc["leaf_serial_matches_device"])
+    def test_the_committed_anchor_is_the_one_the_camera_stream_carries(self):
+        """If these ever diverge the chain tests would be checking against
+        something the device never presented."""
+        chain = vc.extract_sensor_cert_chain(AXIS_CLIP)
+        self.assertEqual(len(chain), 2)
+        with open(ANCHOR) as f:
+            self.assertEqual(chain[1].strip(), f.read().strip())
 
     @unittest.skipUnless(have_other, "needs the non-Axis signed clip")
     def test_a_clip_with_no_chain_does_not_reach_the_anchor(self):
