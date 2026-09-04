@@ -23,6 +23,7 @@ synthetic vectors:
 """
 
 import contextlib
+import glob
 import hashlib
 import io
 import json
@@ -871,6 +872,53 @@ class SegmentPayloadAxisTests(unittest.TestCase):
         self.assertEqual(fields, {vc.CITED_VALIDATOR_OUTPUT})
         # the absence is specific: the segments themselves WERE found
         self.assertTrue(all(it["path"] is None for it in payload["items"]))
+
+    def test_an_unreadable_directory_is_inaccessible_never_absent(self):
+        """chmod 000. glob() cannot tell an unreadable directory from an
+        empty one, so before this the audit reported every artifact
+        missing — a complete and confident account of evidence it had
+        never been allowed to look at."""
+        d = self._spool()
+        os.chmod(d, 0o000)
+        self.addCleanup(os.chmod, d, 0o700)
+        if os.access(d, os.R_OK):
+            self.skipTest("running as root: chmod 000 does not deny access")
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], d)["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_INACCESSIBLE)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_ABSENT], 0)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_VERIFIED], 0)
+        self.assertTrue(all(it["state"] == vc.PAYLOAD_INACCESSIBLE
+                            for it in payload["items"]))
+        self.assertIn("inaccessible", vc.payload_axis({"cam-p": payload}))
+
+    def test_an_unreadable_FILE_is_inaccessible_not_absent(self):
+        """The directory lists, the file does not open. It IS there, so
+        reporting it missing would be a false statement about the spool."""
+        d = self._spool()
+        target = glob.glob(os.path.join(d, "*.mp4"))[0]
+        os.chmod(target, 0o000)
+        self.addCleanup(os.chmod, target, 0o600)
+        if os.access(target, os.R_OK):
+            self.skipTest("running as root: chmod 000 does not deny access")
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], d)["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_INACCESSIBLE)
+        states = {it["state"] for it in payload["items"]}
+        self.assertEqual(states, {vc.PAYLOAD_INACCESSIBLE})
+
+    def test_inaccessible_outranks_absent_in_the_roll_up(self):
+        """One unreadable file among genuinely missing ones must not let
+        the summary read ABSENT: part of the question was never asked."""
+        d = self._spool(drop=("validation",))
+        target = glob.glob(os.path.join(d, "*.mp4"))[0]
+        os.chmod(target, 0o000)
+        self.addCleanup(os.chmod, target, 0o600)
+        if os.access(target, os.R_OK):
+            self.skipTest("running as root: chmod 000 does not deny access")
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], d)["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_INACCESSIBLE)
 
     def test_a_spool_missing_the_segment_is_absent_on_that_field(self):
         payload = vc.grade_segment_payload(

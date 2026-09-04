@@ -2468,11 +2468,18 @@ def grade_content_reuse(cam_bodies):
 # and matched.
 PAYLOAD_VERIFIED = "VERIFIED"
 PAYLOAD_ABSENT = "ABSENT"
+# A directory or file this process was not permitted to read. NEVER folded
+# into ABSENT: glob() returns the empty list for an unreadable directory
+# exactly as it does for an empty one, so an audit run without permission
+# on the spool reported every artifact missing — a confident, complete,
+# wrong statement about the evidence. "It is not there" and "I was not
+# allowed to look" are different findings, and only one of them is one.
+PAYLOAD_INACCESSIBLE = "INACCESSIBLE"
 PAYLOAD_FAILED = "FAILED"
 PAYLOAD_NOT_CHECKED = "NOT CHECKED (no --artifact-dir)"
 
 _PAYLOAD_RANK = {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 1,
-                 PAYLOAD_FAILED: 2}
+                 PAYLOAD_INACCESSIBLE: 2, PAYLOAD_FAILED: 3}
 
 
 def _payload_patterns(field, seg_sha, digest):
@@ -2509,22 +2516,38 @@ def _payload_patterns(field, seg_sha, digest):
 
 
 def _find_payload(artifact_dir, field, seg_sha, digest):
-    """The first file under artifact_dir matching this artifact's naming,
-    or None. Digests are hex, so they carry no glob metacharacters."""
+    """(path, blocked) for this artifact under artifact_dir.
+
+    path is None when nothing matched; `blocked` is True when the
+    directory could not be listed or a matching file could not be opened,
+    which is a different answer from "no such file" and must not be
+    reported as one. Digests are hex, so they carry no glob
+    metacharacters."""
+    if not os.access(artifact_dir, os.R_OK | os.X_OK):
+        return None, True
+    blocked = False
     for pat in _payload_patterns(field, seg_sha, digest):
-        hits = sorted(glob.glob(os.path.join(artifact_dir, pat)))
-        if hits:
-            return hits[0]
-    return None
+        try:
+            hits = sorted(glob.glob(os.path.join(artifact_dir, pat)))
+        except OSError:
+            blocked = True
+            continue
+        for hit in hits:
+            if os.access(hit, os.R_OK):
+                return hit, False
+            blocked = True               # it IS there; we cannot read it
+    return None, blocked
 
 
 def grade_segment_payload(cam_bodies, artifact_dir):
     """{camera_id: {...}} — for every record, recompute the digest of
     each artifact it cites that is present under artifact_dir.
 
-    Per record: FAILED if any present file's digest does not match,
-    ABSENT if any cited artifact was not found (and none mismatched),
-    VERIFIED only when every cited artifact was found AND matched."""
+    Per record, worst wins: FAILED if any present file's digest does not
+    match; INACCESSIBLE if any cited artifact could not be read; ABSENT if
+    any was simply not found; VERIFIED only when every one was found AND
+    matched. INACCESSIBLE outranks ABSENT because a blind look establishes
+    nothing, where a completed look that found nothing does."""
     out = {}
     for _, _, body in sorted(cam_bodies,
                              key=lambda t: (t[2]["camera_id"],
@@ -2532,21 +2555,25 @@ def grade_segment_payload(cam_bodies, artifact_dir):
         cam = body["camera_id"]
         c = out.setdefault(cam, {
             "dir": artifact_dir, "records": 0,
-            "verdicts": {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 0,
-                         PAYLOAD_FAILED: 0},
+            "verdicts": {v: 0 for v in _PAYLOAD_RANK},
             "items": [],
         })
         c["records"] += 1
         seg_sha = body.get(CITED_SEGMENT) or ""
         states = []
         for field, digest in sorted(_cited_digests(body).items()):
-            path = _find_payload(artifact_dir, field, seg_sha, digest)
+            path, blocked = _find_payload(artifact_dir, field, seg_sha, digest)
             if path is None:
-                state, actual = PAYLOAD_ABSENT, None
+                state, actual = ((PAYLOAD_INACCESSIBLE if blocked
+                                  else PAYLOAD_ABSENT), None)
             else:
-                actual = _sha256_file(path)
-                state = (PAYLOAD_VERIFIED if actual == digest
-                         else PAYLOAD_FAILED)
+                try:
+                    actual = _sha256_file(path)
+                except OSError:
+                    state, actual = PAYLOAD_INACCESSIBLE, None
+                else:
+                    state = (PAYLOAD_VERIFIED if actual == digest
+                             else PAYLOAD_FAILED)
             states.append(state)
             if state != PAYLOAD_VERIFIED:
                 c["items"].append({
@@ -2572,15 +2599,18 @@ def payload_axis(payload):
         return PAYLOAD_NOT_CHECKED
     if not payload:
         return PAYLOAD_ABSENT
-    tot = {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 0, PAYLOAD_FAILED: 0}
+    tot = {v: 0 for v in _PAYLOAD_RANK}
     for c in payload.values():
         for v, n in c["verdicts"].items():
             tot[v] += n
     worst = max((v for v, n in tot.items() if n),
                 key=lambda v: _PAYLOAD_RANK[v], default=PAYLOAD_ABSENT)
-    return ("%s (%d verified, %d absent, %d failed)"
+    line = ("%s (%d verified, %d absent, %d failed"
             % (worst, tot[PAYLOAD_VERIFIED], tot[PAYLOAD_ABSENT],
                tot[PAYLOAD_FAILED]))
+    if tot[PAYLOAD_INACCESSIBLE]:
+        line += ", %d inaccessible" % tot[PAYLOAD_INACCESSIBLE]
+    return line + ")"
 
 
 def payload_worst(payload):
@@ -3869,6 +3899,10 @@ def _audit_axes_text(report, have_pubkey):
                 lines.append("               expected %.16s…  recomputed "
                              "%.16s…" % (it["expected"], it["actual"]))
                 lines.append("               file %s" % it["path"])
+            elif it["state"] == PAYLOAD_INACCESSIBLE:
+                lines.append("               could not READ the directory "
+                             "or the file for digest %.16s… — never looked "
+                             "at, NOT graded absent" % it["expected"])
             else:
                 lines.append("               no file under the directory "
                              "for digest %.16s… — NOT a pass"
