@@ -1732,7 +1732,7 @@ def _load_pubkeys(pubkey_paths):
 
 
 def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
-                report=None):
+                report=None, artifact_dir=None):
     """For every camera_segment entry: recompute sha256 over the body
     bytes AS STORED in the chain and match artifact_hash (the
     chainwalk_summary defect was exactly this failing); check the
@@ -1741,11 +1741,18 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
     path or a list of paths (multi-producer chains). Returns
     (checked, failures:list).
 
-    If `report` is a dict it is filled in with the two axes that are NOT
-    chain integrity — coverage completeness and content reuse — which
-    are reported separately because they are different properties: a
-    chain can be perfectly intact across an outage it never claimed to
-    cover.
+    If `report` is a dict it is filled in with the axes that are NOT
+    chain integrity — coverage completeness, content reuse, the sensor's
+    own claim, and (with artifact_dir) the segment payload — which are
+    reported separately because they are different properties: a chain
+    can be perfectly intact across an outage it never claimed to cover,
+    and equally intact while the file it was written about has changed
+    underneath it.
+
+    artifact_dir, when given, is a directory of the referenced artifacts
+    (a capture-host outbox, or a content-addressed artifacts/). Every
+    cited digest of every record whose file is found there is recomputed.
+    A file that is not there is ABSENT, never a pass.
 
     The pinned keys are established FIRST, before a single row is read:
     a requested trust root that cannot be established raises
@@ -1898,6 +1905,11 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
         report["reuse_axis"], report["reuse"] = \
             grade_content_reuse(cam_bodies)
         report["sensor"] = grade_sensor(cam_bodies)
+        # None, not {} — "no directory was given" and "a directory was
+        # given and held nothing" are different facts and must not print
+        # the same way.
+        report["payload"] = (grade_segment_payload(cam_bodies, artifact_dir)
+                             if artifact_dir else None)
     return checked, failures
 
 
@@ -2286,6 +2298,151 @@ def grade_content_reuse(cam_bodies):
     groups.sort(key=lambda g: (-_REUSE_RANK[g["class"]],
                                g["segment_seqs"][0]))
     return axis, groups
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Segment payload — the referenced bytes, a SEPARATE axis again
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Chain integrity answers "are these records unaltered and in order".
+# Coverage answers "was the camera recording the whole time". Neither
+# answers "is the file on disk still the file the record was written
+# about", and until this axis existed nothing an examiner was likely to
+# run did: a byte flipped in a segment mp4, and a byte flipped in a
+# validation_results.txt, both survived `virp-verify` and `audit` with
+# output byte-identical to the untampered run.
+#
+# It stays its own axis for the same reason coverage does. A record
+# whose payload is missing is not a broken chain, and a broken chain
+# with every payload present is not a clean one. Collapsing them would
+# make each verdict less useful, and would let a present, matching file
+# soften a real integrity failure.
+#
+# ABSENT IS NEVER A PASS. A file that is not under the directory was not
+# checked, and "not checked" and "verified" must never be the same shape
+# on the wire — the rule the sensor verdict vocabulary was closed for.
+# A record grades VERIFIED only when EVERY artifact it cites was found
+# and matched.
+PAYLOAD_VERIFIED = "VERIFIED"
+PAYLOAD_ABSENT = "ABSENT"
+PAYLOAD_FAILED = "FAILED"
+PAYLOAD_NOT_CHECKED = "NOT CHECKED (no --artifact-dir)"
+
+_PAYLOAD_RANK = {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 1,
+                 PAYLOAD_FAILED: 2}
+
+
+def _payload_patterns(field, seg_sha, digest):
+    """Filename patterns under which this cited artifact may be found.
+
+    Two layouts, both keyed on a digest so that a file which IS present
+    but altered is found and graded FAILED rather than vanishing into
+    ABSENT — which would turn tampering into absence, the one confusion
+    this axis cannot afford:
+
+      outbox           <camera>.<seq>.<segment_sha256>.mp4
+                       <camera>.<seq>.<segment_sha256>.validation.txt
+      content-addressed  <digest>.<ext>, the artifacts/ convention
+
+    Note both outbox names key on the SEGMENT digest: that is how the
+    driver names a segment's whole file set, so a tampered validation
+    output is still located through the segment it belongs to."""
+    if field == CITED_SEGMENT:
+        return ("*.%s.mp4" % seg_sha, "%s.mp4" % seg_sha)
+    return ("*.%s.validation.txt" % seg_sha,
+            "*.%s.validation_results.txt" % seg_sha,
+            "%s.txt" % digest)
+
+
+def _find_payload(artifact_dir, field, seg_sha, digest):
+    """The first file under artifact_dir matching this artifact's naming,
+    or None. Digests are hex, so they carry no glob metacharacters."""
+    for pat in _payload_patterns(field, seg_sha, digest):
+        hits = sorted(glob.glob(os.path.join(artifact_dir, pat)))
+        if hits:
+            return hits[0]
+    return None
+
+
+def grade_segment_payload(cam_bodies, artifact_dir):
+    """{camera_id: {...}} — for every record, recompute the digest of
+    each artifact it cites that is present under artifact_dir.
+
+    Per record: FAILED if any present file's digest does not match,
+    ABSENT if any cited artifact was not found (and none mismatched),
+    VERIFIED only when every cited artifact was found AND matched."""
+    out = {}
+    for _, _, body in sorted(cam_bodies,
+                             key=lambda t: (t[2]["camera_id"],
+                                            t[2]["segment_seq"])):
+        cam = body["camera_id"]
+        c = out.setdefault(cam, {
+            "dir": artifact_dir, "records": 0,
+            "verdicts": {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 0,
+                         PAYLOAD_FAILED: 0},
+            "items": [],
+        })
+        c["records"] += 1
+        seg_sha = body.get(CITED_SEGMENT) or ""
+        states = []
+        for field, digest in sorted(_cited_digests(body).items()):
+            path = _find_payload(artifact_dir, field, seg_sha, digest)
+            if path is None:
+                state, actual = PAYLOAD_ABSENT, None
+            else:
+                actual = _sha256_file(path)
+                state = (PAYLOAD_VERIFIED if actual == digest
+                         else PAYLOAD_FAILED)
+            states.append(state)
+            if state != PAYLOAD_VERIFIED:
+                c["items"].append({
+                    "seq": body["segment_seq"], "field": field,
+                    "state": state, "path": path,
+                    "expected": digest, "actual": actual})
+        # a record citing nothing checkable is ABSENT, never VERIFIED:
+        # there is no evidence here that anything was confirmed
+        verdict = (max(states, key=lambda s: _PAYLOAD_RANK[s])
+                   if states else PAYLOAD_ABSENT)
+        c["verdicts"][verdict] += 1
+    for c in out.values():
+        c["verdict"] = max(
+            (v for v, n in c["verdicts"].items() if n),
+            key=lambda v: _PAYLOAD_RANK[v], default=PAYLOAD_ABSENT)
+    return out
+
+
+def payload_axis(payload):
+    """The one-line worst case across cameras. Worst wins, and ABSENT is
+    never folded into VERIFIED."""
+    if payload is None:
+        return PAYLOAD_NOT_CHECKED
+    if not payload:
+        return PAYLOAD_ABSENT
+    tot = {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 0, PAYLOAD_FAILED: 0}
+    for c in payload.values():
+        for v, n in c["verdicts"].items():
+            tot[v] += n
+    worst = max((v for v, n in tot.items() if n),
+                key=lambda v: _PAYLOAD_RANK[v], default=PAYLOAD_ABSENT)
+    return ("%s (%d verified, %d absent, %d failed)"
+            % (worst, tot[PAYLOAD_VERIFIED], tot[PAYLOAD_ABSENT],
+               tot[PAYLOAD_FAILED]))
+
+
+def payload_worst(payload):
+    """The bare worst verdict, for the exit code. None when unchecked."""
+    if not payload:
+        return None
+    return max((c["verdict"] for c in payload.values()),
+               key=lambda v: _PAYLOAD_RANK[v])
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -3157,6 +3314,26 @@ def main(argv=None):
                          "INTERRUPTED / UNEXPLAINED (chain integrity and "
                          "coverage are separate properties; by default "
                          "only integrity drives the exit code)")
+    au.add_argument("--artifact-dir", default=None,
+                    help="directory of the REFERENCED artifacts (a "
+                         "capture-host outbox, or a content-addressed "
+                         "artifacts/). Every cited digest — the segment "
+                         "and the validator output — is recomputed for "
+                         "every record whose file is found there, and "
+                         "reported on its own SEGMENT PAYLOAD axis. A "
+                         "file that is not there grades ABSENT, never a "
+                         "pass. Without this flag the axis reads NOT "
+                         "CHECKED: the chain cannot say whether the file "
+                         "on disk is still the file it was written "
+                         "about")
+    au.add_argument("--fail-on-payload", action="store_true",
+                    help="also exit nonzero (4) when the SEGMENT PAYLOAD "
+                         "axis grades FAILED — a referenced file was "
+                         "found and does not hash to what the signed "
+                         "record commits to. Opt-in for the same reason "
+                         "--fail-on-coverage is: payload and chain "
+                         "integrity are separate properties and neither "
+                         "stands in for the other")
 
     args = p.parse_args(argv)
 
@@ -3297,7 +3474,8 @@ def main(argv=None):
         report = {}
         try:
             checked, failures = audit_chain(args.db, args.session_prefix,
-                                            args.pubkey, report=report)
+                                            args.pubkey, report=report,
+                                            artifact_dir=args.artifact_dir)
         except TrustRootError as e:
             print("TRUST ROOT NOT ESTABLISHED: %s" % e, file=sys.stderr)
             print("no evidence was evaluated; this is NOT a clean audit.",
@@ -3334,6 +3512,9 @@ def main(argv=None):
         if (args.fail_on_coverage
                 and coverage_axis(report["coverage"]) == COVERAGE_UNEXPLAINED):
             return 3
+        if (args.fail_on_payload
+                and payload_worst(report.get("payload")) == PAYLOAD_FAILED):
+            return 4
         return 0
 
     return 2
@@ -3468,6 +3649,29 @@ def _audit_axes_text(report, have_pubkey):
                 lines.append("        first=%s  last=%s"
                              % (c["asserted_first_frame"],
                                 c["asserted_last_frame"]))
+    payload = report.get("payload")
+    lines.append("SEGMENT PAYLOAD: %s" % payload_axis(payload))
+    for cam in sorted(payload or {}):
+        c = payload[cam]
+        lines.append("  %-24s %-24s %s (%d record(s), dir=%s)"
+                     % (cam,
+                        c["verdict"],
+                        "  ".join("%s=%d" % (v.lower(), c["verdicts"][v])
+                                  for v in (PAYLOAD_VERIFIED,
+                                            PAYLOAD_ABSENT, PAYLOAD_FAILED)
+                                  if c["verdicts"][v]),
+                        c["records"], c["dir"]))
+        for it in c["items"]:
+            lines.append("      %-8s seq %-4d %s"
+                         % (it["state"], it["seq"], it["field"]))
+            if it["state"] == PAYLOAD_FAILED:
+                lines.append("               expected %.16s…  recomputed "
+                             "%.16s…" % (it["expected"], it["actual"]))
+                lines.append("               file %s" % it["path"])
+            else:
+                lines.append("               no file under the directory "
+                             "for digest %.16s… — NOT a pass"
+                             % it["expected"])
     lines.append("CONTENT REUSE: %s" % report.get("reuse_axis", REUSE_NONE))
     for g in report.get("reuse") or []:
         lines.append("  %-22s %.16s… x%d  cam=%s seqs=%s Δseq=%d "

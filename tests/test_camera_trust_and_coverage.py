@@ -655,6 +655,202 @@ class VerifySegmentCitedArtifactTests(unittest.TestCase):
         self.assertNotIn(vc.CITED_VALIDATOR_OUTPUT, cited)
 
 
+class SegmentPayloadAxisTests(unittest.TestCase):
+    """The axis the tamper pass exists for: is the file on disk still the
+    file the signed record was written about. Its own axis, never folded
+    into chain integrity — a record whose payload is missing is not a
+    broken chain, and a broken chain with every payload present is not a
+    clean one."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.outbox = os.path.join(self.tmp, "outbox")
+        os.makedirs(self.outbox)
+        self.chain = SignedChain(self.tmp, camera="cam-p")
+        self.pk = self.chain.pk_path
+        self.bodies = [self._segment(i) for i in range(3)]
+        self.db = self.chain.write()
+
+    def _segment(self, i, with_validation=True):
+        """One record plus the two files it cites, named the way the
+        driver's outbox names them."""
+        video = b"video-%d" % i + b"\x00" * 64
+        seg_sha = hashlib.sha256(video).hexdigest()
+        self._write("cam-p.%06d.%s.mp4" % (i, seg_sha), video)
+        sensor = vc.sensor_signature_unsigned()
+        if with_validation:
+            val = b"VIDEO IS VALID!\nsegment %d\n" % i
+            self._write("cam-p.%06d.%s.validation.txt" % (i, seg_sha), val)
+            sensor["validator_output_sha256"] = hashlib.sha256(val).hexdigest()
+        return self.chain.add(hole_s=0.3, seg_sha=seg_sha, sensor=sensor)
+
+    def _write(self, name, data):
+        with open(os.path.join(self.outbox, name), "wb") as f:
+            f.write(data)
+
+    def _path(self, glob_pat):
+        import glob as _g
+        return _g.glob(os.path.join(self.outbox, glob_pat))[0]
+
+    def _audit(self, *extra, artifact_dir=_UNSET):
+        argv = ["audit", "--db", self.db, "--session-prefix", "camera:",
+                "--pubkey", self.pk]
+        d = self.outbox if artifact_dir is _UNSET else artifact_dir
+        if d is not None:
+            argv += ["--artifact-dir", d]
+        return run_main(argv + list(extra))
+
+    # ── the clean case ────────────────────────────────────────────────
+
+    def test_all_present_and_matching_reads_verified(self):
+        rc, out, _ = self._audit()
+        self.assertEqual(rc, 0)
+        self.assertIn("SEGMENT PAYLOAD: VERIFIED", out)
+        self.assertIn("INTEGRITY: OK", out)
+
+    def test_the_content_addressed_layout_is_found_too(self):
+        alt = os.path.join(self.tmp, "artifacts")
+        os.makedirs(alt)
+        for b in self.bodies:
+            src = self._path("*.%s.mp4" % b["segment_sha256"])
+            shutil.copy(src, os.path.join(alt, b["segment_sha256"] + ".mp4"))
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], alt)["cam-p"]
+        # segments verify; the validator outputs are simply not there
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_ABSENT], 3)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_FAILED], 0)
+        fields = {it["field"] for it in payload["items"]}
+        self.assertEqual(fields, {vc.CITED_VALIDATOR_OUTPUT})
+
+    # ── the two tamper points, on DIFFERENT fields ────────────────────
+
+    def test_a_flipped_byte_in_the_mp4_fails_the_segment_field(self):
+        target = self._path("*.%s.mp4" % self.bodies[1]["segment_sha256"])
+        with open(target, "rb") as f:
+            data = bytearray(f.read())
+        data[len(data) // 2] ^= 0x01
+        with open(target, "wb") as f:
+            f.write(bytes(data))
+        rc, out, _ = self._audit()
+        self.assertIn("SEGMENT PAYLOAD: FAILED", out)
+        self.assertIn(vc.CITED_SEGMENT, out)
+        # a payload failure is NOT a chain failure
+        self.assertIn("INTEGRITY: OK", out)
+        self.assertEqual(rc, 0)
+
+    def test_a_flipped_byte_in_the_validation_fails_the_other_field(self):
+        target = self._path(
+            "*.%s.validation.txt" % self.bodies[1]["segment_sha256"])
+        with open(target, "rb") as f:
+            data = f.read()
+        with open(target, "wb") as f:
+            f.write(data.replace(b"VALID", b"VALLD"))
+        rc, out, _ = self._audit()
+        self.assertIn("SEGMENT PAYLOAD: FAILED", out)
+        self.assertIn(vc.CITED_VALIDATOR_OUTPUT, out)
+        self.assertIn("INTEGRITY: OK", out)
+        self.assertEqual(rc, 0)
+
+    def test_the_two_points_fail_different_fields(self):
+        """The requirement the tamper pass was run against, pinned."""
+        seg = self._path("*.%s.mp4" % self.bodies[0]["segment_sha256"])
+        val = self._path(
+            "*.%s.validation.txt" % self.bodies[1]["segment_sha256"])
+        for p, old, new in ((seg, b"video-0", b"video-X"),
+                            (val, b"VALID", b"VALLD")):
+            with open(p, "rb") as f:
+                data = f.read()
+            with open(p, "wb") as f:
+                f.write(data.replace(old, new))
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], self.outbox)["cam-p"]
+        failed = {(it["seq"], it["field"]) for it in payload["items"]
+                  if it["state"] == vc.PAYLOAD_FAILED}
+        self.assertEqual(len(failed), 2)
+        self.assertEqual({f for _, f in failed},
+                         {vc.CITED_SEGMENT, vc.CITED_VALIDATOR_OUTPUT})
+
+    # ── absent is never a pass ────────────────────────────────────────
+
+    def test_a_missing_file_is_absent_never_verified(self):
+        os.remove(self._path("*.%s.mp4" % self.bodies[2]["segment_sha256"]))
+        rc, out, _ = self._audit()
+        self.assertIn("SEGMENT PAYLOAD: ABSENT", out)
+        self.assertNotIn("SEGMENT PAYLOAD: VERIFIED", out)
+        self.assertIn("NOT a pass", out)
+        self.assertEqual(rc, 0)
+
+    def test_an_empty_directory_grades_every_record_absent(self):
+        empty = os.path.join(self.tmp, "empty")
+        os.makedirs(empty)
+        _, out, _ = self._audit(artifact_dir=empty)
+        self.assertIn("SEGMENT PAYLOAD: ABSENT", out)
+        # counted per RECORD, not per artifact: 3 records, 6 cited files
+        self.assertIn("0 verified, 3 absent, 0 failed", out)
+        self.assertEqual(out.count("NOT a pass"), 6)
+
+    def test_one_present_artifact_does_not_carry_a_record(self):
+        """Segment present and matching, validator output missing: the
+        record is ABSENT, not VERIFIED. Partial evidence is not proof."""
+        os.remove(self._path(
+            "*.%s.validation.txt" % self.bodies[0]["segment_sha256"]))
+        payload = vc.grade_segment_payload(
+            [("s", "a", self.bodies[0])], self.outbox)["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_ABSENT)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_VERIFIED], 0)
+
+    def test_a_failure_outranks_an_absence(self):
+        os.remove(self._path("*.%s.mp4" % self.bodies[2]["segment_sha256"]))
+        target = self._path("*.%s.mp4" % self.bodies[1]["segment_sha256"])
+        with open(target, "wb") as f:
+            f.write(b"replaced entirely")
+        _, out, _ = self._audit()
+        self.assertIn("SEGMENT PAYLOAD: FAILED", out)
+
+    # ── the axis stays separate from chain integrity ──────────────────
+
+    def test_without_the_flag_the_axis_reads_not_checked(self):
+        _, out, _ = self._audit(artifact_dir=None)
+        self.assertIn("SEGMENT PAYLOAD: NOT CHECKED", out)
+        self.assertNotIn("SEGMENT PAYLOAD: VERIFIED", out)
+
+    def test_a_broken_chain_with_good_payloads_reports_both_truthfully(self):
+        """Copy C of the tamper pass: the body was altered, the files
+        were not. Integrity FAILED, payload VERIFIED — neither verdict
+        softens the other."""
+        sid, seq, aid, _, content = self.chain.rows[1]
+        body = json.loads(content)
+        body["duration_s"] = 99.0
+        content = json.dumps(body)
+        self.chain.rows[1] = (sid, seq, aid,
+                              hashlib.sha256(content.encode()).hexdigest(),
+                              content)
+        self.db = self.chain.write("broken.db")
+        rc, out, _ = self._audit()
+        self.assertEqual(rc, 1)
+        self.assertIn("INTEGRITY: FAILED", out)
+        self.assertIn("SEGMENT PAYLOAD: VERIFIED", out)
+
+    def test_fail_on_payload_is_opt_in(self):
+        target = self._path("*.%s.mp4" % self.bodies[1]["segment_sha256"])
+        with open(target, "wb") as f:
+            f.write(b"replaced entirely")
+        self.assertEqual(self._audit()[0], 0)
+        self.assertEqual(self._audit("--fail-on-payload")[0], 4)
+
+    def test_integrity_still_outranks_the_payload_exit_code(self):
+        sid, seq, aid, ahash, content = self.chain.rows[1]
+        self.chain.rows[1] = (sid, seq, aid, ahash, content + " ")
+        self.db = self.chain.write("broken.db")
+        target = self._path("*.%s.mp4" % self.bodies[1]["segment_sha256"])
+        with open(target, "wb") as f:
+            f.write(b"replaced entirely")
+        rc, out, _ = self._audit("--fail-on-payload")
+        self.assertEqual(rc, 1)
+        self.assertIn("INTEGRITY: FAILED", out)
+
+
 class CoverageGradingTests(unittest.TestCase):
 
     def setUp(self):
