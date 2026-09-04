@@ -27,6 +27,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -79,10 +80,15 @@ class SignedChain:
         self.end_ns = 1_700_000_000_000_000_000
 
     def add(self, policy=POLICY_6S, gap=None, hole_s=0.0, duration_s=6.0,
-            seg_sha=None, camera=None, bump_seq=1, raw_gap=_UNSET):
+            seg_sha=None, camera=None, bump_seq=1, raw_gap=_UNSET,
+            sensor=None):
         """raw_gap substitutes the gap AFTER build_body, bypassing the
         emission guard — the only way to produce the signed-but-invalid
-        record the pre-hardening producer could emit."""
+        record the pre-hardening producer could emit.
+
+        sensor promotes the record to the version that carries a
+        sensor_signature (/5), which is how a chain of CURRENT records
+        is built here rather than of /2 ones."""
         cam = camera or self.camera
         self.seq += bump_seq
         start_ns = self.end_ns + int(hole_s * 1e9)
@@ -92,7 +98,7 @@ class SignedChain:
         nosig = vc.build_body(cam, cam, self.seq, sha, self.prev, 1000,
                               duration_s, start_ns, end_ns, "host-clock",
                               "live", None if raw_gap is not _UNSET else gap,
-                              self.key_id, policy)
+                              self.key_id, policy, sensor)
         if raw_gap is not _UNSET:
             nosig["gap"] = raw_gap
         body_bytes, body = vc.producer_sign(self.sk, nosig)
@@ -434,6 +440,113 @@ class CapturePolicyTests(unittest.TestCase):
             vc.capture_policy_new(0.0, 1.0, 0.0)
         with self.assertRaises(SystemExit):
             vc.capture_policy_new(6.0, 1.0, -1.0)
+
+
+class SchemaTableTests(unittest.TestCase):
+    """One table decides what every version carries. These tests exist
+    because the /5 bump did not reach a hand-typed tuple in
+    `_body_policy`, so four live records carrying a perfectly good
+    capture_policy graded UNDECLARED and were reported as /1."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def _schema_constants(self):
+        """Every SCHEMA_V<n> the module defines, by introspection — so a
+        /6 added tomorrow is caught by this test on the day it appears,
+        not on the day someone notices a wrong verdict."""
+        return {name: getattr(vc, name) for name in dir(vc)
+                if re.fullmatch(r"SCHEMA_V\d+", name)}
+
+    def test_every_schema_constant_is_classified(self):
+        consts = self._schema_constants()
+        self.assertGreaterEqual(len(consts), 5)
+        for name, value in sorted(consts.items()):
+            with self.subTest(schema=name):
+                self.assertIn(value, vc.SCHEMA_TABLE,
+                              "%s is not classified in SCHEMA_TABLE — a "
+                              "version this module cannot say whether it "
+                              "carries a policy" % name)
+                row = vc.SCHEMA_TABLE[value]
+                self.assertIsInstance(row["policy"], bool)
+                self.assertIn("sensor", row)
+                self.assertIn(value, vc.SCHEMAS)
+
+    def test_derived_sets_are_derived_and_not_retyped(self):
+        self.assertEqual(set(vc.SCHEMAS), set(vc.SCHEMA_TABLE))
+        self.assertEqual(
+            vc.POLICY_SCHEMAS,
+            frozenset(s for s, d in vc.SCHEMA_TABLE.items() if d["policy"]))
+        self.assertEqual(
+            set(vc.SENSOR_KEYS_BY_SCHEMA),
+            {s for s, d in vc.SCHEMA_TABLE.items() if d["sensor"] is not None})
+
+    def test_only_v1_declares_no_capture_policy(self):
+        self.assertEqual(set(vc.SCHEMAS) - vc.POLICY_SCHEMAS,
+                         {vc.SCHEMA_V1})
+        self.assertIn(vc.SCHEMA_V5, vc.POLICY_SCHEMAS)
+
+    def test_the_current_schema_is_classified(self):
+        # the bump that started this: whatever this producer emits today
+        # must be a version the auditor can grade
+        self.assertIn(vc.SCHEMA, vc.SCHEMA_TABLE)
+        self.assertIn(vc.SCHEMA, vc.POLICY_SCHEMAS)
+
+    def test_a_v5_body_declares_its_policy(self):
+        chain = SignedChain(self.tmp, camera="v5cam")
+        body = chain.add(sensor=vc.sensor_signature_unsigned())
+        self.assertEqual(body["schema"], vc.SCHEMA_V5)
+        self.assertEqual(vc._body_policy(body), POLICY_6S)
+
+    def test_v5_records_grade_accounted_not_undeclared(self):
+        """The lab case, in miniature: /5 records across a signed gap.
+        Before the table this read UNDECLARED and disagreed with
+        virp-verify about the same records."""
+        s = vc.sensor_signature_unsigned()
+        chain = SignedChain(self.tmp, camera="v5cam")
+        for _ in range(3):
+            chain.add(hole_s=0.3, sensor=s)
+        chain.add(hole_s=400.0, gap={"after_seq": 2, "reason": "driver-restart"},
+                  sensor=s)
+        chain.add(hole_s=0.3, sensor=s)
+        bodies = [(sid, aid, json.loads(content))
+                  for sid, _, aid, _, content in chain.rows]
+        info = vc.grade_coverage(bodies)["v5cam"]
+        self.assertEqual(info["verdict"], vc.COVERAGE_ACCOUNTED)
+        self.assertEqual(info["undeclared_records"], 0)
+
+    def test_the_undeclared_reason_names_the_versions_it_saw(self):
+        chain = SignedChain(self.tmp, camera="mixed")
+        chain.add()
+        chain.add(policy=None)
+        bodies = [(sid, aid, json.loads(content))
+                  for sid, _, aid, _, content in chain.rows]
+        info = vc.grade_coverage(bodies)["mixed"]
+        self.assertEqual(info["verdict"], vc.COVERAGE_UNDECLARED)
+        # names the version actually seen, never asserts /1 on faith
+        self.assertIn(vc.SCHEMA_V1, info["reason"])
+        self.assertNotIn(vc.SCHEMA_V5, info["reason"])
+
+    def test_a_v5_body_with_a_broken_policy_is_still_flagged(self):
+        """The second stale tuple: audit's own policy check skipped /5
+        too, so a /5 record with an unusable capture_policy would have
+        passed silently."""
+        chain = SignedChain(self.tmp, camera="v5cam")
+        chain.add(sensor=vc.sensor_signature_unsigned())
+        sid, seq, aid, _, content = chain.rows[0]
+        body = json.loads(content)
+        body["capture_policy"]["nominal_segment_s"] = 0.0   # unusable
+        content = json.dumps(body)
+        # rehash so the body-hash check passes and the POLICY check is
+        # what this test is actually reading
+        ahash = hashlib.sha256(content.encode()).hexdigest()
+        chain.rows[0] = (sid, seq, aid, ahash, content)
+        db = chain.write("broken.db")
+        rc, out, _ = run_main(["audit", "--db", db,
+                               "--session-prefix", "camera:"])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("carries no usable capture_policy", out)
 
 
 class CoverageGradingTests(unittest.TestCase):

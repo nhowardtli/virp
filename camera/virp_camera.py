@@ -102,7 +102,9 @@ SCHEMA_V5 = "camera_segment/5"
 # what the CAMERA asserts about its own video, which is a different
 # fact from anything this host can observe.
 SCHEMA = SCHEMA_V5
-SCHEMAS = (SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5)
+# SCHEMAS, POLICY_SCHEMAS and SENSOR_KEYS_BY_SCHEMA are all DERIVED, from
+# the one table below — see SCHEMA_TABLE, after the sensor field sets it
+# needs. Nothing in this module may hand-type a set of schema names.
 
 # ── The sensor's own claim ─────────────────────────────────────────────
 #
@@ -144,11 +146,48 @@ SENSOR_SIGNATURE_KEYS_V4 = SENSOR_SIGNATURE_KEYS_V3 + (
     "public_key_pin", "sensor_key_sha256",
 )
 SENSOR_SIGNATURE_KEYS = SENSOR_SIGNATURE_KEYS_V4 + ("device_chain",)
-SENSOR_KEYS_BY_SCHEMA = {
-    SCHEMA_V3: frozenset(SENSOR_SIGNATURE_KEYS_V3),
-    SCHEMA_V4: frozenset(SENSOR_SIGNATURE_KEYS_V4),
-    SCHEMA_V5: frozenset(SENSOR_SIGNATURE_KEYS),
+
+# ── The schema table: ONE row per version, and every set derived ───────
+#
+# What each version carries, stated once. Before this table the same
+# facts were spelled out as hand-typed tuples in five places, and the /5
+# bump reached four of them: `_body_policy` still tested
+# `schema in (V2, V3, V4)`, so every /5 record graded UNDECLARED while
+# carrying a perfectly good capture_policy, and audit reported them as
+# `camera_segment/1` — the one version that legitimately has none. The
+# audit disagreed with virp-verify about coverage on live records for as
+# long as that tuple was stale, and the tool reading the producer's own
+# records was the wrong one.
+#
+# So a version bump is ADDING A ROW HERE. If a set has to be updated
+# somewhere else too, that place is a bug waiting for the next bump —
+# which is the whole reason the /5 omission was possible.
+#
+#   policy: the body carries capture_policy (the signed cadence)
+#   sensor: the sensor_signature field set at that version, or None for
+#           the versions from before the camera's own claim existed
+SCHEMA_TABLE = {
+    SCHEMA_V1: {"policy": False, "sensor": None},
+    SCHEMA_V2: {"policy": True, "sensor": None},
+    SCHEMA_V3: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V3},
+    SCHEMA_V4: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V4},
+    SCHEMA_V5: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS},
 }
+
+# Every schema this auditor can read, oldest first. A schema absent here
+# is one it will not judge, and says so rather than passing it.
+SCHEMAS = tuple(SCHEMA_TABLE)
+# The versions whose bodies carry a capture_policy. /1 is the only one
+# that does not, and that is UNDECLARED coverage, not zero tolerance.
+POLICY_SCHEMAS = frozenset(s for s, d in SCHEMA_TABLE.items()
+                           if d["policy"])
+# The sensor_signature field set REQUIRED at each version that has one.
+# The field set IS the schema one level down: an exact match, never a
+# subset, because reading the fields we recognise and ignoring the rest
+# is how a record of an unexpected shape ends up inside a clean result.
+SENSOR_KEYS_BY_SCHEMA = {s: frozenset(d["sensor"])
+                         for s, d in SCHEMA_TABLE.items()
+                         if d["sensor"] is not None}
 
 # ── The device certificate chain, anchored at a CA WE pinned ───────────
 #
@@ -1704,8 +1743,7 @@ def audit_chain(db_path, session_prefix="camera:", pubkey_path=None,
                                 "pass it"
                                 % (session_id, artifact_id, schema))
             continue
-        if (schema in (SCHEMA_V2, SCHEMA_V3, SCHEMA_V4)
-                and _body_policy(body) is None):
+        if schema in POLICY_SCHEMAS and _body_policy(body) is None:
             failures.append("%s %s: %s carries no usable capture_policy"
                             % (session_id, artifact_id, schema))
         # The camera_id/capture_policy precedent: the object is REQUIRED
@@ -1828,7 +1866,7 @@ _COVERAGE_RANK = {COVERAGE_CONTINUOUS: 0, COVERAGE_ACCOUNTED: 1,
 def _body_policy(body):
     """The usable capture_policy of a body, or None. A /1 record has
     none by construction — that is UNDECLARED, not zero tolerance."""
-    if body.get("schema") not in (SCHEMA_V2, SCHEMA_V3, SCHEMA_V4):
+    if body.get("schema") not in POLICY_SCHEMAS:
         return None
     p = body.get("capture_policy")
     if not isinstance(p, dict):
@@ -1968,9 +2006,16 @@ def grade_coverage(cam_bodies):
         info["policies"] = seen
         if undeclared:
             info["verdict"] = COVERAGE_UNDECLARED
+            # Name the versions actually seen rather than asserting /1.
+            # The hardcoded "(camera_segment/1)" told a reader the four
+            # /5 records in front of it were /1 records, which is how a
+            # stale schema tuple reads from the outside: not as a bug,
+            # as a fact about the evidence.
+            seen_schemas = sorted({str(b.get("schema")) for b in undeclared})
             info["reason"] = ("%d of %d records declare no capture "
-                              "policy (camera_segment/1)"
-                              % (len(undeclared), len(lst)))
+                              "policy (%s)"
+                              % (len(undeclared), len(lst),
+                                 ", ".join(seen_schemas)))
             out[cam] = info
             continue
         worst = COVERAGE_CONTINUOUS
