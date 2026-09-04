@@ -144,6 +144,16 @@ grows `sensor_signature`, and growing that object is a version bump by
 the rule `/4` and `/5` were each created under. Left for a `/6`
 session; recorded here so it is not rediscovered.
 
+> **Closed at `camera_segment/6`.** `device_chain.leaf_sha256`, over the
+> leaf's DER. The bump turned out to be invisible at the level the field-set
+> rule was written for: `/5` and `/6` carry the same sixteen
+> `sensor_signature` keys, so `device_chain` had to be field-checked at its
+> own version — on both sides — or a `/5` object would have validated as a
+> `/6` and a `/6` as a `/5`. Nothing had ever checked that object's shape.
+> Findings 1–3 were closed in the three commits after this note; this
+> paragraph is the only edit it has taken, and the findings above stand as
+> written.
+
 ## What this pass proves, and what it does not
 
 It proves that a byte flip in the video a `/5` record was written about
