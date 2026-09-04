@@ -52,17 +52,23 @@ def live_cfg(tmp, sk_path, pk_path):
 
 
 class ShipRecorder:
-    """Fake ship(): records every (seg_file, body_file, name) and returns
-    ok, or fails on a chosen call index."""
+    """Fake ship(): records every (seg_file, body_file, name, cited) and
+    returns ok, or fails on a chosen call index.
+
+    `cited` is recorded because the artifacts a body commits to by digest
+    travel in the SAME all-or-nothing batch as the segment; a test that
+    dropped the argument could not see a ship that left one behind."""
 
     def __init__(self, fail_on=None):
         self.calls = []
         self.fail_on = fail_on
 
-    def __call__(self, seg_file, body_file, name):
+    def __call__(self, seg_file, body_file, name, cited=None):
         with open(body_file, "rb") as f:
             body_bytes = f.read()
-        self.calls.append({"name": name, "body_bytes": body_bytes})
+        self.calls.append({"name": name, "body_bytes": body_bytes,
+                           "cited": list(cited or []),
+                           "cited_suffixes": sorted(sfx for _, sfx in (cited or []))})
         if self.fail_on is not None and len(self.calls) - 1 == self.fail_on:
             return False
         return True

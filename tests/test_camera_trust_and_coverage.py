@@ -23,6 +23,7 @@ synthetic vectors:
 """
 
 import contextlib
+import glob
 import hashlib
 import io
 import json
@@ -471,6 +472,10 @@ class SchemaTableTests(unittest.TestCase):
                 row = vc.SCHEMA_TABLE[value]
                 self.assertIsInstance(row["policy"], bool)
                 self.assertIn("sensor", row)
+                # /6 grew `chain` while leaving `sensor` alone, so a row
+                # missing this column is a version the table can no longer
+                # fully describe.
+                self.assertIn("chain", row)
                 self.assertIn(value, vc.SCHEMAS)
 
     def test_derived_sets_are_derived_and_not_retyped(self):
@@ -481,6 +486,18 @@ class SchemaTableTests(unittest.TestCase):
         self.assertEqual(
             set(vc.SENSOR_KEYS_BY_SCHEMA),
             {s for s, d in vc.SCHEMA_TABLE.items() if d["sensor"] is not None})
+        self.assertEqual(
+            set(vc.DEVICE_CHAIN_KEYS_BY_SCHEMA),
+            {s for s, d in vc.SCHEMA_TABLE.items() if d["chain"] is not None})
+
+    def test_a_version_carrying_a_chain_also_carries_a_sensor(self):
+        """device_chain lives INSIDE sensor_signature: a row claiming one
+        without the other describes a shape that cannot exist."""
+        for schema, row in vc.SCHEMA_TABLE.items():
+            with self.subTest(schema=schema):
+                if row["chain"] is not None:
+                    self.assertIsNotNone(row["sensor"], schema)
+                    self.assertIn("device_chain", row["sensor"])
 
     def test_only_v1_declares_no_capture_policy(self):
         self.assertEqual(set(vc.SCHEMAS) - vc.POLICY_SCHEMAS,
@@ -493,10 +510,10 @@ class SchemaTableTests(unittest.TestCase):
         self.assertIn(vc.SCHEMA, vc.SCHEMA_TABLE)
         self.assertIn(vc.SCHEMA, vc.POLICY_SCHEMAS)
 
-    def test_a_v5_body_declares_its_policy(self):
+    def test_a_sensor_bearing_body_declares_its_policy(self):
         chain = SignedChain(self.tmp, camera="v5cam")
         body = chain.add(sensor=vc.sensor_signature_unsigned())
-        self.assertEqual(body["schema"], vc.SCHEMA_V5)
+        self.assertEqual(body["schema"], vc.SCHEMA)
         self.assertEqual(vc._body_policy(body), POLICY_6S)
 
     def test_v5_records_grade_accounted_not_undeclared(self):
@@ -807,6 +824,109 @@ class SegmentPayloadAxisTests(unittest.TestCase):
             f.write(b"replaced entirely")
         _, out, _ = self._audit()
         self.assertIn("SEGMENT PAYLOAD: FAILED", out)
+
+    # --- the SPOOL layout, which this axis was never exercised against --
+
+    def _spool(self, drop=()):
+        """A spool/done layout: <camera>.<seq>.<segment_sha256>.<ext>, the
+        shape submit-spool leaves behind on the O-node.
+
+        THE TEST GAP THIS CLOSES. Every payload test wrote a capture-host
+        OUTBOX, where the driver has just written all three files side by
+        side, so the axis was only ever asked about a directory that was
+        complete by construction. The spool is the directory an examiner
+        actually points --artifact-dir at, and until 2026-09-04 it carried
+        the segment alone: the validator output was written on the capture
+        host and never shipped, and the leaf DER was never written at all.
+        Both graded ABSENT on the O-node forever, and no test could see it
+        because no test had ever built a directory with a file missing."""
+        d = tempfile.mkdtemp(dir=self.tmp)
+        for b in self.bodies:
+            seg = b["segment_sha256"]
+            base = "cam-p.%06d.%s" % (b["segment_seq"], seg)
+            if "mp4" not in drop:
+                shutil.copy(self._path("*.%s.mp4" % seg),
+                            os.path.join(d, base + ".mp4"))
+            if "validation" not in drop:
+                shutil.copy(self._path("*.%s.validation.txt" % seg),
+                            os.path.join(d, base + ".validation.txt"))
+        return d
+
+    def test_the_spool_layout_verifies_when_every_cited_file_arrived(self):
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], self._spool())["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_VERIFIED)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_ABSENT], 0)
+
+    def test_a_spool_missing_the_validator_output_is_absent_not_verified(self):
+        """The exact 2026-09-04 shape: segments shipped, validator outputs
+        did not. Every record ABSENT, nothing FAILED, and the axis must
+        not read as a pass anywhere."""
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies],
+            self._spool(drop=("validation",)))["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_ABSENT)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_VERIFIED], 0)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_FAILED], 0)
+        fields = {it["field"] for it in payload["items"]}
+        self.assertEqual(fields, {vc.CITED_VALIDATOR_OUTPUT})
+        # the absence is specific: the segments themselves WERE found
+        self.assertTrue(all(it["path"] is None for it in payload["items"]))
+
+    def test_an_unreadable_directory_is_inaccessible_never_absent(self):
+        """chmod 000. glob() cannot tell an unreadable directory from an
+        empty one, so before this the audit reported every artifact
+        missing — a complete and confident account of evidence it had
+        never been allowed to look at."""
+        d = self._spool()
+        os.chmod(d, 0o000)
+        self.addCleanup(os.chmod, d, 0o700)
+        if os.access(d, os.R_OK):
+            self.skipTest("running as root: chmod 000 does not deny access")
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], d)["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_INACCESSIBLE)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_ABSENT], 0)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_VERIFIED], 0)
+        self.assertTrue(all(it["state"] == vc.PAYLOAD_INACCESSIBLE
+                            for it in payload["items"]))
+        self.assertIn("inaccessible", vc.payload_axis({"cam-p": payload}))
+
+    def test_an_unreadable_FILE_is_inaccessible_not_absent(self):
+        """The directory lists, the file does not open. It IS there, so
+        reporting it missing would be a false statement about the spool."""
+        d = self._spool()
+        target = glob.glob(os.path.join(d, "*.mp4"))[0]
+        os.chmod(target, 0o000)
+        self.addCleanup(os.chmod, target, 0o600)
+        if os.access(target, os.R_OK):
+            self.skipTest("running as root: chmod 000 does not deny access")
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], d)["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_INACCESSIBLE)
+        states = {it["state"] for it in payload["items"]}
+        self.assertEqual(states, {vc.PAYLOAD_INACCESSIBLE})
+
+    def test_inaccessible_outranks_absent_in_the_roll_up(self):
+        """One unreadable file among genuinely missing ones must not let
+        the summary read ABSENT: part of the question was never asked."""
+        d = self._spool(drop=("validation",))
+        target = glob.glob(os.path.join(d, "*.mp4"))[0]
+        os.chmod(target, 0o000)
+        self.addCleanup(os.chmod, target, 0o600)
+        if os.access(target, os.R_OK):
+            self.skipTest("running as root: chmod 000 does not deny access")
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], d)["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_INACCESSIBLE)
+
+    def test_a_spool_missing_the_segment_is_absent_on_that_field(self):
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies],
+            self._spool(drop=("mp4",)))["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_ABSENT)
+        fields = {it["field"] for it in payload["items"]}
+        self.assertEqual(fields, {vc.CITED_SEGMENT})
 
     # ── the axis stays separate from chain integrity ──────────────────
 

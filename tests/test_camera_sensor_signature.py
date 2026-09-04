@@ -553,6 +553,54 @@ class DeviceChainTests(unittest.TestCase):
         dc = vc.device_chain_check(AXIS_CLIP, other_ca, DEVICE_SERIAL)
         self.assertTrue(dc["chain_to_anchor_verified"])
 
+    # --- /6: which certificate the assertions are ABOUT -----------------
+
+    def test_the_leaf_is_recorded_by_digest_over_its_der(self):
+        """/5 asserted three things about a certificate and committed to
+        none of its bytes, so a later reader could re-derive nothing."""
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+        dc = vc.device_chain_check(AXIS_CLIP, ANCHOR, DEVICE_SERIAL)
+        chain = vc.extract_sensor_cert_chain(AXIS_CLIP)
+        leaf = x509.load_pem_x509_certificate(chain[0].encode())
+        self.assertEqual(
+            dc["leaf_sha256"],
+            hashlib.sha256(leaf.public_bytes(Encoding.DER)).hexdigest())
+
+    def test_the_leaf_digest_is_der_not_pem(self):
+        """PEM whitespace can differ while the certificate is identical, so
+        the digest that identifies a certificate cannot be over PEM."""
+        dc = vc.device_chain_check(AXIS_CLIP, ANCHOR, DEVICE_SERIAL)
+        pem = vc.extract_sensor_cert_chain(AXIS_CLIP)[0]
+        self.assertNotEqual(
+            dc["leaf_sha256"], hashlib.sha256(pem.encode()).hexdigest())
+        # and re-wrapping the PEM must not change the recorded digest
+        rewrapped = pem.replace("\n", "\r\n") + "\n"
+        self.assertNotEqual(pem, rewrapped)
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+        leaf = x509.load_pem_x509_certificate(rewrapped.encode())
+        self.assertEqual(
+            dc["leaf_sha256"],
+            hashlib.sha256(leaf.public_bytes(Encoding.DER)).hexdigest())
+
+    @unittest.skipUnless(have_vendor, "needs the vendor sample clip")
+    def test_a_different_device_records_a_different_leaf(self):
+        """The digest identifies THIS device's certificate. The wrong-device
+        clip chains to the same CA and is still a different leaf."""
+        ours = vc.device_chain_check(AXIS_CLIP, ANCHOR, DEVICE_SERIAL)
+        theirs = vc.device_chain_check(VENDOR_CLIP, ANCHOR, DEVICE_SERIAL)
+        self.assertTrue(theirs["chain_to_anchor_verified"])
+        self.assertFalse(theirs["leaf_serial_matches_device"])
+        self.assertNotEqual(ours["leaf_sha256"], theirs["leaf_sha256"])
+        self.assertIsNotNone(theirs["leaf_sha256"])
+
+    def test_an_unreachable_leaf_records_the_absence_not_a_guess(self):
+        dc = vc.device_chain_check(
+            AXIS_CLIP, os.path.join(self.tmp, "absent.pem"), DEVICE_SERIAL)
+        self.assertIsNone(dc["leaf_sha256"])
+        self.assertEqual(set(dc), set(vc.DEVICE_CHAIN_KEYS))
+
 
 @unittest.skipUnless(have_clip and have_anchor and have_validator,
                      "needs the Axis clip, anchor and validator")
@@ -614,15 +662,22 @@ class SchemaV3Tests(unittest.TestCase):
                              1, 2, "host-clock", "live", None,
                              self.key_id, policy, sensor)
 
-    def test_sensor_signature_makes_a_v5_body(self):
+    def test_sensor_signature_makes_a_current_version_body(self):
         s = vc.sensor_signature_unsigned()
         body = self._body(sensor=s)
-        self.assertEqual(body["schema"], "camera_segment/5")
+        self.assertEqual(body["schema"], "camera_segment/6")
         self.assertEqual(body["sensor_signature"], s)
 
-    def test_v5_is_what_this_producer_now_emits(self):
-        self.assertEqual(vc.SCHEMA, "camera_segment/5")
-        self.assertIn("camera_segment/5", vc.SCHEMAS)
+    def test_v6_is_what_this_producer_now_emits(self):
+        self.assertEqual(vc.SCHEMA, "camera_segment/6")
+        self.assertIn("camera_segment/6", vc.SCHEMAS)
+
+    def test_every_earlier_version_stays_readable(self):
+        """/3, /4 and /5 records are signed and on the chain. A bump adds
+        a version; it never removes one, and never re-grades one."""
+        for older in ("camera_segment/3", "camera_segment/4", "camera_segment/5"):
+            self.assertIn(older, vc.SCHEMAS)
+            self.assertIn(older, vc.SENSOR_KEYS_BY_SCHEMA)
 
     def test_every_sensor_version_keeps_its_own_field_set(self):
         self.assertEqual(len(vc.SENSOR_SIGNATURE_KEYS_V3), 13)
@@ -637,6 +692,57 @@ class SchemaV3Tests(unittest.TestCase):
         v4["verdict"] = vc.SENSOR_UNSIGNED
         self.assertIsNone(vc.sensor_defect(v4, "camera_segment/4"))
         self.assertIsNotNone(vc.sensor_defect(v4, "camera_segment/5"))
+
+    # --- /6 is distinguished one level DEEPER ---------------------------
+
+    def test_v5_and_v6_carry_the_same_sensor_keys(self):
+        """Which is exactly why device_chain has to be field-checked: the
+        top-level object cannot tell these two versions apart."""
+        self.assertEqual(vc.SENSOR_KEYS_BY_SCHEMA["camera_segment/5"],
+                         vc.SENSOR_KEYS_BY_SCHEMA["camera_segment/6"])
+
+    def test_the_device_chain_field_set_is_what_separates_them(self):
+        self.assertEqual(len(vc.DEVICE_CHAIN_KEYS_V5), 5)
+        self.assertEqual(len(vc.DEVICE_CHAIN_KEYS), 6)
+        self.assertEqual(
+            set(vc.DEVICE_CHAIN_KEYS) - set(vc.DEVICE_CHAIN_KEYS_V5),
+            {"leaf_sha256"})
+
+    def _sensor_with_chain(self, chain_keys):
+        s = {k: None for k in vc.SENSOR_SIGNATURE_KEYS}
+        s["verdict"] = vc.SENSOR_UNSIGNED
+        s["device_chain"] = {k: None for k in chain_keys}
+        return s
+
+    def test_a_v5_chain_is_refused_at_v6(self):
+        five = self._sensor_with_chain(vc.DEVICE_CHAIN_KEYS_V5)
+        self.assertIsNone(vc.sensor_defect(five, "camera_segment/5"))
+        defect = vc.sensor_defect(five, "camera_segment/6")
+        self.assertIsNotNone(defect)
+        self.assertIn("leaf_sha256", defect)
+
+    def test_a_v6_chain_is_refused_at_v5(self):
+        """The other direction matters as much: appending a field to a
+        frozen version is how a verdict gets added to signed history."""
+        six = self._sensor_with_chain(vc.DEVICE_CHAIN_KEYS)
+        self.assertIsNone(vc.sensor_defect(six, "camera_segment/6"))
+        defect = vc.sensor_defect(six, "camera_segment/5")
+        self.assertIsNotNone(defect)
+        self.assertIn("leaf_sha256", defect)
+
+    def test_a_null_device_chain_stays_legal_at_both_versions(self):
+        """An unsigning camera, or one with no anchor configured, records
+        the absence. That is an honest statement, not a defect."""
+        s = {k: None for k in vc.SENSOR_SIGNATURE_KEYS}
+        s["verdict"] = vc.SENSOR_UNSIGNED
+        for schema in ("camera_segment/5", "camera_segment/6"):
+            self.assertIsNone(vc.sensor_defect(s, schema))
+
+    def test_a_device_chain_that_is_not_an_object_is_a_defect(self):
+        s = {k: None for k in vc.SENSOR_SIGNATURE_KEYS}
+        s["verdict"] = vc.SENSOR_UNSIGNED
+        s["device_chain"] = "intermediate_pinned"
+        self.assertIsNotNone(vc.sensor_defect(s, "camera_segment/6"))
 
     def test_growing_the_object_was_a_version_bump(self):
         """/3 records are signed and on the chain with 13 fields. The
@@ -823,23 +929,24 @@ class ShipsAnywayTests(unittest.TestCase):
         return p
 
     def _run(self):
-        ship = ShipRecorder()
+        self.ship = ShipRecorder()
         p = self._seg()
-        vc.process_live_segment(p, self.cfg, None, None, ship)
-        self.assertEqual(len(ship.calls), 1)
-        return json.loads(ship.calls[0]["body_bytes"]), ship.calls[0]["name"]
+        vc.process_live_segment(p, self.cfg, None, None, self.ship)
+        self.assertEqual(len(self.ship.calls), 1)
+        return (json.loads(self.ship.calls[0]["body_bytes"]),
+                self.ship.calls[0]["name"])
 
     def test_missing_validator_still_ships_an_unverified_record(self):
         self.cfg["sensor_vendor"] = "axis"
         self.cfg["validator"] = "/nonexistent/validator"
         body, _ = self._run()
-        self.assertEqual(body["schema"], "camera_segment/5")
+        self.assertEqual(body["schema"], "camera_segment/6")
         self.assertEqual(body["sensor_signature"]["verdict"],
                          vc.SENSOR_UNVERIFIED)
 
     def test_unconfigured_vendor_ships_an_unsigned_record(self):
         body, _ = self._run()
-        self.assertEqual(body["schema"], "camera_segment/5")
+        self.assertEqual(body["schema"], "camera_segment/6")
         self.assertEqual(body["sensor_signature"]["verdict"],
                          vc.SENSOR_UNSIGNED)
         self.assertIsNone(body["sensor_signature"]["vendor"])
@@ -858,6 +965,29 @@ class ShipsAnywayTests(unittest.TestCase):
             got = hashlib.sha256(f.read()).hexdigest()
         self.assertEqual(body["sensor_signature"]["validator_output_sha256"],
                          got)
+
+    def test_the_validator_output_is_SHIPPED_not_only_kept(self):
+        """The 2026-09-04 defect. Writing it beside the segment satisfied
+        the old test while the file never left the capture host, so the
+        O-node held a digest whose preimage it could not obtain and
+        SEGMENT PAYLOAD there was permanently ABSENT."""
+        stub = os.path.join(self.tmp, "stub")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\ncp %s validation_results.txt\n" % REAL_VALID)
+        os.chmod(stub, 0o755)
+        self.cfg["sensor_vendor"] = "axis"
+        self.cfg["validator"] = stub
+        body, name = self._run()
+        shipped = self.ship.calls[-1]["cited_suffixes"]
+        self.assertIn("validation.txt", shipped,
+                      "the validator output was written but not shipped")
+
+    def test_a_record_citing_nothing_extra_ships_nothing_extra(self):
+        """No vendor, no validator output, no leaf: the cited set is empty
+        and the batch is the segment and the body, exactly as before."""
+        body, _ = self._run()
+        self.assertEqual(self.ship.calls[-1]["cited_suffixes"], [])
+        self.assertIsNone(vc._cited_digests(body).get(vc.CITED_VALIDATOR_OUTPUT))
 
     def test_the_onode_receipt_time_is_not_the_cameras_claim(self):
         """The two facts stay separate in the signed bytes: capture_end

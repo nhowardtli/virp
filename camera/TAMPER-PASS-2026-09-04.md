@@ -144,6 +144,16 @@ grows `sensor_signature`, and growing that object is a version bump by
 the rule `/4` and `/5` were each created under. Left for a `/6`
 session; recorded here so it is not rediscovered.
 
+> **Closed at `camera_segment/6`.** `device_chain.leaf_sha256`, over the
+> leaf's DER. The bump turned out to be invisible at the level the field-set
+> rule was written for: `/5` and `/6` carry the same sixteen
+> `sensor_signature` keys, so `device_chain` had to be field-checked at its
+> own version — on both sides — or a `/5` object would have validated as a
+> `/6` and a `/6` as a `/5`. Nothing had ever checked that object's shape.
+> Findings 1–3 were closed in the three commits after this note; this
+> paragraph is the only edit it has taken, and the findings above stand as
+> written.
+
 ## What this pass proves, and what it does not
 
 It proves that a byte flip in the video a `/5` record was written about
@@ -156,3 +166,63 @@ The gap is one of *reach*, not of soundness. The chain says what the
 producer signed. It has never said the file on disk is still the file
 that was signed about — and until finding 1 and finding 2 are closed,
 no tool an examiner is likely to run says it either.
+
+## Addendum 2 — finding 2 recurred twice, and the test that could not see it
+
+Written 2026-09-04 evening, after taking `/6` through the real path for
+the first time. The `/5` bundle above was assembled from a capture-host
+outbox. Nothing had ever pointed `--artifact-dir` at an O-node.
+
+The first live `/6` session put six records on the real chain and then
+`audit --artifact-dir` on 313 read **SEGMENT PAYLOAD: ABSENT** for every
+one of them. Not a grading bug. The files were not there.
+
+| artifact | cited by | written | shipped | checkable at the O-node |
+|---|---|---|---|---|
+| segment mp4 | `segment_sha256` | yes | yes | yes |
+| validator output | `validator_output_sha256` | yes, capture host only | **no** | **no** |
+| leaf certificate | `device_chain.leaf_sha256` | **no** | **no** | **no** |
+
+Both are finding 2 again: *a digest inside a signed record whose preimage
+does not travel*. The validator output was written beside the segment and
+`ship()` sent only the segment and the body. The leaf was never written
+at all — `/6` added the digest and dropped the bytes it was taken over,
+which means the commit that introduced `leaf_sha256` reproduced, on the
+same day, the defect this note was written about.
+
+A hash whose preimage is unobtainable is an assertion, not a commitment.
+It has the *shape* of something checkable, which is the property that
+makes it worse than saying nothing — the same reason `verify-segment`'s
+old `NO MATCH` on a validation output was worse than no answer.
+
+### The test gap
+
+Every SEGMENT PAYLOAD test built a capture-host **outbox** — a directory
+the driver had just written every file into, complete by construction.
+The suite asked "does the axis grade a complete directory correctly?"
+and never "what does it do when a file did not arrive?"
+
+The **spool** is the directory an examiner actually points
+`--artifact-dir` at, and it was never constructed in a test. So the axis
+was only ever exercised where it could not fail, and the two artifacts
+that never shipped were invisible to 251 passing tests.
+
+The existing test `test_the_raw_validator_output_is_kept_beside_the_segment`
+passed throughout and always would have. It asserted the file was
+*written*. The claim that was wrong is that it *ships*, and nothing
+asserted that, because on a laptop the two are indistinguishable.
+
+Closed by three tests that build a spool layout with a file removed: a
+complete spool VERIFIES, a spool missing the validator output grades
+ABSENT on that field alone with nothing FAILED, and a spool missing the
+segment grades ABSENT on that one. Plus one asserting the validator
+output is handed to `ship()`, not merely written.
+
+### What the leaf turned out to be
+
+Not per-record. One certificate signs every segment the device emits, so
+the bundle carries it **once** and eleven `/6` records cite the same
+digest. Flipping one byte in the carried leaf DER fails all eleven, not
+one — every record that commits to that digest is a record whose
+commitment no longer holds. Correct, and worth knowing before designing a
+per-record expectation around it.

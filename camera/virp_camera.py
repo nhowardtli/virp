@@ -23,7 +23,8 @@ How a segment becomes evidence:
      chain_append. evidence_item is the established externally
      submittable, hash-bound record type (autopilot/virp_evidence.py);
      "camera_segment/1" is the schema INSIDE the body, per that
-     convention. The daemon stores the body and D-1 Ed25519-signs the
+     convention. The current version is camera_segment/6; every
+     earlier one stays readable forever and is never re-emitted. The daemon stores the body and D-1 Ed25519-signs the
      chain entry with its own chain-signing key.
 
 Continuity is committed INSIDE the bodies: each record carries
@@ -94,6 +95,7 @@ SCHEMA_V2 = "camera_segment/2"
 SCHEMA_V3 = "camera_segment/3"
 SCHEMA_V4 = "camera_segment/4"
 SCHEMA_V5 = "camera_segment/5"
+SCHEMA_V6 = "camera_segment/6"
 # What this producer emits when a capture policy is declared (always,
 # from the CLI). SCHEMA_V1 remains emitted only by callers that pass no
 # policy, and remains READABLE forever: 2553 live records carry it and
@@ -101,10 +103,11 @@ SCHEMA_V5 = "camera_segment/5"
 # signed capture_policy; SCHEMA_V3 is /2 plus the sensor_signature —
 # what the CAMERA asserts about its own video, which is a different
 # fact from anything this host can observe.
-SCHEMA = SCHEMA_V5
-# SCHEMAS, POLICY_SCHEMAS and SENSOR_KEYS_BY_SCHEMA are all DERIVED, from
-# the one table below — see SCHEMA_TABLE, after the sensor field sets it
-# needs. Nothing in this module may hand-type a set of schema names.
+SCHEMA = SCHEMA_V6
+# SCHEMAS, POLICY_SCHEMAS, SENSOR_KEYS_BY_SCHEMA and
+# DEVICE_CHAIN_KEYS_BY_SCHEMA are all DERIVED, from the one table below —
+# see SCHEMA_TABLE, after the field sets it needs. Nothing in this module
+# may hand-type a set of schema names.
 
 # ── The sensor's own claim ─────────────────────────────────────────────
 #
@@ -135,6 +138,11 @@ SENSOR_VERDICTS = (SENSOR_VALID, SENSOR_INVALID, SENSOR_UNSIGNED,
 # quietly accepted both sizes would have given up the very rule that
 # stops anyone appending a verdict to frozen history. /4 adds the leaf
 # pin. /3 stays READABLE forever and is never emitted again.
+#
+# /5 and /6 share this 16-key set: /6 grows device_chain, one level
+# DEEPER, so the set below cannot tell them apart and the version gate
+# for that pair lives in DEVICE_CHAIN_KEYS_BY_SCHEMA instead. A bump is
+# not always visible at the level you last looked at.
 SENSOR_SIGNATURE_KEYS_V3 = (
     "vendor", "validator", "verdict", "public_key",
     "gops_valid", "gops_valid_with_missing", "gops_invalid",
@@ -146,48 +154,6 @@ SENSOR_SIGNATURE_KEYS_V4 = SENSOR_SIGNATURE_KEYS_V3 + (
     "public_key_pin", "sensor_key_sha256",
 )
 SENSOR_SIGNATURE_KEYS = SENSOR_SIGNATURE_KEYS_V4 + ("device_chain",)
-
-# ── The schema table: ONE row per version, and every set derived ───────
-#
-# What each version carries, stated once. Before this table the same
-# facts were spelled out as hand-typed tuples in five places, and the /5
-# bump reached four of them: `_body_policy` still tested
-# `schema in (V2, V3, V4)`, so every /5 record graded UNDECLARED while
-# carrying a perfectly good capture_policy, and audit reported them as
-# `camera_segment/1` — the one version that legitimately has none. The
-# audit disagreed with virp-verify about coverage on live records for as
-# long as that tuple was stale, and the tool reading the producer's own
-# records was the wrong one.
-#
-# So a version bump is ADDING A ROW HERE. If a set has to be updated
-# somewhere else too, that place is a bug waiting for the next bump —
-# which is the whole reason the /5 omission was possible.
-#
-#   policy: the body carries capture_policy (the signed cadence)
-#   sensor: the sensor_signature field set at that version, or None for
-#           the versions from before the camera's own claim existed
-SCHEMA_TABLE = {
-    SCHEMA_V1: {"policy": False, "sensor": None},
-    SCHEMA_V2: {"policy": True, "sensor": None},
-    SCHEMA_V3: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V3},
-    SCHEMA_V4: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V4},
-    SCHEMA_V5: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS},
-}
-
-# Every schema this auditor can read, oldest first. A schema absent here
-# is one it will not judge, and says so rather than passing it.
-SCHEMAS = tuple(SCHEMA_TABLE)
-# The versions whose bodies carry a capture_policy. /1 is the only one
-# that does not, and that is UNDECLARED coverage, not zero tolerance.
-POLICY_SCHEMAS = frozenset(s for s, d in SCHEMA_TABLE.items()
-                           if d["policy"])
-# The sensor_signature field set REQUIRED at each version that has one.
-# The field set IS the schema one level down: an exact match, never a
-# subset, because reading the fields we recognise and ignoring the rest
-# is how a record of an unexpected shape ends up inside a clean result.
-SENSOR_KEYS_BY_SCHEMA = {s: frozenset(d["sensor"])
-                         for s, d in SCHEMA_TABLE.items()
-                         if d["sensor"] is not None}
 
 # ── The device certificate chain, anchored at a CA WE pinned ───────────
 #
@@ -212,13 +178,105 @@ SENSOR_KEYS_BY_SCHEMA = {s: frozenset(d["sensor"])
 # "root" only when a genuinely out-of-band root is pinned.
 ANCHOR_INTERMEDIATE = "intermediate_pinned"
 ANCHOR_ROOT = "root"
-DEVICE_CHAIN_KEYS = (
+#
+# THE LEAF IS RECORDED BY DIGEST, AND THAT IS NOT A PIN. /5 bound the
+# anchor by digest and the leaf by four assertions —
+# chain_to_anchor_verified, leaf_serial_matches_device, leaf_not_after,
+# and the key indirectly through sensor_key_sha256. So a later reader
+# could not re-derive ANY of them: the certificate those booleans are
+# about did not travel, and nothing committed to its bytes. `leaf_sha256`
+# closes that, for the same reason `anchor_sha256` exists — which
+# certificate was actually in this segment's stream is its own fact, and
+# a record that asserts things about a certificate should say WHICH one.
+#
+# It is a RECORD, not a check. A leaf that rotates within the same CA is
+# expected and legitimate, so nothing compares this digest across
+# segments and a change in it is not a defect. What it buys is that the
+# three assertions beside it stop being unfalsifiable.
+#
+# Over the DER, not the PEM. PEM is a transport wrapper whose line
+# breaks and trailing whitespace can differ while the certificate is
+# byte-identical; DER is the certificate. sensor_key_sha256 hashes PEM
+# text because the SEI hands us text and nothing parses it; here the
+# leaf is already an x509 object, so the unambiguous form is available
+# and is the one to commit to.
+#
+# GROWING THIS OBJECT IS A VERSION BUMP, exactly as growing
+# sensor_signature is — this object rides inside it. /5's five-key form
+# is frozen and stays READABLE forever; /6 is the six-key form and is
+# what this producer now emits.
+DEVICE_CHAIN_KEYS_V5 = (
     "anchor", "anchor_sha256", "chain_to_anchor_verified",
     "leaf_serial_matches_device", "leaf_not_after",
 )
+DEVICE_CHAIN_KEYS = DEVICE_CHAIN_KEYS_V5 + ("leaf_sha256",)
 SENSOR_ANCHOR_FILE = os.path.join("trust", "axis-edge-vault-attestation-ca.pem")
 _PEM_CERT = re.compile(
     rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+
+
+# ── The schema table: ONE row per version, and every set derived ───────
+#
+# What each version carries, stated once. Before this table the same
+# facts were spelled out as hand-typed tuples in five places, and the /5
+# bump reached four of them: `_body_policy` still tested
+# `schema in (V2, V3, V4)`, so every /5 record graded UNDECLARED while
+# carrying a perfectly good capture_policy, and audit reported them as
+# `camera_segment/1` — the one version that legitimately has none. The
+# audit disagreed with virp-verify about coverage on live records for as
+# long as that tuple was stale, and the tool reading the producer's own
+# records was the wrong one.
+#
+# So a version bump is ADDING A ROW HERE. If a set has to be updated
+# somewhere else too, that place is a bug waiting for the next bump —
+# which is the whole reason the /5 omission was possible.
+#
+#   policy: the body carries capture_policy (the signed cadence)
+#   sensor: the sensor_signature field set at that version, or None for
+#           the versions from before the camera's own claim existed
+#   chain:  the device_chain field set at that version, or None for the
+#           versions from before the certificate chain existed. It is a
+#           column here and not a constant beside DEVICE_CHAIN_KEYS
+#           because /6 grows THIS set while leaving `sensor` untouched:
+#           the two move independently, and a table that could only
+#           describe one of them would have made the /6 bump invisible.
+SCHEMA_TABLE = {
+    SCHEMA_V1: {"policy": False, "sensor": None, "chain": None},
+    SCHEMA_V2: {"policy": True, "sensor": None, "chain": None},
+    SCHEMA_V3: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V3, "chain": None},
+    SCHEMA_V4: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS_V4, "chain": None},
+    SCHEMA_V5: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS,
+                "chain": DEVICE_CHAIN_KEYS_V5},
+    SCHEMA_V6: {"policy": True, "sensor": SENSOR_SIGNATURE_KEYS,
+                "chain": DEVICE_CHAIN_KEYS},
+}
+
+# Every schema this auditor can read, oldest first. A schema absent here
+# is one it will not judge, and says so rather than passing it.
+SCHEMAS = tuple(SCHEMA_TABLE)
+# The versions whose bodies carry a capture_policy. /1 is the only one
+# that does not, and that is UNDECLARED coverage, not zero tolerance.
+POLICY_SCHEMAS = frozenset(s for s, d in SCHEMA_TABLE.items()
+                           if d["policy"])
+# The sensor_signature field set REQUIRED at each version that has one.
+# The field set IS the schema one level down: an exact match, never a
+# subset, because reading the fields we recognise and ignoring the rest
+# is how a record of an unexpected shape ends up inside a clean result.
+SENSOR_KEYS_BY_SCHEMA = {s: frozenset(d["sensor"])
+                         for s, d in SCHEMA_TABLE.items()
+                         if d["sensor"] is not None}
+# The device_chain field set REQUIRED at each version that has one.
+#
+# /5 and /6 carry the SAME sensor_signature keys — the growth is one
+# level deeper, inside device_chain — so this is the only set that can
+# tell the two versions apart. Without it the bump would be cosmetic: a
+# /5 object would validate as /6 and a /6 object as /5, which is exactly
+# the "quietly accepted both sizes" failure the field-set rule exists to
+# stop. Before /6 nothing checked this object's shape at all.
+DEVICE_CHAIN_KEYS_BY_SCHEMA = {s: frozenset(d["chain"])
+                               for s, d in SCHEMA_TABLE.items()
+                               if d["chain"] is not None}
+
 
 # The leaf pin. `public_key` is the FRAMEWORK's opinion of the key it
 # used; `public_key_pin` is OURS — whether the key in the stream is the
@@ -916,11 +974,62 @@ def device_chain_check(seg_path, anchor_path, device_serial):
     except Exception:
         dc["chain_to_anchor_verified"] = False
 
+    # WHICH certificate the three assertions above are about. Over the
+    # DER: PEM is a transport wrapper whose whitespace can differ while
+    # the certificate is byte-identical, and the leaf is already parsed
+    # here, so the unambiguous form is the one to commit to.
+    try:
+        from cryptography.hazmat.primitives.serialization import Encoding
+        dc["leaf_sha256"] = hashlib.sha256(
+            leaf.public_bytes(Encoding.DER)).hexdigest()
+    except Exception:
+        # Recorded as absent rather than guessed. A null here is the same
+        # honest shape every other unavailable value in this object has.
+        dc["leaf_sha256"] = None
+
     serial = _leaf_serial(leaf)
     dc["leaf_serial_matches_device"] = bool(
         serial and device_serial
         and serial.strip().upper() == str(device_serial).strip().upper())
     return dc
+
+
+def cited_leaf_der(seg_path, sensor):
+    """The leaf DER when this record CITES it, else None.
+
+    Driven off the sensor object rather than off the anchor config, so
+    the file that gets written is exactly the preimage of the digest the
+    body carries — never one without the other."""
+    chain = (sensor or {}).get("device_chain")
+    if not isinstance(chain, dict) or not chain.get("leaf_sha256"):
+        return None
+    return leaf_certificate_der(seg_path)
+
+
+def leaf_certificate_der(seg_path):
+    """The DER bytes of the leaf certificate this segment's stream carries,
+    or None.
+
+    THE PREIMAGE OF device_chain.leaf_sha256. /6 records that digest and
+    nothing carried the bytes it is over, which put leaf_sha256 in exactly
+    the position validator_output_sha256 was in before the tamper pass: a
+    digest inside a signed record that no tool could recompute because the
+    thing it names never travelled. A hash whose preimage is unobtainable
+    is an assertion, not a commitment.
+
+    Kept separate from device_chain_check rather than returned beside its
+    verdict: the check answers "does this chain hold", this answers "what
+    were the bytes", and the callers of the first are graders that have no
+    use for a certificate."""
+    chain = extract_sensor_cert_chain(seg_path)
+    if not chain:
+        return None
+    try:
+        from cryptography.hazmat.primitives.serialization import Encoding
+        leaf = _x509().load_pem_x509_certificate(chain[0].encode())
+        return leaf.public_bytes(Encoding.DER)
+    except Exception:
+        return None
 
 
 def _pin_state(observed_pem, pin_path):
@@ -1132,7 +1241,7 @@ def sensor_for_segment(path, cfg, log=None):
         device_serial=cfg.get("sensor_device_serial"), log=log)
 
 
-def sensor_defect(sensor, schema=SCHEMA_V5):
+def sensor_defect(sensor, schema=SCHEMA):
     """Why this object may not be signed into (or read out of) a body at
     `schema`, or None. Each version has ONE permitted field set."""
     if not isinstance(sensor, dict):
@@ -1148,6 +1257,29 @@ def sensor_defect(sensor, schema=SCHEMA_V5):
     if sensor.get("verdict") not in SENSOR_VERDICTS:
         return ("sensor_signature verdict %r is not one of %s"
                 % (sensor.get("verdict"), ", ".join(SENSOR_VERDICTS)))
+    return device_chain_defect(sensor.get("device_chain"), schema)
+
+
+def device_chain_defect(chain, schema):
+    """Why this device_chain may not sit inside a body at `schema`, or
+    None. The field set is the schema one level DEEPER, and at /5 vs /6
+    it is the only thing that distinguishes the two versions — their
+    sensor_signature key sets are identical.
+
+    A null chain stays legal at every version that has the field: an
+    unsigning camera, or one with no anchor configured, records the
+    absence rather than an object full of nulls, and that is an honest
+    statement, not a defective one."""
+    want = DEVICE_CHAIN_KEYS_BY_SCHEMA.get(schema)
+    if want is None or chain is None:
+        return None
+    if not isinstance(chain, dict):
+        return "device_chain must be an object or null"
+    if set(chain) != want:
+        missing = sorted(want - set(chain))
+        extra = sorted(set(chain) - want)
+        return ("device_chain field set is the schema at %s "
+                "(missing=%s extra=%s)" % (schema, missing, extra))
     return None
 
 
@@ -1194,7 +1326,10 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
     elif sensor is None:
         schema = SCHEMA_V2
     else:
-        schema = SCHEMA_V5
+        # SCHEMA, not a literal: /5 was hardcoded here and the next bump
+        # would have had to remember this line. It is the same class of
+        # staleness that left _body_policy on (V2, V3, V4).
+        schema = SCHEMA
     if sensor is not None:
         # judged against the version this body will actually claim
         defect = sensor_defect(sensor, schema)
@@ -1400,6 +1535,10 @@ def process_segment(path, cfg, state, gap, send=onode_send):
         with open(os.path.join(art_dir, seg_sha + ".validation.txt"),
                   "w") as f:
             f.write(sensor_raw)
+    _leaf_der = cited_leaf_der(path, sensor)
+    if _leaf_der:
+        with open(os.path.join(art_dir, seg_sha + ".leaf.der"), "wb") as f:
+            f.write(_leaf_der)
 
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
@@ -1511,6 +1650,7 @@ def _run_replay_locked(replay_dir, names, cfg, send):
 # of a record's commitments the file satisfied.
 CITED_SEGMENT = "segment_sha256"
 CITED_VALIDATOR_OUTPUT = "sensor_signature.validator_output_sha256"
+CITED_LEAF = "sensor_signature.device_chain.leaf_sha256"
 
 
 def _cited_digests(body):
@@ -1526,6 +1666,9 @@ def _cited_digests(body):
     sensor = _body_sensor(body)
     if sensor and sensor.get("validator_output_sha256"):
         out[CITED_VALIDATOR_OUTPUT] = sensor["validator_output_sha256"]
+    chain = (sensor or {}).get("device_chain")
+    if isinstance(chain, dict) and chain.get("leaf_sha256"):
+        out[CITED_LEAF] = chain["leaf_sha256"]
     return out
 
 
@@ -2325,11 +2468,18 @@ def grade_content_reuse(cam_bodies):
 # and matched.
 PAYLOAD_VERIFIED = "VERIFIED"
 PAYLOAD_ABSENT = "ABSENT"
+# A directory or file this process was not permitted to read. NEVER folded
+# into ABSENT: glob() returns the empty list for an unreadable directory
+# exactly as it does for an empty one, so an audit run without permission
+# on the spool reported every artifact missing — a confident, complete,
+# wrong statement about the evidence. "It is not there" and "I was not
+# allowed to look" are different findings, and only one of them is one.
+PAYLOAD_INACCESSIBLE = "INACCESSIBLE"
 PAYLOAD_FAILED = "FAILED"
 PAYLOAD_NOT_CHECKED = "NOT CHECKED (no --artifact-dir)"
 
 _PAYLOAD_RANK = {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 1,
-                 PAYLOAD_FAILED: 2}
+                 PAYLOAD_INACCESSIBLE: 2, PAYLOAD_FAILED: 3}
 
 
 def _payload_patterns(field, seg_sha, digest):
@@ -2340,37 +2490,64 @@ def _payload_patterns(field, seg_sha, digest):
     ABSENT — which would turn tampering into absence, the one confusion
     this axis cannot afford:
 
-      outbox           <camera>.<seq>.<segment_sha256>.mp4
-                       <camera>.<seq>.<segment_sha256>.validation.txt
-      content-addressed  <digest>.<ext>, the artifacts/ convention
+      outbox / spool     <camera>.<seq>.<segment_sha256>.mp4
+                         <camera>.<seq>.<segment_sha256>.validation.txt
+                         <camera>.<seq>.<segment_sha256>.leaf.der
+      replay artifacts/  <segment_sha256>.<ext>
+      content-addressed  <digest>.<ext>, by the artifact's own hash
+
+    The replay form was missing until the leaf was added, so a replayed
+    validation output could never be located either — the same shape of
+    gap, found by adding a third artifact to the same locator.
 
     Note both outbox names key on the SEGMENT digest: that is how the
     driver names a segment's whole file set, so a tampered validation
     output is still located through the segment it belongs to."""
     if field == CITED_SEGMENT:
         return ("*.%s.mp4" % seg_sha, "%s.mp4" % seg_sha)
+    if field == CITED_LEAF:
+        return ("*.%s.leaf.der" % seg_sha,      # outbox / spool
+                "%s.leaf.der" % seg_sha,        # replay's artifacts/
+                "%s.der" % digest)              # addressed by its own hash
     return ("*.%s.validation.txt" % seg_sha,
+            "%s.validation.txt" % seg_sha,
             "*.%s.validation_results.txt" % seg_sha,
             "%s.txt" % digest)
 
 
 def _find_payload(artifact_dir, field, seg_sha, digest):
-    """The first file under artifact_dir matching this artifact's naming,
-    or None. Digests are hex, so they carry no glob metacharacters."""
+    """(path, blocked) for this artifact under artifact_dir.
+
+    path is None when nothing matched; `blocked` is True when the
+    directory could not be listed or a matching file could not be opened,
+    which is a different answer from "no such file" and must not be
+    reported as one. Digests are hex, so they carry no glob
+    metacharacters."""
+    if not os.access(artifact_dir, os.R_OK | os.X_OK):
+        return None, True
+    blocked = False
     for pat in _payload_patterns(field, seg_sha, digest):
-        hits = sorted(glob.glob(os.path.join(artifact_dir, pat)))
-        if hits:
-            return hits[0]
-    return None
+        try:
+            hits = sorted(glob.glob(os.path.join(artifact_dir, pat)))
+        except OSError:
+            blocked = True
+            continue
+        for hit in hits:
+            if os.access(hit, os.R_OK):
+                return hit, False
+            blocked = True               # it IS there; we cannot read it
+    return None, blocked
 
 
 def grade_segment_payload(cam_bodies, artifact_dir):
     """{camera_id: {...}} — for every record, recompute the digest of
     each artifact it cites that is present under artifact_dir.
 
-    Per record: FAILED if any present file's digest does not match,
-    ABSENT if any cited artifact was not found (and none mismatched),
-    VERIFIED only when every cited artifact was found AND matched."""
+    Per record, worst wins: FAILED if any present file's digest does not
+    match; INACCESSIBLE if any cited artifact could not be read; ABSENT if
+    any was simply not found; VERIFIED only when every one was found AND
+    matched. INACCESSIBLE outranks ABSENT because a blind look establishes
+    nothing, where a completed look that found nothing does."""
     out = {}
     for _, _, body in sorted(cam_bodies,
                              key=lambda t: (t[2]["camera_id"],
@@ -2378,21 +2555,25 @@ def grade_segment_payload(cam_bodies, artifact_dir):
         cam = body["camera_id"]
         c = out.setdefault(cam, {
             "dir": artifact_dir, "records": 0,
-            "verdicts": {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 0,
-                         PAYLOAD_FAILED: 0},
+            "verdicts": {v: 0 for v in _PAYLOAD_RANK},
             "items": [],
         })
         c["records"] += 1
         seg_sha = body.get(CITED_SEGMENT) or ""
         states = []
         for field, digest in sorted(_cited_digests(body).items()):
-            path = _find_payload(artifact_dir, field, seg_sha, digest)
+            path, blocked = _find_payload(artifact_dir, field, seg_sha, digest)
             if path is None:
-                state, actual = PAYLOAD_ABSENT, None
+                state, actual = ((PAYLOAD_INACCESSIBLE if blocked
+                                  else PAYLOAD_ABSENT), None)
             else:
-                actual = _sha256_file(path)
-                state = (PAYLOAD_VERIFIED if actual == digest
-                         else PAYLOAD_FAILED)
+                try:
+                    actual = _sha256_file(path)
+                except OSError:
+                    state, actual = PAYLOAD_INACCESSIBLE, None
+                else:
+                    state = (PAYLOAD_VERIFIED if actual == digest
+                             else PAYLOAD_FAILED)
             states.append(state)
             if state != PAYLOAD_VERIFIED:
                 c["items"].append({
@@ -2418,15 +2599,18 @@ def payload_axis(payload):
         return PAYLOAD_NOT_CHECKED
     if not payload:
         return PAYLOAD_ABSENT
-    tot = {PAYLOAD_VERIFIED: 0, PAYLOAD_ABSENT: 0, PAYLOAD_FAILED: 0}
+    tot = {v: 0 for v in _PAYLOAD_RANK}
     for c in payload.values():
         for v, n in c["verdicts"].items():
             tot[v] += n
     worst = max((v for v, n in tot.items() if n),
                 key=lambda v: _PAYLOAD_RANK[v], default=PAYLOAD_ABSENT)
-    return ("%s (%d verified, %d absent, %d failed)"
+    line = ("%s (%d verified, %d absent, %d failed"
             % (worst, tot[PAYLOAD_VERIFIED], tot[PAYLOAD_ABSENT],
                tot[PAYLOAD_FAILED]))
+    if tot[PAYLOAD_INACCESSIBLE]:
+        line += ", %d inaccessible" % tot[PAYLOAD_INACCESSIBLE]
+    return line + ")"
 
 
 def payload_worst(payload):
@@ -2537,10 +2721,13 @@ def ffmpeg_cmd(cfg):
 
 def sftp_ship(spool_target, ssh_key=None, extra_opts=None,
               known_hosts=None):
-    """Return ship(seg_file, body_file, name) -> bool. Uploads to the
-    chrooted spool as <name>.mp4/.body via .part staging + rename, then
-    a <name>.done marker LAST, so the submitter only ever sees complete
-    jobs. One ssh path, key-only, sftp-only (the account is chrooted to
+    """Return ship(seg_file, body_file, name, cited=None) -> bool. Uploads
+    to the chrooted spool as <name>.mp4/.body — plus every CITED sidecar
+    the body commits to by digest — via .part staging + rename, then a
+    <name>.done marker LAST, so the submitter only ever sees complete
+    jobs. The marker going last is what makes this all-or-nothing: a
+    partial upload leaves no marker, the submitter never sees the job,
+    and the caller does not advance continuity. One ssh path, key-only, sftp-only (the account is chrooted to
     internal-sftp on the far end).
 
     The spool host's key is PINNED (Sep 1 review, Task 4): `known_hosts`
@@ -2572,14 +2759,24 @@ def sftp_ship(spool_target, ssh_key=None, extra_opts=None,
             sys.stderr.write("sftp: %s\n" % p.stderr.decode(errors="replace"))
         return p.returncode == 0
 
-    def ship(seg_file, body_file, name):
+    def ship(seg_file, body_file, name, cited=None):
+        """cited: [(local_path, suffix)] — the files the BODY commits to
+        by digest, beyond the segment itself. They go up inside the same
+        all-or-nothing batch, before the .done marker, because a record
+        whose cited artifacts did not arrive is a record no one can check
+        the digests of. Shipping the segment and leaving them behind is
+        precisely how the validator output ended up capture-host-only and
+        SEGMENT PAYLOAD ended up permanently ABSENT on the O-node."""
         rd = "/incoming"
-        if not _batch("\n".join([
-                "put %s %s/%s.mp4.part" % (seg_file, rd, name),
-                "put %s %s/%s.body.part" % (body_file, rd, name),
-                "rename %s/%s.mp4.part %s/%s.mp4" % (rd, name, rd, name),
-                "rename %s/%s.body.part %s/%s.body" % (rd, name, rd, name),
-                ])):
+        puts = ["put %s %s/%s.mp4.part" % (seg_file, rd, name),
+                "put %s %s/%s.body.part" % (body_file, rd, name)]
+        renames = ["rename %s/%s.mp4.part %s/%s.mp4" % (rd, name, rd, name),
+                   "rename %s/%s.body.part %s/%s.body" % (rd, name, rd, name)]
+        for local, suffix in (cited or []):
+            puts.append("put %s %s/%s.%s.part" % (local, rd, name, suffix))
+            renames.append("rename %s/%s.%s.part %s/%s.%s"
+                           % (rd, name, suffix, rd, name, suffix))
+        if not _batch("\n".join(puts + renames)):
             return False
         marker = body_file + ".done"
         open(marker, "wb").close()
@@ -2630,6 +2827,7 @@ def process_live_segment(path, cfg, state, gap, ship):
     # segment is still attested and still ships (ruling #1).
     sensor, sensor_raw = sensor_for_segment(
         path, cfg, log=lambda m: print(m, flush=True))
+    leaf_der = cited_leaf_der(path, sensor)
 
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
@@ -2656,18 +2854,37 @@ def process_live_segment(path, cfg, state, gap, ship):
     with open(body_out + ".tmp", "wb") as f:
         f.write(body_bytes)
     os.replace(body_out + ".tmp", body_out)
-    # The raw validator output, kept beside the segment it judged: the
-    # body carries only its sha256, so the bytes have to survive
-    # somewhere for that hash to be checkable.
+    # Every artifact the body commits to by digest is written beside the
+    # segment AND shipped with it. The body carries only the hashes, so
+    # the bytes have to survive somewhere for those hashes to be
+    # checkable — and "somewhere" has to include the far end, or the
+    # O-node holds digests it can never recompute.
+    cited = []
     if sensor_raw is not None:
         val_out = os.path.join(out, name + ".validation.txt")
         with open(val_out + ".tmp", "w") as f:
             f.write(sensor_raw)
         os.replace(val_out + ".tmp", val_out)
+        cited.append((val_out, "validation.txt"))
+    # The leaf certificate, when the record cites it. Written at build
+    # time from the same stream the digest was taken over, so the bytes
+    # and the commitment cannot drift apart.
+    if leaf_der:
+        leaf_out = os.path.join(out, name + ".leaf.der")
+        with open(leaf_out + ".tmp", "wb") as f:
+            f.write(leaf_der)
+        os.replace(leaf_out + ".tmp", leaf_out)
+        cited.append((leaf_out, "leaf.der"))
 
-    if not ship(seg_out, body_out, name):
+    # All of it, or none of it. A ship that put the segment up and left a
+    # cited artifact behind would produce a record on the chain whose
+    # digests no one at the far end can check, which is indistinguishable
+    # from the defect this whole axis exists to catch.
+    if not ship(seg_out, body_out, name, cited=cited):
         raise SubmitError("%s: ship to spool failed (continuity not "
-                          "advanced)" % os.path.basename(path))
+                          "advanced; %d cited artifact(s) were part of "
+                          "the same batch)"
+                          % (os.path.basename(path), len(cited)))
 
     # Capture-side handoff record: the exact bytes shipped, for audit of
     # what left this host independent of what the far end did with it.
@@ -3169,7 +3386,9 @@ def submit_spool(cfg, once=False, send=onode_send, _clock=time.time):
     """Watch the spool for complete jobs (a .done marker with its .mp4 and
     .body present) and relay each into the chain in seq order. A refused
     append leaves the job in place to retry; a completed one is moved to
-    done/. Runs until SIGINT/SIGTERM, or one pass with once=True."""
+    done/ WITH every cited sidecar the capture host shipped beside it, so
+    the artifacts the record commits to by digest stay reachable from one
+    directory — which is what `audit --artifact-dir` reads. Runs until SIGINT/SIGTERM, or one pass with once=True."""
     incoming = cfg["incoming"]
     done_dir = cfg["done"]
     os.makedirs(done_dir, mode=0o770, exist_ok=True)
@@ -3205,7 +3424,19 @@ def _submit_spool_locked(cfg, once, send, incoming, done_dir):
                 sys.stderr.write("submit %s: %s\n" % (name, e))
                 continue                     # malformed; leave for a human
             if landed:
-                for p in (seg, body, marker):
+                # The cited sidecars move with the job. Moving only the
+                # segment and the body left every .validation.txt in
+                # incoming/ forever — which is how the O-node ended up
+                # holding digests whose preimages sat one directory away
+                # and graded ABSENT for it. Anything sharing the job name
+                # belongs to the job.
+                extras = [os.path.join(incoming, n)
+                          for n in os.listdir(incoming)
+                          if n.startswith(name + ".")
+                          and n not in (os.path.basename(seg),
+                                        os.path.basename(body),
+                                        os.path.basename(marker))]
+                for p in [seg, body] + extras + [marker]:
                     try:
                         os.replace(p, os.path.join(done_dir,
                                                    os.path.basename(p)))
@@ -3668,6 +3899,10 @@ def _audit_axes_text(report, have_pubkey):
                 lines.append("               expected %.16s…  recomputed "
                              "%.16s…" % (it["expected"], it["actual"]))
                 lines.append("               file %s" % it["path"])
+            elif it["state"] == PAYLOAD_INACCESSIBLE:
+                lines.append("               could not READ the directory "
+                             "or the file for digest %.16s… — never looked "
+                             "at, NOT graded absent" % it["expected"])
             else:
                 lines.append("               no file under the directory "
                              "for digest %.16s… — NOT a pass"

@@ -115,3 +115,46 @@ difference is visible only by reading the fields rather than the
 headline. Docket renders the whole object as a *producer claim*, held
 deliberately apart from its own cryptographic verdict ladder, for the
 same reason.
+
+## Deployed
+
+Where this driver is installed, and what is running there. The capture side
+runs from a working tree on the laptop; the O-node side is an installed copy,
+and `submit-spool` uses THAT one — so a capture host at `/6` shipping to an
+O-node at `/5` is refused at the schema gate, correctly and unhelpfully. Keep
+this table current or the next bump repeats that.
+
+| host | path | purpose |
+|---|---|---|
+| laptop | working tree `camera/virp_camera.py` | `live` capture, `verify-segment` |
+| 313 `virp-onode-home` (10.0.0.13) | `/usr/local/lib/virp-camera/virp_camera.py` | `submit-spool`, `audit` |
+
+### 313, current
+
+- **Commit** `e3a16c75c6310e59adf0ec2f8d238cba14b354f3` (short `e3a16c7`),
+  deployed 2026-09-04 21:49 UTC
+- **sha256** `95fc356c39939503b9a28b4950a6e60034d8a5aac6bd56bbeba863efdeeaae43`
+- **Emits / accepts**: `SCHEMA = camera_segment/6`; reads `/1` through `/6`
+- **Cites**: `segment_sha256`,
+  `sensor_signature.validator_output_sha256`,
+  `sensor_signature.device_chain.leaf_sha256`
+- **Payload grades**: VERIFIED, ABSENT, INACCESSIBLE, FAILED
+- **Supersedes**: `/5` at sha256 `f5d5088…`, kept as
+  `virp_camera.py.bak-v5-20260904` beside it
+- **Why this one mattered**: the previous copy's `submit-spool` moved only
+  `(segment, body, marker)` out of `incoming/`, so every cited sidecar the
+  capture host shipped stayed behind and `audit --artifact-dir` on 313 graded
+  SEGMENT PAYLOAD ABSENT forever. This copy moves the whole job.
+
+Verify what is installed, without changing anything:
+
+```sh
+ssh nhoward@10.0.0.13 '
+  D=/usr/local/lib/virp-camera/virp_camera.py
+  sha256sum $D; grep "^SCHEMA = " $D
+  sudo -u virp python3 $D submit-spool --sock /run/virp/onode.sock \
+    --db /var/lib/virp/chain.db --incoming /var/spool/virp-capture/incoming --once'
+```
+
+An empty `incoming/` makes that a no-op — `0 job(s) appended this run`, exit 0
+— which is the safe way to confirm the installed copy runs at all.
