@@ -93,6 +93,7 @@ SCHEMA_V1 = "camera_segment/1"
 SCHEMA_V2 = "camera_segment/2"
 SCHEMA_V3 = "camera_segment/3"
 SCHEMA_V4 = "camera_segment/4"
+SCHEMA_V5 = "camera_segment/5"
 # What this producer emits when a capture policy is declared (always,
 # from the CLI). SCHEMA_V1 remains emitted only by callers that pass no
 # policy, and remains READABLE forever: 2553 live records carry it and
@@ -100,8 +101,8 @@ SCHEMA_V4 = "camera_segment/4"
 # signed capture_policy; SCHEMA_V3 is /2 plus the sensor_signature —
 # what the CAMERA asserts about its own video, which is a different
 # fact from anything this host can observe.
-SCHEMA = SCHEMA_V4
-SCHEMAS = (SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4)
+SCHEMA = SCHEMA_V5
+SCHEMAS = (SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5)
 
 # ── The sensor's own claim ─────────────────────────────────────────────
 #
@@ -139,13 +140,46 @@ SENSOR_SIGNATURE_KEYS_V3 = (
     "asserted_first_frame", "asserted_last_frame",
     "validator_output_sha256",
 )
-SENSOR_SIGNATURE_KEYS = SENSOR_SIGNATURE_KEYS_V3 + (
+SENSOR_SIGNATURE_KEYS_V4 = SENSOR_SIGNATURE_KEYS_V3 + (
     "public_key_pin", "sensor_key_sha256",
 )
+SENSOR_SIGNATURE_KEYS = SENSOR_SIGNATURE_KEYS_V4 + ("device_chain",)
 SENSOR_KEYS_BY_SCHEMA = {
     SCHEMA_V3: frozenset(SENSOR_SIGNATURE_KEYS_V3),
-    SCHEMA_V4: frozenset(SENSOR_SIGNATURE_KEYS),
+    SCHEMA_V4: frozenset(SENSOR_SIGNATURE_KEYS_V4),
+    SCHEMA_V5: frozenset(SENSOR_SIGNATURE_KEYS),
 }
+
+# ── The device certificate chain, anchored at a CA WE pinned ───────────
+#
+# THE ANCHOR IS A KEY, NOT A CERTIFICATE. Axis has issued at least two
+# certificates for `Axis Edge Vault Attestation CA ECC 1` — identical
+# subject and identical public key, different serial numbers and
+# different notAfter (2032-10-25 and 2055-06-01). Both are legitimate.
+# Pinning certificate BYTES would reject a real device whose stream
+# happens to carry the other one, so what is checked is the signature
+# under the anchor's PUBLIC KEY. `anchor_sha256` still records the exact
+# file pinned, because which bytes an operator installed is its own fact.
+#
+# WHAT THIS PROVES, AND WHAT IT DOES NOT. The anchor was taken from the
+# camera's own stream: it is trust on first use one level up from the
+# leaf. It detects a leaf issued by any other CA, and it survives leaf
+# rotation within this CA — both real gains over pinning the leaf key
+# alone. It is NOT a chain to a root delivered out of band, because Axis
+# does not publish the Edge Vault Attestation root: the PKI repository
+# carries only the Device ID hierarchy, and their own Certificate Policy
+# names "Axis Edge Vault Root CA" as a separate CA it does not publish.
+# The `anchor` field says which of those two things happened, and reads
+# "root" only when a genuinely out-of-band root is pinned.
+ANCHOR_INTERMEDIATE = "intermediate_pinned"
+ANCHOR_ROOT = "root"
+DEVICE_CHAIN_KEYS = (
+    "anchor", "anchor_sha256", "chain_to_anchor_verified",
+    "leaf_serial_matches_device", "leaf_not_after",
+)
+SENSOR_ANCHOR_FILE = os.path.join("trust", "axis-edge-vault-attestation-ca.pem")
+_PEM_CERT = re.compile(
+    rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
 
 # The leaf pin. `public_key` is the FRAMEWORK's opinion of the key it
 # used; `public_key_pin` is OURS — whether the key in the stream is the
@@ -746,6 +780,110 @@ def extract_sensor_public_key(path):
     return m.group(0).decode("ascii", "replace") if m else None
 
 
+def extract_sensor_cert_chain(path):
+    """Every distinct certificate the stream's SEI carries, PEM text, in
+    the order first seen (leaf, then issuing CA). Empty when the stream
+    carries no chain — some signing implementations ship only a bare
+    public key, and that is a different situation from a broken chain."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+    out = []
+    for m in _PEM_CERT.finditer(data):
+        pem = m.group(0).decode("ascii", "replace")
+        if pem not in out:
+            out.append(pem)
+    return out
+
+
+def _x509():
+    from cryptography import x509
+    return x509
+
+
+def _load_anchor(anchor_path):
+    """(anchor_certificate, sha256_of_the_pinned_file) or (None, None).
+    Never raises: an unreadable anchor is a state to report, not a crash,
+    and it must NEVER fall back to the CA the stream itself supplies —
+    that would check the evidence against itself."""
+    if not anchor_path:
+        return None, None
+    try:
+        with open(anchor_path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None, None
+    try:
+        cert = _x509().load_pem_x509_certificate(raw)
+    except Exception:
+        return None, None
+    return cert, hashlib.sha256(raw).hexdigest()
+
+
+def _leaf_serial(cert):
+    """The device serial the leaf asserts (X.520 serialNumber in the
+    subject), or None."""
+    x509 = _x509()
+    try:
+        vals = cert.subject.get_attributes_for_oid(
+            x509.oid.NameOID.SERIAL_NUMBER)
+    except Exception:
+        return None
+    return vals[0].value if vals else None
+
+
+def device_chain_check(seg_path, anchor_path, device_serial):
+    """Grade the SEI's certificate chain against the pinned anchor.
+    Returns the device_chain object; never raises, never omits a key."""
+    dc = {k: None for k in DEVICE_CHAIN_KEYS}
+    dc["anchor"] = ANCHOR_INTERMEDIATE
+    dc["chain_to_anchor_verified"] = False
+    dc["leaf_serial_matches_device"] = False
+
+    anchor, anchor_sha = _load_anchor(anchor_path)
+    dc["anchor_sha256"] = anchor_sha
+    if anchor is None:
+        return dc
+
+    chain = extract_sensor_cert_chain(seg_path)
+    if not chain:
+        return dc
+    try:
+        leaf = _x509().load_pem_x509_certificate(chain[0].encode())
+    except Exception:
+        return dc
+
+    try:
+        dc["leaf_not_after"] = leaf.not_valid_after_utc.strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    except AttributeError:                       # cryptography < 42
+        dc["leaf_not_after"] = leaf.not_valid_after.strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+
+    # The leaf must be signed by the anchor's KEY. One signature check,
+    # not a path build: there is exactly one hop between them.
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ec, padding
+        pub = anchor.public_key()
+        if isinstance(pub, ec.EllipticCurvePublicKey):
+            pub.verify(leaf.signature, leaf.tbs_certificate_bytes,
+                       ec.ECDSA(leaf.signature_hash_algorithm))
+        else:
+            pub.verify(leaf.signature, leaf.tbs_certificate_bytes,
+                       padding.PKCS1v15(), leaf.signature_hash_algorithm)
+        dc["chain_to_anchor_verified"] = True
+    except Exception:
+        dc["chain_to_anchor_verified"] = False
+
+    serial = _leaf_serial(leaf)
+    dc["leaf_serial_matches_device"] = bool(
+        serial and device_serial
+        and serial.strip().upper() == str(device_serial).strip().upper())
+    return dc
+
+
 def _pin_state(observed_pem, pin_path):
     """(pin_state, pinned_pem_or_None). Never raises."""
     if pin_path is None:
@@ -817,7 +955,8 @@ def parse_validation_results(text):
 
 
 def run_sensor_validator(seg_path, vendor=None, validator=None,
-                         lib_path=None, log=None, sensor_pubkey=None):
+                         lib_path=None, log=None, sensor_pubkey=None,
+                         sensor_anchor=None, device_serial=None):
     """Validate ONE segment before its record is signed. Returns
     (sensor_signature, raw_validation_text_or_None).
 
@@ -835,6 +974,8 @@ def run_sensor_validator(seg_path, vendor=None, validator=None,
     key_sha = (hashlib.sha256(observed.encode()).hexdigest()
                if observed else None)
     pin, _pinned = _pin_state(observed, sensor_pubkey)
+    chain = (device_chain_check(seg_path, sensor_anchor, device_serial)
+             if sensor_anchor else None)
 
     def _unverified(why):
         if log:
@@ -843,7 +984,23 @@ def run_sensor_validator(seg_path, vendor=None, validator=None,
         s = sensor_signature_unverified(vendor)
         s["public_key_pin"] = pin
         s["sensor_key_sha256"] = key_sha
+        s["device_chain"] = chain
         return s, None
+
+    # Identity questions are decided HERE, before the validator is asked
+    # anything, and they downgrade to UNVERIFIED — never INVALID. A leaf
+    # from another CA, or a genuine camera that is not this one, is not
+    # tampered footage; saying INVALID would accuse a device of altering
+    # video it signed honestly.
+    if chain is not None:
+        if not chain["chain_to_anchor_verified"]:
+            return _unverified(
+                "the segment's certificate chain does not verify to the "
+                "pinned anchor (%s)" % (sensor_anchor,))
+        if not chain["leaf_serial_matches_device"]:
+            return _unverified(
+                "the chain verifies to the pinned anchor but the leaf is "
+                "not this device (expected serial %r)" % (device_serial,))
 
     if pin == PIN_UNREADABLE:
         return _unverified("pinned key %r is missing or not a PEM public "
@@ -909,6 +1066,7 @@ def run_sensor_validator(seg_path, vendor=None, validator=None,
         s["validator_output_sha256"] = digest
         s["public_key_pin"] = pin
         s["sensor_key_sha256"] = key_sha
+        s["device_chain"] = chain
         if log:
             log("sensor-signature UNVERIFIED (%s): %s"
                 % (os.path.basename(seg_path), e))
@@ -917,6 +1075,7 @@ def run_sensor_validator(seg_path, vendor=None, validator=None,
     sensor["validator_output_sha256"] = digest
     sensor["public_key_pin"] = pin
     sensor["sensor_key_sha256"] = key_sha
+    sensor["device_chain"] = chain
     return sensor, text
 
 
@@ -929,10 +1088,12 @@ def sensor_for_segment(path, cfg, log=None):
         path, vendor=cfg.get("sensor_vendor"),
         validator=cfg.get("validator"),
         lib_path=cfg.get("validator_lib_path"),
-        sensor_pubkey=cfg.get("sensor_pubkey"), log=log)
+        sensor_pubkey=cfg.get("sensor_pubkey"),
+        sensor_anchor=cfg.get("sensor_anchor"),
+        device_serial=cfg.get("sensor_device_serial"), log=log)
 
 
-def sensor_defect(sensor, schema=SCHEMA_V4):
+def sensor_defect(sensor, schema=SCHEMA_V5):
     """Why this object may not be signed into (or read out of) a body at
     `schema`, or None. Each version has ONE permitted field set."""
     if not isinstance(sensor, dict):
@@ -985,22 +1146,22 @@ def build_body(camera_id, device, seq, seg_sha, prev_sha, byte_len,
     if defect:
         raise ValueError("refusing to build a camera_segment body: %s"
                          % defect)
-    if sensor is not None:
-        if policy is None:
-            raise ValueError("refusing to build a camera_segment body: a "
-                             "sensor_signature needs a capture_policy — "
-                             "there is no schema with one and not the "
-                             "other")
-        defect = sensor_defect(sensor)
-        if defect:
-            raise ValueError("refusing to build a camera_segment body: %s"
-                             % defect)
+    if sensor is not None and policy is None:
+        raise ValueError("refusing to build a camera_segment body: a "
+                         "sensor_signature needs a capture_policy — "
+                         "there is no schema with one and not the other")
     if policy is None:
         schema = SCHEMA_V1
     elif sensor is None:
         schema = SCHEMA_V2
     else:
-        schema = SCHEMA_V4
+        schema = SCHEMA_V5
+    if sensor is not None:
+        # judged against the version this body will actually claim
+        defect = sensor_defect(sensor, schema)
+        if defect:
+            raise ValueError("refusing to build a camera_segment body: %s"
+                             % defect)
     body = {
         "schema": schema,
         "camera_id": camera_id,
@@ -1335,8 +1496,9 @@ def verify_segment(file_path, db_path, pubkey_path=None):
                   "   the file's bytes have changed since that record "
                   "was made)" % (b["segment_seq"], b["segment_sha256"]))
         print("checked: sha256 recompute of the file vs the "
-              "segment_sha256 field of every camera_segment/1 body in "
-              "%s. Nothing more." % db_path)
+              "segment_sha256 field of every camera_segment body in "
+              "%s (schemas %s). Nothing more."
+              % (db_path, ", ".join(SCHEMAS)))
         return 1
 
     session_id, artifact_id, body_raw, body = match
@@ -2928,6 +3090,8 @@ def main(argv=None):
             "validator": args.validator,
             "validator_lib_path": args.validator_lib_path,
             "sensor_pubkey": _resolve_sensor_pubkey(args),
+            "sensor_anchor": _resolve_sensor_anchor(args),
+            "sensor_device_serial": args.sensor_device_serial,
         }
         try:
             run_replay(args.dir, cfg)
@@ -2982,6 +3146,8 @@ def main(argv=None):
             "validator": args.validator,
             "validator_lib_path": args.validator_lib_path,
             "sensor_pubkey": _resolve_sensor_pubkey(args),
+            "sensor_anchor": _resolve_sensor_anchor(args),
+            "sensor_device_serial": args.sensor_device_serial,
         }
         try:
             ship = sftp_ship(args.spool, ssh_key=args.ssh_key,
@@ -3076,6 +3242,15 @@ def _resolve_sensor_pubkey(args):
     return default if os.path.exists(default) else None
 
 
+def _resolve_sensor_anchor(args):
+    """--sensor-anchor, else the data_dir's pinned CA if one is there. An
+    anchor that exists is never ignored for want of a flag."""
+    if args.sensor_anchor:
+        return args.sensor_anchor
+    default = os.path.join(args.data_dir, SENSOR_ANCHOR_FILE)
+    return default if os.path.exists(default) else None
+
+
 def _add_sensor_args(sp):
     """Where the per-segment sensor validator lives. Absent --sensor-
     vendor the producer states UNSIGNED (Tapo, Reolink); present but
@@ -3097,6 +3272,15 @@ def _add_sensor_args(sp):
                          "segment signed by any other grades UNVERIFIED — "
                          "never INVALID, which would call an unpinned "
                          "camera a tampered one." % SENSOR_PUBKEY_FILE)
+    sp.add_argument("--sensor-anchor", default=None,
+                    help="PEM certificate of the CA the device's leaf must "
+                         "chain to (default: <data-dir>/%s if present). The "
+                         "anchor's KEY is what is checked, so a re-issued "
+                         "certificate for the same CA still verifies."
+                         % SENSOR_ANCHOR_FILE)
+    sp.add_argument("--sensor-device-serial", default=None,
+                    help="serial the leaf certificate must assert for this "
+                         "camera, e.g. B8A44FDD572C")
 
 
 def _add_policy_args(sp):
