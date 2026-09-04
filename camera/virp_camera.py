@@ -1497,12 +1497,46 @@ def _run_replay_locked(replay_dir, names, cfg, send):
 
 # ── verify-segment: recompute-and-compare, not a second judge ──────────
 
+# ── What a camera_segment body commits to by hash, and under which name ─
+#
+# A /3-and-later record cites TWO artifacts by digest: the video, and the
+# validator's own output about that video. Checking only the first is
+# what made this command useless on the second: a validation_results.txt
+# read NO MATCH whether it had been tampered with or not, because it was
+# being compared against segment_sha256, which it was never going to
+# equal. An answer that is identical for clean and altered input is
+# worse than no answer, since it has the shape of one.
+#
+# The field name goes in the verdict. "MATCH" alone would not say WHICH
+# of a record's commitments the file satisfied.
+CITED_SEGMENT = "segment_sha256"
+CITED_VALIDATOR_OUTPUT = "sensor_signature.validator_output_sha256"
+
+
+def _cited_digests(body):
+    """{field: digest} for every artifact this body commits to by hash.
+
+    The sensor object is read through _body_sensor, so a record whose
+    sensor_signature does not match its own version's field set cites
+    nothing here — a malformed object is not a digest to check against.
+    """
+    out = {}
+    if body.get(CITED_SEGMENT):
+        out[CITED_SEGMENT] = body[CITED_SEGMENT]
+    sensor = _body_sensor(body)
+    if sensor and sensor.get("validator_output_sha256"):
+        out[CITED_VALIDATOR_OUTPUT] = sensor["validator_output_sha256"]
+    return out
+
+
 def verify_segment(file_path, db_path, pubkey_path=None):
     """Recompute sha256 over the file's CURRENT bytes and report whether
-    any camera_segment/1 body stored on the chain commits to that hash.
-    This helper renders the verdict from the signed body — it recomputes
-    ONE hash and compares. It does not verify chain entry signatures or
-    sequencing; that is Docket's job. Returns process exit code.
+    any camera_segment body stored on the chain commits to that hash —
+    as its segment, or as its validator output. This helper renders the
+    verdict from the signed body: it recomputes ONE hash and compares
+    against both cited digests. It does not verify chain entry
+    signatures or sequencing; that is Docket's job. Returns process exit
+    code.
 
     If a pubkey was asked for, it is established FIRST: a trust root
     that cannot be loaded raises TrustRootError before the file is read,
@@ -1517,32 +1551,35 @@ def verify_segment(file_path, db_path, pubkey_path=None):
     print("sha256 of current file bytes: %s" % file_sha)
 
     rows = _camera_bodies(db_path)
+    # segment first: a file handed to this command is far more often the
+    # video than the validator's note about it. Both are checked either
+    # way; the order only decides which is reported when a digest
+    # collision would otherwise be ambiguous.
     match = None
-    for session_id, artifact_id, body_raw, body in rows:
-        if body.get("segment_sha256") == file_sha:
-            match = (session_id, artifact_id, body_raw, body)
+    for field in (CITED_SEGMENT, CITED_VALIDATOR_OUTPUT):
+        for session_id, artifact_id, body_raw, body in rows:
+            if _cited_digests(body).get(field) == file_sha:
+                match = (field, session_id, artifact_id, body_raw, body)
+                break
+        if match:
             break
+
     if match is None:
-        claimed = [b for _, _, _, b in rows
-                   if os.path.basename(file_path).startswith(
-                       b.get("segment_sha256", "")[:16])]
         print("VERDICT: NO MATCH — no camera_segment body on this chain "
-              "commits to the file's current bytes.")
-        if claimed:
-            b = claimed[0]
-            print("  (a chain body DOES commit to a segment whose hash "
-                  "matches this FILENAME: seq=%s segment_sha256=%s —\n"
-                  "   the file's bytes have changed since that record "
-                  "was made)" % (b["segment_seq"], b["segment_sha256"]))
-        print("checked: sha256 recompute of the file vs the "
-              "segment_sha256 field of every camera_segment body in "
-              "%s (schemas %s). Nothing more."
-              % (db_path, ", ".join(SCHEMAS)))
+              "commits to the file's current bytes, as a segment or as a "
+              "validator output.")
+        _print_filename_hint(file_path, rows)
+        print("checked: sha256 recompute of the file vs the %s and %s "
+              "fields of every camera_segment body in %s (schemas %s). "
+              "Nothing more."
+              % (CITED_SEGMENT, CITED_VALIDATOR_OUTPUT, db_path,
+                 ", ".join(SCHEMAS)))
         return 1
 
-    session_id, artifact_id, body_raw, body = match
-    print("VERDICT: MATCH — the file's current bytes are exactly the "
-          "bytes committed by a chain-stored body:")
+    field, session_id, artifact_id, body_raw, body = match
+    what = ("segment" if field == CITED_SEGMENT else "validator_output")
+    print("VERDICT: MATCH %s — the file's current bytes are exactly the "
+          "bytes committed by a chain-stored body's %s:" % (what, field))
     print("  session=%s seq=%s artifact_id=%s"
           % (session_id, body["segment_seq"], artifact_id))
     if pk is not None:
@@ -1553,11 +1590,36 @@ def verify_segment(file_path, db_path, pubkey_path=None):
         if not ok:
             return 1
     print("checked: sha256 recompute of the file vs the signed body's "
-          "segment_sha256%s. Chain entry signatures and sequencing are "
-          "Docket's verdict, not this tool's."
-          % (", plus the body's producer signature" if pubkey_path
+          "%s%s. Chain entry signatures and sequencing are Docket's "
+          "verdict, not this tool's."
+          % (field,
+             ", plus the body's producer signature" if pubkey_path
              else ""))
     return 0
+
+
+def _print_filename_hint(file_path, rows):
+    """On NO MATCH, say whether the FILENAME points at a record anyway.
+
+    The outbox names both artifacts after the segment digest
+    (<camera>.<seq>.<segment_sha256>.mp4 and .validation.txt), and the
+    content-addressed layout names the segment <sha>.mp4. Either way a
+    16-hex-digit prefix appearing in the basename identifies the record
+    the file CLAIMS to be part of, which is what turns a bare NO MATCH
+    into "these bytes changed since that record was made"."""
+    base = os.path.basename(file_path)
+    for _, _, _, b in rows:
+        sha = b.get(CITED_SEGMENT) or ""
+        if len(sha) < 16 or sha[:16] not in base:
+            continue
+        cited = _cited_digests(b)
+        print("  (a chain body DOES commit to the segment named by this "
+              "FILENAME: seq=%s — the file's bytes are not any artifact "
+              "that record cites, so they have changed since it was "
+              "made)" % b["segment_seq"])
+        for field, digest in sorted(cited.items()):
+            print("    that record's %s = %s" % (field, digest))
+        return
 
 
 def _camera_bodies(db_path):

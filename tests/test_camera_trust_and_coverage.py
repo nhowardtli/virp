@@ -549,6 +549,112 @@ class SchemaTableTests(unittest.TestCase):
         self.assertIn("carries no usable capture_policy", out)
 
 
+class VerifySegmentCitedArtifactTests(unittest.TestCase):
+    """A /3-and-later record cites TWO artifacts by digest. Checking only
+    the segment made this command return the SAME verdict for a clean
+    and a tampered validation_results.txt — an answer with no signal,
+    which is worse than none because it has the shape of one."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.chain = SignedChain(self.tmp, camera="cited")
+        self.pk = self.chain.pk_path
+
+        self.seg = os.path.join(self.tmp, "seg.mp4")
+        self._write(self.seg, b"\x00\x00\x00\x18ftypisom" + b"video" * 64)
+        self.val = os.path.join(self.tmp, "validation_results.txt")
+        self._write(self.val, b"VIDEO IS VALID!\nNumber of invalid GOPs: 0\n")
+
+        sensor = vc.sensor_signature_unsigned()
+        sensor["validator_output_sha256"] = self._sha(self.val)
+        self.body = self.chain.add(seg_sha=self._sha(self.seg),
+                                   sensor=sensor)
+        self.db = self.chain.write()
+
+    def _write(self, path, data):
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def _sha(self, path):
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def _run(self, path):
+        return run_main(["verify-segment", path, "--db", self.db,
+                         "--pubkey", self.pk])
+
+    def test_the_record_cites_both_artifacts(self):
+        cited = vc._cited_digests(self.body)
+        self.assertEqual(cited[vc.CITED_SEGMENT], self._sha(self.seg))
+        self.assertEqual(cited[vc.CITED_VALIDATOR_OUTPUT],
+                         self._sha(self.val))
+
+    def test_intact_segment_reads_match_segment(self):
+        rc, out, _ = self._run(self.seg)
+        self.assertEqual(rc, 0)
+        self.assertIn("VERDICT: MATCH segment", out)
+        self.assertNotIn("MATCH validator_output", out)
+
+    def test_intact_validator_output_reads_match_validator_output(self):
+        """The case that returned zero signal before this change."""
+        rc, out, _ = self._run(self.val)
+        self.assertEqual(rc, 0)
+        self.assertIn("VERDICT: MATCH validator_output", out)
+        self.assertIn(vc.CITED_VALIDATOR_OUTPUT, out)
+
+    def test_tampered_validator_output_reads_no_match(self):
+        """The other half of the pair. A clean and a tampered file must
+        not produce the same verdict — that was the whole defect."""
+        _, clean, _ = self._run(self.val)
+        with open(self.val, "rb") as f:
+            data = f.read()
+        self._write(self.val, data.replace(b"GOPs: 0", b"GOPs: 1"))
+        rc, out, _ = self._run(self.val)
+        self.assertEqual(rc, 1)
+        self.assertIn("VERDICT: NO MATCH", out)
+        self.assertNotIn("VERDICT: MATCH", out)
+        self.assertNotEqual(clean, out)
+
+    def test_tampered_segment_reads_no_match(self):
+        with open(self.seg, "rb") as f:
+            data = bytearray(f.read())
+        data[len(data) // 2] ^= 0x01
+        self._write(self.seg, bytes(data))
+        rc, out, _ = self._run(self.seg)
+        self.assertEqual(rc, 1)
+        self.assertIn("VERDICT: NO MATCH", out)
+
+    def test_no_match_says_both_fields_were_checked(self):
+        stranger = os.path.join(self.tmp, "stranger.mp4")
+        self._write(stranger, b"not any artifact this chain cites")
+        rc, out, _ = self._run(stranger)
+        self.assertEqual(rc, 1)
+        self.assertIn(vc.CITED_SEGMENT, out)
+        self.assertIn(vc.CITED_VALIDATOR_OUTPUT, out)
+
+    def test_the_filename_hint_names_the_record_and_both_digests(self):
+        """Outbox naming puts the SEGMENT digest in both files' names, so
+        a tampered validation.txt can still be tied to its record."""
+        named = os.path.join(
+            self.tmp, "cam.000000.%s.validation.txt" % self._sha(self.seg))
+        self._write(named, b"altered validator output\n")
+        rc, out, _ = self._run(named)
+        self.assertEqual(rc, 1)
+        self.assertIn("named by this FILENAME", out)
+        self.assertIn(self._sha(self.val), out)
+
+    def test_a_malformed_sensor_object_cites_no_validator_digest(self):
+        """_cited_digests reads the sensor through _body_sensor, so an
+        object that does not match its own version's field set is not
+        trusted to supply a digest to check against."""
+        body = json.loads(json.dumps(self.body))
+        del body["sensor_signature"]["device_chain"]     # /4 shape at /5
+        cited = vc._cited_digests(body)
+        self.assertIn(vc.CITED_SEGMENT, cited)
+        self.assertNotIn(vc.CITED_VALIDATOR_OUTPUT, cited)
+
+
 class CoverageGradingTests(unittest.TestCase):
 
     def setUp(self):
