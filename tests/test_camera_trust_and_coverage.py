@@ -824,6 +824,62 @@ class SegmentPayloadAxisTests(unittest.TestCase):
         _, out, _ = self._audit()
         self.assertIn("SEGMENT PAYLOAD: FAILED", out)
 
+    # --- the SPOOL layout, which this axis was never exercised against --
+
+    def _spool(self, drop=()):
+        """A spool/done layout: <camera>.<seq>.<segment_sha256>.<ext>, the
+        shape submit-spool leaves behind on the O-node.
+
+        THE TEST GAP THIS CLOSES. Every payload test wrote a capture-host
+        OUTBOX, where the driver has just written all three files side by
+        side, so the axis was only ever asked about a directory that was
+        complete by construction. The spool is the directory an examiner
+        actually points --artifact-dir at, and until 2026-09-04 it carried
+        the segment alone: the validator output was written on the capture
+        host and never shipped, and the leaf DER was never written at all.
+        Both graded ABSENT on the O-node forever, and no test could see it
+        because no test had ever built a directory with a file missing."""
+        d = tempfile.mkdtemp(dir=self.tmp)
+        for b in self.bodies:
+            seg = b["segment_sha256"]
+            base = "cam-p.%06d.%s" % (b["segment_seq"], seg)
+            if "mp4" not in drop:
+                shutil.copy(self._path("*.%s.mp4" % seg),
+                            os.path.join(d, base + ".mp4"))
+            if "validation" not in drop:
+                shutil.copy(self._path("*.%s.validation.txt" % seg),
+                            os.path.join(d, base + ".validation.txt"))
+        return d
+
+    def test_the_spool_layout_verifies_when_every_cited_file_arrived(self):
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies], self._spool())["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_VERIFIED)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_ABSENT], 0)
+
+    def test_a_spool_missing_the_validator_output_is_absent_not_verified(self):
+        """The exact 2026-09-04 shape: segments shipped, validator outputs
+        did not. Every record ABSENT, nothing FAILED, and the axis must
+        not read as a pass anywhere."""
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies],
+            self._spool(drop=("validation",)))["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_ABSENT)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_VERIFIED], 0)
+        self.assertEqual(payload["verdicts"][vc.PAYLOAD_FAILED], 0)
+        fields = {it["field"] for it in payload["items"]}
+        self.assertEqual(fields, {vc.CITED_VALIDATOR_OUTPUT})
+        # the absence is specific: the segments themselves WERE found
+        self.assertTrue(all(it["path"] is None for it in payload["items"]))
+
+    def test_a_spool_missing_the_segment_is_absent_on_that_field(self):
+        payload = vc.grade_segment_payload(
+            [("s", "a", b) for b in self.bodies],
+            self._spool(drop=("mp4",)))["cam-p"]
+        self.assertEqual(payload["verdict"], vc.PAYLOAD_ABSENT)
+        fields = {it["field"] for it in payload["items"]}
+        self.assertEqual(fields, {vc.CITED_SEGMENT})
+
     # ── the axis stays separate from chain integrity ──────────────────
 
     def test_without_the_flag_the_axis_reads_not_checked(self):

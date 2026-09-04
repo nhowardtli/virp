@@ -929,11 +929,12 @@ class ShipsAnywayTests(unittest.TestCase):
         return p
 
     def _run(self):
-        ship = ShipRecorder()
+        self.ship = ShipRecorder()
         p = self._seg()
-        vc.process_live_segment(p, self.cfg, None, None, ship)
-        self.assertEqual(len(ship.calls), 1)
-        return json.loads(ship.calls[0]["body_bytes"]), ship.calls[0]["name"]
+        vc.process_live_segment(p, self.cfg, None, None, self.ship)
+        self.assertEqual(len(self.ship.calls), 1)
+        return (json.loads(self.ship.calls[0]["body_bytes"]),
+                self.ship.calls[0]["name"])
 
     def test_missing_validator_still_ships_an_unverified_record(self):
         self.cfg["sensor_vendor"] = "axis"
@@ -964,6 +965,29 @@ class ShipsAnywayTests(unittest.TestCase):
             got = hashlib.sha256(f.read()).hexdigest()
         self.assertEqual(body["sensor_signature"]["validator_output_sha256"],
                          got)
+
+    def test_the_validator_output_is_SHIPPED_not_only_kept(self):
+        """The 2026-09-04 defect. Writing it beside the segment satisfied
+        the old test while the file never left the capture host, so the
+        O-node held a digest whose preimage it could not obtain and
+        SEGMENT PAYLOAD there was permanently ABSENT."""
+        stub = os.path.join(self.tmp, "stub")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\ncp %s validation_results.txt\n" % REAL_VALID)
+        os.chmod(stub, 0o755)
+        self.cfg["sensor_vendor"] = "axis"
+        self.cfg["validator"] = stub
+        body, name = self._run()
+        shipped = self.ship.calls[-1]["cited_suffixes"]
+        self.assertIn("validation.txt", shipped,
+                      "the validator output was written but not shipped")
+
+    def test_a_record_citing_nothing_extra_ships_nothing_extra(self):
+        """No vendor, no validator output, no leaf: the cited set is empty
+        and the batch is the segment and the body, exactly as before."""
+        body, _ = self._run()
+        self.assertEqual(self.ship.calls[-1]["cited_suffixes"], [])
+        self.assertIsNone(vc._cited_digests(body).get(vc.CITED_VALIDATOR_OUTPUT))
 
     def test_the_onode_receipt_time_is_not_the_cameras_claim(self):
         """The two facts stay separate in the signed bytes: capture_end

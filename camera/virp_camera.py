@@ -994,6 +994,44 @@ def device_chain_check(seg_path, anchor_path, device_serial):
     return dc
 
 
+def cited_leaf_der(seg_path, sensor):
+    """The leaf DER when this record CITES it, else None.
+
+    Driven off the sensor object rather than off the anchor config, so
+    the file that gets written is exactly the preimage of the digest the
+    body carries — never one without the other."""
+    chain = (sensor or {}).get("device_chain")
+    if not isinstance(chain, dict) or not chain.get("leaf_sha256"):
+        return None
+    return leaf_certificate_der(seg_path)
+
+
+def leaf_certificate_der(seg_path):
+    """The DER bytes of the leaf certificate this segment's stream carries,
+    or None.
+
+    THE PREIMAGE OF device_chain.leaf_sha256. /6 records that digest and
+    nothing carried the bytes it is over, which put leaf_sha256 in exactly
+    the position validator_output_sha256 was in before the tamper pass: a
+    digest inside a signed record that no tool could recompute because the
+    thing it names never travelled. A hash whose preimage is unobtainable
+    is an assertion, not a commitment.
+
+    Kept separate from device_chain_check rather than returned beside its
+    verdict: the check answers "does this chain hold", this answers "what
+    were the bytes", and the callers of the first are graders that have no
+    use for a certificate."""
+    chain = extract_sensor_cert_chain(seg_path)
+    if not chain:
+        return None
+    try:
+        from cryptography.hazmat.primitives.serialization import Encoding
+        leaf = _x509().load_pem_x509_certificate(chain[0].encode())
+        return leaf.public_bytes(Encoding.DER)
+    except Exception:
+        return None
+
+
 def _pin_state(observed_pem, pin_path):
     """(pin_state, pinned_pem_or_None). Never raises."""
     if pin_path is None:
@@ -1497,6 +1535,10 @@ def process_segment(path, cfg, state, gap, send=onode_send):
         with open(os.path.join(art_dir, seg_sha + ".validation.txt"),
                   "w") as f:
             f.write(sensor_raw)
+    _leaf_der = cited_leaf_der(path, sensor)
+    if _leaf_der:
+        with open(os.path.join(art_dir, seg_sha + ".leaf.der"), "wb") as f:
+            f.write(_leaf_der)
 
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
@@ -1608,6 +1650,7 @@ def _run_replay_locked(replay_dir, names, cfg, send):
 # of a record's commitments the file satisfied.
 CITED_SEGMENT = "segment_sha256"
 CITED_VALIDATOR_OUTPUT = "sensor_signature.validator_output_sha256"
+CITED_LEAF = "sensor_signature.device_chain.leaf_sha256"
 
 
 def _cited_digests(body):
@@ -1623,6 +1666,9 @@ def _cited_digests(body):
     sensor = _body_sensor(body)
     if sensor and sensor.get("validator_output_sha256"):
         out[CITED_VALIDATOR_OUTPUT] = sensor["validator_output_sha256"]
+    chain = (sensor or {}).get("device_chain")
+    if isinstance(chain, dict) and chain.get("leaf_sha256"):
+        out[CITED_LEAF] = chain["leaf_sha256"]
     return out
 
 
@@ -2437,16 +2483,27 @@ def _payload_patterns(field, seg_sha, digest):
     ABSENT — which would turn tampering into absence, the one confusion
     this axis cannot afford:
 
-      outbox           <camera>.<seq>.<segment_sha256>.mp4
-                       <camera>.<seq>.<segment_sha256>.validation.txt
-      content-addressed  <digest>.<ext>, the artifacts/ convention
+      outbox / spool     <camera>.<seq>.<segment_sha256>.mp4
+                         <camera>.<seq>.<segment_sha256>.validation.txt
+                         <camera>.<seq>.<segment_sha256>.leaf.der
+      replay artifacts/  <segment_sha256>.<ext>
+      content-addressed  <digest>.<ext>, by the artifact's own hash
+
+    The replay form was missing until the leaf was added, so a replayed
+    validation output could never be located either — the same shape of
+    gap, found by adding a third artifact to the same locator.
 
     Note both outbox names key on the SEGMENT digest: that is how the
     driver names a segment's whole file set, so a tampered validation
     output is still located through the segment it belongs to."""
     if field == CITED_SEGMENT:
         return ("*.%s.mp4" % seg_sha, "%s.mp4" % seg_sha)
+    if field == CITED_LEAF:
+        return ("*.%s.leaf.der" % seg_sha,      # outbox / spool
+                "%s.leaf.der" % seg_sha,        # replay's artifacts/
+                "%s.der" % digest)              # addressed by its own hash
     return ("*.%s.validation.txt" % seg_sha,
+            "%s.validation.txt" % seg_sha,
             "*.%s.validation_results.txt" % seg_sha,
             "%s.txt" % digest)
 
@@ -2634,10 +2691,13 @@ def ffmpeg_cmd(cfg):
 
 def sftp_ship(spool_target, ssh_key=None, extra_opts=None,
               known_hosts=None):
-    """Return ship(seg_file, body_file, name) -> bool. Uploads to the
-    chrooted spool as <name>.mp4/.body via .part staging + rename, then
-    a <name>.done marker LAST, so the submitter only ever sees complete
-    jobs. One ssh path, key-only, sftp-only (the account is chrooted to
+    """Return ship(seg_file, body_file, name, cited=None) -> bool. Uploads
+    to the chrooted spool as <name>.mp4/.body — plus every CITED sidecar
+    the body commits to by digest — via .part staging + rename, then a
+    <name>.done marker LAST, so the submitter only ever sees complete
+    jobs. The marker going last is what makes this all-or-nothing: a
+    partial upload leaves no marker, the submitter never sees the job,
+    and the caller does not advance continuity. One ssh path, key-only, sftp-only (the account is chrooted to
     internal-sftp on the far end).
 
     The spool host's key is PINNED (Sep 1 review, Task 4): `known_hosts`
@@ -2669,14 +2729,24 @@ def sftp_ship(spool_target, ssh_key=None, extra_opts=None,
             sys.stderr.write("sftp: %s\n" % p.stderr.decode(errors="replace"))
         return p.returncode == 0
 
-    def ship(seg_file, body_file, name):
+    def ship(seg_file, body_file, name, cited=None):
+        """cited: [(local_path, suffix)] — the files the BODY commits to
+        by digest, beyond the segment itself. They go up inside the same
+        all-or-nothing batch, before the .done marker, because a record
+        whose cited artifacts did not arrive is a record no one can check
+        the digests of. Shipping the segment and leaving them behind is
+        precisely how the validator output ended up capture-host-only and
+        SEGMENT PAYLOAD ended up permanently ABSENT on the O-node."""
         rd = "/incoming"
-        if not _batch("\n".join([
-                "put %s %s/%s.mp4.part" % (seg_file, rd, name),
-                "put %s %s/%s.body.part" % (body_file, rd, name),
-                "rename %s/%s.mp4.part %s/%s.mp4" % (rd, name, rd, name),
-                "rename %s/%s.body.part %s/%s.body" % (rd, name, rd, name),
-                ])):
+        puts = ["put %s %s/%s.mp4.part" % (seg_file, rd, name),
+                "put %s %s/%s.body.part" % (body_file, rd, name)]
+        renames = ["rename %s/%s.mp4.part %s/%s.mp4" % (rd, name, rd, name),
+                   "rename %s/%s.body.part %s/%s.body" % (rd, name, rd, name)]
+        for local, suffix in (cited or []):
+            puts.append("put %s %s/%s.%s.part" % (local, rd, name, suffix))
+            renames.append("rename %s/%s.%s.part %s/%s.%s"
+                           % (rd, name, suffix, rd, name, suffix))
+        if not _batch("\n".join(puts + renames)):
             return False
         marker = body_file + ".done"
         open(marker, "wb").close()
@@ -2727,6 +2797,7 @@ def process_live_segment(path, cfg, state, gap, ship):
     # segment is still attested and still ships (ruling #1).
     sensor, sensor_raw = sensor_for_segment(
         path, cfg, log=lambda m: print(m, flush=True))
+    leaf_der = cited_leaf_der(path, sensor)
 
     body_nosig = build_body(cfg["camera_id"], cfg["device"], seq, seg_sha,
                             prev, len(seg_bytes), duration, start_ns,
@@ -2753,18 +2824,37 @@ def process_live_segment(path, cfg, state, gap, ship):
     with open(body_out + ".tmp", "wb") as f:
         f.write(body_bytes)
     os.replace(body_out + ".tmp", body_out)
-    # The raw validator output, kept beside the segment it judged: the
-    # body carries only its sha256, so the bytes have to survive
-    # somewhere for that hash to be checkable.
+    # Every artifact the body commits to by digest is written beside the
+    # segment AND shipped with it. The body carries only the hashes, so
+    # the bytes have to survive somewhere for those hashes to be
+    # checkable — and "somewhere" has to include the far end, or the
+    # O-node holds digests it can never recompute.
+    cited = []
     if sensor_raw is not None:
         val_out = os.path.join(out, name + ".validation.txt")
         with open(val_out + ".tmp", "w") as f:
             f.write(sensor_raw)
         os.replace(val_out + ".tmp", val_out)
+        cited.append((val_out, "validation.txt"))
+    # The leaf certificate, when the record cites it. Written at build
+    # time from the same stream the digest was taken over, so the bytes
+    # and the commitment cannot drift apart.
+    if leaf_der:
+        leaf_out = os.path.join(out, name + ".leaf.der")
+        with open(leaf_out + ".tmp", "wb") as f:
+            f.write(leaf_der)
+        os.replace(leaf_out + ".tmp", leaf_out)
+        cited.append((leaf_out, "leaf.der"))
 
-    if not ship(seg_out, body_out, name):
+    # All of it, or none of it. A ship that put the segment up and left a
+    # cited artifact behind would produce a record on the chain whose
+    # digests no one at the far end can check, which is indistinguishable
+    # from the defect this whole axis exists to catch.
+    if not ship(seg_out, body_out, name, cited=cited):
         raise SubmitError("%s: ship to spool failed (continuity not "
-                          "advanced)" % os.path.basename(path))
+                          "advanced; %d cited artifact(s) were part of "
+                          "the same batch)"
+                          % (os.path.basename(path), len(cited)))
 
     # Capture-side handoff record: the exact bytes shipped, for audit of
     # what left this host independent of what the far end did with it.
@@ -3266,7 +3356,9 @@ def submit_spool(cfg, once=False, send=onode_send, _clock=time.time):
     """Watch the spool for complete jobs (a .done marker with its .mp4 and
     .body present) and relay each into the chain in seq order. A refused
     append leaves the job in place to retry; a completed one is moved to
-    done/. Runs until SIGINT/SIGTERM, or one pass with once=True."""
+    done/ WITH every cited sidecar the capture host shipped beside it, so
+    the artifacts the record commits to by digest stay reachable from one
+    directory — which is what `audit --artifact-dir` reads. Runs until SIGINT/SIGTERM, or one pass with once=True."""
     incoming = cfg["incoming"]
     done_dir = cfg["done"]
     os.makedirs(done_dir, mode=0o770, exist_ok=True)
@@ -3302,7 +3394,19 @@ def _submit_spool_locked(cfg, once, send, incoming, done_dir):
                 sys.stderr.write("submit %s: %s\n" % (name, e))
                 continue                     # malformed; leave for a human
             if landed:
-                for p in (seg, body, marker):
+                # The cited sidecars move with the job. Moving only the
+                # segment and the body left every .validation.txt in
+                # incoming/ forever — which is how the O-node ended up
+                # holding digests whose preimages sat one directory away
+                # and graded ABSENT for it. Anything sharing the job name
+                # belongs to the job.
+                extras = [os.path.join(incoming, n)
+                          for n in os.listdir(incoming)
+                          if n.startswith(name + ".")
+                          and n not in (os.path.basename(seg),
+                                        os.path.basename(body),
+                                        os.path.basename(marker))]
+                for p in [seg, body] + extras + [marker]:
                     try:
                         os.replace(p, os.path.join(done_dir,
                                                    os.path.basename(p)))
