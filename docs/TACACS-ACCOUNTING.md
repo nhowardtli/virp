@@ -456,7 +456,7 @@ sends to the first server in *each* named group.
 
 | Platform | Duplicate accounting delivery | Status |
 |---|---|---|
-| Cisco IOS / IOS-XE | Two `aaa group server tacacs+` groups + `broadcast` on the `aaa accounting` line | **CONFIG VALIDATED IN LAB** on 15.2(4)M7 — `broadcast` confirmed active by `debug aaa accounting` (`Broadcast osr 2`). Delivery to both targets: see §7.4 |
+| Cisco IOS / IOS-XE | Two `aaa group server tacacs+` groups + `broadcast` on the `aaa accounting` line | **VALIDATED IN LAB** on 15.2(4)M7 — 38 TCP sessions to each of two distinct servers from one `broadcast` line, by packet capture (§7.4) |
 | Arista EOS | Believed to support multiple TACACS+ groups; fan-out semantics not confirmed | **UNVALIDATED** |
 | Juniper Junos | Junos TACACS+ accounting server list semantics (failover vs. fan-out) not confirmed | **UNVALIDATED** |
 | Fortinet FortiOS | Multiple TACACS+ servers configurable; duplicate-delivery behaviour not confirmed | **UNVALIDATED** |
@@ -619,12 +619,12 @@ under GNS3 2.2.59 / dynamips 0.2.23. Applied to R1, R2 and R3.
 aaa new-model
 !
 tacacs server VIRP
- address ipv4 10.0.0.36
+ address ipv4 192.168.122.1
  port 4949
  key LabKeyVirp
 !
 tacacs server STUB-ISE
- address ipv4 10.0.0.21
+ address ipv4 172.17.0.1
  port 4950
  key LabKeyStub
 !
@@ -925,6 +925,147 @@ adding the parts would double-count. And it must not show `verdict`
 without `coverage`: `START_WITHOUT_STOP` with `RECEIVER_UP` and the same
 verdict with `INTERRUPTED` are different claims, and collapsing them
 re-introduces exactly the ambiguity the coverage axis exists to remove.
+
+---
+
+## 8a. Docket additions for AUTHORIZATION (v2 scope)
+
+**Docket was not edited.** These are the field sets, reported.
+
+### The scope change itself, stated plainly
+
+v1's scope paragraph says VIRP serves accounting only, because "an
+authorization server that fails can lock an operator out of a device"
+and v1 "deliberately takes only the job whose failure mode is 'evidence
+is missing', never 'the network is down'."
+
+**Authorization deliberately reverses that trade.** An authorization
+server that fails open is not a control, so the rw method list has NO
+fallback (`group GRP-VIRPAZ` and nothing else) and an unreachable server
+denies every command on the vty. The consequence is real and is the
+biggest change in the design: VIRP moves from "cannot break the network"
+to "can deny every command on every router it governs".
+
+Two things keep that survivable, and both are load-bearing rather than
+decorative:
+
+- **The console is exempt** (`aaa authorization commands 15 CONSOLE
+  none`). An authorization outage leaves console access working, which
+  is the documented break-glass path. On real hardware that is a
+  deliberate, stated hole: anyone with console access bypasses command
+  authorization entirely.
+- **Accounting stays a separate process on a separate address.** An
+  authorization outage cannot lose evidence and an accounting outage
+  cannot deny commands. Merging them would couple exactly the two
+  failure modes v1 separated.
+
+### `tacacs_authorization/1` — the decision record
+
+One per AUTHOR request, chained BEFORE the reply is sent. A decision the
+router acted on that no record describes is the hole this exists to
+close, so a chain-append failure downgrades the decision to `ERROR`,
+which denies.
+
+| field | type | meaning |
+|---|---|---|
+| `schema` | string | `"tacacs_authorization/1"` |
+| `recv_utc_ns`, `recv_monotonic_ns` | u64 | receiver clocks, same discipline as §2 |
+| `client_identity`, `client_identity_source` | string | configured label, never a measurement |
+| `user` | string | `virp-ro` \| `virp-rw` — the identity the ROUTER authenticated |
+| `port`, `rem_addr`, `priv_lvl` | string/int | as sent |
+| `args` | [string] | verbatim, same rule as the accounting receipt |
+| `command` | string\|null | reassembled under a NAMED rule |
+| `command_reassembly` | string | which rule produced it |
+| `decision` | string | closed set: `PASS_ADD`, `PASS_REPL`, `FAIL`, `ERROR` |
+| `decision_reason` | string | operator-visible; denials carry the `VIRP-DENY: ` prefix |
+| `grant_id` | string\|null | the grant spent, or null |
+| `policy_sha256` | 64 hex | the policy in force AT THE MOMENT OF THE DECISION |
+| `raw_body_sha256` | 64 hex | over the decrypted AUTHOR body |
+| `parse` | string | `COMPLETE` \| `MALFORMED` |
+
+`policy_sha256` is the field that makes the record auditable: it binds a
+decision to the exact policy bytes it was judged against.
+
+### `tacacs_authz_policy_rendered/1` — what the router would have accepted
+
+| field | type | meaning |
+|---|---|---|
+| `schema` | string | `"tacacs_authz_policy_rendered/1"` |
+| `device` | string | device, or a comma list for a multi-device render |
+| `rendered_utc_ns` | u64 | when the compiler ran |
+| `policy_sha256`, `policy_bytes_len` | 64 hex / int | commitment to the rendered bytes |
+| `grant_count` | int | grants in force |
+| `approval_ids` | [string] | which approvals are represented |
+| `refusals[]` | array | `{approval_id, reason}` for every approval NOT rendered |
+| `daemon_load_confirmed` | bool\|null | whether the daemon's own ledger confirmed the load |
+| `presentation` | string | the beside-the-ladder rule, in the record |
+
+**`refusals` is not optional.** An approval that silently failed to
+render is a silent denial of approved work and looks identical to an
+attack; the record must show what did not make it in.
+
+**A renderer must show `daemon_load_confirmed`.** A policy that was
+written but never loaded describes a router that was never governed by
+it. `false` and `null` are different: `false` means the daemon was asked
+and did not confirm; `null` means nobody checked.
+
+### The grant shape a reader needs
+
+Grants inside the policy carry `accepted_spellings` and `spelling_rule`.
+That is deliberate and must be rendered: IOS does not authorize the
+command the operator typed (§8b), so "what was approved" and "what the
+router will be allowed to say" are different strings, and only the second
+governs. A UI that showed the approved text alone would be showing the
+wrong string.
+
+`derived: "config_mode_prerequisite"` marks a grant the COMPILER minted,
+not one a human approved. It must never be displayed as an approval.
+
+### The gap this session could not close: identity
+
+The `outcome` record (src/virp_onode.c) carries `proposal_id`,
+`proposal_entry_hash`, `approval_entry_hash`, `device`, `command_hash`,
+`success` and `intent_entry_hash` — and **no identity field**. So "which
+identity executed this" is not answerable from the chain. The
+authorization record knows (`user`), and the outcome record does not, and
+nothing binds the two.
+
+**Recommended field for `outcome`:** `executed_as` (string, the AAA
+username the gate authenticated with). It is a schema bump on a
+daemon-reserved type and therefore not made here.
+
+### Recommendation: `producer_key_id` from day one — argued
+
+The accounting report left `producer_key_id` open for
+`tacacs_accounting/1`, where adding it means a `/2` bump because `/1`
+records exist and must never be re-signed.
+
+**The two new types above have produced nothing real yet. They should
+carry `producer_key_id` from their first record, and the argument is not
+symmetry — it is that the cost curve is entirely one-sided.**
+
+Adding it now costs one field in a record no auditor has yet read.
+Adding it later costs a schema bump, a period where two versions are
+live, a verifier that must handle both forever, and a body of `/1`
+records that can never be upgraded because re-signing evidence is exactly
+what this system refuses to do. The accounting type is already paying
+that price; there is no reason to buy it twice.
+
+The counter-argument — "wait until Docket actually verifies producer
+signatures, in case the field set changes" — fails on its own terms. If
+Docket later wants something different, a type with `producer_key_id`
+can add a field; a type WITHOUT it cannot retroactively acquire the one
+field that says which key to check, because the records are already
+signed. The asymmetry is the whole argument: the field is cheap before
+first use and permanently unavailable after.
+
+**So: `tacacs_authorization/1` and `tacacs_authz_policy_rendered/1` carry
+`producer_key_id` before any of their records is treated as evidence.**
+This is recorded as a decision, not implemented in this session, because
+the records already written during the lab run would then be `/1` bodies
+without the field — which is the exact trap being described. The clean
+move is to add the field and DISCARD the lab chain, not to bump a type
+that is three hours old.
 
 ---
 

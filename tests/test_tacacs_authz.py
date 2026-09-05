@@ -934,3 +934,99 @@ class TestIosCommandRespelling(unittest.TestCase):
         self.assertIn("accepted_spellings", real)
         self.assertIn("interface Loopback 91", real["accepted_spellings"])
         self.assertEqual(real["spelling_rule"], az.SPELLING_RULE)
+
+
+class TestAttemptedUnapprovedClass(unittest.TestCase):
+    """Phase 4: a DENIED attempt must not reconcile as UNGOVERNED.
+
+    UNGOVERNED means "the device executed a command VIRP did not
+    govern" -- an accountability gap. A denial is the opposite: the
+    control worked. Reporting a successful refusal in the same bucket as
+    an ungoverned execution would make a working control look like a
+    failure, and would bury real gaps under noise from every blocked
+    attempt."""
+
+    def test_verdict_vocabulary_has_the_new_class(self):
+        import virp_tacacs_reconcile as rc
+        self.assertIn("ATTEMPTED_UNAPPROVED", rc.VERDICTS)
+
+    def test_denied_authz_decision_reclassifies_an_ungoverned_record(self):
+        import virp_tacacs_reconcile as rc
+        decisions = [{"client_identity": "R1", "command": "configure terminal",
+                      "decision": "FAIL", "recv_utc_ns": 1000}]
+        self.assertEqual(
+            rc.authz_outcome_for("R1", "configure terminal", 1000, decisions,
+                                 window_ns=5_000_000_000),
+            "FAIL")
+
+    def test_permitted_decision_does_not_reclassify(self):
+        import virp_tacacs_reconcile as rc
+        decisions = [{"client_identity": "R1", "command": "show version",
+                      "decision": "PASS_ADD", "recv_utc_ns": 1000}]
+        self.assertEqual(
+            rc.authz_outcome_for("R1", "show version", 1000, decisions,
+                                 window_ns=5_000_000_000),
+            "PASS_ADD")
+
+    def test_no_decision_in_window_is_none(self):
+        import virp_tacacs_reconcile as rc
+        self.assertIsNone(
+            rc.authz_outcome_for("R1", "show version", 10**12, [],
+                                 window_ns=1000))
+
+    def test_a_decision_on_another_device_does_not_count(self):
+        import virp_tacacs_reconcile as rc
+        decisions = [{"client_identity": "R2", "command": "configure terminal",
+                      "decision": "FAIL", "recv_utc_ns": 1000}]
+        self.assertIsNone(
+            rc.authz_outcome_for("R1", "configure terminal", 1000, decisions,
+                                 window_ns=5_000_000_000))
+
+
+class TestReconcilerUsesAuthzDecisions(unittest.TestCase):
+    """Integration: an accounting record whose command was DENIED by the
+    authorization server reconciles ATTEMPTED_UNAPPROVED, not UNGOVERNED."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+
+    def _items(self, decisions):
+        import virp_tacacs_reconcile as rc
+        import virp_tacacs_codec as tp
+        t = 1_757_002_500_000_000_000
+        args = ["task_id=1", "service=shell", "priv-lvl=15",
+                "cmd=configure terminal <cr>"]
+        body = {"schema": "tacacs_accounting/1", "client_identity": "R1",
+                "source_addr": "192.168.122.11", "recv_utc_ns": t,
+                "acct_flags": ["STOP"], "args": args,
+                "args_index": tp.args_index(args), "port": "tty2",
+                "raw_body_sha256": "a" * 64, "decode": "OBFUSCATED_MD5",
+                "parse": "COMPLETE"}
+        receipts = [{"session_id": "s", "sequence": 0, "artifact_id": "x",
+                     "timestamp_ns": t, "body": body}]
+        return rc.reconcile(receipts, [], [], 15000,
+                            authz_decisions=decisions)
+
+    def test_denied_attempt_is_not_ungoverned(self):
+        t = 1_757_002_500_000_000_000
+        items = self._items([{"client_identity": "R1",
+                              "command": "configure terminal",
+                              "decision": "FAIL", "recv_utc_ns": t}])
+        self.assertEqual(items[0]["verdict"], "ATTEMPTED_UNAPPROVED")
+        self.assertEqual(items[0]["authz_decision"], "FAIL")
+
+    def test_without_a_decision_it_stays_ungoverned(self):
+        items = self._items([])
+        self.assertEqual(items[0]["verdict"], "UNGOVERNED")
+        self.assertIsNone(items[0]["authz_decision"])
+
+    def test_permitted_attempt_stays_ungoverned(self):
+        """A PASS with no gate record is still an accountability gap: the
+        authorization server allowed it, but VIRP's gate never saw it."""
+        t = 1_757_002_500_000_000_000
+        items = self._items([{"client_identity": "R1",
+                              "command": "configure terminal",
+                              "decision": "PASS_ADD", "recv_utc_ns": t}])
+        self.assertEqual(items[0]["verdict"], "UNGOVERNED")
+        self.assertEqual(items[0]["authz_decision"], "PASS_ADD")

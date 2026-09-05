@@ -47,7 +47,10 @@ REASSEMBLY_CISCO_SINGLE = "cisco_cmd_single_arg_drop_cr"
 REASSEMBLY_UNRECOGNIZED = "UNRECOGNIZED"
 
 VERDICTS = ("MATCHED", "START_WITHOUT_STOP", "STOP_WITHOUT_START",
-            "UNGOVERNED", "UNREPORTED", "AMBIGUOUS")
+            "UNGOVERNED", "UNREPORTED", "AMBIGUOUS",
+            "ATTEMPTED_UNAPPROVED")
+
+AUTHZ_SCHEMA = "tacacs_authorization/1"
 COVERAGE = ("RECEIVER_UP", "RECEIVER_DOWN", "INTERRUPTED",
             "RECEIVER_UNKNOWN")
 
@@ -294,6 +297,41 @@ def _flags(body):
     return set(body.get("acct_flags") or [])
 
 
+def authz_outcome_for(device, command, t_ns, decisions, window_ns):
+    """The authorization decision for this device+command near t_ns, or
+    None if there was none.
+
+    Used to separate ATTEMPTED_UNAPPROVED from UNGOVERNED. UNGOVERNED
+    means the device EXECUTED something VIRP did not govern -- an
+    accountability gap. A denial is the opposite fact: the control
+    worked. Filing a successful refusal under UNGOVERNED would make a
+    working control read as a failure, and would bury real gaps under
+    noise from every blocked attempt.
+    """
+    best, best_dt = None, None
+    for d in decisions:
+        if d.get("client_identity") != device:
+            continue
+        if d.get("command") != command:
+            continue
+        dt = abs(int(d.get("recv_utc_ns") or 0) - int(t_ns))
+        if dt > window_ns:
+            continue
+        if best_dt is None or dt < best_dt:
+            best, best_dt = d.get("decision"), dt
+    return best
+
+
+def read_authz_decisions(db_path):
+    """tacacs_authorization/1 bodies, through the shared reader."""
+    out = []
+    for r in read_entries(db_path, artifact_types=("evidence_item",)):
+        b = r["body"]
+        if b.get("schema") == AUTHZ_SCHEMA:
+            out.append(b)
+    return out
+
+
 def record_class(body):
     """"command" or "session".
 
@@ -320,7 +358,8 @@ def record_class(body):
     return "session"
 
 
-def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
+def reconcile(receipts, gates, windows, match_window_ms,
+              horizon_ns=None, authz_decisions=None):
     """Pair receipts with gate_executions and grade. Returns the list of
     per-item claims. Nothing here writes anything."""
     window_ns = match_window_ms * 1_000_000
@@ -331,6 +370,7 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
     # START_WITHOUT_STOP would be graded at a single instant and a receiver
     # outage AFTER the START -- exactly the case worth catching -- would be
     # invisible. Default: the last receipt this run observed.
+    authz_decisions = authz_decisions or []
     if horizon_ns is None:
         _t = [r["body"].get("recv_utc_ns") or r["timestamp_ns"]
               for r in receipts]
@@ -448,9 +488,20 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
         # carried alongside rather than overwriting it.
         final = verdict or gate_verdict
 
+        # An UNGOVERNED record whose command the authorization server
+        # DENIED is not an accountability gap -- it is the control
+        # working. Only a denial reclassifies: a PASS with no gate record
+        # is still a gap, because the authorizer allowed something VIRP's
+        # own gate never saw.
+        authz = authz_outcome_for(device, command, t_ns, authz_decisions,
+                                  window_ns)
+        if final == "UNGOVERNED" and authz in ("FAIL", "ERROR"):
+            final = "ATTEMPTED_UNAPPROVED"
+
         items.append({
             "verdict": final,
             "record_class": klass,
+            "authz_decision": authz,
             "gate_correspondence": gate_verdict,
             "device": device,
             "task_id": task_id,
@@ -489,6 +540,7 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
             items.append({
                 "verdict": "UNREPORTED",
                 "record_class": None,
+                "authz_decision": None,
                 "gate_correspondence": "UNREPORTED",
                 "device": g["body"].get("device"),
                 "task_id": None,
@@ -599,12 +651,15 @@ def main(argv=None):
 
     receipts, gates = read_chain(args.db)
     windows = read_ledger(args.ledger)
-    items = reconcile(receipts, gates, windows, args.match_window_ms)
+    decisions = read_authz_decisions(args.db)
+    items = reconcile(receipts, gates, windows, args.match_window_ms,
+                      authz_decisions=decisions)
     rec = build_record(items, args.match_window_ms, args.db,
                        args.ledger, windows)
 
-    print("receipts: %d   gate_executions: %d   items: %d"
-          % (len(receipts), len(gates), len(items)))
+    print("receipts: %d   gate_executions: %d   authz_decisions: %d   "
+          "items: %d" % (len(receipts), len(gates), len(decisions),
+                         len(items)))
     print("tally: %s" % json.dumps(rec["tally"], sort_keys=True))
     print("coverage: %s" % json.dumps(rec["coverage_tally"], sort_keys=True))
 
