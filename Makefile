@@ -1033,6 +1033,18 @@ test-config-backup:
 test-render-devices:
 	@bash tests/test_render_devices.sh
 
+# The deploy dirty-tree guard must fail CLOSED. The four install targets
+# share scripts/require-clean-tree.sh; this proves it refuses when git
+# cannot answer at all — a worktree owned by a uid git calls dubious
+# (the ordinary shape of `sudo make install-prod`), a tree with no .git,
+# no git on PATH — and that the target does not proceed anyway. The
+# real-ownership tier needs the privilege to chown and self-skips
+# without it; `sudo make test-deploy-dirty-guard` runs it for real.
+# Reads no production path, writes none.
+.PHONY: test-deploy-dirty-guard
+test-deploy-dirty-guard:
+	@bash tests/test_deploy_dirty_guard.sh
+
 # Sep 1 review, Task 2: the SHIPPED templates, rendered by the real
 # render-devices.sh into a sandbox, must give every allowed uid an
 # explicit socket_uid_action_allow entry (the daemon refuses to start
@@ -1415,17 +1427,19 @@ VIRP_INSTALL_PY     = autopilot/virp_autopilot.py \
                       autopilot/virp_config_backup.py \
                       autopilot/virp_evidence.py
 
+# The dirty-tree guard is scripts/require-clean-tree.sh, shared by all
+# four install targets. It replaced four hand-copied `st=$(git status
+# --porcelain 2>/dev/null)` checks that read a FAILING git as a clean
+# tree -- dubious ownership under sudo, a tree with no .git, or no git at
+# all all deployed silently and stamped DEPLOYED.md with an unverified
+# commit. One helper, git's exit status kept, refusal on nonzero before
+# the dirty test is even reached. See the script header and
+# tests/test_deploy_dirty_guard.sh.
 .PHONY: install-prod
 install-prod: prod $(TOOL_BIN) deploy-capture
 	@test -f $(ONODE_PROD) || { echo "FAIL: $(ONODE_PROD) was not built"; exit 1; }
 	@test -f $(TOOL_BIN) || { echo "FAIL: $(TOOL_BIN) was not built"; exit 1; }
-	@st=$$(git status --porcelain 2>/dev/null); \
-	 if [ -n "$$st" ]; then \
-	     echo "FAIL: refusing to install from a dirty tree — what gets deployed"; \
-	     echo "      must be exactly what a commit hash names:"; \
-	     echo "$$st"; \
-	     exit 1; \
-	 fi
+	@scripts/require-clean-tree.sh "refusing to install from a dirty tree"
 	@echo "=== installing to $(VIRP_INSTALL_DIR) (outside any worktree) ==="
 	install -d -m 0755 $(VIRP_INSTALL_DIR)
 	install -m 0755 $(ONODE_PROD) $(VIRP_INSTALL_BIN)
@@ -1444,11 +1458,10 @@ install-prod: prod $(TOOL_BIN) deploy-capture
 deploy-record:
 	@test -f $(VIRP_INSTALL_BIN) || \
 	    { echo "FAIL: $(VIRP_INSTALL_BIN) is not installed"; exit 1; }
-	@st=$$(git status --porcelain 2>/dev/null); \
-	 if [ -n "$$st" ]; then echo "FAIL: tree is dirty:"; echo "$$st"; exit 1; fi
+	@scripts/require-clean-tree.sh "refusing to record a deploy"
 	@echo "- **Commit**: \`$$(git rev-parse HEAD)\`"
 	@echo "- **Branch**: \`$$(git rev-parse --abbrev-ref HEAD)\`"
-	@echo "- **Tree at install**: clean (\`git status --porcelain\` empty)"
+	@echo "- **Tree at install**: clean (\`git status --porcelain\` exited 0 and printed nothing; see scripts/require-clean-tree.sh)"
 	@echo "- **Installed binary**: \`$(VIRP_INSTALL_BIN)\`"
 	@echo "- **sha256**: \`$$(sha256sum $(VIRP_INSTALL_BIN) | awk '{print $$1}')\`"
 	@echo "- **sha256** \`$(VIRP_INSTALL_TOOL)\`: \`$$(sha256sum $(VIRP_INSTALL_TOOL) | awk '{print $$1}')\`"
@@ -1544,9 +1557,7 @@ deploy-capture:
 .PHONY: install-units
 install-units: check-deploy-unit-source
 	@test -f $(VIRP_UNIT_SRC) || { echo "FAIL: $(VIRP_UNIT_SRC) missing"; exit 1; }
-	@st=$$(git status --porcelain 2>/dev/null); \
-	 if [ -n "$$st" ]; then \
-	     echo "FAIL: refusing to install a unit from a dirty tree:"; echo "$$st"; exit 1; fi
+	@scripts/require-clean-tree.sh "refusing to install a unit"
 	install -d -m 0755 $(VIRP_DROPIN_DIR)
 	install -m 0644 $(VIRP_UNIT_SRC) $(VIRP_UNIT_DST)
 	systemctl daemon-reload
@@ -1582,10 +1593,7 @@ VIRP_DEVICES_TEMPLATE_DST = /etc/virp/devices.template.json
 install-devices-template:
 	@test -f $(VIRP_DEVICES_TEMPLATE_SRC) || \
 	    { echo "FAIL: $(VIRP_DEVICES_TEMPLATE_SRC) missing"; exit 1; }
-	@st=$$(git status --porcelain 2>/dev/null); \
-	 if [ -n "$$st" ]; then \
-	     echo "FAIL: refusing to install a template from a dirty tree:"; \
-	     echo "$$st"; exit 1; fi
+	@scripts/require-clean-tree.sh "refusing to install a template"
 	@python3 -c "import json,sys; json.load(open('$(VIRP_DEVICES_TEMPLATE_SRC)'.replace(chr(36)+'{','')))" \
 	    2>/dev/null || true
 	install -m 0644 $(VIRP_DEVICES_TEMPLATE_SRC) $(VIRP_DEVICES_TEMPLATE_DST)
@@ -2047,7 +2055,7 @@ test-release-tools:
 	@scripts/gen-test-attestation.sh --selftest
 	@scripts/verify-release-bundle.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 
