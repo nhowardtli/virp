@@ -1738,6 +1738,93 @@ static void approval_proposer_id(onode_state_t *state, int obs_version,
 }
 
 /* =========================================================================
+ * Ingress separator refusal — the chain record.
+ *
+ * This is the one refusal in the daemon that used to leave nothing
+ * durable behind: it logged, returned a signed ERROR observation, and
+ * stopped. Every tier refusal beside it writes a gate_rejection/1, so an
+ * audit asking "was anything refused at ingress?" had to be answered
+ * from the journal, which rotates, instead of from chain.db, which does
+ * not.
+ *
+ * Two things make this entry different from gate_refuse_obs()'s, and
+ * both are deliberate:
+ *
+ *  - NO PROPOSAL. gate_refuse_obs() files one so a human can escalate
+ *    the exact command via `virp approve`. There is no such command
+ *    here. "show version ; reload" was never ONE command, so there is
+ *    nothing an approver could bind an approval hash to; offering an
+ *    escalation path would be offering to approve a string whose
+ *    meaning depends on the far end's parser. A separator refusal is
+ *    unapprovable by construction.
+ *
+ *  - Its own session id (gate-separator:<device>, not
+ *    gate-enforce:<device>) and refusal_stage=ingress-separator. The
+ *    refusal happens before dev_idx and the driver are resolved and
+ *    before any classifier runs, so there is no driver name and no
+ *    real tier to record. UNCLASSIFIED appears in the body for the same
+ *    reason it appears in the observation — audit honesty about what
+ *    was never classified — and refusal_stage is what stops a reader
+ *    concluding that a tier decision blocked this.
+ *
+ * Best-effort, exactly like the tier path: a chain failure is logged and
+ * never weakens the refusal, which has already been decided.
+ * ========================================================================= */
+static void separator_refuse_chain(onode_state_t *state,
+                                   const char *device_name,
+                                   const char *command,
+                                   const char *why,
+                                   const char *err_msg)
+{
+    if (!state->chain_enabled)
+        return;
+
+    char session_id[96];
+    snprintf(session_id, sizeof(session_id), "gate-separator:%s",
+             device_name);
+
+    /* cJSON does the escaping: `command` is attacker-controlled and by
+     * definition contains bytes we refused, so it must never be pasted
+     * into JSON by hand. `why` renders control bytes as \xNN already. */
+    char *body = NULL;
+    cJSON *o = cJSON_CreateObject();
+    if (o) {
+        cJSON_AddStringToObject(o, "schema", "gate_rejection/1");
+        cJSON_AddStringToObject(o, "device", device_name);
+        cJSON_AddStringToObject(o, "refusal_stage", "ingress-separator");
+        cJSON_AddStringToObject(o, "command", command);
+        cJSON_AddStringToObject(o, "classified_tier", "UNCLASSIFIED");
+        cJSON_AddStringToObject(o, "refused_sequence", why);
+        cJSON_AddStringToObject(o, "message", err_msg);
+        cJSON_AddBoolToObject(o, "executed", false);
+        body = cJSON_PrintUnformatted(o);
+        cJSON_Delete(o);
+    }
+
+    char artifact_hash[65];
+    const char *commit_src = body ? body : err_msg;
+    gate_sha256_hex(commit_src, strlen(commit_src), artifact_hash);
+    char artifact_id[64];
+    snprintf(artifact_id, sizeof(artifact_id), "gatereject-%.16s",
+             artifact_hash);
+
+    virp_chain_entry_t ce;
+    virp_error_t cerr = virp_chain_append_with_artifact(
+                            &state->chain, session_id,
+                            "gate_rejection", artifact_id,
+                            artifact_hash, body, &ce);
+    if (cerr == VIRP_OK)
+        fprintf(stderr, "[GATE] separator rejection persisted: session=%s "
+                "seq=%lld hash=%.16s\n", session_id,
+                (long long)ce.sequence, ce.chain_entry_hash);
+    else
+        fprintf(stderr, "[GATE] separator rejection chain append+store "
+                "failed: %s\n", virp_error_str(cerr));
+
+    if (body) free(body);
+}
+
+/* =========================================================================
  * Gate refusal — shared by BOTH refusal sites in onode_execute_obs_ex():
  * the unconditional BLACK branch (any mode) and the ENFORCE over-tier /
  * unclassified branch. Files the escalation proposal when the tier
@@ -2096,6 +2183,8 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             snprintf(err_msg, sizeof(err_msg),
                      "ERROR: multi-command / illegal separator rejected "
                      "for '%s': %s", device_name, why);
+            separator_refuse_chain(state, device_name, command, why,
+                                   err_msg);
             log_error_obs(device_name, VIRP_TIER_UNCLASSIFIED, err_msg);
             return virp_build_observation_tiered(
                         out_buf, out_buf_len, out_len,

@@ -1003,7 +1003,16 @@ int virp_command_check_separators(const char *cmd, char *why, size_t why_len)
             /* Control byte — render escaped, never raw. */
             snprintf(rendered, sizeof(rendered), "\\x%02x", (unsigned)*p);
             what = rendered;
-        } else if (*p == ';' || *p == '|' || *p == '&' || *p == '`') {
+        } else if (*p == ';' || *p == '|' || *p == '&' || *p == '`' ||
+                   *p == '>' || *p == '<') {
+            /* '>' and '<' start no second command, which is why they
+             * outlived the first version of this policy. What they do is
+             * move bytes: on any driver with a shell under it,
+             * "show tech-support > /etc/cron.d/x" is an arbitrary write
+             * performed by a command that classifies as a read, and '<'
+             * feeds a file into one. driver_linux.c refused both locally
+             * from the start; the nine other drivers did not. Refused
+             * here so the answer stops depending on the far end. */
             rendered[0] = (char)*p;
             rendered[1] = '\0';
             what = rendered;
