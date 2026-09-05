@@ -28,7 +28,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from virp_tacacs_authz import (canonical_command, command_spellings,
-                               ios_canonical, SPELLING_RULE)
+                               ios_canonical, is_do_command, SPELLING_RULE)
 
 # 2c: the compiler and the reconciler call the SAME function. If these
 # two ever diverge, a command is authorized under one spelling and
@@ -196,6 +196,14 @@ def compile_grants(approvals, now_ns, default_uses=1):
             continue
 
         raw = a.get("command")
+        if is_do_command(raw):
+            refusals.append({
+                "approval_id": aid,
+                "reason": "approval text is a 'do' command, which runs an "
+                          "EXEC command from config mode. Gate identities "
+                          "are never granted 'do': it would turn one "
+                          "approved command into a way to run others."})
+            continue
         bad = unrenderable_reason(raw)
         if bad:
             refusals.append({"approval_id": aid, "reason": bad})

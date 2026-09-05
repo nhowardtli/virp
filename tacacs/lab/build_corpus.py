@@ -65,6 +65,8 @@ CONFIG_CMDS = [
     "do show clock", "do sh ver",
     "logging buffered 16384",
 ]
+# `no logging console` was deliberately REMOVED from this list: it
+# disabled the router's own debug output for two sessions.
 
 # Destructive verbs are refused in ANY mode.
 FORBIDDEN_ANYWHERE = ("reload", "write erase", "erase ", "format ")
@@ -82,6 +84,16 @@ def _assert_safe(exec_cmds, config_cmds):
             if bad in low:
                 raise SystemExit("corpus command %r is destructive (%r); "
                                  "refusing to run" % (c, bad))
+    # Commands that turn OFF an observer. `no logging console` was in
+    # the original list, ran two sessions ago, and silently disabled the
+    # router's own debug output -- so a later three-observer experiment
+    # ran with two, and the third looked like "IOS prints nothing".
+    for c in config_cmds:
+        low = " ".join(c.lower().split())
+        if low.startswith("no logging") or low.startswith("no debug"):
+            raise SystemExit(
+                "corpus CONFIG command %r would disable an observer; "
+                "refusing to run" % c)
     for c in config_cmds:
         low = c.lower()
         for bad in MGMT_IF_TOKENS:

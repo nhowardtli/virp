@@ -356,6 +356,24 @@ def _grant_matches(g, device, command):
     return command in accepted
 
 
+# `do <cmd>` runs an EXEC command from config mode. It is an escape
+# hatch: an approval for one config line says nothing about running
+# arbitrary EXEC commands for the rest of that session. MEASURED (item 1)
+# that IOS accounts and authorizes it as `do-exec <cmd>`, so BOTH
+# spellings are refused -- the one the operator types and the one the
+# router sends.
+#
+# Matched on the first TOKEN, never as a prefix: `do-not-a-real-cmd` and
+# `domain-name` are ordinary commands, and refusing them would be a
+# denial that looks like the control working.
+DO_TOKENS = ("do", "do-exec")
+
+
+def is_do_command(command):
+    toks = (canonical_command(command) or "").split()
+    return bool(toks) and toks[0].lower() in DO_TOKENS
+
+
 def authorize(policy, device, user, command, now_ns):
     """(status, reason, grant_id).
 
@@ -369,6 +387,14 @@ def authorize(policy, device, user, command, now_ns):
     metacharacter is the attacker's input, not ours.
     """
     cmd = canonical_command(command)
+
+    # Refused before any grant is consulted, for every identity.
+    if is_do_command(cmd):
+        return (FAIL,
+                DENY_PREFIX + "'do' runs an EXEC command from config mode "
+                              "and is refused for gate identities: an "
+                              "approval for one command does not grant a "
+                              "way to run others (%r)" % cmd, None)
 
     if cmd in ALWAYS_PERMITTED:
         return PASS_ADD, "always permitted (%s)" % cmd, None

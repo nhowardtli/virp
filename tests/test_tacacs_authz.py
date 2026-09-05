@@ -1532,3 +1532,111 @@ class TestBundleExportConsistency(unittest.TestCase):
         out = os.path.join(d, "bundle")
         with self.assertRaises(vb.InconsistentSnapshot):
             vb.export(db, out, "test")
+
+
+class TestA10DoInsideConfigSession(unittest.TestCase):
+    """A10: an approved config change, then `do <cmd>` inside the same
+    config session. The gate identities must never get `do`.
+
+    `do` is an escape hatch: it runs an EXEC command from config mode. An
+    approval for `interface Loopback9` says nothing about
+    `do show running-config`, and granting the session a way to run
+    arbitrary EXEC commands would make the one-approval-one-command rule
+    meaningless for the rest of that session.
+
+    MEASURED (item 1): IOS accounts it as `do-exec <cmd>`, so the
+    authorization request carries that spelling too. The denial must
+    therefore match the spelling the ROUTER sends, not the one the
+    operator typed -- the same lesson as the respelling finding."""
+
+    def test_do_is_denied_for_rw_even_with_an_unrelated_grant(self):
+        p = policy([grant(command="interface Loopback9")])
+        for cmd in ("do show running-config", "do-exec show running-config"):
+            st, reason, _ = az.authorize(p, **req(cmd))
+            self.assertEqual(st, az.FAIL, cmd)
+            self.assertTrue(reason.startswith(az.DENY_PREFIX), reason)
+
+    def test_do_is_denied_for_ro(self):
+        """Even though `show running-config` alone is on no allowlist,
+        and `show version` IS -- `do show version` is still refused,
+        because the escape hatch is the thing being refused, not the
+        inner command."""
+        for cmd in ("do show version", "do-exec show version"):
+            st, _, _ = az.authorize(policy([]), **req(cmd, user="virp-ro"))
+            self.assertEqual(st, az.FAIL, cmd)
+
+    def test_do_denied_even_if_the_inner_command_is_granted(self):
+        """The grant is for the command, not for a way of reaching it."""
+        p = policy([grant(command="show ip route")])
+        st, _, _ = az.authorize(p, **req("do show ip route"))
+        self.assertEqual(st, az.FAIL)
+        st2, _, _ = az.authorize(p, **req("do-exec show ip route"))
+        self.assertEqual(st2, az.FAIL)
+
+    def test_a_grant_whose_text_is_a_do_command_never_renders(self):
+        """Belt and braces: the compiler must not mint such a grant."""
+        appr = {"approval_id": "a-do", "device": "R1",
+                "command": "do show running-config", "ttl_ns": 300 * SEC,
+                "issued_utc_ns": NOW, "signature_verified": True}
+        grants, refusals = pol.compile_grants([appr], now_ns=NOW)
+        self.assertEqual([g for g in grants if g.get("derived") is None], [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("do", refusals[0]["reason"].lower())
+
+    def test_authorizer_refuses_do_even_with_an_exactly_matching_grant(self):
+        """Defence in depth. The compiler will not mint such a grant, but
+        if one ever existed the authorizer must still refuse: the escape
+        hatch is what is being refused, not the inner command."""
+        p = policy([grant(command="do show ip route")])
+        st, reason, _ = az.authorize(p, **req("do show ip route"))
+        self.assertEqual(st, az.FAIL)
+        self.assertIn("do", reason.lower())
+
+    def test_plain_commands_beginning_with_do_are_not_caught(self):
+        """`domain-name` is not `do`. A prefix test would refuse real
+        commands and the denial would look like the control working."""
+        st, _, _ = az.authorize(policy([grant(command="do-not-a-real-cmd")]),
+                                **req("do-not-a-real-cmd"))
+        self.assertEqual(st, az.PASS_ADD)
+
+
+class TestCorpusBuilderFence(unittest.TestCase):
+    """The corpus builder must not disable an observer.
+
+    Session 3's fence stopped it touching the management interface, after
+    it took the lab down. It did NOT stop `no logging console`, which the
+    same command list also ran -- and that silently disabled the router's
+    own `debug aaa accounting` output. Session 4 then ran a
+    three-observer experiment with only two observers working, and the
+    third looked like "IOS prints nothing" rather than "someone turned
+    the console log off two sessions ago".
+
+    A tool that types commands must not be able to type one that blinds
+    the person reading its output."""
+
+    def _mod(self):
+        import importlib.util as u
+        spec = u.spec_from_file_location(
+            "bc_fence", os.path.join(ROOT, "tacacs", "lab",
+                                     "build_corpus.py"))
+        m = u.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_disabling_console_logging_is_refused(self):
+        m = self._mod()
+        with self.assertRaises(SystemExit):
+            m._assert_safe([], ["no logging console"])
+
+    def test_disabling_buffered_logging_is_refused(self):
+        m = self._mod()
+        with self.assertRaises(SystemExit):
+            m._assert_safe([], ["no logging buffered"])
+
+    def test_the_shipped_command_lists_still_pass_the_fence(self):
+        m = self._mod()
+        m._assert_safe(m.EXEC_CMDS, m.CONFIG_CMDS)
+
+    def test_reading_logging_config_is_still_allowed(self):
+        m = self._mod()
+        m._assert_safe(["show logging"], [])
