@@ -88,25 +88,33 @@ RO_PERMITTED = (
 
 
 def canonical_command(text):
-    """The ONE normal form shared with the accounting reconciler.
+    """VIRP's canonical command form, matching virp_canonicalize_command
+    (include/virp_crypto.h): trim, collapse repeated internal spaces to
+    one, strip CR. Plus the TACACS-specific step of dropping the literal
+    trailing " <cr>" IOS appends (measured, 15.2(4)M7).
 
-    IOS delivers a command as a single `cmd=` argument with a literal
-    trailing " <cr>" (measured, IOS 15.2(4)M7). Both the authorizer and
-    the accounting matcher must strip it the same way, or a command could
-    be authorized under one spelling and reconciled under another.
+    WHY THIS FORM AND NOT THE RECONCILER'S. An approval's `command_hash`
+    is sha256 over virp_canonicalize_command(command). The grant is only
+    legitimate if its text is the text that hash commits to, so the
+    authorizer must speak the same form the approval was signed in. Using
+    the accounting reconciler's form -- which PRESERVES internal
+    whitespace -- would mean granting a string the approver never signed
+    for.
 
-    Internal whitespace is PRESERVED, not collapsed. Matching is
-    byte-exact by design: "show  ip route" and "show ip route" are
-    different requests, and a device that sends the first when the
-    approval says the second gets a denial rather than a guess. Failing
-    closed on a spelling difference is the correct direction to fail.
+    The two forms therefore differ, deliberately, and the difference is
+    pinned by test and reported in the design doc rather than smoothed
+    over. Practical effect: a command differing only in whitespace runs
+    still authorizes, which is correct because IOS treats those as the
+    same command; the accounting matcher may still see them as distinct
+    strings, which is a reporting asymmetry, not an authorization hole.
     """
     if text is None:
         return None
-    t = text.strip()
+    t = text.replace("\r", "")
+    t = t.strip()
     if t.endswith("<cr>"):
         t = t[:-4]
-    return t.strip()
+    return " ".join(t.split())
 
 
 def _grant_matches(g, device, command):

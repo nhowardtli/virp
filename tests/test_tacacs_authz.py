@@ -290,17 +290,41 @@ class TestCanonicalisationSharedWithReconciler(unittest.TestCase):
         from_policy = az.canonical_command("show ip route <cr>")
         self.assertEqual(from_acct, from_policy)
 
-    def test_internal_whitespace_is_preserved_identically(self):
-        """Named for what it proves. Neither side COLLAPSES internal
-        whitespace -- matching is byte-exact, so "show  ip route" and
-        "show ip route" are different requests and the second is denied
-        against a grant for the first. Failing closed on a spelling
-        difference is the correct direction to fail; the earlier name for
-        this test claimed a normalisation that does not happen."""
+    def test_authorizer_collapses_where_the_reconciler_preserves(self):
+        """FINDING, pinned rather than papered over.
+
+        VIRP's own `virp_canonicalize_command` (include/virp_crypto.h)
+        trims, COLLAPSES repeated internal spaces, and strips \r. That is
+        the form an approval's `command_hash` commits to. The accounting
+        reconciler PRESERVES internal whitespace.
+
+        Two normal forms exist in one system. The authorizer must use
+        VIRP's, because the grant is derived from a proposal whose text is
+        bound to the approval by a hash over the COLLAPSED form -- using
+        the reconciler's form would mean granting a string the approver
+        never actually signed for.
+
+        Consequence, stated: a command differing only in whitespace runs
+        authorizes (IOS treats them as identical anyway), while the
+        accounting matcher may still see them as distinct strings. That
+        asymmetry is reported in the design doc, not hidden here."""
         import virp_tacacs_reconcile as rc
         from_acct, _ = rc.reassemble_command(["cmd=show   ip  route <cr>"])
-        self.assertEqual(from_acct, "show   ip  route")
-        self.assertEqual(az.canonical_command("show   ip  route"), from_acct)
+        self.assertEqual(from_acct, "show   ip  route")      # preserves
+        self.assertEqual(az.canonical_command("show   ip  route"),
+                         "show ip route")                     # collapses
+        self.assertNotEqual(az.canonical_command("show   ip  route"),
+                            from_acct)
+
+    def test_virp_canonical_form_matches_the_c_contract(self):
+        """trim, collapse internal runs, strip \r -- the three rules
+        include/virp_crypto.h states for virp_canonicalize_command."""
+        self.assertEqual(az.canonical_command("  show   ip  route  "),
+                         "show ip route")
+        self.assertEqual(az.canonical_command("show\rip route"),
+                         "showip route")
+        self.assertEqual(az.canonical_command("show ip route <cr>"),
+                         "show ip route")
 
 
 class TestReplyShape(unittest.TestCase):
