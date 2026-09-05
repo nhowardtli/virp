@@ -818,3 +818,119 @@ class TestGateIdentity(unittest.TestCase):
         (driver_cisco.c). If it is not permitted for virp-ro the gate
         marks every device down and stops working."""
         self.assertIn("show clock", az.RO_PERMITTED)
+
+
+class TestDerivedPrerequisiteScope(unittest.TestCase):
+    """BUG found by the live attack run: the derived `configure terminal`
+    grant took its window from the OLDEST still-valid config approval and
+    was emitted once GLOBALLY.
+
+    Two consequences, both of which denied approved work:
+      - a freshly approved change inherited a prerequisite that was
+        nearly expired, so `configure terminal` was denied and the
+        approved line never ran;
+      - with approvals on two devices, the single global prerequisite was
+        bound to whichever device sorted first, so the other device could
+        not enter config mode at all.
+
+    Correct scope: one prerequisite PER DEVICE, spanning [min not_before,
+    max not_after] of that device's config grants, with one use per
+    config grant so each approved line can be applied."""
+
+    def _appr(self, aid, device, command, issued, ttl=300 * SEC):
+        return {"approval_id": aid, "device": device, "command": command,
+                "ttl_ns": ttl, "issued_utc_ns": issued,
+                "signature_verified": True}
+
+    def test_prerequisite_window_spans_the_newest_approval(self):
+        old = self._appr("a-old", "R1", "interface Loopback1", NOW - 290 * SEC)
+        new = self._appr("a-new", "R1", "interface Loopback2", NOW)
+        grants, _ = pol.compile_grants([old, new], now_ns=NOW)
+        ct = [g for g in grants if g["command"] == "configure terminal"]
+        self.assertEqual(len(ct), 1)
+        self.assertEqual(ct[0]["not_after_ns"], NOW + 300 * SEC,
+                         "prerequisite must outlive the newest approval")
+
+    def test_one_prerequisite_per_device(self):
+        a = self._appr("a1", "R1", "interface Loopback1", NOW)
+        b = self._appr("a2", "R2", "interface Loopback2", NOW)
+        grants, _ = pol.compile_grants([a, b], now_ns=NOW)
+        ct = [g for g in grants if g["command"] == "configure terminal"]
+        self.assertEqual(sorted(g["device"] for g in ct), ["R1", "R2"])
+
+    def test_prerequisite_has_one_use_per_config_grant(self):
+        a = self._appr("a1", "R1", "interface Loopback1", NOW)
+        b = self._appr("a2", "R1", "interface Loopback2", NOW)
+        grants, _ = pol.compile_grants([a, b], now_ns=NOW)
+        ct = [g for g in grants if g["command"] == "configure terminal"]
+        self.assertEqual(ct[0]["uses_remaining"], 2)
+
+    def test_prerequisite_still_absent_for_exec_only_approvals(self):
+        a = self._appr("a1", "R1", "show ip route", NOW)
+        grants, _ = pol.compile_grants([a], now_ns=NOW)
+        self.assertEqual([g["command"] for g in grants], ["show ip route"])
+
+
+class TestIosCommandRespelling(unittest.TestCase):
+    """MEASURED on IOS 15.2(4)M7, found by the live attack run: the
+    router does NOT authorize the command the operator typed. It
+    re-tokenizes first, separating an interface type from its unit
+    number:
+
+        typed/approved : interface Loopback91
+        sent to AUTHOR : interface Loopback 91
+
+    An exact-match policy therefore denies approved work, and it denies
+    it silently enough to look like the control working. A3 initially
+    "passed" for exactly this wrong reason -- the changed argument was
+    denied, but so was the approved one.
+
+    The fix must NOT be a loose matcher. Instead the grant carries the
+    finite set of spellings a NAMED rule derives from the approved text,
+    so an auditor can read exactly what the router will be allowed to
+    say. Nothing is accepted that is not written down in the grant."""
+
+    def test_rule_derives_the_spaced_interface_form(self):
+        sp = az.command_spellings("interface Loopback91")
+        self.assertIn("interface Loopback91", sp)
+        self.assertIn("interface Loopback 91", sp)
+
+    def test_rule_is_symmetric(self):
+        sp = az.command_spellings("interface Loopback 91")
+        self.assertIn("interface Loopback91", sp)
+        self.assertIn("interface Loopback 91", sp)
+
+    def test_rule_does_not_touch_unrelated_commands(self):
+        self.assertEqual(az.command_spellings("show ip route"),
+                         ["show ip route"])
+        self.assertEqual(az.command_spellings("ip route 10.0.0.0 255.0.0.0"),
+                         ["ip route 10.0.0.0 255.0.0.0"])
+
+    def test_spellings_never_change_the_argument_values(self):
+        """Respelling is about whitespace between a name and its unit
+        number. It must never alter a number, add a token, or drop one."""
+        for c in ("interface Loopback91", "interface GigabitEthernet0/0"):
+            for s in az.command_spellings(c):
+                self.assertEqual("".join(s.split()), "".join(c.split()))
+
+    def test_authorize_accepts_the_routers_spelling(self):
+        p = policy([grant(command="interface Loopback91")])
+        st, _, gid = az.authorize(p, **req("interface Loopback 91"))
+        self.assertEqual(st, az.PASS_ADD)
+        self.assertEqual(gid, "g-appr-1")
+
+    def test_authorize_still_denies_a_different_unit(self):
+        p = policy([grant(command="interface Loopback91")])
+        st, _, _ = az.authorize(p, **req("interface Loopback 92"))
+        self.assertEqual(st, az.FAIL)
+
+    def test_grant_records_what_will_be_accepted(self):
+        g = pol.compile_grants([{
+            "approval_id": "a1", "device": "R1",
+            "command": "interface Loopback91", "ttl_ns": 300 * SEC,
+            "issued_utc_ns": NOW, "signature_verified": True}],
+            now_ns=NOW)[0]
+        real = [x for x in g if x.get("derived") is None][0]
+        self.assertIn("accepted_spellings", real)
+        self.assertIn("interface Loopback 91", real["accepted_spellings"])
+        self.assertEqual(real["spelling_rule"], az.SPELLING_RULE)

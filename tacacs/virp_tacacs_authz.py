@@ -25,6 +25,7 @@ Copyright 2026 Third Level IT LLC — Apache 2.0
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -117,9 +118,68 @@ def canonical_command(text):
     return " ".join(t.split())
 
 
+# MEASURED on IOS 15.2(4)M7: the router re-tokenizes a command before
+# authorizing it, separating an interface type from its unit number --
+# `interface Loopback91` is authorized as `interface Loopback 91`. An
+# exact-match policy denies the approved change and looks, from the
+# outside, exactly like the control working.
+#
+# The response is NOT a loose matcher. This rule derives a FINITE set of
+# spellings from the approved text, the grant records that set, and only
+# those are accepted. An auditor can read exactly what the router will be
+# allowed to say.
+SPELLING_RULE = "cisco_interface_unit_spacing"
+
+_UNIT_SPLIT = re.compile(r"^([A-Za-z][A-Za-z-]*)(\d[\d/.:]*)$")
+
+
+def command_spellings(command):
+    """Every spelling accepted for `command`, under SPELLING_RULE.
+
+    Scoped TIGHTLY to what was measured: the token immediately following
+    the literal `interface` keyword, whose type name and unit number IOS
+    separates. Nothing else is respelled.
+
+    A first, broader draft joined any alphabetic token to a following
+    number and produced `ip route10.0.0.0` from `ip route 10.0.0.0` --
+    a spelling no router will ever send and no approver ever wrote.
+    Inventing accepted spellings is the one thing this rule must not do,
+    so it is anchored to a keyword rather than to a character class.
+    """
+    base = canonical_command(command)
+    if base is None:
+        return []
+    toks = base.split()
+    out = {base}
+
+    for i, t in enumerate(toks):
+        if t.lower() != "interface":
+            continue
+        if i + 1 >= len(toks):
+            break
+        nxt = toks[i + 1]
+        m = _UNIT_SPLIT.match(nxt)
+        if m:
+            # "Loopback91" -> "Loopback 91"
+            out.add(" ".join(toks[:i + 1] + [m.group(1), m.group(2)]
+                             + toks[i + 2:]))
+        elif (i + 2 < len(toks)
+              and re.fullmatch(r"[A-Za-z][A-Za-z-]*", nxt)
+              and re.fullmatch(r"\d[\d/.:]*", toks[i + 2])):
+            # "Loopback 91" -> "Loopback91"
+            out.add(" ".join(toks[:i + 1] + [nxt + toks[i + 2]]
+                             + toks[i + 3:]))
+        break
+    return sorted(out)
+
+
 def _grant_matches(g, device, command):
-    return (g.get("device") == device
-            and canonical_command(g.get("command")) == command)
+    if g.get("device") != device:
+        return False
+    accepted = g.get("accepted_spellings")
+    if not accepted:
+        accepted = command_spellings(g.get("command"))
+    return command in accepted
 
 
 def authorize(policy, device, user, command, now_ns):

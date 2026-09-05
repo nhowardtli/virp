@@ -27,7 +27,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from virp_tacacs_authz import canonical_command
+from virp_tacacs_authz import (canonical_command, command_spellings,
+                               SPELLING_RULE)
 
 SCHEMA = "tacacs_authz_policy/1"
 RENDERED_SCHEMA = "tacacs_authz_policy_rendered/1"
@@ -195,25 +196,45 @@ def compile_grants(approvals, now_ns, default_uses=1):
             "not_before_ns": issued,
             "not_after_ns": not_after,
             "uses_remaining": uses,
+            # Written into the grant so an auditor reads exactly what the
+            # router will be allowed to say, rather than trusting a
+            # matcher's behaviour.
+            "accepted_spellings": command_spellings(cmd),
+            "spelling_rule": SPELLING_RULE,
             "derived": None,
         })
 
-    # One prerequisite for the whole render, not one per approval: two
-    # approved config lines must not silently double the number of times
-    # a session may enter config mode.
-    config_grants = [g for g in grants if is_config_mode_command(g["command"])]
-    if config_grants:
-        first = min(config_grants, key=lambda g: g["not_before_ns"])
+    # One prerequisite PER DEVICE, spanning that device's config grants.
+    #
+    # Taking the window from a single arbitrary grant (the first draft
+    # used the oldest) gave a freshly approved change a nearly-expired
+    # prerequisite, so `configure terminal` was denied and the approved
+    # line never ran. Emitting one globally bound it to whichever device
+    # sorted first, leaving the other unable to enter config mode. Both
+    # denied approved work, which is the failure direction that erodes
+    # trust in a control fastest.
+    #
+    # One use per config grant: each approved line may be applied in its
+    # own session, and a session that cannot enter config mode cannot
+    # apply the line it was approved for.
+    by_device = {}
+    for g in grants:
+        if is_config_mode_command(g["command"]):
+            by_device.setdefault(g["device"], []).append(g)
+    for device, cgs in sorted(by_device.items()):
+        anchor = min(cgs, key=lambda g: g["not_before_ns"])
         grants.append({
-            "grant_id": "g-configentry-%s" % first["approval_id"],
-            "device": first["device"],
+            "grant_id": "g-configentry-%s" % device,
+            "device": device,
             "user": "virp-rw",
             "command": CONFIG_ENTRY_COMMAND,
-            "approval_id": first["approval_id"],
-            "approval_entry_hash": first.get("approval_entry_hash"),
-            "not_before_ns": first["not_before_ns"],
-            "not_after_ns": first["not_after_ns"],
-            "uses_remaining": 1,
+            "approval_id": anchor["approval_id"],
+            "approval_entry_hash": anchor.get("approval_entry_hash"),
+            "not_before_ns": min(g["not_before_ns"] for g in cgs),
+            "not_after_ns": max(g["not_after_ns"] for g in cgs),
+            "uses_remaining": len(cgs),
+            "accepted_spellings": command_spellings(CONFIG_ENTRY_COMMAND),
+            "spelling_rule": SPELLING_RULE,
             # Never presented as something a human approved.
             "derived": "config_mode_prerequisite",
         })
