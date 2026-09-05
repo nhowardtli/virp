@@ -109,6 +109,14 @@ def read_ledger(path):
             except ValueError:
                 continue
             if rec.get("event") == "LISTEN_START":
+                if open_start is not None:
+                    # Previous window never closed: the listener died
+                    # without writing LISTEN_STOP (SIGKILL, crash, power).
+                    # Close it at this restart. The exact stop instant is
+                    # unknown, but the RESTART is certain, so a span
+                    # crossing it grades INTERRUPTED rather than borrowing
+                    # continuity nobody observed.
+                    windows.append((open_start, rec.get("utc_ns")))
                 open_start = rec.get("utc_ns")
             elif rec.get("event") == "LISTEN_STOP" and open_start is not None:
                 windows.append((open_start, rec.get("utc_ns")))
@@ -231,6 +239,32 @@ def _flags(body):
     return set(body.get("acct_flags") or [])
 
 
+def record_class(body):
+    """"command" or "session".
+
+    MEASURED on Cisco IOS 15.2(4)M7: `aaa accounting commands 15 ...
+    start-stop` emits a SINGLE STOP record per command. There is no START.
+    `start-stop` governs EXEC/session accounting, where both records do
+    appear; for COMMAND accounting one STOP is the whole, complete record.
+
+    This distinction is load-bearing. Without it every accounted command
+    grades STOP_WITHOUT_START, which would report a platform's normal and
+    correct behaviour as a missing-evidence defect on every row -- crying
+    wolf so consistently that a real missing STOP would be invisible.
+
+    A command record is identified by carrying a `cmd` argument; a session
+    record does not. Both are shell service records, so `service=` alone
+    cannot separate them.
+    """
+    idx = body.get("args_index") or {}
+    if idx.get("cmd") is not None:
+        return "command"
+    for a in (body.get("args") or []):
+        if a.startswith("cmd="):
+            return "command"
+    return "session"
+
+
 def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
     """Pair receipts with gate_executions and grade. Returns the list of
     per-item claims. Nothing here writes anything."""
@@ -280,10 +314,22 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
         # and does not depend on any gate record existing.
         # A pair that never closed stays open to the horizon; a closed
         # pair is judged only over its own span.
-        span_end = horizon_ns if (starts and not stops) else last_ns
+        klass = record_class(rb)
+        span_end = horizon_ns if not stops else last_ns
         cov, cov_evidence = coverage_for_span(windows, t_ns, span_end)
 
-        if starts and not stops:
+        # Pair rules apply to SESSION records. For command accounting a
+        # lone STOP is the complete record (see record_class); grading it
+        # STOP_WITHOUT_START would report normal platform behaviour as a
+        # defect on every row, and a real missing STOP would then be
+        # invisible in the noise.
+        if klass == "command":
+            if stops:
+                verdict, detail = None, ""
+            else:
+                verdict, detail = ("START_WITHOUT_STOP",
+                                   "command record with no STOP")
+        elif starts and not stops:
             verdict, detail = "START_WITHOUT_STOP", "no STOP for this task_id"
         elif stops and not starts:
             verdict, detail = "STOP_WITHOUT_START", "no START for this task_id"
@@ -337,6 +383,7 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
 
         items.append({
             "verdict": final,
+            "record_class": klass,
             "gate_correspondence": gate_verdict,
             "device": device,
             "task_id": task_id,
@@ -366,6 +413,7 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
                 continue
             items.append({
                 "verdict": "UNREPORTED",
+                "record_class": None,
                 "gate_correspondence": "UNREPORTED",
                 "device": g["body"].get("device"),
                 "task_id": None,
