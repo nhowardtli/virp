@@ -15,6 +15,12 @@ block commands, whereas an authorization server that fails can lock an
 operator out of a device. v1 deliberately takes only the job whose
 failure mode is "evidence is missing", never "the network is down".
 
+**v2 adds authorization, and this paragraph is why it applies to the
+GATE's identities only.** `virp-ro` and `virp-rw` fail closed when the
+TACACS+ server is unreachable; humans never do, because the reasoning
+above still holds for them. See §9.1 for the resolution and §9.3 for the
+measurement that rules out a network break-glass path.
+
 ---
 
 ## 1. What this source is, and the boundary on the report face
@@ -1131,7 +1137,109 @@ not a borrowed one.
 
 ---
 
-## 9. What this whole source does not prove
+## 9. Scope of authorization, and what this source still does not prove
+
+### 9.1 The resolution: authorization applies to the GATE's identities only
+
+§1 and §8a were in tension. §1 says VIRP takes only the job whose failure
+mode is "evidence is missing, never the network is down". §8a introduced
+an authorization control whose whole point is to deny. Both cannot be
+true of the same identities.
+
+**They are true of different identities, and that is the resolution.**
+
+| identity | authorization | if the TACACS+ server is unreachable |
+|---|---|---|
+| `virp-ro` (gate steady state) | TACACS+ per-command, `group` only | **can do nothing** |
+| `virp-rw` (gate, approved actions) | TACACS+ per-command, `group` only | **can do nothing** |
+| humans, via the console | exempt (`CONSOLE` list, method `none`) | **unaffected** |
+| `breakglass` (local account, console path) | exempt with the console | **unaffected** |
+
+**The original §1 argument is not withdrawn — it is the reason humans are
+exempt.** An authorization server that can lock an operator out of a
+device is exactly the failure v1 refused to build, so no human depends on
+one. What changed is that the GATE is now fenced: VIRP's own automated
+identities fail closed, because an automated actor that keeps acting when
+its control plane is unreachable is not governed at all.
+
+So the failure mode is still "evidence is missing, never the network is
+down" **for humans**, and is deliberately "the gate stops" for the gate.
+
+### 9.2 Break-glass use is an event, graded RED
+
+The exemption has a price and it is paid in visibility. `breakglass` is
+the one identity that can act without the gate, so its use is:
+
+- **recorded** — a locally-authenticated console session emits TACACS+
+  accounting (EXEC START plus a command STOP per command,
+  `user=breakglass`). Measured 2026-09-05.
+- **graded `RED`** by the reconciler, under its own verdict
+  `BREAKGLASS_USED`, on a grade axis separate from the verdict.
+- **never folded into `UNGOVERNED`.** A break-glass command has no gate
+  record by definition, so `UNGOVERNED` is where it would land by
+  default — and that is a counting bucket. Burying an alarm in a
+  counting bucket is how alarms get ignored.
+
+The break-glass account list is **configured, never inferred**. With none
+configured the reconciler reports `NOT_GRADED`, which is not the same
+claim as "no break-glass happened".
+
+### 9.3 Why there is no network break-glass path
+
+Measured on IOS 15.2(4)M7, 2026-09-05, with the authorization server
+down:
+
+| shape | `virp-rw` | `breakglass` |
+|---|---|---|
+| `commands N VIRPRW group GRP-VIRPAZ` | login OK, **every command DENIED** | login OK, **every command DENIED** |
+| `commands N VIRPRW group GRP-VIRPAZ local` | login OK, **`configure terminal` EXECUTED** | everything EXECUTED |
+| separate vty on its own SSH port, list `local` | port 22 **DENIED**; **port 2222 EXECUTED** | port 2222 EXECUTED |
+
+**IOS cannot scope `local` fallback to specific users.** A method list
+binds to a LINE and authorizes whoever reaches it. The gate must hold a
+local account in order to authenticate at all, so any line offering a
+`local` fallback offers it to the gate too — including a dedicated
+break-glass port, which the gate simply connects to.
+
+A network break-glass therefore requires `access-class` source
+separation, and is only a control where the gate host and the operator's
+jump host are different sources. **Without one it is a gate
+self-escalation route**, and is not shipped in the template for that
+reason.
+
+### 9.4 The limit: both servers down
+
+Measured, and this is the honest edge of the design.
+
+| what is down | break-glass visible to VIRP? |
+|---|---|
+| authorization server only | **YES** — accounting is a separate process on a separate address, so receipts still arrive |
+| authorization **and** accounting | **NO** — zero receipts |
+
+That accounting survives an authorization outage is not luck; it is the
+separation §1 spent a paragraph on, doing its job.
+
+With both down, what survives is the router's own local buffer, and only
+if it was configured for it:
+
+- `%SEC_LOGIN-5-LOGIN_SUCCESS: [user: breakglass]` (needs
+  `login on-success log`)
+- `%SYS-6-LOGOUT: User breakglass has exited`
+- `%PARSER-5-CFGLOG_LOGGEDCMD: User:breakglass logged command:<cmd>` for
+  every config command (needs `archive` / `log config`)
+
+Without those, a break-glass **`show`** command during a full outage
+leaves **no trace anywhere**. Even with them, the buffer is volatile,
+unauthenticated, lost on reload, and under the control of the device
+being investigated. It is a lead, not evidence.
+
+Shipping a durable answer means getting those events off the box while
+the collectors are down — which is the `syslog_event/1` transport in
+§6a, still `UNBUILT`, and which has its own boundary problems.
+
+---
+
+### 9.5 What this whole source still does not prove
 
 Collected in one place, because a reader who skips everything else
 should still find this.
@@ -1142,12 +1250,16 @@ should still find this.
   accounting produces nothing, and its silence is indistinguishable
   from a device that ran nothing — which is exactly why `UNREPORTED`
   exists as a verdict rather than as an absence.
+- **Not a record of what was REFUSED.** A denied command never executes,
+  so it produces no accounting record at all. Measured: 5 of 16 distinct
+  denied command strings appeared nowhere in accounting. Only the
+  `tacacs_authorization/1` record evidences a refusal.
 - **Not tamper-proof against the device.** A compromised device
   controls what it reports. VIRP records what it was told, signed at
   receipt. Tamper-**evident downstream of receipt**, not upstream.
-- **Not a security control.** v1 serves accounting only. It authorizes
-  nothing and denies nothing. A command already ran by the time its
-  accounting arrives.
+- **Not a control over humans.** Authorization governs the gate's
+  identities. Anyone at a console is outside it by design (§9.1), and
+  the compensating control is a RED record, not a refusal.
 - **Not authenticated transport.** RFC 8907 obfuscation is not TLS. An
   observer on-path with the secret reads everything; an observer
   without it sees packet sizes, timing, and the header in clear.

@@ -130,6 +130,33 @@ def canonical_command(text):
 # allowed to say.
 SPELLING_RULE = "cisco_interface_unit_spacing"
 
+# Phase 2: IOS canonical form.
+#
+# Exact-match on the approved text is wrong in BOTH directions, and both
+# were measured:
+#   - IOS RE-SPELLS commands before accounting/authorizing them
+#     (`interface Loopback91` -> `interface Loopback 91`), so an exact
+#     match FALSE-DENIES a legitimate approval;
+#   - IOS TRUNCATES at `;`, so `show clock ; reload` is accounted as
+#     `show clock`, and an approval written with a `;` claims something
+#     the router will never be asked about.
+#
+# The canonicalizer maps approved text to the form IOS actually uses. Its
+# expansion table is derived FROM THE ROUTER (the corpus in
+# tests/fixtures/ios_respelling_corpus.json), never from memory. A token
+# the table cannot resolve raises rather than passing through: passing an
+# unexpanded abbreviation would silently compare the wrong string and
+# deny an approved change.
+CANONICAL_RULE = "ios_15_2_accounted_form"
+
+
+class CanonicalizationError(ValueError):
+    """The canonicalizer could not produce IOS's form for this text.
+
+    Raised rather than returning the input unchanged. A passthrough would
+    put a string into the policy that the router will never send, which
+    denies approved work and looks like the control working."""
+
 _UNIT_SPLIT = re.compile(r"^([A-Za-z][A-Za-z-]*)(\d[\d/.:]*)$")
 
 

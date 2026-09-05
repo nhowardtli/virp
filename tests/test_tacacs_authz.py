@@ -1262,3 +1262,103 @@ class TestBreakGlassTemplate(unittest.TestCase):
         self.assertIn("login on-success log", cfg)
         self.assertIn("login on-failure log", cfg)
         self.assertIn("log config", cfg)
+
+
+class TestAllVtyLinesAreBound(unittest.TestCase):
+    """FOUND by diffing running configs, not by reading the template.
+
+    The template bound the rw authorization list to `line vty 0 4` only.
+    A router with more vty lines than that -- IOS commonly has 0-15 --
+    leaves the rest with NO command authorization, so a session that
+    overflows to vty 5 runs unpoliced. The gate is fenced on the first
+    five lines and free on the rest, which is the same as not being
+    fenced.
+
+    Binding every vty line is the fix. A line the template does not
+    mention is a line the control does not cover."""
+
+    def test_rw_list_is_bound_to_every_vty_line(self):
+        cfg = pol.render_router_config(device="R1")
+        self.assertIn("line vty 0 15", cfg,
+                      "every vty line must carry the rw list, not just 0-4")
+
+    def test_no_unbound_vty_range_is_left_behind(self):
+        """The template must not create a vty stanza it does not also
+        bind an authorization list to."""
+        cfg = pol.render_router_config(device="R1").splitlines()
+        in_vty, bound = False, False
+        for line in cfg:
+            if line.startswith("line vty"):
+                if in_vty:
+                    self.assertTrue(bound, "a vty stanza had no authorization")
+                in_vty, bound = True, False
+            elif in_vty and line.startswith(" authorization commands"):
+                bound = True
+            elif in_vty and not line.startswith(" "):
+                self.assertTrue(bound, "a vty stanza had no authorization")
+                in_vty = False
+        if in_vty:
+            self.assertTrue(bound, "final vty stanza had no authorization")
+
+    def test_template_does_not_leave_a_breakglass_list_defined(self):
+        """A named `local` list that is defined but unbound is a hole
+        waiting for someone to bind it."""
+        cfg = pol.render_router_config(device="R1")
+        self.assertNotIn("BREAKGLASS local", cfg)
+
+
+class TestIosCanonicalizerAgainstCorpus(unittest.TestCase):
+    """Phase 2b: the canonicalizer is graded against a corpus captured
+    from a real router, never against anyone's memory of IOS.
+
+    For every entry, `ios_canonical(typed)` must equal the string IOS
+    actually put in the accounting `cmd=` field. A command the expansion
+    table cannot resolve is an ERROR, not a passthrough: passing an
+    unexpanded abbreviation through would silently compare the wrong
+    string and deny an approved change.
+    """
+
+    CORPUS = os.path.join(ROOT, "tests", "fixtures",
+                          "ios_respelling_corpus.json")
+
+    def _corpus(self):
+        if not os.path.exists(self.CORPUS):
+            self.skipTest("corpus not captured on this host")
+        import json
+        with open(self.CORPUS) as f:
+            return json.load(f)
+
+    def test_corpus_is_big_enough_and_states_its_version(self):
+        c = self._corpus()
+        self.assertGreaterEqual(len(c["entries"]), 40)
+        self.assertIn("ios_version", c)
+        self.assertTrue(c["ios_version"])
+
+    def test_every_corpus_entry_canonicalizes_to_what_ios_accounted(self):
+        c = self._corpus()
+        misses = []
+        for e in c["entries"]:
+            if not e.get("accounted_cmd"):
+                continue          # nothing was accounted; not a target
+            try:
+                got = az.ios_canonical(e["typed"])
+            except az.CanonicalizationError as exc:
+                misses.append((e["typed"], e["accounted_cmd"],
+                               "ERROR: %s" % exc))
+                continue
+            if got != e["accounted_cmd"]:
+                misses.append((e["typed"], e["accounted_cmd"], got))
+        self.assertEqual(misses, [], "canonicalizer disagrees with IOS:\n" +
+                         "\n".join("  typed=%r ios=%r got=%r" % m
+                                   for m in misses[:15]))
+
+    def test_unknown_abbreviation_raises_rather_than_passing_through(self):
+        with self.assertRaises(az.CanonicalizationError):
+            az.ios_canonical("zzq notacommand")
+
+    def test_compiler_and_reconciler_use_the_same_function(self):
+        """2c: if these two ever diverge, a command is authorized under
+        one spelling and reconciled under another."""
+        import virp_tacacs_reconcile as rc
+        self.assertIs(pol.canonical_for_policy, az.ios_canonical)
+        self.assertIs(rc.canonical_for_match, az.ios_canonical)
