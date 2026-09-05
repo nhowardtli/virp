@@ -3024,6 +3024,128 @@ TEST(test_load_devices_accepts_boolean_evidence_required)
     unlink(CFG);
 }
 
+/*
+ * A device the operator governs but has powered down. The daemon has
+ * always had `enabled` on the device struct — the watchdog skips a
+ * disabled device in both its count and its connect pass, and
+ * list_fleet reports it as Status=disabled rather than omitting it —
+ * but load_devices() hardcoded the field to true and never read it from
+ * JSON, so no template could reach that state.
+ *
+ * That is the state wanted for kit that is racked-and-off: listed, so
+ * the fleet view is complete and an agent can see the device exists and
+ * is down; never connected, so a dark device costs the single serial
+ * watchdog thread nothing per backoff.
+ *
+ * Absent key must keep the compiled-in true, or every existing template
+ * on both nodes changes meaning on upgrade.
+ */
+TEST(test_load_devices_enabled_defaults_true_when_absent)
+{
+    const char *CFG = "/tmp/virp-onode-enabled-default.json";
+    FILE *f = fopen(CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"plain\", \"host\": \"10.0.0.55\", \"vendor\": \"mock\",\n"
+        "      \"node_id\": \"0A0A0A37\" }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0040, NULL,
+                         "/tmp/virp-onode-enabled-default.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    ASSERT_EQ(load_devices(&tmp, CFG), 1);
+    ASSERT_EQ(tmp.device_count, 1);
+    ASSERT_EQ((int)tmp.devices[0].enabled, 1);
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(CFG);
+}
+
+TEST(test_load_devices_enabled_false_loads_but_disabled)
+{
+    /* The device is LOADED — it must appear in the fleet listing — and
+     * carries enabled=false so the watchdog leaves it alone. Loading and
+     * connecting are different things; this is the whole point. */
+    const char *CFG = "/tmp/virp-onode-enabled-false.json";
+    FILE *f = fopen(CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"darkfw\", \"host\": \"10.0.0.250\", \"vendor\": \"mock\",\n"
+        "      \"node_id\": \"0A0000FA\", \"enabled\": false },\n"
+        "    { \"hostname\": \"liveone\", \"host\": \"10.0.0.55\", \"vendor\": \"mock\",\n"
+        "      \"node_id\": \"0A0A0A37\", \"enabled\": true }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0041, NULL,
+                         "/tmp/virp-onode-enabled-false.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    ASSERT_EQ(load_devices(&tmp, CFG), 2);
+    ASSERT_EQ(tmp.device_count, 2);
+    ASSERT_EQ((int)tmp.devices[0].enabled, 0);   /* powered down, still governed */
+    ASSERT_EQ((int)tmp.devices[1].enabled, 1);   /* explicit true is honoured */
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(CFG);
+}
+
+TEST(test_load_devices_refuses_nonboolean_enabled)
+{
+    /* STRICT, exactly as evidence_required (Sep 1 review, 1.4): the
+     * value means what it says or the daemon refuses to load. The
+     * failure mode being closed off is specific — "enabled": "false" is
+     * a string, always truthy, so a silent default would read as OFF to
+     * a careless operator and ON to the watchdog, which is the churn
+     * this field exists to prevent. Skipping the entry instead would be
+     * worse still: the device would vanish from list_fleet and the
+     * operator would lose the visibility they were configuring. */
+    const char *CFG = "/tmp/virp-onode-enabled-badtype.json";
+    FILE *f = fopen(CFG, "w");
+    ASSERT_TRUE(f != NULL);
+    fprintf(f,
+        "{\n"
+        "  \"devices\": [\n"
+        "    { \"hostname\": \"typo\", \"host\": \"10.0.0.55\", \"vendor\": \"mock\",\n"
+        "      \"node_id\": \"0A0A0A37\", \"enabled\": \"false\" }\n"
+        "  ]\n"
+        "}\n");
+    fclose(f);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0042, NULL,
+                         "/tmp/virp-onode-enabled-badtype.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+
+    /* Call ONCE into a variable: ASSERT_EQ evaluates its first argument
+     * twice (comparison, then the failure printf), and a second
+     * load_devices() on the same state trips the duplicate-hostname
+     * guard and returns -1 on its own — which would make this assertion
+     * report a pass-looking "Expected -1, got -1" while masking what the
+     * first call actually did. */
+    int rc = load_devices(&tmp, CFG);
+    ASSERT_EQ(rc, -1);                           /* refused, not defaulted */
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+    unlink(CFG);
+}
+
 TEST(test_load_devices_refuses_blocked_address)
 {
     /* A config that is VALID in every respect except the blocked host:
@@ -8050,6 +8172,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_node_config_best_effort_when_not_required);
     RUN_TEST(test_load_devices_refuses_nonboolean_evidence_required);
     RUN_TEST(test_load_devices_accepts_boolean_evidence_required);
+    RUN_TEST(test_load_devices_enabled_defaults_true_when_absent);
+    RUN_TEST(test_load_devices_enabled_false_loads_but_disabled);
+    RUN_TEST(test_load_devices_refuses_nonboolean_enabled);
     RUN_TEST(test_load_devices_refuses_blocked_address);
     RUN_TEST(test_load_devices_allows_neighbor_addresses);
 
