@@ -564,23 +564,51 @@ and IOS version: **recorded in §7.4 once executed.**
 
 ### 7.1 What the run must show
 
-1. Every command produces START and STOP receipts on the VIRP chain.
+1. Every accounted command produces a receipt on the VIRP chain, and the
+   same event reaches BOTH configured server groups (proved by packet
+   capture, not by inference).
 2. The gated commands reconcile `MATCHED` to their `gate_execution`.
 3. The console commands reconcile `UNGOVERNED`.
-4. With the VIRP listener killed for one command, the device's next STOP
-   is missing, and the gap is **graded** (`START_WITHOUT_STOP`,
-   `coverage: RECEIVER_DOWN`) — not hidden, not excused.
+4. With the VIRP listener killed for one command, that command's record
+   is missing, and the gap is **graded** — `coverage: INTERRUPTED`, with
+   the ledger boundary cited as evidence — not hidden and not excused.
 5. A bundle exports and `virp-verify` grades the new record types under
    the existing artifact rules, with reconciliation shown beside the
    ladder.
 
+> **Requirement 1 was written expecting a START *and* a STOP per
+> command. The platform does not do that**, and the requirement is
+> restated above rather than quietly failed. On IOS 15.2(4)M7 command
+> accounting emits a **single STOP record per command** even under
+> `start-stop`; `start-stop` governs EXEC/session accounting, where a
+> START and STOP pair genuinely do appear. The run therefore configures
+> BOTH `aaa accounting commands 15` and `aaa accounting exec`, so the
+> pair vocabulary is exercised on real session records while command
+> records are counted as the complete single-STOP records they are. See
+> `record_class()` in `tacacs/virp_tacacs_reconcile.py`.
+
 ### 7.2 Lab topology
 
-The `Tie in to AI OPs` GNS3 project (R1/R2/R3, c7200, one switch, one
-cloud bridge) is the right shape. Its cloud bridge points at a USB NIC
-that currently has no carrier, so the proof runs on a **copy** of the
-project bridged to a host-local segment; the original project is left
-untouched.
+A **duplicate** of the `Tie in to AI OPs` GNS3 project
+(`TACACS-VIRBR0-LAB`), so the original is untouched. Cloud1's
+`ports_mapping` binds **`virbr0` only** — no physical NIC, per §6b.
+
+```
+R1 192.168.122.11 (Gi0/0) ─┐
+R2 192.168.122.12 (Gi1/0) ─┼─ Switch1 ─ Cloud1(virbr0) ─ host 192.168.122.1
+R3 192.168.122.13 (Gi1/0) ─┘
+                                    VIRP receiver  192.168.122.1:4949
+                                    stub-ISE       172.17.0.1:4950
+```
+
+**Why the stub is on 172.17.0.1.** IOS refuses two TACACS+ servers at the
+same address (§7.3, finding 2), and the host has exactly one address on
+the lab segment. `172.17.0.1` is the host's `docker0` address, reachable
+from the lab via its own gateway (`ip route 172.17.0.0 255.255.0.0
+192.168.122.1`) and delivered locally because it is a host address. That
+gives IOS the two distinct server addresses it requires **without adding
+one** — which would have needed privileged host configuration this run
+was not permitted to make.
 
 ### 7.3 Exact Cisco configuration
 
@@ -685,15 +713,218 @@ configures only `commands 15` and concludes "we have command accounting" has
 accounting for `configure terminal` and `show running-config`, and none for
 the bulk of what operators actually type.
 
-### 7.4 Run record
+### 7.4 Run record — 2026-09-05
 
-*(populated by the lab run)*
+Executed 06:00-06:05 UTC. `virp-onode-prod` build `v0.2.0-57-g1dab856`,
+chain signing ENABLED (`ed25519-detached-v1`, key_id
+`aec58669fa9c5d4726d12a4e8570a6f8`).
+
+**Emulator honesty controls.** Idle-PC applied on all three routers
+(`0x6062dd4c`, `idlemax=500`) before the run. Host load average
+**89.18 before / 86.49 after** — high, because an unrelated 35-router
+project was running and was deliberately not touched. Load alone would
+make "missing record" ambiguous, so it was measured rather than assumed:
+a 200-packet probe to each router immediately before the run returned
+**0% loss on all three**, and the second accounting target received
+**every** record VIRP did except the one deliberately withheld. Emulator
+loss is therefore excluded by evidence, not by hope.
+
+**Idle baseline.** 90 s with no commands issued produced **3** receipts,
+not 0 — the gate's three persistent SSH sessions each emitting an EXEC
+session START. Explained, not waved away; it is why counts below are
+given per record class.
+
+#### Delivery to both server groups (requirement: duplicate delivery)
+
+From `dumpcap` on `virbr0`, 752 frames:
+
+| | VIRP `192.168.122.1:4949` | stub-ISE `172.17.0.1:4950` |
+|---|---|---|
+| TCP sessions opened (SYN) | **38** | **38** |
+| accounting payload frames | **37** | **38** |
+
+Equal session counts to two distinct servers, one per accounting event,
+from one `broadcast` accounting line. **The Cisco row in §6 moves to
+VALIDATED.** The single payload difference is the deliberate outage
+below, and is itself the proof it is meant to be.
+
+#### Counts, by record class
+
+Command-class records (one STOP each, §7.1):
+
+| phase | MATCHED | UNGOVERNED | AMBIGUOUS |
+|---|---|---|---|
+| A — 15 gated + 15 console | **15** | **15** | **0** |
+| C — deliberate mismatch | 1 | 1 | 0 |
+
+Run totals across all classes: `MATCHED 16, UNGOVERNED 17,
+START_WITHOUT_STOP 6, STOP_WITHOUT_START 0, UNREPORTED 1, AMBIGUOUS 0`;
+coverage `RECEIVER_UP 33, INTERRUPTED 7, RECEIVER_DOWN 0,
+RECEIVER_UNKNOWN 0`. The 6 `START_WITHOUT_STOP` are EXEC **session**
+records still open when the reconciler ran — sessions that had not
+ended, correctly reported as unclosed rather than as complete.
+
+#### The withheld record (requirement: a graded gap)
+
+The VIRP listener was killed with SIGTERM, `show file systems` was run
+on R1 through the gate, and the listener was restored.
+
+```
+LISTEN_STOP   1788588250183687267
+stub receives 1788588257545435918   <- inside VIRP's outage
+LISTEN_START  1788588265688471864
+```
+
+- VIRP receipts mentioning `file systems`: **0**
+- stub-ISE receipts for it: **1**, carrying `cmd=show file systems <cr>`
+- reconciler: `UNREPORTED`, `coverage: INTERRUPTED`, evidence
+  `[{"event":"LISTEN_START","utc_ns":1788588265688471864}]`
+
+**The cause is evidenced, not inferred.** The second server holds the
+record VIRP lacks, at a timestamp inside VIRP's own recorded outage. That
+distinguishes a receiver outage from emulator or device loss by
+independent evidence — which is the entire point of keeping `coverage`
+on its own axis, apart from the verdict.
+
+#### The deliberate mismatch (requirement: side-by-side)
+
+The gate authorised `show ip bgp summary` on R1; `clear ip bgp *` was
+then run at the console, ungoverned.
+
+| record | verdict | why |
+|---|---|---|
+| `show ip bgp summary` | **MATCHED** | accounting corresponds to a `gate_execution` on device, command bytes and time window |
+| `clear ip bgp *` | **UNGOVERNED** | accounting exists; no gate record does |
+
+Both appear in the same reconciliation, side by side, neither inferred
+from the other's absence.
+
+#### Bundle and verification
+
+`tools/bundle/virp_export_bundle.py` → 6 sessions, 79 entries, 79
+carried artifact bodies. `virp-verify` **exit 0**, every session
+`CRYPTOGRAPHICALLY-VERIFIED`, including both new types:
+
+```
+session tacacs:virp-tacacs-lab  (40 entries)
+  entry_hashes        VERIFIED   40 entries recomputed (SHA-256 over canonical bytes)
+  links               VERIFIED   39 links checked against recomputed hashes
+  entry_signatures    VERIFIED   40 entries, ed25519-detached-v1
+  artifact_binding    VERIFIED   40/40 entries have carried bodies
+  signer_trust        PINNED
+  verdict: CRYPTOGRAPHICALLY-VERIFIED
+
+session tacacs-reconcile  (4 entries)
+  artifact_binding    VERIFIED   4/4 entries have carried bodies
+  entry_signatures    VERIFIED   4 entries, ed25519-detached-v1
+  verdict: CRYPTOGRAPHICALLY-VERIFIED
+```
+
+That is **carried, hashed, signed** under the existing artifact rules,
+with no verifier change — the intended outcome, since a record type that
+needed the verifier altered to pass would have negotiated its own
+grading.
+
+**Reconciliation did not fit one record and was SPLIT, not trimmed.** The
+full run is 23,835 bytes against the daemon's 8,191-byte artifact field.
+It was refused (never truncated), then re-submitted as 4 chunks of
+7,471 / 7,358 / 7,446 / 5,304 bytes, each naming `run_id`, `index`, `of`
+and carrying the run-wide tally beside its own. No item was dropped:
+dropping findings to fit would be an evidence tool deciding which
+findings survive.
 
 ---
 
-## 8. Docket field set, if an entry is needed
+## 8. Docket field set — an entry IS needed
 
-*(populated once the record shapes are exercised end to end)*
+**Docket was not edited.** This section states the field set and stops,
+per the rule governing the run that produced it.
+
+### What works today with no Docket change
+
+`virp-verify 0.1.0` grades both new types fully — `entry_hashes`,
+`contiguity`, `genesis`, `links`, `head_commitment`, `entry_hmacs`,
+`head_signature`, `session_key_binding`, `entry_signatures`,
+`artifact_binding` — and reaches `CRYPTOGRAPHICALLY-VERIFIED`. Nothing
+below is required for that.
+
+### What is missing, exactly
+
+Two things, both observed in the run:
+
+```
+producer_signature   ABSENT          no camera_segment records among the carried bodies;
+                                     there is no producer signature to check
+producer_trust       UNESTABLISHED   none — no producer key was available for this session
+```
+
+The producer-signature check is **keyed on `camera_segment`**. A
+`tacacs_accounting/1` body carries a `producer_sig` over its canonical
+form minus that field, under a producer key with its own `key_id`, and
+Docket has no way to know it should check it. `--producer-key` was
+supplied and correctly reported as unused.
+
+Second, `tacacs_reconciliation/1` is graded as an opaque artifact. Its
+verdicts are not rendered. Per §5 they must appear **beside** the verdict
+ladder, never inside it — the same treatment `sensor_signature` and the
+witness result already get.
+
+### Field set for a `tacacs_accounting/1` Docket entry
+
+Producer-signature verification needs only:
+
+| field | type | meaning |
+|---|---|---|
+| `schema` | string | `"tacacs_accounting/1"` — the dispatch key |
+| `producer_sig` | 128 hex | Ed25519 over `canonical_json(body minus producer_sig)`; **no domain-tag prefix** (unlike chain entry/head signatures) |
+| `producer_key_id` | 32 hex | **NOT PRESENT TODAY — see below** |
+
+**One producer change is required first, and it is not cosmetic.** The
+camera record carries `producer_key_id`; `tacacs_accounting/1` does
+**not**. Docket resolves which `--producer-key` to check against by that
+id, so without it a bundle with two producer keys cannot say which key a
+record claims. Adding `producer_key_id` is a `tacacs_accounting/2`
+schema bump, because existing `/1` records must stay readable and must
+never be re-signed. Until then, producer verification is possible only
+when exactly one producer key is supplied, and Docket should report
+`UNVERIFIABLE` rather than guess.
+
+### Field set for a `tacacs_reconciliation/1` Docket entry
+
+Rendered as a **claim panel beside the ladder**:
+
+| field | type | meaning |
+|---|---|---|
+| `schema` | string | `"tacacs_reconciliation/1"` |
+| `reconciled_utc_ns` | u64 | when the reconciler ran (not when anything was observed) |
+| `match_rule.match_window_ms` | int | window the run used |
+| `match_rule.command_comparison` | string | `"exact_bytes"` |
+| `match_rule.join_key` | string | how receipts were grouped |
+| `match_rule.known_reassembly_rules` | [string] | named interpretations available |
+| `tally` | {verdict: int} | closed set: MATCHED, START_WITHOUT_STOP, STOP_WITHOUT_START, UNGOVERNED, UNREPORTED, AMBIGUOUS |
+| `coverage_tally` | {coverage: int} | closed set: RECEIVER_UP, RECEIVER_DOWN, INTERRUPTED, RECEIVER_UNKNOWN |
+| `items[]` | array | one claim per group |
+| `items[].verdict` | string | from the closed verdict set |
+| `items[].record_class` | string | `"command"` \| `"session"` \| null |
+| `items[].coverage` | string | from the closed coverage set |
+| `items[].coverage_evidence` | array | ledger boundaries justifying `coverage` |
+| `items[].coverage_span_ns` | [u64, u64] | interval the coverage answer covers |
+| `items[].device` | string | configured label, never a measurement |
+| `items[].command` | string\|null | reassembled under the NAMED rule |
+| `items[].command_reassembly` | string | which rule produced it |
+| `items[].receipt_cites[]` | array | `{session_id, sequence, raw_body_sha256, acct_flags}` |
+| `items[].gate_cite` | object\|array\|null | cited `gate_execution`; an ARRAY when AMBIGUOUS |
+| `items[].detail` | string | free text; never load-bearing |
+| `chunk` | object\|absent | `{run_id, index, of}` when a run is split |
+| `run_tally` | {verdict: int}\|absent | run-wide tally carried in every chunk |
+| `presentation` | string | states the beside-the-ladder rule in the record itself |
+
+**Two things a renderer must not do.** It must not sum `tally` across
+chunks of one `run_id` — every chunk already carries `run_tally`, and
+adding the parts would double-count. And it must not show `verdict`
+without `coverage`: `START_WITHOUT_STOP` with `RECEIVER_UP` and the same
+verdict with `INTERRUPTED` are different claims, and collapsing them
+re-introduces exactly the ambiguity the coverage axis exists to remove.
 
 ---
 
