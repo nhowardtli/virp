@@ -1,0 +1,28 @@
+{
+  "_comment": "EXAMPLE receiver config for tacacs/virp_tacacs_recv.py. This file is tracked and is 0644; it is NOT loadable as-is and is not read by anything at runtime. Copy it to a root-only 0600 path (load_config REFUSES any config whose mode has group or world bits) and replace every REPLACE_ME secret with the real shared key. Note that load_config does NO placeholder substitution — unlike deploy/devices.template.json there is no render step, so a ${VAR} left in a secret field would be used verbatim as the TACACS+ key. That is why the placeholders here are REPLACE_ME rather than ${...}: a config that was never filled in fails to authenticate loudly instead of silently obfuscating with the literal string.",
+
+  "_client_identity_rule": "client_identity MUST equal the VIRP device hostname exactly. It is not a label of convenience: virp_tacacs_reconcile.py groups receipts by (client_identity or source_addr) and then matches gate records with gb['device'] != device, so a client_identity that does not name a fleet device silently pairs with nothing. The failure mode is not an error — it is reconciliation that quietly matches zero gate records for that switch and reports unmatched receipts forever. tests/test_tacacs_identities.py asserts every entry here resolves to a hostname in a tracked device template.",
+
+  "_secret_rule": "The shared secret is a bearer credential and is copyable, so a receipt proves possession of it, not physical origin — see docs/TACACS-ACCOUNTING.md §1. Use a distinct secret per device where the platform allows it: a group-wide key means any member can produce receipts attributed to any other member.",
+
+  "receiver_node": "virp-tacacs-lab",
+
+  "listen_addr": "0.0.0.0",
+  "_listen_addr_note": "Bind narrowly in production. Also read §7.3 constraint 2 before choosing this host: IOS keys TACACS+ servers by ADDRESS ALONE and refuses a second server at an address it already has, even on a different port, so VIRP CANNOT share a host address with the incumbent AAA server. It needs its own address, not its own port.",
+
+  "listen_port": 4949,
+  "_listen_port_note": "49 is the registered port. 4949 is what the lab used to sit beside a stub server on a different host. Whatever is chosen must match the `port` line in the device's `tacacs server VIRP` block.",
+
+  "onode_socket": "/run/virp/onode.sock",
+  "producer_key": "/etc/virp/keys/tacacs-producer.key",
+  "ledger": "/var/lib/virp/tacacs-receiver-ledger.jsonl",
+
+  "relationships": [
+    {
+      "_comment": "SW-3850 — the colo Catalyst 3850 stack, fleet entry added 2026-09-05 in deploy/devices.template.json with node_id 0A000A02. source_addr is the address the switch SOURCES accounting packets from, which is not necessarily the management address VIRP connects TO: if the switch has `ip tacacs source-interface` set, this must be that interface's address or every packet lands as unconfigured_source. Confirm with `show tacacs` on the device, not from the fleet entry.",
+      "source_addr": "10.0.10.2",
+      "client_identity": "SW-3850",
+      "secret": "REPLACE_ME"
+    }
+  ]
+}

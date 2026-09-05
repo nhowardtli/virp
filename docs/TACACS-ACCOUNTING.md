@@ -835,6 +835,139 @@ findings survive.
 
 ---
 
+## 7.5 Enrolling SW-3850 — the first non-lab device
+
+**Status: enrolled in the tree, not on the wire.** The switch is in the
+fleet and in the example receiver config. Nothing has been applied to
+the switch, no receiver is listening for it, and the production daemon
+config still does not admit a receiver uid — see
+[What is still missing](#what-is-still-missing-before-a-packet-can-land)
+before reading this as done.
+
+SW-3850 is the colo Catalyst 3850 stack at `10.0.10.2`, IOS-XE. It is
+the first device this source has been aimed at that is not a GNS3
+router, and the differences that matter are operational rather than
+protocol-level.
+
+### VIRP side, done
+
+- **Fleet entry** (`deploy/devices.template.json`, `ff5fe32`): vendor
+  `cisco_iosxe`, `node_id 0A000A02`, user `aiops-svc`, password from
+  `${SWITCH_PASS}`, and **no `enable` credential** — deliberate. The
+  load-time no-enable refusal is scoped to `cisco_asa`, and
+  `driver_cisco.c:439` skips the enable block entirely when the
+  credential is empty, so a wrong "aiops-svc is privilege 15"
+  assumption costs priv-1 command failures, not the ASA reconnect
+  storm. VIRP holds no enable secret for this switch.
+- **Receiver relationship** (`docs/tacacs-receiver.example.json`):
+  `10.0.10.2` → `SW-3850`, secret `REPLACE_ME`.
+
+### `client_identity` is a join key, and a typo is silent
+
+This is the sharpest edge in enrolling a device and it produces no
+error message at any layer. `virp_tacacs_reconcile.py` groups receipts
+by `client_identity` (falling back to `source_addr`) and then filters
+gate records with `gb.get("device") != device`. So `client_identity`
+must equal the **VIRP device hostname, exactly** — `SW-3850`, not
+`sw3850`, not `sw-3850.colo`.
+
+Get it wrong and nothing fails: the receiver records receipts happily,
+the reconciler matches zero gate records for that switch, and the
+operator reads unmatched receipts forever without being told why.
+`tests/test_tacacs_identities.py` (`make test-tacacs-identities`)
+asserts every tracked relationship resolves to a hostname in a tracked
+device template, so the typo is a test failure instead.
+
+The same suite pins that no tracked config carries anything that could
+be a real shared secret, and that no `${...}` appears in a secret or
+address field: `load_config` does **no** placeholder substitution — 
+unlike `deploy/devices.template.json` there is no render step — so a
+`${TACACS_KEY}` left in place would be used verbatim as the TACACS+ key.
+
+### Switch configuration — derived, NOT measured
+
+The block below adapts §7.3, which was measured on a 7206VXR running
+IOS 15.2(4)M7. **It has not been applied to a 3850 or to any IOS-XE
+device.** Every constraint in §7.3 is stated there as measured; the
+notes here are the same constraints reasoned onto this platform, and
+they are worth re-confirming on the box rather than trusting.
+
+```
+aaa new-model
+!
+tacacs server VIRP
+ address ipv4 <receiver address>
+ port 4949
+ key <shared secret>
+!
+aaa group server tacacs+ GRP-VIRP
+ server name VIRP
+!
+aaa authentication login default local
+aaa authentication login CONSOLE local
+aaa authorization exec default local
+aaa accounting commands 1 default start-stop group GRP-VIRP
+aaa accounting commands 15 default start-stop group GRP-VIRP
+!
+line con 0
+ login authentication CONSOLE
+line vty 0 4
+ login authentication default
+ transport input ssh
+```
+
+Four things to carry over from the lab, in the order they bite:
+
+1. **`aaa new-model` is the dangerous line, and this is production.**
+   Before it, none of the `tacacs server` block parses at all; after it,
+   login is under AAA. On a colo switch reached over the network, enable
+   `aaa new-model` and the console-protecting authentication list in the
+   **same** change, with out-of-band access already open, or a lost
+   session is a truck roll. This is the one step where the lab's
+   "isolated bridge only" rule (§6b, and the 2026-09-05 outage that
+   bought it) has no equivalent safety net.
+2. **IOS keys TACACS+ servers by address alone.** A second server at an
+   address the device already has is refused even on a different port,
+   the address is silently dropped, and `show running-config` still
+   looks right while `show tacacs` reports `Server address: UNKNOWN`.
+   If the colo has an incumbent AAA server, **VIRP needs its own
+   address, not its own port**. Confirm with `show tacacs`, never with
+   `show running-config`.
+3. **`commands 15` alone accounts almost nothing.** It matches commands
+   whose own privilege level is 15, so `show clock` and most of what an
+   operator types produce no record. Both `commands 1` and `commands 15`
+   are configured above for that reason.
+4. **An unauthenticated console is invisible to accounting.** With
+   `login authentication ... none` on `line con 0` there is no AAA user
+   to attribute a command to and nothing is generated, at any privilege
+   level. VIRP reads that as `UNREPORTED` — the device did not report —
+   rather than as silence.
+
+One IOS-XE-specific item with no lab counterpart: if the switch sets
+`ip tacacs source-interface`, accounting packets are sourced from that
+interface, which need not be the management address VIRP connects to.
+`source_addr` in the receiver config must be the **sourcing** address or
+every packet lands as `unconfigured_source` — recorded, but unjoinable.
+Read it off `show tacacs`.
+
+### What is still missing before a packet can land
+
+- **The receiver has no uid on the production daemon.** §4 requires an
+  entry in `socket_allowed_uids`, `socket_uid_action_allow` exactly
+  `["chain_append"]`, and `socket_uid_chain_append_types` exactly
+  `["evidence_item"]`. No tracked production template carries one, and
+  the daemon refuses to start naming any allowlisted uid missing from
+  those maps — so this is a deliberate, reviewable edit to
+  `deploy/devices.template.json`, not a detail. It has NOT been made:
+  this document's own status line says v1 is lab-only, and flipping
+  that is a decision, not a fix.
+- **No producer key and no ledger path exist** at the paths the example
+  config names.
+- **The switch is unconfigured**, and the receiver address and port are
+  placeholders in the example.
+
+---
+
 ## 8. Docket field set — an entry IS needed
 
 **Docket was not edited.** This section states the field set and stops,
