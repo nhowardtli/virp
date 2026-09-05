@@ -131,6 +131,29 @@ this table current or the next bump repeats that.
 
 ### 313, current
 
+- **Commit** `b01c055` (Merge feat/camera-retention), deployed
+  2026-09-05 05:37 UTC — this deploy overtook the `1dab8560` one below by
+  minutes; both happened on 2026-09-05 and both copies are kept as .baks
+- **sha256** `934d99e6abcc52733a451e7fb00e127e6bc2434c9ec8d47949b86b17464dad5f`
+- **Emits / accepts**: `SCHEMA = camera_segment/6`; reads `/1` through `/6`;
+  NEW: accepts record-only `camera_retention/1` spool jobs at the schema
+  gate, and grows the `retention` subcommand (camera/RETENTION.md)
+- **Runs as**: `virp-camera-submit.service` (continuous submit-spool,
+  Restart=always) and `virp-spool-retention.timer` (02:30 UTC daily,
+  14-day declare-then-delete of `done/`); `virp-nightly-verify.timer`
+  (03:00 UTC) exports and verifies yesterday's camera sessions with the
+  released examiner binary — log at `/var/lib/virp/nightly-verify.log`,
+  alerts greppable as `NIGHTLY-ALERT`
+- **Supersedes**: `5e602902…` (`1dab8560`), kept as
+  `virp_camera.py.bak-v6-1dab856-20260905` beside it
+- **Also deployed**: Spark `spark-e5fd` (10.0.0.15) capture host —
+  same commit and sha, `/usr/local/lib/virp-camera/virp_camera.py`,
+  three per-camera capture units + 30-day retention timers,
+  data dirs on `/srv/virp-capture` (T7), keys under `/etc/virp-capture`
+  via LoadCredential (never on the T7)
+
+### 313, superseded 2026-09-05 (deployed 05:30 UTC, overtaken 05:37 UTC)
+
 - **Commit** `1dab8560a478ab55ee3d8705a83de832fbf9c6aa` (short `1dab8560`),
   deployed 2026-09-05 05:30 UTC
 - **sha256** `5e6029023e11c86d8dc22bcebbd7a3fcce408453f12d2486ae21dd36a0393387`
