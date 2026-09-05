@@ -1236,6 +1236,10 @@ static void test_evidence_cache_failure_after_intent_still_executes(void)
 
 #include <pthread.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <poll.h>
+#include <arpa/inet.h>   /* htonl/ntohl */
 
 #define CLI_BIN "./build/virp"
 
@@ -1457,6 +1461,174 @@ static void test_cli_approve_apply_e2e(void)
     PASS();
 }
 
+/* =========================================================================
+ * Review B #1 — `virp approve` reconstructs before it signs.
+ *
+ * A hostile / MITM'd O-Node hands the operator a challenge whose
+ * human-readable summary shows one command_hash while the canonical
+ * bytes to be signed commit to ANOTHER. A blind signer signs the
+ * attacker's bytes and hands back a real approver signature for a
+ * command the operator never saw. The fixed client re-derives the
+ * proposal_id and command_hash embedded in the canonical and refuses
+ * when they do not match the display — BEFORE any signing, and so
+ * without ever sending a submit.
+ * ========================================================================= */
+
+struct hostile_srv {
+    char sock_path[108];
+    virp_signing_key_t okey;
+    char pid[33];
+    char canon_hex[2 * VIRP_APPROVAL_CANON_SIZE + 1];
+    char disp_chash[65];        /* what the summary DISPLAYS (benign) */
+    int  submit_seen;           /* set iff the client came back to submit */
+    int  ready;                 /* listening socket is bound + listening */
+};
+
+static int read_n(int fd, void *buf, size_t n)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, (uint8_t *)buf + got, n - got);
+        if (r <= 0) return -1;
+        got += (size_t)r;
+    }
+    return 0;
+}
+
+/* Drain one framed request ([4B len][1B ver][json]); contents ignored. */
+static void drain_one_request(int fd)
+{
+    uint8_t hdr[4];
+    if (read_n(fd, hdr, 4) != 0) return;
+    uint32_t len = ntohl(*(uint32_t *)hdr);
+    if (len == 0 || len > VIRP_MAX_MESSAGE_SIZE) return;
+    uint8_t *tmp = malloc(len);
+    if (!tmp) return;
+    (void)read_n(fd, tmp, len);
+    free(tmp);
+}
+
+static void *hostile_serve_thread(void *arg)
+{
+    struct hostile_srv *s = arg;
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (lfd < 0) return NULL;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s", s->sock_path);
+    unlink(s->sock_path);
+    if (bind(lfd, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(lfd, 4) != 0) {
+        close(lfd);
+        return NULL;
+    }
+    __atomic_store_n(&s->ready, 1, __ATOMIC_RELEASE);
+
+    /* Connection 1: the approval_challenge fetch. Answer with the
+     * inconsistent challenge and close. */
+    int c1 = accept(lfd, NULL, NULL);
+    if (c1 >= 0) {
+        drain_one_request(c1);
+
+        char json[1024];
+        snprintf(json, sizeof(json),
+                 "{\"proposal_id\":\"%s\",\"canonical\":\"%s\","
+                 "\"device\":\"core-sw-1\",\"command\":\"show version\","
+                 "\"command_hash\":\"%s\",\"tier\":\"YELLOW\","
+                 "\"device_node_id\":5,\"approved_at_ns\":1750000000000000000,"
+                 "\"ttl_seconds\":300}",
+                 s->pid, s->canon_hex, s->disp_chash);
+
+        uint8_t obuf[VIRP_MAX_MESSAGE_SIZE];
+        size_t olen = 0;
+        if (virp_build_observation(obuf, sizeof(obuf), &olen, 1, 1,
+                                   VIRP_OBS_APPROVAL_CHALLENGE, VIRP_SCOPE_LOCAL,
+                                   (const uint8_t *)json, (uint16_t)strlen(json),
+                                   &s->okey) == VIRP_OK) {
+            uint32_t belen = htonl((uint32_t)olen);
+            (void)!write(c1, &belen, 4);
+            (void)!write(c1, obuf, olen);
+        }
+        close(c1);
+    }
+
+    /* If the client is buggy it now opens a SECOND connection to submit.
+     * A correct client refuses after the challenge and never comes back.
+     * Poll briefly; any second connection is the failure signal. */
+    struct pollfd pfd = { .fd = lfd, .events = POLLIN };
+    if (poll(&pfd, 1, 2000) > 0 && (pfd.revents & POLLIN)) {
+        int c2 = accept(lfd, NULL, NULL);
+        if (c2 >= 0) {
+            __atomic_store_n(&s->submit_seen, 1, __ATOMIC_RELEASE);
+            drain_one_request(c2);
+            close(c2);
+        }
+    }
+    close(lfd);
+    unlink(s->sock_path);
+    return NULL;
+}
+
+static void test_cli_approve_refuses_inconsistent_canonical(void)
+{
+    TEST("CLI: approve refuses a challenge whose canonical != display");
+
+    struct hostile_srv s;
+    memset(&s, 0, sizeof(s));
+    snprintf(s.sock_path, sizeof(s.sock_path), "/tmp/virp-test-hostile.sock");
+
+    /* O-Key to sign the (well-formed) challenge observation. The approve
+     * client does not HMAC-verify the challenge, so any O-Key serves. */
+    ASSERT(virp_key_generate(&s.okey, VIRP_KEY_TYPE_OKEY) == VIRP_OK,
+           "gen okey");
+
+    /* 32-hex proposal id the client will pass on the command line. */
+    snprintf(s.pid, sizeof(s.pid), "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1");
+
+    /* The canonical commits to H_evil; the summary DISPLAYS H_benign. */
+    char evil[65], benign[65];
+    for (int i = 0; i < 64; i++) { evil[i] = 'b'; benign[i] = 'a'; }
+    evil[64] = benign[64] = '\0';
+    snprintf(s.disp_chash, sizeof(s.disp_chash), "%s", benign);
+
+    uint8_t canon[VIRP_APPROVAL_CANON_SIZE];
+    ASSERT(virp_approval_build_canonical(s.pid, evil, 5, 1750000000000000000ULL,
+                                         300, canon) == VIRP_OK,
+           "build evil canonical");
+    for (size_t i = 0; i < sizeof(canon); i++)
+        snprintf(s.canon_hex + i * 2, 3, "%02x", canon[i]);
+
+    /* A loadable approver key file for --key (else the client fails at
+     * load, before the challenge, for the wrong reason). */
+    const char *sk = "/tmp/virp-test-hostile.key",
+               *pk = "/tmp/virp-test-hostile.pub";
+    unlink(sk); unlink(pk);
+    ASSERT(virp_fed_save(&g_kp, pk, sk) == VIRP_OK, "save approver key");
+
+    pthread_t srv;
+    ASSERT(pthread_create(&srv, NULL, hostile_serve_thread, &s) == 0,
+           "spawn hostile daemon");
+    /* Wait for the listener to be up before the client connects. */
+    for (int i = 0; i < 200 && !__atomic_load_n(&s.ready, __ATOMIC_ACQUIRE); i++)
+        usleep(5000);
+
+    char out[8192], cmd[512];
+    snprintf(cmd, sizeof(cmd), CLI_BIN " approve %s --socket %s --key %s",
+             s.pid, s.sock_path, sk);
+    int rc = run_cli(cmd, out, sizeof(out));
+
+    pthread_join(srv, NULL);
+    virp_key_destroy(&s.okey);
+    unlink(sk); unlink(pk);
+
+    ASSERT(rc == 1, "client must refuse (exit 1), not sign");
+    ASSERT(strstr(out, "REFUSING to sign") != NULL, "no refusal message");
+    ASSERT(strstr(out, "APPROVED") == NULL, "must not report APPROVED");
+    ASSERT(__atomic_load_n(&s.submit_seen, __ATOMIC_ACQUIRE) == 0,
+           "client sent a submit for bytes it should have refused");
+    PASS();
+}
+
 /* Regression for the two-file loader bug: the secret key file that
  * `virp-tool keygen approval` actually writes must load directly via
  * `virp approve --key <prefix>.key`. Run keygen as a subprocess, then
@@ -1673,6 +1845,7 @@ int main(void)
     test_cli_exec_verifies_signature();
     test_cli_exec_red_rejected_with_proposal();
     test_cli_approve_apply_e2e();
+    test_cli_approve_refuses_inconsistent_canonical();
     test_cli_keygen_key_loads();
     test_cli_approve_key_diagnostics();
     test_cli_chain_tail_format();

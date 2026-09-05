@@ -1317,6 +1317,42 @@ static int cmd_approve(int argc, char **argv)
     printf("  Command:      %s\n", cJSON_IsString(j_cmd) ? j_cmd->valuestring : "?");
     printf("  Command hash: %s\n", cJSON_IsString(j_ch) ? j_ch->valuestring : "?");
     printf("  Tier:         %s\n", cJSON_IsString(j_tier) ? j_tier->valuestring : "?");
+
+    /* RECONSTRUCT-BEFORE-SIGN (Review B #1). The daemon just handed us
+     * opaque canonical bytes plus a human-readable summary. Do not sign
+     * the bytes on faith: the two anchors the operator can actually
+     * verify — the proposal this challenge is for, and the command_hash
+     * — live at fixed offsets inside the canonical, so re-derive them
+     * from the bytes we are about to sign and require they match what was
+     * displayed. A compromised or MITM'd O-Node that shows one command
+     * but signs the hash of another is refused HERE, before the key ever
+     * touches the payload. device_node_id / approved_at / ttl are
+     * daemon-chosen operational values the operator has no independent
+     * truth for, so binding them to the display would add nothing; the
+     * device NAME is unsigned metadata (see docs/APPROVAL-FLOW.md). */
+    {
+        char canon_pid[2 * 16 + 1];
+        char canon_chash[2 * 32 + 1];
+        for (int i = 0; i < 16; i++)
+            snprintf(canon_pid + i * 2, 3, "%02x", canon[4 + i]);
+        for (int i = 0; i < 32; i++)
+            snprintf(canon_chash + i * 2, 3, "%02x", canon[20 + i]);
+        const char *disp_chash = cJSON_IsString(j_ch) ? j_ch->valuestring : "";
+        if (memcmp(canon, VIRP_APPROVAL_CANON_MAGIC, 4) != 0 ||
+            strcmp(canon_pid, proposal_id) != 0 ||
+            strcmp(canon_chash, disp_chash) != 0) {
+            fprintf(stderr,
+                "Error: challenge is internally inconsistent — the canonical "
+                "bytes to be signed do not match the displayed proposal/command.\n"
+                "  displayed proposal_id:  %s\n  canonical proposal_id:  %s\n"
+                "  displayed command hash: %s\n  canonical command hash: %s\n"
+                "REFUSING to sign. The O-Node may be compromised, or the "
+                "challenge was tampered in transit.\n",
+                proposal_id, canon_pid, disp_chash, canon_chash);
+            cJSON_Delete(ch);
+            return 1;
+        }
+    }
     cJSON_Delete(ch);
 
     /* 2. SIGN the canonical bytes. */
