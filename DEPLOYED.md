@@ -2321,3 +2321,78 @@ had nothing to do with HA.
 `808d38f`'s commit message cannot be edited without rewriting pushed history and
 is left alone; this note is the correction of record. The source comment in
 `driver_linux.c` has been corrected in place.
+
+## Deploy guard 2026-09-04 — the dirty-tree check now fails closed
+
+Recorded here the way `camera/README.md` records the 313 driver install:
+which copy runs where, at what commit, with the read-only command that
+answers the question. The difference is that this artifact is not a
+daemon or a driver — it is the check that decides whether an install is
+allowed to happen at all, so the copy that matters is the one in the tree
+`make install-prod` is invoked from.
+
+| host | path | purpose |
+|---|---|---|
+| laptop `nhoward-ThinkPad-E16-Gen-2` | working tree `scripts/require-clean-tree.sh` | development; `make test-deploy-dirty-guard` |
+| deploy tree (`VIRP_DEPLOY_TREE`, default `/opt/virp`) | `scripts/require-clean-tree.sh` in that checkout | gates `install-prod`, `deploy-record`, `install-units`, `install-devices-template` |
+
+### Current
+
+- **Commit** `cda7be9c22899e06e5d8cc8fd9a92c77b0e9444d` (short `cda7be9`),
+  authored 2026-09-04 21:53 -0400 on branch `fix/deploy-dirty-tree-guard`
+- **sha256** `scripts/require-clean-tree.sh`:
+  `7cb01f77f9969f45188cbcb9bfcd209cb63533ff49b125946f6dd3566b509120`
+- **sha256** `tests/test_deploy_dirty_guard.sh`:
+  `b0e7f6ae9221d697e0c5e07eeef85de6380b3146bbb06fc79691d42034473326`
+- **Gates**: `install-prod`, `deploy-record`, `install-units`,
+  `install-devices-template` — all four, none with a private copy
+- **Refuses on**: git exit status nonzero (dubious ownership, no
+  repository, git absent) with `unable to establish repository state`;
+  then, separately, a non-empty `git status --porcelain`
+- **Supersedes**: four hand-copied `st=$(git status --porcelain
+  2>/dev/null)` guards at Makefile lines 1422, 1447, 1547 and 1585 of
+  `c65f623`, each of which read a FAILING git as a clean tree
+
+**NOT INSTALLED ANYWHERE YET.** This laptop has no `/opt/virp` and no
+`/usr/local/lib/virp`; nothing was deployed, restarted or touched on any
+host in the session that wrote this. The branch is unmerged. The entry
+records the commit so the next deploy can say which guard was in force,
+which is precisely the fact the old guard could not establish.
+
+### What this means for the stanzas above
+
+Every `- **Tree at install**: clean (…)` line in this file above this
+point was produced by the fail-open guard. Where the deploy ran under
+`sudo` from a worktree owned by `nhoward` with no `safe.directory`
+exception, that line records that `git status --porcelain` printed
+nothing — which is also what it prints when it exits 128 without
+answering. Those lines are therefore **weaker than they read**: they
+assert an empty stdout, not a verified clean tree. They are not corrected
+in place, per this file's convention; this note is the correction of
+record. The commit hashes in those stanzas came from `git rev-parse HEAD`
+in the same recipe, so a run where git worked at all still names a real
+commit — the unverified part is whether the tree matched it.
+
+`deploy-record` now says `exited 0 and printed nothing` rather than
+`empty`, so stanzas written from `cda7be9` onward carry the stronger
+claim on their face.
+
+### Verify, without changing anything
+
+```sh
+tree=${VIRP_DEPLOY_TREE:-/opt/virp}          # or the checkout you deploy from
+sha256sum "$tree/scripts/require-clean-tree.sh"
+git -C "$tree" log -1 --format='%H %cI' -- scripts/require-clean-tree.sh
+# Count the RECIPE invocations, not every mention: the file also names the
+# script in two comments and in deploy-record's own output line.
+grep -cE '^\t@scripts/require-clean-tree\.sh' "$tree/Makefile"   # expect 4
+grep -n 'git status --porcelain' "$tree/Makefile" | grep '2>/dev/null'  # expect no output
+
+# The guard itself is read-only: on a clean tree it prints nothing and
+# exits 0, which is the no-op that confirms the installed copy runs.
+"$tree/scripts/require-clean-tree.sh" --tree "$tree" "verification"; echo "exit=$?"
+```
+
+Run on this laptop against the working tree at `cda7be9`: the recipe-line
+count reported 4, the fail-open grep reported nothing, and the guard
+printed nothing and exited 0.
