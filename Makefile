@@ -1045,6 +1045,16 @@ test-render-devices:
 test-deploy-dirty-guard:
 	@bash tests/test_deploy_dirty_guard.sh
 
+# Every line of the DEPLOYED.md stanza is a provenance claim, so every
+# line must be established or deploy-record must fail. Runs the real
+# recipe against a sandbox VIRP_INSTALL_DIR inside a throwaway git repo:
+# a missing or unreadable artifact, and an unborn HEAD, must refuse
+# rather than record an empty field. Reads no production path, writes
+# none.
+.PHONY: test-deploy-record-facts
+test-deploy-record-facts:
+	@bash tests/test_deploy_record_facts.sh
+
 # Sep 1 review, Task 2: the SHIPPED templates, rendered by the real
 # render-devices.sh into a sandbox, must give every allowed uid an
 # explicit socket_uid_action_allow entry (the daemon refuses to start
@@ -1454,24 +1464,61 @@ install-prod: prod $(TOOL_BIN) deploy-capture
 # The DEPLOYED.md stanza, generated rather than hand-written so it cannot
 # drift from what is actually installed. Refuses on a dirty tree for the
 # same reason install-prod does.
+#
+# Every line of the stanza is a provenance CLAIM, so every line has to be
+# established or the target has to fail. It used to interpolate each fact
+# straight into an echo:
+#
+#     @echo "- **Commit**: \`$$(git rev-parse HEAD)\`"
+#     @echo "- **sha256**: \`$$(sha256sum $(VIRP_INSTALL_BIN) | awk '{print $$1}')\`"
+#
+# which is the dirty-tree guard's defect one field at a time. A command
+# substitution that fails expands to nothing, so the recipe printed
+# `- **Commit**: ``' or `- **sha256** `/usr/local/lib/virp/virp`: ``'
+# and exited 0 — a record with a hole in it, written into the file that
+# is supposed to be the answer to "what is running?". The sha256 lines
+# were worse than the commit line: the pipe into awk discards
+# sha256sum's exit status outright, and only the daemon binary had a
+# `test -f` in front of it, so a missing virp-tool, helper script or
+# autopilot module recorded an empty hash rather than stopping.
+#
+# Now every fact is captured, checked, and only then printed. The
+# helpers must not run inside `$$(...)` — `exit` in a command
+# substitution kills the subshell and lets the recipe carry on with an
+# empty value, which is the exact failure being fixed — so sha_of sets
+# $$H in the recipe's own shell instead of echoing.
 .PHONY: deploy-record
 deploy-record:
 	@test -f $(VIRP_INSTALL_BIN) || \
 	    { echo "FAIL: $(VIRP_INSTALL_BIN) is not installed"; exit 1; }
 	@scripts/require-clean-tree.sh "refusing to record a deploy"
-	@echo "- **Commit**: \`$$(git rev-parse HEAD)\`"
-	@echo "- **Branch**: \`$$(git rev-parse --abbrev-ref HEAD)\`"
-	@echo "- **Tree at install**: clean (\`git status --porcelain\` exited 0 and printed nothing; see scripts/require-clean-tree.sh)"
-	@echo "- **Installed binary**: \`$(VIRP_INSTALL_BIN)\`"
-	@echo "- **sha256**: \`$$(sha256sum $(VIRP_INSTALL_BIN) | awk '{print $$1}')\`"
-	@echo "- **sha256** \`$(VIRP_INSTALL_TOOL)\`: \`$$(sha256sum $(VIRP_INSTALL_TOOL) | awk '{print $$1}')\`"
-	@for s in $(VIRP_INSTALL_SCRIPTS); do \
-	    b=$$(basename $$s); \
-	    echo "- **sha256** \`$(VIRP_INSTALL_DIR)/$$b\`: \`$$(sha256sum $(VIRP_INSTALL_DIR)/$$b | awk '{print $$1}')\`"; \
-	 done
-	@for s in $(VIRP_INSTALL_PY); do \
-	    b=$$(basename $$s); \
-	    echo "- **sha256** \`$(VIRP_INSTALL_PY_DIR)/$$b\`: \`$$(sha256sum $(VIRP_INSTALL_PY_DIR)/$$b | awk '{print $$1}')\`"; \
+	@set -u; \
+	 die() { echo "FAIL: refusing to record a deploy — $$*" >&2; exit 1; }; \
+	 sha_of() { \
+	     [ -f "$$1" ] || die "$$1 is not installed; the record cannot name its sha256"; \
+	     H=$$(sha256sum "$$1") || die "sha256sum failed on $$1"; \
+	     H=$${H%% *}; \
+	     [ -n "$$H" ] || die "sha256sum printed nothing for $$1"; \
+	 }; \
+	 commit=$$(git rev-parse HEAD) || die "git rev-parse HEAD failed"; \
+	 [ -n "$$commit" ] || die "git rev-parse HEAD printed nothing"; \
+	 branch=$$(git rev-parse --abbrev-ref HEAD) || die "git rev-parse --abbrev-ref HEAD failed"; \
+	 [ -n "$$branch" ] || die "git rev-parse --abbrev-ref HEAD printed nothing"; \
+	 echo "- **Commit**: \`$$commit\`"; \
+	 echo "- **Branch**: \`$$branch\`"; \
+	 echo "- **Tree at install**: clean (\`git status --porcelain\` exited 0 and printed nothing; see scripts/require-clean-tree.sh)"; \
+	 echo "- **Installed binary**: \`$(VIRP_INSTALL_BIN)\`"; \
+	 sha_of "$(VIRP_INSTALL_BIN)"; echo "- **sha256**: \`$$H\`"; \
+	 sha_of "$(VIRP_INSTALL_TOOL)"; echo "- **sha256** \`$(VIRP_INSTALL_TOOL)\`: \`$$H\`"; \
+	 for s in $(VIRP_INSTALL_SCRIPTS); do \
+	     b=$$(basename $$s) || die "basename failed on $$s"; \
+	     sha_of "$(VIRP_INSTALL_DIR)/$$b"; \
+	     echo "- **sha256** \`$(VIRP_INSTALL_DIR)/$$b\`: \`$$H\`"; \
+	 done; \
+	 for s in $(VIRP_INSTALL_PY); do \
+	     b=$$(basename $$s) || die "basename failed on $$s"; \
+	     sha_of "$(VIRP_INSTALL_PY_DIR)/$$b"; \
+	     echo "- **sha256** \`$(VIRP_INSTALL_PY_DIR)/$$b\`: \`$$H\`"; \
 	 done
 
 # =========================================================================
@@ -2055,7 +2102,7 @@ test-release-tools:
 	@scripts/gen-test-attestation.sh --selftest
 	@scripts/verify-release-bundle.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 
