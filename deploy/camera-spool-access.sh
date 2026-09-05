@@ -33,7 +33,7 @@ DONE="$CHROOT/done"
 AK_DIR="/etc/ssh/authorized_keys.d"
 AK_FILE="$AK_DIR/$CAP_USER"
 SSHD_DROPIN="/etc/ssh/sshd_config.d/60-virp-capture.conf"
-FROM_PIN="${FROM_PIN:-10.0.3.102,10.0.0.222}"
+FROM_PIN="${FROM_PIN:-10.0.3.102,10.0.0.222,10.0.0.36,10.0.0.15}"
 PUBKEY="${CAP_PUBKEY:?set CAP_PUBKEY to the capture host public key line}"
 
 # ── capture identity ───────────────────────────────────────────────────

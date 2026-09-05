@@ -88,6 +88,7 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 SCHEMA_V1 = "camera_segment/1"
@@ -2773,19 +2774,36 @@ def sftp_ship(spool_target, ssh_key=None, extra_opts=None,
         # submitter's schema gate holds the other side of this contract —
         # a camera_segment job stays a pair, and a record-only job of any
         # other schema is refused there, not silently accepted here.
-        puts, renames = [], []
+        # Every landed path is chmod-ed 640 in this SAME batch, after the
+        # renames and before the marker. `sftp put` stamps the DESTINATION
+        # with the local file's mode, and the capture units write their
+        # segments and bodies 0600. On a spool whose default ACL grants
+        # the submitter `u:virp:rwx`, a 0600 file drives the POSIX ACL
+        # mask — which is taken from the mode's GROUP bits — to `---`,
+        # and every named entry collapses to `#effective:---`. The
+        # submitter is then locked out of the spool by the very ACL that
+        # exists to admit it, and the job wedges in incoming/ forever with
+        # EACCES. Restoring the group bits restores the mask, and with it
+        # the named entry. 640 leaves the submitter `r--`, which is all it
+        # needs: it reads the segment and the body, and the move into
+        # done/ is a rename, which is authorized by the DIRECTORY's perms,
+        # never the file's.
+        puts, renames, chmods = [], [], []
         if seg_file is not None:
             puts.append("put %s %s/%s.mp4.part" % (seg_file, rd, name))
             renames.append("rename %s/%s.mp4.part %s/%s.mp4"
                            % (rd, name, rd, name))
+            chmods.append("chmod 640 %s/%s.mp4" % (rd, name))
         puts.append("put %s %s/%s.body.part" % (body_file, rd, name))
         renames.append("rename %s/%s.body.part %s/%s.body"
                        % (rd, name, rd, name))
+        chmods.append("chmod 640 %s/%s.body" % (rd, name))
         for local, suffix in (cited or []):
             puts.append("put %s %s/%s.%s.part" % (local, rd, name, suffix))
             renames.append("rename %s/%s.%s.part %s/%s.%s"
                            % (rd, name, suffix, rd, name, suffix))
-        if not _batch("\n".join(puts + renames)):
+            chmods.append("chmod 640 %s/%s.%s" % (rd, name, suffix))
+        if not _batch("\n".join(puts + renames + chmods)):
             return False
         marker = body_file + ".done"
         open(marker, "wb").close()
@@ -3256,8 +3274,50 @@ def _unlink_quiet(path):
         pass
 
 
+# ffmpeg is handed the RTSP URL with its credentials inline, and on any
+# failure it echoes that URL back on stderr — "Error opening input file
+# rtsp://user:pass@host/stream". Inherited stderr puts that straight into
+# the journal in cleartext, where the `adm` group reads it, which quietly
+# undoes the root-only LoadCredential custody the capture units are built
+# around. A unit that cannot reach its camera restarts every RestartSec
+# and reprints it, so the leak grows without bound. stderr is therefore
+# CAPTURED and filtered rather than inherited.
+#
+# Only the userinfo is removed. The scheme, host and path survive, because
+# they are what an operator needs to see: a Reolink unit dialling the Axis
+# camera's address is exactly the kind of misconfiguration this line is
+# read to find, and blanking the host would have hidden it.
+_STREAM_CRED_RE = re.compile(r"://[^/@\s]*:[^/@\s]*@")
+
+
+def redact_stream_credentials(text):
+    """Return `text` with any `://user:pass@` userinfo replaced by
+    `://REDACTED@`. Host, port and path are left intact."""
+    return _STREAM_CRED_RE.sub("://REDACTED@", text)
+
+
+def _pump_redacted(pipe, out=None):
+    """Copy `pipe` to `out` line by line, redacting stream credentials.
+    Runs on a daemon thread so ffmpeg never blocks on a full stderr pipe;
+    ends by itself at EOF when the child exits."""
+    out = sys.stderr if out is None else out
+    try:
+        for line in iter(pipe.readline, b""):
+            out.write(redact_stream_credentials(
+                line.decode("utf-8", "replace")))
+            out.flush()
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
 def _spawn_ffmpeg(cfg):
-    return subprocess.Popen(ffmpeg_cmd(cfg))
+    proc = subprocess.Popen(ffmpeg_cmd(cfg), stderr=subprocess.PIPE)
+    threading.Thread(target=_pump_redacted, args=(proc.stderr,),
+                     daemon=True).start()
+    return proc
 
 
 # ── O-node side: submit-spool (runs as the Phase 1 identity) ───────────
