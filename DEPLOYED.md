@@ -2,7 +2,7 @@
 
 - **Role**: production reference instance
 
-## Current live state (verified 2026-08-11 01:06 UTC)
+## Current live state (verified 2026-09-05 05:25 UTC)
 
 **This block is authoritative for what is running right now.** Everything below
 it is a chronological, append-only log: each section describes the state at the
@@ -10,17 +10,20 @@ time it was written and is deliberately *not* corrected in place. Where a fact
 below disagrees with this block, this block wins. A copy of this file without
 this block is stale — check the commit before relying on it.
 
-- **Commit**: `569bff11517718e0347bdd48f82c9d3a2a7d6375` (short `569bff11`)
-  — deployed 2026-08-11 01:00 UTC (consolidated main: branch consolidation +
-  driver_linux AF_UNSPEC + installed virp-tool), superseding `5bda4deb`
-  (2026-08-10 01:31 UTC); see the update log.
-- **Branch**: `main` (consolidated 2026-08-10: `feat/cisco-config-scrub-netclaw-yellow` merged into main at `b446c3c2`; branch retired to `archive/feat/cisco-config-scrub-netclaw-yellow-2026-08-10`)
+- **Commit**: `1dab8560a478ab55ee3d8705a83de832fbf9c6aa` (short `1dab8560`)
+  — deployed 2026-09-05 05:23:42 UTC, `v0.2.0-57-g1dab8560`, superseding
+  `dc49b748` (2026-09-03 20:18:37 UTC, the fed_error cherry-pick). That
+  commit is not on `main`'s history; its daemon sources were byte-identical
+  to `d54aeb3`, which is. See "Deploy 2026-09-05" below.
+- **Branch**: `main` (the checkout at `/opt/virp` was moved off
+  `deploy/fed-error-2026-09-03` onto `main` for this deploy; that branch is
+  retained locally and on origin)
 - **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
   socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
   — binary sha256
-  `27c0788354234cce2e19426b18f9eea70da680ab1c709ac7370516dd7b614bb5`
+  `c541fc729fd178f6732291c6105c28050d9f9b64ec40a98de91bd71e32b46575`
 - **Client**: `/usr/local/lib/virp/virp-tool` (+ `virp` alias), sha256
-  `8c4005a8628a62ca22ea9dd574357452b0da1df3302ccf00f085b4485028d0aa` —
+  `338cd33107566d8e6eae866e548e11a8d744085bdb40cfdbbba313e2f70568c8` —
   installed by `make install-prod` as the fourth artifact class; the
   autopilot shells out to this path. The build-tree copy is no longer a
   production dependency (the "Chain gap 2026-08-09" defect is closed).
@@ -63,6 +66,74 @@ are now stale on two counts:
    classifier it was waiting on has been live ever since.
 2. The deployed commit has advanced through the update log below and is now
    `b6e9602c`, not `0c9c7338`.
+
+## Deploy 2026-09-05 05:23:42 UTC — main `1dab8560` (approver binding + unchained-execution)
+
+First deploy through the hardened guard, and the first whose record was
+produced by a `deploy-record` that fails rather than leaving a hole.
+
+- **Commit**: `1dab8560a478ab55ee3d8705a83de832fbf9c6aa`
+- **Branch**: `main`
+- **Tree at install**: clean (`git status --porcelain` exited 0 and printed
+  nothing; see `scripts/require-clean-tree.sh`)
+- **Installed binary**: `/usr/local/lib/virp/virp-onode-prod`
+- **sha256**: `c541fc729fd178f6732291c6105c28050d9f9b64ec40a98de91bd71e32b46575`
+- **sha256** `/usr/local/lib/virp/virp-tool`: `338cd33107566d8e6eae866e548e11a8d744085bdb40cfdbbba313e2f70568c8`
+- **sha256** `/usr/local/lib/virp/render-devices.sh`: `47abe98fc9cebe6113a8e22a4e4ce315f222fd7ef0397af7e52f14147d3fcae6`
+- **sha256** `/usr/local/lib/virp/config-backup-access.sh`: `358aa3aa978a0f220636c444336141f65d62f57136653f0e020fd370219fe022`
+- **sha256** `/usr/local/lib/virp/evidence-access.sh`: `bcf299794a84b63b0b14b3e9c98dab2009912b8d2fa180493f33834e28a67219`
+- **sha256** `/usr/local/lib/virp/netclaw-access.sh`: `a36999889421177fa437bf0d5d1fa680cfc92b37a7b761e7298839bfdd3fa8ca`
+- **sha256** `/usr/local/lib/virp/autopilot/virp_autopilot.py`: `4611f2a47b0077c3f2c90125c845f1abd6061a37d3bb84944513e1f719e6d945`
+- **sha256** `/usr/local/lib/virp/autopilot/virp_config_backup.py`: `6dfc726d5ee0fa9b2b34a16ba31584be5ba5668d2a6277101aeffa3ef183c7b1`
+- **sha256** `/usr/local/lib/virp/autopilot/virp_evidence.py`: `b596b6de5859e8ee980410cf63e371780cbd3eed5a2f3b1bdd2ac4a7f978e504`
+
+### What changed on the wire
+
+Two daemon-affecting commits, both closing a case of a component trusting a
+claim it was in a position to check:
+
+- `3b15afb` — `virp approve` re-derives `proposal_id` and `command_hash` from
+  the bytes it is about to sign and refuses on a mismatch, so a compromised or
+  MITM'd O-Node can no longer display one command while the canonical commits
+  to another.
+- `80453df` — an approved apply whose outcome append fails now returns the
+  signed `unchained-execution` error instead of an ordinary success. The
+  approval is consumed either way; what changes is that the response stops
+  claiming a chained outcome that does not exist.
+
+The unit was NOT updated, for the reason recorded on 2026-08-11: the
+canonical unit drops `VIRP_WAZUH_INSECURE=1`, no lab CA exists yet, and
+`wazuh-lab` is live. `install-devices-template` was NOT run.
+
+### Verification
+
+Per the 2026-09-02 rollback lesson — one full cycle and an advancing head,
+never `systemctl status`:
+
+- Daemon reports `v0.2.0-57-g1dab8560`; 43/43 devices loaded from
+  `/run/virp/devices.json`; gate `default=ENFORCE max_tier=YELLOW
+  overrides=0 evidence_required=true`.
+- Autopilot cycle at 05:25:07 completed: 18 observations, chained and
+  `verified=VALID`.
+- Chain entries 317582 -> 317637 across the restart.
+- No append refusal of any kind since the restart — specifically not the
+  v0.2.0 "restricted principal" shape.
+- Rollback point: `sudo make rollback-prod
+  ROLLBACK_FROM=/var/backups/virp/20260905T052141Z`, plus
+  `/root/virp-install-snapshot-20260905.tar` (`tar -p`, per the same lesson).
+
+### Two standing defects this deploy did NOT introduce, and did not fix
+
+Both were measured before and after and are unchanged:
+
+- `[ERROR-OBS] device='virp-node2-peer' not found` — 4953 occurrences since
+  Aug 31, 1166 of them in the window before this restart. The autopilot
+  comparator battery names a device that is not in the rendered
+  `devices.json` (grep count: 0).
+- `virp-autopilot.service` exits 1 on every cycle (~288/day for five days)
+  while ~280 cycles/day complete normally. The nonzero exit is the alert
+  condition, not a failure to run. Worth fixing so that a real failure is
+  distinguishable from the steady state, which today it is not.
 
 ## Anomaly 2026-09-02 02:16:00-02:26:14 UTC — v0.2.0 deployed, refused its own evidence, rolled back
 
@@ -1733,6 +1804,65 @@ here does not describe, correct, or supersede anything above. If these two
 nodes keep diverging, this section should become its own file
 (`DEPLOYED-home.md`); it is appended here only because that is where the
 deploy record convention lives today.
+
+## 2026-09-05 05:29:53 UTC — main `1dab856`, daemon + camera driver
+
+Brought this node current with `main` after 48 commits. Its checkout had
+already been fast-forwarded to `e0da78d` without being installed, so the
+running daemon was `7cda019` (2026-09-02) while the tree was a merge ahead.
+
+- **Commit**: `1dab8560a478ab55ee3d8705a83de832fbf9c6aa`
+- **Branch**: `main`
+- **Tree at install**: clean (`git status --porcelain` exited 0 and printed
+  nothing; see `scripts/require-clean-tree.sh`)
+- **Installed binary**: `/usr/local/lib/virp/virp-onode-prod`
+- **sha256**: `612bcd6b30a5ea40372e09f5a600d51ce0595ba2b62ee3cd3ba95d9e030757da`
+- **sha256** `/usr/local/lib/virp/virp-tool`: `c615fc9997ba28aaabcf8115e8c20bb19731e74dba5dce1a75d460ddb51f8534`
+- **Supersedes**: daemon `v0.2.0-9-g7cda019`, sha256 `cfca4565…`
+- **Rollback**: `sudo make rollback-prod
+  ROLLBACK_FROM=/var/backups/virp/20260905T052757Z`, plus
+  `/root/virp-install-snapshot-20260905.tar`
+
+Worth recording about the guard itself: this node's checkout lives at
+`/home/nhoward/virp` and is owned by `nhoward`, so `sudo make install-prod`
+is the dubious-ownership shape the guard was written for. It passed, and
+correctly — git accepts a worktree whose owner matches `SUDO_UID`. The
+guard bites when the owner is a *different* user than the one invoking
+sudo, which is not this case. Neither host needed a `safe.directory`
+exception, which is the outcome the guard's header argues for.
+
+### Camera driver
+
+- **Path**: `/usr/local/lib/virp-camera/virp_camera.py`
+- **sha256**: `5e6029023e11c86d8dc22bcebbd7a3fcce408453f12d2486ae21dd36a0393387`
+- **Schema**: `SCHEMA = SCHEMA_V6`, unchanged — the capture host at `/6` stays
+  compatible, so this is not the schema-gate trap `camera/README.md` warns of
+- **Supersedes**: `95fc356c…` (`e3a16c7`), retained beside it as
+  `virp_camera.py.bak-v6-20260905`
+- **Carries**: `438e4a0` — the chain is authoritative over a sidecar on the
+  idempotency skip, so a sidecar that outlived its chain entry no longer reads
+  as proof of attestation
+- Verified with the README's own no-op: `submit-spool --once` as `virp` →
+  `0 job(s) appended this run`, exit 0
+
+### Verification
+
+- Daemon reports `v0.2.0-57-g1dab856`; 38/38 devices; gate
+  `default=ENFORCE max_tier=GREEN overrides=0 evidence_required=true`;
+  detached Ed25519 chain signing enabled, key_id `c1104805e1044d63a0c531eb7a025e68`.
+- Full autopilot cycle at 05:30:01: 12 observations, chain head
+  `autopilot:2026-09-05` seq 791 -> 803.
+- No append refusals since the restart.
+- The node's per-cycle output is **identical before and after** — 12
+  observations, 17 alerts on every cycle from 05:00 through 05:30 — so the
+  48-commit jump changed nothing operationally here. Those 17 alerts are a
+  standing defect, not a deploy artifact: the battery names `librenms-lab`,
+  which is not in the rendered `devices.json` (grep count: 0), the same shape
+  as virp-lab's `virp-node2-peer`.
+
+Note for whoever updates this file next: the section header above still says
+this node's only device is `pve-lab`. It has had 38 devices since at least
+2026-09-04. Left uncorrected in place, per this file's append-only rule.
 
 ## 2026-08-12 23:53 UTC — Proxmox classifier widening + BLACK never-class
 
