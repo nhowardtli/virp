@@ -20,6 +20,13 @@ sys.path.insert(0, "/home/nhoward/virp/tacacs")
 from console import Console
 import virp_tacacs_reconcile as rc
 
+# Only THIS console session counts. The gate's watchdog runs `show clock`
+# as virp-ro on a vty every few seconds, which made almost every capture
+# AMBIGUOUS -- correctly, since the window really did contain someone
+# else's command. Filtering by console port makes the window exclusive
+# without weakening the refuse-to-guess rule.
+CONSOLE_PORT = "tty0"
+
 EXEC_CMDS = [
     "show version", "sh version", "sho ver", "show ver",
     "show ip interface brief", "sh ip int br", "show ip int brief",
@@ -36,16 +43,51 @@ EXEC_CMDS = [
     "show   ip    route",
     "show file systems", "show logging",
 ]
+# CONFIG-MODE probes run ONLY against a throwaway loopback.
+#
+# The first version of this list included `shutdown`, `no ip address` and
+# `interface GigabitEthernet0/0`. It ran them on R1's MANAGEMENT
+# interface, took the lab link down mid-capture, and every command after
+# that point recorded "no accounting record" -- because the router could
+# no longer reach the accounting server. R1 needed its address put back
+# by hand from the console.
+#
+# A corpus builder types commands for a living. It must not be able to
+# type one that removes the path its own evidence travels over.
+CORPUS_IF = "Loopback301"
 CONFIG_CMDS = [
-    "interface Loopback301", "interface Loopback 301", "int lo301",
-    "interface GigabitEthernet0/0", "int gi0/0",
+    "interface %s" % CORPUS_IF, "interface Loopback 301", "int lo301",
     "description CORPUS-TEST", "no description",
-    "no shutdown", "shutdown",
     "ip address 10.30.1.1 255.255.255.255", "no ip address",
+    "shutdown", "no shutdown",
     "do show clock", "do sh ver",
     "logging buffered 16384",
-    "no logging console",
 ]
+
+# Destructive verbs are refused in ANY mode.
+FORBIDDEN_ANYWHERE = ("reload", "write erase", "erase ", "format ")
+
+# The management interface may be READ (a `show` is harmless and is a
+# useful corpus row) but never CONFIGURED. That distinction is the whole
+# lesson: the first version configured it.
+MGMT_IF_TOKENS = ("gigabitethernet0/0", "gi0/0")
+
+
+def _assert_safe(exec_cmds, config_cmds):
+    for c in exec_cmds + config_cmds:
+        low = c.lower()
+        for bad in FORBIDDEN_ANYWHERE:
+            if bad in low:
+                raise SystemExit("corpus command %r is destructive (%r); "
+                                 "refusing to run" % (c, bad))
+    for c in config_cmds:
+        low = c.lower()
+        for bad in MGMT_IF_TOKENS:
+            if bad in low:
+                raise SystemExit(
+                    "corpus CONFIG command %r targets the management "
+                    "interface, which carries this tool's own evidence; "
+                    "refusing to run" % c)
 
 
 def receipts_since(seq_after):
@@ -64,6 +106,8 @@ def receipts_since(seq_after):
         try:
             b = json.loads(content)
         except ValueError:
+            continue
+        if b.get("port") != CONSOLE_PORT:
             continue
         cmd = None
         for a in b.get("args", []):
@@ -86,6 +130,7 @@ def max_seq():
 
 
 def main():
+    _assert_safe(EXEC_CMDS, CONFIG_CMDS)
     c = Console(5000)
     c.send("terminal length 0", 1.5)
     entries = []
@@ -125,13 +170,14 @@ def main():
     for cmd in CONFIG_CMDS:
         capture(cmd, "config")
     c.run("end", 2)
-    c.run("no interface Loopback301", 2)
+    c.run("no interface %s" % CORPUS_IF, 2)
     c.close()
 
     corpus = {
         "ios_version": "15.2(4)M7",
         "platform": "Cisco 7206VXR (NPE400), C7200-ADVENTERPRISEK9-M",
         "device": "R1",
+        "captured_on_port": CONSOLE_PORT,
         "captured_utc_ns": time.time_ns(),
         "note": ("`accounted_cmd` is what IOS put in the accounting cmd= "
                  "field for the typed string. Ground truth; the "

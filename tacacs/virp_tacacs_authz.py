@@ -200,6 +200,153 @@ def command_spellings(command):
     return sorted(out)
 
 
+_CORPUS_PATH = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "tests", "fixtures",
+    "ios_respelling_corpus.json")
+
+_TABLE = None
+
+
+def _load_table(path=None):
+    """Token expansion table, DERIVED FROM THE ROUTER.
+
+    Built by aligning each corpus row's typed tokens with the tokens IOS
+    actually accounted. Nothing here is typed from memory of IOS: if the
+    router was never observed expanding a token, the table does not claim
+    to know it.
+    """
+    global _TABLE
+    if _TABLE is not None and path is None:
+        return _TABLE
+    import json as _json
+    tok, verbs, bigram = {}, set(), {}
+    try:
+        with open(path or _CORPUS_PATH) as f:
+            corpus = _json.load(f)
+    except OSError:
+        corpus = {"entries": []}
+    for e in corpus.get("entries", []):
+        acct = e.get("accounted_cmd")
+        if not acct:
+            continue
+        typed = _pre_normalise(e["typed"]).split()
+        got = acct[:-4].strip().split() if acct.endswith("<cr>") \
+            else acct.split()
+        if not typed or not got:
+            continue
+        verbs.add(got[0].lower())
+        if len(typed) == len(got):
+            for i, (a, b) in enumerate(zip(typed, got)):
+                if a.lower() != b.lower() or a != b:
+                    tok[a.lower()] = b
+                    # MEASURED: `int` expands to `interfaces` after
+                    # `show` and to `interface` in config mode. A
+                    # context-free table cannot hold both, so the
+                    # preceding token is part of the key.
+                    prev = typed[i - 1].lower() if i else ""
+                    bigram[(prev, a.lower())] = b
+        elif len(got) == len(typed) + 1:
+            # IOS split an interface unit off its type name, so the two
+            # token sequences are the same up to the split point and
+            # offset by one after it. Aligning naively with zip() pairs
+            # the wrong tokens and silently learns nothing -- which is
+            # how `int` -> `interfaces` (exec) was missed while
+            # `int` -> `interface` (config) was learned.
+            split_at = None
+            for i, a in enumerate(typed):
+                m = _UNIT_SPLIT.match(a)
+                if m and i + 1 < len(got) and got[i + 1] == m.group(2):
+                    split_at = i
+                    break
+            if split_at is None:
+                continue
+            pairs = [(typed[i], got[i]) for i in range(split_at)]
+            pairs.append((typed[split_at], got[split_at]))   # type name
+            for i in range(split_at + 1, len(typed)):
+                pairs.append((typed[i], got[i + 1]))
+            for i, (a, b) in enumerate(pairs):
+                if a == b:
+                    continue
+                m = _UNIT_SPLIT.match(a)
+                key = m.group(1).lower() if (m and i == split_at) else a.lower()
+                tok[key] = b
+                prev = typed[i - 1].lower() if i else ""
+                bigram[(prev, key)] = b
+    table = {"tokens": tok, "verbs": verbs, "bigrams": bigram}
+    if path is None:
+        _TABLE = table
+    return table
+
+
+def _pre_normalise(text):
+    """The shape-only steps, before any expansion.
+
+    All four measured on the router:
+      - trailing " <cr>" dropped;
+      - everything from `;` onward TRUNCATED (IOS discards it, and never
+        asks about it);
+      - everything from `|` onward STRIPPED (the output filter never
+        reaches the accounting or authorization record);
+      - whitespace runs collapsed, case lowered.
+    """
+    t = (text or "").replace("\r", "").strip()
+    if t.endswith("<cr>"):
+        t = t[:-4]
+    for sep in (";", "|"):
+        i = t.find(sep)
+        if i >= 0:
+            t = t[:i]
+    return " ".join(t.lower().split())
+
+
+def ios_canonical(text, table=None):
+    """Approved text -> the exact string IOS accounts and authorizes.
+
+    Raises CanonicalizationError rather than passing an unrecognised verb
+    through. A passthrough would put a string in the policy that the
+    router will never send, which denies approved work while looking like
+    the control working.
+    """
+    tbl = table or _load_table()
+    base = _pre_normalise(text)
+    if not base:
+        raise CanonicalizationError("empty command after normalisation: %r"
+                                    % text)
+    toks = base.split()
+
+    verb = tbl["tokens"].get(toks[0], toks[0]).lower()
+    if tbl["verbs"] and verb not in tbl["verbs"]:
+        raise CanonicalizationError(
+            "verb %r is not in the corpus-derived table (%d verbs known); "
+            "the router has never been observed accounting it, so its "
+            "canonical form is unknown" % (toks[0], len(tbl["verbs"])))
+
+    out = []
+    for idx, t in enumerate(toks):
+        prev = toks[idx - 1].lower() if idx else ""
+        rep = tbl.get("bigrams", {}).get((prev, t))
+        if rep is None:
+            rep = tbl["tokens"].get(t)
+        if rep is None:
+            out.append(t)
+            continue
+        m = _UNIT_SPLIT.match(t)
+        out.append(rep)
+        if m and not _UNIT_SPLIT.match(rep):
+            out.append(m.group(2))              # unit split off by IOS
+    # A unit typed adjacent to a known interface type, e.g. "Loopback301"
+    # where the table knows "loopback301" only as part of a longer row.
+    final = []
+    for t in out:
+        m = _UNIT_SPLIT.match(t)
+        if m and m.group(1).lower() in tbl["tokens"]:
+            final.append(tbl["tokens"][m.group(1).lower()])
+            final.append(m.group(2))
+        else:
+            final.append(t)
+    return " ".join(final)
+
+
 def _grant_matches(g, device, command):
     if g.get("device") != device:
         return False

@@ -36,6 +36,11 @@ from virp_tacacs_recv import (ARTIFACT_TYPE, canonical_bytes,
                               chain_append_evidence, producer_load_sk,
                               producer_sign)
 
+import virp_tacacs_authz as _az
+
+# 2c: same function as the compiler. See virp_tacacs_policy.py.
+canonical_for_match = _az.ios_canonical
+
 SCHEMA = "tacacs_reconciliation/1"
 ACCT_SCHEMA = "tacacs_accounting/1"
 

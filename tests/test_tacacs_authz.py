@@ -1340,14 +1340,22 @@ class TestIosCanonicalizerAgainstCorpus(unittest.TestCase):
         for e in c["entries"]:
             if not e.get("accounted_cmd"):
                 continue          # nothing was accounted; not a target
+            # The corpus records IOS's RAW accounting string, which
+            # carries a literal trailing " <cr>". Both the accounting
+            # reconciler and the authorization server strip that marker
+            # before matching, so the normal form both paths compare on
+            # is the stripped one. Comparing against the raw string would
+            # be testing the canonicalizer against a form nothing uses.
+            want = e["accounted_cmd"]
+            if want.endswith("<cr>"):
+                want = want[:-4].strip()
             try:
                 got = az.ios_canonical(e["typed"])
             except az.CanonicalizationError as exc:
-                misses.append((e["typed"], e["accounted_cmd"],
-                               "ERROR: %s" % exc))
+                misses.append((e["typed"], want, "ERROR: %s" % exc))
                 continue
-            if got != e["accounted_cmd"]:
-                misses.append((e["typed"], e["accounted_cmd"], got))
+            if got != want:
+                misses.append((e["typed"], want, got))
         self.assertEqual(misses, [], "canonicalizer disagrees with IOS:\n" +
                          "\n".join("  typed=%r ios=%r got=%r" % m
                                    for m in misses[:15]))
@@ -1362,3 +1370,63 @@ class TestIosCanonicalizerAgainstCorpus(unittest.TestCase):
         import virp_tacacs_reconcile as rc
         self.assertIs(pol.canonical_for_policy, az.ios_canonical)
         self.assertIs(rc.canonical_for_match, az.ios_canonical)
+
+
+class TestUnrenderableApprovalText(unittest.TestCase):
+    """2d: an approval whose text IOS will silently rewrite must not be
+    rendered at all.
+
+    IOS truncates at `;` and strips everything after `|`. So an approval
+    for `show clock ; reload` canonicalizes to `show clock` -- and the
+    approver believes they authorized something the router will never
+    even be asked about. Rendering that grant would mean the approval
+    text and the granted text say different things, with the difference
+    invisible on the report face.
+
+    Refusing is the only honest option: the approver must re-approve the
+    command they actually meant."""
+
+    def _appr(self, cmd):
+        return {"approval_id": "a1", "device": "R1", "command": cmd,
+                "ttl_ns": 300 * SEC, "issued_utc_ns": NOW,
+                "signature_verified": True}
+
+    def test_semicolon_is_refused(self):
+        grants, refusals = pol.compile_grants([self._appr("show clock ; reload")],
+                                              now_ns=NOW)
+        self.assertEqual(grants, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn(";", refusals[0]["reason"])
+
+    def test_pipe_is_refused(self):
+        grants, refusals = pol.compile_grants(
+            [self._appr("show running-config | include hostname")], now_ns=NOW)
+        self.assertEqual(grants, [])
+        self.assertEqual(len(refusals), 1)
+
+    def test_newline_is_refused(self):
+        grants, refusals = pol.compile_grants(
+            [self._appr("show clock\nreload")], now_ns=NOW)
+        self.assertEqual(grants, [])
+        self.assertEqual(len(refusals), 1)
+
+    def test_a_clean_command_still_renders(self):
+        grants, refusals = pol.compile_grants([self._appr("show ip route")],
+                                              now_ns=NOW)
+        self.assertEqual(refusals, [])
+        self.assertEqual([g["command"] for g in grants], ["show ip route"])
+
+    def test_refusal_names_the_reason_and_the_approval(self):
+        _, refusals = pol.compile_grants([self._appr("show clock ; reload")],
+                                         now_ns=NOW)
+        self.assertEqual(refusals[0]["approval_id"], "a1")
+        self.assertIn("rewrite", refusals[0]["reason"].lower())
+
+    def test_render_refused_record_shape(self):
+        _, refusals = pol.compile_grants([self._appr("show clock ; reload")],
+                                         now_ns=NOW)
+        rec = pol.build_render_refused_record("R1", refusals)
+        self.assertEqual(rec["schema"], pol.RENDER_REFUSED_SCHEMA)
+        self.assertEqual(rec["refused_count"], 1)
+        self.assertEqual(rec["refusals"][0]["approval_id"], "a1")
+        self.assertIn("beside", rec["presentation"])

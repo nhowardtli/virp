@@ -28,10 +28,42 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from virp_tacacs_authz import (canonical_command, command_spellings,
-                               SPELLING_RULE)
+                               ios_canonical, SPELLING_RULE)
+
+# 2c: the compiler and the reconciler call the SAME function. If these
+# two ever diverge, a command is authorized under one spelling and
+# reconciled under another, and both records look correct in isolation.
+canonical_for_policy = ios_canonical
 
 SCHEMA = "tacacs_authz_policy/1"
 RENDERED_SCHEMA = "tacacs_authz_policy_rendered/1"
+RENDER_REFUSED_SCHEMA = "tacacs_authz_policy_render_refused/1"
+
+# Text IOS will silently rewrite before it ever reaches authorization.
+# An approval containing any of these means the approver believes they
+# authorized something the router will never be asked about, so it is
+# refused rather than rendered under a different meaning.
+UNRENDERABLE = (
+    (";", "IOS TRUNCATES at ';' -- everything after it is discarded "
+          "before authorization and before execution"),
+    ("|", "IOS STRIPS the output filter after '|' -- it never reaches "
+          "the authorization or accounting record"),
+    ("\n", "a newline is more than one command; one approval grants one "
+            "command"),
+    ("\r", "a carriage return is more than one command; one approval "
+            "grants one command"),
+)
+
+
+def unrenderable_reason(command):
+    """Why this approval text cannot be rendered, or None."""
+    for ch, why in UNRENDERABLE:
+        if ch in (command or ""):
+            return ("approval text contains %r, which IOS would rewrite "
+                    "before authorizing: %s. Rendering it would grant a "
+                    "different command than the one approved. Re-approve "
+                    "the command actually intended." % (ch, why))
+    return None
 
 # The authorization server's own AAA identifiers on the router.
 AUTHZ_SERVER_NAME = "VIRPAZ"
@@ -163,7 +195,13 @@ def compile_grants(approvals, now_ns, default_uses=1):
                              a.get("trust_basis"))})
             continue
 
-        cmd = canonical_command(a.get("command"))
+        raw = a.get("command")
+        bad = unrenderable_reason(raw)
+        if bad:
+            refusals.append({"approval_id": aid, "reason": bad})
+            continue
+
+        cmd = canonical_command(raw)
         if not cmd:
             refusals.append({"approval_id": aid,
                              "reason": "approval carries no command"})
@@ -519,3 +557,23 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def build_render_refused_record(device, refusals):
+    """The record that says what did NOT make it into the policy.
+
+    An approval that silently failed to render is a silent denial of
+    approved work and is indistinguishable, from the router's side, from
+    an attack. This makes the absence explicit and auditable."""
+    return {
+        "schema": RENDER_REFUSED_SCHEMA,
+        "device": device,
+        "refused_utc_ns": time.time_ns(),
+        "refused_count": len(refusals),
+        "refusals": refusals,
+        "presentation": (
+            "CLAIM about approvals NOT rendered. Render beside the "
+            "verdict ladder, never inside it. A refusal here is not a "
+            "cryptographic failure; it is the compiler declining to "
+            "grant a command different from the one approved."),
+    }
