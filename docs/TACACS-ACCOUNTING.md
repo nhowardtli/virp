@@ -470,6 +470,92 @@ the second server, and the run is cited here.
 
 ---
 
+## 6a. Transport table — what else could carry device evidence
+
+TACACS+ accounting is one transport. Others are possible and are NOT
+built; naming them here with their boundary difference keeps a reader
+from assuming this design generalises for free.
+
+| transport | record | status | boundary difference from `tacacs_accounting/1` |
+|---|---|---|---|
+| TACACS+ accounting (RFC 8907) | `tacacs_accounting/1` | **BUILT** (lab) | TCP; body obfuscated under a shared secret, so receipt authenticates possession of that secret; the record is a PROTOCOL EXCHANGE the device initiated for the purpose of being accounted |
+| Syslog | `syslog_event/1` | **UNBUILT** | **UDP** — no connection, no delivery signal, no ordering; a lost message is indistinguishable from one never sent. **Unauthenticated unless RFC 5425 TLS is configured**, so with plain syslog a receipt authenticates *nothing* — anyone who can reach the port can write any message claiming any source. And the content is a **device LOG ENTRY, not a protocol exchange**: it is whatever the device chose to write for human reading, subject to logging level, rate limiting and message-format changes between releases, rather than a structured record the device emitted specifically to be accounted |
+
+**Why `syslog_event/1` is not simply the same design with a different
+parser.** Three of its properties break assumptions this design relies
+on, and each would need answering before a record type could be honest:
+
+- **No secret, no possession claim.** `tacacs_accounting/1` says the
+  sender held the configured secret. A plain-syslog record could not say
+  even that, and its `client_identity_source` would need a value weaker
+  than `configured_by_source_address` — the source address of a UDP
+  datagram is trivially forged.
+- **Loss is silent and unbounded.** The `coverage` axis here can say
+  `INTERRUPTED` because the receiver knows when it was listening and TCP
+  tells the device when delivery failed. Over UDP neither end knows, so a
+  gap has no cause the record can evidence.
+- **No START/STOP pairing.** Reconciliation's pair vocabulary
+  (`START_WITHOUT_STOP`, `STOP_WITHOUT_START`) has no syslog equivalent;
+  a log line is a point, not an interval.
+
+`UNBUILT` is a positive statement, on the same principle as `UNSIGNED`
+in the camera driver: it means *we considered this and have not built
+it*, not that it is impossible and not that it is coming.
+
+---
+
+## 6b. Lab rule: isolated bridge only
+
+**Rule: a VIRP lab is bridged to a host-only segment and NEVER to a
+physical NIC.** In this repo that means `virbr0` (192.168.122.0/24). Not
+`enp0s31f6`, not `wlp0s20f3`, not a USB adapter — not even
+"temporarily", and not when the isolated path would need one more
+privileged command than is already granted.
+
+### What happened on 2026-09-05 when it wasn't
+
+An earlier attempt at this same proof bridged three GNS3 c7200s to the
+laptop's physical NIC, because the isolated option needed one `ip link
+set virbr0 up` and that felt like the bigger obstacle. It was not. What
+followed, in order:
+
+1. **Duplicate addresses on a production segment.** A second, unrelated
+   GNS3 project (35 routers) was started on the same carrier, using the
+   same 10.0.0.50-.52 the lab routers had. Two live R1s, two R2s, two R3s
+   answered ARP on the house LAN.
+2. **ARP flux took out the receiver's own address.** The host was
+   multi-homed on one subnet (wifi held the receiver address; the wired
+   NIC was the bridge carrier). With `arp_ignore=0` the kernel answers ARP
+   for any local address on ANY interface, so the wired NIC began
+   answering for the receiver's address with its own MAC. Replies then
+   left via the physical switch instead of the bridge, and reached
+   nothing. Accounting delivery went to zero with every component
+   apparently healthy.
+3. **The house network went down.** Two GNS3 clouds bridging two switch
+   fabrics onto one physical NIC, with 38 emulated routers between them.
+   The operator lost internet and pulled the ethernet link to stop it.
+
+Nothing in that sequence was a TACACS+ problem, a VIRP problem, or a
+Cisco problem. All of it came from one decision: putting a lab on a real
+network.
+
+### Why the isolated bridge is not merely safer, but more correct
+
+It also removes a whole class of evidence defect. On `virbr0` the host
+has exactly ONE interface on the lab subnet, so the ARP ambiguity in (2)
+cannot arise, and lab traffic cannot be perturbed by — or perturb —
+anything outside. A missing accounting record on an isolated segment is
+therefore attributable; on a shared one it is not, and this design's
+entire value is in the difference between "the gap has a cause we can
+evidence" and "something, somewhere, dropped it."
+
+**If the isolated path needs a privileged step that is not already
+granted, that is a blocker to report, not an obstacle to route around.**
+The physical bridge was the cheaper-looking route and cost an evening
+and the household's connectivity.
+
+---
+
 ## 7. Lab proof
 
 Three GNS3 routers, a stub standing in for ISE's role as the second
