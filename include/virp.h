@@ -586,7 +586,20 @@ typedef enum {
  *
  * Rejected: all control bytes (< 0x20, including newline, carriage
  * return and tab) and DEL; the CLI/shell separators ';' '|' '&' '`';
- * and the shell expansions "$(" and "${".
+ * the redirections '>' and '<'; and the shell expansions "$(" and "${".
+ *
+ * The redirections are here for a different reason than the rest. They
+ * start no second command, so the "only the first command is tiered"
+ * argument above does not reach them. They move bytes instead: a read-
+ * classified command with '>' on it is an arbitrary write, and '<' feeds
+ * a chosen file into one. Same conclusion, different route.
+ *
+ * NOT rejected by exception: nothing. Every vendor gets the same answer,
+ * including the pipe — VIRP has no output-filter allowlist, so
+ * "show running-config | include hostname" is refused on Cisco too.
+ * That is stricter than the device would be, and deliberately so: a
+ * per-vendor allowlist is a per-vendor hole, and the exemption it would
+ * need has not been asked for by anything in the tree.
  *
  * Returns 0 when `cmd` is a single separator-free command, else -1. When
  * `why` is non-NULL it receives a human-readable reason naming the
