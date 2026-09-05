@@ -784,3 +784,37 @@ class TestConfigModePrerequisite(unittest.TestCase):
         grants, _ = pol.compile_grants([a1, a2], now_ns=NOW)
         ct = [g for g in grants if g["command"] == "configure terminal"]
         self.assertEqual(len(ct), 1, "exactly one prerequisite grant")
+
+
+class TestGateIdentity(unittest.TestCase):
+    """Phase 3: the gate's STEADY STATE identity is virp-ro.
+
+    aiops-svc is a privilege-15 account with no grants and no read
+    allowlist, so under per-command authorization every gate command --
+    including the watchdog's `show clock` -- is denied. The gate must
+    connect as virp-ro, whose reads are allowlisted and whose writes are
+    not."""
+
+    LAB_DEVICES = os.path.join(
+        "/tmp/claude-1000/-home-nhoward-virp",
+        "14778f44-c2e6-423e-a169-796579cee5fc",
+        "scratchpad", "lab2", "devices.json")
+
+    def _devices(self):
+        if not os.path.exists(self.LAB_DEVICES):
+            self.skipTest("lab devices.json not present on this host")
+        import json
+        with open(self.LAB_DEVICES) as f:
+            return json.load(f)["devices"]
+
+    def test_gate_connects_as_virp_ro(self):
+        for d in self._devices():
+            self.assertEqual(d["username"], "virp-ro",
+                             "%s: gate must use the read-only identity"
+                             % d["hostname"])
+
+    def test_watchdog_probe_is_in_the_ro_allowlist(self):
+        """The driver's liveness probe is `show clock`
+        (driver_cisco.c). If it is not permitted for virp-ro the gate
+        marks every device down and stops working."""
+        self.assertIn("show clock", az.RO_PERMITTED)
