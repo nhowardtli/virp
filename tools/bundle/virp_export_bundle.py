@@ -35,6 +35,22 @@ import os
 import re
 import sqlite3
 import sys
+import time
+
+class InconsistentSnapshot(RuntimeError):
+    """The entries and the head disagree about where the chain ends.
+
+    Found by verifying a bundle exported from a LIVE chain: entries and
+    heads were read in two separate queries, the daemon appended between
+    them, and the exported head named a sequence the exported entries did
+    not contain. virp-verify then reported head_commitment FAILED -- a
+    healthy chain producing a failing bundle, with the blame landing on
+    the chain rather than on the tool that sliced it.
+
+    An exporter must be consistent or refuse. Writing a bundle it knows
+    disagrees with itself would be manufacturing evidence of a defect
+    that does not exist."""
+
 
 BUNDLE_VERSION = "docket-bundle/0.1"
 CHAIN_FORMAT = "v1"
@@ -74,8 +90,24 @@ def has_column(conn, table, col):
                conn.execute("PRAGMA table_info(%s)" % table).fetchall())
 
 
-def export(db_path, out_dir, producer):
+def export(db_path, out_dir, producer, retries=3):
+    """Export, retrying on a racing writer, refusing if it cannot get a
+    consistent slice."""
+    last_err = None
+    for _ in range(max(1, retries)):
+        try:
+            return _export_once(db_path, out_dir, producer)
+        except InconsistentSnapshot as e:
+            last_err = e
+            time.sleep(0.75)
+    raise last_err
+
+
+def _export_once(db_path, out_dir, producer):
     conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    # One transaction for entries AND heads. Without this the two reads
+    # can straddle an append.
+    conn.execute("BEGIN DEFERRED")
     ent_sig = has_column(conn, "chain_entries", "chain_sig")
     head_sig = has_column(conn, "chain_heads", "head_sig")
 
@@ -128,6 +160,19 @@ def export(db_path, out_dir, producer):
 
     # Only bodies an entry actually references may be carried; strict
     # reading rejects unattested content.
+    # The head must not name a sequence the entries do not contain.
+    for sid, h in heads.items():
+        entries = sessions.get(sid) or []
+        if not entries:
+            continue
+        last = max(e["sequence"] for e in entries)
+        if int(h.get("last_sequence", -1)) > last:
+            conn.close()
+            raise InconsistentSnapshot(
+                "session %r: head names last_sequence %s but the exported "
+                "entries stop at %s -- a writer appended during the read"
+                % (sid, h.get("last_sequence"), last))
+
     referenced = {e["artifact_hash"] for es in sessions.values() for e in es}
     bodies = {}
     for ah, content in conn.execute(

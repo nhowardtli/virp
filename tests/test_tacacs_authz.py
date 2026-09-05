@@ -1451,3 +1451,84 @@ class TestUnrenderableApprovalText(unittest.TestCase):
         self.assertEqual(rec["refused_count"], 1)
         self.assertEqual(rec["refusals"][0]["approval_id"], "a1")
         self.assertIn("beside", rec["presentation"])
+
+
+class TestBundleExportConsistency(unittest.TestCase):
+    """FOUND by verifying a bundle exported from a LIVE chain.
+
+    The exporter read `chain_entries` and `chain_heads` in two separate
+    queries. With the authorization daemon still appending, an entry
+    landed between them, so the exported head named `last_sequence 3492`
+    while the exported entries stopped at 3491, and virp-verify reported
+
+        head_commitment FAILED — head commits to last_sequence 3492
+        but last entry is 3491
+
+    A healthy chain produced a FAILING bundle, and the blame would land
+    on the chain rather than on the tool that sliced it inconsistently.
+
+    The export must either be consistent or refuse. It must never write a
+    bundle it knows disagrees with itself."""
+
+    def _db(self, head_seq, last_entry_seq):
+        import sqlite3, hashlib as _h, json as _json, tempfile
+        d = tempfile.mkdtemp()
+        db = os.path.join(d, "c.db")
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE chain_entries (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " session_id TEXT, sequence INTEGER, chain_entry_hash TEXT,"
+            " previous_entry_hash TEXT, timestamp_ns INTEGER,"
+            " monotonic_ns INTEGER, artifact_type TEXT, artifact_id TEXT,"
+            " artifact_hash TEXT, artifact_hash_alg TEXT,"
+            " artifact_schema_version TEXT, signer_node_id INTEGER,"
+            " signer_org_id TEXT, chain_hmac TEXT);"
+            "CREATE TABLE artifacts (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " artifact_id TEXT, artifact_type TEXT, artifact_content TEXT,"
+            " artifact_hash TEXT, session_id TEXT, created_at_ns INTEGER);"
+            "CREATE TABLE chain_heads (session_id TEXT PRIMARY KEY,"
+            " last_sequence INTEGER, last_entry_hash TEXT, head_hmac TEXT,"
+            " updated_at_ns INTEGER);")
+        for seq in range(last_entry_seq + 1):
+            body = _json.dumps({"n": seq}, sort_keys=True,
+                               separators=(",", ":"))
+            h = _h.sha256(body.encode()).hexdigest()
+            conn.execute(
+                "INSERT INTO chain_entries (session_id,sequence,"
+                "chain_entry_hash,previous_entry_hash,timestamp_ns,"
+                "monotonic_ns,artifact_type,artifact_id,artifact_hash,"
+                "artifact_hash_alg,artifact_schema_version,signer_node_id,"
+                "signer_org_id,chain_hmac) VALUES "
+                "('s',?,?,'p',1,1,'evidence_item',?,?,'sha256','1',1,"
+                "'local','hm')", (seq, "e%d" % seq, "a%d" % seq, h))
+            conn.execute(
+                "INSERT INTO artifacts (artifact_id,artifact_type,"
+                "artifact_content,artifact_hash,session_id,created_at_ns) "
+                "VALUES (?,'evidence_item',?,?,'s',1)",
+                ("a%d" % seq, body, h))
+        conn.execute("INSERT INTO chain_heads VALUES ('s',?,?,'hh',1)",
+                     (head_seq, "e%d" % head_seq))
+        conn.commit(); conn.close()
+        return db, d
+
+    def test_consistent_chain_exports(self):
+        import importlib.util as _u
+        spec = _u.spec_from_file_location(
+            "vb", os.path.join(ROOT, "tools", "bundle",
+                               "virp_export_bundle.py"))
+        vb = _u.module_from_spec(spec); spec.loader.exec_module(vb)
+        db, d = self._db(head_seq=3, last_entry_seq=3)
+        out = os.path.join(d, "bundle")
+        r = vb.export(db, out, "test")
+        self.assertEqual(r["entries"], 4)
+
+    def test_head_ahead_of_entries_is_REFUSED_not_written(self):
+        import importlib.util as _u
+        spec = _u.spec_from_file_location(
+            "vb2", os.path.join(ROOT, "tools", "bundle",
+                                "virp_export_bundle.py"))
+        vb = _u.module_from_spec(spec); spec.loader.exec_module(vb)
+        db, d = self._db(head_seq=4, last_entry_seq=3)
+        out = os.path.join(d, "bundle")
+        with self.assertRaises(vb.InconsistentSnapshot):
+            vb.export(db, out, "test")
