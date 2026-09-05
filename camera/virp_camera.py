@@ -2768,10 +2768,19 @@ def sftp_ship(spool_target, ssh_key=None, extra_opts=None,
         precisely how the validator output ended up capture-host-only and
         SEGMENT PAYLOAD ended up permanently ABSENT on the O-node."""
         rd = "/incoming"
-        puts = ["put %s %s/%s.mp4.part" % (seg_file, rd, name),
-                "put %s %s/%s.body.part" % (body_file, rd, name)]
-        renames = ["rename %s/%s.mp4.part %s/%s.mp4" % (rd, name, rd, name),
-                   "rename %s/%s.body.part %s/%s.body" % (rd, name, rd, name)]
+        # seg_file=None is a RECORD-ONLY job (camera_retention/1): the
+        # body IS the whole evidence, so only body + marker travel. The
+        # submitter's schema gate holds the other side of this contract —
+        # a camera_segment job stays a pair, and a record-only job of any
+        # other schema is refused there, not silently accepted here.
+        puts, renames = [], []
+        if seg_file is not None:
+            puts.append("put %s %s/%s.mp4.part" % (seg_file, rd, name))
+            renames.append("rename %s/%s.mp4.part %s/%s.mp4"
+                           % (rd, name, rd, name))
+        puts.append("put %s %s/%s.body.part" % (body_file, rd, name))
+        renames.append("rename %s/%s.body.part %s/%s.body"
+                       % (rd, name, rd, name))
         for local, suffix in (cited or []):
             puts.append("put %s %s/%s.%s.part" % (local, rd, name, suffix))
             renames.append("rename %s/%s.%s.part %s/%s.%s"
@@ -3450,13 +3459,27 @@ def _submit_spool_locked(cfg, once, send, incoming, done_dir):
             seg = os.path.join(incoming, name + ".mp4")
             body = os.path.join(incoming, name + ".body")
             marker = os.path.join(incoming, m)
-            if not (os.path.exists(seg) and os.path.exists(body)):
+            if not os.path.exists(body):
                 continue                     # marker raced ahead; wait
-            try:
-                landed = submit_one(cfg, name, seg, body, send=send)
-            except (ValueError, OSError) as e:
-                sys.stderr.write("submit %s: %s\n" % (name, e))
-                continue                     # malformed; leave for a human
+            if not os.path.exists(seg):
+                # No .mp4 will ever come for a RECORD-ONLY job; for a
+                # segment job the .mp4 may still be racing the marker.
+                # The body's own schema declaration decides which this
+                # is — the gate never infers a job's shape from which
+                # files happen to be missing.
+                if _peek_schema(body) != SCHEMA_RETENTION:
+                    continue                 # segment racing ahead; wait
+                try:
+                    landed = submit_record_only(cfg, name, body, send=send)
+                except (ValueError, OSError) as e:
+                    sys.stderr.write("submit %s: %s\n" % (name, e))
+                    continue                 # malformed; leave for a human
+            else:
+                try:
+                    landed = submit_one(cfg, name, seg, body, send=send)
+                except (ValueError, OSError) as e:
+                    sys.stderr.write("submit %s: %s\n" % (name, e))
+                    continue                 # malformed; leave for a human
             if landed:
                 # The cited sidecars move with the job. Moving only the
                 # segment and the body left every .validation.txt in
@@ -3481,6 +3504,403 @@ def _submit_spool_locked(cfg, once, send, incoming, done_dir):
             break
         time.sleep(cfg.get("interval", 1.0))
     return appended
+
+
+# ── Retention as a signed record (camera_retention/1) ──────────────────
+#
+# Deletion is the one thing this system does that LOOKS like the attack
+# it exists to catch, so nothing here deletes silently: every batch is
+# declared in a producer-signed, chain-appended camera_retention/1
+# record BEFORE any byte goes away — policy, camera, tier, and the exact
+# digests removed — so a later verifier can tell "absent by declared
+# policy" from "absent unexplained". (Docket does not grade that
+# distinction yet; camera/RETENTION.md carries the field set and the
+# proposed NotCarried reason for the Docket session that will.)
+#
+# camera_retention/1 is deliberately NOT a row in SCHEMA_TABLE: it is
+# not a capture record, carries no capture_policy and no sensor claim,
+# and must never be counted by the coverage grader as a segment. It has
+# its own frozen field set — the field set IS the schema, the same rule
+# as everywhere else — and its own sessions
+# (camera-retention:<camera_id>:<date>), so camera sessions stay pure
+# camera_segment streams.
+#
+# ORDER IS THE WHOLE DESIGN. The record reaches the chain (or the spool,
+# which is a durable handoff to it) before the first unlink. A crash
+# after delivery re-runs from the journal and the body-keyed dedup makes
+# redelivery a no-op; a crash before delivery deletes nothing. At no
+# point do bytes disappear that no signed record declares.
+
+SCHEMA_RETENTION = "camera_retention/1"
+RETENTION_TIERS = ("capture-host", "spool")
+RETENTION_FIELDS = (
+    "schema", "camera_id", "tier", "policy_days", "deleted_at_utc_ns",
+    "removed", "removed_count", "removed_bytes",
+    "producer_key_id", "producer_sig",
+)
+RETENTION_ITEM_FIELDS = ("sha256", "kind", "byte_len")
+# Spool-job suffix -> what the record calls the file. Matched by
+# endswith, longest first, so "validation.txt" wins over "txt".
+RETENTION_KINDS = (
+    ("validation.txt", "validator_output"),
+    ("handoff.json", "handoff"),
+    ("leaf.der", "leaf_der"),
+    ("body", "record_body"),
+    ("done", "marker"),
+    ("mp4", "segment"),
+)
+RETENTION_KIND_OTHER = "other"
+RETENTION_KIND_NAMES = tuple(k for _, k in RETENTION_KINDS) + (RETENTION_KIND_OTHER,)
+RETENTION_JOURNAL = "retention-journal.json"
+_HEX = set("0123456789abcdef")
+
+
+def retention_kind(filename):
+    """What the record calls this file, from its suffix. Unknown
+    suffixes are "other", never skipped: a file this code deletes but
+    cannot classify still gets its digest declared."""
+    for suffix, kind in RETENTION_KINDS:
+        if filename.endswith("." + suffix):
+            return kind
+    return RETENTION_KIND_OTHER
+
+
+def retention_defect(body):
+    """Why this dict is not a valid camera_retention/1 body, or None.
+    An exact field-set match — the same rule as sensor_signature:
+    reading the fields we recognise and ignoring the rest is how a
+    record of an unexpected shape ends up inside a clean result."""
+    if not isinstance(body, dict):
+        return "retention body is not an object"
+    if body.get("schema") != SCHEMA_RETENTION:
+        return "schema is %r, not %s" % (body.get("schema"),
+                                         SCHEMA_RETENTION)
+    if set(body) != set(RETENTION_FIELDS):
+        return ("field set is not the %d fields %s defines"
+                % (len(RETENTION_FIELDS), SCHEMA_RETENTION))
+    if body["tier"] not in RETENTION_TIERS:
+        return "tier %r is not one of %s" % (body["tier"],
+                                             ", ".join(RETENTION_TIERS))
+    if not (isinstance(body["policy_days"], int)
+            and not isinstance(body["policy_days"], bool)
+            and body["policy_days"] > 0):
+        return "policy_days is not a positive integer"
+    if not (isinstance(body["deleted_at_utc_ns"], int)
+            and not isinstance(body["deleted_at_utc_ns"], bool)
+            and body["deleted_at_utc_ns"] > 0):
+        return "deleted_at_utc_ns is not a positive integer"
+    if not (isinstance(body["camera_id"], str) and body["camera_id"]):
+        return "camera_id is empty"
+    removed = body["removed"]
+    if not isinstance(removed, list) or not removed:
+        return ("removed is not a non-empty list — an empty batch "
+                "writes no record at all")
+    total = 0
+    for i, item in enumerate(removed):
+        if (not isinstance(item, dict)
+                or set(item) != set(RETENTION_ITEM_FIELDS)):
+            return ("removed[%d] is not the exact {sha256, kind, "
+                    "byte_len} triple" % i)
+        sha = item["sha256"]
+        if not (isinstance(sha, str) and len(sha) == 64
+                and set(sha) <= _HEX):
+            return "removed[%d].sha256 is not 64 lowercase hex chars" % i
+        if item["kind"] not in RETENTION_KIND_NAMES:
+            return "removed[%d].kind %r is not a known kind" % (
+                i, item["kind"])
+        if not (isinstance(item["byte_len"], int)
+                and not isinstance(item["byte_len"], bool)
+                and item["byte_len"] >= 0):
+            return "removed[%d].byte_len is not a non-negative integer" % i
+        total += item["byte_len"]
+    if body["removed_count"] != len(removed):
+        return ("removed_count %r != len(removed) %d — the count is a "
+                "claim, and it is wrong"
+                % (body["removed_count"], len(removed)))
+    if body["removed_bytes"] != total:
+        return ("removed_bytes %r != sum of byte_len %d"
+                % (body["removed_bytes"], total))
+    return None
+
+
+def build_retention_body(camera_id, tier, policy_days, deleted_at_ns,
+                         removed, key_id):
+    """The body WITHOUT producer_sig; producer_sign finishes it."""
+    return {
+        "schema": SCHEMA_RETENTION,
+        "camera_id": camera_id,
+        "tier": tier,
+        "policy_days": int(policy_days),
+        "deleted_at_utc_ns": int(deleted_at_ns),
+        "removed": removed,
+        "removed_count": len(removed),
+        "removed_bytes": sum(i["byte_len"] for i in removed),
+        "producer_key_id": key_id,
+    }
+
+
+def retention_session_for(camera_id, deleted_at_ns):
+    """Retention gets its OWN sessions, per camera per UTC day of the
+    deletion — camera:<id>:<date> sessions stay pure camera_segment."""
+    day = time.strftime("%Y-%m-%d", time.gmtime(deleted_at_ns / 1e9))
+    return "camera-retention:%s:%s" % (camera_id, day)
+
+
+def retention_artifact_id(body, chunk):
+    """Unique per chunk: one scan can write several records for one
+    camera (the daemon's artifact field caps a record's size), and two
+    records must never share an artifact_id."""
+    return "camret:%s:%s:%d:%d" % (body["camera_id"], body["tier"],
+                                   body["deleted_at_utc_ns"], chunk)
+
+
+def _peek_schema(body_path):
+    """The body's schema string, or None if the file does not parse.
+    The spool gate decides record-only vs segment-pair from the body's
+    own declaration, never from which files happen to be missing."""
+    try:
+        with open(body_path, "rb") as f:
+            b = json.loads(f.read())
+        return b.get("schema") if isinstance(b, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def submit_record_only(cfg, name, body_path, send=onode_send):
+    """Relay ONE record-only job (camera_retention/1) into the chain.
+    The producer's exact signed bytes go verbatim — the same rule as
+    submit_one — and validation refuses anything that is not a
+    well-formed retention record: a record-only path that accepted
+    arbitrary bodies would be a second, laxer schema gate."""
+    with open(body_path, "rb") as f:
+        body_bytes = f.read()
+    body = json.loads(body_bytes)            # must parse; bytes go verbatim
+    if not isinstance(body, dict) or body.get("schema") != SCHEMA_RETENTION:
+        raise ValueError("%s: record-only submit accepts %s bodies only, "
+                         "got %r" % (name, SCHEMA_RETENTION,
+                                     body.get("schema")
+                                     if isinstance(body, dict) else body))
+    defect = retention_defect(body)
+    if defect is not None:
+        raise ValueError("%s: %s" % (name, defect))
+
+    session_id = retention_session_for(body["camera_id"],
+                                       body["deleted_at_utc_ns"])
+    chunk = 0
+    m = re.search(r"\.retention\.\d+\.(\d+)$", name)
+    if m:
+        chunk = int(m.group(1))
+    artifact_id = retention_artifact_id(body, chunk)
+
+    art_dir = os.path.join(cfg["data_dir"], "artifacts")
+    os.makedirs(art_dir, mode=0o700, exist_ok=True)
+    body_sha = hashlib.sha256(body_bytes).hexdigest()
+    sidecar_path = os.path.join(art_dir, body_sha + ".json")
+    if os.path.exists(sidecar_path):
+        # The chain outranks a sidecar (same rule as submit_one): only a
+        # definite "not on chain" lets a local receipt be overruled.
+        on_chain = _on_chain(cfg.get("db"), body_sha)
+        if on_chain is None or on_chain:
+            print("skip %s: this exact retention record already attested "
+                  "(body %.16s…)" % (name, body_sha), flush=True)
+            return True
+        sys.stderr.write(
+            "warning: %s has a sidecar but body %.16s… is NOT on the "
+            "chain — a sidecar is not proof of membership; re-appending\n"
+            % (name, body_sha))
+    elif _on_chain(cfg.get("db"), body_sha):
+        sidecar = {
+            "artifact_id": artifact_id,
+            "session_id": session_id,
+            "body": body_bytes.decode("ascii"),
+            "body_sha256": body_sha,
+            "source_file": name + ".body",
+            "submitted_via": "record-only",
+            "note": "sidecar reconstructed: body already on chain "
+                    "(chain-keyed idempotency); receipt not retained",
+        }
+        with open(sidecar_path, "w") as f:
+            json.dump(sidecar, f, indent=1, sort_keys=True)
+            f.write("\n")
+        print("skip %s: body already on chain (%.16s…); sidecar "
+              "reconstructed" % (name, body_sha), flush=True)
+        return True
+
+    ok, receipt = chain_append_evidence(session_id, artifact_id,
+                                        body_bytes,
+                                        sock_path=cfg["sock"], send=send)
+    if not ok:
+        sys.stderr.write("chain refused %s: %s\n" % (name, receipt))
+        return False
+    sidecar = {
+        "artifact_id": artifact_id,
+        "session_id": session_id,
+        "body": body_bytes.decode("ascii"),
+        "body_sha256": body_sha,
+        "chain_receipt_b64": base64.b64encode(receipt).decode(),
+        "source_file": name + ".body",
+        "submitted_via": "record-only",
+    }
+    with open(sidecar_path, "w") as f:
+        json.dump(sidecar, f, indent=1, sort_keys=True)
+        f.write("\n")
+    print("appended retention record session=%s removed=%d bytes=%d"
+          % (session_id, body["removed_count"], body["removed_bytes"]),
+          flush=True)
+    return True
+
+
+def _camera_for_token(dir_path, token):
+    """camera_id for a job-name token, read from any .body that shares
+    it — the body's own claim, not a guess from the filename. None when
+    no body with that token parses."""
+    for n in sorted(os.listdir(dir_path)):
+        if n.startswith(token + ".") and n.endswith(".body"):
+            try:
+                with open(os.path.join(dir_path, n), "rb") as f:
+                    b = json.loads(f.read())
+                cam = b.get("camera_id")
+                if isinstance(cam, str) and cam:
+                    return cam
+            except (OSError, ValueError):
+                continue
+    return None
+
+
+def _retention_chunks(files_removed, limit):
+    """Greedy split of [(path, item)] into chunks whose eventual SIGNED
+    body stays under the daemon's artifact field. Deterministic: the
+    same input always chunks the same way, so a journal replay rebuilds
+    byte-identical bodies."""
+    # producer_sig adds ~145 canonical bytes; a fixed margin covers it
+    # plus every non-removed field at their largest plausible sizes.
+    margin = 600
+    chunks, cur, cur_len = [], [], 0
+    for path, item in files_removed:
+        item_len = len(canonical_bytes(item)) + 1
+        if cur and cur_len + item_len > limit - margin:
+            chunks.append(cur)
+            cur, cur_len = [], 0
+        cur.append((path, item))
+        cur_len += item_len
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def run_retention(cfg, deliver, now_ns=None, dry_run=False):
+    """One retention pass over cfg["dir"]: journal, deliver each chunk's
+    signed record, and only then delete that chunk's files. Returns the
+    number of files removed. A pass with a leftover journal resumes it
+    and scans nothing new: finish declaring what the last pass started
+    before naming more bytes for deletion."""
+    journal_path = os.path.join(cfg["data_dir"], RETENTION_JOURNAL)
+    journal = None
+    if os.path.exists(journal_path):
+        with open(journal_path) as f:
+            journal = json.load(f)
+        if dry_run:
+            print("retention dry-run: an interrupted journal is pending "
+                  "(%d chunk(s)); a real run resumes it before scanning "
+                  "anything new" % len(journal["chunks"]), flush=True)
+            return 0
+        sys.stderr.write("retention: resuming interrupted journal "
+                         "(%d chunk(s) left)\n" % len(journal["chunks"]))
+
+    if journal is None:
+        now = int(now_ns if now_ns is not None else time.time_ns())
+        cutoff = now - cfg["policy_days"] * 86400 * 10**9
+        groups = {}
+        for n in sorted(os.listdir(cfg["dir"])):
+            p = os.path.join(cfg["dir"], n)
+            if not os.path.isfile(p):
+                continue
+            if os.stat(p).st_mtime_ns >= cutoff:
+                continue
+            groups.setdefault(n.split(".", 1)[0], []).append(p)
+        if not groups:
+            print("retention: nothing in %s older than %d day(s)"
+                  % (cfg["dir"], cfg["policy_days"]), flush=True)
+            return 0
+        chunks = []
+        for token in sorted(groups):
+            camera_id = (cfg.get("camera_id")
+                         or _camera_for_token(cfg["dir"], token)
+                         or token)
+            files_removed = []
+            for p in sorted(groups[token]):
+                with open(p, "rb") as f:
+                    data = f.read()
+                files_removed.append((p, {
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "kind": retention_kind(os.path.basename(p)),
+                    "byte_len": len(data),
+                }))
+            for i, chunk in enumerate(_retention_chunks(files_removed,
+                                                        ARTIFACT_LIMIT)):
+                chunks.append({
+                    "camera_id": camera_id,
+                    "deleted_at_utc_ns": now,
+                    "chunk": i,
+                    "files": [p for p, _ in chunk],
+                    "removed": [item for _, item in chunk],
+                })
+        if dry_run:
+            for c in chunks:
+                print("retention dry-run: %s chunk %d — %d file(s), "
+                      "%d byte(s)"
+                      % (c["camera_id"], c["chunk"], len(c["removed"]),
+                         sum(i["byte_len"] for i in c["removed"])),
+                      flush=True)
+            return 0
+        journal = {"tier": cfg["tier"], "policy_days": cfg["policy_days"],
+                   "chunks": chunks}
+        tmp = journal_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(journal, f, indent=1, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, journal_path)
+        _fsync_dir(cfg["data_dir"])
+
+    removed_files = 0
+    while journal["chunks"]:
+        c = journal["chunks"][0]
+        body_nosig = build_retention_body(
+            c["camera_id"], journal["tier"], journal["policy_days"],
+            c["deleted_at_utc_ns"], c["removed"], cfg["key_id"])
+        body_bytes, _body = producer_sign(cfg["sk"], body_nosig)
+        if len(body_bytes) >= ARTIFACT_LIMIT:
+            raise SubmitError(
+                "retention record for %s chunk %d is %d bytes, at/past "
+                "the daemon's %d-byte artifact field — refusing (and "
+                "deleting nothing)" % (c["camera_id"], c["chunk"],
+                                       len(body_bytes), ARTIFACT_LIMIT))
+        if not deliver(c, body_bytes):
+            raise SubmitError(
+                "retention record for %s chunk %d was not delivered — "
+                "nothing from this chunk was deleted; the journal "
+                "remains and the next run resumes it"
+                % (c["camera_id"], c["chunk"]))
+        for p in c["files"]:
+            try:
+                os.unlink(p)
+                removed_files += 1
+            except FileNotFoundError:
+                pass                     # journal replay after a crash
+        journal["chunks"] = journal["chunks"][1:]
+        tmp = journal_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(journal, f, indent=1, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, journal_path)
+        print("retention: %s chunk %d declared and removed (%d file(s))"
+              % (c["camera_id"], c["chunk"], len(c["files"])), flush=True)
+    os.unlink(journal_path)
+    return removed_files
 
 
 # ── CLI ────────────────────────────────────────────────────────────────
@@ -3555,6 +3975,39 @@ def main(argv=None):
     sp.add_argument("--once", action="store_true",
                     help="drain one pass and exit (else poll until "
                          "signalled)")
+
+    rt = sub.add_parser("retention",
+                        help="declare-then-delete aged spool/outbox "
+                             "files as chain-signed camera_retention/1 "
+                             "records")
+    rt.add_argument("--dir", required=True,
+                    help="directory the policy applies to (a capture "
+                         "host's outbox, or the O-node spool's done/)")
+    rt.add_argument("--days", type=int, required=True,
+                    help="files strictly older than this many days are "
+                         "declared and removed")
+    rt.add_argument("--tier", required=True, choices=RETENTION_TIERS,
+                    help="who is deleting: the capture host's 30-day "
+                         "store, or the O-node spool's 14-day one")
+    rt.add_argument("--data-dir", default=DATA_DIR,
+                    help="producer key + retention journal live here")
+    rt.add_argument("--camera-id", default=None,
+                    help="capture-host: the one camera this data-dir "
+                         "serves; spool: derived from each job's .body")
+    rt.add_argument("--dry-run", action="store_true",
+                    help="print what would be declared and removed; "
+                         "write and delete nothing")
+    rt.add_argument("--spool", default=None,
+                    help="capture-host tier: sftp target of the chrooted "
+                         "spool the record ships to")
+    rt.add_argument("--ssh-key", default=None)
+    rt.add_argument("--known-hosts", default=None,
+                    help="required with --spool (the spool host key is "
+                         "pinned, same as live)")
+    rt.add_argument("--sock", default=ONODE_SOCKET,
+                    help="spool tier: the O-node socket the record is "
+                         "appended through directly")
+    rt.add_argument("--db", default=CHAIN_DB)
 
     vs = sub.add_parser("verify-segment",
                         help="recompute a file's sha256 and compare it "
@@ -3725,6 +4178,70 @@ def main(argv=None):
         }
         n = submit_spool(cfg, once=args.once)
         print("submit-spool: %d job(s) appended this run" % n, flush=True)
+        return 0
+
+    if args.cmd == "retention":
+        if args.dry_run:
+            key_id, sk = None, None
+        else:
+            sk_path = os.path.join(args.data_dir, "producer.key")
+            pk_path = os.path.join(args.data_dir, "producer.pub")
+            key_id, sk = _producer_identity(sk_path, pk_path)
+        cfg = {
+            "data_dir": args.data_dir,
+            "dir": args.dir,
+            "tier": args.tier,
+            "policy_days": args.days,
+            "camera_id": args.camera_id,
+            "sk": sk,
+            "key_id": key_id,
+            "sock": args.sock,
+            "db": args.db,
+        }
+
+        def _stage_record(c, body_bytes):
+            name = "%s.retention.%d.%d" % (
+                spool_camera_token(c["camera_id"]),
+                c["deleted_at_utc_ns"], c["chunk"])
+            out = os.path.join(args.data_dir, "outbox")
+            os.makedirs(out, mode=0o700, exist_ok=True)
+            body_path = os.path.join(out, name + ".body")
+            with open(body_path + ".tmp", "wb") as f:
+                f.write(body_bytes)
+            os.replace(body_path + ".tmp", body_path)
+            return name, body_path
+
+        if args.tier == "capture-host":
+            # The record ships through the same pinned channel as the
+            # segments it covers; the staged .body stays in the outbox
+            # as the capture-side copy, and ages out under this same
+            # policy later.
+            if not args.dry_run and not args.spool:
+                p.error("--tier capture-host needs --spool")
+            ship = (sftp_ship(args.spool, ssh_key=args.ssh_key,
+                              known_hosts=args.known_hosts)
+                    if args.spool else None)
+
+            def deliver(c, body_bytes):
+                name, body_path = _stage_record(c, body_bytes)
+                return ship(None, body_path, name)
+        else:
+            # spool tier: this host IS the O-node host; the record goes
+            # straight through the socket, and the artifacts/ sidecar is
+            # the durable copy, so the staging file is cleaned up.
+            def deliver(c, body_bytes):
+                name, body_path = _stage_record(c, body_bytes)
+                ok = submit_record_only(cfg, name, body_path)
+                if ok:
+                    os.unlink(body_path)
+                return ok
+
+        try:
+            n = run_retention(cfg, deliver, dry_run=args.dry_run)
+        except (SubmitError, ValueError, OSError) as e:
+            sys.stderr.write("retention: %s\n" % e)
+            return 1
+        print("retention: %d file(s) removed" % n, flush=True)
         return 0
 
     if args.cmd == "verify-segment":
