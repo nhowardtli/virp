@@ -1079,3 +1079,186 @@ class TestS2RepeatCount(unittest.TestCase):
                                                   now_ns=NOW)
             self.assertEqual(grants, [], "repeat_count %r" % bad)
             self.assertEqual(len(refusals), 1)
+
+
+class TestBreakglassUsed(unittest.TestCase):
+    """Phase 1c: break-glass use is an EVENT VIRP must see and grade RED.
+
+    The §9 resolution exempts humans from VIRP-driven authorization so a
+    TACACS outage cannot lock them out. The price of that exemption is
+    that break-glass use must be loud: it is the one identity that can
+    act without the gate, so its use is graded RED and never folded into
+    UNGOVERNED, which is a counting bucket rather than an alarm.
+
+    MEASURED on R1: a locally-authenticated console session as
+    `breakglass` DOES emit TACACS accounting -- an EXEC START plus a
+    command STOP per command, user=breakglass, port=tty0. So the evidence
+    path exists; this class is what makes it visible.
+    """
+
+    def _receipt(self, user, t, cmd="show running-config"):
+        import virp_tacacs_codec as tp
+        args = ["task_id=9", "service=shell", "priv-lvl=15",
+                "cmd=%s <cr>" % cmd]
+        return {"session_id": "s", "sequence": 0, "artifact_id": "x",
+                "timestamp_ns": t,
+                "body": {"schema": "tacacs_accounting/1",
+                         "client_identity": "R1", "recv_utc_ns": t,
+                         "acct_flags": ["STOP"], "args": args,
+                         "args_index": tp.args_index(args), "port": "tty0",
+                         "user": user, "raw_body_sha256": "a" * 64,
+                         "decode": "OBFUSCATED_MD5", "parse": "COMPLETE"}}
+
+    def test_vocabulary_has_the_class_and_the_grade(self):
+        import virp_tacacs_reconcile as rc
+        self.assertIn("BREAKGLASS_USED", rc.VERDICTS)
+        self.assertIn("RED", rc.GRADES)
+
+    def test_breakglass_command_is_red(self):
+        import virp_tacacs_reconcile as rc
+        t = 1_757_003_000_000_000_000
+        items = rc.reconcile([self._receipt("breakglass", t)], [], [], 15000,
+                             breakglass_users=("breakglass",))
+        self.assertEqual(items[0]["verdict"], "BREAKGLASS_USED")
+        self.assertEqual(items[0]["grade"], "RED")
+
+    def test_gate_identity_is_not_breakglass(self):
+        import virp_tacacs_reconcile as rc
+        t = 1_757_003_100_000_000_000
+        items = rc.reconcile([self._receipt("virp-ro", t)], [], [], 15000,
+                             breakglass_users=("breakglass",))
+        self.assertNotEqual(items[0]["verdict"], "BREAKGLASS_USED")
+        self.assertNotEqual(items[0].get("grade"), "RED")
+
+    def test_breakglass_outranks_ungoverned(self):
+        """A break-glass command has no gate record by definition. It must
+        NOT be filed as UNGOVERNED -- that is a counting bucket, and
+        burying an alarm in it is how alarms get ignored."""
+        import virp_tacacs_reconcile as rc
+        t = 1_757_003_200_000_000_000
+        items = rc.reconcile([self._receipt("breakglass", t)], [], [], 15000,
+                             breakglass_users=("breakglass",))
+        self.assertEqual(items[0]["verdict"], "BREAKGLASS_USED")
+
+    def test_no_breakglass_list_configured_grades_nothing_red(self):
+        """Absence of a configured list must never be read as 'no
+        break-glass happened' -- but it also must not invent one."""
+        import virp_tacacs_reconcile as rc
+        t = 1_757_003_300_000_000_000
+        items = rc.reconcile([self._receipt("breakglass", t)], [], [], 15000)
+        self.assertNotEqual(items[0]["verdict"], "BREAKGLASS_USED")
+
+    def test_tally_counts_the_grade(self):
+        import virp_tacacs_reconcile as rc
+        t = 1_757_003_400_000_000_000
+        items = rc.reconcile([self._receipt("breakglass", t)], [], [], 15000,
+                             breakglass_users=("breakglass",))
+        rec = rc.build_record(items, 15000, "/nonexistent", None, [])
+        self.assertEqual(rec["grade_tally"]["RED"], 1)
+
+
+class TestChunkedGradeTally(unittest.TestCase):
+    """A chunked reconciliation must carry the run-wide GRADE tally in
+    every chunk, exactly as it already carries the run-wide verdict tally.
+
+    Found live: the run had 10 RED items, and chunk 0 read
+    `grade_tally {"RED": 0}`. A reader holding that chunk would see no
+    alarm. Per-chunk counts are the chunk's own; the run-wide counts are
+    what a reader needs, and summing chunks is explicitly forbidden
+    because it double-counts."""
+
+    def _items(self, n_red, n_plain):
+        import virp_tacacs_reconcile as rc
+        items = []
+        for i in range(n_red):
+            items.append({"verdict": "BREAKGLASS_USED", "grade": "RED",
+                          "user": "breakglass", "coverage": "RECEIVER_UP",
+                          "device": "R1", "command": "show version",
+                          "record_class": "command", "authz_decision": None,
+                          "coverage_evidence": [], "coverage_span_ns": [0, 0],
+                          "receipt_cites": [], "gate_cite": None,
+                          "command_reassembly": "x", "task_id": str(i),
+                          "detail": ""})
+        for i in range(n_plain):
+            items.append(dict(items[0] if items else {},
+                              verdict="UNGOVERNED", grade="NOT_GRADED",
+                              user="virp-ro", task_id="p%d" % i))
+        return items
+
+    def test_every_chunk_carries_the_run_wide_grade_tally(self):
+        import virp_tacacs_reconcile as rc
+        items = self._items(3, 40)
+        chunks = rc.chunk_items(items)
+        self.assertGreater(len(chunks), 1, "need a split to test this")
+        whole = rc.build_record(items, 15000, "/nonexistent", None, [])
+        for i, part in enumerate(chunks):
+            rec = rc.build_record(part, 15000, "/nonexistent", None, [],
+                                  chunk={"run_id": "r", "index": i,
+                                         "of": len(chunks)},
+                                  run_tally=whole["tally"],
+                                  run_grade_tally=whole["grade_tally"])
+            self.assertEqual(rec["run_grade_tally"]["RED"], 3,
+                             "chunk %d hides the run's RED count" % i)
+
+    def test_unchunked_record_has_no_run_grade_tally(self):
+        """The run-wide copy exists only to survive splitting."""
+        import virp_tacacs_reconcile as rc
+        rec = rc.build_record(self._items(1, 0), 15000, "/nonexistent",
+                              None, [])
+        self.assertNotIn("run_grade_tally", rec)
+
+
+class TestBreakGlassTemplate(unittest.TestCase):
+    """Phase 1e: the final §9 shape, rendered rather than hand-typed.
+
+    Four properties, each measured in Phase 1b before being encoded:
+
+    1. The gate's list stays tacacs+ ONLY. Shape B (`group tacacs+
+       local`) let virp-rw EXECUTE `configure terminal` with the server
+       down -- the gate failing wide open exactly when the control is
+       unavailable.
+    2. A break-glass ACCOUNT exists, with a placeholder secret. Never a
+       real password in a committed template.
+    3. NO network break-glass path. A separate vty on its own port works
+       for humans but does NOT fence the gate: virp-rw reached that port
+       and took local privilege 15. The console is the break-glass path.
+    4. Local logging is on, because with BOTH servers down the router's
+       own buffer is the only evidence that survives.
+    """
+
+    def _cfg(self):
+        return pol.render_router_config(device="R1")
+
+    def test_rw_list_is_tacacs_only(self):
+        for line in self._cfg().splitlines():
+            if line.startswith("aaa authorization commands") and "VIRPRW" in line:
+                self.assertNotIn(" local", line)
+                self.assertNotIn("if-authenticated", line)
+                self.assertNotIn(" none", line)
+
+    def test_breakglass_account_with_a_placeholder(self):
+        cfg = self._cfg()
+        self.assertIn("username breakglass", cfg)
+        self.assertIn(pol.BREAKGLASS_SECRET_PLACEHOLDER, cfg)
+
+    def test_no_real_secret_in_the_template(self):
+        self.assertNotIn("BgPass123", self._cfg())
+
+    def test_no_network_breakglass_path(self):
+        """Measured: an unrestricted break-glass port is a gate
+        self-escalation route."""
+        cfg = self._cfg()
+        self.assertNotIn("rotary", cfg)
+        self.assertNotIn("ip ssh port", cfg)
+
+    def test_console_stays_exempt(self):
+        cfg = self._cfg()
+        self.assertIn("aaa authorization commands 15 CONSOLE none", cfg)
+        self.assertIn("authorization commands 15 CONSOLE", cfg)
+
+    def test_local_logging_is_enabled(self):
+        """With both servers down this is the ONLY surviving evidence."""
+        cfg = self._cfg()
+        self.assertIn("login on-success log", cfg)
+        self.assertIn("login on-failure log", cfg)
+        self.assertIn("log config", cfg)

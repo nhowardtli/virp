@@ -56,6 +56,11 @@ CONFIG_MODE_PREFIXES = (
 )
 CONFIG_ENTRY_COMMAND = "configure terminal"
 
+# Never a real password in a committed template. The lab substitutes a
+# value at apply time; production substitutes from a vault.
+BREAKGLASS_SECRET_PLACEHOLDER = "${BREAKGLASS_SECRET}"
+BREAKGLASS_USER = "breakglass"
+
 
 def is_config_mode_command(cmd):
     c = canonical_command(cmd) or ""
@@ -288,6 +293,32 @@ def render_router_config(device, authz_addr="172.17.0.1", authz_port=4950,
     """
     return "\n".join([
         "! VIRP per-command authorization — device %s" % device,
+        "!",
+        "! BREAK-GLASS (design doc §9). Humans are never subject to",
+        "! VIRP-driven authorization. This account's PATH is the CONSOLE,",
+        "! which is exempt below. There is deliberately NO network",
+        "! break-glass path: a separate vty on its own SSH port was",
+        "! measured on 2026-09-05 and it does NOT fence the gate --",
+        "! virp-rw reached that port and took local privilege 15,",
+        "! because a method list authorizes whoever reaches the LINE and",
+        "! the gate must hold a local account in order to authenticate.",
+        "! A network break-glass needs `access-class` source separation;",
+        "! without one it is a gate self-escalation route.",
+        "username %s privilege 15 secret 0 %s"
+        % (BREAKGLASS_USER, BREAKGLASS_SECRET_PLACEHOLDER),
+        "!",
+        "! With BOTH servers down the router's own buffer is the only",
+        "! evidence that survives. Measured: without these, a break-glass",
+        "! `show` leaves no trace at all.",
+        "login on-success log",
+        "login on-failure log",
+        "archive",
+        " log config",
+        "  logging enable",
+        "  notify syslog",
+        "  hidekeys",
+        "  exit",
+        " exit",
         "tacacs server %s" % AUTHZ_SERVER_NAME,
         " address ipv4 %s" % authz_addr,
         " port %d" % authz_port,

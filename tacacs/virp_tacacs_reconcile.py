@@ -48,7 +48,13 @@ REASSEMBLY_UNRECOGNIZED = "UNRECOGNIZED"
 
 VERDICTS = ("MATCHED", "START_WITHOUT_STOP", "STOP_WITHOUT_START",
             "UNGOVERNED", "UNREPORTED", "AMBIGUOUS",
-            "ATTEMPTED_UNAPPROVED")
+            "ATTEMPTED_UNAPPROVED", "BREAKGLASS_USED")
+
+# A separate axis from the verdict, like coverage. RED means "a human
+# acted outside the gate and someone must look now". It is deliberately
+# NOT a verdict value on its own: the verdict says what the record is,
+# the grade says how loudly to say it.
+GRADES = ("RED", "NOT_GRADED")
 
 AUTHZ_SCHEMA = "tacacs_authorization/1"
 COVERAGE = ("RECEIVER_UP", "RECEIVER_DOWN", "INTERRUPTED",
@@ -359,7 +365,8 @@ def record_class(body):
 
 
 def reconcile(receipts, gates, windows, match_window_ms,
-              horizon_ns=None, authz_decisions=None):
+              horizon_ns=None, authz_decisions=None,
+              breakglass_users=()):
     """Pair receipts with gate_executions and grade. Returns the list of
     per-item claims. Nothing here writes anything."""
     window_ns = match_window_ms * 1_000_000
@@ -371,6 +378,10 @@ def reconcile(receipts, gates, windows, match_window_ms,
     # outage AFTER the START -- exactly the case worth catching -- would be
     # invisible. Default: the last receipt this run observed.
     authz_decisions = authz_decisions or []
+    # A configured list, never inferred. An empty list means "nobody told
+    # this reconciler which accounts are break-glass", which is reported
+    # as NOT_GRADED rather than as "no break-glass happened".
+    breakglass_users = set(breakglass_users or ())
     if horizon_ns is None:
         _t = [r["body"].get("recv_utc_ns") or r["timestamp_ns"]
               for r in receipts]
@@ -498,8 +509,21 @@ def reconcile(receipts, gates, windows, match_window_ms,
         if final == "UNGOVERNED" and authz in ("FAIL", "ERROR"):
             final = "ATTEMPTED_UNAPPROVED"
 
+        # Break-glass outranks everything else this function can say. A
+        # break-glass command has no gate record BY DEFINITION, so it
+        # would otherwise be filed UNGOVERNED -- a counting bucket, and
+        # burying an alarm in a counting bucket is how alarms get
+        # ignored.
+        acct_user = rb.get("user")
+        grade = "NOT_GRADED"
+        if acct_user and acct_user in breakglass_users:
+            final = "BREAKGLASS_USED"
+            grade = "RED"
+
         items.append({
             "verdict": final,
+            "grade": grade,
+            "user": acct_user,
             "record_class": klass,
             "authz_decision": authz,
             "gate_correspondence": gate_verdict,
@@ -539,6 +563,8 @@ def reconcile(receipts, gates, windows, match_window_ms,
             g_cov, g_ev = coverage_for_span(windows, ts, ts + window_ns)
             items.append({
                 "verdict": "UNREPORTED",
+                "grade": "NOT_GRADED",
+                "user": None,
                 "record_class": None,
                 "authz_decision": None,
                 "gate_correspondence": "UNREPORTED",
@@ -582,12 +608,15 @@ def chunk_items(items, budget=RECORD_BUDGET):
 
 
 def build_record(items, match_window_ms, db_path, ledger_path, windows,
-                 chunk=None, run_tally=None):
+                 chunk=None, run_tally=None, run_grade_tally=None):
     tally = {v: 0 for v in VERDICTS}
     cov = {c: 0 for c in COVERAGE}
+    grades = {g: 0 for g in GRADES}
     for it in items:
         tally[it["verdict"]] = tally.get(it["verdict"], 0) + 1
         cov[it["coverage"]] = cov.get(it["coverage"], 0) + 1
+        grades[it.get("grade", "NOT_GRADED")] = \
+            grades.get(it.get("grade", "NOT_GRADED"), 0) + 1
     rec = {
         "schema": SCHEMA,
         "reconciled_utc_ns": time.time_ns(),
@@ -606,6 +635,7 @@ def build_record(items, match_window_ms, db_path, ledger_path, windows,
         },
         "tally": tally,
         "coverage_tally": cov,
+        "grade_tally": grades,
         "items": items,
         "presentation": (
             "CLAIM, not a cryptographic verdict. Render beside the "
@@ -620,6 +650,12 @@ def build_record(items, match_window_ms, db_path, ledger_path, windows,
         rec["chunk"] = chunk
         if run_tally is not None:
             rec["run_tally"] = run_tally
+        # The run-wide GRADE tally travels with every chunk for the same
+        # reason the verdict tally does: a RED alarm that is only visible
+        # in the chunk that happens to contain it is an alarm a reader
+        # can miss by opening the wrong file.
+        if run_grade_tally is not None:
+            rec["run_grade_tally"] = run_grade_tally
     return rec
 
 
@@ -641,6 +677,10 @@ def main(argv=None):
     p.add_argument("--db", required=True, help="chain database (read-only)")
     p.add_argument("--ledger", help="receiver LISTEN_START/STOP ledger")
     p.add_argument("--match-window-ms", type=int, default=15000)
+    p.add_argument("--breakglass-user", action="append", default=[],
+                   help="account name whose use is graded RED (repeatable). "
+                        "Configured, never inferred: with none given, "
+                        "break-glass use is NOT_GRADED rather than absent.")
     p.add_argument("--out", help="write the record JSON here")
     p.add_argument("--submit", action="store_true",
                    help="append the record to the chain")
@@ -653,7 +693,8 @@ def main(argv=None):
     windows = read_ledger(args.ledger)
     decisions = read_authz_decisions(args.db)
     items = reconcile(receipts, gates, windows, args.match_window_ms,
-                      authz_decisions=decisions)
+                      authz_decisions=decisions,
+                      breakglass_users=args.breakglass_user)
     rec = build_record(items, args.match_window_ms, args.db,
                        args.ledger, windows)
 
@@ -662,6 +703,12 @@ def main(argv=None):
                          len(items)))
     print("tally: %s" % json.dumps(rec["tally"], sort_keys=True))
     print("coverage: %s" % json.dumps(rec["coverage_tally"], sort_keys=True))
+    print("grades:   %s" % json.dumps(rec["grade_tally"], sort_keys=True))
+    for it in items:
+        if it.get("grade") == "RED":
+            print("  RED  %-14s %-4s user=%-12s %r"
+                  % (it["verdict"], it.get("device"), it.get("user"),
+                     it.get("command")))
 
     if args.out:
         with open(args.out, "w") as f:
@@ -680,7 +727,8 @@ def main(argv=None):
                                args.ledger, windows,
                                chunk={"run_id": run_id, "index": i,
                                       "of": len(groups)},
-                               run_tally=rec["tally"])
+                               run_tally=rec["tally"],
+                               run_grade_tally=rec["grade_tally"])
             body_bytes, _ = producer_sign(sk, sub)
             aid = "tacacs-reconcile:%s:%d" % (run_id, i)
             ok, detail = chain_append_evidence(args.chain_session, aid,
