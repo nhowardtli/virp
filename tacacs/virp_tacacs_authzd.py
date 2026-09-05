@@ -59,8 +59,9 @@ class PolicyStore:
     per request makes the window zero instead of "until someone sends a
     HUP"."""
 
-    def __init__(self, path):
+    def __init__(self, path, ledger=None):
         self.path = path
+        self.ledger = ledger
         self._lock = threading.Lock()
         self._stamp = None
         self._policy = {"schema": "tacacs_authz_policy/1", "grants": []}
@@ -74,6 +75,7 @@ class PolicyStore:
             return None
 
     def load(self, force=False):
+        changed = False
         with self._lock:
             stamp = self._stat()
             if not force and stamp == self._stamp:
@@ -82,18 +84,29 @@ class PolicyStore:
                 # No policy file is an EMPTY policy, never an open one.
                 self._policy = {"schema": "tacacs_authz_policy/1",
                                 "grants": []}
-                self._stamp = None
-                return True
-            try:
-                with open(self.path) as f:
-                    self._policy = json.load(f)
-            except (ValueError, OSError):
-                # An unreadable policy denies everything. Failing closed
-                # on a corrupt file is the only safe reading.
-                self._policy = {"schema": "tacacs_authz_policy/1",
-                                "grants": [], "_load_error": True}
+            else:
+                try:
+                    with open(self.path) as f:
+                        self._policy = json.load(f)
+                except (ValueError, OSError):
+                    # An unreadable policy denies everything. Failing
+                    # closed on a corrupt file is the only safe reading.
+                    self._policy = {"schema": "tacacs_authz_policy/1",
+                                    "grants": [], "_load_error": True}
             self._stamp = stamp
-            return True
+            changed = True
+            loaded_sha = hashlib.sha256(json.dumps(
+                self._policy, sort_keys=True,
+                separators=(",", ":")).encode()).hexdigest()
+            loaded_grants = len(self._policy.get("grants", []))
+        if changed and self.ledger is not None:
+            # Written outside the lock (the ledger fsyncs), using values
+            # captured while the lock was held.
+            self.ledger.write("POLICY_LOADED",
+                              policy_path=self.path,
+                              policy_sha256=loaded_sha,
+                              grants=loaded_grants)
+        return changed
 
     def snapshot(self):
         with self._lock:
@@ -356,7 +369,7 @@ def main(argv=None):
     srv.sk = producer_load_sk(cfg["producer_key"])
     srv.ledger = Ledger(cfg["ledger"])
     srv.counters = Counters()
-    srv.policy = PolicyStore(args.policy)
+    srv.policy = PolicyStore(args.policy, ledger=srv.ledger)
     srv.onode_socket = args.onode_socket or cfg.get("onode_socket")
 
     srv.ledger.write("AUTHZ_LISTEN_START", policy=args.policy,

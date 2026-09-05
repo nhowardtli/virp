@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from virp_tacacs_authz import canonical_command
@@ -39,6 +40,88 @@ RO_LIST = "VIRPRO"
 CONSOLE_LIST = "CONSOLE"
 
 DEFAULT_TTL_NS = 300 * 1_000_000_000
+
+# Commands that only exist inside configuration mode. An approval for one
+# of these is unusable unless the session can also run `configure
+# terminal`, which no approval covers -- so the compiler emits that as a
+# DERIVED grant, marked as such, sharing the approval's window and spent
+# once. Safe because `aaa authorization config-commands` is on: the
+# session reaches config mode and can still run only the approved line.
+CONFIG_MODE_PREFIXES = (
+    "interface ", "router ", "ip route ", "no ", "hostname ",
+    "username ", "aaa ", "line ", "access-list ", "snmp-server ",
+    "description ", "shutdown", "ip address ", "banner ", "crypto ",
+    "logging ", "ntp ", "vlan ", "spanning-tree ", "tacacs ",
+)
+CONFIG_ENTRY_COMMAND = "configure terminal"
+
+
+def is_config_mode_command(cmd):
+    c = canonical_command(cmd) or ""
+    return any(c == p.strip() or c.startswith(p)
+               for p in CONFIG_MODE_PREFIXES)
+
+
+def command_hash(command):
+    """sha256 over VIRP's canonical command form.
+
+    Mirrors command_hash_hex() in src/virp_approval.c for the non-typed
+    path: virp_canonicalize_command() then sha256 of the result. The
+    compiler recomputes this rather than trusting the hash in either
+    record, because a hash copied from the thing being checked proves
+    nothing."""
+    return hashlib.sha256(
+        canonical_command(command).encode("utf-8")).hexdigest()
+
+
+def approval_from_chain(proposal, approval):
+    """Join a chained proposal to its approval and state, honestly, what
+    was verified.
+
+    FINDING, encoded here rather than in a comment nobody reads: the
+    chained `approval` record carries `approver_key_id` but NOT the
+    approver's signature -- that lives only in the approval file on the
+    daemon host. A chain-only consumer cannot verify it. So this returns
+    `trust_basis` (checks that ran and passed) alongside
+    `trust_not_established` (checks that could not run at all), and the
+    approver signature is permanently in the second list for this read
+    path. Naming the flag "signature_verified" would claim a check that
+    never happened.
+    """
+    basis, missing = [], ["approver_signature"]
+
+    p_hash = proposal.get("command_hash")
+    a_hash = approval.get("command_hash")
+    if p_hash and a_hash and p_hash == a_hash:
+        basis.append("command_hash_binding")
+
+    recomputed = command_hash(proposal.get("command") or "")
+    if a_hash and recomputed == a_hash:
+        basis.append("command_hash_recomputed")
+
+    if proposal.get("device") and proposal.get("device") == approval.get("device"):
+        basis.append("device_agreement")
+
+    trusted = ("command_hash_binding" in basis
+               and "command_hash_recomputed" in basis
+               and "device_agreement" in basis)
+
+    ttl_s = int(approval.get("ttl_seconds") or 0)
+    return {
+        "approval_id": approval.get("proposal_id"),
+        "device": approval.get("device"),
+        "command": proposal.get("command"),
+        "command_hash": a_hash,
+        "issued_utc_ns": int(float(approval.get("approved_at_ns") or 0)),
+        "ttl_ns": ttl_s * 1_000_000_000,
+        "repeat_count": approval.get("repeat_count"),
+        "approver_key_id": approval.get("approver_key_id"),
+        "operator": approval.get("operator"),
+        "approval_entry_hash": approval.get("_entry_hash"),
+        "approval_trusted": trusted,
+        "trust_basis": basis,
+        "trust_not_established": missing,
+    }
 
 
 def compile_grants(approvals, now_ns, default_uses=1):
@@ -57,11 +140,21 @@ def compile_grants(approvals, now_ns, default_uses=1):
         # whose signature was not checked is indistinguishable, to this
         # compiler, from one that failed -- and rendering either would let
         # an unsigned record open a router.
-        if a.get("signature_verified") is not True:
+        # Accepts either gate: the chain reader sets approval_trusted
+        # after recomputing the bindings; synthetic callers set
+        # signature_verified. Absence of BOTH is refused exactly as a
+        # failure -- absence is never read as verified.
+        trusted = a.get("approval_trusted")
+        if trusted is None:
+            trusted = a.get("signature_verified")
+        if trusted is not True:
             refusals.append({
                 "approval_id": aid,
-                "reason": "approval signature not verified (flag is %r)"
-                          % a.get("signature_verified")})
+                "reason": "approval not verified (approval_trusted=%r, "
+                          "signature_verified=%r); basis=%r"
+                          % (a.get("approval_trusted"),
+                             a.get("signature_verified"),
+                             a.get("trust_basis"))})
             continue
 
         cmd = canonical_command(a.get("command"))
@@ -102,6 +195,27 @@ def compile_grants(approvals, now_ns, default_uses=1):
             "not_before_ns": issued,
             "not_after_ns": not_after,
             "uses_remaining": uses,
+            "derived": None,
+        })
+
+    # One prerequisite for the whole render, not one per approval: two
+    # approved config lines must not silently double the number of times
+    # a session may enter config mode.
+    config_grants = [g for g in grants if is_config_mode_command(g["command"])]
+    if config_grants:
+        first = min(config_grants, key=lambda g: g["not_before_ns"])
+        grants.append({
+            "grant_id": "g-configentry-%s" % first["approval_id"],
+            "device": first["device"],
+            "user": "virp-rw",
+            "command": CONFIG_ENTRY_COMMAND,
+            "approval_id": first["approval_id"],
+            "approval_entry_hash": first.get("approval_entry_hash"),
+            "not_before_ns": first["not_before_ns"],
+            "not_after_ns": first["not_after_ns"],
+            "uses_remaining": 1,
+            # Never presented as something a human approved.
+            "derived": "config_mode_prerequisite",
         })
     return grants, refusals
 
@@ -175,6 +289,38 @@ def render_router_config(device, authz_addr="172.17.0.1", authz_port=4950,
     ])
 
 
+def wait_for_policy_load(ledger_path, sha, timeout_s=10.0, poll_s=0.25):
+    """True only when the authorization daemon's OWN ledger says it
+    loaded this exact policy sha.
+
+    A render that was written but never loaded is a silent deny of an
+    approved action and is indistinguishable from an attack, so the
+    compiler must never report success on the strength of having written
+    a file. A missing or unreadable ledger returns False: absence of
+    evidence that it loaded is not evidence that it did.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            with open(ledger_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if (rec.get("event") == "POLICY_LOADED"
+                            and rec.get("policy_sha256") == sha):
+                        return True
+        except OSError:
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(poll_s)
+
+
 def build_rendered_record(device, policy, refusals, policy_path):
     """The one record this compiler writes. It commits to the policy bytes
     a router would have been judged against, so an auditor can bind a
@@ -194,3 +340,117 @@ def build_rendered_record(device, policy, refusals, policy_path):
             "accept. Render beside the verdict ladder, never inside it. "
             "It does not assert any command was run."),
     }
+
+
+# ── CLI: chain -> policy -> verified load -> policy_rendered record ────
+
+def compile_from_chain(db_path, now_ns):
+    """(approvals, refusals_from_join). Reads through the reconciler's
+    shared reader, joins approval to proposal by proposal_id, and refuses
+    any approval whose proposal is absent -- command text must never
+    enter the policy from an unbound source."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import virp_tacacs_reconcile as rc
+
+    rows = rc.read_entries(db_path, artifact_types=("proposal", "approval"))
+    proposals, approvals = {}, []
+    for r in rows:
+        b = r["body"]
+        if r["artifact_type"] == "proposal":
+            proposals[b.get("proposal_id")] = b
+        else:
+            b = dict(b)
+            b["_entry_hash"] = r["chain_entry_hash"]
+            approvals.append(b)
+
+    joined, refusals = [], []
+    for a in approvals:
+        pid = a.get("proposal_id")
+        pr = proposals.get(pid)
+        if pr is None:
+            refusals.append({
+                "approval_id": pid,
+                "reason": "no proposal on chain for this approval; the "
+                          "command text is unbound and will not be rendered"})
+            continue
+        joined.append(approval_from_chain(pr, a))
+    return joined, refusals
+
+
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Compile VIRP approvals into TACACS+ authorization "
+                    "policy (lab only)")
+    ap.add_argument("--db", required=True)
+    ap.add_argument("--out", required=True, help="policy JSON the daemon reads")
+    ap.add_argument("--device", action="append", default=None,
+                    help="restrict to these devices (repeatable)")
+    ap.add_argument("--authz-ledger", help="daemon ledger, to confirm the load")
+    ap.add_argument("--load-timeout", type=float, default=15.0)
+    ap.add_argument("--submit", action="store_true",
+                    help="append the policy_rendered record")
+    ap.add_argument("--producer-key")
+    ap.add_argument("--onode-socket")
+    ap.add_argument("--chain-session", default="tacacs-authz-policy")
+    a = ap.parse_args(argv)
+
+    now = time.time_ns()
+    joined, join_refusals = compile_from_chain(a.db, now)
+    grants, refusals = compile_grants(joined, now_ns=now)
+    refusals = join_refusals + refusals
+
+    devices = a.device or sorted({g["device"] for g in grants}) or ["R1"]
+    all_grants = [g for g in grants if g["device"] in devices]
+
+    combined = {"schema": SCHEMA, "device": ",".join(devices),
+                "rendered_utc_ns": now, "grants": all_grants}
+    tmp = a.out + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(combined, f, indent=1, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, a.out)
+
+    sha = policy_sha256(combined)
+    print("grants: %d   refusals: %d   policy_sha256: %s"
+          % (len(all_grants), len(refusals), sha))
+    for r in refusals:
+        print("  REFUSED %s: %s" % (r.get("approval_id"), r.get("reason")))
+    for g in all_grants:
+        print("  GRANT %s %s %r uses=%d until=%d"
+              % (g["grant_id"], g["device"], g["command"],
+                 g["uses_remaining"], g["not_after_ns"]))
+
+    loaded = None
+    if a.authz_ledger:
+        loaded = wait_for_policy_load(a.authz_ledger, sha,
+                                      timeout_s=a.load_timeout)
+        print("daemon loaded this policy: %s" % ("YES" if loaded else "NO"))
+        if not loaded:
+            # A render that was written but not loaded is a silent deny.
+            print("REFUSING to report success: the daemon has not "
+                  "confirmed this policy", file=sys.stderr)
+
+    if a.submit:
+        if not a.producer_key:
+            raise SystemExit("--submit needs --producer-key")
+        from virp_tacacs_recv import (producer_load_sk, producer_sign,
+                                      chain_append_evidence)
+        rec = build_rendered_record(combined["device"], combined, refusals,
+                                    a.out)
+        rec["daemon_load_confirmed"] = loaded
+        sk = producer_load_sk(a.producer_key)
+        body_bytes, _ = producer_sign(sk, rec)
+        aid = "authzpolicy:%d:%s" % (now, sha[:16])
+        ok, detail = chain_append_evidence(a.chain_session, aid, body_bytes,
+                                           a.onode_socket)
+        if not ok:
+            raise SystemExit("policy_rendered NOT chained: %s" % detail)
+        print("chained %s (%d bytes)" % (aid, len(body_bytes)))
+
+    return 0 if (loaded is not False) else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

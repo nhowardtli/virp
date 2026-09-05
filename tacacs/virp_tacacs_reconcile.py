@@ -54,6 +54,43 @@ COVERAGE = ("RECEIVER_UP", "RECEIVER_DOWN", "INTERRUPTED",
 
 # ── reading, strictly read-only ────────────────────────────────────────
 
+def read_entries(db_path, artifact_types=None):
+    """Generic read-only entry reader, shared with the policy compiler.
+
+    One read path for the whole TACACS toolchain: a second SQLite reader
+    would be a second place for a schema change to break and a second
+    place to forget `mode=ro`. Returns the chain_entry_hash alongside the
+    body so a consumer can cite the entry it acted on.
+    """
+    conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT e.session_id, e.sequence, e.artifact_id, "
+            "       e.artifact_type, e.timestamp_ns, e.chain_entry_hash, "
+            "       a.artifact_content "
+            "FROM chain_entries e JOIN artifacts a "
+            "  ON a.artifact_hash = e.artifact_hash "
+            " AND a.artifact_id = e.artifact_id "
+            "ORDER BY e.session_id, e.sequence").fetchall()
+    finally:
+        conn.close()
+    out = []
+    for session_id, seq, aid, atype, ts, ceh, content in rows:
+        if artifact_types is not None and atype not in artifact_types:
+            continue
+        try:
+            body = json.loads(content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(body, dict):
+            continue
+        out.append({"session_id": session_id, "sequence": seq,
+                    "artifact_id": aid, "artifact_type": atype,
+                    "timestamp_ns": ts, "chain_entry_hash": ceh,
+                    "body": body})
+    return out
+
+
 def read_chain(db_path):
     """(receipts, gate_executions). Read-only URI; this program has no
     write path to the chain other than its own append."""

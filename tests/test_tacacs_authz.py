@@ -242,9 +242,16 @@ class TestA8BadSignature(unittest.TestCase):
                 "ttl_ns": 300 * SEC, "issued_utc_ns": NOW,
                 "signature_verified": True}
         grants, refusals = pol.compile_grants([appr], now_ns=NOW)
-        self.assertEqual(len(grants), 1)
         self.assertEqual(refusals, [])
-        self.assertEqual(grants[0]["command"], "interface Loopback99")
+        # `interface ...` is a config-mode command, so the render is the
+        # approved grant PLUS the derived `configure terminal`
+        # prerequisite. The approved one is never marked derived.
+        approved = [g for g in grants if g.get("derived") is None]
+        self.assertEqual(len(approved), 1)
+        self.assertEqual(approved[0]["command"], "interface Loopback99")
+        derived = [g for g in grants if g.get("derived")]
+        self.assertEqual([g["command"] for g in derived],
+                         ["configure terminal"])
 
     def test_missing_verification_flag_is_refused_not_assumed(self):
         """Absence of the flag is never treated as verified."""
@@ -523,3 +530,257 @@ class TestOutcomeClassifier(unittest.TestCase):
         out = ("conf t\r\nCommand authorization failed.\r\n"
                "% Invalid input detected\r\nR1#")
         self.assertEqual(iossh.classify(out), iossh.DENIED)
+
+
+class TestLabDaemonActionPolicy(unittest.TestCase):
+    """The lab O-node's per-uid action allowlist must cover the verbs the
+    approval flow actually sends, or `virp approve` fails at the socket
+    with "Action not in the caller uid's allowed set" -- which looks like
+    a broken approval flow rather than a missing config line.
+
+    The daemon refuses to start on an allowlisted-but-unmapped uid, so
+    the failure mode is a boot error or a refused verb, never a silent
+    grant. This test pins the verbs so the next person adding a component
+    does not rediscover it from a -50."""
+
+    LAB_DEVICES = os.path.join(
+        "/tmp/claude-1000/-home-nhoward-virp",
+        "14778f44-c2e6-423e-a169-796579cee5fc",
+        "scratchpad", "lab2", "devices.json")
+
+    def _cfg(self):
+        if not os.path.exists(self.LAB_DEVICES):
+            self.skipTest("lab devices.json not present on this host")
+        import json
+        with open(self.LAB_DEVICES) as f:
+            return json.load(f)
+
+    def test_approval_verbs_are_allowed(self):
+        cfg = self._cfg()
+        allow = cfg["socket_uid_action_allow"]
+        uid = str(os.getuid())
+        self.assertIn(uid, allow)
+        for verb in ("approval_challenge", "approval_submit"):
+            self.assertIn(verb, allow[uid],
+                          "%s missing: `virp approve` fails with -50" % verb)
+
+    def test_every_allowlisted_uid_has_an_action_map(self):
+        cfg = self._cfg()
+        for uid in cfg["socket_allowed_uids"]:
+            self.assertIn(str(uid), cfg["socket_uid_action_allow"],
+                          "uid %s allowlisted but unmapped -- the daemon "
+                          "refuses to start" % uid)
+
+
+class TestApprovalTrustBasis(unittest.TestCase):
+    """FINDING: the chained `approval` record carries `approver_key_id`
+    but NOT the approver's Ed25519 signature -- that lives only in the
+    approval file on the daemon host (virp_approval_write_record). A
+    chain-only consumer therefore CANNOT verify the approver's signature.
+
+    What it CAN verify, and what the compiler must therefore require:
+      - the proposal and approval agree on command_hash (binding), and
+      - sha256(virp_canonicalize_command(proposal.command)) recomputes to
+        that same command_hash (so the command text is not free-floating).
+
+    Calling that "signature_verified" would be a lie. The field is named
+    for what was actually checked and carries the basis, so a reader can
+    see the approver signature was never among them."""
+
+    def _pair(self, command="interface Loopback77", tamper=None):
+        h = pol.command_hash(command)
+        proposal = {"proposal_id": "p1", "device": "R1", "command": command,
+                    "command_hash": h, "timestamp_ns": NOW, "tier": "RED"}
+        approval = {"proposal_id": "p1", "device": "R1", "command_hash": h,
+                    "approved_at_ns": NOW, "ttl_seconds": 300,
+                    "approver_key_id": "k1", "operator": "op"}
+        if tamper == "command":
+            proposal["command"] = "interface Loopback66"
+        elif tamper == "hash":
+            approval["command_hash"] = "b" * 64
+        return proposal, approval
+
+    def test_matching_pair_is_trusted_with_a_named_basis(self):
+        pr, ap = self._pair()
+        out = pol.approval_from_chain(pr, ap)
+        self.assertTrue(out["approval_trusted"])
+        self.assertIn("command_hash_binding", out["trust_basis"])
+        self.assertIn("command_hash_recomputed", out["trust_basis"])
+
+    def test_basis_never_claims_the_approver_signature(self):
+        pr, ap = self._pair()
+        out = pol.approval_from_chain(pr, ap)
+        self.assertNotIn("approver_signature", out["trust_basis"])
+        self.assertIn("approver_signature",
+                      out["trust_not_established"])
+
+    def test_tampered_command_text_is_refused(self):
+        """A8: a tampered copy must not render."""
+        pr, ap = self._pair(tamper="command")
+        out = pol.approval_from_chain(pr, ap)
+        self.assertFalse(out["approval_trusted"])
+        grants, refusals = pol.compile_grants([out], now_ns=NOW)
+        self.assertEqual(grants, [])
+        self.assertEqual(len(refusals), 1)
+
+    def test_mismatched_command_hash_is_refused(self):
+        pr, ap = self._pair(tamper="hash")
+        out = pol.approval_from_chain(pr, ap)
+        self.assertFalse(out["approval_trusted"])
+
+    def test_command_hash_matches_the_c_implementation(self):
+        """sha256 over the COLLAPSED canonical form, per
+        command_hash_hex() in src/virp_approval.c."""
+        import hashlib
+        self.assertEqual(
+            pol.command_hash("interface   Loopback77  "),
+            hashlib.sha256(b"interface Loopback77").hexdigest())
+
+
+class TestChainReadPathIsShared(unittest.TestCase):
+    """The compiler must not open the chain with its own SQLite reader.
+    One read path means one place where a schema change breaks, and one
+    place to fix it."""
+
+    def test_reconciler_exposes_a_generic_entry_reader(self):
+        import virp_tacacs_reconcile as rc
+        self.assertTrue(hasattr(rc, "read_entries"),
+                        "policy compiler needs a shared reader")
+
+    def test_reader_filters_by_artifact_type(self):
+        import json as _json
+        import sqlite3
+        import hashlib as _h
+        import virp_tacacs_reconcile as rc
+        import tempfile
+        d = tempfile.mkdtemp()
+        db = os.path.join(d, "c.db")
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE chain_entries (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " session_id TEXT, sequence INTEGER, artifact_type TEXT,"
+            " artifact_id TEXT, artifact_hash TEXT, chain_entry_hash TEXT,"
+            " timestamp_ns INTEGER);"
+            "CREATE TABLE artifacts (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " artifact_id TEXT, artifact_type TEXT, artifact_content TEXT,"
+            " artifact_hash TEXT, session_id TEXT, created_at_ns INTEGER);")
+        for i, (atype, body) in enumerate([
+                ("proposal", {"proposal_id": "p1", "command": "x"}),
+                ("approval", {"proposal_id": "p1"}),
+                ("evidence_item", {"schema": "other"})]):
+            c = _json.dumps(body, sort_keys=True, separators=(",", ":"))
+            h = _h.sha256(c.encode()).hexdigest()
+            conn.execute("INSERT INTO chain_entries (session_id,sequence,"
+                         "artifact_type,artifact_id,artifact_hash,"
+                         "chain_entry_hash,timestamp_ns) VALUES (?,?,?,?,?,?,?)",
+                         ("s", i, atype, "a%d" % i, h, "e%d" % i, 1))
+            conn.execute("INSERT INTO artifacts (artifact_id,artifact_type,"
+                         "artifact_content,artifact_hash,session_id,"
+                         "created_at_ns) VALUES (?,?,?,?,?,?)",
+                         ("a%d" % i, atype, c, h, "s", 1))
+        conn.commit(); conn.close()
+
+        rows = rc.read_entries(db, artifact_types=("proposal", "approval"))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["artifact_type"] for r in rows},
+                         {"proposal", "approval"})
+        self.assertEqual(rows[0]["body"]["proposal_id"], "p1")
+        self.assertIn("chain_entry_hash", rows[0])
+
+
+class TestPolicyLoadVerification(unittest.TestCase):
+    """A render that was written but never loaded is a SILENT DENY of an
+    approved action, and it looks exactly like an attack. The compiler
+    must confirm the daemon loaded the bytes it wrote, from the daemon's
+    own ledger, before reporting success."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.led = os.path.join(self.tmp, "led.jsonl")
+
+    def _write(self, *events):
+        import json as _json
+        with open(self.led, "w") as f:
+            for e in events:
+                f.write(_json.dumps(e) + "\n")
+
+    def test_returns_true_when_the_ledger_shows_the_sha_loaded(self):
+        self._write({"event": "POLICY_LOADED", "policy_sha256": "abc",
+                     "utc_ns": 1})
+        self.assertTrue(pol.wait_for_policy_load(self.led, "abc",
+                                                 timeout_s=0.5))
+
+    def test_returns_false_when_only_another_sha_is_loaded(self):
+        self._write({"event": "POLICY_LOADED", "policy_sha256": "other",
+                     "utc_ns": 1})
+        self.assertFalse(pol.wait_for_policy_load(self.led, "abc",
+                                                  timeout_s=0.5))
+
+    def test_missing_ledger_is_false_not_true(self):
+        """Absence of evidence that it loaded is never evidence it did."""
+        self.assertFalse(pol.wait_for_policy_load(
+            os.path.join(self.tmp, "nope.jsonl"), "abc", timeout_s=0.3))
+
+    def test_rendered_record_commits_to_the_policy_bytes(self):
+        p = policy([grant()])
+        rec = pol.build_rendered_record("R1", p, [], "/tmp/policy.json")
+        self.assertEqual(rec["policy_sha256"], pol.policy_sha256(p))
+        self.assertEqual(rec["approval_ids"], ["appr-1"])
+        self.assertIn("beside", rec["presentation"])
+
+
+class TestConfigModePrerequisite(unittest.TestCase):
+    """An approval for a CONFIG-MODE command is unusable on its own: the
+    session must first run `configure terminal`, which no approval
+    covers, so the approved change is denied at the door.
+
+    The compiler therefore emits an auxiliary grant for `configure
+    terminal`, bound to the SAME approval, same TTL, single use, and
+    marked `derived`. It is emitted only for config-mode commands and is
+    never presented as something a human approved.
+
+    This is safe because `aaa authorization config-commands` is on: the
+    session can enter config mode and still run ONLY the approved line.
+    The blast radius is one command, not a shell."""
+
+    def _appr(self, command):
+        return {"approval_id": "a1", "device": "R1", "command": command,
+                "ttl_ns": 300 * SEC, "issued_utc_ns": NOW,
+                "signature_verified": True}
+
+    def test_config_command_gets_a_derived_configure_terminal_grant(self):
+        grants, _ = pol.compile_grants([self._appr("interface Loopback77")],
+                                       now_ns=NOW)
+        cmds = sorted(g["command"] for g in grants)
+        self.assertEqual(cmds, ["configure terminal", "interface Loopback77"])
+        derived = [g for g in grants if g["command"] == "configure terminal"]
+        self.assertEqual(derived[0]["derived"], "config_mode_prerequisite")
+        self.assertEqual(derived[0]["approval_id"], "a1")
+
+    def test_exec_command_gets_no_prerequisite(self):
+        grants, _ = pol.compile_grants([self._appr("show ip route")],
+                                       now_ns=NOW)
+        self.assertEqual([g["command"] for g in grants], ["show ip route"])
+
+    def test_derived_grant_shares_the_approval_window(self):
+        grants, _ = pol.compile_grants([self._appr("interface Loopback77")],
+                                       now_ns=NOW)
+        windows = {(g["not_before_ns"], g["not_after_ns"]) for g in grants}
+        self.assertEqual(len(windows), 1)
+
+    def test_approved_grant_is_never_marked_derived(self):
+        grants, _ = pol.compile_grants([self._appr("interface Loopback77")],
+                                       now_ns=NOW)
+        real = [g for g in grants if g["command"] == "interface Loopback77"]
+        self.assertIsNone(real[0].get("derived"))
+
+    def test_one_prerequisite_even_with_several_config_approvals(self):
+        """Two approved config lines must not mint two `configure
+        terminal` grants -- that would silently double the number of
+        times the session may enter config mode."""
+        a1 = self._appr("interface Loopback77")
+        a2 = dict(self._appr("interface Loopback78"), approval_id="a2")
+        grants, _ = pol.compile_grants([a1, a2], now_ns=NOW)
+        ct = [g for g in grants if g["command"] == "configure terminal"]
+        self.assertEqual(len(ct), 1, "exactly one prerequisite grant")
