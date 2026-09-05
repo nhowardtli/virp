@@ -392,10 +392,37 @@ uid needs:
 - an entry in `socket_uid_chain_append_types` — exactly
   `["evidence_item"]`
 
-All three are mandatory: the daemon **refuses to start** naming the uid
-if an allowlisted uid is missing from the action or type map. A
-forgotten entry is a boot failure, never a silent grant. In the lab this
-is a rendered lab config; no production template is edited by this work.
+All three are mandatory **for an appending uid**, and the daemon
+**refuses to start** naming the uid if one is missing. A forgotten entry
+is a boot failure, never a silent grant.
+
+The rule is conditional, and the condition matters when editing a live
+node's config: a `socket_uid_chain_append_types` entry is required only
+of a uid whose `socket_uid_action_allow` set **contains `chain_append`**
+(`src/virp_onode.c:4218-4231`). A uid that never appends legitimately has
+no type entry, and a missing entry means *unrestricted*, not deny-all —
+the boot invariant is what stops that from becoming a silent grant,
+because it guarantees every uid that can reach this code path has a
+policy.
+
+**Confirmed against both deployed nodes, 2026-09-05:**
+
+```
+10.0.10.211  999 1000 997 995 993  chain_append=yes  type policy present
+             994                   chain_append=no   no policy   (boots fine)
+10.0.0.13    999 1000              chain_append=yes  type policy present
+             997 1001              chain_append=no   no policy   (boots fine)
+```
+
+So adding a receiver uid is a **single edit touching three keys at
+once**. Adding it to `socket_allowed_uids` and `socket_uid_action_allow`
+with `chain_append`, but forgetting
+`socket_uid_chain_append_types`, does not degrade to a refusal at append
+time — it stops the daemon coming back up, which turns a planned restart
+into an outage on every device that node governs.
+
+In the lab this is a rendered lab config; no production template is
+edited by this work.
 
 ---
 
