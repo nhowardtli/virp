@@ -1,6 +1,6 @@
 {
  "captured_on_port": "tty0",
- "captured_utc_ns": 1788620119714636663,
+ "captured_utc_ns": 1788620860308414960,
  "device": "R1",
  "entries": [
   {
@@ -221,6 +221,41 @@
    "typed": "show logging"
   },
   {
+   "accounted_cmd": null,
+   "mode": "exec",
+   "note": "no accounting record",
+   "receipts": 0,
+   "typed": "show running-config"
+  },
+  {
+   "accounted_cmd": null,
+   "mode": "exec",
+   "note": "AMBIGUOUS: 2 receipts arrived in this window (['show running-config <cr>', 'show running-config <cr>']) -- another session was active; not recorded as truth",
+   "receipts": 2,
+   "typed": "sh run"
+  },
+  {
+   "accounted_cmd": "show ip bgp summary <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show ip bgp summary"
+  },
+  {
+   "accounted_cmd": "terminal length 0 <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "terminal length 0"
+  },
+  {
+   "accounted_cmd": "configure terminal <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "configure terminal"
+  },
+  {
    "accounted_cmd": "interface Loopback 301 <cr>",
    "mode": "config",
    "note": null,
@@ -242,20 +277,6 @@
    "typed": "int lo301"
   },
   {
-   "accounted_cmd": "interface GigabitEthernet 0/0 <cr>",
-   "mode": "config",
-   "note": null,
-   "receipts": 1,
-   "typed": "interface GigabitEthernet0/0"
-  },
-  {
-   "accounted_cmd": "interface GigabitEthernet 0/0 <cr>",
-   "mode": "config",
-   "note": null,
-   "receipts": 1,
-   "typed": "int gi0/0"
-  },
-  {
    "accounted_cmd": "description CORPUS-TEST <cr>",
    "mode": "config",
    "note": null,
@@ -270,6 +291,27 @@
    "typed": "no description"
   },
   {
+   "accounted_cmd": "ip address 10.30.1.1 255.255.255.255 <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "ip address 10.30.1.1 255.255.255.255"
+  },
+  {
+   "accounted_cmd": "no ip address <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "no ip address"
+  },
+  {
+   "accounted_cmd": "shutdown <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "shutdown"
+  },
+  {
    "accounted_cmd": "no shutdown <cr>",
    "mode": "config",
    "note": null,
@@ -279,43 +321,22 @@
   {
    "accounted_cmd": null,
    "mode": "config",
-   "note": "no accounting record",
-   "receipts": 0,
-   "typed": "shutdown"
-  },
-  {
-   "accounted_cmd": null,
-   "mode": "config",
-   "note": "no accounting record",
-   "receipts": 0,
-   "typed": "ip address 10.30.1.1 255.255.255.255"
-  },
-  {
-   "accounted_cmd": null,
-   "mode": "config",
-   "note": "no accounting record",
-   "receipts": 0,
-   "typed": "no ip address"
-  },
-  {
-   "accounted_cmd": null,
-   "mode": "config",
-   "note": "no accounting record",
-   "receipts": 0,
+   "note": "AMBIGUOUS: 2 receipts arrived in this window (['do-exec show clock <cr>', 'show clock <cr>']) -- another session was active; not recorded as truth",
+   "receipts": 2,
    "typed": "do show clock"
   },
   {
    "accounted_cmd": null,
    "mode": "config",
-   "note": "no accounting record",
-   "receipts": 0,
+   "note": "AMBIGUOUS: 2 receipts arrived in this window (['do-exec sh ver <cr>', 'show version <cr>']) -- another session was active; not recorded as truth",
+   "receipts": 2,
    "typed": "do sh ver"
   },
   {
-   "accounted_cmd": null,
+   "accounted_cmd": "logging buffered 16384 <cr>",
    "mode": "config",
-   "note": "no accounting record",
-   "receipts": 0,
+   "note": null,
+   "receipts": 1,
    "typed": "logging buffered 16384"
   },
   {
@@ -323,7 +344,7 @@
    "mode": "config",
    "note": "no accounting record",
    "receipts": 0,
-   "typed": "no logging console"
+   "typed": "end"
   }
  ],
  "ios_version": "15.2(4)M7",

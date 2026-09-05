@@ -264,7 +264,28 @@ class TestA8BadSignature(unittest.TestCase):
 
 
 class TestA9ChainedCommands(unittest.TestCase):
-    """A9: chained command against an approval for the first half only."""
+    """A9: chained command against an approval for the first half only.
+
+    WHAT WAS BELIEVED IN SESSION 2, AND WHY IT WAS WRONG.
+    The original assertion was "the chained form is DENIED". It is not.
+    IOS truncates at `;` before authorization: for
+    `interface LoopbackN ; reload` the server is asked only about
+    `interface Loopback N`, that PASSES, and `reload` is never authorized
+    and never runs. The attack does not escalate, but not for the reason
+    the test claimed -- it was asserting a denial mechanism that does not
+    exist, and would have kept passing if the denial had silently stopped
+    working.
+
+    Two things follow, and both are now true elsewhere:
+      - the ENGINE still denies a chained string if one ever reaches it
+        (these tests), because the metacharacter is attacker input and
+        splitting it would invent a permission;
+      - the COMPILER now REFUSES to render any approval whose text
+        contains `;` or `|` at all (TestUnrenderableApprovalText), because
+        such an approval means something different from what the router
+        will be asked -- the approver's text and the granted text would
+        disagree, invisibly.
+    """
 
     def test_semicolon_chain_denies(self):
         p = policy([grant(command="show clock")])

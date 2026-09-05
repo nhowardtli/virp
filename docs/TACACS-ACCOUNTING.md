@@ -1137,6 +1137,72 @@ not a borrowed one.
 
 ---
 
+## 8c. Docket additions from the §9 resolution
+
+**Docket was not edited.** Field sets, reported.
+
+### `BREAKGLASS_USED` — a verdict that must render as an alarm
+
+A new value in `tacacs_reconciliation/1`'s closed verdict set, and a new
+`grade` axis beside it.
+
+| field | type | meaning |
+|---|---|---|
+| `items[].verdict` | string | now includes `BREAKGLASS_USED` |
+| `items[].grade` | string | closed set: `RED`, `NOT_GRADED` |
+| `items[].user` | string\|null | the account the ROUTER authenticated |
+| `grade_tally` | {grade: int} | per-record counts |
+| `run_grade_tally` | {grade: int}\|absent | run-wide counts, carried in EVERY chunk |
+
+**Three rendering rules, each from a mistake this session made or nearly
+made:**
+
+1. **`RED` must be visible without opening every chunk.** A chunked run
+   carried the run-wide VERDICT tally but not the run-wide GRADE tally,
+   so chunk 0 of a run with 10 RED items read `RED: 0`. Every chunk now
+   carries `run_grade_tally`; a renderer must read that, never sum the
+   per-chunk `grade_tally`.
+2. **`BREAKGLASS_USED` must not be displayed as a kind of
+   `UNGOVERNED`.** Break-glass has no gate record by definition, so
+   `UNGOVERNED` is where it lands by default — and that is a counting
+   bucket. An alarm in a counting bucket is an alarm nobody sees.
+3. **`NOT_GRADED` is not "no break-glass happened".** The break-glass
+   account list is configuration. With none supplied the reconciler
+   cannot grade, and saying so is different from saying nothing occurred.
+
+### `tacacs_authz_policy_render_refused/1` — approvals that did NOT render
+
+| field | type | meaning |
+|---|---|---|
+| `schema` | string | `"tacacs_authz_policy_render_refused/1"` |
+| `device` | string | device the render was for |
+| `refused_utc_ns` | u64 | when the compiler refused |
+| `refused_count` | int | how many approvals did not render |
+| `refusals[]` | array | `{approval_id, reason}` |
+| `presentation` | string | beside-the-ladder rule, in the record |
+
+**Why this is its own record and not a footnote on the policy.** An
+approval that silently failed to render is a silent denial of approved
+work, and from the router's side it is indistinguishable from an attack:
+the command arrives, no grant matches, it is refused. The operator sees a
+denial and the approver sees an approval, and nothing connects them. This
+record is the connection.
+
+### Identity used — still missing, now located precisely
+
+The `outcome` record is built by `snprintf` into a fixed `content[1024]`
+at `src/virp_onode.c:855-866` and hashed as the artifact body. It does
+**not** pass through `build_canonical_json`, so adding a field is **not**
+a canonical-format-window item — it is an ordinary daemon-reserved schema
+change, and it is not made here.
+
+Recommended: `executed_as` (string, the AAA username the gate
+authenticated with). Until it exists, "which identity executed this" is
+answerable only from the `tacacs_authorization/1` record's `user` field,
+and nothing binds that to the outcome.
+
+---
+
 ## 9. Scope of authorization, and what this source still does not prove
 
 ### 9.1 The resolution: authorization applies to the GATE's identities only

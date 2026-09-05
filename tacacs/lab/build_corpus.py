@@ -42,6 +42,8 @@ EXEC_CMDS = [
     "SHOW VERSION", "Show Clock",
     "show   ip    route",
     "show file systems", "show logging",
+    "show running-config", "sh run", "show ip bgp summary",
+    "terminal length 0",
 ]
 # CONFIG-MODE probes run ONLY against a throwaway loopback.
 #
@@ -152,6 +154,13 @@ def main():
             accounted, note = got[0]["accounted_cmd"], None
         elif not got:
             accounted, note = None, "no accounting record"
+        elif len({g["accounted_cmd"] for g in got}) == 1:
+            # Several receipts, all carrying the SAME string: a slow
+            # command's record can land inside the next command's window.
+            # Content-identical is not ambiguous, and refusing it loses a
+            # real row (`sh run` was dropped this way).
+            accounted = got[0]["accounted_cmd"]
+            note = "%d receipts, all identical" % len(got)
         else:
             accounted = None
             note = ("AMBIGUOUS: %d receipts arrived in this window (%r) -- "
@@ -166,10 +175,14 @@ def main():
 
     for cmd in EXEC_CMDS:
         capture(cmd, "exec")
-    c.run("configure terminal", 2.5)
+    # `configure terminal` and `end` are captured as the transitions they
+    # are: the compiler mints a `configure terminal` grant as the
+    # config-mode prerequisite, so its canonical form has to come from
+    # the router like every other.
+    capture("configure terminal", "exec")
     for cmd in CONFIG_CMDS:
         capture(cmd, "config")
-    c.run("end", 2)
+    capture("end", "config")
     c.run("no interface %s" % CORPUS_IF, 2)
     c.close()
 
