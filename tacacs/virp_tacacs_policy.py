@@ -180,7 +180,11 @@ def compile_grants(approvals, now_ns, default_uses=1):
                           % (not_after, now_ns)})
             continue
 
-        uses = int(a.get("repeat_count") or default_uses)
+        # `or default_uses` would silently CLAMP repeat_count 0 to 1,
+        # turning an approval that grants nothing into one that grants a
+        # use. An explicit None check refuses it instead.
+        rc_raw = a.get("repeat_count")
+        uses = default_uses if rc_raw is None else int(rc_raw)
         if uses < 1:
             refusals.append({"approval_id": aid,
                              "reason": "repeat_count %r is below 1" % uses})
@@ -232,7 +236,10 @@ def compile_grants(approvals, now_ns, default_uses=1):
             "approval_entry_hash": anchor.get("approval_entry_hash"),
             "not_before_ns": min(g["not_before_ns"] for g in cgs),
             "not_after_ns": max(g["not_after_ns"] for g in cgs),
-            "uses_remaining": len(cgs),
+            # One entry into config mode per USE, not per grant: a
+            # repeat_count 3 change needs to enter config mode 3 times,
+            # and counting grants would leave it stranded after the first.
+            "uses_remaining": sum(int(g["uses_remaining"]) for g in cgs),
             "accepted_spellings": command_spellings(CONFIG_ENTRY_COMMAND),
             "spelling_rule": SPELLING_RULE,
             # Never presented as something a human approved.

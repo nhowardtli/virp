@@ -1030,3 +1030,52 @@ class TestReconcilerUsesAuthzDecisions(unittest.TestCase):
                               "decision": "PASS_ADD", "recv_utc_ns": t}])
         self.assertEqual(items[0]["verdict"], "UNGOVERNED")
         self.assertEqual(items[0]["authz_decision"], "PASS_ADD")
+
+
+class TestS2RepeatCount(unittest.TestCase):
+    """S2: an approval carrying repeat_count 3 grants exactly three uses.
+
+    Default stays single use. The repeat count must come from the
+    APPROVAL, never from the compiler's own default, or the compiler
+    would be deciding how many times a change may be applied."""
+
+    def _appr(self, repeat=None):
+        a = {"approval_id": "rep1", "device": "R1",
+             "command": "interface Loopback61", "ttl_ns": 300 * SEC,
+             "issued_utc_ns": NOW, "signature_verified": True}
+        if repeat is not None:
+            a["repeat_count"] = repeat
+        return a
+
+    def test_default_is_single_use(self):
+        g = [x for x in pol.compile_grants([self._appr()], now_ns=NOW)[0]
+             if x.get("derived") is None][0]
+        self.assertEqual(g["uses_remaining"], 1)
+
+    def test_repeat_count_three_grants_three(self):
+        g = [x for x in pol.compile_grants([self._appr(3)], now_ns=NOW)[0]
+             if x.get("derived") is None][0]
+        self.assertEqual(g["uses_remaining"], 3)
+
+    def test_three_pass_then_the_fourth_denies(self):
+        p = policy([grant(uses=3, command="interface Loopback61")])
+        for i in range(3):
+            st, _, gid = az.authorize(p, **req("interface Loopback61"))
+            self.assertEqual(st, az.PASS_ADD, "use %d" % (i + 1))
+            az.consume(p, gid)
+        st, reason, _ = az.authorize(p, **req("interface Loopback61"))
+        self.assertEqual(st, az.FAIL)
+        self.assertIn("spent", reason.lower())
+
+    def test_prerequisite_covers_every_repeat(self):
+        """A 3-use config change needs to enter config mode 3 times."""
+        grants, _ = pol.compile_grants([self._appr(3)], now_ns=NOW)
+        ct = [g for g in grants if g["command"] == "configure terminal"][0]
+        self.assertEqual(ct["uses_remaining"], 3)
+
+    def test_zero_or_negative_repeat_is_refused_not_clamped(self):
+        for bad in (0, -1):
+            grants, refusals = pol.compile_grants([self._appr(bad)],
+                                                  now_ns=NOW)
+            self.assertEqual(grants, [], "repeat_count %r" % bad)
+            self.assertEqual(len(refusals), 1)
