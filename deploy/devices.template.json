@@ -14,7 +14,11 @@
     "${VIRP_BROKER_UID}"
   ],
   "_socket_uid_tier_ceilings_note": "Per-uid tier ceilings (2026-08-09). A uid listed here has its effective gate ceiling TIGHTENED to the named tier and can NEVER raise the node-wide gate_max_tier. ${VIRP_NETCLAW_UID} (virp-netclaw, the remote netclaw requester) is pinned to GREEN: reads auto-execute, while YELLOW and RED both become proposal-only for it \u2014 local operators (uid 1000) and the autopilot keep the node-wide YELLOW ceiling. This is what makes the remote AI path read-only-by-default without lowering the whole node. Enforced in onode_execute_obs_ex via onode_effective_max_tier, on BOTH the single and batch execute paths; the connecting uid is SO_PEERCRED, not client-asserted.",
+  "_socket_uid_tier_ceilings_note_2026_09_05": "999/1000/994 pinned to green when SW-3850 joined the fleet (2026-09-05). Before this they carried NO ceiling and so inherited the node-wide gate_max_tier, which is YELLOW \u2014 meaning the autopilot could auto-execute show running-config, show tech-support and clear counters against the switch that carries the colo. There is no per-device tier cap in this daemon; the only knobs are the node-wide gate_max_tier and this per-uid map, so protecting one device means capping the identities fleet-wide. MEASURED COST before applying it, 3 days of journal on this node: 319 YELLOW decisions, 313 of them already blocked at uid 997 (which has held a green ceiling all along), and exactly 3 allowed \u2014 all uid 999, all `vtysh -c \"show running-config\"` auto-executed against clab-frr-ospf-frr1. Those three now file a PROPOSAL instead of executing, which is a queue for a human, not a loss. virp-config-backup runs as uid 997 and is unaffected. uid 1000 and 994 executed no YELLOW at all in that window, so their caps cost nothing.",
   "socket_uid_tier_ceilings": {
+    "${VIRP_UID}": "green",
+    "1000": "green",
+    "${VIRP_BROKER_UID}": "green",
     "${VIRP_NETCLAW_UID}": "green",
     "${VIRP_BACKUP_UID}": "green",
     "${VIRP_EVIDENCE_UID}": "green"
