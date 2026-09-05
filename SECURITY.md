@@ -1364,18 +1364,33 @@ touched.
   restart re-opens the chain, writes a fresh `node_config`, and clears the
   latch — so `node_config` is not rewritten on recovery within a run,
   because there is no in-run recovery.
-- **Approved-apply outcome-fail is a known limitation.** The
-  unchained-execution marker is returned on the auto-execute path. For an
-  approved apply the `outcome` record is written after the observation is
-  already built (the `pre_outcome` ordering the adversarial crash test
-  pins), so an `outcome`-append failure there still latches
-  evidence-degraded and leaves the intent OPEN, but that one caller may
-  receive a normal observation rather than the marker. Exact shape: the
-  approved-apply caller may get a normal observation while its outcome is
-  unrecorded; the daemon latches; the intent grades OPEN and must be
-  reconciled against the target. Closing it means moving the `outcome`
-  append ahead of the observation build, which is entangled with the
-  `pre_outcome` fault point and deferred with the late-closer spool.
+- **Approved-apply outcome-fail returns `unchained-execution` too (V39
+  item 1).** This was carried as a known limitation: the marker was
+  returned only on the auto-execute path, so an approved apply whose
+  `outcome` append failed after the device had acted could hand its caller
+  an ordinary observation. It no longer can. `approval_emit_outcome()`
+  returns an error, and every approved call site — the four driver-failure
+  returns and the success return — replaces its response with the signed
+  `unchained-execution` ERROR when that append fails. The response names
+  the OPEN intent entry hash, the proposal id and the approval entry hash,
+  and states in words that whether the device changed **cannot be
+  determined from it**: on four of those five sites the driver also
+  reported a failure, and "the outcome was not chained" must never be read
+  as "nothing happened".
+
+  What did NOT change, deliberately: the `outcome` append still happens
+  where it always did, after the observation is built, so the `pre_outcome`
+  fault point and the artefact set that survives a kill there are exactly
+  as the adversarial crash transcript pins them. Only the caller's response
+  changes. The intent stays OPEN — no synthetic outcome is written — and
+  the approval stays consumed: it was spent by the committed `gate_intent`
+  before dispatch, so a second apply refuses `approval_reused` (-37) and
+  the daemon never retries the physical action. Evidence-degraded latches
+  through the same `onode_mark_evidence_degraded()` path as the
+  auto-execute case. Recovery of the lost outcome is still the deferred
+  late-closer spool (`docs/PROPOSAL-LATE-CLOSER-SPOOL.md`); this is the
+  fail-safe, not the recovery. Covered by
+  `tests/test_approved_outcome_fi.c` (`make test-approved-outcome-fi`).
 - **The fault hook is compile-gated.** The `evidence_fail_closer_once` /
   `evidence_ttl_now_override_ns` injection fields exist ONLY under
   `-DVIRP_FAULT_INJECT`, exactly like the `VIRP_FI()` crash points — the

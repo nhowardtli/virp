@@ -257,6 +257,39 @@ elements a draft-07 reader must know; the mechanism and rationale are in
   restart (1.3). The durable late-closer spool that would recover such an
   outcome is deferred — see `docs/PROPOSAL-LATE-CLOSER-SPOOL.md`.
 
+- **`unchained-execution` — protocol vocabulary (V39 item 1).** A distinct
+  *kind* of signed error, not a variant of the gate's other refusals, and a
+  reader must not treat it as one. It is carried in the payload of a signed
+  `VIRP_OBS_ERROR` observation at the command's true classified tier, and
+  it means exactly:
+
+  > the gate admitted this command, a `gate_intent` was committed, the
+  > driver was dispatched, and the record of what the device did could not
+  > be committed to the chain.
+
+  It is the only error in the vocabulary that is emitted **after** dispatch.
+  Every other refusal (`evidence-unavailable`, `approval_reused`,
+  `approval_expired`, the tier-gate block, `evidence-degraded`) asserts that
+  nothing reached the device; this one asserts the opposite, and says so.
+  Distinguish it from its neighbour `evidence-unavailable` (-53): that is
+  the PRE-dispatch refusal — the intent could not be made durable, nothing
+  was sent. `unchained-execution` is its post-dispatch mirror.
+
+  Payload contract (substring-stable, both paths):
+  - always contains the literal token `unchained-execution`;
+  - names the OPEN `gate_intent` by the first 16 hex of its
+    `chain_entry_hash`, followed by the word `OPEN`;
+  - names the underlying cause (`virp_error_str` of the append failure);
+  - says the daemon is now `evidence-degraded` until restart;
+  - on the approved-apply path additionally names the `proposal_id` and the
+    approval's chain entry hash, and states that whether the device changed
+    **cannot be determined** from the response.
+
+  Chain-visible consequence: the intent is left OPEN and no closer is ever
+  synthesised for it, so the C and Python verifiers grade the session
+  `executions_open >= 1` with `valid` still true. The caller is expected to
+  reconcile against the target; the O-Node cannot.
+
 ## 5. Three body-level truth gaps still open (recorded together)
 
 These are pre-existing honesty gaps in the daemon's own record bodies, NOT

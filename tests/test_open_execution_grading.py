@@ -302,6 +302,34 @@ class TestOpenExecutionGrading(unittest.TestCase):
         self.assertEqual(self._fail_reasons(summary), [])
         self.assertEqual(summary["executions_closed"], 1)
 
+    def test_unchained_approved_apply_is_open_not_broken(self):
+        """V39 item 1 — the approved-apply half of the unchained-execution
+        shape. The gate committed a gate_intent naming the approval, the
+        device acted, and the `outcome` closer never landed because the
+        chain would not take the write. Python must grade this exactly as
+        it grades the auto-execute half: the chain is CLEAN (every entry
+        passes on its own merits, nothing is tampering, no double-spend)
+        and the intent is OPEN, awaiting reconciliation against the target.
+
+        The daemon writes no synthetic outcome for it, which is why the
+        shape is a bare intent and not a closer of any kind."""
+        b = ChainBuilder()
+        i = b.intent(decision="approved-apply", proposal_id="p-unchained",
+                     approval_entry_hash="f" * 64)
+        verifications, summary = b.verify()
+        self._assert_chain_clean(verifications, summary)
+        self.assertEqual(self._fail_reasons(summary), [])
+        self.assertEqual(summary["executions_closed"], 0)
+        self.assertEqual(len(summary["open_executions"]), 1)
+        v = summary["open_executions"][0]
+        self.assertEqual(v.entry["chain_entry_hash"], i["chain_entry_hash"])
+        self.assertEqual(v.entry["artifact_type"], "gate_intent")
+        body = json.loads(b.artifacts[(i["artifact_id"], i["artifact_hash"])])
+        self.assertEqual(body["decision"], "approved-apply")
+        self.assertEqual(body["proposal_id"], "p-unchained")
+        # An open execution is a reconciliation task, never a tamper exit.
+        self.assertNotIn(v, summary["failed_entries"])
+
     def test_legacy_pre_intent_chain_grades_unchanged(self):
         """item 7 — a chain with gate_execution/1 bodies that carry no
         intent citation, no gate_intent entries and no node_config grades
