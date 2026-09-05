@@ -1033,6 +1033,28 @@ test-config-backup:
 test-render-devices:
 	@bash tests/test_render_devices.sh
 
+# The deploy dirty-tree guard must fail CLOSED. The four install targets
+# share scripts/require-clean-tree.sh; this proves it refuses when git
+# cannot answer at all — a worktree owned by a uid git calls dubious
+# (the ordinary shape of `sudo make install-prod`), a tree with no .git,
+# no git on PATH — and that the target does not proceed anyway. The
+# real-ownership tier needs the privilege to chown and self-skips
+# without it; `sudo make test-deploy-dirty-guard` runs it for real.
+# Reads no production path, writes none.
+.PHONY: test-deploy-dirty-guard
+test-deploy-dirty-guard:
+	@bash tests/test_deploy_dirty_guard.sh
+
+# Every line of the DEPLOYED.md stanza is a provenance claim, so every
+# line must be established or deploy-record must fail. Runs the real
+# recipe against a sandbox VIRP_INSTALL_DIR inside a throwaway git repo:
+# a missing or unreadable artifact, and an unborn HEAD, must refuse
+# rather than record an empty field. Reads no production path, writes
+# none.
+.PHONY: test-deploy-record-facts
+test-deploy-record-facts:
+	@bash tests/test_deploy_record_facts.sh
+
 # Sep 1 review, Task 2: the SHIPPED templates, rendered by the real
 # render-devices.sh into a sandbox, must give every allowed uid an
 # explicit socket_uid_action_allow entry (the daemon refuses to start
@@ -1415,17 +1437,19 @@ VIRP_INSTALL_PY     = autopilot/virp_autopilot.py \
                       autopilot/virp_config_backup.py \
                       autopilot/virp_evidence.py
 
+# The dirty-tree guard is scripts/require-clean-tree.sh, shared by all
+# four install targets. It replaced four hand-copied `st=$(git status
+# --porcelain 2>/dev/null)` checks that read a FAILING git as a clean
+# tree -- dubious ownership under sudo, a tree with no .git, or no git at
+# all all deployed silently and stamped DEPLOYED.md with an unverified
+# commit. One helper, git's exit status kept, refusal on nonzero before
+# the dirty test is even reached. See the script header and
+# tests/test_deploy_dirty_guard.sh.
 .PHONY: install-prod
 install-prod: prod $(TOOL_BIN) deploy-capture
 	@test -f $(ONODE_PROD) || { echo "FAIL: $(ONODE_PROD) was not built"; exit 1; }
 	@test -f $(TOOL_BIN) || { echo "FAIL: $(TOOL_BIN) was not built"; exit 1; }
-	@st=$$(git status --porcelain 2>/dev/null); \
-	 if [ -n "$$st" ]; then \
-	     echo "FAIL: refusing to install from a dirty tree — what gets deployed"; \
-	     echo "      must be exactly what a commit hash names:"; \
-	     echo "$$st"; \
-	     exit 1; \
-	 fi
+	@scripts/require-clean-tree.sh "refusing to install from a dirty tree"
 	@echo "=== installing to $(VIRP_INSTALL_DIR) (outside any worktree) ==="
 	install -d -m 0755 $(VIRP_INSTALL_DIR)
 	install -m 0755 $(ONODE_PROD) $(VIRP_INSTALL_BIN)
@@ -1440,25 +1464,61 @@ install-prod: prod $(TOOL_BIN) deploy-capture
 # The DEPLOYED.md stanza, generated rather than hand-written so it cannot
 # drift from what is actually installed. Refuses on a dirty tree for the
 # same reason install-prod does.
+#
+# Every line of the stanza is a provenance CLAIM, so every line has to be
+# established or the target has to fail. It used to interpolate each fact
+# straight into an echo:
+#
+#     @echo "- **Commit**: \`$$(git rev-parse HEAD)\`"
+#     @echo "- **sha256**: \`$$(sha256sum $(VIRP_INSTALL_BIN) | awk '{print $$1}')\`"
+#
+# which is the dirty-tree guard's defect one field at a time. A command
+# substitution that fails expands to nothing, so the recipe printed
+# `- **Commit**: ``' or `- **sha256** `/usr/local/lib/virp/virp`: ``'
+# and exited 0 — a record with a hole in it, written into the file that
+# is supposed to be the answer to "what is running?". The sha256 lines
+# were worse than the commit line: the pipe into awk discards
+# sha256sum's exit status outright, and only the daemon binary had a
+# `test -f` in front of it, so a missing virp-tool, helper script or
+# autopilot module recorded an empty hash rather than stopping.
+#
+# Now every fact is captured, checked, and only then printed. The
+# helpers must not run inside `$$(...)` — `exit` in a command
+# substitution kills the subshell and lets the recipe carry on with an
+# empty value, which is the exact failure being fixed — so sha_of sets
+# $$H in the recipe's own shell instead of echoing.
 .PHONY: deploy-record
 deploy-record:
 	@test -f $(VIRP_INSTALL_BIN) || \
 	    { echo "FAIL: $(VIRP_INSTALL_BIN) is not installed"; exit 1; }
-	@st=$$(git status --porcelain 2>/dev/null); \
-	 if [ -n "$$st" ]; then echo "FAIL: tree is dirty:"; echo "$$st"; exit 1; fi
-	@echo "- **Commit**: \`$$(git rev-parse HEAD)\`"
-	@echo "- **Branch**: \`$$(git rev-parse --abbrev-ref HEAD)\`"
-	@echo "- **Tree at install**: clean (\`git status --porcelain\` empty)"
-	@echo "- **Installed binary**: \`$(VIRP_INSTALL_BIN)\`"
-	@echo "- **sha256**: \`$$(sha256sum $(VIRP_INSTALL_BIN) | awk '{print $$1}')\`"
-	@echo "- **sha256** \`$(VIRP_INSTALL_TOOL)\`: \`$$(sha256sum $(VIRP_INSTALL_TOOL) | awk '{print $$1}')\`"
-	@for s in $(VIRP_INSTALL_SCRIPTS); do \
-	    b=$$(basename $$s); \
-	    echo "- **sha256** \`$(VIRP_INSTALL_DIR)/$$b\`: \`$$(sha256sum $(VIRP_INSTALL_DIR)/$$b | awk '{print $$1}')\`"; \
-	 done
-	@for s in $(VIRP_INSTALL_PY); do \
-	    b=$$(basename $$s); \
-	    echo "- **sha256** \`$(VIRP_INSTALL_PY_DIR)/$$b\`: \`$$(sha256sum $(VIRP_INSTALL_PY_DIR)/$$b | awk '{print $$1}')\`"; \
+	@scripts/require-clean-tree.sh "refusing to record a deploy"
+	@set -u; \
+	 die() { echo "FAIL: refusing to record a deploy — $$*" >&2; exit 1; }; \
+	 sha_of() { \
+	     [ -f "$$1" ] || die "$$1 is not installed; the record cannot name its sha256"; \
+	     H=$$(sha256sum "$$1") || die "sha256sum failed on $$1"; \
+	     H=$${H%% *}; \
+	     [ -n "$$H" ] || die "sha256sum printed nothing for $$1"; \
+	 }; \
+	 commit=$$(git rev-parse HEAD) || die "git rev-parse HEAD failed"; \
+	 [ -n "$$commit" ] || die "git rev-parse HEAD printed nothing"; \
+	 branch=$$(git rev-parse --abbrev-ref HEAD) || die "git rev-parse --abbrev-ref HEAD failed"; \
+	 [ -n "$$branch" ] || die "git rev-parse --abbrev-ref HEAD printed nothing"; \
+	 echo "- **Commit**: \`$$commit\`"; \
+	 echo "- **Branch**: \`$$branch\`"; \
+	 echo "- **Tree at install**: clean (\`git status --porcelain\` exited 0 and printed nothing; see scripts/require-clean-tree.sh)"; \
+	 echo "- **Installed binary**: \`$(VIRP_INSTALL_BIN)\`"; \
+	 sha_of "$(VIRP_INSTALL_BIN)"; echo "- **sha256**: \`$$H\`"; \
+	 sha_of "$(VIRP_INSTALL_TOOL)"; echo "- **sha256** \`$(VIRP_INSTALL_TOOL)\`: \`$$H\`"; \
+	 for s in $(VIRP_INSTALL_SCRIPTS); do \
+	     b=$$(basename $$s) || die "basename failed on $$s"; \
+	     sha_of "$(VIRP_INSTALL_DIR)/$$b"; \
+	     echo "- **sha256** \`$(VIRP_INSTALL_DIR)/$$b\`: \`$$H\`"; \
+	 done; \
+	 for s in $(VIRP_INSTALL_PY); do \
+	     b=$$(basename $$s) || die "basename failed on $$s"; \
+	     sha_of "$(VIRP_INSTALL_PY_DIR)/$$b"; \
+	     echo "- **sha256** \`$(VIRP_INSTALL_PY_DIR)/$$b\`: \`$$H\`"; \
 	 done
 
 # =========================================================================
@@ -1544,9 +1604,7 @@ deploy-capture:
 .PHONY: install-units
 install-units: check-deploy-unit-source
 	@test -f $(VIRP_UNIT_SRC) || { echo "FAIL: $(VIRP_UNIT_SRC) missing"; exit 1; }
-	@st=$$(git status --porcelain 2>/dev/null); \
-	 if [ -n "$$st" ]; then \
-	     echo "FAIL: refusing to install a unit from a dirty tree:"; echo "$$st"; exit 1; fi
+	@scripts/require-clean-tree.sh "refusing to install a unit"
 	install -d -m 0755 $(VIRP_DROPIN_DIR)
 	install -m 0644 $(VIRP_UNIT_SRC) $(VIRP_UNIT_DST)
 	systemctl daemon-reload
@@ -1582,10 +1640,7 @@ VIRP_DEVICES_TEMPLATE_DST = /etc/virp/devices.template.json
 install-devices-template:
 	@test -f $(VIRP_DEVICES_TEMPLATE_SRC) || \
 	    { echo "FAIL: $(VIRP_DEVICES_TEMPLATE_SRC) missing"; exit 1; }
-	@st=$$(git status --porcelain 2>/dev/null); \
-	 if [ -n "$$st" ]; then \
-	     echo "FAIL: refusing to install a template from a dirty tree:"; \
-	     echo "$$st"; exit 1; fi
+	@scripts/require-clean-tree.sh "refusing to install a template"
 	@python3 -c "import json,sys; json.load(open('$(VIRP_DEVICES_TEMPLATE_SRC)'.replace(chr(36)+'{','')))" \
 	    2>/dev/null || true
 	install -m 0644 $(VIRP_DEVICES_TEMPLATE_SRC) $(VIRP_DEVICES_TEMPLATE_DST)
@@ -2047,7 +2102,7 @@ test-release-tools:
 	@scripts/gen-test-attestation.sh --selftest
 	@scripts/verify-release-bundle.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-evidence-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

@@ -147,6 +147,27 @@ DEPLOYED until the next rebuild.
   signature still does not say what the comments in
   `src/virp_approval.c` claim. Fixing it means widening the signed
   canonical — approval-identity binding is pending that format window.
+- Typed-operation hashing does not bind the driver/registry VERSION.
+  `virp_typed_op_hash()` binds the profile id and the exact validated
+  octets (`src/virp_crypto.c` `command_hash_hex`, used by
+  `src/virp_approval.c` for the proposal and for verify/consume alike).
+  What it does NOT bind is the semantic table that gives an op id its
+  meaning, so an approval issued under one table verifies unchanged
+  against a later table in which the same op id means something else.
+  Confirmed as a roadmap item by an outside review (2026-09-04), and
+  the reviewer's framing is the one to keep: **an approval means "this
+  operation under this exact semantic table", and today only the first
+  half is signed.** Tracked in code as the TODO at
+  `src/virp_onode.c:128-131` (the "out of scope" list, 2026-08-01);
+  no code change was made when this was logged on 2026-09-04.
+  The table is compiled in, so changing it means a rebuild and a
+  restart — the exposure is an approval minted before that restart and
+  consumed after it. That window is bounded by the approval TTL
+  (`ttl_seconds`, default 300 s) and by nothing in the derivation
+  itself, which is the point: the binding is a property of the deploy
+  cadence rather than of the signature. Closing it widens the signed
+  canonical, so it lands in the same format window as the
+  approval-identity binding above rather than on its own.
 - Execution intent (gate_execution/2, three-valued `executed`):
   an undeclared `!success` driver result still resolves to
   `executed:true` and is signed as DEVICE_OUTPUT. Tracked by the two
