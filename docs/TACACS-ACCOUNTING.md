@@ -1069,6 +1069,68 @@ that is three hours old.
 
 ---
 
+## 8b. FortiOS: a design sketch, and where the Cisco model does not reach
+
+**No FortiGate was touched.** This is design only, written from the
+platform model, and every row is `UNVALIDATED` until a lab proves it.
+
+### What maps cleanly
+
+| Cisco element | FortiOS equivalent | note |
+|---|---|---|
+| two AAA identities (`virp-ro`, `virp-rw`) | two admin accounts, each bound to its own `accprofile` | direct |
+| the read allowlist | an `accprofile` with read-only scopes | coarser: FortiOS grants by FEATURE AREA, not by command |
+| source restriction | `trusthost` on the admin account | **stronger than Cisco.** `trusthost` pins the source prefixes an admin may log in from at all, which Cisco's command authorization does not do |
+| command accounting | TACACS+ accounting, `config log tacacs+accounting` | the accounting half of this design should port |
+
+### What does NOT map, and it is the important half
+
+**FortiOS has no per-command TACACS+ authorization.** Cisco asks the
+TACACS+ server about every command; FortiOS decides locally from the
+admin's `accprofile`. There is no AUTHOR exchange per command to
+intercept, so there is nothing for a policy compiler to answer.
+
+That breaks the central mechanism of this design. "One approval, one
+command, one device" has no expression on FortiOS: the finest grain
+available is a feature-area permission (`fwgrp`, `sysgrp`, `netgrp` and
+so on, each none/read/read-write). An approval for *one command* would
+have to be rendered as a profile granting *every command in that feature
+area* — which is not the same claim, and quietly widens the blast radius
+from one command to a category.
+
+Three shapes are possible, and none is equivalent:
+
+1. **Dynamic profile rewrite.** On approval, rewrite the `virp-rw`
+   account's `accprofile` to open the needed feature area, and close it
+   on outcome or TTL. Honest description: *time-boxed feature-area
+   access*, not per-command authorization. The window is narrow in TIME
+   but wide in SCOPE, and a report must say so rather than reusing the
+   Cisco wording.
+2. **Approval-gated credential release.** Keep `virp-rw` permanently
+   disabled and enable it only inside an approved window. Same scope
+   problem, plus the account is a bearer credential while enabled.
+3. **Proxy the CLI.** Put VIRP in the command path rather than beside
+   it, so it can refuse per command. This restores the granularity and
+   loses the property that makes the Cisco design worth having: the
+   router refuses *regardless of what the gate sends*. A proxy that is
+   also the gate is back to trusting the gate.
+
+**The recommendation is to say so plainly rather than ship option 1 under
+the Cisco vocabulary.** On Cisco, `UNGOVERNED` means the device executed
+something VIRP did not authorize. On FortiOS under option 1 the device
+would be executing things VIRP never saw, inside a window VIRP opened —
+which is a materially weaker statement and needs its own verdict name,
+not a borrowed one.
+
+| FortiOS capability | status |
+|---|---|
+| per-command TACACS+ authorization | **NOT AVAILABLE** — architectural, not a config gap |
+| time-boxed feature-area access via profile rewrite | **UNVALIDATED** |
+| `trusthost` source pinning | **UNVALIDATED** |
+| TACACS+ command accounting | **UNVALIDATED** |
+
+---
+
 ## 9. What this whole source does not prove
 
 Collected in one place, because a reader who skips everything else
