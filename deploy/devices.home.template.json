@@ -125,6 +125,17 @@
       "vendor": "wazuh"
     },
     {
+      "_comment": "LAB-SWITCH-1 -- the lab Catalyst 2960 (WS-C2960-24TC-L, IOS 12.2(55)SE6, C2960-LANBASEK9-M). Added 2026-09-05 for the TACACS+ accounting work, read-only by construction. ssh_legacy=true IS REQUIRED AND WAS TESTED, NOT ASSUMED: this train offers exactly one KEX, diffie-hellman-group1-sha1, and nothing else. A handshake-only libssh2 probe run on this node against the live switch failed with CISCO_KEX_DEFAULT (rc=-5, 'Unable to exchange encryption keys' -- the same refusal OpenSSH gives) and succeeded with CISCO_KEX_LEGACY, negotiating kex=diffie-hellman-group1-sha1 hostkey=ssh-rsa crypt=aes256-cbc and offering keyboard-interactive,password, both of which driver_cisco.c implements. The weak algorithms are the switch's ceiling, not a preference; ssh_legacy is per-device so it lowers nothing for the other 38. No 'enable' credential: aiops-svc is priv 15 and the no-enable refusal in virp_onode_prod.c is cisco_asa-only. The password rides ${SWITCH_PASS}, which is a DISTINCT value from VIRP_LABNET_PASSWORD (digests 40ca091e vs 0db9c95d, compared 2026-09-05) and therefore a NEW entry in this node's autopilot.env -- render-devices.sh lists SWITCH_PASS in its required-vars tuple and is FATAL when the template names a placeholder the env does not define, so a missing value here stops the daemon booting across every governed device, it does not degrade to one unreachable switch. Secret first, template second. NOTE 12.2(55) has no '| section' filter -- use '| include' / '| begin' -- and no 'tacacs server <name>' block; legacy 'tacacs-server host ... key ...' syntax applies on this train.",
+      "hostname": "LAB-SWITCH-1",
+      "node_id": 167772170,
+      "host": "10.0.0.10",
+      "vendor": "cisco_ios",
+      "username": "aiops-svc",
+      "password": "${SWITCH_PASS}",
+      "port": 22,
+      "ssh_legacy": true
+    },
+    {
       "host": "10.0.0.55",
       "hostname": "R6",
       "node_id": 167772215,
