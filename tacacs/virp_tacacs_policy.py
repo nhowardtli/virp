@@ -124,7 +124,7 @@ def policy_sha256(policy):
     return hashlib.sha256(policy_bytes(policy)).hexdigest()
 
 
-def render_router_config(device, authz_addr="172.17.0.1", authz_port=4951,
+def render_router_config(device, authz_addr="172.17.0.1", authz_port=4950,
                          authz_key="LabKeyAuthz"):
     """The router-side AAA for per-command authorization.
 
@@ -154,6 +154,10 @@ def render_router_config(device, authz_addr="172.17.0.1", authz_port=4951,
         "aaa group server tacacs+ %s" % AUTHZ_GROUP,
         " server name %s" % AUTHZ_SERVER_NAME,
         " exit",
+        "! Without this, commands typed INSIDE config mode are not",
+        "! authorized at all -- the whole control defeated by one",
+        "! `configure terminal`. MEASURED on IOS 15.2(4)M7.",
+        "aaa authorization config-commands",
         "! rw: tacacs+ only. No local, no if-authenticated, no none.",
         "aaa authorization commands 15 %s group %s" % (RW_LIST, AUTHZ_GROUP),
         "aaa authorization commands 1 %s group %s" % (RW_LIST, AUTHZ_GROUP),

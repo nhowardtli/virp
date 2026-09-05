@@ -38,10 +38,35 @@ FAIL = "FAIL"
 ERROR = "ERROR"
 STATUSES = (PASS_ADD, PASS_REPL, FAIL, ERROR)
 
+# Every denial the operator sees is prefixed. The router prints
+# server_msg straight to the terminal, and an unprefixed message is
+# indistinguishable from any other IOS output -- both to the person at
+# the keyboard and to anyone grepping a transcript later.
+DENY_PREFIX = "VIRP-DENY: "
+
+
+def reply_args_for(status):
+    """Arguments to put in the AUTHOR reply.
+
+    MEASURED on IOS 15.2(4)M7: a PASS_ADD carrying arguments the router
+    did not ask to have added is REJECTED -- the router prints "Command
+    authorization failed." even though the server said PASS. PASS_ADD
+    with arg_cnt 0 means "permit exactly as requested", which is the only
+    correct reply for a command we are not modifying.
+    """
+    return []
+
 # The only things virp-rw may do with no grant. Not a convenience: a
 # session that cannot leave config mode is a session that has to be
 # killed, and killing it loses the accounting for what it did.
-ALWAYS_PERMITTED = ("exit", "quit", "end")
+# `terminal length 0` is here for a concrete reason: the cisco_ios driver
+# sends it on every session, and under `aaa authorization commands 1` it
+# needs a decision. Denying it breaks every gate session, read-only ones
+# included. It changes only the current session's pager -- it cannot
+# alter device state and reveals nothing -- so it is permitted for both
+# identities as a minimal, exact-string exemption. Not a `terminal`
+# prefix: `terminal monitor` is still denied.
+ALWAYS_PERMITTED = ("exit", "quit", "end", "terminal length 0")
 
 # virp-ro is the gate's steady state: GREEN reads and nothing else. This
 # list is deliberately short and explicit -- no "show *" -- because
@@ -109,7 +134,9 @@ def authorize(policy, device, user, command, now_ns):
     if user == "virp-ro":
         if cmd in RO_PERMITTED:
             return PASS_ADD, "virp-ro read allowlist", None
-        return FAIL, "virp-ro may not run %r (read allowlist only)" % cmd, None
+        return (FAIL,
+                DENY_PREFIX + "virp-ro may not run %r (read allowlist "
+                              "only)" % cmd, None)
 
     # virp-rw: nothing is permitted without a grant.
     candidates = [g for g in policy.get("grants", [])
@@ -121,11 +148,14 @@ def authorize(policy, device, user, command, now_ns):
                   if canonical_command(g.get("command")) == cmd]
         if by_cmd:
             return (FAIL,
-                    "no grant for %r on device %r (approved for %s)"
+                    DENY_PREFIX + "no grant for %r on device %r (approved "
+                                  "for %s)"
                     % (cmd, device,
                        ", ".join(sorted({g.get("device") for g in by_cmd}))),
                     None)
-        return FAIL, "no grant for %r on device %r" % (cmd, device), None
+        return (FAIL,
+                DENY_PREFIX + "no grant for %r on device %r" % (cmd, device),
+                None)
 
     # Among matching grants, report the most specific failure rather than
     # a generic one: an expired grant and a spent grant are different
@@ -143,7 +173,7 @@ def authorize(policy, device, user, command, now_ns):
             continue
         return PASS_ADD, "grant %s" % g.get("grant_id"), g.get("grant_id")
 
-    return FAIL, "; ".join(reasons), None
+    return FAIL, DENY_PREFIX + "; ".join(reasons), None
 
 
 def consume(policy, grant_id):

@@ -25,6 +25,9 @@ sys.path.insert(0, os.path.join(ROOT, "tacacs"))
 import virp_tacacs_authz as az
 import virp_tacacs_policy as pol
 
+sys.path.insert(0, os.path.join(ROOT, "tacacs", "lab"))
+import iossh
+
 NOW = 1_757_002_000_000_000_000
 SEC = 1_000_000_000
 
@@ -76,6 +79,33 @@ class TestA1NoApproval(unittest.TestCase):
         for c in ("exit", "quit"):
             st, _, _ = az.authorize(policy([]), **req(c))
             self.assertEqual(st, az.PASS_ADD, "%s must be permitted" % c)
+
+
+class TestSessionDisplayCommands(unittest.TestCase):
+    """`terminal length 0` is the first thing the cisco_ios driver sends
+    on every session. Under `aaa authorization commands 1` it needs a
+    decision, and denying it breaks every gate session including
+    read-only ones.
+
+    It is permitted for BOTH identities as a deliberate, minimal
+    exemption: it changes only the current session's pager and cannot
+    alter device state or reveal anything. Stated and tested rather than
+    discovered later as a mystery outage."""
+
+    def test_terminal_length_permitted_for_ro(self):
+        st, _, _ = az.authorize(policy([]), **req("terminal length 0",
+                                                  user="virp-ro"))
+        self.assertEqual(st, az.PASS_ADD)
+
+    def test_terminal_length_permitted_for_rw_without_a_grant(self):
+        st, _, _ = az.authorize(policy([]), **req("terminal length 0"))
+        self.assertEqual(st, az.PASS_ADD)
+
+    def test_exemption_does_not_extend_to_other_terminal_commands(self):
+        """The exemption is the exact string, not a `terminal` prefix."""
+        for c in ("terminal monitor", "terminal exec prompt timestamp"):
+            st, _, _ = az.authorize(policy([]), **req(c))
+            self.assertEqual(st, az.FAIL, c)
 
 
 class TestA2Expiry(unittest.TestCase):
@@ -273,6 +303,61 @@ class TestCanonicalisationSharedWithReconciler(unittest.TestCase):
         self.assertEqual(az.canonical_command("show   ip  route"), from_acct)
 
 
+class TestReplyShape(unittest.TestCase):
+    """MEASURED on IOS 15.2(4)M7: a PASS_ADD carrying arguments the
+    router did not ask to have added is rejected, and the router prints
+    "Command authorization failed." even though the server said PASS.
+
+    PASS_ADD with arg_cnt 0 is "permit exactly as requested". That is the
+    only correct reply for a command authorization we are not modifying.
+    """
+
+    def test_permit_replies_with_no_arguments(self):
+        self.assertEqual(az.reply_args_for(az.PASS_ADD), [])
+
+    def test_denial_replies_with_no_arguments(self):
+        self.assertEqual(az.reply_args_for(az.FAIL), [])
+        self.assertEqual(az.reply_args_for(az.ERROR), [])
+
+
+class TestDenialMarker(unittest.TestCase):
+    """The router prints the server_msg to the operator. Prefixing every
+    denial makes it unambiguous who denied and greppable in a transcript
+    -- otherwise a VIRP denial is indistinguishable from any other IOS
+    message, in evidence and to the person at the keyboard."""
+
+    def test_denial_reason_is_prefixed(self):
+        st, reason, _ = az.authorize(policy([]), **req("configure terminal"))
+        self.assertEqual(st, az.FAIL)
+        self.assertTrue(reason.startswith(az.DENY_PREFIX), reason)
+
+    def test_permit_reason_is_not_prefixed(self):
+        st, reason, _ = az.authorize(policy([grant()]),
+                                     **req("interface Loopback99"))
+        self.assertEqual(st, az.PASS_ADD)
+        self.assertFalse(reason.startswith(az.DENY_PREFIX))
+
+    def test_every_denial_path_is_prefixed(self):
+        cases = [
+            (policy([]), "configure terminal"),
+            (policy([grant(not_after=NOW - 1)]), "interface Loopback99"),
+            (policy([grant(not_before=NOW + 60 * SEC)]), "interface Loopback99"),
+            (policy([grant(uses=0)]), "interface Loopback99"),
+            (policy([grant(device="R9")]), "interface Loopback99"),
+        ]
+        for p, cmd in cases:
+            st, reason, _ = az.authorize(p, **req(cmd))
+            self.assertEqual(st, az.FAIL, cmd)
+            self.assertTrue(reason.startswith(az.DENY_PREFIX),
+                            "%r -> %r" % (cmd, reason))
+
+    def test_ro_denial_is_prefixed(self):
+        st, reason, _ = az.authorize(policy([]),
+                                     **req("show running-config",
+                                           user="virp-ro"))
+        self.assertTrue(reason.startswith(az.DENY_PREFIX), reason)
+
+
 class TestNoLocalFallbackInRenderedConfig(unittest.TestCase):
     """A7's router half: the rw method list must never fall back to local
     or if-authenticated. A fallback is an authorization control that
@@ -288,6 +373,16 @@ class TestNoLocalFallbackInRenderedConfig(unittest.TestCase):
         self.assertNotIn("if-authenticated", line[0])
         self.assertNotIn("none", line[0])
 
+    def test_config_mode_commands_are_authorized(self):
+        """MEASURED on IOS 15.2(4)M7: without `aaa authorization
+        config-commands`, commands typed INSIDE config mode are not
+        authorized at all. Authorizing `configure terminal` and then
+        leaving the config session unpoliced would be the whole control
+        defeated by one command -- an operator who gets into config mode
+        could do anything."""
+        cfg = pol.render_router_config(device="R1")
+        self.assertIn("aaa authorization config-commands", cfg)
+
     def test_console_is_exempt_so_the_lab_cannot_be_locked_out(self):
         cfg = pol.render_router_config(device="R1")
         self.assertIn("authorization commands 15 CONSOLE", cfg)
@@ -295,3 +390,112 @@ class TestNoLocalFallbackInRenderedConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestAuthorCodec(unittest.TestCase):
+    """RFC 8907 §6.1/§6.2 authorization REQUEST and RESPONSE.
+
+    The authorization REQUEST body is NOT the accounting body with a
+    different type byte: accounting starts with a flags octet and
+    authorization does not. Reusing the accounting parser here would
+    misread every field by one byte.
+    """
+
+    def test_request_round_trip(self):
+        import virp_tacacs_codec as tp
+        args = ["service=shell", "cmd=show", "cmd-arg=version",
+                "cmd-arg=<cr>"]
+        body = tp.build_author_request(
+            authen_method=0x06, priv_lvl=15, authen_type=0x01,
+            authen_service=0x01, user="virp-rw", port="tty2",
+            rem_addr="192.168.122.1", args=args)
+        f, state = tp.parse_author_request(body)
+        self.assertEqual(state, "COMPLETE")
+        self.assertEqual(f["user"], "virp-rw")
+        self.assertEqual(f["priv_lvl"], 15)
+        self.assertEqual(f["args"], args)
+
+    def test_request_body_has_no_flags_octet(self):
+        """Pinning the one-byte difference from the accounting body."""
+        import virp_tacacs_codec as tp
+        body = tp.build_author_request(
+            authen_method=0x06, priv_lvl=15, authen_type=0x01,
+            authen_service=0x01, user="u", port="p", rem_addr="r",
+            args=["service=shell"])
+        # byte 0 is authen_method, not flags
+        self.assertEqual(body[0], 0x06)
+        self.assertEqual(body[1], 15)
+
+    def test_response_round_trip(self):
+        import virp_tacacs_codec as tp
+        blob = tp.build_author_response(
+            tp.TAC_PLUS_AUTHOR_STATUS_PASS_ADD,
+            args=["service=shell"], server_msg=b"ok", data=b"")
+        r = tp.parse_author_response(blob)
+        self.assertEqual(r["status"], tp.TAC_PLUS_AUTHOR_STATUS_PASS_ADD)
+        self.assertEqual(r["args"], ["service=shell"])
+        self.assertEqual(r["server_msg"], "ok")
+
+    def test_fail_status_carries_no_args(self):
+        import virp_tacacs_codec as tp
+        blob = tp.build_author_response(tp.TAC_PLUS_AUTHOR_STATUS_FAIL,
+                                        args=[], server_msg=b"denied")
+        r = tp.parse_author_response(blob)
+        self.assertEqual(r["status"], tp.TAC_PLUS_AUTHOR_STATUS_FAIL)
+        self.assertEqual(r["args"], [])
+        self.assertEqual(r["server_msg"], "denied")
+
+    def test_short_body_is_malformed_not_an_exception(self):
+        import virp_tacacs_codec as tp
+        f, state = tp.parse_author_request(b"\x06\x0f")
+        self.assertEqual(state, "MALFORMED")
+
+    def test_command_reassembly_from_author_args_matches_accounting(self):
+        """The authorizer must reassemble a command from AUTHOR args the
+        same way the reconciler does from accounting args, or the two
+        will disagree about what was asked for."""
+        import virp_tacacs_reconcile as rc
+        cmd, rule = rc.reassemble_command(
+            ["service=shell", "cmd=show", "cmd-arg=ip", "cmd-arg=route",
+             "cmd-arg=<cr>"])
+        self.assertEqual(cmd, "show ip route")
+
+
+class TestOutcomeClassifier(unittest.TestCase):
+    """Router output must be classified three ways, not two.
+
+    DENIED and NOT_A_COMMAND are different facts: the first means the
+    authorization server refused, the second means the command never
+    reached authorization because IOS did not recognise it in the current
+    mode. Collapsing them would let a typo be recorded as a successful
+    denial -- evidence that a control worked when it was never asked.
+    """
+
+    def test_iOS_denial_is_denied(self):
+        self.assertEqual(
+            iossh.classify("show run\r\nCommand authorization failed.\r\nR1#"),
+            iossh.DENIED)
+
+    def test_virp_reason_is_denied(self):
+        out = "conf t\r\n" + az.DENY_PREFIX + "no grant\r\nR1#"
+        self.assertEqual(iossh.classify(out), iossh.DENIED)
+
+    def test_invalid_input_is_not_a_command(self):
+        out = "interface Loopback99\r\n     ^\r\n% Invalid input detected at '^' marker.\r\nR1#"
+        self.assertEqual(iossh.classify(out), iossh.NOT_A_COMMAND)
+
+    def test_incomplete_command_is_not_a_command(self):
+        self.assertEqual(
+            iossh.classify("interface\r\n% Incomplete command.\r\nR1#"),
+            iossh.NOT_A_COMMAND)
+
+    def test_plain_output_is_executed(self):
+        self.assertEqual(
+            iossh.classify("show clock\r\n*12:00:00.000 UTC Fri Sep 5 2026\r\nR1#"),
+            iossh.EXECUTED)
+
+    def test_denial_wins_over_invalid_when_both_appear(self):
+        """A denial anywhere in the transcript is the stronger fact."""
+        out = ("conf t\r\nCommand authorization failed.\r\n"
+               "% Invalid input detected\r\nR1#")
+        self.assertEqual(iossh.classify(out), iossh.DENIED)
