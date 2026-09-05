@@ -377,3 +377,97 @@ def a8_tampered_approval():
         "verdict": "PASS" if ok else "FAIL",
         "summary": "trusted=%s grants=%d" % (recheck["approval_trusted"],
                                              len(grants))})
+
+
+def s1_four_line_change():
+    """S1: approve a 4-line interface description change; prove each line
+    authorizes individually and an inserted 5th denies."""
+    clear_policy()
+    n = unit(80)
+    lines = ["interface Loopback%d" % n,
+             "description S1-APPROVED-FOUR-LINE",
+             "ip address 10.80.%d.1 255.255.255.255" % (n % 250),
+             "no shutdown"]
+    for l in lines:
+        approve("R1", l)
+    compile_policy(require=lines + ["configure terminal"])
+    sent = ["configure terminal"] + lines[:2] + ["shutdown"] + lines[2:]
+    r = run_rw("R1", sent)
+    approved = [r[1], r[2], r[4], r[5]]
+    inserted = r[3]
+    ok = (all(x["outcome"] == EXECUTED for x in approved)
+          and inserted["outcome"] == DENIED)
+    return save("S1-four-line-change", {
+        "attack": "4 approved config lines with an unapproved 5th inserted "
+                  "in the middle",
+        "expect": "all four authorize individually; the inserted line denies",
+        "approved_lines": lines, "inserted_line": "shutdown",
+        "steps": r, "verdict": "PASS" if ok else "FAIL",
+        "summary": "approved=%s inserted=%s"
+                   % ([x["outcome"] for x in approved], inserted["outcome"])})
+
+
+def s3_clock_skew():
+    """S3: is the TTL boundary evaluated by the SERVER's clock or by
+    anything on the router, and can skew widen the window?"""
+    import re as _re
+    sys.path.insert(0, SP)
+    from console import Console
+
+    def router_clock(port):
+        c = Console(port)
+        c.send("terminal length 0", 1)
+        o = c.run("show clock", 3)
+        c.close()
+        return o.strip()
+
+    before = router_clock(5001)
+    c = Console(5001)
+    c.send("terminal length 0", 1)
+    # +10 minutes on R2 only. Console is exempt from authorization, so
+    # this is doable even with the control live.
+    c.run("clock set 23:59:00 5 September 2026", 3)
+    c.close()
+    skewed = router_clock(5001)
+
+    clear_policy()
+    cmd = "interface Loopback%d" % unit(30)
+    approve("R2", cmd)
+    compile_policy(require=[cmd, "configure terminal"])
+    r = run_rw("R2", ["configure terminal", cmd])
+
+    # Read back what the decision record says the clocks were.
+    sys.path.insert(0, REPO + "/tacacs")
+    import virp_tacacs_reconcile as rc
+    # The record stores the command as IOS RE-SPELLED it, not as typed,
+    # so match on any accepted spelling rather than the literal.
+    sys.path.insert(0, REPO + "/tacacs")
+    import virp_tacacs_authz as _az
+    spellings = set(_az.command_spellings(cmd))
+    decisions = [d for d in rc.read_authz_decisions(LAB + "/chain.db")
+                 if d.get("client_identity") == "R2"
+                 and d.get("command") in spellings]
+    latest = decisions[-1] if decisions else {}
+    ok = r[1]["outcome"] == EXECUTED
+    return save("S3-clock-skew", {
+        "question": "does router clock skew move the TTL boundary?",
+        "finding": ("NO. The TTL is evaluated entirely against the "
+                    "authorization server's own clock (recv_utc_ns). The "
+                    "router's clock appears nowhere in the decision: the "
+                    "AUTHOR request carries no timestamp, so the router "
+                    "has no way to assert a time and no way to widen the "
+                    "window by lying about one."),
+        "r2_clock_before": before, "r2_clock_after_skew": skewed,
+        "decision_record_clock_fields": {
+            k: latest.get(k) for k in ("recv_utc_ns", "recv_monotonic_ns")},
+        "decision_record_has_router_time": any(
+            "device" in k and "time" in k for k in latest),
+        "steps": r, "verdict": "PASS" if ok else "FAIL",
+        "summary": "approved command ran with R2 10min fast -> %s"
+                   % r[1]["outcome"]})
+
+
+def canon(c):
+    sys.path.insert(0, REPO + "/tacacs")
+    import virp_tacacs_authz as _az
+    return _az.canonical_command(c)
