@@ -131,6 +131,57 @@ this table current or the next bump repeats that.
 
 ### 313, current
 
+- **Commit** `47f58b5` (Merge fix/spool-mode-and-credential-redaction),
+  deployed 2026-09-05 06:17 UTC
+- **sha256** `8088497f448b62d757a4916bb9c2628344a195c2d7955de659df5bd9c256fb83`
+- **Emits / accepts**: `SCHEMA = camera_segment/6`; reads `/1` through `/6`;
+  record-only `camera_retention/1` spool jobs at the schema gate
+- **Supersedes**: `934d99e6…` (`b01c055`), kept as
+  `virp_camera.py.bak-v6-b01c055-20260905` beside it
+- **Why this one mattered**: `sftp put` stamps the destination with the
+  LOCAL file's mode. The Spark's capture units write 0600, so every job
+  landed 0600 in the spool — and because the POSIX ACL mask is taken from
+  the mode's GROUP bits, a 0600 file drove the mask to `---` and collapsed
+  the spool's `u:virp:rwx` default entry to `#effective:---`. The
+  submitter was locked out by the ACL that exists to admit it, and jobs
+  wedged in `incoming/` with EACCES. `ship()` now chmods each landed path
+  640 in the same all-or-nothing batch, before the marker. Uploads from
+  the laptop were never affected — a file created under a default ACL
+  takes its mask from that ACL, and the laptop's 0644 locals left it
+  `rw-`. Only an explicit client-side mode collapses it, so the defect
+  could not appear until a second capture host existed.
+- **Also**: ffmpeg's stderr is captured and its `://user:pass@` userinfo
+  redacted before logging; it was being inherited into the journal in
+  cleartext on every failed stream open.
+
+> **The Spark is NOT yet on this commit.** It still ships 0600 and still
+> leaks the URL, so the wedge recurs on every new segment until it is
+> updated. Jobs landing in `incoming/` at mode `0600` are the symptom.
+
+### Tonight's Axis records stay as written
+
+The 146 `camera_segment/6` records in
+`camera:axis-m3085v-b8a44fdd572c:2026-09-05` (seq 39..184) all grade
+`sensor_signature UNVERIFIED`, reading *the chain verifies to the pinned
+anchor but the leaf is not this device (expected serial None)*. The
+expected serial was never configured on the capture unit, so
+`leaf_serial_matches_device` could not be true — an identity question
+that was never asked, which is why it is `UNVERIFIED` and not `INVALID`.
+
+Passing the serial into the axis unit fixes it going FORWARD only. These
+records are **not** revised, re-signed or re-graded. They say what was
+actually established at the time they were written, which is the whole
+point of the grade existing; a record upgraded after the fact would be a
+record that lies about what its producer knew. The first record after
+the serial lands is where `MATCH` begins.
+
+`INTEGRITY: OK` and `COVERAGE: CONTINUOUS` over the whole range, with the
+run boundary declared in the record itself — seq 39 carries
+`gap {"after_seq": 38, "reason": "driver-restart"}` and there is no
+internal seq gap.
+
+### 313, superseded 2026-09-05 (deployed 05:37 UTC, overtaken 06:17 UTC)
+
 - **Commit** `b01c055` (Merge feat/camera-retention), deployed
   2026-09-05 05:37 UTC — this deploy overtook the `1dab8560` one below by
   minutes; both happened on 2026-09-05 and both copies are kept as .baks
