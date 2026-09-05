@@ -16,7 +16,7 @@ Group=virp-tacacs
 # the same way virp-spark and virp-laptop do on this node.
 SupplementaryGroups=virp
 
-ExecStart=/usr/bin/python3 /usr/local/lib/virp/virp-tacacs-recv.py serve \
+ExecStart=/usr/bin/python3 /usr/local/lib/virp/virp_tacacs_recv.py serve \
     --config /etc/virp/tacacs/recv.json
 
 Restart=always

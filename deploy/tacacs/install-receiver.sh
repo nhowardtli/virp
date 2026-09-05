@@ -52,15 +52,33 @@ install -d -o "$USER_NAME" -g "$USER_NAME" -m 0700 "$ETC"
 
 # 2. Code, as an INSTALLED ARTIFACT and never a path inside a worktree --
 #    the rule virp-onode.service states at length and for good reason.
-install -o root -g root -m 0755 "$SRC/tacacs/virp_tacacs_recv.py"  "$LIB/virp-tacacs-recv.py"
+#    Installed under its IMPORTABLE name. The first version of this
+#    script installed it as virp-tacacs-recv.py, which reads better as a
+#    command and is not a valid Python module name: a hyphen cannot appear
+#    in an import. virp_tacacs_reconcile.py does
+#    `from virp_tacacs_recv import ...` so the receipt's canonical bytes
+#    and artifact type are defined once and shared, rather than restated
+#    in the reconciler where they could drift. With the hyphenated name
+#    the reconciler cannot run against an installed receiver at all --
+#    found on 313 mid-run, 2026-09-05, with 45 real records waiting to be
+#    reconciled. The command keeps its hyphenated spelling as a wrapper.
+install -o root -g root -m 0644 "$SRC/tacacs/virp_tacacs_recv.py"  "$LIB/virp_tacacs_recv.py"
 install -o root -g root -m 0644 "$SRC/tacacs/virp_tacacs_codec.py" "$LIB/virp_tacacs_codec.py"
-python3 "$LIB/virp-tacacs-recv.py" selftest >/dev/null
+cat > "$LIB/virp-tacacs-recv" <<WRAP
+#!/bin/sh
+# Thin wrapper. The module must be importable (underscores); the command
+# reads better hyphenated. Both spellings, one copy of the code.
+exec /usr/bin/python3 $LIB/virp_tacacs_recv.py "\$@"
+WRAP
+chmod 0755 "$LIB/virp-tacacs-recv"
+rm -f "$LIB/virp-tacacs-recv.py"
+PYTHONPATH="$LIB" python3 "$LIB/virp_tacacs_recv.py" selftest >/dev/null
 
 # 3. Producer keypair, generated HERE. The private half never leaves this
 #    box and is not in any repo. Regeneration is refused: a new key makes
 #    every record it already signed unverifiable under the pinned one.
 if [ ! -f "$ETC/producer.key" ]; then
-    python3 "$LIB/virp-tacacs-recv.py" keygen \
+    PYTHONPATH="$LIB" python3 "$LIB/virp_tacacs_recv.py" keygen \
         --sk "$ETC/producer.key" --pk "$ETC/producer.pub" >/dev/null
     chown "$USER_NAME:$USER_NAME" "$ETC/producer.key" "$ETC/producer.pub"
     chmod 0600 "$ETC/producer.key"; chmod 0644 "$ETC/producer.pub"
