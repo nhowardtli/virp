@@ -2352,6 +2352,12 @@ allowed to happen at all, so the copy that matters is the one in the tree
 - **Supersedes**: four hand-copied `st=$(git status --porcelain
   2>/dev/null)` guards at Makefile lines 1422, 1447, 1547 and 1585 of
   `c65f623`, each of which read a FAILING git as a clean tree
+- **Then** `13007193c64f8b676a6839d0f0266e60a6ee51d5` (short `1300719`),
+  authored 2026-09-04 21:58 -0400 on the same branch: `deploy-record`
+  establishes every fact in the stanza before printing any of it, closing
+  the same class of hole one field at a time (see below)
+- **sha256** `tests/test_deploy_record_facts.sh`:
+  `ddef5a95d144a913395efebb831877c297db46d970c02af346386886fcc0b12c`
 
 **NOT INSTALLED ANYWHERE YET.** This laptop has no `/opt/virp` and no
 `/usr/local/lib/virp`; nothing was deployed, restarted or touched on any
@@ -2377,6 +2383,19 @@ commit — the unverified part is whether the tree matched it.
 `empty`, so stanzas written from `cda7be9` onward carry the stronger
 claim on their face.
 
+The same reading applies field by field to the sha256 lines above.
+`deploy-record` used to interpolate each one straight into an echo,
+piping `sha256sum` into `awk` — which discards sha256sum's exit status —
+and only the daemon binary had a `test -f` in front of it. A missing or
+unreadable virp-tool, helper script or autopilot module recorded an
+empty hash and the target still exited 0. An unborn HEAD was worse than
+empty: `git rev-parse HEAD` prints the literal string `HEAD` and exits
+128, so the stanza would have read ``- **Commit**: `HEAD` ``. From
+`1300719` on, every fact is captured and checked before anything is
+printed, so a stanza that exists is a stanza with no holes in it. Any
+sha256 line above with an empty value is that defect, not an artifact
+with no content.
+
 ### Verify, without changing anything
 
 ```sh
@@ -2387,12 +2406,15 @@ git -C "$tree" log -1 --format='%H %cI' -- scripts/require-clean-tree.sh
 # script in two comments and in deploy-record's own output line.
 grep -cE '^\t@scripts/require-clean-tree\.sh' "$tree/Makefile"   # expect 4
 grep -n 'git status --porcelain' "$tree/Makefile" | grep '2>/dev/null'  # expect no output
+# Recipe lines only (leading tab): the Makefile quotes the old shape in a
+# comment, on purpose, as the record of what it replaced.
+grep -nE '^\t.*sha256sum.*\|.*awk' "$tree/Makefile"     # expect no output
 
 # The guard itself is read-only: on a clean tree it prints nothing and
 # exits 0, which is the no-op that confirms the installed copy runs.
 "$tree/scripts/require-clean-tree.sh" --tree "$tree" "verification"; echo "exit=$?"
 ```
 
-Run on this laptop against the working tree at `cda7be9`: the recipe-line
-count reported 4, the fail-open grep reported nothing, and the guard
-printed nothing and exited 0.
+Run on this laptop against the working tree at `1300719`: the recipe-line
+count reported 4, both greps reported nothing, and the guard printed
+nothing and exited 0.
