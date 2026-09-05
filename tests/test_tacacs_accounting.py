@@ -403,13 +403,56 @@ class TestReconcile(unittest.TestCase):
         items, _, _ = self._run(receipts, [])
         self.assertEqual(items[0]["verdict"], "START_WITHOUT_STOP")
 
-    def test_stop_without_start(self):
+    def test_stop_without_start_applies_to_session_records_only(self):
+        """STOP_WITHOUT_START is a SESSION-accounting defect. A session
+        record carries no cmd= argument."""
         t = 1_757_000_300_000_000_000
-        receipts = [("tacacs:lab", "evidence_item",
-                     receipt_body("R3", "11", ["STOP"], "show",
-                                  ["version"], t), t)]
+        body = receipt_body("R3", "11", ["STOP"], "show", ["version"], t)
+        body["args"] = ["task_id=11", "service=shell", "priv-lvl=15"]
+        body["args_index"] = tp.args_index(body["args"])
+        receipts = [("tacacs:lab", "evidence_item", body, t)]
         items, _, _ = self._run(receipts, [])
+        self.assertEqual(items[0]["record_class"], "session")
         self.assertEqual(items[0]["verdict"], "STOP_WITHOUT_START")
+
+    def test_command_accounting_lone_stop_is_complete(self):
+        """MEASURED on IOS 15.2(4)M7: command accounting emits ONE STOP
+        per command, no START. Grading that STOP_WITHOUT_START would mark
+        every correctly-accounted command as a defect, and a real missing
+        record would then be invisible in the noise."""
+        t = 1_757_000_350_000_000_000
+        receipts = [("tacacs:lab", "evidence_item",
+                     receipt_body("R1", "30", ["STOP"], "show",
+                                  ["version"], t), t)]
+        gates = [("gate", "gate_execution", gate_body("R1", "show version"),
+                  t + 100)]
+        items, _, _ = self._run(receipts, gates)
+        self.assertEqual(items[0]["record_class"], "command")
+        self.assertEqual(items[0]["verdict"], "MATCHED")
+
+    def test_command_record_with_no_stop_is_still_a_gap(self):
+        t = 1_757_000_360_000_000_000
+        body = receipt_body("R1", "31", ["START"], "show", ["version"], t)
+        receipts = [("tacacs:lab", "evidence_item", body, t)]
+        items, _, _ = self._run(receipts, [])
+        self.assertEqual(items[0]["record_class"], "command")
+        self.assertEqual(items[0]["verdict"], "START_WITHOUT_STOP")
+
+    def test_restart_without_listen_stop_still_interrupts(self):
+        """A listener killed by SIGKILL writes no LISTEN_STOP. Two
+        consecutive LISTEN_STARTs must not read as continuous uptime."""
+        import tempfile
+        led = os.path.join(self.tmp, "led.jsonl")
+        t = 1_757_000_370_000_000_000
+        with open(led, "w") as f:
+            f.write(json.dumps({"event": "LISTEN_START", "utc_ns": t}) + "\n")
+            f.write(json.dumps({"event": "LISTEN_START",
+                                "utc_ns": t + 10_000}) + "\n")
+        w = rc.read_ledger(led)
+        self.assertEqual(len(w), 2)
+        cov, ev = rc.coverage_for_span(w, t + 1, t + 20_000)
+        self.assertEqual(cov, "INTERRUPTED")
+        self.assertTrue(ev)
 
     def test_two_identical_gate_records_are_ambiguous_not_guessed(self):
         t = 1_757_000_400_000_000_000
