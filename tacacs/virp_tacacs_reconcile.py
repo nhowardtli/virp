@@ -469,13 +469,37 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
     return items
 
 
-def build_record(items, match_window_ms, db_path, ledger_path, windows):
+# The daemon stores artifact_content in an 8192-byte field; a body at or
+# past it could never hash to its own artifact_hash and is refused, never
+# truncated. A reconciliation over a real run does not fit in one record,
+# so it is SPLIT rather than trimmed: dropping items to fit would be an
+# evidence tool silently deciding which findings to keep.
+RECORD_BUDGET = 7600
+
+
+def chunk_items(items, budget=RECORD_BUDGET):
+    """Split items into groups whose serialized record stays under the
+    daemon's artifact limit. Never drops an item."""
+    chunks, cur, cur_len = [], [], 0
+    overhead = 1200          # schema, match_rule, tally, presentation, sig
+    for it in items:
+        n = len(canonical_bytes(it))
+        if cur and cur_len + n + overhead > budget:
+            chunks.append(cur); cur, cur_len = [], 0
+        cur.append(it); cur_len += n
+    if cur:
+        chunks.append(cur)
+    return chunks or [[]]
+
+
+def build_record(items, match_window_ms, db_path, ledger_path, windows,
+                 chunk=None, run_tally=None):
     tally = {v: 0 for v in VERDICTS}
     cov = {c: 0 for c in COVERAGE}
     for it in items:
         tally[it["verdict"]] = tally.get(it["verdict"], 0) + 1
         cov[it["coverage"]] = cov.get(it["coverage"], 0) + 1
-    return {
+    rec = {
         "schema": SCHEMA,
         "reconciled_utc_ns": time.time_ns(),
         "match_rule": {
@@ -499,6 +523,15 @@ def build_record(items, match_window_ms, db_path, ledger_path, windows):
             "PASS/FAIL/UNCHECKED/UNVERIFIABLE ladder, never inside it. "
             "This record cites receipts and never modifies them."),
     }
+    if chunk is not None:
+        # A run too large for one record is SPLIT, never trimmed. Each
+        # part names the whole it belongs to, and carries the run-wide
+        # tally beside its own, so a reader holding one part can tell
+        # both that others exist and what the complete run said.
+        rec["chunk"] = chunk
+        if run_tally is not None:
+            rec["run_tally"] = run_tally
+    return rec
 
 
 def _file_sha256(path):
@@ -548,15 +581,23 @@ def main(argv=None):
         if not args.producer_key:
             raise SystemExit("--submit needs --producer-key")
         sk = producer_load_sk(args.producer_key)
-        body_bytes, _ = producer_sign(sk, rec)
-        aid = "tacacs-reconcile:%d:%s" % (
-            rec["reconciled_utc_ns"],
-            hashlib.sha256(body_bytes).hexdigest()[:16])
-        ok, detail = chain_append_evidence(args.chain_session, aid,
-                                           body_bytes, args.onode_socket)
-        if not ok:
-            raise SystemExit("reconciliation NOT chained: %s" % detail)
-        print("chained as %s (%d bytes)" % (aid, len(body_bytes)))
+        groups = chunk_items(items)
+        run_id = "%d" % rec["reconciled_utc_ns"]
+        for i, part in enumerate(groups):
+            sub = build_record(part, args.match_window_ms, args.db,
+                               args.ledger, windows,
+                               chunk={"run_id": run_id, "index": i,
+                                      "of": len(groups)},
+                               run_tally=rec["tally"])
+            body_bytes, _ = producer_sign(sk, sub)
+            aid = "tacacs-reconcile:%s:%d" % (run_id, i)
+            ok, detail = chain_append_evidence(args.chain_session, aid,
+                                               body_bytes, args.onode_socket)
+            if not ok:
+                raise SystemExit("reconciliation part %d/%d NOT chained: %s"
+                                 % (i + 1, len(groups), detail))
+            print("chained %s (%d items, %d bytes)"
+                  % (aid, len(part), len(body_bytes)))
     return 0
 
 
