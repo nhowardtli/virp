@@ -793,6 +793,43 @@ int load_devices(onode_state_t *state, const char *path)
         if (json_get_bool(dev_obj, "ssh_legacy", &bool_val))
             device.ssh_legacy = bool_val;
 
+        /* A device the operator governs but has powered down. The
+         * watchdog already skips a disabled device in both its count and
+         * its connect pass, and list_fleet already reports it as
+         * Status=disabled rather than omitting it — but this field was
+         * hardcoded true above and never read from JSON, so no template
+         * could reach that state. Racked-and-off kit wants exactly it:
+         * listed, so the fleet view is complete and an agent can see the
+         * device exists and is down; never connected, so a dark device
+         * costs the single serial watchdog thread nothing per backoff.
+         *
+         * Absent key keeps the default of true, so every existing
+         * template renders unchanged.
+         *
+         * STRICT on type, as evidence_required (Sep 1 review, 1.4): a
+         * non-boolean is a config error, not something to default. The
+         * hazard is specific — "enabled": "false" is a string, always
+         * truthy, so papering over it would read as OFF to the operator
+         * and ON to the watchdog, producing the exact churn this field
+         * exists to prevent. Refusing the whole config is also chosen
+         * over skipping the entry: a skip would drop the device from
+         * list_fleet entirely, silently losing the visibility the
+         * operator was configuring. */
+        struct json_object *enabled_val;
+        if (json_object_object_get_ex(dev_obj, "enabled", &enabled_val)) {
+            if (!json_object_is_type(enabled_val, json_type_boolean)) {
+                fprintf(stderr,
+                        "[O-Node] FATAL: device '%s' has non-boolean "
+                        "\"enabled\" in %s — must be literal true or "
+                        "false; refusing to load\n",
+                        device.hostname[0] ? device.hostname : "(unnamed)",
+                        path);
+                json_object_put(root);
+                return -1;
+            }
+            device.enabled = json_object_get_boolean(enabled_val);
+        }
+
         /* cisco_asa only: the operator declares that login already lands
          * in enable mode (aaa authorization exec ... auto-enable), so the
          * no-enable-credential refusal below does not apply (#14). */
