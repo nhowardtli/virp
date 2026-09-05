@@ -43,6 +43,7 @@ ACCT_SCHEMA = "tacacs_accounting/1"
 # goes into the record, because reassembly is an interpretation and a
 # reader is entitled to see which one ran.
 REASSEMBLY_CISCO = "cisco_cmd_cmdarg_space_join_drop_cr"
+REASSEMBLY_CISCO_SINGLE = "cisco_cmd_single_arg_drop_cr"
 REASSEMBLY_UNRECOGNIZED = "UNRECOGNIZED"
 
 VERDICTS = ("MATCHED", "START_WITHOUT_STOP", "STOP_WITHOUT_START",
@@ -224,6 +225,23 @@ def reassemble_command(args):
             tokens.append(a[8:])
     if verb is None:
         return None, REASSEMBLY_UNRECOGNIZED
+
+    if not tokens:
+        # MEASURED on IOS 15.2(4)M7: the whole command arrives in ONE
+        # cmd= argument, with a literal trailing " <cr>" inside the
+        # value -- e.g. cmd=show ip route <cr>. There are no cmd-arg=
+        # arguments at all. This is a DIFFERENT wire shape from the
+        # split form below, and it gets its own rule name rather than
+        # being silently folded into it, because a reader comparing two
+        # runs must be able to see which shape the device actually sent.
+        cmd = verb
+        if cmd.endswith("<cr>"):
+            cmd = cmd[:-4]
+        cmd = cmd.strip()
+        return (cmd or None), REASSEMBLY_CISCO_SINGLE
+
+    # Split form: cmd=<verb> followed by repeated cmd-arg=<token>, with a
+    # trailing cmd-arg=<cr>.
     while tokens and tokens[-1] == "<cr>":
         tokens.pop()
     parts = [verb] + tokens
@@ -281,18 +299,30 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
               for r in receipts]
         horizon_ns = max(_t) if _t else 0
 
-    # Group receipts by (client_identity or source_addr, task_id). task_id
-    # is the device's own correlator for one accounting session and is the
-    # only join key TACACS+ offers between a START and its STOP.
+    # Group receipts by (device, port, task_id, record_class).
+    #
+    # task_id is the device's own correlator and is the only join key
+    # TACACS+ offers between a START and its STOP -- but it is NOT unique
+    # on its own. MEASURED on IOS 15.2(4)N7: the EXEC session record and
+    # the FIRST command record inside that session carry the SAME task_id.
+    # Grouping on task_id alone therefore merged a session record with a
+    # command record; the session record sorted first, the pair was
+    # classified "session", and the first command of every session
+    # silently vanished from the reconciliation -- 6 of 32 records on the
+    # first full run, reported as UNREPORTED gate records rather than as
+    # the matches they were.
+    #
+    # `port` is included because task_id is scoped to a line: tty0 and
+    # tty2 number their tasks independently.
     groups = {}
     for r in receipts:
         b = r["body"]
         key = (b.get("client_identity") or b.get("source_addr"),
-               _task_id(b))
+               b.get("port"), _task_id(b), record_class(b))
         groups.setdefault(key, []).append(r)
 
-    for (device, task_id), members in sorted(
-            groups.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
+    for (device, _port, task_id, _klass), members in sorted(
+            groups.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
         members.sort(key=lambda r: r["body"].get("recv_utc_ns") or 0)
         starts = [r for r in members if "START" in _flags(r["body"])]
         stops = [r for r in members if "STOP" in _flags(r["body"])]
@@ -411,6 +441,14 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
             ts = g["timestamp_ns"] or 0
             if not (lo <= ts <= hi):
                 continue
+            # Graded over the window in which the accounting SHOULD have
+            # arrived, not at the single instant of execution. A device
+            # sends its record after the command runs, so "was the
+            # receiver listening throughout the arrival window" is the
+            # question that bears on whether the absence is explained --
+            # and a receiver that went down and came back inside that
+            # window grades INTERRUPTED, with the ledger boundary cited.
+            g_cov, g_ev = coverage_for_span(windows, ts, ts + window_ns)
             items.append({
                 "verdict": "UNREPORTED",
                 "record_class": None,
@@ -419,9 +457,9 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
                 "task_id": None,
                 "command": g["body"].get("command"),
                 "command_reassembly": None,
-                "coverage": coverage_for(windows, ts),
-                "coverage_evidence": [],
-                "coverage_span_ns": [ts, ts],
+                "coverage": g_cov,
+                "coverage_evidence": g_ev,
+                "coverage_span_ns": [ts, ts + window_ns],
                 "receipt_cites": [],
                 "gate_cite": {"session_id": g["session_id"],
                               "sequence": g["sequence"],
@@ -443,8 +481,10 @@ def build_record(items, match_window_ms, db_path, ledger_path, windows):
         "match_rule": {
             "match_window_ms": match_window_ms,
             "command_comparison": "exact_bytes",
-            "join_key": "client_identity_or_source_addr + args_index.task_id",
-            "known_reassembly_rules": [REASSEMBLY_CISCO],
+            "join_key": ("client_identity_or_source_addr + port + "
+                         "args_index.task_id + record_class"),
+            "known_reassembly_rules": [REASSEMBLY_CISCO,
+                                       REASSEMBLY_CISCO_SINGLE],
         },
         "source": {
             "chain_db_sha256": _file_sha256(db_path),

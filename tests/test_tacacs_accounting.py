@@ -299,6 +299,23 @@ class TestReassembly(unittest.TestCase):
         self.assertIsNone(cmd)
         self.assertEqual(rule, rc.REASSEMBLY_UNRECOGNIZED)
 
+    def test_single_cmd_argument_form_drops_trailing_cr(self):
+        """MEASURED on IOS 15.2(4)M7: the whole command arrives in ONE
+        cmd= argument with a literal trailing " <cr>", and there are no
+        cmd-arg= arguments. Missing this is what made every gated command
+        reconcile UNGOVERNED on the first full run."""
+        cmd, rule = rc.reassemble_command(
+            ["task_id=3", "service=shell", "priv-lvl=15",
+             "cmd=show ip route <cr>"])
+        self.assertEqual(cmd, "show ip route")
+        self.assertEqual(rule, rc.REASSEMBLY_CISCO_SINGLE)
+
+    def test_two_wire_shapes_get_different_rule_names(self):
+        """A reader comparing runs must see which shape the device sent."""
+        _, split = rc.reassemble_command(cisco_args("show", ["version"]))
+        _, single = rc.reassemble_command(["cmd=show version <cr>"])
+        self.assertNotEqual(split, single)
+
     def test_bare_command_has_no_trailing_space(self):
         cmd, _ = rc.reassemble_command(["cmd=configure", "cmd-arg=<cr>"])
         self.assertEqual(cmd, "configure")
@@ -613,6 +630,33 @@ class TestReconcile(unittest.TestCase):
     def test_no_ledger_never_reports_receiver_up(self):
         self.assertEqual(rc.coverage_for_span([], 1, 2)[0],
                          "RECEIVER_UNKNOWN")
+
+    def test_session_and_first_command_sharing_a_task_id_stay_separate(self):
+        """MEASURED on IOS 15.2(4)M7: the EXEC session record and the
+        FIRST command inside that session carry the SAME task_id.
+        Grouping on task_id alone merged them, classified the pair
+        "session", and silently lost the first command of every session
+        -- 6 of 32 records on the first full run."""
+        t = 1_757_001_500_000_000_000
+        sess = receipt_body("R1", "30", ["START"], "show", ["version"], t)
+        sess["args"] = ["task_id=30", "service=shell", "priv-lvl=15"]
+        sess["args_index"] = tp.args_index(sess["args"])
+        sess["port"] = "tty2"
+        cmd = receipt_body("R1", "30", ["STOP"], "show", ["version"], t + 500)
+        cmd["args"] = ["task_id=30", "service=shell", "priv-lvl=15",
+                       "cmd=show version <cr>"]
+        cmd["args_index"] = tp.args_index(cmd["args"])
+        cmd["port"] = "tty2"
+        gates = [("gate", "gate_execution", gate_body("R1", "show version"),
+                  t + 200)]
+        items, _, _ = self._run(
+            [("tacacs:lab", "evidence_item", sess, t),
+             ("tacacs:lab", "evidence_item", cmd, t + 500)], gates)
+        classes = sorted(i["record_class"] for i in items if i["record_class"])
+        self.assertEqual(classes, ["command", "session"])
+        matched = [i for i in items if i["verdict"] == "MATCHED"]
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["command"], "show version")
 
     def test_record_states_the_rule_it_ran_under(self):
         rec = rc.build_record([], 12345, self.db, None, [])
