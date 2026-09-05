@@ -131,20 +131,30 @@ this table current or the next bump repeats that.
 
 ### 313, current
 
-- **Commit** `e3a16c75c6310e59adf0ec2f8d238cba14b354f3` (short `e3a16c7`),
-  deployed 2026-09-04 21:49 UTC
-- **sha256** `95fc356c39939503b9a28b4950a6e60034d8a5aac6bd56bbeba863efdeeaae43`
+- **Commit** `1dab8560a478ab55ee3d8705a83de832fbf9c6aa` (short `1dab8560`),
+  deployed 2026-09-05 05:30 UTC
+- **sha256** `5e6029023e11c86d8dc22bcebbd7a3fcce408453f12d2486ae21dd36a0393387`
 - **Emits / accepts**: `SCHEMA = camera_segment/6`; reads `/1` through `/6`
+  — the schema is UNCHANGED from the copy this supersedes, so the capture
+  host at `/6` needs no coordinated bump
 - **Cites**: `segment_sha256`,
   `sensor_signature.validator_output_sha256`,
   `sensor_signature.device_chain.leaf_sha256`
 - **Payload grades**: VERIFIED, ABSENT, INACCESSIBLE, FAILED
-- **Supersedes**: `/5` at sha256 `f5d5088…`, kept as
-  `virp_camera.py.bak-v5-20260904` beside it
-- **Why this one mattered**: the previous copy's `submit-spool` moved only
-  `(segment, body, marker)` out of `incoming/`, so every cited sidecar the
-  capture host shipped stayed behind and `audit --artifact-dir` on 313 graded
-  SEGMENT PAYLOAD ABSENT forever. This copy moves the whole job.
+- **Supersedes**: `95fc356c…` (`e3a16c7`), kept as
+  `virp_camera.py.bak-v6-20260905` beside it; the `/5` copy from
+  2026-09-04 is still there as `virp_camera.py.bak-v5-20260904`
+- **Why this one mattered**: `submit_one()` treated any sidecar file as proof
+  the body had been attested. A sidecar is a local receipt and can outlive the
+  chain entry it claims to describe — a chain DB restored to an earlier point,
+  a rolled-back append, a hand-copied file — so "sidecar present" meant "we
+  think it was attested", not "it is on the chain". `_on_chain()` is now
+  tri-state, and a sidecar whose entry is confirmed ABSENT is treated as stale
+  and re-appended rather than skipped. Where the chain cannot be consulted at
+  all, the documented sidecar-only fast path is unchanged.
+- **Previously**: the `/6` copy fixed `submit-spool` moving only
+  `(segment, body, marker)` out of `incoming/`, which left every cited sidecar
+  behind and made `audit --artifact-dir` grade SEGMENT PAYLOAD ABSENT forever.
 
 Verify what is installed, without changing anything:
 
