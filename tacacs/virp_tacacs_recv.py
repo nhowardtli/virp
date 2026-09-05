@@ -45,6 +45,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import socket
 import socketserver
 import struct
@@ -510,6 +511,16 @@ def cmd_serve(args):
 
     ledger.write("LISTEN_START", listen_addr=addr[0], listen_port=addr[1],
                  receiver_node=cfg["receiver_node"], pid=os.getpid())
+
+    # A listener killed by SIGTERM must still close its window. Without
+    # this the ledger shows an open window that never ended, and coverage
+    # cannot distinguish "restarted" from "up the whole time" -- which is
+    # exactly the distinction INTERRUPTED exists to make. The handler
+    # raises through to the same shutdown path as Ctrl-C rather than
+    # writing from inside the signal context.
+    def _term(_sig, _frm):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)
     print("listening on %s:%d — ACCOUNTING only (RFC 8907)"
           % (addr[0], addr[1]), flush=True)
     try:
