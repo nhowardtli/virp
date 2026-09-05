@@ -6,13 +6,17 @@
     "${VIRP_UID}",
     1000,
     997,
-    1001
+    1001,
+    992,
+    "${VIRP_NETCLAW_UID}"
   ],
   "socket_uid_tier_ceilings": {
     "${VIRP_UID}": "green",
     "1000": "green",
     "997": "green",
-    "1001": "green"
+    "1001": "green",
+    "992": "green",
+    "${VIRP_NETCLAW_UID}": "green"
   },
   "_socket_uid_action_allow_note": "FIXES A LIVE DEPLOY BLOCKER (Phase 0 D4). Until 2026-09-03 only 997 and 1001 had action maps; 999 and 1000 were allowlisted with NO entry, which this node's binary treats as unrestricted and origin/main treats as a boot failure. Both now have one, and 999 loses the shutdown it implicitly held. EIGHT VERBS EACH, NOT TWENTY, AND THE NUMBER IS LOAD-BEARING: ONODE_MAX_UID_ACTIONS is 8 in the binary this node runs and only became 32 in 13ec426 (2026-09-01) \u2014 the very commit that added the boot invariant. A longer list overflows the cap and virp_onode_prod.c fails closed by installing DENY-ALL for that uid, which is what happened on the first attempt here: 'uid 999 action allowlist: 0 action(s) (DENY-ALL)', reverted. So the colo node's 20-verb list is NOT portable to this node, and copying it here was the mistake. Eight is also simply the better answer: this node runs no comparator, no netclaw bridge and no v2 sessions, so the session_*, intent_*, batch_execute and validate_turn verbs it was granted were reach nothing here uses. Expanding past 8 becomes possible after the binary upgrade and should be justified by a workload, not by symmetry with virp-lab.",
   "socket_uid_action_allow": {
@@ -48,6 +52,15 @@
       "list_fleet",
       "execute",
       "health"
+    ],
+    "992": [
+      "chain_append"
+    ],
+    "${VIRP_NETCLAW_UID}": [
+      "list_fleet",
+      "health",
+      "execute",
+      "chain_verify"
     ]
   },
   "_socket_uid_chain_append_types_note": "Second half of the same blocker: absent entirely on this node until now. A uid whose action set includes chain_append MUST appear here or the daemon refuses to start naming it. Only 999 and 1000 may chain_append; 997 and 1001 have no chain_append verb and correctly have no entry. `evidence_item` is present so the deployed-state reporter can land its document as a real body rather than a commitment-only hash every reader would grade UNVERIFIABLE \u2014 see the matching note in deploy/devices.template.json. Types use the 16-byte-truncated spellings the wire delivers.",
@@ -63,11 +76,16 @@
       "comparator_verd",
       "chainwalk_summa",
       "evidence_item"
+    ],
+    "992": [
+      "evidence_item"
     ]
   },
   "_gate_posture_note": "gate_max_tier is GREEN here, tighter than the colo node's YELLOW, and deliberately unchanged by this file. pve-lab has NO Proxmox classifier, so its commands land RED-by-absence and are proposal-only and fail-closed. Tracking a config is not the moment to change what it permits: this template is byte-for-byte the posture the node was already running, plus the two policy objects whose ABSENCE was the bug.",
   "gate_default_mode": "enforce",
   "gate_max_tier": "green",
+  "_socket_uid_992_note": "992 = virp-tacacs, the TACACS+ accounting receiver (session 5, 2026-09-05). ONE verb, chain_append, and nothing else: the receiver never executes, never reads a device and never holds a device credential -- it decodes accounting packets from a switch and lands them as evidence. One verb is also well under ONODE_MAX_UID_ACTIONS, which is 8 in the binary this node runs; see the action_allow note above for why that number is load-bearing. The append type is evidence_item because artifact_type is char[16] (15 usable) and tacacs_accounting is 17 -- the real type rides as the body schema tacacs_accounting/1, the same shape every external producer here uses. All three of allowed_uids/action_allow/chain_append_types were added in ONE edit deliberately: a uid carrying chain_append with no append-type entry does NOT degrade to a refused append, it stops the daemon booting, which on this node is an outage across 38 governed devices. The tier ceiling is inert (992 has no execute verb) and present only so every allowlisted uid is described.",
+  "_socket_uid_993_note": "993 = virp-netclaw, the remote requester identity for netclaw/Nexus (10.0.30.30), added 2026-09-05 so the agents can observe the home segment through this node's gate instead of reaching its devices. Same number as virp-netclaw on virp-lab (.211), chosen because 993 was free here and already means exactly this there -- the one uid that converges the two nodes' spaces rather than adding to the collision debt recorded in deploy/FLEET-UIDS.md. FOUR VERBS: list_fleet, health, execute, chain_verify. No chain_append, and therefore deliberately NO socket_uid_chain_append_types entry -- the boot invariant requires an append-type policy only for a uid that carries chain_append, and this one must not. Four is well under ONODE_MAX_UID_ACTIONS (8 on this node's binary; see the action_allow note above for why that number is load-bearing). Ceiling is green, and this node's gate_max_tier is green node-wide, so nothing this identity submits can execute above GREEN by either path. The account MUST exist before this template is rendered: render-devices.sh resolves ${VIRP_NETCLAW_UID} with pwd.getpwnam('virp-netclaw') and is FATAL if it cannot, which stops the daemon booting across 38 governed devices. Create the user first, render second.",
   "devices": [
     {
       "host": "10.0.0.35",
