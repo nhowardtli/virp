@@ -192,6 +192,16 @@
       "node_id": "0A000A0C"
     },
     {
+      "_comment": "SW-3850 \u2014 the colo Catalyst 3850 stack. Added 2026-09-05 for the TACACS+ accounting work: the gate needs a GREEN observation of a command so it can be paired against the switch's own accounting record of the same command. READ-ONLY BY CONSTRUCTION, in two ways that are both deliberate. (1) No \"enable\" credential: aiops-svc is privilege 15 and lands at '#', and the no-enable refusal in virp_onode_prod.c is cisco_asa-only, so omitting it costs nothing and leaves the gate with no enable secret to hold. The password rides ${SWITCH_PASS}, a placeholder render-devices.sh already carries for \"cat3850-lab (10.0.10.2)\" \u2014 this exact switch \u2014 so no change to the render script is needed; the value goes in autopilot.env, never in this file, which is 0644. (2) vendor cisco_iosxe shares driver_cisco's functions and gate table with cisco_ios but is a distinct vendor so the gate can address IOS-XE independently and the journal says which variant a command hit. NOTE the node-wide gate_max_tier here is YELLOW and uids 999/1000/994 carry no per-uid ceiling, so absent a ceiling decision the autopilot may auto-execute YELLOW against this switch \u2014 which on this box includes show running-config, show tech-support and clear counters.",
+      "hostname": "SW-3850",
+      "host": "10.0.10.2",
+      "vendor": "cisco_iosxe",
+      "username": "aiops-svc",
+      "password": "${SWITCH_PASS}",
+      "port": 22,
+      "node_id": "0A000A02"
+    },
+    {
       "_comment": "Zammad, READ-ONLY half. Two entries point at the same host and differ in exactly two things: the token behind them and write_ops_allow. This one names NO write operation, so zammad_execute refuses every typed write against it in the driver, before the connection is touched \u2014 it does not rely on Zammad returning 403, because a token-permission change on the far side would then silently become a policy change here.",
       "_tls_note": "The driver always uses https and always verifies; there is no insecure flag and no CA-bundle override. The certificate for 10.0.40.20 (CN zammad.thirdlevel.ai) carries an iPAddress SAN, which is why addressing by IP validates. Rotating to a certificate without that SAN means addressing by name instead, not disabling verification.",
       "hostname": "zammad-ro",
