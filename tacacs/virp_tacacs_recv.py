@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
 """
-virp_tacacs_recv.py — TACACS+ ACCOUNTING receiver. LAB ONLY.
+virp_tacacs_recv.py — TACACS+ ACCOUNTING receiver.
 
 Listens as a TACACS+ server (RFC 8907) and serves the ACCOUNTING
 session type only. Each received accounting packet becomes one
 chain-signed `tacacs_accounting/1` record containing exactly what
 arrived. Design, boundaries and field set: docs/TACACS-ACCOUNTING.md.
 
-NOT DEPLOYED. This runs against the GNS3 lab from a working tree. It
-does not touch virp-onode-home (313) or virp-lab (.211).
+DEPLOYED, as of 2026-09-05 (session 5). It is installed on
+virp-onode-home (313) as /usr/local/lib/virp/virp-tacacs-recv.py, run by
+virp-tacacs.service as uid 992, and it is intended to take accounting
+from real switches. The banner above used to read "LAB ONLY / NOT
+DEPLOYED"; that stopped being true the moment it was installed, and a
+file that lies about its own scope is worse than one with no banner.
+
+What has NOT changed with deployment, and must not:
+
+  - It serves ACCOUNTING only. AUTHEN and AUTHOR are refused, not
+    ignored (see the refusal path below). It cannot authenticate a
+    login or authorize a command, so pointing a switch at it can never
+    decide whether someone gets in.
+  - It holds no VIRP key and no device credential: only its own
+    producer key and the TACACS+ shared secrets.
+  - It appends as an unprivileged uid with exactly one verb,
+    chain_append, over the local socket.
 
 Three rules this module exists to keep:
 

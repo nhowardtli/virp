@@ -1,0 +1,50 @@
+[Unit]
+Description=VIRP TACACS+ accounting receiver
+Documentation=file:///opt/virp/docs/TACACS-ACCOUNTING.md
+After=network-online.target virp-onode.service
+Wants=network-online.target
+# Not Requires=: if the daemon is down the receiver should still take the
+# packet, fail the append loudly and record the failure in its ledger.
+# A switch does not retry accounting for long, and a receipt refused is
+# evidence; a receipt never taken is silence.
+
+[Service]
+Type=simple
+User=virp-tacacs
+Group=virp-tacacs
+# Group virp is what reaches /run/virp/onode.sock (srw-rw---- virp:virp),
+# the same way virp-spark and virp-laptop do on this node.
+SupplementaryGroups=virp
+
+ExecStart=/usr/bin/python3 /usr/local/lib/virp/virp-tacacs-recv.py serve \
+    --config /etc/virp/tacacs/recv.json
+
+Restart=always
+RestartSec=5
+
+# Sandbox. This process parses attacker-reachable bytes off the network,
+# so it gets less than the daemon it feeds.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET
+# The ONLY writable path: its own ledger directory.
+ReadWritePaths=/var/lib/virp-tacacs
+# It never binds a privileged port (4949, deliberately, so no
+# CAP_NET_BIND_SERVICE is needed anywhere in this unit).
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
