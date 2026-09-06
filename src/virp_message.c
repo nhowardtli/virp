@@ -1085,6 +1085,7 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_ACTION_FORBIDDEN:  return "Action not in the caller uid's allowed set";
     case VIRP_ERR_DUPLICATE_MISMATCH: return "Federation artifact_id reused with different body bytes";
     case VIRP_ERR_EVIDENCE_UNAVAILABLE: return "Evidence unavailable: pre-execution record could not be made durable; operation refused";
+    case VIRP_ERR_APPROVAL_STORE_ABSENT: return "Approval store directory not present on this host (wrong host, or the store is not configured here)";
     default:                         return "Unknown error";
     }
 }

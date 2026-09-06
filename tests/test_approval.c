@@ -1780,6 +1780,49 @@ static void test_unreadable_store_is_minus52_not_notfound(void)
     PASS();
 }
 
+
+/*
+ * Store split (2026-09-05). `virp approve` reaches the store through the
+ * daemon socket; `virp apply` read the directory directly, so approve
+ * succeeded as uid 1000 where apply could not — which is why apply needed
+ * `sudo -u virp`, and half of why defect D bit.
+ *
+ * The message tonight conflated three different causes. The loader must
+ * tell them apart, because the operator's next action differs for each:
+ *
+ *   store directory absent  -> you are on the wrong host
+ *   store present, no file  -> no such proposal
+ *   store present, EACCES   -> permissions          (already -52)
+ *
+ * Before this change, the first two both returned APPROVAL_NOT_FOUND.
+ */
+static void test_absent_store_is_distinct_from_missing_proposal(void)
+{
+    TEST("store-absent (-56) is distinct from proposal-not-found (-41)");
+
+    const char *pid = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c";
+    virp_proposal_rec_t prop;
+
+    /* 1. A store directory that does not exist on this host at all. */
+    virp_error_t e_absent =
+        virp_approval_load_proposal("/tmp/virp-no-such-store-dir-xyz",
+                                    pid, &prop);
+    ASSERT(e_absent == VIRP_ERR_APPROVAL_STORE_ABSENT,
+           "a store directory that is not on this host must be "
+           "STORE_ABSENT (-56), not NOT_FOUND — the operator is on the "
+           "wrong machine, not chasing a missing proposal");
+
+    /* 2. The store EXISTS (the suite's own DIR), the proposal does not. */
+    virp_error_t e_missing = virp_approval_load_proposal(DIR, pid, &prop);
+    ASSERT(e_missing == VIRP_ERR_APPROVAL_NOT_FOUND,
+           "a real store missing one proposal must stay NOT_FOUND (-41)");
+
+    ASSERT(e_absent != e_missing,
+           "the two causes must not share a code — that is the conflation "
+           "the operator hit tonight");
+    PASS();
+}
+
 int main(void)
 {
     printf("\n=== VIRP Approval Flow (propose -> approve -> apply) Tests ===\n");
@@ -1827,6 +1870,7 @@ int main(void)
     test_wrong_algorithm_rejected();
     test_no_approval_plain_block();
     test_unreadable_store_is_minus52_not_notfound();
+    test_absent_store_is_distinct_from_missing_proposal();
     test_reuse_survives_restart();
     test_concurrent_submit_one_entry();
     test_concurrent_submit_attribution_two_approvers();

@@ -418,11 +418,18 @@ virp_error_t virp_approval_load_proposal(const char *dir,
     if (read_file(path, buf, sizeof(buf)) < 0) {
         /* errno is fopen's, untouched by read_file's failure path. A
          * permission failure is NOT a missing proposal — see the note on
-         * VIRP_ERR_APPROVAL_STORE_UNREADABLE in virp.h. ENOENT and every
-         * other errno keep the original code, so no existing caller and
-         * no existing test changes. */
+         * VIRP_ERR_APPROVAL_STORE_UNREADABLE in virp.h. */
         if (errno == EACCES || errno == EPERM)
             return VIRP_ERR_APPROVAL_STORE_UNREADABLE;
+
+        /* Store split (2026-09-05): "the store is not on this host" and
+         * "this store has no such proposal" are different problems with
+         * different fixes — wrong host vs wrong id — and both used to
+         * return NOT_FOUND. Ask the directory before blaming the id. */
+        struct stat dst;
+        if (stat(dir, &dst) != 0 || !S_ISDIR(dst.st_mode))
+            return VIRP_ERR_APPROVAL_STORE_ABSENT;
+
         return VIRP_ERR_APPROVAL_NOT_FOUND;
     }
 

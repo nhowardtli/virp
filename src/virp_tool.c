@@ -1007,10 +1007,22 @@ static int submit_execute(const char *sock_path, const char *device,
                           const char *okey_path, bool chain_register)
 {
     char esc_cmd[2200];
-    json_escape(command, esc_cmd, sizeof(esc_cmd));
 
     char json[3072];
     int jl;
+    /* Store split: an APPLY carries the proposal_id ALONE. The daemon
+     * resolves device+command from its own store, so this client neither
+     * knows nor asserts them. Kept on the `execute` verb on purpose —
+     * apply has always travelled as one, so no uid's action allowlist
+     * has to change. */
+    if (!device && !command && proposal_id) {
+        jl = snprintf(json, sizeof(json),
+                      "{\"action\":\"execute\",\"proposal_id\":\"%s\"}",
+                      proposal_id);
+        goto have_json;
+    }
+
+    json_escape(command, esc_cmd, sizeof(esc_cmd));
     if (proposal_id)
         jl = snprintf(json, sizeof(json),
                       "{\"action\":\"execute\",\"device\":\"%s\","
@@ -1021,6 +1033,7 @@ static int submit_execute(const char *sock_path, const char *device,
                       "{\"action\":\"execute\",\"device\":\"%s\","
                       "\"command\":\"%s\"}",
                       device, esc_cmd);
+have_json:
     if (jl < 0 || (size_t)jl >= sizeof(json)) {
         fprintf(stderr, "Error: request too large\n");
         return 1;
@@ -1037,7 +1050,13 @@ static int submit_execute(const char *sock_path, const char *device,
      * 2 = verified signed rejection). rc 1 means unparseable or a failed
      * signature — never write that to the audit chain. */
     if (chain_register && (rc == 0 || rc == 2)) {
-        if (chain_register_observation(sock_path, device, resp, resp_len) != 0
+        /* Store split: on the apply path this client no longer knows the
+         * device — the daemon resolved it. Scope the CLI registration by
+         * the proposal instead, which is at least as specific: one
+         * proposal names exactly one device and one command. Never pass
+         * the NULL through; it feeds two %s in the request JSON. */
+        const char *reg_scope = device ? device : proposal_id;
+        if (chain_register_observation(sock_path, reg_scope, resp, resp_len) != 0
             && rc == 0)
             rc = 1;
     }
@@ -1099,11 +1118,12 @@ static int cmd_apply(int argc, char **argv)
     }
     const char *proposal_id = argv[0];
     const char *dir = APPROVAL_DEFAULT_DIR;
+    bool dir_given = false;
     const char *sock_path = ONODE_DEFAULT_SOCKET;
     const char *okey_path = OKEY_DEFAULT_PATH;
     bool chain_register = false;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--dir") == 0 && i + 1 < argc) dir = argv[++i];
+        if (strcmp(argv[i], "--dir") == 0 && i + 1 < argc) { dir = argv[++i]; dir_given = true; }
         else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) sock_path = argv[++i];
         else if (strcmp(argv[i], "--okey") == 0 && i + 1 < argc) okey_path = argv[++i];
         else if (strcmp(argv[i], "--no-verify") == 0) okey_path = NULL;
@@ -1111,31 +1131,31 @@ static int cmd_apply(int argc, char **argv)
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
 
-    virp_proposal_rec_t prop;
-    virp_error_t err = virp_approval_load_proposal(dir, proposal_id, &prop);
-    if (err != VIRP_OK) {
-        if (err == VIRP_ERR_APPROVAL_STORE_UNREADABLE) {
-            fprintf(stderr,
-                "Error: approval store %s is not readable by uid %u.\n"
-                "  The proposal may well exist — this is a permissions\n"
-                "  problem, not a missing proposal. `virp approve` reaches\n"
-                "  the store through the daemon socket; `virp apply` reads\n"
-                "  the directory directly, so approve can succeed where\n"
-                "  apply cannot. Run apply on the O-Node host as the daemon\n"
-                "  uid (or via sudo).\n",
-                dir, (unsigned)getuid());
-            return 1;
-        }
-        fprintf(stderr, "Error: cannot load proposal %s from %s: %s\n",
-                proposal_id, dir, virp_error_str(err));
-        return 1;
-    }
+    /* ── Store split (2026-09-05) ──────────────────────────────────────
+     * apply no longer opens the approval store. It used to, for exactly
+     * one reason — to learn device+command and put them in the request —
+     * and that single read is why `virp approve` succeeded as uid 1000
+     * while `virp apply` failed for any uid that cannot read the daemon's
+     * private store, i.e. why apply needed `sudo -u virp`. It is also
+     * half of why a failed apply burned an approval on 2026-09-05: the
+     * operator retried under a different uid against an approval the
+     * first attempt had already spent.
+     *
+     * The daemon owns the store and the keys, so the daemon resolves the
+     * proposal — the same shape `approve` has always had. The client now
+     * sends the proposal_id alone, and device/command reach the gate from
+     * the daemon's own record rather than from this process's copy. */
+    if (dir_given)
+        fprintf(stderr,
+            "Note: --dir is ignored by apply. The daemon resolves the\n"
+            "  proposal from its own store; this client no longer reads\n"
+            "  the directory. Point --socket at the right O-Node instead.\n");
 
-    /* Re-submit the EXACT proposed command with the approval reference. */
-    printf("device=%s command=\"%s\" proposal_id=%s\n",
-           prop.device, prop.command, prop.proposal_id);
-    return submit_execute(sock_path, prop.device, prop.command,
-                          prop.proposal_id, okey_path, chain_register);
+    (void)dir;
+    printf("proposal_id=%s (device and command resolved by the daemon)\n",
+           proposal_id);
+    return submit_execute(sock_path, NULL, NULL,
+                          proposal_id, okey_path, chain_register);
 }
 
 /* =========================================================================
