@@ -2418,3 +2418,224 @@ grep -nE '^\t.*sha256sum.*\|.*awk' "$tree/Makefile"     # expect no output
 Run on this laptop against the working tree at `1300719`: the recipe-line
 count reported 4, both greps reported nothing, and the guard printed
 nothing and exited 0.
+
+---
+
+## RECONSTRUCTED 2026-08-23 18:11 UTC — autopilot installed on virp-onode-home with no node identity
+
+**This stanza was written on 2026-09-06, not at install time.** No deploy
+record was made when this landed, and `deploy-record` did not run — the
+autopilot units and modules were placed on this host by hand. Every fact
+below is reconstructed from evidence that still exists on the box, and
+each one names its source. It is recorded here because the gap itself is
+the finding: the install that broke home collection left no trace in the
+file whose job is to answer "what is running?".
+
+- **Installed**: `/etc/systemd/system/virp-autopilot.service` and
+  `.timer`, mtime `2026-08-23 18:11:31 UTC` (source: `stat`). Also
+  `/usr/local/lib/virp/autopilot/{virp_autopilot,virp_config_backup,virp_evidence}.py`,
+  mtime `2026-09-05 05:27` — later than the units, so the modules were
+  refreshed at least once after the original install; the original module
+  mtimes are gone and are NOT reconstructable.
+- **Commit at install**: **unknown and unrecoverable.** No record was
+  written and the installed files carry no build id. The module content
+  as of 2026-09-06 is byte-identical to `main`, so the code was never the
+  variable — but that is a statement about today, not about 2026-08-23.
+- **Node identity**: `/etc/virp/autopilot-node.json` — **never installed.**
+  This is the defect. `load_node_config()` swallowed the ENOENT with a
+  bare `pass` and returned virp-lab's topology.
+- **First cycle**: `2026-08-23T18:15:02Z`, four minutes after the units
+  landed. It failed. So did every cycle after it.
+- **Never once succeeded**: over the whole journal (which begins at this
+  VM's first boot, `2026-08-12T01:35:16Z`, so this is the complete
+  history) — `Failed with result 'exit-code'` **3895**, `Deactivated
+  successfully` **0**.
+
+### What it did every five minutes for fourteen days
+
+The battery was virp-lab's: `clab-frr-ospf-frr1..4` x 2 commands, plus
+`wazuh-lab` x 2 and `librenms-lab` x 2. None of those six devices exist
+in this node's `devices.json` — there is no FRR ring, no LibreNMS and no
+PBS on the home fleet, and the home Wazuh is `wazuh-home`. All 12 probes
+returned a signed `ERROR: device '<name>' not found` from this node's own
+daemon, tier UNCLASSIFIED, obs 0x0F.
+
+Per cycle: **12 observations, 17 alerts, exit 1.** Twelve
+`battery_not_green_verified`, then five `baseline_deviation` measured
+from the error text itself (`frr_full_adjacencies expected 8 observed 0`,
+`librenms_devices expected 6 observed None`, and three more) — a
+deviation computed from bytes that were never a measurement.
+
+`published.json` carried every field `null` and, worse,
+`"node": "virp-lab"`. **Both nodes were publishing under the same
+identity.** The comparator would have diffed virp-lab against itself.
+
+Nothing here was a real fleet fault. The home fleet was not being
+observed at all; a genuine outage in this window would not have been
+caught. The 2026-09-05 work on this node (2960 receiver, tacacs uid 992)
+and the SW-3850 work on .211 the same day are **unrelated** — the
+signature on 2026-08-23 is byte-identical to the one on 2026-09-06.
+
+### Why it stayed invisible
+
+The unit was `active (waiting)` on its timer and the failures were
+`exit-code`, not crashes. `emit_alert` wrote all 66,000-odd alerts to
+`/var/lib/virp/autopilot/alerts.jsonl`, which had no size bound and no
+rotation and reached **15 MB**. The one line that would have named the
+cause — "I cannot read my own identity" — was the `pass` that was never
+written.
+
+
+## 2026-09-06 17:32 UTC — the battery is built from node identity (fix/autopilot-home)
+
+- **Commit**: `6cc72ea6b718ace124e08ef4eeb364e4e68df314` (short `6cc72ea`)
+- **Branch**: `fix/autopilot-home` — **NOT merged.** Pushed for review; this
+  stanza records an install from an unmerged branch, deliberately, because
+  the node was collecting nothing and the fix should not wait on a merge.
+- **Tree at install**: clean (`scripts/require-clean-tree.sh` passed inside
+  all three install targets; each refuses a dirty tree)
+- **Installed via** `make install-autopilot`,
+  `make install-autopilot-node NODE=home`,
+  `make install-autopilot-logrotate`
+- **Daemon NOT rebuilt, NOT reinstalled, NOT restarted.** `virp-onode.service`
+  MainPID `972525` and ActiveEnterTimestamp `2026-09-05 17:52:19 UTC` are
+  identical before and after. `make install-prod` was deliberately NOT used:
+  it replaces the gate's binary, which a monitoring-client change does not
+  need. That is why `install-autopilot` now exists.
+- **Only `virp-autopilot.service` was restarted.**
+
+| Installed path | sha256 |
+|---|---|
+| `/usr/local/lib/virp/autopilot/virp_autopilot.py` | `ea4f019ee19a9e08ad9bd9e491c93f2f11af9fe1e8d43144da655c295b37bf23` |
+| `/etc/virp/autopilot-node.json` | `392329e420f1545bc8b3a30e87f1b4966ef0db48ae26aef73a072df37b7fe879` |
+| `/etc/logrotate.d/virp-autopilot-alerts` | `7339f5a2cc9df05648fce24adebc8eea7c89f63e5af63e0549b2f2f53a75b672` |
+
+Each matches its tracked source in the commit above byte-for-byte
+(`virp_autopilot.py`, `deploy/autopilot-node.home.template.json`,
+`deploy/virp-autopilot-alerts.logrotate` respectively).
+
+### What changed
+
+Two causes, both required — see the commit message for the full account.
+**Config**: the node identity file was never installed here, and
+`load_node_config` swallowed the ENOENT silently. **Code**: `WAZUH_DEV`
+and `LIBRENMS_DEV` were module constants spliced into every battery
+unconditionally, so even a correct identity file could only have removed
+the FRR rows; the home node was unfixable by config alone.
+
+`wazuh_device` and `librenms_device` are now gated on config exactly like
+`pbs_device` and `peer_device` already were. An absent key resolves to the
+virp-lab default, so **virp-lab's battery is bit-for-bit unchanged** and
+this deploy requires nothing of it. `evaluate_baselines` takes a per-node
+baseline set and skips any check whose key is absent. `run_cycle` feeds
+baselines only from verified GREEN DEVICE_OUTPUT, so an error payload can
+no longer be counted a second time as a baseline deviation.
+
+`load_node_config` is no longer silent: a node that cannot read its own
+identity now says so on stderr and names the install command.
+
+### Baselines are deliberately EMPTY on this node
+
+`deploy/autopilot-node.home.template.json` ships `"baselines": {}`. The
+home Wazuh agent count has never been agreed, and inheriting the colo's
+5 active / 6 total would alert every cycle against a number nobody chose
+— the mirror of the caution this file already records for LibreNMS
+availability ("decide the intent before adding it"). The observed figures
+from the first cycles are recorded below as the input to that decision,
+NOT as an adopted baseline. Setting them is a separate commit.
+
+### Live verification — three consecutive cycles, exit 0
+
+One manual restart at 17:32:35 UTC, then two timer-driven cycles at
+17:35:11 and 17:40:11. All three identical:
+
+| Time (UTC) | Observations | Alerts | Exit | `wazuh_active` | `wazuh_total` |
+|---|---|---|---|---|---|
+| 17:32:35 (restart) | 2 | 0 | 0 | 2 | 5 |
+| 17:35:11 (timer) | 2 | 0 | 0 | 2 | 5 |
+| 17:40:11 (timer) | 2 | 0 | 0 | 2 | 5 |
+
+Both probes GREEN, `obs=0x07` (DEVICE_OUTPUT), `verified=VALID`, chained
+to `obs:wazuh-home:*`. `systemctl show` reports `Result=success`,
+`ExecMainStatus=0`, `NRestarts=0`. The journal says `Deactivated
+successfully` / `Finished` — lines that had never appeared for this unit
+on this host.
+
+`published.json` now carries `"node": "virp-onode-home"`. Before this
+deploy it said `"node": "virp-lab"`, so the two nodes were publishing
+under one identity and the comparator would have diffed virp-lab against
+itself.
+
+**Observed, NOT adopted as a baseline**: Wazuh reports 2 active of 5
+total agents, stable across all three cycles. That 2-of-5 is itself worth
+a look — three agents are not reporting — but it is an observation the
+node can now make, which is the point of this deploy. Recording it here
+is the input to the baseline decision, not the decision.
+
+### The alert sink is bounded, and nothing was discarded
+
+`/var/lib/virp/autopilot/alerts.jsonl` had no rotation and stood at
+**15,221,702 bytes**. `/etc/logrotate.d/virp-autopilot-alerts` now bounds
+it at 5 MB, 4 generations, compressed, `su virp virp`.
+
+Deliberately **not** `copytruncate`: that file is fourteen days of
+evidence that the failure was silent, and it is rotated and kept, never
+emptied. virp-autopilot is a oneshot, so no process holds the fd between
+cycles and rename+create loses nothing. Verified with `logrotate --debug`
+(dry run) before install: it renames to `alerts.jsonl.1` and creates a
+new file. The existing file was untouched by this deploy; the first real
+rotation happens at the next `logrotate.timer` firing, 00:00 UTC.
+
+### PENDING on virp-lab (.211) — not done, deliberately
+
+`deploy/autopilot-node.virp-lab.template.json` is transcribed verbatim
+from the file that has been live on .211 since 2026-07-29 and was tracked
+nowhere. **It has not been installed there.** Nothing on .211 was read
+beyond its config and journal, and nothing on it was changed.
+
+The code change requires nothing of .211: an absent `wazuh_device` /
+`librenms_device` / `baselines` key resolves to the virp-lab default, so
+its battery is bit-for-bit what it is today whether or not the tracked
+identity is installed.
+
+Outstanding, at the operator's next planned touch on that node:
+
+```sh
+sudo make install-autopilot-node NODE=virp-lab
+```
+
+Until that runs, .211's node identity is still an untracked hand-written
+file — the drift this commit exists to end, closed on one node of two.
+
+### Tests
+
+`make test-autopilot`: **58/58 PASS**. 20 new cases were written BEFORE
+the implementation and failed 7 failures / 6 errors against the old code,
+for exactly the reasons above. `test-config-backup`, `test-evidence`,
+`test-virp-report`, `test-template-uid-policy`: **PASS**.
+
+`make all-tests` was NOT run — it builds and links the daemon, and this
+deploy deliberately did not touch the daemon.
+
+### Known-open after this deploy
+
+- **`make check-unit-drift` FAILS on this node, and did before this
+  deploy.** Nine units are installed here and named in no manifest entry:
+  `virp-camera-submit.service`, `virp-nightly-verify.{service,timer}`,
+  `virp-spool-retention.{service,timer}`, `virp-tacacs.service`,
+  `virp-witness-submit.{service,timer}`, `virp-witness-tunnel.service`;
+  one further installed unit does not match its tracked source. Verified
+  pre-existing by stashing this branch and re-running on `main`. This
+  commit adds no new drift and fixes none of it. It is the same class of
+  finding as the one above — units live on the host that no commit names
+  — and it is larger than this change.
+- **`virp-onode-home` still has no `peer_device`.** It publishes, but no
+  node reads it, so the cross-node comparator does not cover the home
+  fleet. That needs a peer device entry on both sides and is a separate
+  piece of work.
+- **`baselines` is empty**, by choice. Until it is populated, a change in
+  the Wazuh agent count is published but not alerted on.
+- The battery is **two rows**. It observes the home Wazuh and nothing
+  else — `pve-lab` and `fortigate-home` are reachable and unprobed. That
+  is scope, held out of this fix on purpose; see
+  `feat/autopilot-home-battery`.
