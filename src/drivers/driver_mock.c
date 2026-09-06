@@ -306,6 +306,18 @@ static virp_conn_t *mock_connect(const virp_device_t *device)
     return conn;
 }
 
+/*
+ * Test hook: a session the DEVICE closed while we were idle.
+ *
+ * The connection object is still cached and non-NULL — that is the whole
+ * point of defects C and D — but the channel underneath it is gone. So a
+ * liveness probe fails, and a write fails without a byte reaching the
+ * device (no_dispatch / NOT_SENT). Models SW-3850's `exec-timeout 10`
+ * expiring in the gap between the approve and the apply.
+ */
+static bool mock_dead_session = false;
+void virp_driver_mock_set_dead_session(bool on) { mock_dead_session = on; }
+
 static virp_error_t mock_execute(virp_conn_t *conn,
                                  const char *command,
                                  virp_exec_result_t *result)
@@ -316,6 +328,17 @@ static virp_error_t mock_execute(virp_conn_t *conn,
     memset(result, 0, sizeof(*result));
     mock_count_exec_attempt();
     mock_maybe_crash();
+
+    if (mock_dead_session) {
+        /* The write dies on a channel the peer already closed. Nothing
+         * was dispatched, and the driver says so positively. */
+        result->success = false;
+        result->no_dispatch = true;
+        result->disposition = VIRP_DISPOSITION_NOT_SENT;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "session closed by peer on %s", conn->device.hostname);
+        return VIRP_ERR_SESSION_INVALID;
+    }
 
     /* Test hook: simulate driver-level error (not just result.success=false) */
     if (mock_forced_error != VIRP_OK)
@@ -451,9 +474,20 @@ static bool mock_detect(virp_conn_t *conn)
     return conn->device.vendor == VIRP_VENDOR_MOCK;
 }
 
+/*
+ * Test hook: a session the DEVICE closed while we were idle.
+ *
+ * The connection object is still cached and non-NULL — that is the whole
+ * point of defect C/D — but the channel underneath it is gone, so a
+ * liveness probe fails and any write would fail too. Models SW-3850's
+ * `exec-timeout 10` expiring between the approve and the apply.
+ */
 static virp_error_t mock_health_check(virp_conn_t *conn)
 {
     if (!conn) return VIRP_ERR_NULL_PTR;
+
+    if (mock_dead_session)
+        return VIRP_ERR_SESSION_INVALID;
 
     pthread_mutex_lock(&mock_hook_mutex);
     bool shared = mock_shared_channel;
