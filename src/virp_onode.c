@@ -2375,6 +2375,61 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                       &state->okey);
     }
 
+    /* ── DEFECT D (2026-09-05): reachable BEFORE spent ────────────────
+     *
+     * Production burned a RED approval on a command that never ran. The
+     * switch's vty had idled out (exec-timeout 10) between the approve
+     * and the apply; get_connection() returned the CACHED connection —
+     * non-NULL, but dead — the intent commit below spent the approval,
+     * and only THEN did the write fail. The retry reported
+     * approval_reused (-37) and a human had to approve again.
+     *
+     * The ordering was already careful about everything it could see: an
+     * unreadable store, a missing driver and a NULL connection all refuse
+     * above, consuming nothing. What it could not see is a connection
+     * object that is alive while its channel is not. So for an APPROVED
+     * apply — and only there, because only there is something spent —
+     * probe liveness before the consume. This is the brief's third
+     * condition: the session must be live enough to attempt the write.
+     *
+     * Cost: one lightweight read (drivers implement health_check as
+     * `show clock` or equivalent) on the approved path only. RED applies
+     * are human-approved and rare; an auto-executed GREEN read consumes
+     * no approval and is deliberately left alone.
+     *
+     * This is a REFUSAL, not a retry: the driver is never dispatched, no
+     * intent is committed, and the approval stays valid for a re-apply.
+     * Recovering the session is defect C's job in the driver; if that
+     * fix is present the probe passes straight through, and if it is not
+     * the operator re-applies after the watchdog reconnects. Either way
+     * the approval survives.
+     */
+    if (approved && drv->health_check) {
+        virp_error_t herr = drv->health_check(conn);
+        if (herr != VIRP_OK) {
+            drop_connection(state, dev_idx);
+            pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+            char err_msg[384];
+            snprintf(err_msg, sizeof(err_msg),
+                     "ERROR: apply refused for proposal %s on '%s': the "
+                     "device session is not live (%s). Nothing was "
+                     "dispatched and the approval was NOT consumed — "
+                     "re-apply once the device is reachable.",
+                     proposal_id, device_name, virp_error_str(herr));
+            fprintf(stderr, "[GATE] apply refused: proposal=%s device=%s "
+                    "reason=session-not-live (%s) — approval NOT consumed\n",
+                    proposal_id, device_name, virp_error_str(herr));
+            log_error_obs(device_name, gate_tier, err_msg);
+            return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                  state->devices[dev_idx].node_id,
+                                  onode_next_seq(state),
+                                  VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                  gate_obs_tier(gate_tier),
+                                  (const uint8_t *)err_msg,
+                                  (uint16_t)strlen(err_msg), &state->okey);
+        }
+    }
+
     /* ── EVIDENCE-REQUIRED (Sep 1 review, Task 5) ─────────────────────
      * The device is connected and the gate has admitted the command;
      * nothing has been sent yet. Commit the pre-execution record NOW,
