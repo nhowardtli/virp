@@ -267,7 +267,22 @@ class TestPolicyInvariants(unittest.TestCase):
         # issue exactly that query. A filtered variant (?type=up etc.)
         # answers a different question and would silently split the
         # baseline from the measurement again.
-        device_cmds = [c for d, c, kind in ap.BATTERY
+        # Built from an EXPLICIT config, never the ambient module-level
+        # BATTERY. ap.BATTERY is assembled at import time from
+        # /etc/virp/autopilot-node.json, so on a node whose identity names
+        # no LibreNMS this read an empty list and the assertion failed on
+        # the real node while passing on a build host.
+        #
+        # That is the SAME defect test_battery_rest_commands_are_in_green_sets
+        # above records having fixed. This one survived because until
+        # 2026-09-06 no deployed node had a LibreNMS-less identity: virp-lab
+        # has LibreNMS and virp-onode-home had no identity file at all, so
+        # both nodes happened to build a battery containing the rows. The
+        # first correct home identity broke it immediately.
+        battery = ap.build_battery({"node": "virp-lab",
+                                    "frr_nodes": list(ap.FRR_NODES),
+                                    "peer_device": None})
+        device_cmds = [c for d, c, kind in battery
                        if kind == "librenms_devices"]
         self.assertEqual(device_cmds, ["GET /api/v0/devices"])
         for cmd in device_cmds:
