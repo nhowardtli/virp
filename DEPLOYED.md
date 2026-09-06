@@ -2769,3 +2769,146 @@ deploy deliberately did not touch the daemon.
   else — `pve-lab` and `fortigate-home` are reachable and unprobed. That
   is scope, held out of this fix on purpose; see
   `feat/autopilot-home-battery`.
+
+## 2026-09-06 18:30 UTC — nine units on virp-onode-home brought under repo control (fix/313-unit-manifest)
+
+- **Commit**: `4e7b2c9` on branch `fix/313-unit-manifest`, cut from
+  `origin/main` at `cb4589e`. **Not merged.**
+- **Tree at install**: clean (`scripts/require-clean-tree.sh` inside every
+  target)
+- **Installed via** `make install-home-units`, `install-camera-runtime`,
+  `install-nightly-verify`, `install-witness-units`,
+  `install-tacacs-receiver`
+- **Nothing was restarted, reloaded, stopped or rebuilt.** No
+  `systemctl daemon-reload`, no `install-prod`, `virp-onode.service`
+  untouched.
+
+### The install was a verified no-op
+
+Every target compares before writing and prints `no change` rather than
+touching a live unit's mtime. All sixteen paths printed `no change`.
+Proof beyond the target's own word — mtimes before and after are
+identical to the nanosecond:
+
+| Path | mtime, unchanged |
+|---|---|
+| `virp-camera-submit.service` | `2026-09-05 05:39:07.726945674` |
+| `virp-nightly-verify.service` | `2026-09-05 05:39:07.755946039` |
+| `virp-spool-retention.service` | `2026-09-05 05:39:07.737945812` |
+| `virp-witness-submit.service` | `2026-09-03 02:31:01.573594289` |
+| `virp-witness-tunnel.service` | `2026-09-03 12:30:11.396055027` |
+| `virp-tacacs.service` | `2026-09-05 21:58:52.198435866` |
+
+`ExecMainStartTimestamp` likewise unchanged for every running unit:
+virp-camera-submit `Sep 05 11:25:08`, virp-tacacs `Sep 05 21:58:52`,
+virp-witness-tunnel `Sep 04 22:14:26`, virp-onode `Sep 05 17:52:19`.
+
+### check-unit-drift
+
+Nine `installed but named in no manifest entry` failures before; **zero**
+after. All nine now report `match:`. The check still exits non-zero on
+**exactly one** finding, the netclaw ruleset below, which is deliberate
+and is the honest state.
+
+### A correction to the survey that preceded this
+
+The Phase 1 inventory was run against 313's local `main`, which was three
+commits stale, and it overstated what was untracked. Corrected against
+`origin/main`:
+
+| Artifact | Survey said | Actually |
+|---|---|---|
+| `camera/virp_camera.py` | tracked but 26 KB behind, missing `run_retention` | **already current.** `run_retention` landed in `1ef5fd9`. The drift was between the box and a stale checkout, never between the box and this repo. Nothing overwritten |
+| `deploy/tacacs/virp-tacacs.service` | untracked | **already tracked, byte-identical** to installed. It was missing from the manifest only |
+| `tacacs/virp_tacacs_recv.py` | untracked | **already tracked, byte-identical** |
+| `tacacs/virp_tacacs_codec.py` | untracked | **already tracked, byte-identical** |
+| `export_bundle.py` | untracked | untracked, confirmed. `tools/bundle/virp_export_bundle.py` is a **different program** — 9 KB vs 79 KB, different CLI — and is untouched |
+
+So this commit adds 8 units and 4 files, not 9 and 7. A survey run from a
+stale checkout reports the checkout's age as the host's drift; the fix is
+to compare against the remote, which is what the corrected table above
+does.
+
+### TACACS receiver: config is box-only and unrendered — OPEN
+
+`virp-tacacs.service` is live production; the 2960 accounts into it
+(45 accepted / 45 recorded / 0 failed at last count, listening on
+`10.0.0.13:4949`). The unit, `virp_tacacs_recv.py`, `virp_tacacs_codec.py`
+and the two-line `virp-tacacs-recv` wrapper are all tracked and installed
+byte-identical. **It was not restarted** — a restart drops in-flight
+accounting records.
+
+Its runtime configuration is NOT in this repo and NOT rendered from it:
+
+- `/etc/virp/tacacs/recv.json` (0600 `virp-tacacs`) — carries
+  `producer_key` and a per-relationship `secret` for each client,
+  including the live 2960's
+- `/etc/virp/tacacs/producer.key`, `/etc/virp/tacacs/secret-2960`
+
+Deliberately excluded. Tracking `recv.json` needs a placeholder scheme
+and a render step at service start, the way `render-devices.sh`
+substitutes `devices.template.json` — neither exists for this receiver
+yet. **Until it does, the relationship config that decides which switches
+are trusted, and with what shared secret, is unreviewed and exists in
+exactly one place.** That is a real gap, it is not closed by this commit,
+and it is its own follow-up.
+
+### netclaw egress ruleset: tracked differs from installed — REINSTALL PENDING
+
+| | sha256 | |
+|---|---|---|
+| `deploy/nftables-virp-netclaw-egress.nft` | `9e8ce9ce6e05e40d…` | the fuller text, keeps `#!/usr/sbin/nft -f` |
+| `/etc/nftables-virp-netclaw-egress.nft` | `975d49f0afa0f508…` | shorter comment, shebang dropped |
+
+**Comments only.** The `table inet virp_netclaw_egress` block is
+byte-identical in both, and `nft list ruleset` confirms the loaded rules
+match either file — `meta skuid 993 ct state established,related accept`
+then `meta skuid 993 counter reject`. The installed copy replaced the
+explanation of the OpenSSH 9.6 streamlocal quirk, the `ct state`
+exemption and AF_UNIX being outside netfilter with a two-line pointer at
+`sshd_config.d/61-virp-netclaw.conf`, and dropped the shebang.
+
+The repo keeps its own text. **The box is NOT being reinstalled here** —
+that writes to a live egress control and needs its own approval, so it is
+outstanding:
+
+```sh
+sudo install -m 0644 deploy/nftables-virp-netclaw-egress.nft \
+    /etc/nftables-virp-netclaw-egress.nft
+# then reload deliberately; the running kernel ruleset is already correct
+```
+
+`deploy/unit-drift-allowlist.txt` was NOT used to silence this. That file
+ships empty on purpose and says so at length: "a red check that tells the
+truth is worth more than a green one that does not." A pattern broad
+enough to forgive a comment rewrite is exactly the pattern that hides the
+next one. One honest FAIL stands.
+
+### Tests
+
+`make test-autopilot`: **62/62 PASS**, including the new
+`TestCameraRuntimeCoversWhatTheTimersCall`. Two units exec
+`camera/virp_camera.py`, so the tracked runtime must not fall below what
+they invoke: it asserts `run_retention()` is defined, and that every
+subcommand spelled in a unit's `ExecStart` is both registered with
+`add_parser` and dispatched. Verified to FAIL (2 of 4 cases) against
+`1dab856`'s camera runtime — the state in which 02:30 retention would
+have broken silently, since a timer exiting non-zero into an unread log
+looks identical to "nothing was old enough to delete".
+
+`make all-tests` was NOT run: it builds and links the daemon, and nothing
+here touches the daemon.
+
+### Known-open after this commit
+
+- The netclaw reinstall above.
+- The TACACS receiver config, above.
+- Eight tracked units remain `not installed` on this node
+  (autopilot corpus/comparator/chainwalk, config-backup, evidence,
+  broker, prometheus exporter, three onode drop-ins). That is expected —
+  the checker treats absent as skipped, not failed — but nobody has
+  confirmed which of them this node is *supposed* to run.
+- `virp-camera-submit` has appended nothing since `15:40:53` and
+  `/var/spool/virp-capture/incoming` is empty. The submitter is healthy
+  and idle; the cameras stopped producing. Unrelated to this commit, and
+  unexplained.
