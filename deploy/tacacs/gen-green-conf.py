@@ -225,6 +225,49 @@ def rule(cmd, prefix_mode):
     return r"/\A" + body + r"(?: <cr>)?\z/"
 
 
+def always_permitted(repo_root):
+    """The session-display exemption, READ FROM THE ENGINE.
+
+    virp_tacacs_authz.py:ALWAYS_PERMITTED is the source of truth and this
+    imports it rather than restating it. Restating is exactly how the
+    authorization server and the gate come to disagree about what GREEN
+    means -- the failure this file's own header warns about.
+
+    Why these are needed at all: the cisco_ios driver sends
+    `terminal length 0` on EVERY session (driver_cisco.c:434,455). Under
+    `aaa authorization commands 1` it needs a decision, and denying it
+    leaves the pager on, so any read longer than a screen never reaches
+    the device prompt and the whole observation fails. Measured on
+    LAB-SWITCH-1 2026-09-06: `show clock` completed, `show version` did
+    not.
+
+    EXACT match, never a prefix, even when --prefix is set for the GREEN
+    table: `terminal length 0` is permitted and `terminal monitor` stays
+    denied. exit/quit/end are here for the reason the engine gives -- a
+    session that cannot leave config mode has to be killed, and killing
+    it loses the accounting for what it did.
+    """
+    import importlib.util
+    src = repo_root / "tacacs" / "virp_tacacs_authz.py"
+    if not src.exists():
+        sys.exit("FATAL: %s not found; cannot derive the session "
+                 "exemption. Refusing to guess it." % src)
+    spec = importlib.util.spec_from_file_location("_az", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    vals = tuple(mod.ALWAYS_PERMITTED)
+    if not vals:
+        sys.exit("FATAL: ALWAYS_PERMITTED is empty in %s" % src)
+    return vals
+
+
+def exact_rule(cmd):
+    """Anchored exact match plus the optional IOS ' <cr>' terminator."""
+    if not SAFE_LITERAL.match(cmd):
+        sys.exit("FATAL: %r is not a safe literal for the config lexer" % cmd)
+    return "/\\A%s(?: <cr>)?\\z/" % cmd
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--driver", required=True)
@@ -270,6 +313,16 @@ def main():
     lines.append("#")
     lines.append("# Slash delimiters select PCRE2. Double quotes would select")
     lines.append("# POSIX ERE, which has no non-capturing group and rejects these.")
+    lines.append("")
+    session = always_permitted(repo_root)
+    lines.append("    # Session-display exemption, derived from")
+    lines.append("    # virp_tacacs_authz.py:ALWAYS_PERMITTED -- not restated here.")
+    lines.append("    # EXACT match even under --prefix: 'terminal length 0' is")
+    lines.append("    # permitted, 'terminal monitor' stays denied. The driver sends")
+    lines.append("    # 'terminal length 0' on every session; denying it leaves the")
+    lines.append("    # pager on and any read longer than a screen never completes.")
+    for c in session:
+        lines.append("    if (cmd =~ %s) { permit }" % exact_rule(c))
     lines.append("")
     for c in green:
         lines.append("    if (cmd =~ %s) { permit }" % rule(c, args.prefix))
