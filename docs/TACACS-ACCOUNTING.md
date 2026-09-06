@@ -1365,7 +1365,7 @@ and nothing binds that to the outcome.
 
 ## 9. Scope of authorization, and what this source still does not prove
 
-### 9.1 The resolution: authorization applies to the GATE's identities only
+### 9.1 The resolution: the gate is fenced, operators are decisioned
 
 §1 and §8a were in tension. §1 says VIRP takes only the job whose failure
 mode is "evidence is missing, never the network is down". §8a introduced
@@ -1378,18 +1378,54 @@ true of the same identities.
 |---|---|---|
 | `virp-ro` (gate steady state) | TACACS+ per-command, `group` only | **can do nothing** |
 | `virp-rw` (gate, approved actions) | TACACS+ per-command, `group` only | **can do nothing** |
+| `nhoward` (human operator, VTY) | TACACS+ per-command, **full permit** | **VTY stops; console unaffected** |
 | humans, via the console | exempt (`CONSOLE` list, method `none`) | **unaffected** |
 | `breakglass` (local account, console path) | exempt with the console | **unaffected** |
 
-**The original §1 argument is not withdrawn — it is the reason humans are
-exempt.** An authorization server that can lock an operator out of a
-device is exactly the failure v1 refused to build, so no human depends on
-one. What changed is that the GATE is now fenced: VIRP's own automated
-identities fail closed, because an automated actor that keeps acting when
-its control plane is unreachable is not governed at all.
+Three shapes, not two:
+
+1. **The gate is fenced.** `virp-ro` and `virp-rw` are authorized
+   per-command and fail closed. An automated actor that keeps acting when
+   its control plane is unreachable is not governed at all.
+
+2. **Human operators go through TACACS+ and are never refused by it.**
+   `operator_profile` permits every command (`\A.*\z`, and deliberately
+   *without* `guard.conf`). They are on this server for **visibility, not
+   restriction**: a permit is still a decision, so it lands in
+   `authz.log` and is attributable, where previously an operator's VTY
+   commands produced no authorization record at all. §9.2's point about
+   accounting stands — but accounting cannot see a refusal, and it also
+   could not see *who decided* anything for an exempt human.
+
+3. **The console remains the recovery path.** Authentication `local`,
+   authorization `none`. This is what keeps the §1 argument intact: an
+   authorization server that can lock an operator out of a device is the
+   failure v1 refused to build, and the console is the reason adding
+   operator accounts does not rebuild it.
+
+**What genuinely changed, and it is not free.** Until now no human
+depended on this server. Now a human's *VTY* session does — if
+tac_plus-ng is down, `nhoward` cannot log in over the network and must
+walk to the console. That is a real reduction in remote availability,
+accepted in exchange for operator commands being decisioned. It is also
+why `authorization commands N CONSOLE none` is now load-bearing:
+removing it from a device converts a server outage into a full operator
+lockout.
+
+**The blast radius of a tac_plus-ng compromise grew.** Before, the
+credentials this server could vouch for were `virp-ro` (fenced to GREEN)
+and `virp-rw` (deny-all until `approved.conf`). It can now vouch for a
+priv-15 identity permitted to run anything on every enrolled device.
+The password is stored as a `crypt`/SHA-512 hash rather than cleartext,
+which is a real improvement over the gate accounts and does not change
+the conclusion: this host is now worth more to an attacker than it was.
+It is not a reason to withhold the change — the alternative is operator
+commands nobody can attribute — but it belongs in the threat model, not
+in a footnote.
 
 So the failure mode is still "evidence is missing, never the network is
-down" **for humans**, and is deliberately "the gate stops" for the gate.
+down" **for humans at the console**, is "the VTY stops" for humans on the
+network, and is deliberately "the gate stops" for the gate.
 
 ### 9.2 Break-glass use is an event, graded RED
 

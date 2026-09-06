@@ -1109,6 +1109,18 @@ test-tacacs-identities:
 	@echo "=== TACACS+ relationship identities vs the fleet ==="
 	python3 tests/test_tacacs_identities.py
 
+# Operator vs gate authorization, against a REAL tac_plus-ng. NOT part of
+# all-tests: it needs a live server, and guard.conf's possessive
+# quantifier cannot be faithfully re-implemented in Python, so there is
+# no offline substitute. Skips cleanly when the two vars are unset.
+#
+#   make test-tacacs-operator TACACS_PROBE_HOST=127.0.0.1 \
+#        TACACS_PROBE_KEY="$$(read it from secrets.conf on the server)"
+.PHONY: test-tacacs-operator
+test-tacacs-operator:
+	@echo "=== TACACS+ operator vs gate authorization (live server) ==="
+	python3 tests/test_tacacs_operator_policy.py
+
 # Sep 1 review, Task 2: the SHIPPED templates, rendered by the real
 # render-devices.sh into a sandbox, must give every allowed uid an
 # explicit socket_uid_action_allow entry (the daemon refuses to start

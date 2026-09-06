@@ -14,7 +14,7 @@ GNS3 fabric was powered off throughout. VM 313 was not modified.
 | Storage | rootfs on **`local`** (dir), *not* `local-lvm` |
 | Software | tac_plus-ng `fd4818b71485f5746a522242027133c26092f9f6`, PCRE2, OpenSSL 3.0.20, built from source |
 | Service | `virp-tacacs-authz.service`, enabled, `Type=exec`, `Restart=always` |
-| Identities | `virp-ro` (priv 1), `virp-rw` (priv 15). **No human accounts** (§9.1). |
+| Identities | `virp-ro` (priv 1), `virp-rw` (priv 15), both fenced. Plus human operator accounts (`nhoward`, priv 15) on `operator_profile`, **permitted everything** — decisioned for visibility, never refused (§9.1). |
 | Secrets | `/etc/tacacs/secrets.conf`, 0600 root:root, generated on the box, never printed |
 | Decision log | `/var/log/tacacs/authz.log` — permits **and** denials |
 

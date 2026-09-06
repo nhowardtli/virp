@@ -8,7 +8,7 @@ fabric (R1–R35) was powered off throughout and remains so.
 |---|---|
 | Authorization + authentication server | **10.0.0.215 port 49** (CT 215 `virp-tacacs`, pve-lab) |
 | Accounting receivers — **do not change** | 313 at **10.0.0.13:4949**, .211 at **10.0.10.211:4949** |
-| Identities | `virp-ro` (priv 1), `virp-rw` (priv 15). No human accounts. |
+| Identities | `virp-ro` (priv 1), `virp-rw` (priv 15), both fenced. Plus human operators (`nhoward`, priv 15) on `operator_profile`, permitted everything — see §9.1. |
 | Shared key | `/etc/tacacs/secrets.conf` on CT 215, `host gns3_home_fabric`. 0600 root. Read it there. |
 | Fabric addressing | R*n* = `10.0.0.(49+n)`; R1 = `.50` … R35 = `.84` |
 
@@ -114,7 +114,10 @@ aaa authorization exec VIRPNET group GRP-VIRPAZ
 aaa authorization commands 1  VIRPNET group GRP-VIRPAZ
 aaa authorization commands 15 VIRPNET group GRP-VIRPAZ
 !
-! Humans on the console are EXEMPT from authorization entirely (§9.1).
+! Humans on the CONSOLE are EXEMPT from authorization entirely (§9.1) and
+! this is now the RECOVERY PATH, not merely an exemption: operator VTY
+! sessions authorize against the server, so this list is what keeps a
+! server outage from becoming an operator lockout. Do not remove it.
 ! Authentication is "local", NOT "none": §7.3 measured that a console
 ! authenticating with "none" produces NO command accounting at all,
 ! because there is no AAA user to attribute a command to.
