@@ -4360,6 +4360,59 @@ TEST(test_separator_refusal_chains_rejection_without_proposing)
 }
 
 /*
+ * The PIPE case, chained — and what it proves about Cell 3.
+ *
+ * `|` is refused at ingress for EVERY vendor: virp_command_check_separators
+ * has no output-filter allowlist, deliberately (see the policy note in
+ * virp.h). So a command carrying an output filter can never reach a
+ * driver, and therefore can never produce a gate_execution record.
+ *
+ * That is worth pinning as a test rather than leaving as a reading of the
+ * code, because the reconciler's defect-E analysis assumed the opposite:
+ * it assumed a GATE-side command could carry ` | include ...` and fail to
+ * match the switch's stripped accounting record. It cannot. A filtered
+ * command through the gate produces a gate_rejection and nothing else, so
+ * the only way one reaches a device is a human at the console — which the
+ * reconciler correctly grades UNGOVERNED.
+ *
+ * Concretely: Cell 3 as written (`show running-config | include hostname`)
+ * cannot run through the gate at all. That is an ingress-policy fact, not
+ * an accounting one.
+ */
+TEST(test_pipe_refusal_chains_and_mints_no_execution)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB",
+                            "show running-config | include hostname",
+                            obs, sizeof(obs), &olen));
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session("gate-separator:PVE-LAB", rows, GX_MAX_ROWS);
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(strcmp(rows[0].type, "gate_rejection"), 0);
+    ASSERT_TRUE(rows[0].have_body);
+    /* The refused byte is named, so an auditor sees WHICH separator. */
+    ASSERT_TRUE(strstr(rows[0].body, "illegal separator '|'") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"refusal_stage\":\"ingress-separator\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":false") != NULL);
+
+    /* Nothing executed, and no proposal was filed: a separator refusal is
+     * unapprovable, so there is no escalation path to offer. */
+    int enforce_rows = gx_read_session(GX_SESSION, rows, GX_MAX_ROWS);
+    ASSERT_EQ(enforce_rows, 0);
+}
+
+/*
  * REGRESSION: a refused action still chains a gate_rejection, exactly as
  * before — same type, same artifact_id prefix, same schema, same
  * executed=false — and mints no execution record.
@@ -8172,6 +8225,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_execution_record_commits_to_digest_not_response_body);
     RUN_TEST(test_errored_execution_still_chains_no_gap);
     RUN_TEST(test_separator_refusal_chains_rejection_without_proposing);
+    RUN_TEST(test_pipe_refusal_chains_and_mints_no_execution);
     RUN_TEST(test_refused_action_still_chains_gate_rejection);
     RUN_TEST(test_chain_verify_over_mixed_executions_and_rejections);
 
