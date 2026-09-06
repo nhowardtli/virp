@@ -570,11 +570,13 @@ typedef enum {
      * treat this as a PRE-EXECUTION failure: it consumes nothing. */
     VIRP_ERR_TRANSPORT_WRITE          = -54,
 
-    /* -55 is RESERVED for VIRP_ERR_TRANSPORT_CLOSED on the
-     * fix/B-preserve-libssh2-errno branch, which is merged next in this
-     * same gate. -54 above was the other half of that reservation and is
-     * now claimed. Leaving -55 free is what keeps the B merge from a
-     * silent enum collision. Do not reuse it here. */
+    /* The peer closed the channel (defect B, 2026-09-05). A narrower
+     * case of VIRP_ERR_TRANSPORT_WRITE: the session is gone rather than
+     * merely unwell, so ONE reconnect-and-retry is the correct response
+     * (defect C). Nothing was dispatched — same pre-execution contract
+     * as VIRP_ERR_TRANSPORT_WRITE: it consumes no approval. */
+    VIRP_ERR_TRANSPORT_CLOSED         = -55,
+
 
     /* The approval store DIRECTORY is not on this host (defect: store
      * split, 2026-09-05). Distinct from VIRP_ERR_APPROVAL_NOT_FOUND

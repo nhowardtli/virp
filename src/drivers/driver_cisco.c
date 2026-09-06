@@ -60,6 +60,7 @@ struct virp_conn {
     bool                connected;
     bool                in_enable;
     cisco_mode_t        current_mode; /* tracked from the learned prompt */
+    int                 last_io_error; /* raw libssh2 code, defect B */
 };
 
 /* ── Transport adapter for the shared read path ─────────────────── */
@@ -71,6 +72,37 @@ static ssize_t cisco_io_read(void *ctx, char *buf, size_t len)
     if (n == LIBSSH2_ERROR_EAGAIN)
         return VIRP_SSH_IO_EAGAIN;
     return n;
+}
+
+/*
+ * Classify a hard libssh2 transport error and preserve the raw code on
+ * the connection. Returns a VIRP_SSH_IO_* sentinel - never the native
+ * code (see the note in virp_ssh_io.h).
+ */
+static ssize_t cisco_io_write_error(virp_conn_t *conn, int rc)
+{
+    /* Preserve the native code for the log and for the reconnect
+     * decision. This is the fact defect B was throwing away. */
+    conn->last_io_error = rc;
+
+    switch (rc) {
+    /* The peer is gone. A vty session-timeout on IOS-XE lands here:
+     * the switch closed the channel while we were idle, and the first
+     * write after that fails. Reconnecting is the correct response. */
+    case LIBSSH2_ERROR_CHANNEL_CLOSED:
+    case LIBSSH2_ERROR_CHANNEL_EOF_SENT:
+    case LIBSSH2_ERROR_SOCKET_DISCONNECT:
+    case LIBSSH2_ERROR_SOCKET_SEND:
+    case LIBSSH2_ERROR_SOCKET_RECV:
+        return VIRP_SSH_IO_CLOSED;
+
+    /* Everything else is hard but not a closed peer - allocation
+     * failures, protocol errors. Reconnecting would not fix these, and
+     * reporting them as CLOSED would make defect C's one retry fire on
+     * failures it cannot help, turning one honest error into two. */
+    default:
+        return VIRP_SSH_IO_ERROR;
+    }
 }
 
 static ssize_t cisco_io_write(void *ctx, const char *buf, size_t len)
@@ -85,7 +117,7 @@ static ssize_t cisco_io_write(void *ctx, const char *buf, size_t len)
         else if (n == LIBSSH2_ERROR_EAGAIN)
             usleep(10000);
         else
-            return -1;
+            return cisco_io_write_error(conn, (int)n);
     }
     return (ssize_t)written;
 }
