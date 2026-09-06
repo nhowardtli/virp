@@ -92,6 +92,10 @@ typedef struct {
     int         writes;
     char        written[4096];
     size_t      written_len;
+    /* When non-zero, mock_write returns this value instead of writing:
+     * a HARD transport error, the shape libssh2 reports when the peer
+     * has closed the channel underneath us. */
+    ssize_t     write_fail;
 } mock_pty_t;
 
 static void mock_queue(mock_pty_t *m, const char *data)
@@ -141,6 +145,10 @@ static ssize_t mock_read(void *ctx, char *buf, size_t len)
 static ssize_t mock_write(void *ctx, const char *buf, size_t len)
 {
     mock_pty_t *m = (mock_pty_t *)ctx;
+    if (m->write_fail) {
+        m->writes++;
+        return m->write_fail;
+    }
     if (m->written_len + len < sizeof(m->written)) {
         memcpy(m->written + m->written_len, buf, len);
         m->written_len += len;
@@ -703,6 +711,47 @@ TEST(test_keepalive_without_prompt_is_error)
 
 /* ========================================================================= */
 
+
+/* =========================================================================
+ * Defect A — a transport write failure must not wear a crypto error code
+ *
+ * Observed 2026-09-05 against SW-3850: the vty session had idled out, the
+ * channel write failed, and virp_ssh_exec returned VIRP_ERR_CRYPTO. Every
+ * reader — human and agent — then went hunting for a key problem. The
+ * ~10 minutes that cost is the whole reason this test exists.
+ *
+ * VIRP_ERR_CRYPTO means a cryptographic operation failed. A channel that
+ * will not accept bytes is a TRANSPORT fact and must say so, so that the
+ * caller (and defect C's reconnect logic) can act on "the pipe is gone"
+ * rather than "the keys are wrong".
+ * ========================================================================= */
+TEST(test_write_failure_reports_transport_not_crypto)
+{
+    mock_pty_t m;
+    mock_init(&m, "", 32);
+    m.write_fail = -1;            /* hard transport error from the adapter */
+    virp_ssh_io_t io = { .ctx = &m, .read = mock_read, .write = mock_write };
+
+    virp_ssh_prompt_t pr;
+    memset(&pr, 0, sizeof(pr));
+    snprintf(pr.prompt, sizeof(pr.prompt), "SW-3850#");
+    pr.prompt_len = strlen(pr.prompt);
+    pr.learned = true;
+
+    char buf[256];
+    size_t out_len = 0;
+    virp_error_t rc = virp_ssh_exec(&io, &pr, "show clock",
+                                    buf, sizeof(buf), &out_len,
+                                    1000, "SW-3850");
+
+    CHECK(rc != VIRP_ERR_CRYPTO,
+          "a transport write failure must NOT report VIRP_ERR_CRYPTO (%d) "
+          "- that sends every reader after a key problem", (int)rc);
+    CHECK(rc == VIRP_ERR_TRANSPORT_WRITE,
+          "expected VIRP_ERR_TRANSPORT_WRITE (%d), got %d",
+          (int)VIRP_ERR_TRANSPORT_WRITE, (int)rc);
+}
+
 int main(void)
 {
     printf("\n=== VIRP Shared SSH Read Path Tests (finding N1 / 2a) ===\n\n");
@@ -723,6 +772,9 @@ int main(void)
     printf("\n--- PAN-OS keepalive window (2b) ---\n");
     RUN_TEST(test_keepalive_exchange_leaves_channel_clean);
     RUN_TEST(test_keepalive_without_prompt_is_error);
+
+    printf("\n--- Transport error typing (defect A) ---\n");
+    RUN_TEST(test_write_failure_reports_transport_not_crypto);
 
     printf("\n--- Scrubbing and drain accounting ---\n");
     RUN_TEST(test_strip_echo_matches_command_text);

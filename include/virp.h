@@ -561,6 +561,15 @@ typedef enum {
      * payload cites "evidence-unavailable". */
     VIRP_ERR_EVIDENCE_UNAVAILABLE     = -53,
 
+    /* Transport write failure (defect A, 2026-09-05). The channel would
+     * not accept bytes: the peer closed, the session reset, or the
+     * adapter reported a hard error. Distinct from VIRP_ERR_CRYPTO
+     * (-32), which this path used to return and which sends every
+     * reader hunting a key problem for what is a dead pipe. Nothing was
+     * dispatched to the device, so a caller holding an approval must
+     * treat this as a PRE-EXECUTION failure: it consumes nothing. */
+    VIRP_ERR_TRANSPORT_WRITE          = -54,
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency
