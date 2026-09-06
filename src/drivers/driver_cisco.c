@@ -1174,6 +1174,78 @@ virp_error_t cisco_store_output(virp_exec_result_t *result,
     return VIRP_OK;
 }
 
+/* ── Defect C: stale-session recovery ──────────────────────────────
+ *
+ * SW-3850 runs `exec-timeout 10`. After ten idle minutes the switch
+ * closes the vty; the daemon still holds the cached connection and hands
+ * it out, so the next command's first write lands on a dead channel.
+ * Deterministic, and it fired on every idle gap tonight.
+ *
+ * Re-establish the transport IN PLACE. The O-Node caches virp_conn_t
+ * POINTERS (onode_state.connections[]), so the address must not change:
+ * we build a fresh connection with the normal cisco_connect() path — TCP,
+ * handshake, host-key verification, auth, enable, prompt learn, all of it,
+ * with no weakening — and then move its transport into the existing
+ * struct. Returns true if the connection is usable again.
+ */
+static bool cisco_reconnect_in_place(virp_conn_t *conn)
+{
+    if (!conn) return false;
+
+    fprintf(stderr, "[Cisco] Session closed by peer on %s — reconnecting "
+            "once (last libssh2 error %d)\n",
+            conn->device.hostname, conn->last_io_error);
+
+    /* Tear down the dead transport. No graceful "exit": the peer is gone,
+     * and writing to it is what just failed. */
+    if (conn->channel) {
+        libssh2_channel_free(conn->channel);
+        conn->channel = NULL;
+    }
+    if (conn->session) {
+        libssh2_session_free(conn->session);
+        conn->session = NULL;
+    }
+    if (conn->sock_fd >= 0) {
+        close(conn->sock_fd);
+        conn->sock_fd = -1;
+    }
+    conn->connected = false;
+
+    virp_conn_t *fresh = cisco_connect(&conn->device);
+    if (!fresh) {
+        fprintf(stderr, "[Cisco] Reconnect FAILED on %s — reporting the "
+                "transport error\n", conn->device.hostname);
+        return false;
+    }
+
+    /* Adopt the fresh transport into the cached struct, then discard the
+     * shell. NOT cisco_disconnect(fresh) — that would tear down the very
+     * session we just adopted. */
+    conn->sock_fd      = fresh->sock_fd;
+    conn->session      = fresh->session;
+    conn->channel      = fresh->channel;
+    conn->prompt       = fresh->prompt;
+    conn->connected    = fresh->connected;
+    conn->in_enable    = fresh->in_enable;
+    conn->current_mode = fresh->current_mode;
+    conn->io.ctx       = conn;      /* fresh->io.ctx pointed at the shell */
+
+    OPENSSL_cleanse(fresh->device.password, sizeof(fresh->device.password));
+    OPENSSL_cleanse(fresh->device.enable_password,
+                    sizeof(fresh->device.enable_password));
+    free(fresh);
+
+    fprintf(stderr, "[Cisco] Reconnected: %s (prompt '%s')\n",
+            conn->device.hostname, conn->prompt.prompt);
+    return true;
+}
+
+/* Test seam: tests/test_driver_cisco_reconnect.c swaps this for a stub so
+ * the retry policy can be exercised without a device. Production always
+ * runs cisco_reconnect_in_place. */
+static bool (*cisco_reconnect_fn)(virp_conn_t *) = cisco_reconnect_in_place;
+
 static virp_error_t cisco_execute(virp_conn_t *conn,
                                   const char *command,
                                   virp_exec_result_t *result)
@@ -1233,6 +1305,38 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
                                       raw_output, sizeof(raw_output), &n,
                                       SSH_READ_TIMEOUT_MS,
                                       conn->device.hostname);
+
+    /* ── Defect C: one reconnect, one retry, never a loop ──────────────
+     *
+     * ONLY on VIRP_ERR_TRANSPORT_CLOSED — defect B's proof that the peer
+     * closed the channel. That code is returned by the WRITE path before
+     * any byte reached the device, so the retry is a first execution, not
+     * a repeat: the same standard the O-Node's no_dispatch retry uses.
+     *
+     * Deliberately NOT retried:
+     *   - VIRP_ERR_TRANSPORT_WRITE / VIRP_SSH_IO_ERROR: hard, but not a
+     *     closed peer; reconnecting cannot fix it and would turn one
+     *     honest error into two.
+     *   - VIRP_ERR_NO_PROMPT: bytes went out. Absence of a response is
+     *     not proof of non-execution.
+     *   - anything issued from config mode: a reconnect lands us back in
+     *     exec mode, where the same literal no longer means the same
+     *     thing. Report the drop honestly instead of guessing.
+     */
+    if (rerr == VIRP_ERR_TRANSPORT_CLOSED) {
+        if (conn->current_mode == CISCO_MODE_CONFIG ||
+            conn->current_mode == CISCO_MODE_CONFIG_SUB) {
+            fprintf(stderr, "[Cisco] Session closed on %s while in config "
+                    "mode — NOT reconnecting: the same literal would run in "
+                    "a different mode\n", conn->device.hostname);
+        } else if (cisco_reconnect_fn(conn)) {
+            n = 0;
+            rerr = virp_ssh_exec(&conn->io, &conn->prompt, command,
+                                 raw_output, sizeof(raw_output), &n,
+                                 SSH_READ_TIMEOUT_MS,
+                                 conn->device.hostname);
+        }
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
