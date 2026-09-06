@@ -96,6 +96,25 @@ deploy/virp-onode-home.dropin.conf /etc/systemd/system/virp-onode.service.d/40-h
 deploy/virp-deployed-state.service /etc/systemd/system/virp-deployed-state.service
 deploy/virp-deployed-state.timer /etc/systemd/system/virp-deployed-state.timer
 
+# ── autopilot alert-sink rotation ─────────────────────────────────────
+# Not a systemd unit, listed for the reason the netclaw ruleset above is:
+# the thing that must not drift is the RULE. A rotation policy edited on
+# the host is how an evidence file silently changes retention.
+deploy/virp-autopilot-alerts.logrotate /etc/logrotate.d/virp-autopilot-alerts
+
+# ── autopilot node identities: DELIBERATELY ABSENT ────────────────────
+# deploy/autopilot-node.home.template.json and
+# deploy/autopilot-node.virp-lab.template.json both install to the same
+# path, /etc/virp/autopilot-node.json, on their respective nodes. That is
+# the one-tracked-file-per-installed-path collision this file already
+# refuses for the two device templates, and for the same reason: listing
+# either alone would assert that every node runs that node's battery,
+# which is false, and would report the other node as drifted forever.
+#
+# They are tracked (as of 2026-09-06) and installed by `make
+# install-autopilot-node NODE=<name>`; they are compared per-node by the
+# same mechanism as the device templates, not by this manifest.
+
 # ── optional integrations ─────────────────────────────────────────────
 # Not installed on virp-lab. Listed so that a node which DOES install it
 # gets the same comparison as everything else — an optional component is

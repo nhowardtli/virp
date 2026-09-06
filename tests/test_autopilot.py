@@ -469,6 +469,147 @@ class TestNodeConfig(unittest.TestCase):
                                      ap.PEER_CMD_CHAIN_HEAD])
 
 
+class TestHomeNodeShape(unittest.TestCase):
+    """virp-onode-home ran for 14 days emitting the colo battery, because
+    /etc/virp/autopilot-node.json did not exist there and load_node_config
+    silently fell back to virp-lab. Every probe named a colo device the
+    home daemon has never heard of, so all 12 returned a signed
+    `device not found` ERROR, and the node published under virp-lab's
+    identity. These pin the shape that fix cannot regress: the battery is
+    built ONLY from config, and a target the node does not observe is
+    omitted rather than probed and alerted on.
+    """
+
+    HOME = {"node": "virp-onode-home", "frr_nodes": [],
+            "peer_device": None, "peer_node": None,
+            "wazuh_device": "wazuh-home", "librenms_device": None,
+            "pbs_device": None, "baselines": {}}
+
+    def test_home_battery_is_wazuh_home_only(self):
+        b = ap.build_battery(self.HOME)
+        self.assertEqual(b, [
+            ("wazuh-home", "GET /agents/summary/status",   "wazuh_summary"),
+            ("wazuh-home", "GET /manager/stats/analysisd", "wazuh_alerts"),
+        ])
+
+    def test_home_battery_names_no_colo_device(self):
+        colo = set(ap.FRR_NODES) | {ap.WAZUH_DEV, ap.LIBRENMS_DEV,
+                                    ap.PBS_DEV}
+        for device, command, kind in ap.build_battery(self.HOME):
+            self.assertNotIn(device, colo,
+                             "home battery must not name colo device %s"
+                             % device)
+
+    def test_librenms_rows_are_config_gated(self):
+        """LibreNMS gets the treatment PBS and peer already have: a node
+        with no LibreNMS must not probe one. Before this, LIBRENMS_DEV was
+        a module constant used unconditionally, so config alone could not
+        remove the rows."""
+        kinds = {k for _, _, k in ap.build_battery(self.HOME)}
+        self.assertNotIn("librenms_devices", kinds)
+        self.assertNotIn("librenms_alerts", kinds)
+
+    def test_wazuh_device_is_config_overridable(self):
+        b = ap.build_battery(dict(self.HOME, wazuh_device="wazuh-elsewhere"))
+        self.assertTrue(all(d == "wazuh-elsewhere" for d, _, _ in b))
+
+    def test_wazuh_rows_absent_when_no_wazuh_device(self):
+        kinds = {k for _, _, k in
+                 ap.build_battery(dict(self.HOME, wazuh_device=None))}
+        self.assertNotIn("wazuh_summary", kinds)
+        self.assertNotIn("wazuh_alerts", kinds)
+
+
+class TestScopedBaselines(unittest.TestCase):
+    """A baseline the node has not agreed to is not a baseline. Home ships
+    `baselines: {}` deliberately: its Wazuh agent count is not yet known,
+    and inheriting the colo figures (5 active / 6 total) would alert every
+    cycle on a number nobody chose. Absent key -> no check, which is the
+    rule the FRR guard already followed."""
+
+    def test_absent_wazuh_baseline_emits_no_count_deviation(self):
+        r = {"wazuh_summary": [wazuh_summary_payload(3, 4)]}
+        devs = ap.evaluate_baselines(r, baselines={})
+        self.assertEqual(devs, [])
+
+    def test_absent_librenms_baseline_emits_no_count_deviation(self):
+        r = {"librenms_devices": [librenms_payload("devices", 99)]}
+        self.assertEqual(ap.evaluate_baselines(r, baselines={}), [])
+
+    def test_present_baseline_still_flags(self):
+        r = {"wazuh_summary": [wazuh_summary_payload(3, 6)]}
+        devs = ap.evaluate_baselines(r, baselines={"wazuh_active": 5,
+                                                   "wazuh_total": 6})
+        self.assertTrue(any(d["check"] == "wazuh_active_agents" and
+                            d["observed"] == 3 for d in devs))
+
+    def test_unobservable_still_reported_without_a_baseline(self):
+        """An unreadable credential is a finding about THIS node, not a
+        comparison against a number — it must survive an empty baseline
+        set or home loses the only Wazuh signal it has."""
+        r = {"wazuh_summary": [wazuh_rbac_denied_payload()]}
+        devs = ap.evaluate_baselines(r, baselines={})
+        self.assertTrue(any(d["check"] == "wazuh_unobservable"
+                            for d in devs))
+
+    def test_default_baselines_unchanged_when_omitted(self):
+        """One-argument calls keep the module BASELINES: virp-lab must be
+        bit-for-bit unaffected by this change."""
+        self.assertEqual(ap.evaluate_baselines(healthy_results()), [])
+        r = healthy_results()
+        r["librenms_devices"] = [librenms_payload("devices", 5)]
+        self.assertTrue(any(d["check"] == "librenms_devices"
+                            for d in ap.evaluate_baselines(r)))
+
+
+class TestShippedNodeTemplates(unittest.TestCase):
+    """The node identity file is the artifact class that had no install
+    path: referenced by the client, virp_report and DEPLOYED.md, present
+    on virp-lab only because someone wrote it by hand, and absent on
+    virp-onode-home. Both shapes are tracked now, so a node identity is
+    something a commit names."""
+
+    def load(self, name):
+        path = os.path.join(REPO_ROOT, "deploy", name)
+        self.assertTrue(os.path.exists(path), "%s missing" % name)
+        with open(path) as f:
+            return json.load(f)
+
+    def test_home_template_builds_the_home_battery(self):
+        cfg = ap.merge_node_config(self.load(
+            "autopilot-node.home.template.json"))
+        self.assertEqual(cfg["node"], "virp-onode-home")
+        b = ap.build_battery(cfg)
+        self.assertEqual([k for _, _, k in b],
+                         ["wazuh_summary", "wazuh_alerts"])
+        self.assertTrue(all(d == "wazuh-home" for d, _, _ in b))
+
+    def test_home_template_ships_no_baselines(self):
+        self.assertEqual(self.load(
+            "autopilot-node.home.template.json").get("baselines"), {})
+
+    def test_virp_lab_template_reproduces_the_live_colo_battery(self):
+        cfg = ap.merge_node_config(self.load(
+            "autopilot-node.virp-lab.template.json"))
+        kinds = [k for _, _, k in ap.build_battery(cfg)]
+        self.assertEqual(kinds,
+                         ["frr_neighbors"] * 4 + ["frr_routes"] * 4 +
+                         ["wazuh_summary", "wazuh_alerts",
+                          "librenms_devices", "librenms_alerts",
+                          "pbs_version", "pbs_datastore_usage",
+                          "pbs_verify_tasks", "pbs_snapshots",
+                          "peer_liveness", "peer_chain_head"])
+
+    def test_templates_carry_no_credentials(self):
+        for name in ("autopilot-node.home.template.json",
+                     "autopilot-node.virp-lab.template.json"):
+            text = json.dumps(self.load(name)).lower()
+            for bad in ("password", "passwd", "secret", "token", "${"):
+                self.assertNotIn(bad, text,
+                                 "%s must carry no credential material"
+                                 % name)
+
+
 class TestTemplateExclusions(unittest.TestCase):
     """Mirror of the C-side boundary scan (virp_config_blocked_address):
     the shipped device template must never carry 10.0.10.1 / 10.0.10.10,

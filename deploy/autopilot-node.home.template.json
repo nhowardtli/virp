@@ -1,0 +1,25 @@
+{
+  "_comment": [
+    "Node identity for virp-onode-home (node_id 0x0000000D, VM 313).",
+    "Installed to /etc/virp/autopilot-node.json by:",
+    "    sudo make install-autopilot-node NODE=home",
+    "This node observes the HOME fleet. It has no FRR ring, no LibreNMS,",
+    "no PBS and no peer O-node, so those rows are omitted rather than",
+    "probed: a target this node cannot see must not be asked about.",
+    "Absent this file the client falls back to virp-lab's battery, which",
+    "is what happened from 2026-08-23 to 2026-09-06.",
+    "baselines is EMPTY on purpose. The Wazuh agent count here has never",
+    "been agreed, and adopting the colo figures would alert every cycle",
+    "against a number nobody chose. Populate it from observed cycles once",
+    "the intended count is decided, in its own commit."
+  ],
+  "node": "virp-onode-home",
+  "frr_nodes": [],
+  "peer_device": null,
+  "peer_node": null,
+  "wazuh_device": "wazuh-home",
+  "librenms_device": null,
+  "pbs_device": null,
+  "pbs_datastore": null,
+  "baselines": {}
+}

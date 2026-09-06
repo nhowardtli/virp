@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Node identity for virp-lab, the production reference instance.",
+    "Installed to /etc/virp/autopilot-node.json by:",
+    "    sudo make install-autopilot-node NODE=virp-lab",
+    "Transcribed VERBATIM from the file that has been live on virp-lab",
+    "since 2026-07-29. It was created by hand and tracked nowhere, so the",
+    "running battery was not something any commit named -- the same drift",
+    "shape as the 2026-08-09 devices.template.json finding.",
+    "wazuh_device and librenms_device are intentionally absent: the",
+    "defaults in virp_autopilot.py are the colo devices, so omitting them",
+    "keeps this node bit-for-bit what it is today.",
+    "baselines is absent for the same reason -- the module BASELINES are",
+    "virp-lab's agreed figures."
+  ],
+  "node": "virp-lab",
+  "frr_nodes": [
+    "clab-frr-ospf-frr1",
+    "clab-frr-ospf-frr2",
+    "clab-frr-ospf-frr3",
+    "clab-frr-ospf-frr4"
+  ],
+  "peer_device": "virp-node2-peer",
+  "peer_node": "virp-node2",
+  "pbs_device": "pbs-lab",
+  "pbs_datastore": "colo-backups"
+}
