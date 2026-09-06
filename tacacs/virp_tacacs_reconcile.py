@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -45,6 +46,69 @@ ACCT_SCHEMA = "tacacs_accounting/1"
 REASSEMBLY_CISCO = "cisco_cmd_cmdarg_space_join_drop_cr"
 REASSEMBLY_CISCO_SINGLE = "cisco_cmd_single_arg_drop_cr"
 REASSEMBLY_UNRECOGNIZED = "UNRECOGNIZED"
+
+# ── Defect E: IOS-XE drops the output modifier from accounting ─────────
+#
+# MEASURED 2026-09-05 on SW-3850. The operator typed
+#     sh interfaces status | i 1/0/24
+# and the switch accounted
+#     cmd=show interfaces status <cr>
+# (chain tacacs:virp-lab seq 31, arg_cnt 6, ONE cmd= arg). The
+# abbreviation is expanded AND the `| ...` modifier is discarded
+# entirely -- not moved to a second argument, gone.
+#
+# command_comparison is exact_bytes, so a filtered command the operator
+# really ran can never equal the switch's record of it: the receipt
+# grades UNGOVERNED and the gate execution UNREPORTED. Two wrong
+# verdicts from one correct command. So the GATE side is canonicalized
+# to the switch's form before comparison, and the rule that ran is named
+# in the record -- same contract as the reassembly rules above, because
+# this is equally an interpretation.
+#
+# ASSUMPTION (stated because the fix rests on it): the gate refuses `|`
+# from agents at the ingress separator check, so a filtered command is
+# HUMAN-issued. Stripping the modifier gate-side therefore cannot mask
+# an agent's redirection attempt -- an agent cannot get one past the
+# gate to begin with.
+#
+# SCOPE, deliberately narrow: ONLY the read-only DISPLAY filters below.
+# The output REDIRECTION modifiers -- append, redirect, tee -- are NOT
+# stripped and must never be added here. They send device output
+# somewhere, the gate refuses them, and silently removing one would hide
+# exactly the thing the reconciler exists to surface. If a redirect ever
+# does appear gate-side it stays in the string, fails to match, and
+# grades loudly.
+CANON_STRIP_OUTPUT_MODIFIER = "cisco_gate_strip_output_modifier"
+
+_IOS_DISPLAY_MODIFIERS = ("include", "exclude", "begin", "section", "count")
+
+
+def strip_output_modifier(command):
+    """(canonical_command, stripped).
+
+    Remove a trailing IOS output-DISPLAY filter from a gate-side command
+    so it can be compared with the switch's stripped accounting record.
+
+    Matches the FIRST `| <word>` whose word is a non-empty prefix of
+    exactly one display modifier -- IOS accepts unique abbreviations, and
+    `i`/`e`/`b`/`s`/`c` are each unique within this set. A `|` followed
+    by anything else (including nothing) is left alone: it is not an
+    output filter, and cutting there would silently shorten a command the
+    device really ran.
+    """
+    if not command or "|" not in command:
+        return command, False
+
+    m = re.search(r"\s*\|\s*([A-Za-z-]+)(?:\s|$)", command)
+    if not m:
+        return command, False
+
+    word = m.group(1).lower()
+    hits = [k for k in _IOS_DISPLAY_MODIFIERS if k.startswith(word)]
+    if len(hits) != 1:
+        return command, False
+
+    return command[:m.start()].rstrip(), True
 
 VERDICTS = ("MATCHED", "START_WITHOUT_STOP", "STOP_WITHOUT_START",
             "UNGOVERNED", "UNREPORTED", "AMBIGUOUS")
@@ -374,7 +438,12 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
                 gb = g["body"]
                 if gb.get("device") != device:
                     continue
-                if gb.get("command") != command:
+                # Defect E: the switch's record has no output modifier,
+                # so the gate side is canonicalized to that form before
+                # the exact-bytes comparison.
+                gate_cmd, _stripped = strip_output_modifier(
+                    gb.get("command"))
+                if gate_cmd != command:
                     continue
                 if abs((g["timestamp_ns"] or 0) - t_ns) > window_ns:
                     continue
@@ -509,6 +578,16 @@ def build_record(items, match_window_ms, db_path, ledger_path, windows,
                          "args_index.task_id + record_class"),
             "known_reassembly_rules": [REASSEMBLY_CISCO,
                                        REASSEMBLY_CISCO_SINGLE],
+            # The comparison itself is still exact bytes; what changed is
+            # that the GATE operand is canonicalized first. Naming the
+            # rule here is what keeps that honest to a reader.
+            "known_canonicalization_rules": [CANON_STRIP_OUTPUT_MODIFIER],
+            "gate_canonicalization": (
+                "IOS-XE accounting drops a trailing output-display filter "
+                "(| include|exclude|begin|section|count ...), so the same "
+                "filter is stripped from the gate-side command before "
+                "comparison. Redirection modifiers (append, redirect, tee) "
+                "are NEVER stripped."),
         },
         "source": {
             "chain_db_sha256": _file_sha256(db_path),

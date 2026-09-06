@@ -400,6 +400,126 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(items[0]["command_reassembly"], rc.REASSEMBLY_CISCO)
         self.assertEqual(len(items[0]["receipt_cites"]), 2)
 
+
+    # ── Defect E: IOS-XE drops the output modifier ─────────────────────
+    #
+    # MEASURED 2026-09-05 on SW-3850. The operator typed
+    #   sh interfaces status | i 1/0/24
+    # and the switch accounted
+    #   cmd=show interfaces status <cr>
+    # (chain tacacs:virp-lab seq 31, arg_cnt 6, ONE cmd= arg). The
+    # abbreviation is expanded AND the `| ...` modifier is discarded
+    # entirely - it is not moved into a second argument, it is gone.
+    #
+    # match_rule.command_comparison is exact_bytes, so a filtered command
+    # the operator actually ran could never equal the switch's record of
+    # it: the receipt graded UNGOVERNED and the gate execution UNREPORTED.
+    # Two wrong verdicts from one correct command.
+    #
+    # ASSUMPTION, stated because the fix depends on it: the gate refuses
+    # `|` from agents at the ingress separator check, so a filtered
+    # command is HUMAN-issued. Stripping the modifier from the gate side
+    # therefore cannot mask an agent's redirection attempt - an agent
+    # cannot get one past the gate in the first place.
+
+    def test_filtered_command_matches_stripped_accounting_record(self):
+        t = 1_757_000_400_000_000_000
+        receipts = [
+            ("tacacs:lab", "evidence_item",
+             receipt_body("R1", "31", ["START"], "show",
+                          ["interfaces", "status"], t), t),
+            ("tacacs:lab", "evidence_item",
+             receipt_body("R1", "31", ["STOP"], "show",
+                          ["interfaces", "status"], t + 1_000_000),
+             t + 1_000_000),
+        ]
+        # The GATE saw the command the human typed, filter and all.
+        gates = [("gate", "gate_execution",
+                  gate_body("R1", "show interfaces status | include 1/0/24"),
+                  t + 500_000)]
+        items, _, _ = self._run(receipts, gates)
+        self.assertEqual(items[0]["verdict"], "MATCHED",
+                         "a filtered command must reconcile against the "
+                         "switch's stripped record")
+
+    def test_every_ios_output_modifier_is_stripped(self):
+        t = 1_757_000_500_000_000_000
+        for mod in ("include hostname", "exclude down", "begin Vlan",
+                    "section router bgp", "count Gi"):
+            with self.subTest(modifier=mod):
+                # a fresh chain per iteration; build_db creates the table
+                self.db = os.path.join(self.tmp, "chain-%d.db" % len(mod))
+                receipts = [
+                    ("tacacs:lab", "evidence_item",
+                     receipt_body("R1", "41", ["START"], "show",
+                                  ["running-config"], t), t),
+                    ("tacacs:lab", "evidence_item",
+                     receipt_body("R1", "41", ["STOP"], "show",
+                                  ["running-config"], t + 1000), t + 1000),
+                ]
+                gates = [("gate", "gate_execution",
+                          gate_body("R1", "show running-config | " + mod),
+                          t + 500)]
+                items, _, _ = self._run(receipts, gates)
+                self.assertEqual(items[0]["verdict"], "MATCHED",
+                                 "modifier %r must be stripped" % mod)
+
+    def test_stripping_is_not_over_broad(self):
+        """A genuinely DIFFERENT command must still not match. If the
+        strip were greedy - cutting at the first space, say - every
+        `show X` would collapse onto `show` and match anything."""
+        t = 1_757_000_600_000_000_000
+        receipts = [
+            ("tacacs:lab", "evidence_item",
+             receipt_body("R1", "51", ["START"], "show", ["version"], t), t),
+            ("tacacs:lab", "evidence_item",
+             receipt_body("R1", "51", ["STOP"], "show", ["version"],
+                          t + 1000), t + 1000),
+        ]
+        gates = [("gate", "gate_execution",
+                  gate_body("R1", "show running-config | include hostname"),
+                  t + 500)]
+        items, _, _ = self._run(receipts, gates)
+        self.assertEqual(items[0]["verdict"], "UNGOVERNED",
+                         "`show running-config | ...` must NOT match a "
+                         "receipt for `show version`")
+
+    def test_pipe_inside_a_value_is_not_treated_as_a_modifier(self):
+        """Only ` | <known-modifier> ` is an output filter. A pipe that is
+        part of the command text is not, and cutting there would silently
+        shorten a command the device really ran."""
+        t = 1_757_000_700_000_000_000
+        cmd = "banner motd | not-a-modifier |"
+        receipts = [
+            ("tacacs:lab", "evidence_item",
+             receipt_body("R1", "61", ["START"], "banner",
+                          ["motd", "|", "not-a-modifier", "|"], t), t),
+            ("tacacs:lab", "evidence_item",
+             receipt_body("R1", "61", ["STOP"], "banner",
+                          ["motd", "|", "not-a-modifier", "|"], t + 1000),
+             t + 1000),
+        ]
+        gates = [("gate", "gate_execution", gate_body("R1", cmd), t + 500)]
+        items, _, _ = self._run(receipts, gates)
+        self.assertEqual(items[0]["verdict"], "MATCHED",
+                         "an unknown word after `|` is not an output "
+                         "modifier and must not be stripped")
+
+    def test_match_rule_names_the_strip(self):
+        """The reassembly/canonicalization that ran is an interpretation,
+        and the record must say which one - same contract as the existing
+        cisco_cmd_*_drop_cr rule names."""
+        t = 1_757_000_800_000_000_000
+        receipts = [("tacacs:lab", "evidence_item",
+                     receipt_body("R1", "71", ["START"], "show",
+                                  ["version"], t), t)]
+        rec, _, _2 = None, None, None
+        items, r, g = self._run(receipts, [])
+        rec = rc.build_record(items, 15000, self.db, None, [])
+        self.assertIn(rc.CANON_STRIP_OUTPUT_MODIFIER,
+                      rec["match_rule"]["known_canonicalization_rules"],
+                      "the record must name the gate-side strip")
+
     def test_console_command_is_ungoverned(self):
         t = 1_757_000_100_000_000_000
         receipts = [
