@@ -561,12 +561,20 @@ typedef enum {
      * payload cites "evidence-unavailable". */
     VIRP_ERR_EVIDENCE_UNAVAILABLE     = -53,
 
-    /* -54 and -55 are RESERVED for the transport codes on the
-     * fix/A-transport-error-code / fix/B-preserve-libssh2-errno stack
-     * (VIRP_ERR_TRANSPORT_WRITE / VIRP_ERR_TRANSPORT_CLOSED). Those
-     * branches were cut in the same session as this one; leaving the
-     * numbers free is what lets both stacks merge without a silent
-     * enum collision. Do not reuse them here. */
+    /* Transport write failure (defect A, 2026-09-05). The channel would
+     * not accept bytes: the peer closed, the session reset, or the
+     * adapter reported a hard error. Distinct from VIRP_ERR_CRYPTO
+     * (-32), which this path used to return and which sends every
+     * reader hunting a key problem for what is a dead pipe. Nothing was
+     * dispatched to the device, so a caller holding an approval must
+     * treat this as a PRE-EXECUTION failure: it consumes nothing. */
+    VIRP_ERR_TRANSPORT_WRITE          = -54,
+
+    /* -55 is RESERVED for VIRP_ERR_TRANSPORT_CLOSED on the
+     * fix/B-preserve-libssh2-errno branch, which is merged next in this
+     * same gate. -54 above was the other half of that reservation and is
+     * now claimed. Leaving -55 free is what keeps the B merge from a
+     * silent enum collision. Do not reuse it here. */
 
     /* The approval store DIRECTORY is not on this host (defect: store
      * split, 2026-09-05). Distinct from VIRP_ERR_APPROVAL_NOT_FOUND
