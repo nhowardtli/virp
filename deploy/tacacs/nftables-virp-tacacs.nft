@@ -1,0 +1,123 @@
+#!/usr/sbin/nft -f
+#
+# nftables-virp-tacacs.nft -- default-deny ruleset for CT 215 (virp-tacacs,
+# 10.0.0.215), the TACACS+ authentication/authorization server.
+#
+# Installed as /etc/nftables.conf and loaded by nftables.service at boot.
+# Before this file, 215 ran the stock Debian skeleton: three chains, all
+# `policy accept`, i.e. no filtering in either direction.
+#
+# WHY A SINGLE `inet` TABLE: sshd and tac_plus-ng both bind `*`, which is
+# v4+v6. A v4-only ruleset would leave both services reachable over v6.
+# 215 currently has NO global v6 address, so the v6 side is theoretical
+# today -- which is exactly when to close it, rather than after someone
+# adds a v6 prefix to the segment.
+#
+# YOU CANNOT LOCK YOURSELF OUT WITH THIS FILE. 215 is an LXC guest and is
+# administered with `pct exec` from pve-lab, which goes through the
+# Proxmox host, not the network. Nothing here can block that path.
+#
+# Copyright 2026 Third Level IT LLC -- Apache 2.0
+
+flush ruleset
+
+table inet virp_tacacs {
+
+    # ------------------------------------------------------------------
+    # Debian mirrors. deb.debian.org and security.debian.org are Fastly
+    # CDN names and BOTH resolve to this same set today. THESE ADDRESSES
+    # WILL DRIFT: Fastly rotates them, and when it does, apt fails.
+    #
+    # That failure is LOUD (apt errors) rather than silent, which is why
+    # pinning /32s is preferred here over allowing 151.101.0.0/16 -- the
+    # whole of Fastly, which would permit egress to a large fraction of
+    # the internet and quietly defeat the point of an egress policy.
+    #
+    # To refresh:  getent ahostsv4 deb.debian.org security.debian.org
+    # then update this set and reload. See docs/tacacs/.
+    # ------------------------------------------------------------------
+    set apt_mirrors {
+        type ipv4_addr
+        elements = {
+            151.101.2.132,
+            151.101.66.132,
+            151.101.130.132,
+            151.101.194.132
+        }
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iif lo accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # ICMP. Not politeness: `destination-unreachable /
+        # fragmentation-needed` is what makes Path MTU Discovery work,
+        # and dropping it produces TCP sessions that connect and then
+        # hang on the first large packet -- which looks like an
+        # application bug, not a firewall rule.
+        ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept
+        # ICMPv6 is mandatory for v6 to function at all (ND/RA).
+        ip6 nexthdr ipv6-icmp accept
+
+        # TACACS+ from the home segment.
+        #
+        # 10.0.0.0/24 is deliberately WIDER than the enrolled devices.
+        # Narrowing this to an explicit address list is a planned second
+        # step; doing it here, before the decision submitter exists,
+        # would mean a device that stops being able to authenticate
+        # leaves no record anywhere of having tried. The shared key is
+        # still required per host block, so this is not the only control.
+        ip saddr 10.0.0.0/24 tcp dport 49 accept
+
+        # SSH from pve-lab ONLY. Not the operator Mac: administration is
+        # via `pct exec` from the host, so the Mac never needs to reach
+        # 215 over the network.
+        ip saddr 10.0.0.35 tcp dport 22 accept
+
+        limit rate 10/minute burst 5 packets log prefix "virp-tacacs IN-DROP " level info
+        counter drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        counter drop
+    }
+
+    chain output {
+        type filter hook output priority filter; policy drop;
+
+        oif lo accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # DNS to the FortiGate, the only resolver in resolv.conf.
+        ip daddr 10.0.0.1 udp dport 53 accept
+        ip daddr 10.0.0.1 tcp dport 53 accept
+
+        # NTP to the FortiGate. CURRENTLY UNUSED and kept deliberately:
+        # systemd-timesyncd on this box is enabled but inactive, because
+        # an LXC guest takes its clock from the Proxmox host. If anyone
+        # ever enables timesyncd here, it works instead of failing in a
+        # way nobody would connect to a firewall rule. Time correctness
+        # is load-bearing -- every correlation between this server's
+        # decision log and 313's records is joined on timestamps.
+        ip daddr 10.0.0.1 udp dport 123 accept
+
+        # apt. http/80 is what sources.list actually uses; 443 is
+        # permitted so a move to https needs no rule change.
+        ip daddr @apt_mirrors tcp dport { 80, 443 } accept
+
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+
+        # NOTE: there is deliberately NO egress rule for 10.0.0.13 here.
+        # The decision submitter needs tcp/22 outbound to 313, and that
+        # rule lands with the submitter, not before it -- an egress hole
+        # for a service that does not exist yet is just a hole.
+        limit rate 10/minute burst 5 packets log prefix "virp-tacacs OUT-DROP " level info
+        counter drop
+    }
+}
