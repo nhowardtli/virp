@@ -595,9 +595,19 @@ class TestShippedNodeTemplates(unittest.TestCase):
             "autopilot-node.home.template.json"))
         self.assertEqual(cfg["node"], "virp-onode-home")
         b = ap.build_battery(cfg)
+        # Was ["wazuh_summary", "wazuh_alerts"] when the home identity
+        # first shipped: fix/autopilot-home restored collection with the
+        # smallest battery that could work, and this branch adds the
+        # hypervisor and edge rows. The invariant that matters is below
+        # and is unchanged — no colo device is ever named.
         self.assertEqual([k for _, _, k in b],
-                         ["wazuh_summary", "wazuh_alerts"])
-        self.assertTrue(all(d == "wazuh-home" for d, _, _ in b))
+                         ["wazuh_summary", "wazuh_alerts",
+                          "host_disk", "host_uptime", "host_kernel",
+                          "fortigate_status"])
+        colo = set(ap.FRR_NODES) | {ap.WAZUH_DEV, ap.LIBRENMS_DEV,
+                                    ap.PBS_DEV}
+        for device, _, _ in b:
+            self.assertNotIn(device, colo)
 
     def test_home_template_ships_no_baselines(self):
         self.assertEqual(self.load(
@@ -623,6 +633,91 @@ class TestShippedNodeTemplates(unittest.TestCase):
                 self.assertNotIn(bad, text,
                                  "%s must carry no credential material"
                                  % name)
+
+
+class TestHomeHostAndEdgeRows(unittest.TestCase):
+    """The home battery observed the Wazuh manager and nothing else, while
+    pve-lab (the hypervisor this node runs ON) and fortigate-home sat
+    reachable and unprobed.
+
+    Every command here is an EXACT-MATCH GREEN spelling in the driver, not
+    an improvisation:
+      - LINUX_HOST_GREEN_EXACT in src/drivers/driver_linux.c -> the three
+        host-health reads, added 2026-08-12 as "the exception", with the
+        driver noting a fourth row has to be earned. These tests pin the
+        three so a drifted spelling classifies RED and alerts every five
+        minutes — the exact failure fix/autopilot-home just cleared.
+      - fg_route_command in src/drivers/driver_fortigate.c -> `get system
+        status` at VIRP_TIER_GREEN.
+    Both are config-gated like every other target: a node without the
+    device does not probe it.
+    """
+
+    HOST_GREEN = ("df -h", "uptime", "uname -a")
+    FG_GREEN = "get system status"
+
+    HOME = {"node": "virp-onode-home", "frr_nodes": [],
+            "peer_device": None, "peer_node": None,
+            "wazuh_device": "wazuh-home", "librenms_device": None,
+            "pbs_device": None, "baselines": {},
+            "host_device": "pve-lab", "fortigate_device": "fortigate-home"}
+
+    def test_host_rows_are_the_three_exact_green_spellings(self):
+        b = ap.build_battery(self.HOME)
+        rows = [(d, c) for d, c, k in b if k.startswith("host_")]
+        self.assertEqual(rows, [("pve-lab", cmd) for cmd in self.HOST_GREEN])
+
+    def test_fortigate_row_is_the_exact_green_spelling(self):
+        b = ap.build_battery(self.HOME)
+        rows = [(d, c) for d, c, k in b if k == "fortigate_status"]
+        self.assertEqual(rows, [("fortigate-home", self.FG_GREEN)])
+
+    def test_host_rows_are_config_gated(self):
+        kinds = {k for _, _, k in
+                 ap.build_battery(dict(self.HOME, host_device=None))}
+        self.assertFalse(any(k.startswith("host_") for k in kinds))
+
+    def test_fortigate_row_is_config_gated(self):
+        kinds = {k for _, _, k in
+                 ap.build_battery(dict(self.HOME, fortigate_device=None))}
+        self.assertNotIn("fortigate_status", kinds)
+
+    def test_colo_battery_gains_nothing(self):
+        """virp-lab names neither key, so its battery must be byte-identical
+        to what it is today. This branch must require nothing of .211."""
+        cfg = ap.merge_node_config(json.load(open(os.path.join(
+            REPO_ROOT, "deploy", "autopilot-node.virp-lab.template.json"))))
+        kinds = [k for _, _, k in ap.build_battery(cfg)]
+        self.assertEqual(kinds,
+                         ["frr_neighbors"] * 4 + ["frr_routes"] * 4 +
+                         ["wazuh_summary", "wazuh_alerts",
+                          "librenms_devices", "librenms_alerts",
+                          "pbs_version", "pbs_datastore_usage",
+                          "pbs_verify_tasks", "pbs_snapshots",
+                          "peer_liveness", "peer_chain_head"])
+
+    def test_home_template_now_carries_both_devices(self):
+        doc = json.load(open(os.path.join(
+            REPO_ROOT, "deploy", "autopilot-node.home.template.json")))
+        self.assertEqual(doc.get("host_device"), "pve-lab")
+        self.assertEqual(doc.get("fortigate_device"), "fortigate-home")
+        b = ap.build_battery(ap.merge_node_config(doc))
+        self.assertEqual([k for _, _, k in b],
+                         ["wazuh_summary", "wazuh_alerts",
+                          "host_disk", "host_uptime", "host_kernel",
+                          "fortigate_status"])
+
+    def test_new_rows_add_no_baseline_checks(self):
+        """These are liveness reads. A GREEN, verified response IS the
+        finding; inventing a threshold on `df -h` output would be a
+        baseline nobody agreed, which is the trap the empty home baseline
+        set exists to avoid."""
+        r = {"host_disk": ["pve-lab$ df -h\nFilesystem  Size"],
+             "host_uptime": ["pve-lab$ uptime\n 17:40:11 up 2 days"],
+             "host_kernel": ["pve-lab$ uname -a\nLinux pve-lab 6.17.4"],
+             "fortigate_status": ["fortigate-home$ get system status\nVersion: v7"]}
+        self.assertEqual(ap.evaluate_baselines(r, baselines={}), [])
+        self.assertEqual(ap.evaluate_baselines(r), [])
 
 
 class TestTemplateExclusions(unittest.TestCase):

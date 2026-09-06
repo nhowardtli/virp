@@ -138,6 +138,21 @@ WAZUH_DEV    = "wazuh-lab"
 LIBRENMS_DEV = "librenms-lab"
 PBS_DEV      = "pbs-lab"
 
+# Host-health reads. These are the EXACT spellings in
+# LINUX_HOST_GREEN_EXACT (src/drivers/driver_linux.c) — the three rows
+# added 2026-08-12 as a deliberate exception to "do not police arbitrary
+# Linux", with the driver noting that a fourth has to be earned. Spelled
+# out here rather than composed, because the classifier matches exactly
+# and a drifted spelling would classify RED and alert every five minutes.
+HOST_GREEN_CMDS = (
+    ("df -h",    "host_disk"),
+    ("uptime",   "host_uptime"),
+    ("uname -a", "host_kernel"),
+)
+
+# fg_route_command in src/drivers/driver_fortigate.c: exact-match GREEN.
+FORTIGATE_STATUS_CMD = "get system status"
+
 # ── Per-node identity / topology ───────────────────────────────────────
 # /etc/virp/autopilot-node.json lets one client serve both nodes:
 #   {"node": "virp-node2", "frr_nodes": [],
@@ -170,6 +185,7 @@ def merge_node_config(doc=None):
     cfg = {"node": "virp-lab", "frr_nodes": list(FRR_NODES),
            "peer_device": None, "peer_node": None,
            "wazuh_device": WAZUH_DEV, "librenms_device": LIBRENMS_DEV,
+           "host_device": None, "fortigate_device": None,
            "baselines": None}
     if doc:
         cfg.update(doc)
@@ -257,6 +273,18 @@ def build_battery(cfg):
                 (pbs_dev, "pbs op=backup.snapshots.list store=%s" % pbs_store,
                  "pbs_snapshots"),
             ]
+
+    # The node this O-node runs ON, and the edge in front of it. Both
+    # were reachable and unprobed while the battery watched only Wazuh.
+    # Gated exactly like pbs_device and peer_device: a node without the
+    # device does not probe it.
+    host_dev = cfg.get("host_device")
+    if host_dev:
+        battery += [(host_dev, cmd, kind) for cmd, kind in HOST_GREEN_CMDS]
+
+    fg_dev = cfg.get("fortigate_device")
+    if fg_dev:
+        battery += [(fg_dev, FORTIGATE_STATUS_CMD, "fortigate_status")]
 
     peer = cfg.get("peer_device")
     if peer:
