@@ -495,6 +495,38 @@ TEST(test_separator_policy_rejects_every_class)
     ASSERT_EQ(virp_command_check_separators(NULL, NULL, 0), -1);
 }
 
+/*
+ * REDIRECTION. Session 4 gap: the policy refused every separator that
+ * chains a SECOND command but not the two that redirect the FIRST one's
+ * input or output. `>` and `<` do not run anything new, which is why
+ * they were missed; what they do is move bytes. On any driver with a
+ * shell underneath, `show tech-support > /etc/cron.d/x` is a write to an
+ * arbitrary path performed by a command that classifies as a read, and
+ * `< /etc/shadow` feeds a file into one. driver_linux.c refused both
+ * locally from the start; nine other drivers did not. Refused here so
+ * the answer no longer depends on which vendor is on the far end.
+ */
+TEST(test_separator_policy_rejects_redirection)
+{
+    ASSERT_EQ(virp_command_check_separators(
+                  "show tech-support > /etc/cron.d/x", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators(
+                  "cat < /etc/shadow", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show version>x", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators("show version<x", NULL, 0), -1);
+    ASSERT_EQ(virp_command_check_separators(
+                  "show run >> /etc/passwd", NULL, 0), -1);
+
+    /* The reason names the character, like every other class. */
+    char why[160];
+    ASSERT_EQ(virp_command_check_separators("show run > x", why,
+                                            sizeof(why)), -1);
+    ASSERT_TRUE(strstr(why, "'>'") != NULL);
+    ASSERT_EQ(virp_command_check_separators("show run < x", why,
+                                            sizeof(why)), -1);
+    ASSERT_TRUE(strstr(why, "'<'") != NULL);
+}
+
 /* Control bytes must be escaped in the reason text — it is copied
  * verbatim into logs and into the signed error observation. */
 TEST(test_separator_policy_escapes_control_bytes_in_reason)
@@ -4264,6 +4296,67 @@ TEST(test_errored_execution_still_chains_no_gap)
     ASSERT_EQ(strcmp(recomputed, rows[0].ahash), 0);
 
     gx_cleanup();
+}
+
+/*
+ * Session 4 gap: the ingress separator refusal is the ONE refusal in the
+ * daemon that left no chain record. It logged, it returned a signed ERROR
+ * observation, and it stopped — so a command refused for carrying `;` or
+ * `>` was provable only from the daemon journal, which rotates, while
+ * every tier refusal beside it is durable in chain.db. An audit asking
+ * "was anything refused at ingress?" could not be answered from the
+ * evidence.
+ *
+ * It chains a gate_rejection/1 like any other refusal, with two
+ * differences that are themselves the record: `refusal_stage` says
+ * ingress-separator (so a reader knows no classifier ran and the
+ * UNCLASSIFIED tier is not what blocked it), and NO proposal is filed.
+ * A separator refusal must stay unapprovable — there is no version of
+ * "show version ; reload" a human should be able to escalate, because
+ * the string was never one command to approve.
+ */
+TEST(test_separator_refusal_chains_rejection_without_proposing)
+{
+    onode_state_t st;
+    ASSERT_OK(gx_setup(&st));
+
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
+    size_t olen = 0;
+    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version ; reload",
+                            obs, sizeof(obs), &olen));
+
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(obs, olen, &st.okey, &hdr));
+
+    gx_teardown(&st);
+
+    static gx_row_t rows[GX_MAX_ROWS];
+    int n = gx_read_session("gate-separator:PVE-LAB", rows, GX_MAX_ROWS);
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(strcmp(rows[0].type, "gate_rejection"), 0);
+    ASSERT_TRUE(strncmp(rows[0].id, "gatereject-", 11) == 0);
+    ASSERT_TRUE(rows[0].have_body);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"schema\":\"gate_rejection/1\"") != NULL);
+    /* The refused sequence is NAMED, not merely implied by the command. */
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"refusal_stage\":\"ingress-separator\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "illegal separator ';'") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"command\":\"show version ; reload\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":false") != NULL);
+    /* No classifier ran, and the record says so rather than implying a
+     * tier decision that never happened. */
+    ASSERT_TRUE(strstr(rows[0].body,
+                       "\"classified_tier\":\"UNCLASSIFIED\"") != NULL);
+
+    char recomputed[65];
+    gr_sha256_hex(rows[0].body, recomputed);
+    ASSERT_EQ(strcmp(recomputed, rows[0].ahash), 0);
+
+    /* Unapprovable: the tier path files a proposal here, this one must
+     * not. Nothing landed in the gate-enforce session either. */
+    ASSERT_EQ(gx_read_session(GX_SESSION, rows, GX_MAX_ROWS), 0);
 }
 
 /*
@@ -8078,6 +8171,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_evidence_degraded_latch_refuses_further_dispatch);
     RUN_TEST(test_execution_record_commits_to_digest_not_response_body);
     RUN_TEST(test_errored_execution_still_chains_no_gap);
+    RUN_TEST(test_separator_refusal_chains_rejection_without_proposing);
     RUN_TEST(test_refused_action_still_chains_gate_rejection);
     RUN_TEST(test_chain_verify_over_mixed_executions_and_rejections);
 
@@ -8124,6 +8218,7 @@ int main(int argc, char **argv)
     printf("\n[Multi-Command Gate Bypass (layer 1)]\n");
     RUN_TEST(test_separator_policy_accepts_single_commands);
     RUN_TEST(test_separator_policy_rejects_every_class);
+    RUN_TEST(test_separator_policy_rejects_redirection);
     RUN_TEST(test_separator_policy_escapes_control_bytes_in_reason);
     RUN_TEST(test_multicommand_newline_is_blocked);
     RUN_TEST(test_multicommand_newline_is_blocked_batch);

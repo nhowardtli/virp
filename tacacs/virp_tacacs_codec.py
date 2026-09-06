@@ -38,6 +38,21 @@ TAC_PLUS_ACCT_FLAG_START = 0x02
 TAC_PLUS_ACCT_FLAG_STOP = 0x04
 TAC_PLUS_ACCT_FLAG_WATCHDOG = 0x08
 
+# Authorization reply status (RFC 8907 s6.2).
+TAC_PLUS_AUTHOR_STATUS_PASS_ADD = 0x01
+TAC_PLUS_AUTHOR_STATUS_PASS_REPL = 0x02
+TAC_PLUS_AUTHOR_STATUS_FAIL = 0x10
+TAC_PLUS_AUTHOR_STATUS_ERROR = 0x11
+TAC_PLUS_AUTHOR_STATUS_FOLLOW = 0x21
+
+AUTHOR_STATUS_NAMES = {
+    TAC_PLUS_AUTHOR_STATUS_PASS_ADD: "PASS_ADD",
+    TAC_PLUS_AUTHOR_STATUS_PASS_REPL: "PASS_REPL",
+    TAC_PLUS_AUTHOR_STATUS_FAIL: "FAIL",
+    TAC_PLUS_AUTHOR_STATUS_ERROR: "ERROR",
+    TAC_PLUS_AUTHOR_STATUS_FOLLOW: "FOLLOW",
+}
+
 # Accounting reply status.
 TAC_PLUS_ACCT_STATUS_SUCCESS = 0x01
 TAC_PLUS_ACCT_STATUS_ERROR = 0x02
@@ -290,3 +305,120 @@ def args_index(args):
         "lookup_rule": "first_occurrence_verbatim",
         "duplicates": sorted(n for n, c in seen.items() if c > 1),
     }
+
+
+# ── Authorization (RFC 8907 s6.1 / s6.2) ───────────────────────────────
+#
+# The authorization REQUEST body is NOT the accounting body with a
+# different header type. Accounting begins with a flags octet;
+# authorization does not, so its fixed header is 8 bytes where
+# accounting's is 9. Reusing the accounting parser here would misread
+# every field by one byte -- which is why both have their own function
+# and their own round-trip test.
+
+
+def parse_author_request(body):
+    """RFC 8907 s6.1 -> (fields, "COMPLETE"|"MALFORMED").
+
+    Layout:
+      authen_method, priv_lvl, authen_type, authen_service,
+      user_len, port_len, rem_addr_len, arg_cnt,
+      arg_1_len .. arg_N_len,
+      user, port, rem_addr, arg_1 .. arg_N
+    """
+    f = {
+        "authen_method_raw": None, "authen_method": None,
+        "priv_lvl": None,
+        "authen_type_raw": None, "authen_type": None,
+        "authen_service_raw": None, "authen_service": None,
+        "user": None, "port": None, "rem_addr": None,
+        "arg_cnt": None, "args": [],
+    }
+    if len(body) < 8:
+        return f, "MALFORMED"
+
+    (a_method, priv_lvl, a_type, a_service,
+     user_len, port_len, rem_len, arg_cnt) = struct.unpack("!8B", body[:8])
+
+    f["authen_method"], f["authen_method_raw"] = name_of(
+        AUTHEN_METHOD_NAMES, a_method)
+    f["priv_lvl"] = priv_lvl
+    f["authen_type"], f["authen_type_raw"] = name_of(
+        AUTHEN_TYPE_NAMES, a_type)
+    f["authen_service"], f["authen_service_raw"] = name_of(
+        AUTHEN_SERVICE_NAMES, a_service)
+    f["arg_cnt"] = arg_cnt
+
+    off = 8
+    if len(body) < off + arg_cnt:
+        return f, "MALFORMED"
+    arg_lens = list(body[off:off + arg_cnt])
+    off += arg_cnt
+
+    need = user_len + port_len + rem_len + sum(arg_lens)
+    state = "COMPLETE" if len(body) >= off + need else "MALFORMED"
+
+    def take(n):
+        nonlocal off
+        chunk = body[off:off + n]
+        off += n
+        return chunk
+
+    f["user"] = take(user_len).decode("latin-1")
+    f["port"] = take(port_len).decode("latin-1")
+    f["rem_addr"] = take(rem_len).decode("latin-1")
+    for n in arg_lens:
+        if off >= len(body) and n:
+            state = "MALFORMED"
+            break
+        f["args"].append(take(n).decode("latin-1"))
+    return f, state
+
+
+def build_author_request(authen_method, priv_lvl, authen_type,
+                         authen_service, user, port, rem_addr, args):
+    u = user.encode("latin-1")
+    p = port.encode("latin-1")
+    r = rem_addr.encode("latin-1")
+    a = [x.encode("latin-1") for x in args]
+    for blob in [u, p, r] + a:
+        if len(blob) > 255:
+            raise TacacsMalformed("field exceeds 255 bytes: %r" % blob[:32])
+    out = struct.pack("!8B", authen_method, priv_lvl, authen_type,
+                      authen_service, len(u), len(p), len(r), len(a))
+    out += bytes(len(x) for x in a)
+    out += u + p + r + b"".join(a)
+    return out
+
+
+def build_author_response(status, args=(), server_msg=b"", data=b""):
+    """RFC 8907 s6.2: status(1), arg_cnt(1), server_msg_len(2),
+    data_len(2), arg_lens, server_msg, data, args.
+
+    Note the field ORDER differs from the accounting reply, where both
+    lengths precede the status byte. Two formats, two builders."""
+    a = [x.encode("latin-1") if isinstance(x, str) else x for x in args]
+    out = struct.pack("!BBHH", status, len(a), len(server_msg), len(data))
+    out += bytes(len(x) for x in a)
+    out += server_msg + data + b"".join(a)
+    return out
+
+
+def parse_author_response(body):
+    if len(body) < 6:
+        raise TacacsMalformed("authorization response is %d bytes" % len(body))
+    status, arg_cnt, msg_len, data_len = struct.unpack("!BBHH", body[:6])
+    off = 6
+    arg_lens = list(body[off:off + arg_cnt])
+    off += arg_cnt
+    server_msg = body[off:off + msg_len].decode("latin-1")
+    off += msg_len
+    data = body[off:off + data_len].decode("latin-1")
+    off += data_len
+    args = []
+    for n in arg_lens:
+        args.append(body[off:off + n].decode("latin-1"))
+        off += n
+    return {"status": status,
+            "status_name": AUTHOR_STATUS_NAMES.get(status),
+            "server_msg": server_msg, "data": data, "args": args}

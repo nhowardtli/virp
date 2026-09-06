@@ -1,0 +1,353 @@
+{
+ "captured_on_port": "tty0",
+ "captured_utc_ns": 1788620860308414960,
+ "device": "R1",
+ "entries": [
+  {
+   "accounted_cmd": "show version <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show version"
+  },
+  {
+   "accounted_cmd": "show version <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "sh version"
+  },
+  {
+   "accounted_cmd": "show version <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "sho ver"
+  },
+  {
+   "accounted_cmd": "show version <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show ver"
+  },
+  {
+   "accounted_cmd": "show ip interface brief <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show ip interface brief"
+  },
+  {
+   "accounted_cmd": "show ip interface brief <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "sh ip int br"
+  },
+  {
+   "accounted_cmd": "show ip interface brief <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show ip int brief"
+  },
+  {
+   "accounted_cmd": "show ip route <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show ip route"
+  },
+  {
+   "accounted_cmd": "show ip route <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "sh ip ro"
+  },
+  {
+   "accounted_cmd": "show ip protocols <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show ip protocols"
+  },
+  {
+   "accounted_cmd": "show users <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show users"
+  },
+  {
+   "accounted_cmd": "show users <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "sh users"
+  },
+  {
+   "accounted_cmd": "show inventory <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show inventory"
+  },
+  {
+   "accounted_cmd": "show clock <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show clock"
+  },
+  {
+   "accounted_cmd": "show sessions <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show sessions"
+  },
+  {
+   "accounted_cmd": "show cdp neighbors <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show cdp neighbors"
+  },
+  {
+   "accounted_cmd": "show cdp neighbors <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "sh cdp nei"
+  },
+  {
+   "accounted_cmd": "show processes cpu <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show processes cpu"
+  },
+  {
+   "accounted_cmd": "show memory statistics <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show memory statistics"
+  },
+  {
+   "accounted_cmd": null,
+   "mode": "exec",
+   "note": "no accounting record",
+   "receipts": 0,
+   "typed": "show interfaces Loopback0"
+  },
+  {
+   "accounted_cmd": null,
+   "mode": "exec",
+   "note": "no accounting record",
+   "receipts": 0,
+   "typed": "show interfaces lo0"
+  },
+  {
+   "accounted_cmd": "show interfaces GigabitEthernet 0/0 <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show interfaces GigabitEthernet0/0"
+  },
+  {
+   "accounted_cmd": "show interfaces GigabitEthernet 0/0 <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show int gi0/0"
+  },
+  {
+   "accounted_cmd": "show running-config <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show running-config | include hostname"
+  },
+  {
+   "accounted_cmd": "show running-config <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show running-config | begin line"
+  },
+  {
+   "accounted_cmd": "show ip interface brief <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show ip interface brief | exclude unassigned"
+  },
+  {
+   "accounted_cmd": "show version <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "SHOW VERSION"
+  },
+  {
+   "accounted_cmd": "show clock <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "Show Clock"
+  },
+  {
+   "accounted_cmd": "show ip route <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show   ip    route"
+  },
+  {
+   "accounted_cmd": "show file systems <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show file systems"
+  },
+  {
+   "accounted_cmd": "show logging <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show logging"
+  },
+  {
+   "accounted_cmd": null,
+   "mode": "exec",
+   "note": "no accounting record",
+   "receipts": 0,
+   "typed": "show running-config"
+  },
+  {
+   "accounted_cmd": null,
+   "mode": "exec",
+   "note": "AMBIGUOUS: 2 receipts arrived in this window (['show running-config <cr>', 'show running-config <cr>']) -- another session was active; not recorded as truth",
+   "receipts": 2,
+   "typed": "sh run"
+  },
+  {
+   "accounted_cmd": "show ip bgp summary <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "show ip bgp summary"
+  },
+  {
+   "accounted_cmd": "terminal length 0 <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "terminal length 0"
+  },
+  {
+   "accounted_cmd": "configure terminal <cr>",
+   "mode": "exec",
+   "note": null,
+   "receipts": 1,
+   "typed": "configure terminal"
+  },
+  {
+   "accounted_cmd": "interface Loopback 301 <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "interface Loopback301"
+  },
+  {
+   "accounted_cmd": "interface Loopback 301 <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "interface Loopback 301"
+  },
+  {
+   "accounted_cmd": "interface Loopback 301 <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "int lo301"
+  },
+  {
+   "accounted_cmd": "description CORPUS-TEST <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "description CORPUS-TEST"
+  },
+  {
+   "accounted_cmd": "no description <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "no description"
+  },
+  {
+   "accounted_cmd": "ip address 10.30.1.1 255.255.255.255 <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "ip address 10.30.1.1 255.255.255.255"
+  },
+  {
+   "accounted_cmd": "no ip address <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "no ip address"
+  },
+  {
+   "accounted_cmd": "shutdown <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "shutdown"
+  },
+  {
+   "accounted_cmd": "no shutdown <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "no shutdown"
+  },
+  {
+   "accounted_cmd": null,
+   "mode": "config",
+   "note": "AMBIGUOUS: 2 receipts arrived in this window (['do-exec show clock <cr>', 'show clock <cr>']) -- another session was active; not recorded as truth",
+   "receipts": 2,
+   "typed": "do show clock"
+  },
+  {
+   "accounted_cmd": null,
+   "mode": "config",
+   "note": "AMBIGUOUS: 2 receipts arrived in this window (['do-exec sh ver <cr>', 'show version <cr>']) -- another session was active; not recorded as truth",
+   "receipts": 2,
+   "typed": "do sh ver"
+  },
+  {
+   "accounted_cmd": "logging buffered 16384 <cr>",
+   "mode": "config",
+   "note": null,
+   "receipts": 1,
+   "typed": "logging buffered 16384"
+  },
+  {
+   "accounted_cmd": null,
+   "mode": "config",
+   "note": "no accounting record",
+   "receipts": 0,
+   "typed": "end"
+  }
+ ],
+ "ios_version": "15.2(4)M7",
+ "note": "`accounted_cmd` is what IOS put in the accounting cmd= field for the typed string. Ground truth; the canonicalizer targets this, never the other way round.",
+ "platform": "Cisco 7206VXR (NPE400), C7200-ADVENTERPRISEK9-M"
+}

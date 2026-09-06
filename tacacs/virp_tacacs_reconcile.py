@@ -36,6 +36,11 @@ from virp_tacacs_recv import (ARTIFACT_TYPE, canonical_bytes,
                               chain_append_evidence, producer_load_sk,
                               producer_sign)
 
+import virp_tacacs_authz as _az
+
+# 2c: same function as the compiler. See virp_tacacs_policy.py.
+canonical_for_match = _az.ios_canonical
+
 SCHEMA = "tacacs_reconciliation/1"
 ACCT_SCHEMA = "tacacs_accounting/1"
 
@@ -47,12 +52,58 @@ REASSEMBLY_CISCO_SINGLE = "cisco_cmd_single_arg_drop_cr"
 REASSEMBLY_UNRECOGNIZED = "UNRECOGNIZED"
 
 VERDICTS = ("MATCHED", "START_WITHOUT_STOP", "STOP_WITHOUT_START",
-            "UNGOVERNED", "UNREPORTED", "AMBIGUOUS")
+            "UNGOVERNED", "UNREPORTED", "AMBIGUOUS",
+            "ATTEMPTED_UNAPPROVED", "BREAKGLASS_USED")
+
+# A separate axis from the verdict, like coverage. RED means "a human
+# acted outside the gate and someone must look now". It is deliberately
+# NOT a verdict value on its own: the verdict says what the record is,
+# the grade says how loudly to say it.
+GRADES = ("RED", "NOT_GRADED")
+
+AUTHZ_SCHEMA = "tacacs_authorization/1"
 COVERAGE = ("RECEIVER_UP", "RECEIVER_DOWN", "INTERRUPTED",
             "RECEIVER_UNKNOWN")
 
 
 # ── reading, strictly read-only ────────────────────────────────────────
+
+def read_entries(db_path, artifact_types=None):
+    """Generic read-only entry reader, shared with the policy compiler.
+
+    One read path for the whole TACACS toolchain: a second SQLite reader
+    would be a second place for a schema change to break and a second
+    place to forget `mode=ro`. Returns the chain_entry_hash alongside the
+    body so a consumer can cite the entry it acted on.
+    """
+    conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT e.session_id, e.sequence, e.artifact_id, "
+            "       e.artifact_type, e.timestamp_ns, e.chain_entry_hash, "
+            "       a.artifact_content "
+            "FROM chain_entries e JOIN artifacts a "
+            "  ON a.artifact_hash = e.artifact_hash "
+            " AND a.artifact_id = e.artifact_id "
+            "ORDER BY e.session_id, e.sequence").fetchall()
+    finally:
+        conn.close()
+    out = []
+    for session_id, seq, aid, atype, ts, ceh, content in rows:
+        if artifact_types is not None and atype not in artifact_types:
+            continue
+        try:
+            body = json.loads(content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(body, dict):
+            continue
+        out.append({"session_id": session_id, "sequence": seq,
+                    "artifact_id": aid, "artifact_type": atype,
+                    "timestamp_ns": ts, "chain_entry_hash": ceh,
+                    "body": body})
+    return out
+
 
 def read_chain(db_path):
     """(receipts, gate_executions). Read-only URI; this program has no
@@ -257,6 +308,41 @@ def _flags(body):
     return set(body.get("acct_flags") or [])
 
 
+def authz_outcome_for(device, command, t_ns, decisions, window_ns):
+    """The authorization decision for this device+command near t_ns, or
+    None if there was none.
+
+    Used to separate ATTEMPTED_UNAPPROVED from UNGOVERNED. UNGOVERNED
+    means the device EXECUTED something VIRP did not govern -- an
+    accountability gap. A denial is the opposite fact: the control
+    worked. Filing a successful refusal under UNGOVERNED would make a
+    working control read as a failure, and would bury real gaps under
+    noise from every blocked attempt.
+    """
+    best, best_dt = None, None
+    for d in decisions:
+        if d.get("client_identity") != device:
+            continue
+        if d.get("command") != command:
+            continue
+        dt = abs(int(d.get("recv_utc_ns") or 0) - int(t_ns))
+        if dt > window_ns:
+            continue
+        if best_dt is None or dt < best_dt:
+            best, best_dt = d.get("decision"), dt
+    return best
+
+
+def read_authz_decisions(db_path):
+    """tacacs_authorization/1 bodies, through the shared reader."""
+    out = []
+    for r in read_entries(db_path, artifact_types=("evidence_item",)):
+        b = r["body"]
+        if b.get("schema") == AUTHZ_SCHEMA:
+            out.append(b)
+    return out
+
+
 def record_class(body):
     """"command" or "session".
 
@@ -283,7 +369,9 @@ def record_class(body):
     return "session"
 
 
-def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
+def reconcile(receipts, gates, windows, match_window_ms,
+              horizon_ns=None, authz_decisions=None,
+              breakglass_users=()):
     """Pair receipts with gate_executions and grade. Returns the list of
     per-item claims. Nothing here writes anything."""
     window_ns = match_window_ms * 1_000_000
@@ -294,6 +382,11 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
     # START_WITHOUT_STOP would be graded at a single instant and a receiver
     # outage AFTER the START -- exactly the case worth catching -- would be
     # invisible. Default: the last receipt this run observed.
+    authz_decisions = authz_decisions or []
+    # A configured list, never inferred. An empty list means "nobody told
+    # this reconciler which accounts are break-glass", which is reported
+    # as NOT_GRADED rather than as "no break-glass happened".
+    breakglass_users = set(breakglass_users or ())
     if horizon_ns is None:
         _t = [r["body"].get("recv_utc_ns") or r["timestamp_ns"]
               for r in receipts]
@@ -411,9 +504,33 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
         # carried alongside rather than overwriting it.
         final = verdict or gate_verdict
 
+        # An UNGOVERNED record whose command the authorization server
+        # DENIED is not an accountability gap -- it is the control
+        # working. Only a denial reclassifies: a PASS with no gate record
+        # is still a gap, because the authorizer allowed something VIRP's
+        # own gate never saw.
+        authz = authz_outcome_for(device, command, t_ns, authz_decisions,
+                                  window_ns)
+        if final == "UNGOVERNED" and authz in ("FAIL", "ERROR"):
+            final = "ATTEMPTED_UNAPPROVED"
+
+        # Break-glass outranks everything else this function can say. A
+        # break-glass command has no gate record BY DEFINITION, so it
+        # would otherwise be filed UNGOVERNED -- a counting bucket, and
+        # burying an alarm in a counting bucket is how alarms get
+        # ignored.
+        acct_user = rb.get("user")
+        grade = "NOT_GRADED"
+        if acct_user and acct_user in breakglass_users:
+            final = "BREAKGLASS_USED"
+            grade = "RED"
+
         items.append({
             "verdict": final,
+            "grade": grade,
+            "user": acct_user,
             "record_class": klass,
+            "authz_decision": authz,
             "gate_correspondence": gate_verdict,
             "device": device,
             "task_id": task_id,
@@ -451,7 +568,10 @@ def reconcile(receipts, gates, windows, match_window_ms, horizon_ns=None):
             g_cov, g_ev = coverage_for_span(windows, ts, ts + window_ns)
             items.append({
                 "verdict": "UNREPORTED",
+                "grade": "NOT_GRADED",
+                "user": None,
                 "record_class": None,
+                "authz_decision": None,
                 "gate_correspondence": "UNREPORTED",
                 "device": g["body"].get("device"),
                 "task_id": None,
@@ -493,12 +613,15 @@ def chunk_items(items, budget=RECORD_BUDGET):
 
 
 def build_record(items, match_window_ms, db_path, ledger_path, windows,
-                 chunk=None, run_tally=None):
+                 chunk=None, run_tally=None, run_grade_tally=None):
     tally = {v: 0 for v in VERDICTS}
     cov = {c: 0 for c in COVERAGE}
+    grades = {g: 0 for g in GRADES}
     for it in items:
         tally[it["verdict"]] = tally.get(it["verdict"], 0) + 1
         cov[it["coverage"]] = cov.get(it["coverage"], 0) + 1
+        grades[it.get("grade", "NOT_GRADED")] = \
+            grades.get(it.get("grade", "NOT_GRADED"), 0) + 1
     rec = {
         "schema": SCHEMA,
         "reconciled_utc_ns": time.time_ns(),
@@ -517,6 +640,7 @@ def build_record(items, match_window_ms, db_path, ledger_path, windows,
         },
         "tally": tally,
         "coverage_tally": cov,
+        "grade_tally": grades,
         "items": items,
         "presentation": (
             "CLAIM, not a cryptographic verdict. Render beside the "
@@ -531,6 +655,12 @@ def build_record(items, match_window_ms, db_path, ledger_path, windows,
         rec["chunk"] = chunk
         if run_tally is not None:
             rec["run_tally"] = run_tally
+        # The run-wide GRADE tally travels with every chunk for the same
+        # reason the verdict tally does: a RED alarm that is only visible
+        # in the chunk that happens to contain it is an alarm a reader
+        # can miss by opening the wrong file.
+        if run_grade_tally is not None:
+            rec["run_grade_tally"] = run_grade_tally
     return rec
 
 
@@ -552,6 +682,10 @@ def main(argv=None):
     p.add_argument("--db", required=True, help="chain database (read-only)")
     p.add_argument("--ledger", help="receiver LISTEN_START/STOP ledger")
     p.add_argument("--match-window-ms", type=int, default=15000)
+    p.add_argument("--breakglass-user", action="append", default=[],
+                   help="account name whose use is graded RED (repeatable). "
+                        "Configured, never inferred: with none given, "
+                        "break-glass use is NOT_GRADED rather than absent.")
     p.add_argument("--out", help="write the record JSON here")
     p.add_argument("--submit", action="store_true",
                    help="append the record to the chain")
@@ -562,14 +696,24 @@ def main(argv=None):
 
     receipts, gates = read_chain(args.db)
     windows = read_ledger(args.ledger)
-    items = reconcile(receipts, gates, windows, args.match_window_ms)
+    decisions = read_authz_decisions(args.db)
+    items = reconcile(receipts, gates, windows, args.match_window_ms,
+                      authz_decisions=decisions,
+                      breakglass_users=args.breakglass_user)
     rec = build_record(items, args.match_window_ms, args.db,
                        args.ledger, windows)
 
-    print("receipts: %d   gate_executions: %d   items: %d"
-          % (len(receipts), len(gates), len(items)))
+    print("receipts: %d   gate_executions: %d   authz_decisions: %d   "
+          "items: %d" % (len(receipts), len(gates), len(decisions),
+                         len(items)))
     print("tally: %s" % json.dumps(rec["tally"], sort_keys=True))
     print("coverage: %s" % json.dumps(rec["coverage_tally"], sort_keys=True))
+    print("grades:   %s" % json.dumps(rec["grade_tally"], sort_keys=True))
+    for it in items:
+        if it.get("grade") == "RED":
+            print("  RED  %-14s %-4s user=%-12s %r"
+                  % (it["verdict"], it.get("device"), it.get("user"),
+                     it.get("command")))
 
     if args.out:
         with open(args.out, "w") as f:
@@ -588,7 +732,8 @@ def main(argv=None):
                                args.ledger, windows,
                                chunk={"run_id": run_id, "index": i,
                                       "of": len(groups)},
-                               run_tally=rec["tally"])
+                               run_tally=rec["tally"],
+                               run_grade_tally=rec["grade_tally"])
             body_bytes, _ = producer_sign(sk, sub)
             aid = "tacacs-reconcile:%s:%d" % (run_id, i)
             ok, detail = chain_append_evidence(args.chain_session, aid,

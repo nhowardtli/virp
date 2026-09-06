@@ -15,6 +15,12 @@ block commands, whereas an authorization server that fails can lock an
 operator out of a device. v1 deliberately takes only the job whose
 failure mode is "evidence is missing", never "the network is down".
 
+**v2 adds authorization, and this paragraph is why it applies to the
+GATE's identities only.** `virp-ro` and `virp-rw` fail closed when the
+TACACS+ server is unreachable; humans never do, because the reasoning
+above still holds for them. See §9.1 for the resolution and §9.3 for the
+measurement that rules out a network break-glass path.
+
 ---
 
 ## 1. What this source is, and the boundary on the report face
@@ -386,10 +392,37 @@ uid needs:
 - an entry in `socket_uid_chain_append_types` — exactly
   `["evidence_item"]`
 
-All three are mandatory: the daemon **refuses to start** naming the uid
-if an allowlisted uid is missing from the action or type map. A
-forgotten entry is a boot failure, never a silent grant. In the lab this
-is a rendered lab config; no production template is edited by this work.
+All three are mandatory **for an appending uid**, and the daemon
+**refuses to start** naming the uid if one is missing. A forgotten entry
+is a boot failure, never a silent grant.
+
+The rule is conditional, and the condition matters when editing a live
+node's config: a `socket_uid_chain_append_types` entry is required only
+of a uid whose `socket_uid_action_allow` set **contains `chain_append`**
+(`src/virp_onode.c:4218-4231`). A uid that never appends legitimately has
+no type entry, and a missing entry means *unrestricted*, not deny-all —
+the boot invariant is what stops that from becoming a silent grant,
+because it guarantees every uid that can reach this code path has a
+policy.
+
+**Confirmed against both deployed nodes, 2026-09-05:**
+
+```
+10.0.10.211  999 1000 997 995 993  chain_append=yes  type policy present
+             994                   chain_append=no   no policy   (boots fine)
+10.0.0.13    999 1000              chain_append=yes  type policy present
+             997 1001              chain_append=no   no policy   (boots fine)
+```
+
+So adding a receiver uid is a **single edit touching three keys at
+once**. Adding it to `socket_allowed_uids` and `socket_uid_action_allow`
+with `chain_append`, but forgetting
+`socket_uid_chain_append_types`, does not degrade to a refusal at append
+time — it stops the daemon coming back up, which turns a planned restart
+into an outage on every device that node governs.
+
+In the lab this is a rendered lab config; no production template is
+edited by this work.
 
 ---
 
@@ -456,7 +489,7 @@ sends to the first server in *each* named group.
 
 | Platform | Duplicate accounting delivery | Status |
 |---|---|---|
-| Cisco IOS / IOS-XE | Two `aaa group server tacacs+` groups + `broadcast` on the `aaa accounting` line | **CONFIG VALIDATED IN LAB** on 15.2(4)M7 — `broadcast` confirmed active by `debug aaa accounting` (`Broadcast osr 2`). Delivery to both targets: see §7.4 |
+| Cisco IOS / IOS-XE | Two `aaa group server tacacs+` groups + `broadcast` on the `aaa accounting` line | **VALIDATED IN LAB** on 15.2(4)M7 — 38 TCP sessions to each of two distinct servers from one `broadcast` line, by packet capture (§7.4) |
 | Arista EOS | Believed to support multiple TACACS+ groups; fan-out semantics not confirmed | **UNVALIDATED** |
 | Juniper Junos | Junos TACACS+ accounting server list semantics (failover vs. fan-out) not confirmed | **UNVALIDATED** |
 | Fortinet FortiOS | Multiple TACACS+ servers configurable; duplicate-delivery behaviour not confirmed | **UNVALIDATED** |
@@ -619,12 +652,12 @@ under GNS3 2.2.59 / dynamips 0.2.23. Applied to R1, R2 and R3.
 aaa new-model
 !
 tacacs server VIRP
- address ipv4 10.0.0.36
+ address ipv4 192.168.122.1
  port 4949
  key LabKeyVirp
 !
 tacacs server STUB-ISE
- address ipv4 10.0.0.21
+ address ipv4 172.17.0.1
  port 4950
  key LabKeyStub
 !
@@ -928,7 +961,378 @@ re-introduces exactly the ambiguity the coverage axis exists to remove.
 
 ---
 
-## 9. What this whole source does not prove
+## 8a. Docket additions for AUTHORIZATION (v2 scope)
+
+**Docket was not edited.** These are the field sets, reported.
+
+### The scope change itself, stated plainly
+
+v1's scope paragraph says VIRP serves accounting only, because "an
+authorization server that fails can lock an operator out of a device"
+and v1 "deliberately takes only the job whose failure mode is 'evidence
+is missing', never 'the network is down'."
+
+**Authorization deliberately reverses that trade.** An authorization
+server that fails open is not a control, so the rw method list has NO
+fallback (`group GRP-VIRPAZ` and nothing else) and an unreachable server
+denies every command on the vty. The consequence is real and is the
+biggest change in the design: VIRP moves from "cannot break the network"
+to "can deny every command on every router it governs".
+
+Two things keep that survivable, and both are load-bearing rather than
+decorative:
+
+- **The console is exempt** (`aaa authorization commands 15 CONSOLE
+  none`). An authorization outage leaves console access working, which
+  is the documented break-glass path. On real hardware that is a
+  deliberate, stated hole: anyone with console access bypasses command
+  authorization entirely.
+- **Accounting stays a separate process on a separate address.** An
+  authorization outage cannot lose evidence and an accounting outage
+  cannot deny commands. Merging them would couple exactly the two
+  failure modes v1 separated.
+
+### `tacacs_authorization/1` — the decision record
+
+One per AUTHOR request, chained BEFORE the reply is sent. A decision the
+router acted on that no record describes is the hole this exists to
+close, so a chain-append failure downgrades the decision to `ERROR`,
+which denies.
+
+| field | type | meaning |
+|---|---|---|
+| `schema` | string | `"tacacs_authorization/1"` |
+| `recv_utc_ns`, `recv_monotonic_ns` | u64 | receiver clocks, same discipline as §2 |
+| `client_identity`, `client_identity_source` | string | configured label, never a measurement |
+| `user` | string | `virp-ro` \| `virp-rw` — the identity the ROUTER authenticated |
+| `port`, `rem_addr`, `priv_lvl` | string/int | as sent |
+| `args` | [string] | verbatim, same rule as the accounting receipt |
+| `command` | string\|null | reassembled under a NAMED rule |
+| `command_reassembly` | string | which rule produced it |
+| `decision` | string | closed set: `PASS_ADD`, `PASS_REPL`, `FAIL`, `ERROR` |
+| `decision_reason` | string | operator-visible; denials carry the `VIRP-DENY: ` prefix |
+| `grant_id` | string\|null | the grant spent, or null |
+| `policy_sha256` | 64 hex | the policy in force AT THE MOMENT OF THE DECISION |
+| `raw_body_sha256` | 64 hex | over the decrypted AUTHOR body |
+| `parse` | string | `COMPLETE` \| `MALFORMED` |
+
+`policy_sha256` is the field that makes the record auditable: it binds a
+decision to the exact policy bytes it was judged against.
+
+### `tacacs_authz_policy_rendered/1` — what the router would have accepted
+
+| field | type | meaning |
+|---|---|---|
+| `schema` | string | `"tacacs_authz_policy_rendered/1"` |
+| `device` | string | device, or a comma list for a multi-device render |
+| `rendered_utc_ns` | u64 | when the compiler ran |
+| `policy_sha256`, `policy_bytes_len` | 64 hex / int | commitment to the rendered bytes |
+| `grant_count` | int | grants in force |
+| `approval_ids` | [string] | which approvals are represented |
+| `refusals[]` | array | `{approval_id, reason}` for every approval NOT rendered |
+| `daemon_load_confirmed` | bool\|null | whether the daemon's own ledger confirmed the load |
+| `presentation` | string | the beside-the-ladder rule, in the record |
+
+**`refusals` is not optional.** An approval that silently failed to
+render is a silent denial of approved work and looks identical to an
+attack; the record must show what did not make it in.
+
+**A renderer must show `daemon_load_confirmed`.** A policy that was
+written but never loaded describes a router that was never governed by
+it. `false` and `null` are different: `false` means the daemon was asked
+and did not confirm; `null` means nobody checked.
+
+### The grant shape a reader needs
+
+Grants inside the policy carry `accepted_spellings` and `spelling_rule`.
+That is deliberate and must be rendered: IOS does not authorize the
+command the operator typed (§8b), so "what was approved" and "what the
+router will be allowed to say" are different strings, and only the second
+governs. A UI that showed the approved text alone would be showing the
+wrong string.
+
+`derived: "config_mode_prerequisite"` marks a grant the COMPILER minted,
+not one a human approved. It must never be displayed as an approval.
+
+### The gap this session could not close: identity
+
+The `outcome` record (src/virp_onode.c) carries `proposal_id`,
+`proposal_entry_hash`, `approval_entry_hash`, `device`, `command_hash`,
+`success` and `intent_entry_hash` — and **no identity field**. So "which
+identity executed this" is not answerable from the chain. The
+authorization record knows (`user`), and the outcome record does not, and
+nothing binds the two.
+
+**Recommended field for `outcome`:** `executed_as` (string, the AAA
+username the gate authenticated with). It is a schema bump on a
+daemon-reserved type and therefore not made here.
+
+### Recommendation: `producer_key_id` from day one — argued
+
+The accounting report left `producer_key_id` open for
+`tacacs_accounting/1`, where adding it means a `/2` bump because `/1`
+records exist and must never be re-signed.
+
+**The two new types above have produced nothing real yet. They should
+carry `producer_key_id` from their first record, and the argument is not
+symmetry — it is that the cost curve is entirely one-sided.**
+
+Adding it now costs one field in a record no auditor has yet read.
+Adding it later costs a schema bump, a period where two versions are
+live, a verifier that must handle both forever, and a body of `/1`
+records that can never be upgraded because re-signing evidence is exactly
+what this system refuses to do. The accounting type is already paying
+that price; there is no reason to buy it twice.
+
+The counter-argument — "wait until Docket actually verifies producer
+signatures, in case the field set changes" — fails on its own terms. If
+Docket later wants something different, a type with `producer_key_id`
+can add a field; a type WITHOUT it cannot retroactively acquire the one
+field that says which key to check, because the records are already
+signed. The asymmetry is the whole argument: the field is cheap before
+first use and permanently unavailable after.
+
+**So: `tacacs_authorization/1` and `tacacs_authz_policy_rendered/1` carry
+`producer_key_id` before any of their records is treated as evidence.**
+This is recorded as a decision, not implemented in this session, because
+the records already written during the lab run would then be `/1` bodies
+without the field — which is the exact trap being described. The clean
+move is to add the field and DISCARD the lab chain, not to bump a type
+that is three hours old.
+
+---
+
+## 8b. FortiOS: a design sketch, and where the Cisco model does not reach
+
+**No FortiGate was touched.** This is design only, written from the
+platform model, and every row is `UNVALIDATED` until a lab proves it.
+
+### What maps cleanly
+
+| Cisco element | FortiOS equivalent | note |
+|---|---|---|
+| two AAA identities (`virp-ro`, `virp-rw`) | two admin accounts, each bound to its own `accprofile` | direct |
+| the read allowlist | an `accprofile` with read-only scopes | coarser: FortiOS grants by FEATURE AREA, not by command |
+| source restriction | `trusthost` on the admin account | **stronger than Cisco.** `trusthost` pins the source prefixes an admin may log in from at all, which Cisco's command authorization does not do |
+| command accounting | TACACS+ accounting, `config log tacacs+accounting` | the accounting half of this design should port |
+
+### What does NOT map, and it is the important half
+
+**FortiOS has no per-command TACACS+ authorization.** Cisco asks the
+TACACS+ server about every command; FortiOS decides locally from the
+admin's `accprofile`. There is no AUTHOR exchange per command to
+intercept, so there is nothing for a policy compiler to answer.
+
+That breaks the central mechanism of this design. "One approval, one
+command, one device" has no expression on FortiOS: the finest grain
+available is a feature-area permission (`fwgrp`, `sysgrp`, `netgrp` and
+so on, each none/read/read-write). An approval for *one command* would
+have to be rendered as a profile granting *every command in that feature
+area* — which is not the same claim, and quietly widens the blast radius
+from one command to a category.
+
+Three shapes are possible, and none is equivalent:
+
+1. **Dynamic profile rewrite.** On approval, rewrite the `virp-rw`
+   account's `accprofile` to open the needed feature area, and close it
+   on outcome or TTL. Honest description: *time-boxed feature-area
+   access*, not per-command authorization. The window is narrow in TIME
+   but wide in SCOPE, and a report must say so rather than reusing the
+   Cisco wording.
+2. **Approval-gated credential release.** Keep `virp-rw` permanently
+   disabled and enable it only inside an approved window. Same scope
+   problem, plus the account is a bearer credential while enabled.
+3. **Proxy the CLI.** Put VIRP in the command path rather than beside
+   it, so it can refuse per command. This restores the granularity and
+   loses the property that makes the Cisco design worth having: the
+   router refuses *regardless of what the gate sends*. A proxy that is
+   also the gate is back to trusting the gate.
+
+**The recommendation is to say so plainly rather than ship option 1 under
+the Cisco vocabulary.** On Cisco, `UNGOVERNED` means the device executed
+something VIRP did not authorize. On FortiOS under option 1 the device
+would be executing things VIRP never saw, inside a window VIRP opened —
+which is a materially weaker statement and needs its own verdict name,
+not a borrowed one.
+
+| FortiOS capability | status |
+|---|---|
+| per-command TACACS+ authorization | **NOT AVAILABLE** — architectural, not a config gap |
+| time-boxed feature-area access via profile rewrite | **UNVALIDATED** |
+| `trusthost` source pinning | **UNVALIDATED** |
+| TACACS+ command accounting | **UNVALIDATED** |
+
+---
+
+## 8c. Docket additions from the §9 resolution
+
+**Docket was not edited.** Field sets, reported.
+
+### `BREAKGLASS_USED` — a verdict that must render as an alarm
+
+A new value in `tacacs_reconciliation/1`'s closed verdict set, and a new
+`grade` axis beside it.
+
+| field | type | meaning |
+|---|---|---|
+| `items[].verdict` | string | now includes `BREAKGLASS_USED` |
+| `items[].grade` | string | closed set: `RED`, `NOT_GRADED` |
+| `items[].user` | string\|null | the account the ROUTER authenticated |
+| `grade_tally` | {grade: int} | per-record counts |
+| `run_grade_tally` | {grade: int}\|absent | run-wide counts, carried in EVERY chunk |
+
+**Three rendering rules, each from a mistake this session made or nearly
+made:**
+
+1. **`RED` must be visible without opening every chunk.** A chunked run
+   carried the run-wide VERDICT tally but not the run-wide GRADE tally,
+   so chunk 0 of a run with 10 RED items read `RED: 0`. Every chunk now
+   carries `run_grade_tally`; a renderer must read that, never sum the
+   per-chunk `grade_tally`.
+2. **`BREAKGLASS_USED` must not be displayed as a kind of
+   `UNGOVERNED`.** Break-glass has no gate record by definition, so
+   `UNGOVERNED` is where it lands by default — and that is a counting
+   bucket. An alarm in a counting bucket is an alarm nobody sees.
+3. **`NOT_GRADED` is not "no break-glass happened".** The break-glass
+   account list is configuration. With none supplied the reconciler
+   cannot grade, and saying so is different from saying nothing occurred.
+
+### `tacacs_authz_policy_render_refused/1` — approvals that did NOT render
+
+| field | type | meaning |
+|---|---|---|
+| `schema` | string | `"tacacs_authz_policy_render_refused/1"` |
+| `device` | string | device the render was for |
+| `refused_utc_ns` | u64 | when the compiler refused |
+| `refused_count` | int | how many approvals did not render |
+| `refusals[]` | array | `{approval_id, reason}` |
+| `presentation` | string | beside-the-ladder rule, in the record |
+
+**Why this is its own record and not a footnote on the policy.** An
+approval that silently failed to render is a silent denial of approved
+work, and from the router's side it is indistinguishable from an attack:
+the command arrives, no grant matches, it is refused. The operator sees a
+denial and the approver sees an approval, and nothing connects them. This
+record is the connection.
+
+### Identity used — still missing, now located precisely
+
+The `outcome` record is built by `snprintf` into a fixed `content[1024]`
+at `src/virp_onode.c:855-866` and hashed as the artifact body. It does
+**not** pass through `build_canonical_json`, so adding a field is **not**
+a canonical-format-window item — it is an ordinary daemon-reserved schema
+change, and it is not made here.
+
+Recommended: `executed_as` (string, the AAA username the gate
+authenticated with). Until it exists, "which identity executed this" is
+answerable only from the `tacacs_authorization/1` record's `user` field,
+and nothing binds that to the outcome.
+
+---
+
+## 9. Scope of authorization, and what this source still does not prove
+
+### 9.1 The resolution: authorization applies to the GATE's identities only
+
+§1 and §8a were in tension. §1 says VIRP takes only the job whose failure
+mode is "evidence is missing, never the network is down". §8a introduced
+an authorization control whose whole point is to deny. Both cannot be
+true of the same identities.
+
+**They are true of different identities, and that is the resolution.**
+
+| identity | authorization | if the TACACS+ server is unreachable |
+|---|---|---|
+| `virp-ro` (gate steady state) | TACACS+ per-command, `group` only | **can do nothing** |
+| `virp-rw` (gate, approved actions) | TACACS+ per-command, `group` only | **can do nothing** |
+| humans, via the console | exempt (`CONSOLE` list, method `none`) | **unaffected** |
+| `breakglass` (local account, console path) | exempt with the console | **unaffected** |
+
+**The original §1 argument is not withdrawn — it is the reason humans are
+exempt.** An authorization server that can lock an operator out of a
+device is exactly the failure v1 refused to build, so no human depends on
+one. What changed is that the GATE is now fenced: VIRP's own automated
+identities fail closed, because an automated actor that keeps acting when
+its control plane is unreachable is not governed at all.
+
+So the failure mode is still "evidence is missing, never the network is
+down" **for humans**, and is deliberately "the gate stops" for the gate.
+
+### 9.2 Break-glass use is an event, graded RED
+
+The exemption has a price and it is paid in visibility. `breakglass` is
+the one identity that can act without the gate, so its use is:
+
+- **recorded** — a locally-authenticated console session emits TACACS+
+  accounting (EXEC START plus a command STOP per command,
+  `user=breakglass`). Measured 2026-09-05.
+- **graded `RED`** by the reconciler, under its own verdict
+  `BREAKGLASS_USED`, on a grade axis separate from the verdict.
+- **never folded into `UNGOVERNED`.** A break-glass command has no gate
+  record by definition, so `UNGOVERNED` is where it would land by
+  default — and that is a counting bucket. Burying an alarm in a
+  counting bucket is how alarms get ignored.
+
+The break-glass account list is **configured, never inferred**. With none
+configured the reconciler reports `NOT_GRADED`, which is not the same
+claim as "no break-glass happened".
+
+### 9.3 Why there is no network break-glass path
+
+Measured on IOS 15.2(4)M7, 2026-09-05, with the authorization server
+down:
+
+| shape | `virp-rw` | `breakglass` |
+|---|---|---|
+| `commands N VIRPRW group GRP-VIRPAZ` | login OK, **every command DENIED** | login OK, **every command DENIED** |
+| `commands N VIRPRW group GRP-VIRPAZ local` | login OK, **`configure terminal` EXECUTED** | everything EXECUTED |
+| separate vty on its own SSH port, list `local` | port 22 **DENIED**; **port 2222 EXECUTED** | port 2222 EXECUTED |
+
+**IOS cannot scope `local` fallback to specific users.** A method list
+binds to a LINE and authorizes whoever reaches it. The gate must hold a
+local account in order to authenticate at all, so any line offering a
+`local` fallback offers it to the gate too — including a dedicated
+break-glass port, which the gate simply connects to.
+
+A network break-glass therefore requires `access-class` source
+separation, and is only a control where the gate host and the operator's
+jump host are different sources. **Without one it is a gate
+self-escalation route**, and is not shipped in the template for that
+reason.
+
+### 9.4 The limit: both servers down
+
+Measured, and this is the honest edge of the design.
+
+| what is down | break-glass visible to VIRP? |
+|---|---|
+| authorization server only | **YES** — accounting is a separate process on a separate address, so receipts still arrive |
+| authorization **and** accounting | **NO** — zero receipts |
+
+That accounting survives an authorization outage is not luck; it is the
+separation §1 spent a paragraph on, doing its job.
+
+With both down, what survives is the router's own local buffer, and only
+if it was configured for it:
+
+- `%SEC_LOGIN-5-LOGIN_SUCCESS: [user: breakglass]` (needs
+  `login on-success log`)
+- `%SYS-6-LOGOUT: User breakglass has exited`
+- `%PARSER-5-CFGLOG_LOGGEDCMD: User:breakglass logged command:<cmd>` for
+  every config command (needs `archive` / `log config`)
+
+Without those, a break-glass **`show`** command during a full outage
+leaves **no trace anywhere**. Even with them, the buffer is volatile,
+unauthenticated, lost on reload, and under the control of the device
+being investigated. It is a lead, not evidence.
+
+Shipping a durable answer means getting those events off the box while
+the collectors are down — which is the `syslog_event/1` transport in
+§6a, still `UNBUILT`, and which has its own boundary problems.
+
+---
+
+### 9.5 What this whole source still does not prove
 
 Collected in one place, because a reader who skips everything else
 should still find this.
@@ -939,12 +1343,16 @@ should still find this.
   accounting produces nothing, and its silence is indistinguishable
   from a device that ran nothing — which is exactly why `UNREPORTED`
   exists as a verdict rather than as an absence.
+- **Not a record of what was REFUSED.** A denied command never executes,
+  so it produces no accounting record at all. Measured: 5 of 16 distinct
+  denied command strings appeared nowhere in accounting. Only the
+  `tacacs_authorization/1` record evidences a refusal.
 - **Not tamper-proof against the device.** A compromised device
   controls what it reports. VIRP records what it was told, signed at
   receipt. Tamper-**evident downstream of receipt**, not upstream.
-- **Not a security control.** v1 serves accounting only. It authorizes
-  nothing and denies nothing. A command already ran by the time its
-  accounting arrives.
+- **Not a control over humans.** Authorization governs the gate's
+  identities. Anyone at a console is outside it by design (§9.1), and
+  the compensating control is a RED record, not a refusal.
 - **Not authenticated transport.** RFC 8907 obfuscation is not TLS. An
   observer on-path with the secret reads everything; an observer
   without it sees packet sizes, timing, and the header in clear.
