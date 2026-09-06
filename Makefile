@@ -623,6 +623,15 @@ test-chain: $(TEST_CHAIN)
 # Evidence-required intent/closer binding fixtures (Sep 1 review, 1.1-1.2)
 TEST_EVBIND = $(BUILD_DIR)/test_evidence_binding
 TEST_CONSUME_ORD = $(BUILD_DIR)/test_approval_consume_ordering
+TEST_APPLY_DAEMON = $(BUILD_DIR)/test_apply_daemon_request
+
+$(TEST_APPLY_DAEMON): tests/test_apply_daemon_request.c $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-apply-daemon
+test-apply-daemon: $(TEST_APPLY_DAEMON)
+	./$(TEST_APPLY_DAEMON)
 
 $(TEST_CONSUME_ORD): tests/test_approval_consume_ordering.c $(LIB)
 	rm -f $@
@@ -2148,7 +2157,7 @@ test-release-tools:
 	@scripts/verify-release-bundle.sh --selftest
 	@scripts/check-release-tag.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-consume-ordering test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

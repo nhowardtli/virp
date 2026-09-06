@@ -708,6 +708,36 @@ virp_error_t onode_set_approvers(onode_state_t *state,
  * node-wide gate_max_tier. The socket handler and the batch fan-out both
  * pass the real peer uid.
  */
+/*
+ * onode_apply_obs — APPLY as a daemon request (store split, 2026-09-05).
+ *
+ * The caller names ONLY a proposal_id. The daemon resolves `device` and
+ * `command` from its OWN approval store and then runs the unchanged
+ * execute path with the approval reference.
+ *
+ * This exists because `virp approve` reached the store through the socket
+ * while `virp apply` read the directory directly, so approve succeeded as
+ * uid 1000 where apply could not — the `sudo -u virp` requirement, and
+ * half of why a failed apply burned an approval on 2026-09-05.
+ *
+ * It also removes device/command from the client's influence entirely:
+ * the daemon no longer reads either field from the requester on this
+ * path. Nothing else changes — signature, command-hash, device binding,
+ * TTL, liveness and single-use consume all run exactly as before.
+ *
+ * Returns the LOAD failure directly when the proposal cannot be resolved,
+ * so the three causes stay distinguishable to the operator:
+ *   VIRP_ERR_APPROVAL_STORE_ABSENT     (-56) wrong host
+ *   VIRP_ERR_APPROVAL_NOT_FOUND        (-41) wrong proposal id
+ *   VIRP_ERR_APPROVAL_STORE_UNREADABLE (-52) wrong uid
+ */
+virp_error_t onode_apply_obs(onode_state_t *state,
+                             const char *proposal_id,
+                             uint8_t obs_version,
+                             uid_t client_uid,
+                             uint8_t *out_buf, size_t out_buf_len,
+                             size_t *out_len);
+
 virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                   const char *device_name,
                                   const char *command,

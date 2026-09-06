@@ -561,6 +561,22 @@ typedef enum {
      * payload cites "evidence-unavailable". */
     VIRP_ERR_EVIDENCE_UNAVAILABLE     = -53,
 
+    /* -54 and -55 are RESERVED for the transport codes on the
+     * fix/A-transport-error-code / fix/B-preserve-libssh2-errno stack
+     * (VIRP_ERR_TRANSPORT_WRITE / VIRP_ERR_TRANSPORT_CLOSED). Those
+     * branches were cut in the same session as this one; leaving the
+     * numbers free is what lets both stacks merge without a silent
+     * enum collision. Do not reuse them here. */
+
+    /* The approval store DIRECTORY is not on this host (defect: store
+     * split, 2026-09-05). Distinct from VIRP_ERR_APPROVAL_NOT_FOUND
+     * (-41: the store exists, this proposal does not) and from
+     * VIRP_ERR_APPROVAL_STORE_UNREADABLE (-52: it exists and this uid
+     * cannot read it). The operator's next move differs for each —
+     * wrong host, wrong id, wrong uid — and tonight's message
+     * conflated the first two. */
+    VIRP_ERR_APPROVAL_STORE_ABSENT    = -56,
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency

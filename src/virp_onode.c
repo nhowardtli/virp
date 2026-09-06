@@ -2132,6 +2132,37 @@ static virp_error_t gate_unchained_execution_obs(onode_state_t *state,
                                   &state->okey);
 }
 
+virp_error_t onode_apply_obs(onode_state_t *state,
+                             const char *proposal_id,
+                             uint8_t obs_version,
+                             uid_t client_uid,
+                             uint8_t *out_buf, size_t out_buf_len,
+                             size_t *out_len)
+{
+    if (!state || !proposal_id || !proposal_id[0] || !out_buf || !out_len)
+        return VIRP_ERR_NULL_PTR;
+
+    if (!state->approval_dir[0])
+        return VIRP_ERR_APPROVAL_STORE_ABSENT;
+
+    /* The daemon owns the store, so the daemon reads it. The client used
+     * to do this and then hand device/command back to us; now neither
+     * field reaches this path from the requester at all. */
+    virp_proposal_rec_t prop;
+    virp_error_t lerr = virp_approval_load_proposal(state->approval_dir,
+                                                    proposal_id, &prop);
+    if (lerr != VIRP_OK) {
+        fprintf(stderr, "[GATE] apply could not resolve proposal=%s from "
+                "%s: %s\n", proposal_id, state->approval_dir,
+                virp_error_str(lerr));
+        return lerr;
+    }
+
+    return onode_execute_obs_ex(state, prop.device, prop.command,
+                                obs_version, proposal_id, client_uid,
+                                out_buf, out_buf_len, out_len);
+}
+
 virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                   const char *device_name,
                                   const char *command,
@@ -4132,6 +4163,27 @@ static void handle_client(onode_state_t *state, int client_fd,
 
     switch (req.action) {
     case ONODE_ACTION_EXECUTE:
+        /* Store split (2026-09-05): an APPLY names only a proposal_id.
+         * The daemon resolves device+command from its own store rather
+         * than trusting the client's copy — which is what lets `virp
+         * apply` stop reading /var/lib/virp/approvals and stop needing
+         * `sudo -u virp`. No new wire verb, deliberately: apply already
+         * travels as an `execute` (submit_execute has always set
+         * action=execute with proposal_id), so no uid gains a capability
+         * and no per-uid action allowlist has to grow — which matters,
+         * because ONODE_MAX_UID_ACTIONS is 8 on the deployed home-node
+         * binary and its uids already sit at exactly 8. */
+        if (req.device[0] == '\0' && req.command[0] == '\0' &&
+            req.proposal_id[0] != '\0') {
+            err = onode_apply_obs(state, req.proposal_id, req.obs_version,
+                                  client_uid,
+                                  resp_buf, sizeof(resp_buf), &resp_len);
+            if (err == VIRP_OK && resp_len > 0)
+                send_framed(client_fd, resp_buf, resp_len);
+            else
+                send_framed_error(client_fd, err);
+            break;
+        }
         if (req.device[0] == '\0' || req.command[0] == '\0') {
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
