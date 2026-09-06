@@ -1705,6 +1705,108 @@ install-devices-template:
 	@echo "  so the daemon will refuse to start rather than authenticate"
 	@echo "  as a literal \$${TOKEN}. See tests/test_render_devices.sh."
 
+# -------------------------------------------------------------------------
+# install-autopilot — the autopilot Python ONLY.
+#
+# install-prod rebuilds and reinstalls the daemon binary, virp-tool and
+# the helper scripts. Replacing the gate's binary to ship a change to a
+# monitoring client is a far larger blast radius than the change needs,
+# and on a node where the gate must not be disturbed it is not an option
+# at all. The autopilot modules are self-contained (see the comment on
+# VIRP_INSTALL_PY_DIR), so installing just them is sufficient and honest
+# about what it touched.
+#
+# Refuses on a dirty tree for the reason install-prod does: what gets
+# deployed must be exactly what a commit hash names.
+# -------------------------------------------------------------------------
+.PHONY: install-autopilot
+install-autopilot:
+	@for f in $(VIRP_INSTALL_PY); do \
+	    test -f "$$f" || { echo "FAIL: $$f missing"; exit 1; }; \
+	done
+	@scripts/require-clean-tree.sh "refusing to install the autopilot"
+	install -d -m 0755 $(VIRP_INSTALL_PY_DIR)
+	install -m 0644 $(VIRP_INSTALL_PY) $(VIRP_INSTALL_PY_DIR)/
+	@echo
+	@echo "  Installed the autopilot modules to $(VIRP_INSTALL_PY_DIR)."
+	@echo "  The daemon binary, virp-tool and the units are UNTOUCHED."
+	@echo "  Takes effect on the next virp-autopilot cycle."
+
+# -------------------------------------------------------------------------
+# install-autopilot-node — the node IDENTITY file.
+#
+# /etc/virp/autopilot-node.json decides which devices the battery probes.
+# It is named by virp_autopilot.py, report/virp_report.py and DEPLOYED.md,
+# and until now it was tracked NOWHERE: virp-lab's copy was written by
+# hand in July and virp-onode-home never got one at all. The client's
+# fallback is virp-lab's topology, so the home node spent 2026-08-23 to
+# 2026-09-06 — 3895 consecutive cycles — probing four colo FRR
+# containers, a colo Wazuh and a colo LibreNMS, and publishing under
+# virp-lab's node name. Nothing failed loudly enough to notice.
+#
+# This is the same finding as devices.template.json on 2026-08-09: an
+# artifact class that changes what runs, with no install path. One
+# tracked file per node, chosen explicitly:
+#
+#   sudo make install-autopilot-node NODE=home        # virp-onode-home
+#   sudo make install-autopilot-node NODE=virp-lab    # the colo node
+#
+# Never automatic and never defaulted. Installing the wrong node's
+# identity is exactly the failure being fixed, so NODE has to be typed.
+# -------------------------------------------------------------------------
+VIRP_NODE_CONFIG_SRC = deploy/autopilot-node.$(NODE).template.json
+VIRP_NODE_CONFIG_DST = /etc/virp/autopilot-node.json
+
+.PHONY: install-autopilot-node
+install-autopilot-node:
+	@test -n "$(NODE)" || { \
+	    echo "FAIL: set NODE=<name>, e.g. NODE=home or NODE=virp-lab."; \
+	    echo "      Tracked identities:"; \
+	    ls deploy/autopilot-node.*.template.json 2>/dev/null | \
+	        sed 's|deploy/autopilot-node\.|        NODE=|; s|\.template\.json||'; \
+	    exit 1; }
+	@test -f $(VIRP_NODE_CONFIG_SRC) || { \
+	    echo "FAIL: $(VIRP_NODE_CONFIG_SRC) missing — NODE=$(NODE) is not tracked."; \
+	    exit 1; }
+	@scripts/require-clean-tree.sh "refusing to install a node identity"
+	@python3 -c "import json,sys; json.load(open(sys.argv[1]))" \
+	    $(VIRP_NODE_CONFIG_SRC) || { echo "FAIL: $(VIRP_NODE_CONFIG_SRC) is not valid JSON"; exit 1; }
+	install -m 0644 $(VIRP_NODE_CONFIG_SRC) $(VIRP_NODE_CONFIG_DST)
+	@echo
+	@echo "  Installed $(VIRP_NODE_CONFIG_DST) from $(VIRP_NODE_CONFIG_SRC)."
+	@echo "  The battery is rebuilt at the NEXT virp-autopilot cycle;"
+	@echo "  nothing is restarted here."
+	@python3 -c "import json,sys; d=json.load(open(sys.argv[1])); \
+	    print('  node        = %s' % d.get('node')); \
+	    print('  wazuh       = %s' % d.get('wazuh_device', '(default)')); \
+	    print('  librenms    = %s' % d.get('librenms_device', '(default)')); \
+	    print('  frr_nodes   = %d' % len(d.get('frr_nodes') or [])); \
+	    print('  peer_device = %s' % d.get('peer_device'))" \
+	    $(VIRP_NODE_CONFIG_SRC)
+
+# -------------------------------------------------------------------------
+# install-autopilot-logrotate — bound the alert sink.
+#
+# emit_alert() appends one JSON line per alert to
+# /var/lib/virp/autopilot/alerts.jsonl and nothing ever pruned it. On
+# virp-onode-home 3895 failing cycles x 17 alerts reached 15 MB.
+#
+# The rule does NOT truncate: the accumulated file is the evidence that
+# the failure was silent for 14 days, and it is rotated and kept, not
+# emptied.
+# -------------------------------------------------------------------------
+VIRP_ALERTS_ROTATE_SRC = deploy/virp-autopilot-alerts.logrotate
+VIRP_ALERTS_ROTATE_DST = /etc/logrotate.d/virp-autopilot-alerts
+
+.PHONY: install-autopilot-logrotate
+install-autopilot-logrotate:
+	@test -f $(VIRP_ALERTS_ROTATE_SRC) || \
+	    { echo "FAIL: $(VIRP_ALERTS_ROTATE_SRC) missing"; exit 1; }
+	@scripts/require-clean-tree.sh "refusing to install a logrotate rule"
+	install -m 0644 $(VIRP_ALERTS_ROTATE_SRC) $(VIRP_ALERTS_ROTATE_DST)
+	@echo "  Installed $(VIRP_ALERTS_ROTATE_DST) — validating (dry run):"
+	@logrotate --debug $(VIRP_ALERTS_ROTATE_DST) 2>&1 | sed 's/^/    /'
+
 .PHONY: install-wazuh-lab-dropin
 install-wazuh-lab-dropin:
 	@test -f $(VIRP_WAZUH_DROPIN_SRC) || \

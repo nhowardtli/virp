@@ -160,15 +160,51 @@ PUBLISHED_FILE = os.path.join(STATE_DIR, "published.json")
 PEER_STALE_SEC = 900
 
 
-def load_node_config(path=NODE_CONFIG_PATH):
+def merge_node_config(doc=None):
+    """Overlay a node identity document on the virp-lab defaults.
+
+    Split out of load_node_config so the SHIPPED templates can be built
+    and asserted by the unit suite without a file at /etc/virp — the
+    identity file is the one artifact class the tests could not reach.
+    """
     cfg = {"node": "virp-lab", "frr_nodes": list(FRR_NODES),
-           "peer_device": None, "peer_node": None}
+           "peer_device": None, "peer_node": None,
+           "wazuh_device": WAZUH_DEV, "librenms_device": LIBRENMS_DEV,
+           "baselines": None}
+    if doc:
+        cfg.update(doc)
+    return cfg
+
+
+def load_node_config(path=NODE_CONFIG_PATH):
+    """Read this node's identity, or say plainly that it could not.
+
+    The fallback used to be `except (OSError, ValueError): pass`, and it
+    cost virp-onode-home 3895 consecutive failing cycles across 14 days.
+    The file was never installed there, so the node silently adopted
+    virp-lab's topology: every probe named a colo device the home daemon
+    has never heard of, every cycle exited 1, and it published under
+    virp-lab's node name. Nothing said "I do not know who I am" — the
+    only evidence was inside the alert payloads.
+
+    The default is still virp-lab's shape, so an un-migrated deployment
+    keeps behaving exactly as before. It is now NOISY, because a node
+    running someone else's battery is a fact an operator has to be told.
+    """
     try:
         with open(path) as f:
-            cfg.update(json.load(f))
-    except (OSError, ValueError):
-        pass
-    return cfg
+            return merge_node_config(json.load(f))
+    except OSError as e:
+        why = "unreadable (%s)" % e
+    except ValueError as e:
+        why = "not valid JSON (%s)" % e
+    else:
+        why = None
+    print("WARNING: node identity %s is %s -- falling back to the "
+          "virp-lab battery, which is wrong on any other node. Install "
+          "one with: sudo make install-autopilot-node NODE=<name>"
+          % (path, why), file=sys.stderr)
+    return merge_node_config(None)
 
 
 def build_battery(cfg):
@@ -177,14 +213,30 @@ def build_battery(cfg):
     frr = cfg.get("frr_nodes") or []
     battery = (
         [(n, 'vtysh -c "show ip ospf neighbor"', "frr_neighbors") for n in frr] +
-        [(n, 'vtysh -c "show ip route ospf"',    "frr_routes")    for n in frr] +
-        [
-            (WAZUH_DEV,    "GET /agents/summary/status",   "wazuh_summary"),
-            (WAZUH_DEV,    "GET /manager/stats/analysisd", "wazuh_alerts"),
-            (LIBRENMS_DEV, "GET /api/v0/devices",          "librenms_devices"),
-            (LIBRENMS_DEV, "GET /api/v0/alerts?state=1",   "librenms_alerts"),
-        ]
+        [(n, 'vtysh -c "show ip route ospf"',    "frr_routes")    for n in frr]
     )
+
+    # Wazuh and LibreNMS are gated on config exactly like PBS and peer
+    # below. They used to be module constants spliced in unconditionally,
+    # which is why a CORRECT autopilot-node.json still could not stop
+    # virp-onode-home probing `wazuh-lab` and `librenms-lab` — devices
+    # that exist only in the colo. Config alone could remove the FRR rows
+    # and nothing else, so the home node was unfixable without this.
+    # A node observes what its identity says it observes, and nothing
+    # else. Absent key -> the virp-lab default, so the colo is unchanged.
+    wazuh_dev = cfg.get("wazuh_device", WAZUH_DEV)
+    if wazuh_dev:
+        battery += [
+            (wazuh_dev, "GET /agents/summary/status",   "wazuh_summary"),
+            (wazuh_dev, "GET /manager/stats/analysisd", "wazuh_alerts"),
+        ]
+
+    librenms_dev = cfg.get("librenms_device", LIBRENMS_DEV)
+    if librenms_dev:
+        battery += [
+            (librenms_dev, "GET /api/v0/devices",        "librenms_devices"),
+            (librenms_dev, "GET /api/v0/alerts?state=1", "librenms_alerts"),
+        ]
     # PBS typed operations. The command is a canonical typed op, not a
     # path — see docs/DRIVER-TYPED-OPS.md. The datastore name comes from
     # node config rather than a literal, because it is also constrained
@@ -532,19 +584,37 @@ def eval_librenms_count(payload, key):
     return doc.get("count")
 
 
-def evaluate_baselines(results):
-    """results: {kind: [payloads]} → list of deviation dicts. Pure."""
+def evaluate_baselines(results, baselines=None):
+    """results: {kind: [payloads]} → list of deviation dicts. Pure.
+
+    `baselines` defaults to the module BASELINES, so virp-lab is
+    bit-for-bit unaffected. A node may pass a narrower set, and a check
+    whose key is ABSENT is not evaluated at all.
+
+    That is deliberate, and it is the same rule the FRR guard below
+    already followed. virp-onode-home ships an empty set because its
+    Wazuh agent count has never been agreed; inheriting the colo's 5
+    active / 6 total would alert every cycle against a number nobody
+    chose — the mirror of the mistake this file already warns about for
+    LibreNMS availability ("decide the intent before adding it").
+
+    Structural findings are NOT baseline comparisons and survive an
+    empty set: an unreadable credential or an unparseable body is a fact
+    about this node, not a disagreement with a figure.
+    """
+    if baselines is None:
+        baselines = BASELINES
     deviations = []
 
     # FRR adjacencies are only a baseline for nodes that actually observe
     # the ring. An agentless node with no FRR devices must not be told it
     # is missing 8 adjacencies it was never asked to watch.
-    if results.get("frr_neighbors"):
+    if results.get("frr_neighbors") and "frr_full_adjacencies" in baselines:
         full = sum(count_full_adjacencies(p)
                    for p in results["frr_neighbors"])
-        if full != BASELINES["frr_full_adjacencies"]:
+        if full != baselines["frr_full_adjacencies"]:
             deviations.append({"check": "frr_full_adjacencies",
-                               "expected": BASELINES["frr_full_adjacencies"],
+                               "expected": baselines["frr_full_adjacencies"],
                                "observed": full})
 
     for p in results.get("frr_routes", []):
@@ -565,13 +635,15 @@ def evaluate_baselines(results):
         else:
             # Either direction is reportable — the disconnected agent is
             # unexplained, so a silent "recovery" matters too.
-            if active != BASELINES["wazuh_active"]:
+            if "wazuh_active" in baselines and \
+                    active != baselines["wazuh_active"]:
                 deviations.append({"check": "wazuh_active_agents",
-                                   "expected": BASELINES["wazuh_active"],
+                                   "expected": baselines["wazuh_active"],
                                    "observed": active})
-            if total != BASELINES["wazuh_total"]:
+            if "wazuh_total" in baselines and \
+                    total != baselines["wazuh_total"]:
                 deviations.append({"check": "wazuh_total_agents",
-                                   "expected": BASELINES["wazuh_total"],
+                                   "expected": baselines["wazuh_total"],
                                    "observed": total})
 
     for p in results.get("wazuh_alerts", []):
@@ -582,10 +654,12 @@ def evaluate_baselines(results):
                                "observed": detail})
 
     for p in results.get("librenms_devices", []):
+        if "librenms_devices" not in baselines:
+            continue
         n = eval_librenms_count(p, "devices")
-        if n != BASELINES["librenms_devices"]:
+        if n != baselines["librenms_devices"]:
             deviations.append({"check": "librenms_devices",
-                               "expected": BASELINES["librenms_devices"],
+                               "expected": baselines["librenms_devices"],
                                "observed": n})
 
     for p in results.get("librenms_alerts", []):
@@ -652,9 +726,18 @@ def run_cycle():
                         "payload_head": obs["payload"][:200]})
             alerts += 1
 
-        results.setdefault(kind, []).append(obs["payload"])
+        # Only a verified GREEN DEVICE_OUTPUT is an observation. Error
+        # payloads used to land here too, so evaluate_baselines saw a
+        # non-empty list and reported `frr_full_adjacencies expected 8
+        # observed 0` — a deviation measured from text that was never a
+        # measurement ("ERROR: device 'clab-frr-ospf-frr1' not found").
+        # The failure is already alerted above; counting it again as a
+        # baseline deviation reports one fault twice and invents an
+        # observation that was never made.
+        if ok:
+            results.setdefault(kind, []).append(obs["payload"])
 
-    for dev in evaluate_baselines(results):
+    for dev in evaluate_baselines(results, NODE.get("baselines")):
         emit_alert("baseline_deviation", dev)
         alerts += 1
 
