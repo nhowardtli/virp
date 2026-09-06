@@ -1690,8 +1690,37 @@ install-units: check-deploy-unit-source
 VIRP_DEVICES_TEMPLATE_SRC = deploy/devices.template.json
 VIRP_DEVICES_TEMPLATE_DST = /etc/virp/devices.template.json
 
+# Captured BEFORE the target runs: `command line` iff the operator passed
+# VIRP_DEVICES_TEMPLATE_SRC=... explicitly. The default above is the COLO
+# fleet, so on any other node a bare `make install-devices-template`
+# installs 43 devices that node does not have and drops the ones it does.
+# See the node guard in the target.
+VIRP_TEMPLATE_SRC_ORIGIN := $(origin VIRP_DEVICES_TEMPLATE_SRC)
+
 .PHONY: install-devices-template
 install-devices-template:
+	@# NODE GUARD. VIRP_DEVICES_TEMPLATE_SRC defaults to the COLO
+	@# template (deploy/devices.template.json). That default is correct
+	@# on virp-lab and WRONG everywhere else -- on virp-onode-home it
+	@# would install the colo fleet over the home fleet, and because the
+	@# home node's autopilot.env defines none of the colo placeholders,
+	@# render-devices.sh would then FATAL and the daemon would refuse to
+	@# start across every governed device. It also silently drops the
+	@# home node's uid policy for 992 (virp-tacacs) and 993
+	@# (virp-netclaw), which boots fine and quietly breaks accounting.
+	@# So: off virp-lab, the source must be named explicitly.
+	@if [ "$$(hostname -s)" != "virp-lab" ] && \
+	    [ "$(VIRP_TEMPLATE_SRC_ORIGIN)" != "command line" ]; then \
+	    echo "FAIL: this is $$(hostname -s), not virp-lab, and"; \
+	    echo "      VIRP_DEVICES_TEMPLATE_SRC was not set explicitly."; \
+	    echo "      The default is the COLO template and would install"; \
+	    echo "      the wrong fleet. Name the template you mean:"; \
+	    echo ""; \
+	    echo "        make install-devices-template \\"; \
+	    echo "            VIRP_DEVICES_TEMPLATE_SRC=deploy/devices.home.template.json"; \
+	    echo ""; \
+	    exit 1; \
+	fi
 	@test -f $(VIRP_DEVICES_TEMPLATE_SRC) || \
 	    { echo "FAIL: $(VIRP_DEVICES_TEMPLATE_SRC) missing"; exit 1; }
 	@scripts/require-clean-tree.sh "refusing to install a template"

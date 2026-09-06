@@ -2769,3 +2769,104 @@ deploy deliberately did not touch the daemon.
   else — `pve-lab` and `fortigate-home` are reachable and unprobed. That
   is scope, held out of this fix on purpose; see
   `feat/autopilot-home-battery`.
+
+## 2026-09-06 UTC — LAB-SWITCH-1 credential moves to virp-ro; the home template catches up with production
+
+- **Node**: `virp-onode-home` (313, 10.0.0.13)
+- **Branch**: `feat/2960-governed` — pushed, **NOT merged**
+- **This stanza corrects a wrong assumption made earlier the same day.**
+  LAB-SWITCH-1 was *not* being added. It has been governed on 313 since
+  **2026-09-05**, and the live `/etc/virp/devices.template.json` already
+  carried it, already with `ssh_legacy: true`.
+
+### What was actually wrong: the tracked template was BEHIND production
+
+`deploy/devices.home.template.json` had drifted 32 lines behind the file
+running on 313. The tracked copy was missing, in full:
+
+| missing from the repo | what it is |
+|---|---|
+| `992` in `socket_allowed_uids`, `socket_uid_action_allow` (`chain_append`), `socket_uid_chain_append_types` (`evidence_item`), `socket_uid_tier_ceilings` | `virp-tacacs`, the TACACS+ accounting receiver |
+| `${VIRP_NETCLAW_UID}` (993) in `socket_allowed_uids`, `socket_uid_action_allow` (4 verbs), `socket_uid_tier_ceilings` | `virp-netclaw`, the remote requester |
+| `_socket_uid_992_note`, `_socket_uid_993_note` | why each exists |
+| the `LAB-SWITCH-1` device row | the 2960 |
+
+**Installing the tracked template would have deleted all of it.** Not
+loudly: the tracked file is internally consistent, so the daemon would
+have booted clean and the receiver (uid 992) would simply have lost
+socket access, failing its `chain_append` and dropping accounting
+evidence on the floor. The boot invariant that refuses to start on a
+`chain_append` uid with no append-type entry would **not** have fired,
+because the uid would have been absent entirely rather than
+half-configured. A quiet regression, found by diffing before installing
+rather than by restarting and watching.
+
+The repo now matches production byte-for-byte apart from the one
+intended change below.
+
+### The intended change: one line
+
+`LAB-SWITCH-1` moves from `aiops-svc` / `${SWITCH_PASS}` to `virp-ro` /
+`${VIRP_LABSWITCH1_PASSWORD}`. Every gate read of this switch is now
+authenticated *and* per-command authorized by tac_plus-ng on CT 215, so
+one command is described by three records: a gate observation here, an
+accounting receipt here, and an authorization decision there.
+
+**Fail-closed is the design, not a side effect.** If CT 215 is
+unreachable the gate cannot read this switch at all. Per
+`docs/TACACS-ACCOUNTING.md` §9.1 gate identities have no local fallback;
+humans reach the box by console, which is exempt. `virp-ro` is priv 1,
+below `aiops-svc`'s priv 15, and the GREEN table needs nothing above
+priv 1.
+
+### `ssh_legacy: true` is a property of the switch, not a choice
+
+Independently re-measured from 313 on 2026-09-06, agreeing with the
+2026-09-05 probe already recorded in the device row's comment:
+
+| | the 2960 offers |
+|---|---|
+| kex algorithms | `diffie-hellman-group1-sha1` — **the entire list** |
+| host key algorithms | `ssh-rsa` — only |
+| ciphers | `aes128-cbc,3des-cbc,aes192-cbc,aes256-cbc` — CBC only |
+| host key | 2048-bit RSA, `SHA256:yw+0ee+J1JH3UWqKPql0AJ9l00YKvRJFR6J7GL3K5nU` |
+
+`CISCO_KEX_DEFAULT` (`src/drivers/driver_cisco.c:158`) does not contain
+`group1-sha1`; only `CISCO_KEX_LEGACY` (:167) does. Without the flag
+there is zero kex overlap and the handshake fails outright — it does not
+degrade or fall back. **`diffie-hellman-group14-sha1` is irrelevant**:
+it is in the default list, it is tempting to read as covering "legacy
+IOS", and this switch never offers it.
+
+`ssh-keyscan` **cannot** pin this host key — it has no `-o` and will not
+negotiate `group1-sha1`, returning rc=1, zero keys, and only the
+`SSH-2.0-Cisco-1.25` banner. The pin comes from `ssh` with
+`KexAlgorithms`, `HostKeyAlgorithms` and `Ciphers` forced.
+
+### SW-3850 must NOT inherit this flag
+
+`SW-3850` (cat3850-lab, 10.0.10.2) is a different switch on a different
+node, and `deploy/devices.template.json` already records that its
+*default* algorithm set negotiates: `diffie-hellman-group14-sha1`,
+hostkey `ssh-rsa`, cipher `aes256-ctr`. Copying `ssh_legacy: true` onto
+it would offer `group1-sha1` to a device that never needed it. **The
+flag is per-device precisely so it cannot spread by symmetry.**
+
+### `${SWITCH_PASS}` split
+
+That placeholder meant cat3850-lab on the colo node *and*, from
+2026-09-05 to 2026-09-06, LAB-SWITCH-1 on this one — one name standing
+for two credentials on two switches on two nodes. That is how a secret
+reaches the wrong box and how a rotation misses half its targets. It
+keeps its colo meaning; this node's template no longer names it. It
+remains defined in 313's `autopilot.env`, unreferenced, because dropping
+a live credential is a separate and deliberate act.
+
+### `make install-devices-template` node guard
+
+`VIRP_DEVICES_TEMPLATE_SRC` defaults to the **colo** template. A bare
+`make install-devices-template` on 313 would install the wrong fleet,
+and since the home node defines none of the colo placeholders,
+`render-devices.sh` would FATAL and the daemon would refuse to start
+across every governed device. The target now refuses to run off
+`virp-lab` unless the source is named explicitly.
