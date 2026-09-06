@@ -1121,6 +1121,14 @@ test-tacacs-operator:
 	@echo "=== TACACS+ operator vs gate authorization (live server) ==="
 	python3 tests/test_tacacs_operator_policy.py
 
+# Decision submitter. Pure python against fixtures; the one signing test
+# skips when `cryptography` is absent rather than erroring, so a checkout
+# without it reports honestly instead of red.
+.PHONY: test-tacacs-submit
+test-tacacs-submit:
+	@echo "=== TACACS+ decision submitter (parsing + refusal tagging) ==="
+	python3 tests/test_tacacs_submit.py
+
 # Sep 1 review, Task 2: the SHIPPED templates, rendered by the real
 # render-devices.sh into a sandbox, must give every allowed uid an
 # explicit socket_uid_action_allow entry (the daemon refuses to start
