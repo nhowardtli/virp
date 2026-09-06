@@ -570,6 +570,13 @@ typedef enum {
      * treat this as a PRE-EXECUTION failure: it consumes nothing. */
     VIRP_ERR_TRANSPORT_WRITE          = -54,
 
+    /* The peer closed the channel (defect B, 2026-09-05). A narrower
+     * case of VIRP_ERR_TRANSPORT_WRITE: the session is gone rather than
+     * merely unwell, so ONE reconnect-and-retry is the correct response
+     * (defect C). Nothing was dispatched — same pre-execution contract
+     * as VIRP_ERR_TRANSPORT_WRITE: it consumes no approval. */
+    VIRP_ERR_TRANSPORT_CLOSED         = -55,
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency

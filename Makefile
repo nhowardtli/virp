@@ -536,6 +536,7 @@ test-linux-black: $(TEST_LINUX_BLACK)
 # pre-existing *_black tests checked.
 TEST_ASA_REFUSAL  = $(BUILD_DIR)/test_driver_asa_refusal
 TEST_CISCO_REFUSAL = $(BUILD_DIR)/test_driver_cisco_refusal
+TEST_CISCO_IO     = $(BUILD_DIR)/test_driver_cisco_io
 TEST_JUNIPER_REFUSAL = $(BUILD_DIR)/test_driver_juniper_refusal
 TEST_FG_REFUSAL   = $(BUILD_DIR)/test_driver_fortigate_refusal
 TEST_PANOS_REFUSAL = $(BUILD_DIR)/test_driver_panos_refusal
@@ -550,6 +551,19 @@ $(TEST_ASA_REFUSAL): tests/test_driver_asa_refusal.c tests/refusal_contract.h $(
 	  false; }
 	rm -f $@
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+$(TEST_CISCO_IO): tests/test_driver_cisco_io.c $(LIB)
+	@ar t $(LIB) 2>/dev/null | grep -q '^virp_ssh_hostkey.o$$' || { \
+	  echo "ERROR: $@ needs virp_ssh_hostkey.o (virp_ssh_verify_hostkey) in"; \
+	  echo "       $(LIB), which is only built when an SSH driver flag is set"; \
+	  echo "       (CISCO/FORTIGATE/PANOS/ASA/JUNIPER/LINUX). Run e.g."; \
+	  echo "       'make CISCO=1 $@'."; \
+	  false; }
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+
+test-cisco-io: $(TEST_CISCO_IO)
+	./$(TEST_CISCO_IO)
 
 $(TEST_CISCO_REFUSAL): tests/test_driver_cisco_refusal.c tests/refusal_contract.h $(LIB)
 	@ar t $(LIB) 2>/dev/null | grep -q '^virp_ssh_hostkey.o$$' || { \
@@ -1333,9 +1347,9 @@ DRIVER_BUILD_DIR = build-drivers
 
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, zammad-gate, typed-hash, ingress-nul, pbs-trunc) ==="
+	@echo "=== driver test suites (cisco, cisco-io, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, zammad-gate, typed-hash, ingress-nul, pbs-trunc) ==="
 	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 ZAMMAD=1 \
-	        test-cisco test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms \
+	        test-cisco test-cisco-io test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms \
 	        test-pbs test-pbs-gate test-zammad-gate test-typed-hash test-ingress-nul test-pbs-trunc
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.

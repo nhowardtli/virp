@@ -1086,6 +1086,7 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_DUPLICATE_MISMATCH: return "Federation artifact_id reused with different body bytes";
     case VIRP_ERR_EVIDENCE_UNAVAILABLE: return "Evidence unavailable: pre-execution record could not be made durable; operation refused";
     case VIRP_ERR_TRANSPORT_WRITE:   return "Transport write failed: the device channel would not accept bytes (peer closed, reset, or session idled out) - nothing was dispatched";
+    case VIRP_ERR_TRANSPORT_CLOSED:  return "Transport closed: the device closed the session (idle timeout or reset) - nothing was dispatched; one reconnect is warranted";
     default:                         return "Unknown error";
     }
 }

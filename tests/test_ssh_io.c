@@ -752,6 +752,39 @@ TEST(test_write_failure_reports_transport_not_crypto)
           (int)VIRP_ERR_TRANSPORT_WRITE, (int)rc);
 }
 
+
+/*
+ * Defect B, second half: the adapter's CLOSED classification must reach
+ * the caller as its own error, not be flattened back into the generic
+ * write failure. Defect C's reconnect decision is made on this value —
+ * if a closed peer and a broken one arrive as the same code, the driver
+ * either retries everything or retries nothing.
+ */
+TEST(test_peer_closed_write_reports_transport_closed)
+{
+    mock_pty_t m;
+    mock_init(&m, "", 32);
+    m.write_fail = VIRP_SSH_IO_CLOSED;   /* adapter says: the peer is gone */
+    virp_ssh_io_t io = { .ctx = &m, .read = mock_read, .write = mock_write };
+
+    virp_ssh_prompt_t pr;
+    memset(&pr, 0, sizeof(pr));
+    snprintf(pr.prompt, sizeof(pr.prompt), "SW-3850#");
+    pr.prompt_len = strlen(pr.prompt);
+    pr.learned = true;
+
+    char buf[256];
+    size_t out_len = 0;
+    virp_error_t rc = virp_ssh_exec(&io, &pr, "show clock",
+                                    buf, sizeof(buf), &out_len,
+                                    1000, "SW-3850");
+
+    CHECK(rc == VIRP_ERR_TRANSPORT_CLOSED,
+          "a peer-closed write must report VIRP_ERR_TRANSPORT_CLOSED (%d), "
+          "got %d - a reconnectable failure is indistinguishable from a "
+          "permanent one", (int)VIRP_ERR_TRANSPORT_CLOSED, (int)rc);
+}
+
 int main(void)
 {
     printf("\n=== VIRP Shared SSH Read Path Tests (finding N1 / 2a) ===\n\n");
@@ -775,6 +808,7 @@ int main(void)
 
     printf("\n--- Transport error typing (defect A) ---\n");
     RUN_TEST(test_write_failure_reports_transport_not_crypto);
+    RUN_TEST(test_peer_closed_write_reports_transport_closed);
 
     printf("\n--- Scrubbing and drain accounting ---\n");
     RUN_TEST(test_strip_echo_matches_command_text);

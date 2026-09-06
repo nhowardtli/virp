@@ -418,13 +418,19 @@ virp_error_t virp_ssh_exec(const virp_ssh_io_t *io,
     line[cmd_len] = '\n';
     line[cmd_len + 1] = '\0';
 
-    if (io->write(io->ctx, line, cmd_len + 1) < 0)
-        /* Defect A: the channel would not take the bytes. That is a
-         * transport fact, not a crypto one — VIRP_ERR_CRYPTO here sent
-         * readers after a key problem for a session that had simply
-         * idled out. Nothing was dispatched, so callers may treat this
-         * as a pre-execution failure. */
-        return VIRP_ERR_TRANSPORT_WRITE;
+    /* Defect A: the channel would not take the bytes. That is a
+     * transport fact, not a crypto one — VIRP_ERR_CRYPTO here sent
+     * readers after a key problem for a session that had simply idled
+     * out. Nothing was dispatched, so callers may treat either code
+     * below as a pre-execution failure that consumes no approval.
+     *
+     * Defect B: an adapter that could tell the peer had CLOSED says so
+     * (VIRP_SSH_IO_CLOSED), and that distinction must survive to the
+     * caller — it is what defect C reconnects on. */
+    ssize_t wrote = io->write(io->ctx, line, cmd_len + 1);
+    if (wrote < 0)
+        return (wrote == VIRP_SSH_IO_CLOSED) ? VIRP_ERR_TRANSPORT_CLOSED
+                                             : VIRP_ERR_TRANSPORT_WRITE;
 
     return virp_ssh_read_until_prompt(io, prompt, buf, buf_len, out_len,
                                       timeout_ms, device_label);

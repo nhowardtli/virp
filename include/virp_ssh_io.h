@@ -84,6 +84,20 @@
  */
 #define VIRP_SSH_IO_EOF        0
 #define VIRP_SSH_IO_EAGAIN   (-2)
+/*
+ * Defect B (2026-09-05). An adapter that hits a hard error classifies it
+ * into THIS space and never returns its native code: libssh2's EAGAIN is
+ * -37 while ours is -2, and libssh2's -2 is a banner error, so a raw
+ * return would make a banner failure read as "retry forever". Adapters
+ * preserve the native code out-of-band (see cisco_io_write_error).
+ *
+ *   VIRP_SSH_IO_CLOSED   the peer is gone - channel closed, EOF sent,
+ *                        socket disconnected. A reconnect is the correct
+ *                        response; this is what defect C retries on.
+ *   VIRP_SSH_IO_ERROR    a hard error that reconnecting will not fix.
+ */
+#define VIRP_SSH_IO_CLOSED   (-3)
+#define VIRP_SSH_IO_ERROR    (-1)
 
 typedef struct {
     void *ctx;
