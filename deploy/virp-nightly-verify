@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""virp-nightly-verify — snapshot the chain, export yesterday's camera
+sessions, verify them with the examiner-pinned keys, and append the
+verdict to /var/lib/virp/nightly-verify.log.
+
+Runs on the O-node host as `virp`. The verifier is the RELEASED examiner
+binary — the same judge an outside examiner downloads — so this log
+cannot reach a different verdict than they would. The snapshot goes
+through SQLite's backup API, which is WAL-consistent; the exporter is
+then pointed at the snapshot only (it refuses a live WAL by design).
+
+Alert contract, greppable: any line beginning NIGHTLY-ALERT. Written
+for a verdict other than CRYPTOGRAPHICALLY-VERIFIED, a capture grade
+other than CONTINUOUS or INTERRUPTED / ACCOUNTED, an export/verify that
+would not run, and a day with no camera sessions at all (three cameras
+run continuously; silence is itself an anomaly).
+
+Snapshots and bundles are DERIVED artifacts, re-derivable from the
+chain at any time; they are kept KEEP_DAYS and then deleted, and that
+deletion needs no camera_retention record — nothing evidentiary is lost.
+"""
+
+import datetime
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+
+DB = "/var/lib/virp/chain.db"
+WORK = "/var/lib/virp/nightly"
+LOG = "/var/lib/virp/nightly-verify.log"
+PINS = "/etc/virp/nightly-pins"
+EXPORTER = "/usr/local/lib/virp/export_bundle.py"
+VERIFIER = "/usr/local/bin/virp-verify"
+REF_DIRS = ("/var/lib/virp/camera/artifacts", "/var/spool/virp-capture/done")
+WITNESS_URL = "https://witness.virp.systems"
+RECEIPTS = "/var/lib/virp/witness/heads"
+KEEP_DAYS = 14
+OK_VERDICT = "CRYPTOGRAPHICALLY-VERIFIED"
+OK_COVERAGE = ("CONTINUOUS", "INTERRUPTED / ACCOUNTED")
+
+
+def log_lines(lines):
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    with open(LOG, "a") as f:
+        for line in lines:
+            f.write("%s %s\n" % (stamp, line))
+
+
+def alert(day, what):
+    log_lines(["NIGHTLY-ALERT day=%s %s" % (day, what)])
+
+
+def prune():
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(days=KEEP_DAYS))
+    pat = re.compile(r"^(snap|bundle)-(\d{4}-\d{2}-\d{2})(\.db)?$")
+    for n in os.listdir(WORK):
+        m = pat.match(n)
+        if not m:
+            continue
+        if m.group(2) >= cutoff.strftime("%Y-%m-%d"):
+            continue
+        p = os.path.join(WORK, n)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            os.unlink(p)
+
+
+def main():
+    day = (datetime.datetime.now(datetime.timezone.utc)
+           - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    os.makedirs(WORK, mode=0o750, exist_ok=True)
+
+    snap = os.path.join(WORK, "snap-%s.db" % day)
+    if os.path.exists(snap):
+        os.unlink(snap)                      # a rerun replaces its own day
+    src = sqlite3.connect("file:%s?mode=ro" % DB, uri=True)
+    dst = sqlite3.connect(snap)
+    src.backup(dst)
+    dst.close()
+    src.close()
+
+    ro = sqlite3.connect("file:%s?mode=ro" % snap, uri=True)
+    sessions = [r[0] for r in ro.execute(
+        "SELECT DISTINCT session_id FROM chain_entries WHERE "
+        "session_id LIKE ? OR session_id LIKE ? ORDER BY session_id",
+        ("camera:%%:%s" % day, "camera-retention:%%:%s" % day))]
+    ro.close()
+    if not sessions:
+        alert(day, "no camera sessions dated %s — three cameras should "
+                   "be running continuously" % day)
+        prune()
+        return 0
+
+    bundle = os.path.join(WORK, "bundle-%s" % day)
+    if os.path.exists(bundle):
+        shutil.rmtree(bundle)
+    cmd = [sys.executable, EXPORTER, "--db", snap, "--out", bundle,
+           "--sessions"] + sessions + ["--artifacts"]
+    for d in REF_DIRS:
+        cmd += ["--referenced-artifacts", d]
+    cmd += ["--witness", WITNESS_URL, "--witness-receipts", RECEIPTS]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        alert(day, "EXPORT-FAILED rc=%d: %s"
+              % (p.returncode, (p.stderr or p.stdout).strip()[-400:]))
+        return 1
+
+    vcmd = [VERIFIER]
+    for n in sorted(os.listdir(PINS)):
+        path = os.path.join(PINS, n)
+        if n.startswith("pin-"):
+            vcmd += ["--pin", path]
+        elif n.startswith("producer-"):
+            vcmd += ["--producer-key", path]
+        elif n.startswith("witness-"):
+            vcmd += ["--witness-key", path]
+    vcmd.append(bundle)
+    v = subprocess.run(vcmd, capture_output=True, text=True)
+    out = v.stdout.splitlines()
+
+    keep = []
+    if out:
+        keep.append(out[0])                  # the version line
+    session_of = None
+    for line in out:
+        m = re.match(r"^session (\S+)", line)
+        if m:
+            session_of = m.group(1)
+        s = line.strip()
+        if (s.startswith("verdict:")
+                or s.startswith("capture_completeness")
+                or s.startswith("witness ")
+                or s.startswith("witness_trust")):
+            keep.append("session=%s %s" % (session_of, s))
+    keep.append("exit=%d bundle=%s sessions=%d"
+                % (v.returncode, os.path.basename(bundle), len(sessions)))
+    log_lines(keep)
+
+    session_of = None
+    for line in out:
+        m = re.match(r"^session (\S+)", line)
+        if m:
+            session_of = m.group(1)
+        s = line.strip()
+        m = re.match(r"^verdict:\s+(.*)$", s)
+        if m and m.group(1).strip() != OK_VERDICT:
+            alert(day, "session=%s verdict=%s"
+                  % (session_of, m.group(1).strip()))
+        m = re.match(r"^capture_completeness\s+(\S.*?)(?:\s{2,}|$)", s)
+        if m:
+            grade = m.group(1).strip()
+            if grade not in OK_COVERAGE:
+                alert(day, "session=%s capture=%s" % (session_of, grade))
+    if v.returncode != 0:
+        alert(day, "verifier exit=%d" % v.returncode)
+
+    prune()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

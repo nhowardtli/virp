@@ -96,6 +96,41 @@ deploy/virp-onode-home.dropin.conf /etc/systemd/system/virp-onode.service.d/40-h
 deploy/virp-deployed-state.service /etc/systemd/system/virp-deployed-state.service
 deploy/virp-deployed-state.timer /etc/systemd/system/virp-deployed-state.timer
 
+# ── virp-onode-home subsystems, tracked 2026-09-06 ────────────────────
+# Nine units that ran on 313 while no commit named them. They were built
+# on the box after 2026-08-23; check-unit-drift reported them untracked
+# every run and the report was not acted on. Each tracked file here was
+# copied FROM the running host byte for byte, so listing them changes
+# nothing about what runs — it makes what runs reviewable.
+#
+# The camera pair. Both exec /usr/local/lib/virp-camera/virp_camera.py,
+# whose tracked source is camera/virp_camera.py (already current; the
+# retention subcommand the timer calls landed in 1ef5fd9).
+deploy/virp-camera-submit.service /etc/systemd/system/virp-camera-submit.service
+deploy/virp-spool-retention.service /etc/systemd/system/virp-spool-retention.service
+deploy/virp-spool-retention.timer /etc/systemd/system/virp-spool-retention.timer
+
+# Nightly verify. Runs the RELEASED examiner against a WAL-consistent
+# snapshot, so its verdict is the one an outside examiner would reach.
+deploy/virp-nightly-verify.service /etc/systemd/system/virp-nightly-verify.service
+deploy/virp-nightly-verify.timer /etc/systemd/system/virp-nightly-verify.timer
+
+# Witness submission and the SSH tunnel that carries it. The tunnel's
+# key and pinned known_hosts stay on the box under /var/lib/virp/witness
+# — referenced by path, never tracked.
+deploy/virp-witness-submit.service /etc/systemd/system/virp-witness-submit.service
+deploy/virp-witness-submit.timer /etc/systemd/system/virp-witness-submit.timer
+deploy/virp-witness-tunnel.service /etc/systemd/system/virp-witness-tunnel.service
+
+# TACACS+ accounting receiver — LIVE, the 2960 accounts into it. The unit
+# was ALREADY tracked at deploy/tacacs/virp-tacacs.service and is
+# byte-identical to the installed copy; it was only ever missing from
+# this manifest, which is why the checker called it untracked. Its
+# runtime config (/etc/virp/tacacs/recv.json and the key material beside
+# it) is deliberately NOT tracked and NOT rendered from this repo — see
+# DEPLOYED.md, "TACACS receiver config is box-only".
+deploy/tacacs/virp-tacacs.service /etc/systemd/system/virp-tacacs.service
+
 # ── autopilot alert-sink rotation ─────────────────────────────────────
 # Not a systemd unit, listed for the reason the netclaw ruleset above is:
 # the thing that must not drift is the RULE. A rotation policy edited on

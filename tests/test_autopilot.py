@@ -625,6 +625,91 @@ class TestShippedNodeTemplates(unittest.TestCase):
                                  % name)
 
 
+class TestCameraRuntimeCoversWhatTheTimersCall(unittest.TestCase):
+    """virp-spool-retention.service execs
+
+        virp_camera.py retention --tier spool --days 14 ...
+
+    every night at 02:30 UTC, and virp-camera-submit.service execs
+    `submit-spool` continuously.
+
+    On 2026-09-06 the checkout on 313 was three commits behind and its
+    camera/virp_camera.py defined no run_retention at all. Installing
+    that tracked file over the running one would have broken retention
+    silently — the timer would have exited non-zero into a log nobody
+    reads, and the 14-day declare-then-delete would simply stop, which
+    looks identical to "nothing was old enough to delete".
+
+    The tracked runtime must not fall below what an installed unit
+    invokes. Checked against the SOURCE TEXT rather than by importing:
+    the module is 200 KB and pulls in camera dependencies that need not
+    exist on a build host, and the question here is only what the file
+    defines and dispatches.
+
+    Assertions deliberately use assertTrue with a short message — an
+    assertIn against this file embeds 200 KB of source in the failure.
+    """
+
+    CAMERA_PY = os.path.join(REPO_ROOT, "camera", "virp_camera.py")
+
+    # Subcommand exactly as spelled in the unit's ExecStart.
+    TIMER_SUBCOMMANDS = ("retention", "submit-spool")
+
+    def source(self):
+        self.assertTrue(os.path.exists(self.CAMERA_PY),
+                        "camera/virp_camera.py must be tracked")
+        with open(self.CAMERA_PY) as f:
+            return f.read()
+
+    def test_run_retention_is_defined(self):
+        """The specific regression: the tracked copy had no run_retention
+        while the timer called it."""
+        self.assertTrue("def run_retention(" in self.source(),
+                        "camera/virp_camera.py defines no run_retention(), "
+                        "but virp-spool-retention.service execs "
+                        "`virp_camera.py retention`")
+
+    def test_every_timer_subcommand_is_registered_and_dispatched(self):
+        text = self.source()
+        for sub in self.TIMER_SUBCOMMANDS:
+            self.assertTrue('add_parser("%s"' % sub in text,
+                            "subcommand %r is execed by a unit but is not "
+                            "registered with add_parser in the tracked "
+                            "runtime" % sub)
+            self.assertTrue('args.cmd == "%s"' % sub in text,
+                            "subcommand %r is execed by a unit but nothing "
+                            "dispatches it in the tracked runtime" % sub)
+
+    def test_units_exec_the_camera_runtime_at_its_installed_path(self):
+        """The units name an absolute path. If camera/virp_camera.py ever
+        stops installing there, this is what notices."""
+        deploy = os.path.join(REPO_ROOT, "deploy")
+        for unit in ("virp-camera-submit.service",
+                     "virp-spool-retention.service"):
+            p = os.path.join(deploy, unit)
+            self.assertTrue(os.path.exists(p), "%s must be tracked" % unit)
+            with open(p) as f:
+                body = f.read()
+            self.assertTrue(
+                "/usr/local/lib/virp-camera/virp_camera.py" in body,
+                "%s must exec the camera runtime at its installed path"
+                % unit)
+
+    def test_each_unit_uses_the_subcommand_this_test_pins(self):
+        """Keeps TIMER_SUBCOMMANDS honest: if a unit's ExecStart changes
+        to a subcommand this test does not know about, say so here rather
+        than quietly checking the wrong two."""
+        deploy = os.path.join(REPO_ROOT, "deploy")
+        for unit, sub in (("virp-camera-submit.service", "submit-spool"),
+                          ("virp-spool-retention.service", "retention")):
+            with open(os.path.join(deploy, unit)) as f:
+                body = f.read()
+            self.assertTrue(sub in body,
+                            "%s no longer execs %r — update "
+                            "TIMER_SUBCOMMANDS" % (unit, sub))
+            self.assertIn(sub, self.TIMER_SUBCOMMANDS)
+
+
 class TestTemplateExclusions(unittest.TestCase):
     """Mirror of the C-side boundary scan (virp_config_blocked_address):
     the shipped device template must never carry 10.0.10.1 / 10.0.10.10,

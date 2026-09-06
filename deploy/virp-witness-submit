@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Submit this node's VIRP chain heads to the witness.
+
+This is the SHIM described in INTEGRATION.md, not the daemon integration. It
+deliberately lives outside the daemon:
+
+  * it reads chain.db read-only and never writes to it;
+  * it cannot fail an append, because it is a separate timer — which is the
+    one property INTEGRATION.md insists on. Head signing in VIRP is
+    fail-closed on purpose, but a witness is a third party over a network, and
+    a chain that stopped appending because someone else's endpoint was down
+    would have made availability depend on the party it exists to not trust;
+  * its state is the receipt files themselves. A failed run leaves no receipt,
+    and the next run retries. Submission is idempotent at the witness, so a
+    retry after an ambiguous timeout returns the ORIGINAL receipt rather than
+    minting a second leaf.
+
+It signs with the node's own chain-signing key — the same key that signed the
+head — so the witness leaf's key_id matches the head's head_sig_key_id and a
+verifier can tie the two together.
+"""
+
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+CHAIN_DB = "/var/lib/virp/chain.db"
+KEY = "/etc/virp/keys/chain-sign.key"
+HEADS = "/var/lib/virp/witness/heads"
+WITNESS = os.environ.get("VIRP_WITNESS_URL", "http://127.0.0.1:8790")
+CLIENT = "/usr/local/bin/virp-witness-client"
+
+# Pace below the witness's per-key_id budget (60/min, burst 30) so a first run
+# over every session does not spend the burst and collect 429s.
+PACE_SECONDS = 1.2
+MAX_PER_RUN = 120
+
+HEAD_V = "VIRP-CHAIN-HEAD-v1"
+SAFE_SESSION = re.compile(r"^[A-Za-z0-9._:@+-]+$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def head_canonical(session_id, last_sequence, last_entry_hash):
+    """Byte-for-byte ~/virp/src/virp_chain.c:1113. No escaping, by design —
+    which is why session_id is charset-checked before it gets here."""
+    return (
+        '{"last_entry_hash":"%s","last_sequence":%d,"session_id":"%s","v":"%s"}'
+        % (last_entry_hash, last_sequence, session_id, HEAD_V)
+    )
+
+
+def main():
+    if not os.path.exists(CHAIN_DB):
+        print("virp-witness-submit: no chain at %s" % CHAIN_DB, file=sys.stderr)
+        return 1
+    os.makedirs(HEADS, mode=0o750, exist_ok=True)
+
+    conn = sqlite3.connect("file:%s?mode=ro" % CHAIN_DB, uri=True)
+    rows = list(
+        conn.execute(
+            "SELECT session_id, last_sequence, last_entry_hash "
+            "FROM chain_heads ORDER BY updated_at_ns DESC"
+        )
+    )
+    conn.close()
+
+    submitted = failed = skipped = 0
+    for session_id, last_sequence, last_entry_hash in rows:
+        if submitted + failed >= MAX_PER_RUN:
+            print("virp-witness-submit: hit MAX_PER_RUN, rest next cycle")
+            break
+
+        # The head canonical does no JSON escaping, so a session id carrying a
+        # quote or a backslash would produce bytes that are not the head the
+        # daemon hashed. Refuse rather than witness the wrong thing.
+        if not SAFE_SESSION.match(session_id or ""):
+            print("virp-witness-submit: SKIP unsafe session_id %r" % session_id, file=sys.stderr)
+            skipped += 1
+            continue
+        if not HEX64.match(last_entry_hash or ""):
+            print("virp-witness-submit: SKIP %s: last_entry_hash is not 64 hex" % session_id, file=sys.stderr)
+            skipped += 1
+            continue
+
+        safe = session_id.replace(":", "_").replace("/", "_")
+        head_path = os.path.join(HEADS, "%s-%d.head" % (safe, last_sequence))
+        receipt_path = head_path + ".witness.json"
+
+        # The receipt file IS the state. Present means this exact head was
+        # already witnessed; nothing to do.
+        if os.path.exists(receipt_path):
+            skipped += 1
+            continue
+
+        canonical = head_canonical(session_id, last_sequence, last_entry_hash)
+        tmp = head_path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(canonical)
+        os.replace(tmp, head_path)
+
+        result = subprocess.run(
+            [CLIENT, "submit", "--witness", WITNESS, "--head-file", head_path, "--key", KEY],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            submitted += 1
+            leaf = ""
+            for line in result.stdout.splitlines():
+                if "leaf_index" in line or "tree_size" in line:
+                    leaf += line.split()[-1] + " "
+            print("virp-witness-submit: %s seq %d -> leaf/tree %s" % (session_id, last_sequence, leaf.strip()))
+        else:
+            failed += 1
+            print(
+                "virp-witness-submit: FAILED %s seq %d: %s"
+                % (session_id, last_sequence, (result.stderr or result.stdout).strip().splitlines()[-1:]),
+                file=sys.stderr,
+            )
+            # A failure here is almost always the tunnel or the witness being
+            # down; there is no point hammering the rest of the sessions.
+            break
+
+        time.sleep(PACE_SECONDS)
+
+    print(
+        "virp-witness-submit: %d submitted, %d already witnessed, %d failed, %d sessions total"
+        % (submitted, skipped, failed, len(rows))
+    )
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1818,6 +1818,136 @@ install-wazuh-lab-dropin:
 	@echo "  DISABLED for this host on the next restart. Remove it with:"
 	@echo "    sudo rm $(VIRP_WAZUH_DROPIN_DST) && sudo systemctl daemon-reload"
 
+# =========================================================================
+# virp-onode-home subsystem units — tracked 2026-09-06.
+#
+# Nine units ran on 313 that no commit named: they were built on the box
+# after 2026-08-23 and never landed here. `make check-unit-drift` had
+# been reporting them as untracked, correctly, and nobody acted on it.
+# Same defect class as the autopilot node identity fixed the same day,
+# and as devices.template.json on 2026-08-09: an artifact that decides
+# what runs, with no install path.
+#
+# Every file below was copied FROM the running host, byte for byte. The
+# installed copy is the reviewed one by definition here — the repo is
+# catching up to the box, not the other way round — so installing any of
+# these targets on 313 today changes nothing. Each target proves that:
+# it compares first and installs only what differs, so a no-op prints
+# "no change" and never touches a live unit's mtime.
+#
+# Modes match what is installed, which is not uniform and should not be:
+# 0755 for the three files that are EXECUTED (virp-nightly-verify,
+# virp-witness-submit, virp-tacacs-recv), 0644 for the Python MODULES
+# that are only ever passed to the interpreter or imported. Making the
+# modules executable would be drift invented by this commit.
+#
+# None of these targets restart anything. A timer keeps running the file
+# it already has; a byte-identical reinstall gives it nothing new to do.
+# =========================================================================
+VIRP_LIB_DIR        = /usr/local/lib/virp
+VIRP_CAMERA_LIB_DIR = /usr/local/lib/virp-camera
+
+VIRP_HOME_UNITS = deploy/virp-camera-submit.service \
+                  deploy/virp-nightly-verify.service \
+                  deploy/virp-nightly-verify.timer \
+                  deploy/virp-spool-retention.service \
+                  deploy/virp-spool-retention.timer \
+                  deploy/virp-witness-submit.service \
+                  deploy/virp-witness-submit.timer \
+                  deploy/virp-witness-tunnel.service
+
+# install-if-different: $(1)=src $(2)=dst $(3)=mode. Prints and installs
+# only on a real difference, so "byte-for-byte no-op" is demonstrated by
+# the target rather than asserted in a commit message.
+define virp_install_if_diff
+	@if cmp -s "$(1)" "$(2)"; then \
+	    echo "  no change: $(2)"; \
+	else \
+	    install -m $(3) "$(1)" "$(2)" && echo "  INSTALLED: $(2) (was different or absent)"; \
+	fi
+endef
+
+.PHONY: install-home-units
+install-home-units:
+	@for f in $(VIRP_HOME_UNITS); do \
+	    test -f "$$f" || { echo "FAIL: $$f missing"; exit 1; }; \
+	done
+	@scripts/require-clean-tree.sh "refusing to install units"
+	@echo "=== units -> /etc/systemd/system (0644) ==="
+	@for f in $(VIRP_HOME_UNITS); do \
+	    d=/etc/systemd/system/$$(basename $$f); \
+	    if cmp -s "$$f" "$$d"; then echo "  no change: $$d"; \
+	    else install -m 0644 "$$f" "$$d" && echo "  INSTALLED: $$d"; fi; \
+	done
+	@echo
+	@echo "  Nothing was restarted or reloaded. If any line above says"
+	@echo "  INSTALLED, run 'sudo systemctl daemon-reload' yourself and"
+	@echo "  decide per unit whether it needs a restart."
+
+.PHONY: install-camera-runtime
+install-camera-runtime:
+	@test -f camera/virp_camera.py || { echo "FAIL: camera/virp_camera.py missing"; exit 1; }
+	@scripts/require-clean-tree.sh "refusing to install the camera runtime"
+	@echo "=== camera runtime -> $(VIRP_CAMERA_LIB_DIR) (0644, module) ==="
+	install -d -m 0755 $(VIRP_CAMERA_LIB_DIR)
+	$(call virp_install_if_diff,camera/virp_camera.py,$(VIRP_CAMERA_LIB_DIR)/virp_camera.py,0644)
+	@echo "  virp-camera-submit.service and virp-spool-retention.service"
+	@echo "  both exec this file. It is NOT restarted here."
+
+.PHONY: install-nightly-verify
+install-nightly-verify:
+	@test -f deploy/virp-nightly-verify || { echo "FAIL: deploy/virp-nightly-verify missing"; exit 1; }
+	@test -f deploy/export_bundle.py || { echo "FAIL: deploy/export_bundle.py missing"; exit 1; }
+	@scripts/require-clean-tree.sh "refusing to install the nightly verifier"
+	@echo "=== nightly verify -> $(VIRP_LIB_DIR) ==="
+	install -d -m 0755 $(VIRP_LIB_DIR)
+	$(call virp_install_if_diff,deploy/virp-nightly-verify,$(VIRP_LIB_DIR)/virp-nightly-verify,0755)
+	$(call virp_install_if_diff,deploy/export_bundle.py,$(VIRP_LIB_DIR)/export_bundle.py,0644)
+	@echo "  export_bundle.py is the EXPORTER virp-nightly-verify names by"
+	@echo "  absolute path. It is a different program from"
+	@echo "  tools/bundle/virp_export_bundle.py (9 KB, earlier, unrelated"
+	@echo "  code path) — that file is untouched by this target."
+
+.PHONY: install-witness-units
+install-witness-units:
+	@test -f deploy/virp-witness-submit || { echo "FAIL: deploy/virp-witness-submit missing"; exit 1; }
+	@scripts/require-clean-tree.sh "refusing to install the witness submitter"
+	@echo "=== witness submitter -> $(VIRP_LIB_DIR) ==="
+	install -d -m 0755 $(VIRP_LIB_DIR)
+	$(call virp_install_if_diff,deploy/virp-witness-submit,$(VIRP_LIB_DIR)/virp-witness-submit,0755)
+	@echo "  The tunnel's SSH KEY and known_hosts stay on the box under"
+	@echo "  /var/lib/virp/witness/ssh — referenced by path, never tracked."
+
+# -------------------------------------------------------------------------
+# install-tacacs-receiver — LIVE PRODUCTION. The 2960 accounts into this.
+#
+# The unit itself was already tracked at deploy/tacacs/virp-tacacs.service
+# and is byte-identical to the installed copy; it was simply missing from
+# the manifest. Same for tacacs/virp_tacacs_recv.py and
+# tacacs/virp_tacacs_codec.py. Only the two-line exec wrapper was untracked.
+#
+# NOT INSTALLED OR RESTARTED by any routine flow. The receiver's own
+# configuration — /etc/virp/tacacs/recv.json, producer.key, secret-2960 —
+# is deliberately NOT in this repo and NOT rendered from it: recv.json
+# carries the live per-switch shared secrets. Tracking it would need a
+# render step and a placeholder scheme that does not exist yet. Until it
+# does, that config is box-only and unreviewed, which is a real gap and
+# is recorded as such in DEPLOYED.md.
+# -------------------------------------------------------------------------
+.PHONY: install-tacacs-receiver
+install-tacacs-receiver:
+	@test -f deploy/tacacs/virp-tacacs.service || { echo "FAIL: unit missing"; exit 1; }
+	@scripts/require-clean-tree.sh "refusing to install the TACACS receiver"
+	@echo "=== TACACS receiver (live) ==="
+	install -d -m 0755 $(VIRP_LIB_DIR)
+	$(call virp_install_if_diff,deploy/tacacs/virp-tacacs.service,/etc/systemd/system/virp-tacacs.service,0644)
+	$(call virp_install_if_diff,tacacs/virp_tacacs_recv.py,$(VIRP_LIB_DIR)/virp_tacacs_recv.py,0644)
+	$(call virp_install_if_diff,tacacs/virp_tacacs_codec.py,$(VIRP_LIB_DIR)/virp_tacacs_codec.py,0644)
+	$(call virp_install_if_diff,deploy/virp-tacacs-recv,$(VIRP_LIB_DIR)/virp-tacacs-recv,0755)
+	@echo
+	@echo "  NOT restarted. A restart drops in-flight accounting records;"
+	@echo "  do it deliberately, in a window, not as a side effect."
+
 # -------------------------------------------------------------------------
 # rollback-prod — copy back a captured install. No rebuild, no git.
 #
