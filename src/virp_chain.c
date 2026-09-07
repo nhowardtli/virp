@@ -2091,9 +2091,24 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
     snprintf(entry->signer_org_id, sizeof(entry->signer_org_id),
              "%s", state->org_id);
 
-    /* Build canonical JSON (without hash and HMAC) */
+    /* Build canonical JSON (without hash and HMAC).
+     *
+     * HAM review 2026-09-06, item 16. snprintf returns the length it
+     * WOULD have written, not the length it did. That return was fed
+     * straight to sha256_hex, so the day any field widens past what this
+     * buffer holds, the hash would be computed over `clen` bytes of a
+     * buffer that only ever received 2047 -- an out-of-bounds read, on
+     * the hashing path, silently. Current field maxima cannot reach
+     * 2048, so this is not exploitable today; it becomes exploitable the
+     * moment artifact_type widens (item 5 of
+     * docs/CANONICAL-FORMAT-WINDOW.md), which is exactly when nobody
+     * will be looking here. Refuse instead. Nothing is widened. */
     char canonical[2048];
     int clen = build_canonical_json(entry, canonical, sizeof(canonical));
+    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+        sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+    }
 
     /* Compute chain_entry_hash = sha256(canonical) */
     sha256_hex(canonical, (size_t)clen, entry->chain_entry_hash);
@@ -2646,9 +2661,27 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
             break;
         }
 
-        /* Rebuild canonical JSON and verify hash */
+        /* Rebuild canonical JSON and verify hash. The same clamp as the
+         * append path (HAM item 16): an entry whose canonical form does
+         * not fit is refused, never hashed over bytes the buffer never
+         * received. */
         char canonical[2048];
         int clen = build_canonical_json(&e, canonical, sizeof(canonical));
+        if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+            /* The VERIFIER could not complete on this entry; the entry is
+             * not thereby proven bad. Said as plainly as this struct
+             * allows. (fix/ham-verifier adds a first-class VERIFIER_ERROR
+             * outcome to this result; when both land, this should set it.
+             * See the report's DECISIONS.) */
+            result->valid = false;
+            result->first_broken = e.sequence;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "VERIFIER_ERROR: canonical form of sequence %lld does "
+                     "not fit the %zu-byte buffer; it was not hashed, and "
+                     "nothing about this entry has been proven either way",
+                     (long long)e.sequence, sizeof(canonical));
+            break;
+        }
 
         char computed_hash[65];
         sha256_hex(canonical, (size_t)clen, computed_hash);

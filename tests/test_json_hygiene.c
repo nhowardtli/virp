@@ -248,6 +248,80 @@ static void item12_append(void)
     unlink(CK);
 }
 
+/* --------------------------------------------------------------- 16 -- */
+/*
+ * The canonicalization buffer. snprintf returns the length it WOULD have
+ * written; that return was fed straight to sha256_hex, so an entry whose
+ * canonical form overflowed 2048 bytes would have been hashed over bytes
+ * the buffer never received. Current field maxima cannot reach 2048, so
+ * this is not reachable through the ordinary API -- which is exactly why
+ * the guard has to be a clamp on the return value rather than a comment
+ * about the maxima. Asserted here by construction: the widest legal
+ * entry every field can hold must still fit, with room, and the clamp
+ * must exist on both the append and verify paths.
+ */
+static size_t widest_canonical_entry(void)
+{
+    /* Field widths from include/virp_chain.h and src/virp_onode.c, plus
+     * the fixed key names and punctuation of build_canonical_json. */
+    return 64      /* session_id      */
+         + 16      /* artifact_type   */
+         + 128     /* artifact_id     */
+         + 65 * 2  /* artifact_hash, previous_entry_hash */
+         + 16      /* artifact_hash_alg */
+         + 8       /* artifact_schema_version */
+         + 64      /* signer_org_id   */
+         + 20 * 4  /* four integers   */
+         + 256;    /* key names, quotes, colons, commas, braces */
+}
+
+static void item16(void)
+{
+    TEST("16: the widest legal entry still fits the 2048-byte buffer");
+    WANT(widest_canonical_entry() < 2048,
+         "a legal entry can already overflow the canonical buffer");
+
+    TEST("16: the append path clamps the snprintf return before hashing");
+    {
+        FILE *f = fopen("src/virp_chain.c", "r");
+        int found = 0;
+        if (f) {
+            char line[512];
+            int seen_append = 0;
+            while (fgets(line, sizeof(line), f)) {
+                if (strstr(line, "build_canonical_json(entry, canonical"))
+                    seen_append = 1;
+                if (seen_append && strstr(line, "(size_t)clen >= sizeof(canonical)")) {
+                    found = 1;
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        WANT(found, "the append path hashes an unclamped snprintf return");
+    }
+
+    TEST("16: the verify path clamps it too");
+    {
+        FILE *f = fopen("src/virp_chain.c", "r");
+        int found = 0;
+        if (f) {
+            char line[512];
+            int seen_verify = 0;
+            while (fgets(line, sizeof(line), f)) {
+                if (strstr(line, "build_canonical_json(&e, canonical"))
+                    seen_verify = 1;
+                if (seen_verify && strstr(line, "(size_t)clen >= sizeof(canonical)")) {
+                    found = 1;
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        WANT(found, "the verify path hashes an unclamped snprintf return");
+    }
+}
+
 int main(void)
 {
     printf("\n=== JSON ingress hygiene (HAM 2026-09-06) ===\n");
@@ -255,6 +329,7 @@ int main(void)
     item10();
     item12();
     item12_append();
+    item16();
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n",
            tests_passed, tests_failed, tests_run);
     return tests_failed ? 1 : 0;
