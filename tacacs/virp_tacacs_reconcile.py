@@ -43,7 +43,6 @@ canonical_for_match = _az.ios_canonical
 
 SCHEMA = "tacacs_reconciliation/1"
 ACCT_SCHEMA = "tacacs_accounting/1"
-
 # The command-reassembly rules this reconciler knows, BY NAME. The name
 # goes into the record, because reassembly is an interpretation and a
 # reader is entitled to see which one ran.
@@ -51,7 +50,8 @@ REASSEMBLY_CISCO = "cisco_cmd_cmdarg_space_join_drop_cr"
 REASSEMBLY_CISCO_SINGLE = "cisco_cmd_single_arg_drop_cr"
 REASSEMBLY_UNRECOGNIZED = "UNRECOGNIZED"
 
-VERDICTS = ("MATCHED", "START_WITHOUT_STOP", "STOP_WITHOUT_START",
+VERDICTS = ("MATCHED", "MATCHED_LEGACY_NO_PRINCIPAL",
+            "START_WITHOUT_STOP", "STOP_WITHOUT_START",
             "UNGOVERNED", "UNREPORTED", "AMBIGUOUS",
             "ATTEMPTED_UNAPPROVED", "BREAKGLASS_USED")
 
@@ -459,9 +459,24 @@ def reconcile(receipts, gates, windows, match_window_ms,
         else:
             verdict, detail = None, ""
 
-        # Candidate gate records: same device, same reassembled command
-        # bytes, inside the window.
+        # THE PRINCIPAL IS PART OF THE MATCH KEY (HAM item 5).
+        #
+        # -07 says the reconciliation key is device + principal + command
+        # + temporal context. This matched on device + command + time, so
+        # a human running `show running-config` one second after the gate
+        # ran the same command on the same device CORROBORATED the gate's
+        # execution. Measured: 19:00:00 gate as virp-ro, 19:00:01 human
+        # as nhoward, MATCHED.
+        #
+        # gate_execution/1 records carry no device-side principal at all
+        # (`uid` is the local caller, not the identity used on the wire).
+        # Those are legacy and are graded as such: MATCHED_LEGACY_NO_
+        # PRINCIPAL, visibly distinct, never promoted to the strong
+        # grade. Where BOTH sides carry a principal, exact match is
+        # REQUIRED.
+        acct_principal = rb.get("user")
         candidates = []
+        legacy_candidates = []
         if command is not None:
             for g in gates:
                 gb = g["body"]
@@ -471,7 +486,18 @@ def reconcile(receipts, gates, windows, match_window_ms,
                     continue
                 if abs((g["timestamp_ns"] or 0) - t_ns) > window_ns:
                     continue
-                candidates.append(g)
+                gate_principal = gb.get("device_principal")
+                if gate_principal is None:
+                    legacy_candidates.append(g)
+                elif gate_principal == acct_principal:
+                    candidates.append(g)
+                # else: the gate ran this command as somebody else. Not a
+                # candidate, and not silently dropped either -- it stays
+                # available to grade UNREPORTED below.
+        principal_grade = None
+        if not candidates and legacy_candidates:
+            candidates = legacy_candidates
+            principal_grade = "MATCHED_LEGACY_NO_PRINCIPAL"
 
         if command is None:
             gate_verdict = "UNGOVERNED"
@@ -479,7 +505,7 @@ def reconcile(receipts, gates, windows, match_window_ms,
             detail = (detail + "; " if detail else "") + \
                 "command not reassemblable under any known rule"
         elif len(candidates) == 1:
-            gate_verdict = "MATCHED"
+            gate_verdict = principal_grade or "MATCHED"
             g = candidates[0]
             gate_cite = {"session_id": g["session_id"],
                          "sequence": g["sequence"],
@@ -519,7 +545,7 @@ def reconcile(receipts, gates, windows, match_window_ms,
         # would otherwise be filed UNGOVERNED -- a counting bucket, and
         # burying an alarm in a counting bucket is how alarms get
         # ignored.
-        acct_user = rb.get("user")
+        acct_user = acct_principal
         grade = "NOT_GRADED"
         if acct_user and acct_user in breakglass_users:
             final = "BREAKGLASS_USED"
@@ -528,6 +554,9 @@ def reconcile(receipts, gates, windows, match_window_ms,
         items.append({
             "verdict": final,
             "grade": grade,
+            "acct_principal": acct_principal,
+            "gate_principal": (candidates[0]["body"].get("device_principal")
+                               if len(candidates) == 1 else None),
             "user": acct_user,
             "record_class": klass,
             "authz_decision": authz,
@@ -569,6 +598,8 @@ def reconcile(receipts, gates, windows, match_window_ms,
             items.append({
                 "verdict": "UNREPORTED",
                 "grade": "NOT_GRADED",
+                "acct_principal": None,
+                "gate_principal": g["body"].get("device_principal"),
                 "user": None,
                 "record_class": None,
                 "authz_decision": None,

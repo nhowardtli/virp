@@ -1120,6 +1120,15 @@ test-tacacs:
 	@echo "=== TACACS+ accounting codec, receiver, reconciler ==="
 	python3 tests/test_tacacs_accounting.py
 
+# HAM review 2026-09-06, items 4/5/15: the producer signature as a trust
+# decision, the device-side principal in the reconciliation key, and
+# source strength as its own axis. Separate target and separate file so a
+# failure names the review item.
+.PHONY: test-tacacs-evidence-ham
+test-tacacs-evidence-ham:
+	@echo "=== TACACS+ evidence strength (HAM 2026-09-06) ==="
+	python3 tests/test_tacacs_evidence_ham.py
+
 # client_identity is a JOIN KEY: the reconciler groups receipts by it and
 # then matches gate records on the device name, so an identity that names
 # no fleet device matches nothing and says nothing. Asserts every tracked
@@ -2179,7 +2188,7 @@ test-release-tools:
 	@scripts/verify-release-bundle.sh --selftest
 	@scripts/check-release-tag.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-evidence-ham test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

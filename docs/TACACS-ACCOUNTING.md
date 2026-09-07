@@ -280,7 +280,8 @@ confirmed to be the one that was reconciled.
 
 | verdict | meaning |
 |---|---|
-| `MATCHED` | receipt and a `gate_execution` correspond on device, command bytes, and time window |
+| `MATCHED` | receipt and a `gate_execution` correspond on device, **principal**, command bytes, and time window |
+| `MATCHED_LEGACY_NO_PRINCIPAL` | the same, except the `gate_execution` predates `device_principal` and carries none. The identities were NOT checked, and this says so rather than assuming they agreed |
 | `START_WITHOUT_STOP` | a START receipt with no STOP for its `task_id` |
 | `STOP_WITHOUT_START` | a STOP receipt with no START for its `task_id` |
 | `UNGOVERNED` | accounting exists, no gate record — the device executed a command VIRP did not govern |
@@ -291,6 +292,13 @@ confirmed to be the one that was reconciled.
 one device inside one match window are indistinguishable on the stated
 criteria, and picking one would be a fabrication. The record names the
 candidates and stops.
+
+`MATCHED_LEGACY_NO_PRINCIPAL` is never promoted to `MATCHED` and never
+counts toward corroboration. The reviewed matcher used device + command
++ time only: measured, a gate execution of `show running-config` at
+19:00:00 as `virp-ro` and a human running the same command at 19:00:01 as
+`nhoward` graded `MATCHED`, so the human corroborated the gate. -07 names
+the principal in the key, and it is in the key now.
 
 ### The match rule is stated in the record
 

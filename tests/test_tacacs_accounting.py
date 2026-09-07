@@ -365,9 +365,21 @@ def receipt_body(device, task_id, flags, cmd, cmd_args, recv_ns):
     }
 
 
-def gate_body(device, command):
-    return {"schema": "gate_execution/1", "device": device,
-            "command": command, "decision": "auto-execute"}
+def gate_body(device, command, device_principal=None):
+    """A gate_execution body.
+
+    device_principal defaults to ABSENT, which is the shape every
+    gate_execution record written before 2026-09-06 has. Those grade
+    MATCHED_LEGACY_NO_PRINCIPAL, never plain MATCHED: the reconciler
+    cannot check that the gate and the device agree about WHO ran the
+    command, and it says so rather than assuming (HAM review item 5).
+    Pass a principal to exercise the bound path."""
+    b = {"schema": "gate_execution/1", "device": device,
+         "command": command, "decision": "auto-execute"}
+    if device_principal is not None:
+        b["device_principal"] = device_principal
+        b["body_version"] = 2
+    return b
 
 
 class TestReconcile(unittest.TestCase):
@@ -395,7 +407,8 @@ class TestReconcile(unittest.TestCase):
                   gate_body("R1", "show version"), t + 500_000)]
         items, _, _ = self._run(receipts, gates)
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["verdict"], "MATCHED")
+        self.assertEqual(items[0]["verdict"],
+                         "MATCHED_LEGACY_NO_PRINCIPAL")
         self.assertEqual(items[0]["command"], "show version")
         self.assertEqual(items[0]["command_reassembly"], rc.REASSEMBLY_CISCO)
         self.assertEqual(len(items[0]["receipt_cites"]), 2)
@@ -445,7 +458,8 @@ class TestReconcile(unittest.TestCase):
                   t + 100)]
         items, _, _ = self._run(receipts, gates)
         self.assertEqual(items[0]["record_class"], "command")
-        self.assertEqual(items[0]["verdict"], "MATCHED")
+        self.assertEqual(items[0]["verdict"],
+                         "MATCHED_LEGACY_NO_PRINCIPAL")
 
     def test_command_record_with_no_stop_is_still_a_gap(self):
         t = 1_757_000_360_000_000_000
@@ -504,7 +518,8 @@ class TestReconcile(unittest.TestCase):
                   t + 200)]
         items, _, _ = self._run(receipts, gates)
         verdicts = sorted(i["verdict"] for i in items)
-        self.assertEqual(verdicts, ["MATCHED", "UNREPORTED"])
+        self.assertEqual(verdicts,
+                         ["MATCHED_LEGACY_NO_PRINCIPAL", "UNREPORTED"])
 
     def test_gate_far_outside_the_span_is_not_graded_unreported(self):
         """A gate record from before this receiver ever listened is not
@@ -522,7 +537,8 @@ class TestReconcile(unittest.TestCase):
                  ("gate", "gate_execution", gate_body("R1", "reload"),
                   t - 999_000_000_000)]
         items, _, _ = self._run(receipts, gates)
-        self.assertEqual([i["verdict"] for i in items], ["MATCHED"])
+        self.assertEqual([i["verdict"] for i in items],
+                         ["MATCHED_LEGACY_NO_PRINCIPAL"])
 
     def test_coverage_unknown_without_a_ledger(self):
         t = 1_757_000_700_000_000_000
@@ -576,7 +592,7 @@ class TestReconcile(unittest.TestCase):
         rec = rc.build_record(items, 15000, self.db, None, [])
         after = hashlib.sha256(open(self.db, "rb").read()).hexdigest()
         self.assertEqual(before, after)
-        self.assertEqual(rec["tally"]["MATCHED"], 1)
+        self.assertEqual(rec["tally"]["MATCHED_LEGACY_NO_PRINCIPAL"], 1)
 
     def test_listener_killed_mid_session_grades_interrupted(self):
         """The scenario the field exists for: START received, listener
@@ -654,7 +670,8 @@ class TestReconcile(unittest.TestCase):
              ("tacacs:lab", "evidence_item", cmd, t + 500)], gates)
         classes = sorted(i["record_class"] for i in items if i["record_class"])
         self.assertEqual(classes, ["command", "session"])
-        matched = [i for i in items if i["verdict"] == "MATCHED"]
+        matched = [i for i in items
+                   if i["verdict"] == "MATCHED_LEGACY_NO_PRINCIPAL"]
         self.assertEqual(len(matched), 1)
         self.assertEqual(matched[0]["command"], "show version")
 
