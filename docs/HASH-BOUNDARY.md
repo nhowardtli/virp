@@ -92,7 +92,9 @@ the entry cannot be bound from inside the chain
 spellings in that list (`comparator_verd`, `chainwalk_summa`) exist because
 `artifact_type` is `char[16]` (`include/virp_chain.h:46`). The documented fix
 is an explicit `commitment_mode` field inside the canonical object, deferred
-to the same format window.
+to the same format window. The window and everything queued for it are
+listed in `docs/CANONICAL-FORMAT-WINDOW.md`, `artifact_type[16]`
+included.
 
 **Approver identity.** `approver_key_id` and `operator` are outside the signed
 72 bytes. You can tell which key verified an approval only from the unsigned
