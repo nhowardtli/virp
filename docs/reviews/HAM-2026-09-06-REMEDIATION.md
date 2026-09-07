@@ -56,8 +56,10 @@ tests nobody has been running.
 | 16 | `fix/ham-json-hygiene` | `770a241` | DONE | `tests/test_json_hygiene.c` item 16 |
 
 Branch heads: `fix/ham-tacacs-authz` `6ee717c`, `fix/ham-tacacs-evidence`
-`b140ceb`, `fix/ham-verifier` `2460f36`, `fix/ham-json-hygiene` `770a241`.
-All four are pushed. All four are based on local `main` `315e551`.
+`b140ceb`, `fix/ham-verifier` `2460f36`, `fix/ham-json-hygiene` `bba6b25`
+(the last commit on that branch is this report; the item 16 fix is
+`770a241`). All four are pushed. All four are based on local `main`
+`315e551`.
 ## 2. Phase 0 recon
 
 ### Repository
