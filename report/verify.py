@@ -201,6 +201,135 @@ INTENT_CLOSER_TYPES = frozenset(("gate_execution", "outcome"))
 #    bundle simply has none, and the report marks the ceiling UNKNOWN then.
 NODE_CONFIG_TYPE = "node_config"
 
+# 6. TACACS+ ACCOUNTING PRODUCER SIGNATURE (HAM review, 2026-09-06,
+#    item 4). Device-side accounting receipts ride the chain as
+#    `evidence_item` bodies. The chain proves it committed to those
+#    bytes; it says nothing about where the bytes came from, and anyone
+#    with evidence_item append rights could write a body claiming to be
+#    TACACS evidence.
+#
+#    `tacacs_accounting/2` bodies carry producer_key_id,
+#    producer_signature_scheme and producer_signature. Given the
+#    receiver's PUBLIC key this verifier can say which records the
+#    receiver's own key stands behind.
+#
+#    This is an INDEPENDENT property, not part of the integrity rollup.
+#    A /1 record is ABSENT, not a failure: every record on the live
+#    chains today is /1, and folding "was never signed in a checkable
+#    way" into the tamper ladder would report the whole existing corpus
+#    as broken.
+TACACS_ACCT_SCHEMA_V1 = "tacacs_accounting/1"
+TACACS_ACCT_SCHEMA_V2 = "tacacs_accounting/2"
+TACACS_PRODUCER_VERIFIED = "VERIFIED"
+TACACS_PRODUCER_FAILED = "FAILED"
+TACACS_PRODUCER_ABSENT = "ABSENT"
+TACACS_PRODUCER_SIG_EXCLUDED = ("producer_signature", "producer_sig",
+                                "producer_signature_scheme")
+
+
+def tacacs_producer_canonical(body):
+    """The bytes a tacacs_accounting/2 producer signature covers.
+
+    Must stay byte-identical to producer_canonical_bytes() in
+    tacacs/virp_tacacs_recv.py. Reimplemented here rather than imported
+    so this verifier has no dependency on the producer's own tree: a
+    verifier that runs the signer's code is checking nothing."""
+    obj = {k: v for k, v in body.items()
+           if k not in TACACS_PRODUCER_SIG_EXCLUDED}
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True).encode("ascii")
+
+
+def tacacs_producer_key_id(raw_pubkey):
+    return hashlib.sha256(raw_pubkey).hexdigest()[:32]
+
+
+def load_tacacs_producer_pubkey(path):
+    """(raw32, key_id) from a 32-byte raw Ed25519 public key file."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) != 32:
+        raise ValueError("%s is %d bytes, not a 32-byte raw Ed25519 public "
+                         "key" % (path, len(raw)))
+    return raw, tacacs_producer_key_id(raw)
+
+
+def verify_tacacs_producer_signature(body, pubkey, pinned_key_id=None):
+    """(status, detail) for one accounting body. See the note above.
+
+    Returns (None, "") for anything that is not an accounting record: it
+    is not this property's business, and counting it would make the tally
+    a statement about the whole chain rather than about the receipts."""
+    if not isinstance(body, dict):
+        return None, ""
+    schema = body.get("schema")
+    if schema not in (TACACS_ACCT_SCHEMA_V1, TACACS_ACCT_SCHEMA_V2):
+        return None, ""
+    if schema != TACACS_ACCT_SCHEMA_V2:
+        return TACACS_PRODUCER_ABSENT, (
+            "tacacs_accounting/1 carries no verifiable producer identity")
+    if pubkey is None:
+        return TACACS_PRODUCER_FAILED, (
+            "no TACACS producer public key supplied; a /2 record cannot be "
+            "graded without one")
+    kid = body.get("producer_key_id")
+    if pinned_key_id is not None and kid != pinned_key_id:
+        return TACACS_PRODUCER_FAILED, (
+            "record names producer_key_id %r, supplied key is %r"
+            % (kid, pinned_key_id))
+    if body.get("producer_signature_scheme") != "ed25519":
+        return TACACS_PRODUCER_FAILED, (
+            "unsupported producer_signature_scheme %r"
+            % body.get("producer_signature_scheme"))
+    verifier = _load_ed25519_backend()
+    if verifier is None:
+        return TACACS_PRODUCER_FAILED, (
+            "no Ed25519 backend available (install pynacl or cryptography)")
+    sig_hex = body.get("producer_signature")
+    if not sig_hex:
+        return TACACS_PRODUCER_FAILED, (
+            "record claims /2 but carries no producer_signature")
+    try:
+        sig = bytes.fromhex(sig_hex)
+    except ValueError:
+        return TACACS_PRODUCER_FAILED, "producer_signature is not hex"
+    if not verifier(pubkey, tacacs_producer_canonical(body), sig):
+        return TACACS_PRODUCER_FAILED, (
+            "producer signature did not verify under key %s" % pinned_key_id)
+    return TACACS_PRODUCER_VERIFIED, (
+        "producer signature verified under key %s" % kid)
+
+
+def verify_tacacs_producer_signatures(verifications, pubkey,
+                                      pinned_key_id=None):
+    """Grade every accounting record in a selection.
+
+    Returns (rows, tally). `rows` is one dict per accounting record with
+    session_id, sequence, artifact_id, schema, status and detail. `tally`
+    counts VERIFIED / FAILED / ABSENT."""
+    rows = []
+    tally = {TACACS_PRODUCER_VERIFIED: 0, TACACS_PRODUCER_FAILED: 0,
+             TACACS_PRODUCER_ABSENT: 0}
+    for v in verifications:
+        # _intent_body is the generic "parsed dict body of a
+        # verification, or None" accessor; it is named for its first
+        # caller, not for a type restriction.
+        body = _intent_body(v)
+        if body is None:
+            continue
+        status, detail = verify_tacacs_producer_signature(
+            body, pubkey, pinned_key_id)
+        if status is None:
+            continue
+        tally[status] = tally.get(status, 0) + 1
+        rows.append({"session_id": v.entry["session_id"],
+                     "sequence": v.entry["sequence"],
+                     "artifact_id": v.entry["artifact_id"],
+                     "schema": body.get("schema"),
+                     "status": status, "detail": detail})
+    return rows, tally
+
+
 RETENTION_TRUNCATED = (
     "artifact body was truncated at the daemon's %d-byte storage limit; the "
     "entry commits to the full message, only a prefix was retained"

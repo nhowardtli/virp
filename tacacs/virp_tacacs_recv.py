@@ -73,6 +73,42 @@ import virp_tacacs_codec as tp
 
 SCHEMA = "tacacs_accounting/1"
 
+# HAM review 2026-09-06, item 4.
+#
+# /1 bodies carry `producer_sig`: this receiver's Ed25519 signature over
+# the canonical body. It has always been there and it has never been part
+# of anybody's trust decision. The O-Node verifies only the artifact
+# HASH; reconciliation trusted any evidence_item whose body said
+# schema=tacacs_accounting/1; virp-verify and Docket do not look at it.
+# And /1 does not carry a producer KEY ID, so a consumer holding the
+# receiver's public key cannot even tell which key it should try.
+#
+# What /1 proves today: THE CHAIN COMMITTED TO THESE BYTES.
+# What it does not: THESE BYTES CAME FROM THE RECEIVER.
+#
+# /2 closes that. It is /1 plus:
+#
+#   producer_key_id            sha256(raw ed25519 public key)[:32]
+#   producer_signature_scheme  "ed25519"
+#   producer_signature         hex, over PRODUCER_CANONICAL(body)
+#
+# PRODUCER_CANONICAL(body) is defined exactly, and tested by vector in
+# docs/TACACS-ACCOUNTING.md: take the body, REMOVE the keys
+# "producer_signature", "producer_sig" and "producer_signature_scheme" if
+# present, and serialize with
+#     json.dumps(obj, sort_keys=True, separators=(",", ":"),
+#                ensure_ascii=True).encode("ascii")
+# `producer_key_id` IS inside the signed bytes: a signature that did not
+# cover the key id it names could be re-labelled onto another key.
+#
+# /2 bodies do NOT carry `producer_sig`. It was never verified by
+# anything, and carrying two signature fields would leave a reader to
+# guess which one a verdict rests on.
+SCHEMA_V2 = "tacacs_accounting/2"
+PRODUCER_SIGNATURE_SCHEME = "ed25519"
+PRODUCER_SIG_EXCLUDED = ("producer_signature", "producer_sig",
+                         "producer_signature_scheme")
+
 # The wire's artifact_type is char[16] (15 usable), so "tacacs_accounting"
 # would be truncated. Externally-produced records ride as evidence_item
 # with the real type in the body `schema` — the same convention as
@@ -138,6 +174,96 @@ def producer_sign(sk, body_without_sig):
     body = dict(body_without_sig)
     body["producer_sig"] = sig.hex()
     return canonical_bytes(body), body
+
+
+def producer_canonical_bytes(body):
+    """The exact bytes a `tacacs_accounting/2` producer signature covers.
+
+    The body minus its own signature fields, serialized deterministically.
+    Defined here, once, so the receiver that signs and every consumer that
+    verifies cannot drift apart.
+
+    NOTE ON ESCAPING. The C chain canonicalizer (build_canonical_json in
+    src/virp_chain.c) pastes strings with raw %s and therefore cannot
+    carry a character that would need escaping; -07 says so and item 12
+    enforces it there. This is a DIFFERENT canonicalizer: json.dumps is a
+    real serializer, it escapes deterministically, and both sides call
+    this same function. Refusing to sign a body containing a quote would
+    mean the receiver dropped exactly the packets it exists to record."""
+    obj = {k: v for k, v in body.items() if k not in PRODUCER_SIG_EXCLUDED}
+    return canonical_bytes(obj)
+
+
+def producer_sign_v2(sk, key_id, body_without_sig):
+    """Sign a body as tacacs_accounting/2. Returns (bytes, body).
+
+    `schema` is set to /2 here rather than by the caller, so a body can
+    never claim /2 without carrying a /2 signature."""
+    body = dict(body_without_sig)
+    body["schema"] = SCHEMA_V2
+    body["producer_key_id"] = key_id
+    body.pop("producer_sig", None)
+    body["producer_signature_scheme"] = PRODUCER_SIGNATURE_SCHEME
+    sig = sk.sign(producer_canonical_bytes(body))
+    body["producer_signature"] = sig.hex()
+    return canonical_bytes(body), body
+
+
+PRODUCER_VERIFIED = "VERIFIED"
+PRODUCER_FAILED = "FAILED"
+PRODUCER_ABSENT = "ABSENT"
+
+
+def producer_verify(body, pinned_pubkey_raw, pinned_key_id=None):
+    """(status, detail) for one accounting body.
+
+    VERIFIED  the body is /2 and its producer_signature verifies under the
+              pinned public key.
+    FAILED    the body is /2 and it does not: wrong key, bad signature,
+              tampered bytes, malformed fields.
+    ABSENT    the body is /1. It carries no verifiable producer identity
+              and never will. Not a failure and not a pass: a record that
+              was never signed in a checkable way.
+
+    ABSENT is deliberately not FAILED. Every record on 313 and .211 today
+    is /1, and grading the existing corpus as tampered would be a lie."""
+    schema = body.get("schema")
+    if schema != SCHEMA_V2:
+        return PRODUCER_ABSENT, ("body is %r; only tacacs_accounting/2 "
+                                 "carries a verifiable producer identity"
+                                 % schema)
+    if pinned_pubkey_raw is None:
+        return PRODUCER_FAILED, ("no producer public key pinned; a /2 body "
+                                 "cannot be graded without one")
+    kid = body.get("producer_key_id")
+    if pinned_key_id is not None and kid != pinned_key_id:
+        return PRODUCER_FAILED, ("body names producer_key_id %r, pinned key "
+                                 "is %r" % (kid, pinned_key_id))
+    if body.get("producer_signature_scheme") != PRODUCER_SIGNATURE_SCHEME:
+        return PRODUCER_FAILED, ("unsupported producer_signature_scheme %r"
+                                 % body.get("producer_signature_scheme"))
+    sig_hex = body.get("producer_signature")
+    if not sig_hex:
+        return PRODUCER_FAILED, "body claims /2 but carries no signature"
+    try:
+        sig = bytes.fromhex(sig_hex)
+        pk = _ed25519().Ed25519PublicKey.from_public_bytes(pinned_pubkey_raw)
+        pk.verify(sig, producer_canonical_bytes(body))
+    except Exception as e:                      # noqa: BLE001
+        return PRODUCER_FAILED, ("producer signature did not verify: %s"
+                                 % type(e).__name__)
+    return PRODUCER_VERIFIED, "producer signature verified under %s" % kid
+
+
+def producer_load_pk(pk_path):
+    """Load a 32-byte raw Ed25519 producer PUBLIC key. Returns
+    (raw_bytes, key_id)."""
+    with open(pk_path, "rb") as f:
+        raw = f.read()
+    if len(raw) != 32:
+        raise SystemExit("producer public key %s is not 32 raw bytes"
+                         % pk_path)
+    return raw, producer_key_id(raw)
 
 
 # ── O-node client: v2 framing, vocabulary is chain_append only ─────────
@@ -458,7 +584,16 @@ class AcctHandler(socketserver.BaseRequestHandler):
             if body_nosig["client_identity_source"] == "unconfigured_source":
                 counters.bump("unconfigured_source")
 
-            body_bytes, _body = producer_sign(self.server.sk, body_nosig)
+            # /1 by default. The live receivers on 313 (uid 992) and
+            # .211 (uid 995) must not change what they emit on their next
+            # restart because a fix landed in the tree: flipping to /2 is
+            # Nate's decision, made by setting emit_schema_version in the
+            # receiver config.
+            if self.server.emit_schema_version == 2:
+                body_bytes, _body = producer_sign_v2(
+                    self.server.sk, self.server.producer_key_id, body_nosig)
+            else:
+                body_bytes, _body = producer_sign(self.server.sk, body_nosig)
             ok, detail = chain_append_evidence(
                 cfg.get("chain_session", "tacacs:%s" % cfg["receiver_node"]),
                 artifact_id, body_bytes, self.server.onode_socket)
@@ -524,8 +659,24 @@ def cmd_serve(args):
     srv.onode_socket = args.onode_socket or cfg.get("onode_socket",
                                                     ONODE_SOCKET)
 
+    # HAM item 4b. DEFAULT 1. The receivers running on 313 and .211 chain
+    # /1 bodies today and must keep chaining /1 across a restart unless
+    # somebody chose otherwise: a fix landing in the tree is not a
+    # decision to change what a live producer emits. Flipping this means
+    # editing the receiver config on that host and restarting it, and
+    # consumers must be able to read /2 first (they can: reconciliation
+    # and report/verify.py read both).
+    ver = int(cfg.get("emit_schema_version", 1))
+    if ver not in (1, 2):
+        raise SystemExit("emit_schema_version must be 1 or 2, not %r" % ver)
+    srv.emit_schema_version = ver
+    srv.producer_key_id = producer_key_id(
+        sk.public_key().public_bytes_raw())
+
     ledger.write("LISTEN_START", listen_addr=addr[0], listen_port=addr[1],
-                 receiver_node=cfg["receiver_node"], pid=os.getpid())
+                 receiver_node=cfg["receiver_node"], pid=os.getpid(),
+                 emit_schema_version=ver,
+                 producer_key_id=srv.producer_key_id)
 
     # A listener killed by SIGTERM must still close its window. Without
     # this the ledger shows an open window that never ended, and coverage

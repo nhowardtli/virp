@@ -184,6 +184,97 @@ component, and never touches the receipt.
 }
 ```
 
+### `tacacs_accounting/2` — the producer signature, checkable
+
+`/1` bodies carry `producer_sig`, this receiver's Ed25519 signature over
+the canonical body. It has been there since the receiver shipped and it
+has never been part of anybody's trust decision: the O-Node verifies only
+the artifact HASH, reconciliation trusted any `evidence_item` whose body
+said `schema: tacacs_accounting/1`, and neither `virp-verify` nor Docket
+looked at it. `/1` does not carry a producer KEY ID either, so a consumer
+holding the receiver's public key could not tell which key to try.
+
+What `/1` proves: **the chain committed to these bytes.**
+What it does not: **these bytes came from the receiver.**
+
+Anyone with `evidence_item` append rights could fabricate a body claiming
+to be TACACS evidence.
+
+`/2` is `/1` plus exactly three fields:
+
+| field | value |
+|---|---|
+| `producer_key_id` | `sha256(raw ed25519 public key)[:32]`, hex |
+| `producer_signature_scheme` | `"ed25519"` |
+| `producer_signature` | hex, over `PRODUCER_CANONICAL(body)` |
+
+`/2` bodies do **not** carry `producer_sig`. Nothing ever verified it, and
+two signature fields would leave a reader guessing which one a verdict
+rests on.
+
+**`PRODUCER_CANONICAL(body)` is defined exactly.** Take the body; remove
+the keys `producer_signature`, `producer_sig` and
+`producer_signature_scheme` if present; serialize with
+
+```python
+json.dumps(obj, sort_keys=True, separators=(",", ":"),
+           ensure_ascii=True).encode("ascii")
+```
+
+`producer_key_id` IS inside the signed bytes: a signature that did not
+cover the key id it names could be re-labelled onto another key.
+
+This canonicalizer is NOT the chain's. `build_canonical_json` in
+`src/virp_chain.c` pastes strings with raw `%s` and therefore cannot
+carry a character needing escaping, which is why the -07 canonical string
+rule refuses one. `json.dumps` is a real serializer, it escapes
+deterministically, and both the signer and every verifier call the same
+function. Refusing to sign a body containing a quote would mean the
+receiver dropped exactly the packets it exists to record.
+
+#### Worked vector
+
+Throwaway key, seed
+`000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f`
+(the standard Ed25519 test seed; it signs nothing real).
+
+- public key `03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8`
+- `producer_key_id` `56475aa75463474c0285df5dbf2bcab7`
+
+Body before signing:
+
+```json
+{"schema": "tacacs_accounting/1", "receiver_node": "vector",
+ "user": "virp-ro", "decode": "OBFUSCATED_MD5", "parse": "COMPLETE",
+ "recv_utc_ns": 1788722800424766173}
+```
+
+`PRODUCER_CANONICAL` of the /2 body:
+
+```
+{"decode":"OBFUSCATED_MD5","parse":"COMPLETE","producer_key_id":"56475aa75463474c0285df5dbf2bcab7","receiver_node":"vector","recv_utc_ns":1788722800424766173,"schema":"tacacs_accounting/2","user":"virp-ro"}
+```
+
+`producer_signature`:
+
+```
+01e6d36dbdcc830386f2a77cf831850881d48b75a454778dd9085a38870ab210c16350ec64f4104b78387eecf2969dba077012868e4b99ebe4790d63b135cb0d
+```
+
+`tests/test_tacacs_evidence_ham.py` reproduces this vector and asserts
+every part of it appears here, so the code and this document cannot drift.
+
+#### Emitting /2 is a decision, not a consequence of the code landing
+
+The receiver emits `/1` unless its config sets `emit_schema_version: 2`.
+The receivers on 313 (uid 992, `10.0.0.13:4949`) and .211 (uid 995,
+`10.0.10.211:4949`) chain `/1` today and keep chaining `/1` across a
+restart: a fix landing in the tree is not a decision to change what a
+live producer emits. Flipping it means editing that host's receiver
+config and restarting it. Consumers can already read both.
+
+Existing `/1` records are never rewritten. Nothing here touches them.
+
 ### Three clocks, never collapsed
 
 The same discipline the camera driver applies (`camera/README.md`):
@@ -299,6 +390,34 @@ counts toward corroboration. The reviewed matcher used device + command
 19:00:00 as `virp-ro` and a human running the same command at 19:00:01 as
 `nhoward` graded `MATCHED`, so the human corroborated the gate. -07 names
 the principal in the key, and it is in the key now.
+
+### Two independent properties on every accounting record
+
+Neither is a verdict. Both sit beside it, and both must be at their
+strong end before a record may be called independent corroboration.
+
+`source_strength` — how the bytes reached the receiver:
+
+| value | meaning |
+|---|---|
+| `TLS_AUTHENTICATED` | RFC 9887. Nothing emits this yet; the value exists so the ladder need not be renumbered the day something does |
+| `SHARED_SECRET_DECODED` | obfuscated per RFC 8907 §4.5 and unwrapped with the configured secret. The device proved it holds the secret |
+| `CLEARTEXT` | the device set `TAC_PLUS_UNENCRYPTED_FLAG`. Anyone who can reach the port can write one |
+| `UNCONFIGURED_SOURCE` | no relationship configured for that address; nothing decoded, nothing attributed |
+| `MALFORMED` | decoded, but the accounting body did not parse. Whatever else it proves, it is not evidence of a command |
+
+`tacacs_producer_signature` — whether the receiver's own key stands
+behind the bytes: `VERIFIED`, `FAILED`, or `ABSENT`. `ABSENT` means the
+record is `/1`, which carries no verifiable producer identity and never
+will. `ABSENT` is deliberately not `FAILED`: every record on 313 and .211
+today is `/1`, and grading the existing corpus as tampered would be a lie
+about what happened.
+
+`corroboration` is `corroborated_by_independent_device_evidence` only when
+`source_strength` is `SHARED_SECRET_DECODED` or better AND
+`tacacs_producer_signature` is `VERIFIED`. Everything else is
+`correlated_unauthenticated_source`. Correlation is still shown for all of
+them; it is simply not called corroboration.
 
 ### The match rule is stated in the record
 

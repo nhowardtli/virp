@@ -142,5 +142,274 @@ class TestItem5ReconciliationBindsThePrincipal(unittest.TestCase):
         self.assertIn("MATCHED_LEGACY_NO_PRINCIPAL", rc.VERDICTS)
 
 
+class TestItem4ProducerSignatureIsATrustDecision(unittest.TestCase):
+    """HAM item 4: a producer signature nobody checks proves nothing.
+
+    /1 bodies carry `producer_sig` and no consumer has ever verified it,
+    and /1 carries no producer key id, so no consumer could pick a key to
+    try. What /1 proves is that the chain committed to these bytes. What
+    it does not prove is that the bytes came from the receiver."""
+
+    def setUp(self):
+        self.sk, self.pk, self.kid = producer_key()
+
+    def _signed(self, **kw):
+        _bytes, body = rcv.producer_sign_v2(self.sk, self.kid,
+                                            acct_body(**kw))
+        return body
+
+    def test_a_good_v2_body_verifies(self):
+        body = self._signed()
+        self.assertEqual(body["schema"], "tacacs_accounting/2")
+        self.assertEqual(body["producer_key_id"], self.kid)
+        self.assertEqual(body["producer_signature_scheme"], "ed25519")
+        status, detail = rcv.producer_verify(body, self.pk, self.kid)
+        self.assertEqual(status, "VERIFIED", detail)
+
+    def test_a_tampered_body_fails(self):
+        body = self._signed()
+        body["user"] = "eviluser"
+        status, _d = rcv.producer_verify(body, self.pk, self.kid)
+        self.assertEqual(status, "FAILED")
+
+    def test_a_tampered_key_id_fails(self):
+        """The key id is INSIDE the signed bytes. Re-labelling a record
+        onto another key breaks the signature, it does not move it."""
+        body = self._signed()
+        body["producer_key_id"] = "0" * 32
+        status, _d = rcv.producer_verify(body, self.pk, None)
+        self.assertEqual(status, "FAILED")
+
+    def test_the_wrong_pinned_key_fails(self):
+        body = self._signed()
+        _sk2, pk2, kid2 = producer_key()
+        status, _d = rcv.producer_verify(body, pk2, kid2)
+        self.assertEqual(status, "FAILED")
+
+    def test_a_v1_body_is_absent_not_failed(self):
+        """Every record on 313 and .211 today is /1. Grading the existing
+        corpus as tampered would be a lie about what happened."""
+        body = acct_body()
+        _b, signed = rcv.producer_sign(self.sk, body)
+        status, detail = rcv.producer_verify(signed, self.pk, self.kid)
+        self.assertEqual(status, "ABSENT", detail)
+
+    def test_a_v2_body_with_no_pinned_key_is_failed_not_absent(self):
+        """A /2 body a verifier cannot check is not the same thing as a
+        /1 body that carries nothing to check."""
+        body = self._signed()
+        status, _d = rcv.producer_verify(body, None, None)
+        self.assertEqual(status, "FAILED")
+
+    def test_the_canonical_string_excludes_only_the_signature_fields(self):
+        body = self._signed()
+        canon = rcv.producer_canonical_bytes(body)
+        obj = json.loads(canon.decode("ascii"))
+        self.assertNotIn("producer_signature", obj)
+        self.assertNotIn("producer_sig", obj)
+        self.assertNotIn("producer_signature_scheme", obj)
+        self.assertIn("producer_key_id", obj)
+        self.assertEqual(obj["schema"], "tacacs_accounting/2")
+        # Deterministic: sorted keys, compact separators, ascii only.
+        self.assertEqual(canon, json.dumps(
+            obj, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True).encode("ascii"))
+
+    def test_the_documented_test_vector_reproduces(self):
+        """docs/TACACS-ACCOUNTING.md carries a worked vector. If the
+        canonical string ever drifts from the document, this fails."""
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        seed = bytes(range(32))
+        sk = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
+        raw_pk = sk.public_key().public_bytes_raw()
+        kid = rcv.producer_key_id(raw_pk)
+        body = {"schema": "tacacs_accounting/1", "receiver_node": "vector",
+                "user": "virp-ro", "decode": "OBFUSCATED_MD5",
+                "parse": "COMPLETE", "recv_utc_ns": 1788722800424766173}
+        _b, signed = rcv.producer_sign_v2(sk, kid, body)
+        doc = open(os.path.join(ROOT, "docs",
+                                "TACACS-ACCOUNTING.md")).read()
+        self.assertIn(raw_pk.hex(), doc, "documented pubkey drifted")
+        self.assertIn(kid, doc, "documented key_id drifted")
+        self.assertIn(signed["producer_signature"], doc,
+                      "documented signature drifted")
+        self.assertIn(
+            rcv.producer_canonical_bytes(signed).decode("ascii"), doc,
+            "documented canonical string drifted")
+
+    def test_reconciliation_reads_both_schemas(self):
+        v2 = self._signed(user="virp-ro")
+        items = run([receipt(v2)],
+                    [gate(device_principal="virp-ro")],
+                    producer_pubkey=self.pk, producer_key_id=self.kid)
+        self.assertEqual(items[0]["verdict"], "MATCHED")
+        self.assertEqual(items[0]["tacacs_producer_signature"], "VERIFIED")
+
+    def test_only_a_verified_record_may_be_called_corroboration(self):
+        v2 = self._signed(user="virp-ro")
+        strong = run([receipt(v2)], [gate(device_principal="virp-ro")],
+                     producer_pubkey=self.pk, producer_key_id=self.kid)
+        self.assertEqual(strong[0]["corroboration"],
+                         rc.CORROBORATION_STRONG)
+
+        v1 = acct_body(user="virp-ro")
+        weak = run([receipt(v1)], [gate(device_principal="virp-ro")],
+                   producer_pubkey=self.pk, producer_key_id=self.kid)
+        self.assertEqual(weak[0]["verdict"], "MATCHED")
+        self.assertEqual(weak[0]["tacacs_producer_signature"], "ABSENT")
+        self.assertEqual(weak[0]["corroboration"], rc.CORROBORATION_WEAK)
+
+    def test_a_tampered_v2_record_still_correlates_but_never_corroborates(self):
+        v2 = self._signed(user="virp-ro")
+        v2["receiver_node"] = "somewhere-else"
+        items = run([receipt(v2)], [gate(device_principal="virp-ro")],
+                    producer_pubkey=self.pk, producer_key_id=self.kid)
+        self.assertEqual(items[0]["tacacs_producer_signature"], "FAILED")
+        self.assertEqual(items[0]["corroboration"], rc.CORROBORATION_WEAK)
+
+
+class TestItem15SourceStrength(unittest.TestCase):
+    """HAM item 15: a cleartext or unconfigured-source receipt does not
+    grade like a shared-secret-decoded one.
+
+    Correlation is shown for all of them. Only the strong end may be
+    called corroboration: anyone who can reach the accounting port can
+    write a cleartext receipt."""
+
+    def setUp(self):
+        self.sk, self.pk, self.kid = producer_key()
+
+    def _strength(self, **kw):
+        return rc.source_strength(acct_body(**kw))
+
+    def test_every_strength_value(self):
+        self.assertEqual(self._strength(decode="OBFUSCATED_MD5"),
+                         "SHARED_SECRET_DECODED")
+        self.assertEqual(self._strength(decode="CLEARTEXT"), "CLEARTEXT")
+        self.assertEqual(self._strength(decode="NO_SECRET_CONFIGURED",
+                                        parse="NOT_ATTEMPTED"),
+                         "UNCONFIGURED_SOURCE")
+        self.assertEqual(self._strength(decode="OBFUSCATED_MD5",
+                                        parse="MALFORMED"), "MALFORMED")
+        b = acct_body()
+        b["tacacs_tls"] = True
+        self.assertEqual(rc.source_strength(b), "TLS_AUTHENTICATED")
+
+    def test_the_vocabulary_is_closed(self):
+        for decode in ("OBFUSCATED_MD5", "CLEARTEXT", "NO_SECRET_CONFIGURED",
+                       "SOMETHING_NEW", None):
+            self.assertIn(self._strength(decode=decode),
+                          rc.SOURCE_STRENGTHS)
+
+    def test_a_cleartext_receipt_correlates_but_does_not_corroborate(self):
+        _b, body = rcv.producer_sign_v2(
+            self.sk, self.kid, acct_body(user="virp-ro", decode="CLEARTEXT"))
+        items = run([receipt(body)], [gate(device_principal="virp-ro")],
+                    producer_pubkey=self.pk, producer_key_id=self.kid)
+        self.assertEqual(items[0]["verdict"], "MATCHED")
+        self.assertEqual(items[0]["source_strength"], "CLEARTEXT")
+        self.assertEqual(items[0]["tacacs_producer_signature"], "VERIFIED")
+        self.assertEqual(items[0]["corroboration"], rc.CORROBORATION_WEAK,
+                         "a cleartext receipt graded as corroboration")
+
+    def test_an_unconfigured_source_correlates_but_does_not_corroborate(self):
+        body = acct_body(user="virp-ro", decode="NO_SECRET_CONFIGURED",
+                         parse="NOT_ATTEMPTED")
+        items = run([receipt(body)], [gate(device_principal="virp-ro")])
+        self.assertEqual(items[0]["source_strength"], "UNCONFIGURED_SOURCE")
+        self.assertEqual(items[0]["corroboration"], rc.CORROBORATION_WEAK)
+
+    def test_the_claim_sentence_is_unchanged(self):
+        """The reconciliation record still says, verbatim, that it is a
+        CLAIM and not a cryptographic verdict. These two new axes are
+        properties beside that sentence, never a promotion of it."""
+        rec = rc.build_record([], 15000, "/nonexistent", None, ())
+        self.assertEqual(
+            rec["presentation"],
+            "CLAIM, not a cryptographic verdict. Render beside the "
+            "PASS/FAIL/UNCHECKED/UNVERIFIABLE ladder, never inside it. "
+            "This record cites receipts and never modifies them.")
+
+
+class TestItem4dThePublicVerifierAgrees(unittest.TestCase):
+    """HAM item 4d: report/verify.py grades the same property, and grades
+    it identically.
+
+    verify.py reimplements the canonical string rather than importing the
+    producer's. A verifier that runs the signer's own code is checking
+    nothing, so the two implementations are held byte-identical by test
+    instead of by shared import."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(ROOT, "report"))
+        import verify
+        self.verify = verify
+        self.sk, self.pk, self.kid = producer_key()
+
+    def _signed(self, **kw):
+        _b, body = rcv.producer_sign_v2(self.sk, self.kid, acct_body(**kw))
+        return body
+
+    def test_the_two_canonical_strings_are_byte_identical(self):
+        body = self._signed()
+        self.assertEqual(rcv.producer_canonical_bytes(body),
+                         self.verify.tacacs_producer_canonical(body))
+
+    def test_the_two_key_ids_agree(self):
+        self.assertEqual(self.verify.tacacs_producer_key_id(self.pk),
+                         self.kid)
+
+    def test_good_signature_verifies(self):
+        status, detail = self.verify.verify_tacacs_producer_signature(
+            self._signed(), self.pk, self.kid)
+        self.assertEqual(status, "VERIFIED", detail)
+
+    def test_tampered_body_fails(self):
+        body = self._signed()
+        body["command_seen"] = "reload"
+        status, _d = self.verify.verify_tacacs_producer_signature(
+            body, self.pk, self.kid)
+        self.assertEqual(status, "FAILED")
+
+    def test_v1_body_is_absent(self):
+        _b, body = rcv.producer_sign(self.sk, acct_body())
+        status, _d = self.verify.verify_tacacs_producer_signature(
+            body, self.pk, self.kid)
+        self.assertEqual(status, "ABSENT")
+
+    def test_wrong_key_fails(self):
+        _sk2, pk2, kid2 = producer_key()
+        status, _d = self.verify.verify_tacacs_producer_signature(
+            self._signed(), pk2, kid2)
+        self.assertEqual(status, "FAILED")
+
+    def test_a_non_accounting_body_is_not_this_property_s_business(self):
+        status, _d = self.verify.verify_tacacs_producer_signature(
+            {"schema": "gate_execution/1"}, self.pk, self.kid)
+        self.assertIsNone(status)
+
+    def test_the_selection_grader_tallies_and_never_touches_the_rollup(self):
+        class FakeV:
+            def __init__(self, body, seq):
+                self.artifact_raw = json.dumps(body).encode()
+                self.entry = {"session_id": "tacacs:ham", "sequence": seq,
+                              "artifact_id": "tacacs:%d" % seq}
+
+        good = self._signed()
+        bad = self._signed()
+        bad["user"] = "eviluser"
+        v1 = rcv.producer_sign(self.sk, acct_body())[1]
+        other = {"schema": "gate_execution/1", "device": "R1"}
+        rows, tally = self.verify.verify_tacacs_producer_signatures(
+            [FakeV(good, 0), FakeV(bad, 1), FakeV(v1, 2), FakeV(other, 3)],
+            self.pk, self.kid)
+        self.assertEqual(tally, {"VERIFIED": 1, "FAILED": 1, "ABSENT": 1})
+        self.assertEqual(len(rows), 3, "a non-accounting entry was counted")
+
+    def test_the_report_cli_exposes_the_flag(self):
+        src = open(os.path.join(ROOT, "report", "virp_report.py")).read()
+        self.assertIn("--tacacs-producer-pubkey", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

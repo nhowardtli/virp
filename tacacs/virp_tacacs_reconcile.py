@@ -34,7 +34,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from virp_tacacs_recv import (ARTIFACT_TYPE, canonical_bytes,
                               chain_append_evidence, producer_load_sk,
-                              producer_sign)
+                              producer_sign, producer_load_pk,
+                              producer_verify, PRODUCER_ABSENT,
+                              PRODUCER_FAILED, PRODUCER_VERIFIED,
+                              SCHEMA_V2)
 
 import virp_tacacs_authz as _az
 
@@ -43,6 +46,69 @@ canonical_for_match = _az.ios_canonical
 
 SCHEMA = "tacacs_reconciliation/1"
 ACCT_SCHEMA = "tacacs_accounting/1"
+ACCT_SCHEMAS = (ACCT_SCHEMA, SCHEMA_V2)
+
+# HAM review 2026-09-06, items 4 and 15. Two INDEPENDENT properties on
+# every accounting record, carried beside the verdict and never folded
+# into it. Correlation is shown for all of them; only the strong end may
+# be called corroboration.
+#
+# `source_strength` — how the bytes reached this receiver:
+#   TLS_AUTHENTICATED     RFC 9887. Nothing emits this yet; the value
+#                         exists so the ladder does not have to be
+#                         renumbered the day something does.
+#   SHARED_SECRET_DECODED the body was obfuscated per RFC 8907 s4.5 and
+#                         the configured secret unwrapped it. The device
+#                         proved it holds the secret.
+#   CLEARTEXT             the device set TAC_PLUS_UNENCRYPTED_FLAG.
+#                         Anyone who can reach the port can write one.
+#   UNCONFIGURED_SOURCE   no relationship configured for that address;
+#                         nothing was decoded and nothing is attributed.
+#   MALFORMED             decoded, but the accounting body did not parse.
+#
+# `tacacs_producer_signature` — whether the RECEIVER's own key stands
+# behind the bytes: VERIFIED / FAILED / ABSENT (see producer_verify).
+#
+# The strong corroboration grade requires SHARED_SECRET_DECODED or better
+# AND the producer signature VERIFIED. Anything else correlates and is
+# labelled `correlated_unauthenticated_source`.
+SOURCE_STRENGTHS = ("TLS_AUTHENTICATED", "SHARED_SECRET_DECODED",
+                    "CLEARTEXT", "UNCONFIGURED_SOURCE", "MALFORMED")
+STRONG_SOURCE = ("TLS_AUTHENTICATED", "SHARED_SECRET_DECODED")
+CORROBORATION_STRONG = "corroborated_by_independent_device_evidence"
+CORROBORATION_WEAK = "correlated_unauthenticated_source"
+
+
+def source_strength(body):
+    """One accounting record's source strength. Reads only the record."""
+    if body.get("tacacs_tls") is True:
+        return "TLS_AUTHENTICATED"
+    decode = body.get("decode")
+    if decode == "NO_SECRET_CONFIGURED":
+        return "UNCONFIGURED_SOURCE"
+    if decode == "CLEARTEXT":
+        return "CLEARTEXT"
+    if decode == "OBFUSCATED_MD5":
+        # A body that decoded but did not parse is not evidence of a
+        # command, whatever else it proves. Said on this axis rather
+        # than silently graded down on another.
+        if body.get("parse") == "MALFORMED":
+            return "MALFORMED"
+        return "SHARED_SECRET_DECODED"
+    return "UNCONFIGURED_SOURCE"
+
+
+def corroboration_grade(strength, producer_status):
+    """Whether this record may be called independent corroboration.
+
+    Both axes must be at their strong end. A cleartext receipt anyone
+    could have written, and a /1 receipt whose producer identity nothing
+    can check, still CORRELATE -- and correlation is shown -- but they
+    are not corroboration and this says which they are."""
+    if strength in STRONG_SOURCE and producer_status == PRODUCER_VERIFIED:
+        return CORROBORATION_STRONG
+    return CORROBORATION_WEAK
+
 # The command-reassembly rules this reconciler knows, BY NAME. The name
 # goes into the record, because reassembly is an interpretation and a
 # reader is entitled to see which one ran.
@@ -129,7 +195,7 @@ def read_chain(db_path):
         if not isinstance(body, dict):
             continue
         schema = body.get("schema")
-        if atype == ARTIFACT_TYPE and schema == ACCT_SCHEMA:
+        if atype == ARTIFACT_TYPE and schema in ACCT_SCHEMAS:
             receipts.append({"session_id": session_id, "sequence": seq,
                              "artifact_id": aid, "timestamp_ns": ts,
                              "body": body})
@@ -371,9 +437,14 @@ def record_class(body):
 
 def reconcile(receipts, gates, windows, match_window_ms,
               horizon_ns=None, authz_decisions=None,
-              breakglass_users=()):
+              breakglass_users=(), producer_pubkey=None,
+              producer_key_id=None):
     """Pair receipts with gate_executions and grade. Returns the list of
-    per-item claims. Nothing here writes anything."""
+    per-item claims. Nothing here writes anything.
+
+    `producer_pubkey` is the receiver's PUBLIC key, pinned by the caller.
+    With it, /2 records grade VERIFIED or FAILED; without it they grade
+    FAILED, and /1 records grade ABSENT either way."""
     window_ns = match_window_ms * 1_000_000
     items = []
     matched_gate_keys = set()
@@ -551,9 +622,20 @@ def reconcile(receipts, gates, windows, match_window_ms,
             final = "BREAKGLASS_USED"
             grade = "RED"
 
+        # The two independent properties (HAM items 4 and 15). Computed
+        # over the REFERENCE receipt of the group, which is the record
+        # every other field here is read from.
+        strength = source_strength(rb)
+        prod_status, prod_detail = producer_verify(rb, producer_pubkey,
+                                                   producer_key_id)
+
         items.append({
             "verdict": final,
             "grade": grade,
+            "source_strength": strength,
+            "tacacs_producer_signature": prod_status,
+            "tacacs_producer_signature_detail": prod_detail,
+            "corroboration": corroboration_grade(strength, prod_status),
             "acct_principal": acct_principal,
             "gate_principal": (candidates[0]["body"].get("device_principal")
                                if len(candidates) == 1 else None),
@@ -598,6 +680,14 @@ def reconcile(receipts, gates, windows, match_window_ms,
             items.append({
                 "verdict": "UNREPORTED",
                 "grade": "NOT_GRADED",
+                # No receipt exists for this row, so neither axis has
+                # anything to describe. Null, never a default that would
+                # read as a measured value.
+                "source_strength": None,
+                "tacacs_producer_signature": None,
+                "tacacs_producer_signature_detail":
+                    "no accounting record for this gate execution",
+                "corroboration": CORROBORATION_WEAK,
                 "acct_principal": None,
                 "gate_principal": g["body"].get("device_principal"),
                 "user": None,
