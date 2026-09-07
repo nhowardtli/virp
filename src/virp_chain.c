@@ -134,11 +134,42 @@ virp_error_t virp_chain_verify(virp_chain_state_t *state,
     return rc;
 }
 
+bool virp_chain_from_n_temporally_ok(uint64_t first_signed_ns,
+                                     uint64_t cutover_ns)
+{
+    /* At or after. A session whose signed suffix starts BEFORE the
+     * earliest signature on the whole chain is not a cutover session --
+     * signing did not exist yet when those entries claim to have been
+     * signed. */
+    if (cutover_ns == 0) return false;   /* nothing signed: no cutover */
+    return first_signed_ns >= cutover_ns;
+}
+
+virp_error_t virp_chain_cutover_ns(virp_chain_state_t *state,
+                                   uint64_t *out_ns)
+{
+    if (!state || !out_ns) return VIRP_ERR_NULL_PTR;
+    *out_ns = 0;
+    if (!state->db || !state->entry_sig_cols) return VIRP_OK;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT MIN(timestamp_ns) FROM chain_entries "
+            "WHERE chain_sig IS NOT NULL AND chain_sig <> ''",
+            -1, &st, NULL) != SQLITE_OK)
+        return VIRP_ERR_CHAIN_DB;
+    if (sqlite3_step(st) == SQLITE_ROW &&
+        sqlite3_column_type(st, 0) != SQLITE_NULL)
+        *out_ns = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return VIRP_OK;
+}
+
 const char *virp_chain_sig_era_name(virp_chain_sig_era_t era)
 {
     switch (era) {
     case VIRP_CHAIN_SIG_ERA_UNSIGNED: return "UNSIGNED_ERA";
-    case VIRP_CHAIN_SIG_ERA_FROM_1:   return "SIGNED_FROM_1";
+    case VIRP_CHAIN_SIG_ERA_FROM_N:   return "SIGNED_FROM_N";
     case VIRP_CHAIN_SIG_ERA_SIGNED:   return "SIGNED";
     default:                          return "NOT_GRADED";
     }
@@ -333,9 +364,27 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
         result->sig_era = VIRP_CHAIN_SIG_ERA_UNSIGNED;
     } else if (result->entries_unsigned == 0) {
         result->sig_era = VIRP_CHAIN_SIG_ERA_SIGNED;
-    } else if (result->entries_unsigned == 1 && result->first_unsigned == 0) {
-        /* The genesis carve-out, and only that. */
-        result->sig_era = VIRP_CHAIN_SIG_ERA_FROM_1;
+    } else if (result->sig_transition_seq > 0 && head_is_signed) {
+        /* An unsigned prefix followed by a signed suffix, with all five
+         * conditions met. Conditions 1, 4 and 5 were enforced during the
+         * walk (a signature that stops is fatal there; a suffix entry
+         * that does not verify is fatal there; the hash chain is checked
+         * for every entry). Condition 3 was enforced just after it.
+         * Condition 2, the signed head, is the one only this level knows,
+         * and it matters: without it the length claim is unauthenticated
+         * and the suffix cannot be said to cover the session. */
+        result->sig_era = VIRP_CHAIN_SIG_ERA_FROM_N;
+    } else if (result->sig_transition_seq > 0 && !head_is_signed) {
+        /* Prefix shape, but the head does not vouch for the length. Not
+         * excused: reported as a failure rather than as a cutover. */
+        result->valid = false;
+        result->sig_era = VIRP_CHAIN_SIG_ERA_NOT_GRADED;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "Unsigned entries before sequence %lld and the head "
+                 "carries no signature: the length claim is "
+                 "unauthenticated, so the signed suffix cannot be said to "
+                 "cover this session",
+                 (long long)result->sig_transition_seq);
     } else {
         /* Reached only when the walk did not already break: defensive. */
         result->sig_era = VIRP_CHAIN_SIG_ERA_NOT_GRADED;
@@ -2630,6 +2679,7 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
     result->to_sequence = to_sequence;
     result->first_broken = -1;
     result->first_unsigned = -1;
+    result->sig_transition_seq = -1;
     result->valid = true;
     /* Tier flags (pure addition). hmac_checked reflects whether K_chain was
      * supplied; sig_checked whether per-entry Ed25519 was actually graded
@@ -2642,6 +2692,9 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
      * applies is a property of THIS SESSION, and that is what decides it
      * now. Asked here rather than only in the session-level entry point
      * so the range API (virp_chain_verify) reaches the same conclusion. */
+    bool unsigned_prefix = false;
+    int64_t first_signed_seq = -1;
+    uint64_t first_signed_ns = 0;
     bool session_signed = false;
     char session_kid[VIRP_CHAINSIGN_KEYID_HEX] = {0};
     chain_session_sig_state_locked(state, session_id, &session_signed,
@@ -2698,6 +2751,7 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
 
     /* Walk entries in range */
     sqlite3_reset(state->stmt_get_range);
+
     sqlite3_bind_text(state->stmt_get_range, 1, session_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(state->stmt_get_range, 2, from_sequence);
     sqlite3_bind_int64(state->stmt_get_range, 3, to_sequence);
@@ -2786,27 +2840,29 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
         if (check_sigs) {
             uint8_t sig[VIRP_CHAINSIGN_SIG_SIZE];
             if (e.chain_sig[0] == '\0') {
-                /* THE GENESIS CARVE-OUT (HAM item 7, reworked).
+                /* THE UNSIGNED-PREFIX CARVE-OUT (SIGNED_FROM_N).
                  *
-                 * Sequence 0 with no signature, in a session whose later
-                 * entries are signed, is the shape a node produces when
-                 * the session was opened before the signing key was
-                 * loaded. It is graded SIGNED_FROM_1 after the walk --
-                 * visibly not VALID -- rather than called a stripped
-                 * signature.
+                 * A session that was open when signing began has a run
+                 * of unsigned entries followed by signed ones. That
+                 * PREFIX is tolerated here and graded after the walk.
                  *
-                 * It is allowed EXACTLY ONCE and EXACTLY at sequence 0.
-                 * A second unsigned entry anywhere, or a first one
-                 * anywhere else, is a gap the verifier cannot distinguish
-                 * from a stripped signature, so it stays fatal. That is
-                 * deliberate: 313's 30 cutover-spanning sessions have
-                 * runs of unsigned entries and MUST NOT be excused. */
+                 * Tolerated ONLY while no signed entry has been seen
+                 * yet. The moment one has, an unsigned entry means the
+                 * signatures STOPPED, and a verifier cannot tell that
+                 * from a stripped run -- so it is fatal, immediately.
+                 * That is what keeps 313's autopilot:2026-08-23
+                 * (signed through 23, unsigned 24-35, signed from 36)
+                 * BROKEN forever. See
+                 * docs/notes/SIGNING-WINDOW-2026-08-23.md. */
                 result->entries_unsigned++;
                 if (result->first_unsigned < 0)
                     result->first_unsigned = e.sequence;
-                if (e.sequence == 0 && result->entries_unsigned == 1) {
-                    /* Carry on; the era decides at the end. The entry's
-                     * hash, link and HMAC were all checked above. */
+                if (result->entries_signed == 0) {
+                    /* Still inside the prefix. The entry's hash, link
+                     * and HMAC were all checked above; only the
+                     * signature is absent, and the era decides at the
+                     * end whether that is excusable. */
+                    unsigned_prefix = true;
                     goto sig_done;
                 }
                 result->valid = false;
@@ -2836,6 +2892,10 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                          "Ed25519 signature verification failed at "
                          "sequence %lld", (long long)e.sequence);
                 break;
+            }
+            if (first_signed_seq < 0) {
+                first_signed_seq = e.sequence;
+                first_signed_ns = e.timestamp_ns;
             }
             result->entries_signed++;
 sig_done: ;
@@ -2920,6 +2980,29 @@ sig_done: ;
     }
 
     sqlite3_reset(state->stmt_get_range);
+    /* CONDITION 3 of SIGNED_FROM_N. A session with an unsigned prefix is
+     * a cutover session only if its signed suffix starts at or after the
+     * moment signing began on this chain. The instant is read from the
+     * chain, never from a flag: a caller-supplied one would let whoever
+     * supplies it decide which unsigned prefixes get excused. */
+    if (result->valid && unsigned_prefix && first_signed_seq > 0) {
+        uint64_t cut = 0;
+        if (virp_chain_cutover_ns(state, &cut) != VIRP_OK) {
+            result->valid = false;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "VERIFIER_ERROR: could not read the cutover instant");
+        } else if (!virp_chain_from_n_temporally_ok(first_signed_ns, cut)) {
+            result->valid = false;
+            result->first_broken = first_signed_seq;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "Unsigned entries before sequence %lld, but the first "
+                     "signed entry predates the earliest signature on this "
+                     "chain: this is not a signing cutover",
+                     (long long)first_signed_seq);
+        } else {
+            result->sig_transition_seq = first_signed_seq;
+        }
+    }
 
     /* COMPLETENESS: every sequence in [from, to] must have been verified.
      * Middle deletions are caught by the sequence-gap check above, but a

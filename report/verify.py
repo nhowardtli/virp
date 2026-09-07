@@ -160,8 +160,12 @@ UNVERIFIABLE = "UNVERIFIABLE"
 # cannot describe one session with different words.
 #
 #   SIGNED         every entry carries a verifying signature. Clean.
-#   SIGNED_FROM_1  sequence 0 unsigned, every later entry signed and
-#                  verifying. The genesis entry predates the key. NOT clean.
+#   SIGNED_FROM_N  an unsigned PREFIX followed by a signed suffix: the
+#                  session was open across the moment signing began. Every
+#                  condition in include/virp_chain.h must hold, including
+#                  that the first signed entry is at or after the cutover
+#                  instant derived from the chain. Carries the transition
+#                  sequence. NOT clean.
 #   UNSIGNED_ERA   no signature anywhere, head unsigned. Nothing was
 #                  stripped because nothing was ever there. NOT clean.
 #
@@ -169,7 +173,7 @@ UNVERIFIABLE = "UNVERIFIABLE"
 # FAIL: the verifier cannot tell a cutover gap from a stripped signature
 # by looking at the entry, so it does not try.
 SIG_ERA_SIGNED = "SIGNED"
-SIG_ERA_FROM_1 = "SIGNED_FROM_1"
+SIG_ERA_FROM_N = "SIGNED_FROM_N"
 SIG_ERA_UNSIGNED = "UNSIGNED_ERA"
 
 # VERIFIER_ERROR (HAM review 2026-09-06, item 13). THE VERIFIER FAILED,
@@ -484,6 +488,11 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
     precisely so a caller testing `== PASS` cannot be handed a session
     whose signatures do not cover it. `heads` maps session_id -> row dict (may be None)."""
     want_kid = chainsign_key_id(pub)
+    # THE CUTOVER INSTANT, from the chain itself: the earliest timestamp
+    # on any signed entry in the selection. Mirrors virp_chain_cutover_ns.
+    _signed_ts = [e.get("timestamp_ns") for e in entries
+                  if e.get("chain_sig") and e.get("timestamp_ns") is not None]
+    cutover_ns = min(_signed_ts) if _signed_ts else None
     by_session = {}
     for e in entries:
         by_session.setdefault(e["session_id"], []).append(e)
@@ -544,10 +553,13 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
         # a second gap, or a first one elsewhere, is indistinguishable
         # from a stripped signature and stays a FAIL.
         unsigned_seqs = []
+        signed_seen = 0
+        first_signed_ns = None
         for e in rows:
             if not e.get("chain_sig"):
                 unsigned_seqs.append(e["sequence"])
-                if e["sequence"] == 0 and len(unsigned_seqs) == 1:
+                if signed_seen == 0:
+                    # still inside the unsigned PREFIX; the era decides
                     continue
                 verdict, detail = FAIL, ("stripped signature at sequence %d"
                                          % e["sequence"])
@@ -567,17 +579,35 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
                                          % (e["sequence"], ed))
                 break
             signed += 1
+            signed_seen += 1
+            if first_signed_ns is None:
+                first_signed_ns = e.get("timestamp_ns")
         # PASS keeps its meaning -- a clean, fully signed session -- so
         # existing callers are untouched. The genesis carve-out gets its
         # OWN verdict, because a caller testing `== PASS` must not be
         # handed a session whose first entry nothing covers.
         era = SIG_ERA_SIGNED
-        if verdict == PASS and unsigned_seqs == [0]:
-            verdict = SIG_ERA_FROM_1
-            era = SIG_ERA_FROM_1
-            detail = ("sequence 0 carries no signature; every later entry "
-                      "is signed and verified")
+        if verdict == PASS and unsigned_seqs:
+            # An unsigned PREFIX, contiguous from sequence 0, with every
+            # later entry signed and verified. Condition 3, the cutover
+            # instant, is checked against the whole selection -- the same
+            # question the C verifier asks of the whole database.
+            contiguous = unsigned_seqs == list(range(len(unsigned_seqs)))
+            after_cutover = (cutover_ns is None or first_signed_ns is None
+                             or first_signed_ns >= cutover_ns)
+            if contiguous and head_signed and after_cutover:
+                verdict = SIG_ERA_FROM_N
+                era = SIG_ERA_FROM_N
+                detail = ("sequences 0..%d carry no signature; every later "
+                          "entry is signed and verified"
+                          % (len(unsigned_seqs) - 1))
+            else:
+                verdict, era = FAIL, "NOT_GRADED"
+                detail = ("unsigned entries %s do not form a cutover prefix"
+                          % unsigned_seqs[:8])
         out[sid] = {"sig_era": era, "verdict": verdict, "detail": detail,
+                    "sig_transition_seq": (len(unsigned_seqs)
+                                           if era == SIG_ERA_FROM_N else -1),
                     "entries_signed": signed, "entries_total": len(rows),
                     "sig_key_id": sess_kid}
     return out

@@ -349,15 +349,15 @@ static void test_all_unsigned_is_not_valid(void)
 
 static void test_unsigned_genesis_then_all_signed(void)
 {
-    TEST("era: seq 0 unsigned, every later entry signed -> SIGNED_FROM_1");
+    TEST("era: seq 0 unsigned, every later entry signed -> SIGNED_FROM_N");
     cleanup(); make_chain_key(); make_sign_key();
     build_patterned_session("s-gen", "uSSS");
 
     virp_chain_verify_result_t r;
     verdict_of("s-gen", &r);
     ASSERT(r.valid, "the chain itself is intact");
-    ASSERT(r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_1,
-           "must be SIGNED_FROM_1, visibly not VALID");
+    ASSERT(r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_N,
+           "must be SIGNED_FROM_N, visibly not VALID");
     ASSERT(!r.valid_signed, "not a fully signed session");
     ASSERT(r.entries_signed == 3 && r.entries_unsigned == 1,
            "three signed, one unsigned");
@@ -368,7 +368,7 @@ static void test_unsigned_genesis_then_all_signed(void)
 
 static void test_gap_after_genesis_is_broken(void)
 {
-    TEST("era: an unsigned entry anywhere but seq 0 stays BROKEN");
+    TEST("era: an unsigned entry after a signed one stays BROKEN");
     cleanup(); make_chain_key(); make_sign_key();
     build_patterned_session("s-gap", "SSuS");
 
@@ -376,7 +376,7 @@ static void test_gap_after_genesis_is_broken(void)
     verdict_of("s-gap", &r);
     ASSERT(!r.valid, "a mid-session signature gap is a FAILURE");
     ASSERT(r.first_broken == 2, "must name the gap");
-    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_1,
+    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_N,
            "a mid-session gap is not the genesis carve-out");
     cleanup();
     PASS();
@@ -386,29 +386,38 @@ static void test_unsigned_genesis_plus_later_gap_is_broken(void)
 {
     TEST("era: seq 0 unsigned AND a later gap stays BROKEN");
     cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-cut", "SSS");
     build_patterned_session("s-two", "uSuS");
 
     virp_chain_verify_result_t r;
     verdict_of("s-two", &r);
     ASSERT(!r.valid, "two unsigned entries is not the genesis carve-out");
-    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_1,
-           "the carve-out is EXACTLY one unsigned entry, at seq 0");
+    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_N,
+           "the carve-out is one CONTIGUOUS prefix; a signature that stops "
+           "after resuming is a gap, not a cutover");
     cleanup();
     PASS();
 }
 
-static void test_the_313_mixed_shape_stays_broken(void)
+static void test_the_313_mixed_shape_is_from_n(void)
 {
-    TEST("era: 313's MIXED cutover shape stays BROKEN under the real key");
+    TEST("era: 313's MIXED cutover shape is SIGNED_FROM_N, not VALID");
     cleanup(); make_chain_key(); make_sign_key();
-    /* gate-enforce:R1 on 313: unsigned run, then signed run, head signed. */
+    /* gate-enforce:R1 on 313: unsigned run, then signed run, head signed.
+     * 29 of 313's sessions have exactly this shape. Under the FROM_N
+     * rules they are a cutover, not a gap -- but they are still NOT
+     * clean, and must never read as VALID. */
+    build_patterned_session("s-cut", "SSS");
     build_patterned_session("s-mix313", "uuuuuSSSSS");
 
     virp_chain_verify_result_t r;
     verdict_of("s-mix313", &r);
-    ASSERT(!r.valid,
-           "a session that spans the cutover has real gaps and must not "
-           "be quietly excused");
+    ASSERT(r.valid, "the chain is intact across the transition");
+    ASSERT(r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_N,
+           "a single unsigned->signed transition is a cutover session");
+    ASSERT(!r.valid_signed,
+           "it is NOT a clean signed session and must not read as one");
+    ASSERT(r.sig_transition_seq == 5, "transition at sequence 5");
     ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_UNSIGNED,
            "it is not an unsigned-era session: it carries signatures");
     cleanup();
@@ -431,14 +440,286 @@ static void test_fully_signed_is_still_plain_valid(void)
     PASS();
 }
 
+/* =====================================================================
+ * SIGNED_FROM_N (2026-09-07). An unsigned PREFIX followed by a signed
+ * suffix, which is what 29 of 313's sessions actually are: they were
+ * open across the 2026-08-23 17:56:58Z cutover.
+ *
+ * Every one of these conditions must hold, or the session is BROKEN:
+ *
+ *   1. exactly ONE transition, and it is unsigned -> signed. Never
+ *      signed -> unsigned, and never more than one.
+ *   2. the head is signed.
+ *   3. the first signed entry's timestamp is at or after the CUTOVER
+ *      INSTANT, derived from the chain itself (the earliest signature
+ *      anywhere in the database), never from a flag or config.
+ *   4. every entry after the transition verifies under the pinned key.
+ *   5. the hash chain is intact across the transition.
+ *
+ * SIGNED_FROM_1 from the previous commit is the degenerate case of this
+ * (transition at sequence 1) and is folded in: one era value, always
+ * carrying the transition sequence, rather than two names for one idea.
+ * ===================================================================== */
+
+static void test_from_n_unsigned_prefix_then_signed(void)
+{
+    TEST("from_n: unsigned prefix then signed suffix -> SIGNED_FROM_N");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-cut", "SSS");        /* sets the cutover */
+    build_patterned_session("s-n", "uuuSSSS");
+
+    virp_chain_verify_result_t r;
+    verdict_of("s-n", &r);
+    ASSERT(r.valid, "the chain itself is intact");
+    ASSERT(r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_N,
+           "an unsigned prefix then a signed suffix is SIGNED_FROM_N");
+    ASSERT(!r.valid_signed, "not a fully signed session");
+    ASSERT(r.sig_transition_seq == 3,
+           "the transition sequence must be reported");
+    ASSERT(r.entries_unsigned == 3 && r.entries_signed == 4,
+           "three unsigned, four signed");
+    cleanup();
+    PASS();
+}
+
+static void test_from_1_is_the_degenerate_from_n(void)
+{
+    TEST("from_n: a single unsigned genesis is FROM_N at transition 1");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-cut", "SSS");
+    build_patterned_session("s-1", "uSSS");
+
+    virp_chain_verify_result_t r;
+    verdict_of("s-1", &r);
+    ASSERT(r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_N, "same era, k=1");
+    ASSERT(r.sig_transition_seq == 1, "transition at sequence 1");
+    cleanup();
+    PASS();
+}
+
+static void test_signed_then_unsigned_is_broken(void)
+{
+    TEST("from_n: signed THEN unsigned is BROKEN (condition 1)");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-rev", "SSSuu");
+
+    virp_chain_verify_result_t r;
+    verdict_of("s-rev", &r);
+    ASSERT(!r.valid, "a signature that stops is indistinguishable from one "
+                     "that was stripped");
+    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_N, "never FROM_N");
+    cleanup();
+    PASS();
+}
+
+static void test_signed_unsigned_signed_is_broken(void)
+{
+    TEST("from_n: SIGNED-UNSIGNED-SIGNED is BROKEN (autopilot:2026-08-23)");
+    cleanup(); make_chain_key(); make_sign_key();
+    /* The exact shape of autopilot:2026-08-23 on 313: signed through
+     * sequence 23, unsigned 24-35, signed from 36. Two transitions.
+     * See docs/notes/SIGNING-WINDOW-2026-08-23.md. */
+    build_patterned_session("s-auto", "SSSSuuuuSSSS");
+
+    virp_chain_verify_result_t r;
+    verdict_of("s-auto", &r);
+    ASSERT(!r.valid, "two transitions is BROKEN, permanently and by design");
+    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_N,
+           "a restart window is indistinguishable from a stripped run");
+    ASSERT(r.first_broken == 4, "must name the first unsigned entry");
+    cleanup();
+    PASS();
+}
+
+static void test_no_flag_can_excuse_signed_unsigned_signed(void)
+{
+    TEST("from_n: NO tier combination grades SIGNED-UNSIGNED-SIGNED clean");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-auto2", "SSSSuuuuSSSS");
+
+    /* Every combination of the three verifier tiers. The keyless and
+     * symmetric tiers do not look at signatures at all, so they report
+     * VALID -- that is correct and is why the ERA is a separate axis:
+     * whenever the asymmetric tier runs, this shape is BROKEN, and when
+     * it does not run the era says NOT_GRADED rather than implying the
+     * signatures were fine. */
+    const char *keys[]  = { NULL, CK, NULL, CK };
+    const char *pubs[]  = { NULL, NULL, PK, PK };
+    for (int i = 0; i < 4; i++) {
+        virp_chain_state_t v;
+        if (virp_chain_open_verifier_ex(&v, DB, keys[i], pubs[i], 1, "local")
+            != VIRP_OK) { FAILM("open verifier"); return; }
+        virp_chain_verify_result_t r;
+        if (virp_chain_verify_session(&v, "s-auto2", &r) != VIRP_OK) {
+            virp_chain_destroy(&v); FAILM("verify"); return;
+        }
+        if (pubs[i]) {
+            ASSERT(!r.valid, "with the pubkey it MUST be BROKEN");
+            ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_N, "never FROM_N");
+        } else {
+            ASSERT(r.sig_era == VIRP_CHAIN_SIG_ERA_NOT_GRADED,
+                   "without the pubkey the era must claim nothing");
+            ASSERT(!r.valid_signed, "and must never read as cleanly signed");
+        }
+        virp_chain_destroy(&v);
+    }
+    cleanup();
+    PASS();
+}
+
+static void test_unsigned_head_is_not_from_n(void)
+{
+    TEST("from_n: an unsigned head is not FROM_N (condition 2)");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-cut", "SSS");
+    build_patterned_session("s-uh", "uuSS");
+    /* Blank the head signature, leaving the entries as they are. */
+    {
+        sqlite3 *db = NULL;
+        if (sqlite3_open(DB, &db) != SQLITE_OK) { FAILM("open"); return; }
+        sqlite3_exec(db, "UPDATE chain_heads SET head_sig='', "
+                         "head_sig_key_id='' WHERE session_id='s-uh'",
+                     NULL, NULL, NULL);
+        sqlite3_close(db);
+    }
+    virp_chain_verify_result_t r;
+    verdict_of("s-uh", &r);
+    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_N,
+           "without a signed head the length claim is unauthenticated, so "
+           "the suffix cannot be said to cover the session");
+    cleanup();
+    PASS();
+}
+
+static void test_cutover_is_derived_from_the_chain(void)
+{
+    TEST("from_n: the cutover instant comes from the chain, not a flag");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-first", "SS");
+    build_patterned_session("s-later", "uuSS");
+
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, CK, PK, 1, "local") == VIRP_OK,
+           "open");
+    uint64_t cut = 0;
+    ASSERT(virp_chain_cutover_ns(&v, &cut) == VIRP_OK, "cutover query");
+    ASSERT(cut != 0, "a chain with signatures has a cutover instant");
+
+    /* It must equal the earliest signed entry in the whole database. */
+    sqlite3_stmt *st = NULL;
+    uint64_t expect = 0;
+    if (sqlite3_prepare_v2(v.db, "SELECT MIN(timestamp_ns) FROM chain_entries "
+                                 "WHERE chain_sig IS NOT NULL AND chain_sig<>''",
+                           -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW)
+            expect = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    ASSERT(cut == expect, "cutover must be MIN(timestamp) over signed entries");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
+static void test_a_suffix_predating_the_cutover_is_broken(void)
+{
+    TEST("from_n: a signed suffix predating the cutover is refused (cond 3)");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-cut", "SSS");
+    build_patterned_session("s-pre", "uuSS");
+
+    /* The predicate, directly: a session whose first signed entry sits
+     * before the chain's earliest signature cannot be a cutover session.
+     * The shape cannot be built through the append path -- the clock only
+     * moves forward -- and forging it would break the signature that
+     * condition 4 checks first. So the rule is asserted on the predicate
+     * that implements it, with the live 313 chain (29 of 29 sessions
+     * satisfying it) as the integration evidence. */
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v, DB, CK, PK, 1, "local") == VIRP_OK,
+           "open");
+    uint64_t cut = 0;
+    virp_chain_cutover_ns(&v, &cut);
+    ASSERT(!virp_chain_from_n_temporally_ok(cut - 1, cut),
+           "a first-signed BEFORE the cutover must be refused");
+    ASSERT(virp_chain_from_n_temporally_ok(cut, cut),
+           "exactly at the cutover is accepted");
+    ASSERT(virp_chain_from_n_temporally_ok(cut + 1, cut),
+           "after the cutover is accepted");
+    virp_chain_destroy(&v);
+    cleanup();
+    PASS();
+}
+
+static void test_a_bad_signature_after_the_transition_is_broken(void)
+{
+    TEST("from_n: a suffix entry that does not verify is BROKEN (cond 4)");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-cut", "SSS");
+    build_patterned_session("s-bad", "uuSSS");
+    {
+        sqlite3 *db = NULL;
+        if (sqlite3_open(DB, &db) != SQLITE_OK) { FAILM("open"); return; }
+        /* Corrupt one signature in the SUFFIX. */
+        sqlite3_exec(db, "UPDATE chain_entries SET chain_sig="
+                         "'00000000000000000000000000000000"
+                         "00000000000000000000000000000000"
+                         "00000000000000000000000000000000"
+                         "00000000000000000000000000000000' "
+                         "WHERE session_id='s-bad' AND sequence=3",
+                     NULL, NULL, NULL);
+        sqlite3_close(db);
+    }
+    virp_chain_verify_result_t r;
+    verdict_of("s-bad", &r);
+    ASSERT(!r.valid, "a suffix signature that does not verify is fatal");
+    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_N, "never FROM_N");
+    cleanup();
+    PASS();
+}
+
+static void test_a_broken_hash_across_the_transition_is_broken(void)
+{
+    TEST("from_n: a broken hash across the transition is BROKEN (cond 5)");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-cut", "SSS");
+    build_patterned_session("s-hash", "uuSSS");
+    {
+        sqlite3 *db = NULL;
+        if (sqlite3_open(DB, &db) != SQLITE_OK) { FAILM("open"); return; }
+        sqlite3_exec(db, "UPDATE chain_entries SET previous_entry_hash="
+                         "'dead000000000000000000000000000000000000"
+                         "000000000000000000000000' "
+                         "WHERE session_id='s-hash' AND sequence=2",
+                     NULL, NULL, NULL);
+        sqlite3_close(db);
+    }
+    virp_chain_verify_result_t r;
+    verdict_of("s-hash", &r);
+    ASSERT(!r.valid, "linkage across the transition must hold");
+    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_N, "never FROM_N");
+    cleanup();
+    PASS();
+}
+
 int main(void)
 {
     printf("\n=== VIRP chain-signing MIGRATION tests (HAM item 7) ===\n");
+    test_from_n_unsigned_prefix_then_signed();
+    test_from_1_is_the_degenerate_from_n();
+    test_signed_then_unsigned_is_broken();
+    test_signed_unsigned_signed_is_broken();
+    test_no_flag_can_excuse_signed_unsigned_signed();
+    test_unsigned_head_is_not_from_n();
+    test_cutover_is_derived_from_the_chain();
+    test_a_suffix_predating_the_cutover_is_broken();
+    test_a_bad_signature_after_the_transition_is_broken();
+    test_a_broken_hash_across_the_transition_is_broken();
     test_all_unsigned_is_not_valid();
     test_unsigned_genesis_then_all_signed();
     test_gap_after_genesis_is_broken();
     test_unsigned_genesis_plus_later_gap_is_broken();
-    test_the_313_mixed_shape_stays_broken();
+    test_the_313_mixed_shape_is_from_n();
     test_fully_signed_is_still_plain_valid();
     test_presigning_session_passes_with_pubkey();
     test_postsigning_session_still_verifies();

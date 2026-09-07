@@ -1650,15 +1650,17 @@ static void chain_verify_print(const char *sess,
     if (r->valid) {
         switch (r->sig_era) {
         case VIRP_CHAIN_SIG_ERA_UNSIGNED: verdict = "UNSIGNED_ERA";  break;
-        case VIRP_CHAIN_SIG_ERA_FROM_1:   verdict = "SIGNED_FROM_1"; break;
+        case VIRP_CHAIN_SIG_ERA_FROM_N:   verdict = "SIGNED_FROM_N"; break;
         default:                          verdict = "VALID";         break;
         }
     }
     printf("%-32s %-13s  entries=%lld to_seq=%lld",
            sess, verdict,
            (long long)r->entries_checked, (long long)r->to_sequence);
-    if (r->sig_era == VIRP_CHAIN_SIG_ERA_FROM_1)
-        printf(" unsigned_genesis=seq0");
+    if (r->sig_era == VIRP_CHAIN_SIG_ERA_FROM_N)
+        printf(" signed_from=seq%lld unsigned_prefix=%lld",
+               (long long)r->sig_transition_seq,
+               (long long)r->entries_unsigned);
     if (r->sig_era == VIRP_CHAIN_SIG_ERA_UNSIGNED)
         printf(" signed_entries=0");
 
@@ -1801,7 +1803,7 @@ static int chain_verify_offline(const char *db_path, const char *key_path,
         sessions = 1;
         if (!r.valid) broken++;
         else if (r.sig_era == VIRP_CHAIN_SIG_ERA_UNSIGNED ||
-                 r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_1) unclean++;
+                 r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_N) unclean++;
         chain_verify_print(only_session, &r);
     } else {
         /* Enumerate sessions with a second read-only handle; the public
@@ -1837,7 +1839,7 @@ static int chain_verify_offline(const char *db_path, const char *key_path,
             sessions++;
             if (!r.valid) broken++;
             else if (r.sig_era == VIRP_CHAIN_SIG_ERA_UNSIGNED ||
-                     r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_1) unclean++;
+                     r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_N) unclean++;
             chain_verify_print(sess, &r);
         }
         sqlite3_finalize(st);
@@ -1889,7 +1891,8 @@ static void chain_verify_usage(void)
         "                 material is loaded. This is the third-party path.\n"
         "Exit: 0 clean (every session VALID, era SIGNED); 1 a session is\n"
         "      BROKEN; 3 nothing broken but a session is UNSIGNED_ERA or\n"
-        "      SIGNED_FROM_1 (intact, but its signatures do not cover it).\n"
+        "      SIGNED_FROM_N (intact, but its signatures do not cover all\n"
+        "      of it).\n"
         "\n"
         "  --keyless      KEYLESS: hash+link+completeness only. Required to\n"
         "                 run with NEITHER key (so a keyless run is a\n"

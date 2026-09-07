@@ -71,12 +71,14 @@ typedef struct {
 typedef enum {
     VIRP_CHAIN_SIG_ERA_NOT_GRADED = 0,
     VIRP_CHAIN_SIG_ERA_UNSIGNED   = 1,
-    VIRP_CHAIN_SIG_ERA_FROM_1     = 2,
+    VIRP_CHAIN_SIG_ERA_FROM_N     = 2,
     VIRP_CHAIN_SIG_ERA_SIGNED     = 3,
 } virp_chain_sig_era_t;
 
-/* Stable lowercase name for an era, for output and JSON. Never NULL. */
+/* Stable name for an era, for output and JSON. Never NULL. */
 const char *virp_chain_sig_era_name(virp_chain_sig_era_t era);
+
+
 
 typedef struct {
     bool     valid;
@@ -149,10 +151,20 @@ typedef struct {
      *   UNSIGNED    no signature on any entry and none on the head. There
      *               is nothing to strip because nothing was ever there.
      *               Provably a pre-signing session. NOT clean.
-     *   FROM_1      sequence 0 carries no signature; EVERY later entry
-     *               does, and every one verified, and the head is signed.
-     *               The genesis entry predates the key; everything after
-     *               it is covered. NOT clean.
+     *   FROM_N      an unsigned PREFIX followed by a signed suffix: the
+     *               session was open across the moment signing began.
+     *               Allowed only when EVERY one of these holds, each
+     *               pinned by its own test:
+     *                 1. exactly ONE transition, unsigned -> signed.
+     *                    Never signed -> unsigned, never two.
+     *                 2. the head is signed.
+     *                 3. the first signed entry is at or after the
+     *                    CUTOVER INSTANT, derived from the chain itself
+     *                    (virp_chain_cutover_ns), never from a flag.
+     *                 4. every entry after the transition verifies.
+     *                 5. the hash chain is intact across the transition.
+     *               sig_transition_seq carries where it happened.
+     *               NOT clean.
      *   SIGNED      every entry carries a verifying signature. Clean.
      *
      * Any other shape -- a gap anywhere but sequence 0, or sequence 0
@@ -168,6 +180,7 @@ typedef struct {
     virp_chain_sig_era_t sig_era;
     bool     valid_signed;      /* valid && sig_era == SIGNED */
     int64_t  first_unsigned;    /* lowest unsigned sequence, or -1 */
+    int64_t  sig_transition_seq;/* FROM_N: first SIGNED sequence, else -1 */
     char     sig_key_id[VIRP_CHAINSIGN_KEYID_HEX]; /* the session's signing
                                  * key_id as read from the head/entries, or
                                  * "" if the session is unsigned            */
@@ -571,6 +584,30 @@ virp_error_t virp_chain_verify(virp_chain_state_t *state,
  *
  * result->to_sequence is set to the head's last_sequence.
  */
+/*
+ * THE CUTOVER INSTANT: the timestamp of the earliest signed entry
+ * anywhere in this database, or 0 when nothing is signed.
+ *
+ * Derived from the chain, never from a flag or a config value, because
+ * the question SIGNED_FROM_N asks is "was this session open when signing
+ * began", and only the chain can answer it. A caller-supplied instant
+ * would let whoever supplies it decide which unsigned prefixes are
+ * excused.
+ */
+virp_error_t virp_chain_cutover_ns(virp_chain_state_t *state,
+                                   uint64_t *out_ns);
+
+/*
+ * Condition 3 of SIGNED_FROM_N, as a predicate: may a session whose
+ * first signed entry is at `first_signed_ns` be treated as a cutover
+ * session, given `cutover_ns`? Exposed so the rule is testable on its
+ * own -- the shape cannot be produced through the append path, because
+ * the clock only moves forward and forging it breaks the signature that
+ * condition 4 checks first.
+ */
+bool virp_chain_from_n_temporally_ok(uint64_t first_signed_ns,
+                                     uint64_t cutover_ns);
+
 virp_error_t virp_chain_verify_session(virp_chain_state_t *state,
                                        const char *session_id,
                                        virp_chain_verify_result_t *result);
