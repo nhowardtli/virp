@@ -146,6 +146,18 @@ static bool json_extract_string_cjson(cJSON *root, const char *key,
 }
 
 /*
+ * CANONICAL-STRING CONFORMANCE at the request boundary (HAM item 12).
+ * The one validator lives in src/virp_chain.c, next to the canonicalizer
+ * it protects; this is the ingress calling it, so a client learns its
+ * request was refused rather than discovering later that the chain
+ * recorded a different string than the one it sent.
+ */
+static bool onode_canonical_string_ok(const char *s)
+{
+    return virp_chain_canonical_string_ok(s);
+}
+
+/*
  * The typed-operation profile a device's driver declares, or NULL.
  *
  * Single resolver so the three places that bind a command to a hash —
@@ -513,6 +525,22 @@ static bool parse_request(const char *json, onode_request_t *req)
      * recorded a different string than the one it sent. Absent is fine:
      * these are optional for the actions that do not use them.
      */
+    {
+        /* Refused BEFORE the copy, on the raw value, so truncation can
+         * never disguise a non-conformant string (HAM item 12). */
+        static const char *const CANON_KEYS[] = {
+            "session_id", "artifact_type", "artifact_id",
+        };
+        for (size_t i = 0; i < sizeof(CANON_KEYS)/sizeof(CANON_KEYS[0]); i++) {
+            cJSON *it = cJSON_GetObjectItemCaseSensitive(root, CANON_KEYS[i]);
+            if (!it) continue;
+            if (!cJSON_IsString(it) || !it->valuestring ||
+                !onode_canonical_string_ok(it->valuestring)) {
+                cJSON_Delete(root);
+                return false;
+            }
+        }
+    }
     if (cJSON_GetObjectItemCaseSensitive(root, "session_id") &&
         !EXTRACT_STR("session_id", req->session_id,
                      sizeof(req->session_id))) {

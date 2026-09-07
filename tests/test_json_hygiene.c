@@ -132,11 +132,129 @@ static void item10(void)
          "the legacy spelling was refused");
 }
 
+/* --------------------------------------------------------------- 12 -- */
+
+static void item12(void)
+{
+    TEST("12: the validator accepts an ordinary id");
+    WANT(virp_chain_canonical_string_ok("gate-enforce:R1"), "rejected");
+
+    TEST("12: a double quote is refused");
+    WANT(!virp_chain_canonical_string_ok("a\"b"), "quote accepted");
+
+    TEST("12: a backslash is refused");
+    WANT(!virp_chain_canonical_string_ok("a\\b"), "backslash accepted");
+
+    TEST("12: a control byte is refused");
+    WANT(!virp_chain_canonical_string_ok("a\nb"), "newline accepted");
+
+    TEST("12: DEL (0x7F) is refused");
+    WANT(!virp_chain_canonical_string_ok("a\x7f" "b"), "DEL accepted");
+
+    TEST("12: well-formed UTF-8 is accepted");
+    WANT(virp_chain_canonical_string_ok("R\xc3\xa9seau"), "UTF-8 rejected");
+
+    TEST("12: a truncated UTF-8 sequence is refused");
+    WANT(!virp_chain_canonical_string_ok("a\xc3"), "bad UTF-8 accepted");
+
+    TEST("12: an over-long UTF-8 encoding is refused");
+    WANT(!virp_chain_canonical_string_ok("\xc0\xaf"), "over-long accepted");
+
+    TEST("12: a UTF-16 surrogate encoded in UTF-8 is refused");
+    WANT(!virp_chain_canonical_string_ok("\xed\xa0\x80"),
+         "surrogate accepted");
+
+    TEST("12: a lone continuation byte is refused");
+    WANT(!virp_chain_canonical_string_ok("\x80"), "continuation accepted");
+
+    /* The ingress, not just the predicate. */
+    TEST("12: a quoted session_id is refused at the ingress");
+    WANT(!parse("{\"action\":\"chain_append\",\"session_id\":\"a\\\"b\","
+                "\"artifact_type\":\"observation\",\"artifact_id\":\"a\","
+                "\"artifact_hash\":\"" S63 "a\"}"),
+         "a session_id the canonical form cannot carry was accepted");
+
+    TEST("12: a quoted artifact_id is refused at the ingress");
+    WANT(!parse("{\"action\":\"chain_append\",\"session_id\":\"s\","
+                "\"artifact_type\":\"observation\","
+                "\"artifact_id\":\"a\\\"b\","
+                "\"artifact_hash\":\"" S63 "a\"}"),
+         "a quoted artifact_id was accepted");
+
+    TEST("12: a backslash in artifact_type is refused at the ingress");
+    WANT(!parse("{\"action\":\"chain_append\",\"session_id\":\"s\","
+                "\"artifact_type\":\"obs\\\\x\",\"artifact_id\":\"a\","
+                "\"artifact_hash\":\"" S63 "a\"}"),
+         "a backslash in artifact_type was accepted");
+}
+
+/* --------------------------------------------------------------- 12 -- */
+/* The append path, which is where the malformed canonical form was built. */
+
+static const char *DB = "/tmp/virp_test_jsonhygiene.db";
+static const char *CK = "/tmp/virp_test_jsonhygiene.key";
+
+static void item12_append(void)
+{
+    unlink(DB);
+    unlink("/tmp/virp_test_jsonhygiene.db-wal");
+    unlink("/tmp/virp_test_jsonhygiene.db-shm");
+    unlink(CK);
+
+    virp_signing_key_t k;
+    virp_key_generate(&k, VIRP_KEY_TYPE_CHAIN);
+    virp_key_save_file(&k, CK);
+    virp_key_destroy(&k);
+
+    virp_chain_state_t st;
+    if (virp_chain_init(&st, DB, CK, 1, "local") != VIRP_OK) {
+        TEST("12: append refuses a non-conformant session_id");
+        BAD("chain init failed");
+        return;
+    }
+
+    virp_chain_entry_t e;
+    const char *H =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    TEST("12: append refuses a session_id carrying a quote");
+    WANT(virp_chain_append(&st, "sess\"ion", "observation", "a-0", H, &e)
+             != VIRP_OK,
+         "a quoted session_id reached the canonical object");
+
+    TEST("12: append refuses an artifact_id carrying a backslash");
+    WANT(virp_chain_append(&st, "sess", "observation", "a\\0", H, &e)
+             != VIRP_OK,
+         "a backslashed artifact_id reached the canonical object");
+
+    TEST("12: a conformant append still succeeds");
+    WANT(virp_chain_append(&st, "sess", "observation", "a-0", H, &e)
+             == VIRP_OK,
+         "the validator refused a legitimate append");
+
+    TEST("12: an org_id carrying a quote is refused at init");
+    {
+        virp_chain_state_t bad;
+        WANT(virp_chain_init(&bad, "/tmp/virp_test_jsonhygiene2.db", CK, 1,
+                             "or\"g") != VIRP_OK,
+             "a non-conformant org_id would taint every entry this node writes");
+    }
+
+    virp_chain_destroy(&st);
+    unlink(DB);
+    unlink("/tmp/virp_test_jsonhygiene.db-wal");
+    unlink("/tmp/virp_test_jsonhygiene.db-shm");
+    unlink("/tmp/virp_test_jsonhygiene2.db");
+    unlink(CK);
+}
+
 int main(void)
 {
     printf("\n=== JSON ingress hygiene (HAM 2026-09-06) ===\n");
     item9();
     item10();
+    item12();
+    item12_append();
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n",
            tests_passed, tests_failed, tests_run);
     return tests_failed ? 1 : 0;
