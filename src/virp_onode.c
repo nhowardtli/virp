@@ -1038,6 +1038,35 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
                                 mode == GATE_MODE_ENFORCE ? "ENFORCE"
                                                           : "SHADOW");
         cJSON_AddStringToObject(o, "decision", "auto-execute");
+
+        /* THE DEVICE-SIDE PRINCIPAL (HAM review 2026-09-06, item 5).
+         *
+         * `uid` above is the LOCAL caller: which unix account put the
+         * command to this socket. It is not who the device saw. The
+         * device saw the credential this node actually authenticated
+         * with, and until now no gate_execution record carried it, so
+         * reconciliation against TACACS+ accounting could only match on
+         * device + command + time. A human running the same read one
+         * second later corroborated the gate's execution.
+         *
+         * Taken from the DEVICE DESCRIPTOR the dispatch used, never from
+         * the request: the agent does not get to name the identity its
+         * command ran under. Today that is the single credential slot;
+         * when the read/write split lands it becomes whichever slot the
+         * dispatch chose, and this is the line that changes.
+         *
+         * body_version 2 = carries device_principal. Absent reads as 1,
+         * and reconciliation grades those MATCHED_LEGACY_NO_PRINCIPAL
+         * rather than pretending the identities were checked. */
+        cJSON_AddNumberToObject(o, "body_version", 2);
+        {
+            int didx = find_device(state, device_name);
+            if (didx >= 0 && state->devices[didx].username[0])
+                cJSON_AddStringToObject(o, "device_principal",
+                                        state->devices[didx].username);
+            else
+                cJSON_AddNullToObject(o, "device_principal");
+        }
         /* (uid_t)-1 is the internal caller, not a real uid — null, so a
          * reader never renders it as 4294967295. */
         if (client_uid == (uid_t)-1)

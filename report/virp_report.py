@@ -1220,6 +1220,13 @@ def build_parser():
     p.add_argument("--no-journal", action="store_true",
                    help="skip journal corroboration of v2 frames; their "
                         "session ids are then reported UNCHECKED")
+    p.add_argument("--tacacs-producer-pubkey",
+                   help="32-byte raw Ed25519 PUBLIC key of the TACACS+ "
+                        "accounting receiver. With it, tacacs_accounting/2 "
+                        "records are graded VERIFIED or FAILED; without it "
+                        "they grade FAILED and /1 records grade ABSENT "
+                        "either way. Public key only: this never gives the "
+                        "report the ability to forge one.")
     p.add_argument("--allow-immutable", action="store_true",
                    help="permit the unsafe immutable=1 read as a last "
                         "resort; it can silently omit un-checkpointed WAL "
@@ -1298,6 +1305,23 @@ def main(argv=None):
             print("virp report: no chain entries matched the filters",
                   file=sys.stderr)
 
+        # HAM review 2026-09-06, item 4d. An INDEPENDENT property beside
+        # the integrity ladder, never folded into it: a /1 record grades
+        # ABSENT, which is neither a pass nor a tamper signal.
+        tacacs_rows, tacacs_tally = [], None
+        if args.tacacs_producer_pubkey:
+            try:
+                tpk, tkid = verify.load_tacacs_producer_pubkey(
+                    args.tacacs_producer_pubkey)
+            except (OSError, ValueError) as exc:
+                print("virp report: TACACS producer public key unusable "
+                      "(%s); accounting records will not be graded" % exc,
+                      file=sys.stderr)
+            else:
+                tacacs_rows, tacacs_tally = \
+                    verify.verify_tacacs_producer_signatures(
+                        verifications, tpk, tkid)
+
         render_pdf(args.out, ctx, entries, verifications, summary, args)
 
     failed = len(summary["failed_entries"])
@@ -1330,6 +1354,13 @@ def main(argv=None):
     else:
         print("  NODE CONFIG     : none on chain — tier ceiling and "
               "evidence posture UNKNOWN for this bundle")
+    if tacacs_tally is not None:
+        print("  TACACS producer : %s" % _fmt(tacacs_tally))
+        for r in tacacs_rows:
+            if r["status"] == verify.TACACS_PRODUCER_FAILED:
+                print("      FAILED  %s seq %s (%s): %s"
+                      % (r["session_id"], r["sequence"], r["artifact_id"],
+                         r["detail"]))
     open_execs = summary.get("open_executions", [])
     if open_execs:
         print("  OPEN EXECUTIONS : %d (gate_intent with no linked outcome — "
