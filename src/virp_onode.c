@@ -4376,10 +4376,23 @@ static void handle_client(onode_state_t *state, int client_fd,
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
-        /* Health check — execute a simple command */
-        err = onode_execute_obs(state, req.device, "show version",
-                                req.obs_version,
-                                resp_buf, sizeof(resp_buf), &resp_len);
+        /*
+         * Health check — execute a simple command.
+         *
+         * This runs a CLIENT-CHOSEN device through the gate, so it is a
+         * device read like any other and must be judged under the
+         * connecting client's own ceiling. It used to call the plain
+         * onode_execute_obs(), which hardcodes (uid_t)-1; that made
+         * onode_effective_max_tier() return the node-wide gate_max_tier
+         * and skip the per-uid entry entirely. A uid pinned tighter than
+         * the node silently got the looser node-wide ceiling on this one
+         * path — found live 2026-09-07 on 10.0.10.211, where a GREEN-capped
+         * seat saw "(tier=RED max=YELLOW)" come back from its own socket.
+         * Pass client_uid explicitly, exactly as the execute paths do.
+         */
+        err = onode_execute_obs_ex(state, req.device, "show version",
+                                   req.obs_version, NULL, client_uid,
+                                   resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
         else {
