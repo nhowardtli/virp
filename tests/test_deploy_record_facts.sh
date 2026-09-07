@@ -48,15 +48,26 @@ git -C "$repo" -c user.name=t -c user.email=t@example.invalid \
 # The install directory the record is supposed to describe.
 inst="$tmp/inst"
 mkdir -p "$inst/autopilot"
+# Split deliberately. deploy-record emits one sha256 line per artifact it
+# HASHES; install-prod also installs the shared library, which the record
+# does not hash. Keeping the two lists apart means the expected line count
+# is ${#HASHED[@]} and never a magic number — the literal 9 here went stale
+# the moment a fifth script joined VIRP_INSTALL_SCRIPTS (sean-access.sh,
+# 2026-09-07) and failed the target for a reason unrelated to the property
+# under test.
+HASHED=(virp-onode-prod virp-tool render-devices.sh
+        config-backup-access.sh evidence-access.sh netclaw-access.sh
+        sean-access.sh
+        autopilot/virp_autopilot.py autopilot/virp_config_backup.py
+        autopilot/virp_evidence.py)
+# installed by install-prod, deliberately NOT hashed by deploy-record
+UNHASHED=(virp)
+
 make_install() {
     rm -rf "$inst"
     mkdir -p "$inst/autopilot"
-    for f in virp-onode-prod virp-tool virp render-devices.sh \
-             config-backup-access.sh evidence-access.sh netclaw-access.sh; do
+    for f in "${HASHED[@]}" "${UNHASHED[@]}"; do
         echo "$f contents" > "$inst/$f"
-    done
-    for f in virp_autopilot.py virp_config_backup.py virp_evidence.py; do
-        echo "$f contents" > "$inst/autopilot/$f"
     done
 }
 
@@ -77,8 +88,8 @@ if record "$tmp/ok.out" "$tmp/ok.err"; then
     if grep -q '``' "$tmp/ok.out"; then
         fail "complete install still emitted an empty backticked field"
         grep -n '``' "$tmp/ok.out" | sed 's/^/        /' >&2
-    elif [ "$(grep -c '^- \*\*sha256' "$tmp/ok.out")" -ne 9 ]; then
-        fail "expected 9 sha256 lines, got $(grep -c '^- \*\*sha256' "$tmp/ok.out")"
+    elif [ "$(grep -c '^- \*\*sha256' "$tmp/ok.out")" -ne "${#HASHED[@]}" ]; then
+        fail "expected ${#HASHED[@]} sha256 lines (one per hashed artifact), got $(grep -c '^- \*\*sha256' "$tmp/ok.out")"
         sed 's/^/        /' "$tmp/ok.out" >&2
     elif ! grep -qE '^- \*\*Commit\*\*: `[0-9a-f]{40}`$' "$tmp/ok.out"; then
         fail "commit line is not a full 40-hex hash"
