@@ -94,7 +94,9 @@ no free-form punctuation. It exists so a seat can tie a record to its own
 run without inventing a session namespace, and its character class is narrow
 enough that it cannot become a prose field by degrees.
 
-## 5. Size cap: **8 KiB** for the stored body
+## 5. Size cap: **7680 bytes** for the stored body
+
+*(Amended 2026-09-07 from 8 KiB — see Round 1. The tighter number leaves room for the wire envelope.)*
 
 Proposed, with the reasoning, because this one is a real trade and a reviewer
 should be able to push back on it.
@@ -160,3 +162,144 @@ backwards.
   `session_id` now is — a path is a weak free-text field wearing a name.
 * Whether the 8 KiB cap should be enforced at the daemon for seat uids
   specifically, rather than left to schema review.
+
+---
+
+# Round 1 review — seat operator's proposal, 2026-09-07
+
+## R1. The body, redlined
+
+Proposed:
+
+```json
+{ "produced_at": "...", "correlation_id": "7c1e...", "msg_type": "PHASE_COMPLETE",
+  "goal_id": "goal-session-G7G1BGGA", "phase_id": "phase-...-LUomBXW6YD8L",
+  "payload_sha256": "541b...", "payload_bytes": 2114,
+  "request_correlation_id": "cli-3062773" }
+```
+
+**Accepted as-is:** no free-text field anywhere; `payload_sha256` +
+`payload_bytes` is exactly the hash-and-size shape §3 asks for; `produced_at`
+is RFC 3339 UTC; every identifier is inside `[A-Za-z0-9_.:-]`.
+
+**Three changes.**
+
+1. **`schema` is missing, and it is required (§2).** `msg_type` is not a
+   substitute: it names the event, not the field set, and it carries no
+   version. When `payload_bytes` changes meaning in a year there is nothing to
+   bump. Keep `msg_type` as an enum *inside* a versioned schema:
+
+       "schema":   "seat.evidence.phase/1",
+       "msg_type": "PHASE_COMPLETE",
+
+   Declare the closed set `msg_type` may take, in the schema, now.
+
+2. **The sample is not valid JSON** — no comma after the `payload_sha256`
+   line. Almost certainly a paste artifact; worth one check that the emitter
+   serialises with a JSON library rather than string-building, because a body
+   whose `artifact_hash` is computed over hand-built bytes will drift from one
+   parsed and re-serialised anywhere downstream.
+
+3. **`correlation_id` is misnamed.** Derived per record from session +
+   artifact id + body, it is unique per record — so it cannot correlate
+   anything, and `request_correlation_id` is doing the actual grouping. Rename
+   to `record_id`, and let `correlation_id` be the field that groups. Two
+   records a reader wants to see together must share a value.
+
+**7680 accepted over the doc's 8192.** Below the cap, deliberate, and it leaves
+room for the wire envelope so a body near the limit cannot be pushed over by
+framing. The tighter number is the better one; §5 is amended to 7680.
+
+## R2. Answers
+
+### Q1 — retention records: how does a producer declare one?
+
+Today: `camera_retention/1` (`camera/RETENTION.md`) is the pattern. Frozen
+field set — `schema`, `camera_id`, `tier`, `policy_days`, `deleted_at_utc_ns`,
+`removed[{sha256, kind, byte_len}]`, `removed_count`, `removed_bytes` — where
+the counts are claims that must equal the array, producer-signed and
+chain-appended before the bytes go.
+
+**Two things make this a "not yet" for a seat, and you should plan around
+both.**
+
+* **The Docket half is not implemented.** `RETENTION.md §5` is a design note,
+  ruled out of scope on 2026-09-05. Until the exporter emits
+  `absent_by_declared_policy` and the verifier re-checks the cited record,
+  a declared deletion still grades **plain ABSENT**. Writing retention records
+  now is not wasted — they are the evidence the future grader will read — but
+  they will not lift an ABSENT this quarter.
+* **The seat cannot append that type.** uid 987's
+  `socket_uid_chain_append_types` is `["evidence_item"]`; a
+  `camera_retention/1` append returns `-50`. So a seat retention record has to
+  be an `evidence_item` whose *body* follows the retention shape, and the
+  grader that eventually reads it must be taught that. Flagging rather than
+  widening the type list — that is an operator decision, not a schema one.
+
+Design the body to the frozen shape above and keep the digests exact; the
+declaration is worth making before the grader exists, not after.
+
+### Q2 — identifiers as strings: allowed, do not hash them
+
+**Allowed.** §4 forbids free text, not strings. An identifier from a bounded
+character set is checkable and joinable; a hash of it is neither, and hashing
+buys nothing — the id is not a secret, and the digest still correlates exactly
+as well for anyone holding the mapping.
+
+The constraint is the charset, not the shape: `[A-Za-z0-9_.:-]`, ≤64. Both
+your ids pass, and `goal-session-G7G1BGGA` is the right kind — opaque, no
+semantics.
+
+**The failure mode to hold the line on is ids that become prose.**
+`goal-deploy-acme-migration` is a free-text field wearing an identifier's
+name, and it will leak a customer name into a permanent shared chain. If your
+generator can ever put a human-supplied string into an id, constrain it at the
+generator, not in review.
+
+### Q3 — producer key: yes. Pinned format below
+
+Yes — sign them. `producer_signature` grading UNESTABLISHED means the chain
+committed to the bytes but nothing shows they came from you, which is exactly
+the gap worth closing for a third-party producer.
+
+The format is already pinned by `tacacs_accounting/2` and the estate's key
+registry; match it exactly rather than inventing a parallel one.
+
+**Three fields in the body:**
+
+    producer_key_id            SHA-256(raw ed25519 public key)[0:16], 32 lowercase hex
+    producer_signature_scheme  "ed25519"
+    producer_signature         hex, over PRODUCER_CANONICAL(body)
+
+**`PRODUCER_CANONICAL(body)`, exactly:** take the body, remove the keys
+`producer_signature`, `producer_sig` and `producer_signature_scheme` if
+present, then
+
+    json.dumps(obj, sort_keys=True, separators=(",", ":"),
+               ensure_ascii=True).encode("ascii")
+
+**`producer_key_id` stays inside the signed bytes** — a signature that did not
+cover the key id it names could be re-labelled onto another key.
+
+**Do not carry `producer_sig`.** It exists in `/1` bodies, was never verified
+by anything, and two signature fields leave a reader guessing which one a
+verdict rests on.
+
+**Registering the public half** (`deploy/keys/registry.json`, schema
+`virp-key-registry/1`):
+
+* `public_key_hex` is the **RAW** 32-byte public key in hex — **not** DER, not
+  SPKI, not base64. The registry check rejects a DER-wrapped key explicitly.
+* `key_id` must re-derive from those bytes; the checker recomputes every one.
+* `roles` is an array; `status` is `active` or `retired` and nothing else.
+* The registry is **append-only**. A key is retired by status change, never by
+  deletion, so bodies signed under it stay verifiable — a verifier that cannot
+  find a key reports UNVERIFIABLE, which is worse than reading a retired one.
+
+Send the public half and the `private_half_host` description; the entry is
+ours to add.
+
+**What this does and does not buy.** A producer signature binds a **key**, not
+a host — anyone holding the private half can produce bodies that grade
+VERIFIED. Since the key will live on a VM whose operator has root, treat
+VERIFIED as "this producer key asserted it", not "this machine did".
