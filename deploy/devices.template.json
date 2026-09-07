@@ -1,5 +1,6 @@
 {
   "_comment": "virp-lab device template. Rendered to /run/virp/devices.json at daemon start by deploy/render-devices.sh, which substitutes ${...} placeholders from /etc/virp/autopilot.env (root-only). The template itself carries NO credentials for the API devices. HARD EXCLUSIONS apply: the daemon refuses to load any config containing a blocked address (see virp_config_blocked_address in virp_onode.c) \u2014 do not name them here, even in a comment, or the render output will be refused at startup.",
+  "_removed_asa5525_note": "REMOVED 2026-09-07: the ASA-5525 row (10.0.0.253, cisco_asa, aiops-svc). The device is physically on the home LAN and moves to node 313 (virp-onode-home, 10.0.0.13) for TACACS+ accounting and per-command authorization. It had to leave THIS node rather than merely be added to that one: 313's receiver keys accounting sources by address and its reconciler matches accounting records against gate observations on the same node, so a second node holding a session against the same firewall produces accounting records 313 can never match and buckets them UNGOVERNED forever. This node was not reading it in any case -- no autopilot battery ever named ASA-5525; the watchdog simply reconnected every ~4m49s and held an enable-mode session, which after Phase 1 would have emitted roughly twelve EXEC START/STOP records an hour with no gate observation behind them. The device's real hostname is ASA-Lab, not ASA-5525, and 313's row uses the device's own name. The row is NOT deleted from this node's autopilot.env: ${LAB_PASSWORD} and ${LAB_ENABLE} still name other IronClaw colo stage-1 devices. See docs/tacacs/ASA-5525-PHASE0.md.",
   "_socket_allowlist_policy": "DELIBERATE (2026-07-30): uid 0 is EXCLUDED. The allowlist is the daemon's own uid (rendered from ${VIRP_UID}) plus 1000, the interactive operator \u2014 the same policy CT 211 has always run. The autopilot runs as User=virp, i.e. the daemon's own service account (nologin, no sudo, cannot read /etc/virp/autopilot.env). A SEPARATE unprivileged uid was tried and rejected: verifying an observation requires the O-Key because VIRP signs with symmetric HMAC, and virp_key_load_file REFUSES a key with group read (\"insecure mode 0640\"), so a second account could only verify by weakening key hygiene or duplicating the key on disk. Verifier and signer cannot be separated until the daemon exposes a verify action; see DEPLOYED.md \"socket allowlist policy\".",
   "_socket_allowlist_backup_note": "${VIRP_BACKUP_UID} is `virp-backup`, the config-backup runbook's dedicated identity (2026-07-30). It is a CLIENT-only uid: no key or credential group membership, socket reach granted by ACL (deploy/config-backup-access.sh), and it does NOT verify observations \u2014 it stores signed bytes for key holders to verify. This does not contradict the verifier-needs-the-key finding above: the runbook is a submitter, not a verifier.",
   "_socket_allowlist_evidence_note": "${VIRP_EVIDENCE_UID} is `virp-evidence`, the compliance-evidence collector's dedicated identity (2026-07-30). Same CLIENT-only shape as virp-backup and, deliberately, a SEPARATE account from it: each automation owns its own identity and its own evidence tree, so a compromise of one runbook does not reach the other's evidence. It is read-only even within the GREEN set \u2014 it submits nothing but `vtysh -c \"show ...\"` reads (enforced locally as well as at the gate, because its item list is operator-editable). Verification is done afterwards by virp-evidence-report, which runs as a key holder.",
@@ -252,17 +253,6 @@
       "vendor": "panos",
       "username": "aiops-svc",
       "password": "${LAB_PASSWORD}",
-      "port": 22
-    },
-    {
-      "_comment": "IronClaw colo fleet stage 1. The only stage-1 row with enable: the ASA driver enters (and re-enters) enable mode. ssh_legacy is deliberately NOT set \u2014 verified 2026-08-09 from this node that the driver's default algorithm set negotiates with this unit (kex diffie-hellman-group14-sha1, hostkey ssh-rsa, cipher aes256-ctr; the ASA offers nothing newer and all three are in the default preference list).",
-      "hostname": "ASA-5525",
-      "node_id": "0A0000FD",
-      "host": "10.0.0.253",
-      "vendor": "cisco_asa",
-      "username": "aiops-svc",
-      "password": "${LAB_PASSWORD}",
-      "enable": "${LAB_ENABLE}",
       "port": 22
     },
     {

@@ -162,6 +162,49 @@ demonstrate and is not demonstrated here.
 
 ---
 
+## Finding `ASA-SHOW-UNACCOUNTED` — how far this method carries
+
+Recorded 2026-09-07 while surveying a Cisco ASA 5525-X (`ASA-Lab`, 10.0.0.253)
+for the same treatment. It qualifies the method above rather than the run above:
+nothing here changes what the 2026-09-07 timeline shows about LAB-SWITCH-1.
+
+**The three-recorder shape is not portable to the ASA as written, because one
+of the three recorders goes quiet.** Cisco's `aaa accounting command
+[privilege N]` on ASA sends accounting "when you enter any command other than
+show commands at the CLI" ([ASA Command Reference, A–H,
+`aa`–`ac`](https://www.cisco.com/c/en/us/td/docs/security/asa/asa-cli-reference/A-H/asa-command-ref-A-H/aa-ac-commands.html)).
+IOS 12.2(55)SE6 on LAB-SWITCH-1 accounts every command, `show clock` included,
+and both columns of this document's method lean on that.
+
+Two consequences:
+
+1. **A permitted GREEN read on an ASA has no device-side accounting record.**
+   For a `show` cell the third column carries nothing — the gate and CT 215 both
+   speak, the device's own accounting stream does not. What it still carries is
+   session establishment and termination, via `aaa accounting ssh console`, and
+   any non-`show` command.
+
+2. **The cadence witness moves hosts, and improves.** The refusal row above is
+   proved by an unbroken 60-second `show clock` cadence in the accounting log
+   continuing across the moment of the refusal — an enforcement that leaked
+   would show up as a line that isn't there. On an ASA that cadence will not
+   exist in accounting. It *will* exist in CT 215's `authz.log`, because
+   `aaa authorization command` **does** authorize `show` commands. The witness
+   therefore survives intact and moves from a recorder sharing a host with the
+   gate to one on a genuinely different host, which is the stronger of the two
+   positions.
+
+The refusal cell is unaffected on either platform. `configure terminal` is
+refused at the O-Node's ingress check before anything reaches the device, so
+both other recorders are silent for the same reason they are silent here.
+
+Scope: this is a property of the ASA platform, not of a release or of this
+configuration, and no ASA setting turns per-command accounting for `show`
+back on. The `spark-asa-tacacs-*` bundle's exhibit set is shaped to it, and
+that bundle's README says so.
+
+---
+
 ## Reproducing
 
 ```sh
