@@ -13,6 +13,9 @@ Copyright 2026 Third Level IT LLC — Apache 2.0
 
 import json
 import os
+import socket
+import socketserver
+import struct
 import sys
 import tempfile
 import threading
@@ -24,6 +27,7 @@ sys.path.insert(0, os.path.join(ROOT, "tacacs"))
 
 import virp_tacacs_authz as az
 import virp_tacacs_authzd as azd
+import virp_tacacs_codec as tp
 
 NOW = 1_757_002_000_000_000_000
 SEC = 1_000_000_000
@@ -52,6 +56,16 @@ def policy(grants=None, device="R1"):
         "rendered_utc_ns": NOW,
         "grants": list(grants or []),
     }
+
+
+def live_grant(**kw):
+    """A grant valid at the REAL clock, for tests that drive the daemon
+    (which reads time.time_ns() and cannot be handed a fixed NOW)."""
+    import time
+    now = time.time_ns()
+    kw.setdefault("not_before", now - 10 * SEC)
+    kw.setdefault("not_after", now + 3600 * SEC)
+    return grant(**kw)
 
 
 def write_policy(path, grants):
@@ -210,6 +224,212 @@ class TestItem1SingleUseUnderConcurrency(unittest.TestCase):
                 command="interface Loopback99", now_ns=NOW)
             self.assertEqual(st2, az.PASS_ADD,
                              "a reservation nothing acted on must return")
+
+
+# ── a stub O-Node, so the authorization daemon can be driven end to end ──
+#
+# The daemon chains its decision BEFORE it replies, and a chain append
+# that fails downgrades the reply to ERROR. A test that ran without a
+# chain would therefore see ERROR for every request and could not tell a
+# refusal from an outage, which is precisely the confusion the daemon
+# exists to avoid. This accepts the append and returns a receipt so the
+# reply under test is the DECISION.
+
+class _StubONodeHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        hdr = self.request.recv(4)
+        if len(hdr) < 4:
+            return
+        n = struct.unpack(">I", hdr)[0]
+        buf = b""
+        while len(buf) < n:
+            c = self.request.recv(n - len(buf))
+            if not c:
+                return
+            buf += c
+        self.server.appends.append(json.loads(buf[1:].decode()))
+        body = b'{"status":"ok"}'
+        self.request.sendall(struct.pack(">I", len(body)) + body)
+
+
+class _StubONodeServer(socketserver.ThreadingUnixStreamServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class AuthzDaemonHarness:
+    """The real AuthorServer on a loopback port, with a real config, a
+    real producer key and a real ledger. Nothing is mocked but the
+    O-Node."""
+
+    def __init__(self, tmpdir, grants=(), secret=b"labsecret",
+                 configured=True):
+        self.dir = tmpdir
+        self.policy_path = os.path.join(tmpdir, "policy.json")
+        write_policy(self.policy_path, list(grants))
+
+        sk_path = os.path.join(tmpdir, "producer.key")
+        pk_path = os.path.join(tmpdir, "producer.pub")
+        from virp_tacacs_recv import producer_keygen
+        self.producer_key_id = producer_keygen(sk_path, pk_path)
+
+        self.sock_path = os.path.join(tmpdir, "onode.sock")
+        self.onode = _StubONodeServer(self.sock_path, _StubONodeHandler)
+        self.onode.appends = []
+        self._ot = threading.Thread(target=self.onode.serve_forever,
+                                    daemon=True)
+        self._ot.start()
+
+        self.ledger_path = os.path.join(tmpdir, "ledger.jsonl")
+        cfg = {
+            "receiver_node": "ham-test",
+            "producer_key": sk_path,
+            "ledger": self.ledger_path,
+            "onode_socket": self.sock_path,
+            "chain_session": "tacacs-authz:ham-test",
+            "relationships": ([{"source_addr": "127.0.0.1",
+                                "client_identity": "R1",
+                                "secret": secret.decode("latin-1")}]
+                              if configured else []),
+        }
+        self.cfg_path = os.path.join(tmpdir, "authzd.json")
+        fd = os.open(self.cfg_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                     0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f)
+        self.secret = secret
+
+        from virp_tacacs_recv import producer_load_sk
+        self.srv = azd.AuthorServer(("127.0.0.1", 0), azd.AuthorHandler)
+        self.srv.cfg = azd.load_config(self.cfg_path)
+        self.srv.sk = producer_load_sk(sk_path)
+        from virp_tacacs_recv import Ledger
+        self.srv.ledger = Ledger(self.ledger_path)
+        self.srv.counters = azd.Counters()
+        self.srv.policy = azd.PolicyStore(self.policy_path,
+                                          ledger=self.srv.ledger)
+        self.srv.onode_socket = self.sock_path
+        self.addr = self.srv.server_address
+        self._t = threading.Thread(target=self.srv.serve_forever,
+                                   daemon=True)
+        self._t.start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.onode.shutdown()
+        self.onode.server_close()
+
+    def request(self, command, user="virp-rw", unencrypted=False,
+                session_id=0x11223344, seq_no=1):
+        body = tp.build_author_request(
+            authen_method=6, priv_lvl=15, authen_type=1, authen_service=1,
+            user=user, port="tty0", rem_addr="10.0.0.9",
+            args=["service=shell", "cmd=%s" % command.split()[0],
+                  "cmd-arg=%s" % " ".join(command.split()[1:]),
+                  "cmd-arg=<cr>"])
+        flags = tp.TAC_PLUS_UNENCRYPTED_FLAG if unencrypted else 0
+        wire = body if unencrypted else tp.xor_body(
+            body, session_id, self.secret, 0xc0, seq_no)
+        pkt = tp.build_header(0xc0, tp.TAC_PLUS_AUTHOR, seq_no, flags,
+                              session_id, len(wire)) + wire
+        s = socket.create_connection(self.addr, timeout=10)
+        try:
+            s.sendall(pkt)
+            hdr = b""
+            while len(hdr) < tp.HEADER_LEN:
+                c = s.recv(tp.HEADER_LEN - len(hdr))
+                if not c:
+                    raise AssertionError("daemon closed without replying")
+                hdr += c
+            h = tp.parse_header(hdr)
+            rb = b""
+            while len(rb) < h["length"]:
+                c = s.recv(h["length"] - len(rb))
+                if not c:
+                    raise AssertionError("short reply body")
+                rb += c
+        finally:
+            s.close()
+        plain = rb if h["unencrypted"] else tp.xor_body(
+            rb, session_id, self.secret, h["version"], h["seq_no"])
+        return tp.parse_author_response(plain)
+
+    def ledger_events(self):
+        out = []
+        with open(self.ledger_path) as f:
+            for line in f:
+                out.append(json.loads(line))
+        return out
+
+
+class TestItem3CleartextOnTheAuthorizationListener(unittest.TestCase):
+    """HAM item 3: the authorization listener must not let a client opt
+    out of the shared secret.
+
+    The reviewed decode was `if packet.unencrypted or secret is None:
+    plain = body`. On the ACCOUNTING receiver that is right: record the
+    ugly truth, and say in the record that it arrived in the clear. On an
+    AUTHORIZATION service it means the client chooses whether the secret
+    applies, and still reaches PASS_ADD."""
+
+    def test_cleartext_from_a_configured_source_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = AuthzDaemonHarness(d, grants=[live_grant()])
+            try:
+                r = h.request("interface Loopback99", unencrypted=True)
+                self.assertEqual(r["status_name"], "FAIL", r["server_msg"])
+                self.assertIn("cleartext", r["server_msg"].lower())
+                events = [e["event"] for e in h.ledger_events()]
+                self.assertIn("CLEARTEXT_REJECTED", events)
+            finally:
+                h.close()
+
+    def test_the_same_request_obfuscated_is_authorized(self):
+        """The control must be the CLEARTEXT FLAG and nothing else. Same
+        grant, same command, same identity, secret applied: PASS."""
+        with tempfile.TemporaryDirectory() as d:
+            h = AuthzDaemonHarness(d, grants=[live_grant()])
+            try:
+                r = h.request("interface Loopback99", unencrypted=False)
+                self.assertEqual(r["status_name"], "PASS_ADD",
+                                 r["server_msg"])
+            finally:
+                h.close()
+
+    def test_an_unconfigured_source_is_refused(self):
+        """A source with no configured secret is an unknown source. It was
+        already refused, by a different route (device is None -> ERROR);
+        this pins that it stays refused and never reaches policy."""
+        with tempfile.TemporaryDirectory() as d:
+            h = AuthzDaemonHarness(d, grants=[live_grant()], configured=False)
+            try:
+                r = h.request("interface Loopback99", unencrypted=True)
+                self.assertIn(r["status_name"], ("FAIL", "ERROR"),
+                              r["server_msg"])
+            finally:
+                h.close()
+
+    def test_a_refused_cleartext_request_never_reserves_a_grant(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = AuthzDaemonHarness(d, grants=[live_grant(uses=1)])
+            try:
+                h.request("interface Loopback99", unencrypted=True)
+                r = h.request("interface Loopback99", unencrypted=False,
+                              session_id=0x55667788)
+                self.assertEqual(r["status_name"], "PASS_ADD",
+                                 "the cleartext refusal spent the grant")
+            finally:
+                h.close()
+
+    def test_the_accounting_receiver_stays_permissive(self):
+        """The asymmetry is deliberate and must not be 'fixed' later by
+        someone tidying the two decoders into one. The receiver records
+        CLEARTEXT as a fact; the authorizer refuses it."""
+        import virp_tacacs_recv as rcv
+        import inspect
+        src = inspect.getsource(rcv.build_receipt)
+        self.assertIn('"CLEARTEXT"', src)
 
 
 class TestItem2GrantBindsThePrincipal(unittest.TestCase):

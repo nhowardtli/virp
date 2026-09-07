@@ -248,7 +248,7 @@ class Counters:
     _NAMES = ("author_requests", "pass_add", "fail", "error",
               "refused_acct", "refused_authen", "unknown_session_type",
               "chain_failed", "short_read", "malformed",
-              "grant_consumed_unsent")
+              "grant_consumed_unsent", "cleartext_rejected")
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -318,6 +318,27 @@ class AuthorHandler(socketserver.BaseRequestHandler):
             secret = rel["secret"] if rel else None
             device = rel["client_identity"] if rel else None
 
+            # THE ASYMMETRY WITH THE ACCOUNTING RECEIVER, DELIBERATE.
+            #
+            # HAM review 2026-09-06, item 3. virp_tacacs_recv.py accepts a
+            # packet that sets TAC_PLUS_UNENCRYPTED_FLAG and records
+            # decode=CLEARTEXT. That is right for accounting: the receipt
+            # is evidence, the misconfiguration is part of what happened,
+            # and refusing it would DESTROY the record of a device talking
+            # in the clear.
+            #
+            # It is wrong here. This listener does not record what a
+            # device did, it decides what a device MAY do, and honouring
+            # the flag lets the client choose whether the shared secret
+            # applies and still reach PASS_ADD. Measured before the fix: a
+            # cleartext request from a source with a configured secret
+            # returned PASS_ADD and spent the grant.
+            #
+            # So: the body is still decoded-as-received and still
+            # recorded, because the record must say what arrived. The
+            # DECISION is a hard FAIL, taken below before any policy is
+            # consulted.
+            cleartext_refused = bool(hdr["unencrypted"]) and secret is not None
             if hdr["unencrypted"] or secret is None:
                 plain = raw_body
             else:
@@ -335,7 +356,24 @@ class AuthorHandler(socketserver.BaseRequestHandler):
             srv.policy.load()
 
             policy_sha = srv.policy.sha256()
-            if device is None:
+            if cleartext_refused:
+                # First, and before any policy evaluation: the packet
+                # asked us not to use the secret we hold for it.
+                srv.counters.bump("cleartext_rejected")
+                srv.ledger.write("CLEARTEXT_REJECTED",
+                                 source_addr=peer[0],
+                                 client_identity=device,
+                                 tacacs_session_id=hdr["session_id"],
+                                 user=user, command=command)
+                status, reason, gid = (
+                    az.FAIL,
+                    az.DENY_PREFIX + "request set the TACACS+ cleartext "
+                                     "flag from a source that has a "
+                                     "configured shared secret; an "
+                                     "authorization decision is never made "
+                                     "on a body the client chose not to "
+                                     "obfuscate", None)
+            elif device is None:
                 status, reason, gid = (az.ERROR,
                                        az.DENY_PREFIX + "source %s is not a "
                                        "configured device" % peer[0], None)

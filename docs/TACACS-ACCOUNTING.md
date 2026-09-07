@@ -236,6 +236,36 @@ the same trap `camera/README.md` documents for `sensor_signature`.
 | `MALFORMED` | lengths did not reconcile, or the body was short. **The record still ships**, with every field that did parse, `args` truncated to what was recoverable, and `raw_body_sha256` over what arrived |
 | `NOT_ATTEMPTED` | pairs with `decode: NO_SECRET_CONFIGURED` — the body was never decoded, so no parse was tried. Deliberately **not** `MALFORMED`: the body is not known to be broken, it was never read, and accusing a possibly well-formed packet of being malformed is the vocabulary abuse this design refuses everywhere else |
 
+#### The authorization listener does the opposite, on purpose
+
+`virp_tacacs_authzd.py` refuses a packet that sets
+`TAC_PLUS_UNENCRYPTED_FLAG` from a source that has a configured shared
+secret. It is a hard `FAIL`, decisioned and ledgered as
+`CLEARTEXT_REJECTED`, taken before any policy is evaluated, and it never
+reserves a grant.
+
+The two listeners differ because they answer different questions. The
+receiver records **what a device did**: a device talking in the clear is
+part of what happened, and dropping the packet would destroy the evidence
+of the misconfiguration. The authorizer decides **what a device may do**:
+honouring the flag there would let the client choose whether the shared
+secret applies and still reach `PASS_ADD`. Measured before this was
+fixed (HAM review, 2026-09-06): a cleartext authorization request from a
+configured source returned `PASS_ADD` and spent a single-use grant.
+
+The body is still decoded-as-received and still chained, so the record
+says what arrived. Only the decision is refused.
+
+A source with **no** configured secret is refused on the authorization
+listener by a separate, older route: it resolves to no `client_identity`,
+and an unidentified source is answered `ERROR` before policy. That case
+is unchanged.
+
+Neither listener has transport security. RFC 9887 (TACACS+ over TLS) is
+the eventual answer where the platform supports it; IOS 15.2 in this lab
+does not. Until then the obfuscation is the whole of it, which is exactly
+why the authorizer will not let a client opt out of it.
+
 **A packet that cannot be decoded or parsed is still recorded.** Aug 28
 ruling #1, applied here: a prerequisite that could not be established is
 reported, never omitted and never upgraded. A receiver that dropped
