@@ -65,6 +65,7 @@ class PolicyStore:
         self._lock = threading.Lock()
         self._stamp = None
         self._policy = {"schema": "tacacs_authz_policy/1", "grants": []}
+        self._reserved = {}
         self.load(force=True)
 
     def _stat(self):
@@ -94,6 +95,13 @@ class PolicyStore:
                     self._policy = {"schema": "tacacs_authz_policy/1",
                                     "grants": [], "_load_error": True}
             self._stamp = stamp
+            # A reservation names a grant. A policy that no longer carries
+            # that grant cannot have it released back, so the bookkeeping
+            # goes with it.
+            live = {g.get("grant_id") for g in self._policy.get("grants", [])}
+            self._reserved = {k: v for k, v in
+                              getattr(self, "_reserved", {}).items()
+                              if k in live}
             changed = True
             loaded_sha = hashlib.sha256(json.dumps(
                 self._policy, sort_keys=True,
@@ -112,32 +120,135 @@ class PolicyStore:
         with self._lock:
             return json.loads(json.dumps(self._policy))
 
+    def _sha256_locked(self):
+        return hashlib.sha256(json.dumps(
+            self._policy, sort_keys=True,
+            separators=(",", ":")).encode()).hexdigest()
+
     def sha256(self):
         with self._lock:
-            return hashlib.sha256(json.dumps(
-                self._policy, sort_keys=True,
-                separators=(",", ":")).encode()).hexdigest()
+            return self._sha256_locked()
+
+    def _persist_locked(self):
+        """Write the policy back. Caller holds self._lock.
+
+        Restamps afterwards so our own write is not read back as an
+        external change on the next request."""
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self._policy, f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+        self._stamp = self._stat()
 
     def consume(self, grant_id):
-        """Spend a use and persist atomically."""
+        """Spend a use and persist atomically.
+
+        Kept for callers that already hold a decision. The request path
+        does NOT use this: see authorize_and_reserve()."""
         with self._lock:
             n = az.consume(self._policy, grant_id)
             if n is None:
                 return None
-            tmp = self.path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self._policy, f, indent=1, sort_keys=True)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.path)
-            self._stamp = self._stat()
+            self._persist_locked()
             return n
+
+    # ── grant lifecycle ────────────────────────────────────────────────
+    #
+    # HAM review 2026-09-06, item 1. The reviewed request path snapshotted
+    # the policy, authorized against the SNAPSHOT, and consumed under a
+    # second, later acquisition of this lock. N threads that reached the
+    # decision together all read uses_remaining=1, all returned PASS_ADD,
+    # and one human approval became N authorized commands (measured: 16 of
+    # 16 threads passed on a uses=1 grant).
+    #
+    # The fix is that deciding and reserving are ONE operation under ONE
+    # lock. A grant is:
+    #
+    #   AVAILABLE  uses_remaining > 0 and nobody is holding it
+    #   RESERVED   a request has taken it; the decrement is already on
+    #              disk, so a crash here cannot resurrect it
+    #   SPENT      the reply has been serialized to the wire
+    #
+    # RESERVED and SPENT are indistinguishable to a competing request:
+    # both see uses_remaining at 0 and are refused. The only path back to
+    # AVAILABLE is release(), which the caller may use ONLY when it can
+    # prove nothing left the box. That is the same retry asymmetry the
+    # execution path follows.
+    GRANT_AVAILABLE = "AVAILABLE"
+    GRANT_RESERVED = "RESERVED"
+    GRANT_SPENT = "SPENT"
+
+    def authorize_and_reserve(self, device, user, command, now_ns):
+        """Decide and, on PASS, reserve the grant. One atomic step.
+
+        Returns (status, reason, grant_id, policy_sha256). The sha is of
+        the policy AS DECIDED AGAINST, taken inside the same lock and
+        BEFORE the reservation changes it, so the chained record names
+        the policy that produced the decision rather than the one this
+        decision left behind.
+
+        On PASS_ADD with a grant, that grant is already decremented and
+        persisted when this returns, so no second request can be given
+        the same use."""
+        self.load()
+        with self._lock:
+            sha = self._sha256_locked()
+            status, reason, gid = az.authorize(
+                self._policy, device=device, user=user, command=command,
+                now_ns=now_ns)
+            if status == az.PASS_ADD and gid:
+                if az.consume(self._policy, gid) is None:
+                    # The grant vanished between the decision and the
+                    # reservation, which under this lock cannot happen;
+                    # refuse rather than pass on an unreserved grant.
+                    return (az.FAIL,
+                            az.DENY_PREFIX + "grant %s could not be "
+                                             "reserved" % gid, None, sha)
+                self._reserved[gid] = self.GRANT_RESERVED
+                self._persist_locked()
+            return status, reason, gid, sha
+
+    def spend(self, grant_id):
+        """RESERVED -> SPENT. The reply is on the wire.
+
+        The decrement is already durable; this only closes the in-memory
+        reservation so release() can no longer return it."""
+        if not grant_id:
+            return
+        with self._lock:
+            self._reserved[grant_id] = self.GRANT_SPENT
+
+    def release(self, grant_id):
+        """RESERVED -> AVAILABLE. Returns the use to the grant.
+
+        Legitimate ONLY when the caller can prove nothing reached the
+        router: the decision could not be recorded, so no reply was ever
+        built. A reservation already SPENT is never returned."""
+        if not grant_id:
+            return False
+        with self._lock:
+            if self._reserved.get(grant_id) != self.GRANT_RESERVED:
+                return False
+            for g in self._policy.get("grants", []):
+                if g.get("grant_id") == grant_id:
+                    g["uses_remaining"] = int(g.get("uses_remaining", 0)) + 1
+                    self._reserved.pop(grant_id, None)
+                    self._persist_locked()
+                    return True
+            return False
+
+    def grant_state(self, grant_id):
+        with self._lock:
+            return self._reserved.get(grant_id, self.GRANT_AVAILABLE)
 
 
 class Counters:
     _NAMES = ("author_requests", "pass_add", "fail", "error",
               "refused_acct", "refused_authen", "unknown_session_type",
-              "chain_failed", "short_read", "malformed")
+              "chain_failed", "short_read", "malformed",
+              "grant_consumed_unsent")
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -222,8 +333,8 @@ class AuthorHandler(socketserver.BaseRequestHandler):
             user = fields.get("user")
 
             srv.policy.load()
-            policy = srv.policy.snapshot()
 
+            policy_sha = srv.policy.sha256()
             if device is None:
                 status, reason, gid = (az.ERROR,
                                        az.DENY_PREFIX + "source %s is not a "
@@ -241,9 +352,14 @@ class AuthorHandler(socketserver.BaseRequestHandler):
                                        "(service authorization is not "
                                        "served)", None)
             else:
-                status, reason, gid = az.authorize(
-                    policy, device=device, user=user, command=command,
-                    now_ns=recv_utc_ns)
+                # Deciding and reserving are ONE atomic step (HAM item 1).
+                # A PASS returned here has already spent the grant's use,
+                # durably, so a racing request cannot be given the same
+                # one.
+                status, reason, gid, policy_sha = \
+                    srv.policy.authorize_and_reserve(
+                        device=device, user=user, command=command,
+                        now_ns=recv_utc_ns)
 
             body = {
                 "schema": SCHEMA,
@@ -271,7 +387,7 @@ class AuthorHandler(socketserver.BaseRequestHandler):
                 "decision": status,
                 "decision_reason": reason,
                 "grant_id": gid,
-                "policy_sha256": srv.policy.sha256(),
+                "policy_sha256": policy_sha,
                 "tacacs_session_id": hdr["session_id"],
                 "tacacs_seq_no": hdr["seq_no"],
                 "raw_body_len": len(plain),
@@ -299,9 +415,14 @@ class AuthorHandler(socketserver.BaseRequestHandler):
                 status, reason = (az.ERROR,
                                   az.DENY_PREFIX + "decision could not be "
                                                    "recorded")
-
-            if status == az.PASS_ADD and gid:
-                srv.policy.consume(gid)
+                # Nothing has been built for the wire yet, so this is the
+                # one case where we can PROVE nothing reached the router.
+                # Only here does a reservation go back.
+                if srv.policy.release(gid):
+                    srv.ledger.write("GRANT_RESERVATION_RELEASED",
+                                     grant_id=gid, artifact_id=aid,
+                                     reason="chain append failed before any "
+                                            "reply was built")
 
             srv.counters.bump({"PASS_ADD": "pass_add", "FAIL": "fail",
                                "ERROR": "error",
@@ -321,7 +442,19 @@ class AuthorHandler(socketserver.BaseRequestHandler):
             try:
                 self.request.sendall(out)
             except OSError:
+                # The reservation stays consumed. We cannot prove the
+                # router did not see this PASS, and resurrecting the
+                # grant on an unprovable failure is how one approval
+                # becomes two commands.
+                if status == az.PASS_ADD and gid:
+                    srv.policy.spend(gid)
+                    srv.counters.bump("grant_consumed_unsent")
+                    srv.ledger.write("GRANT_CONSUMED_UNSENT", grant_id=gid,
+                                     artifact_id=aid, user=user,
+                                     device=device, command=command)
                 return
+            if status == az.PASS_ADD and gid:
+                srv.policy.spend(gid)
 
             print("[AUTHZ] %-3s %-8s %-40s -> %s (%s)"
                   % (device, user, (command or "-")[:40], status, reason),
