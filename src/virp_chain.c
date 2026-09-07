@@ -20,6 +20,13 @@
 static virp_error_t chain_count_intents_for_approval_locked(
         virp_chain_state_t *state, const char *aeh, int *count);
 static void chain_maps_free(virp_chain_state_t *state);
+static bool cj_str(const cJSON *o, const char *key, char *out, size_t cap);
+static bool chain_citations_ready_locked(virp_chain_state_t *state);
+static void chain_backfill_citations_locked(virp_chain_state_t *state);
+static virp_error_t chain_citation_insert_locked(virp_chain_state_t *state,
+                                                 const char *session_id,
+                                                 int64_t sequence,
+                                                 const char *aeh);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1080,6 +1087,35 @@ static const char *SCHEMA_SQL =
      * open after it is unaffected. */
     "CREATE INDEX IF NOT EXISTS idx_chain_entry_hash "
     "  ON chain_entries(chain_entry_hash);"
+    /* MATERIALISED CITATION for the apply-time replay guard
+     * (docs/PERF-REPLAY-GUARD.md, measured 2026-09-02).
+     *
+     * The guard asks "has this approval already been spent on a
+     * committed intent". The filter it wants -- approval_entry_hash --
+     * lives inside a JSON body, where SQLite cannot reach it, so the
+     * guard fetched and cJSON_Parse'd EVERY gate_intent body ever
+     * written, on every approved apply, while holding both the chain
+     * lock and consume_mu. Measured 0.074 s per apply at ~21,000
+     * intents, growing without bound, on the most safety-critical path
+     * in the system. An index on artifact_type does NOT fix it (1.08x):
+     * finding the rows was never the expensive part.
+     *
+     * This is a DERIVED INDEX of what the chain already says, never a
+     * second source of truth. It is written inside the same transaction
+     * as the intent append, so it cannot exist without its entry or the
+     * entry without it, and the guard joins back to chain_entries so a
+     * forged or orphaned row counts nothing. */
+    "CREATE TABLE IF NOT EXISTS intent_approval_citation ("
+    "  chain_entry_id      INTEGER PRIMARY KEY,"
+    "  approval_entry_hash TEXT NOT NULL"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_iac_aeh "
+    "  ON intent_approval_citation(approval_entry_hash);"
+    /* Small key/value for schema-state that is not itself evidence. */
+    "CREATE TABLE IF NOT EXISTS chain_meta ("
+    "  k TEXT PRIMARY KEY,"
+    "  v TEXT NOT NULL"
+    ");"
     /* Signed per-session head: authenticates chain LENGTH, not just links.
      * Updated in the same transaction as every append. A DB writer without
      * K_chain can neither forge a head for a truncated chain nor delete it
@@ -1799,6 +1835,9 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
     detect_sig_columns(state);
     state->have_chain_key = true;   /* init always loads K_chain */
 
+    /* One-time, verified, and silent when there is nothing to do. */
+    chain_backfill_citations_locked(state);
+
     fprintf(stderr, "[Chain] Initialized: db=%s node=%u org=%s\n",
             db_path, node_id, state->org_id);
 
@@ -2330,6 +2369,28 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
         }
     }
 
+    /* MATERIALISED CITATION, inside this same transaction (constraint 2
+     * of docs/PERF-REPLAY-GUARD.md). A citation that could be lost
+     * independently of its entry would reintroduce exactly the crash
+     * window the replay guard exists to close, so it lands or rolls back
+     * with everything else. Failure fails the append. */
+    if (artifact_content && artifact_content[0] != '\0' &&
+        strcmp(artifact_type, "gate_intent") == 0) {
+        cJSON *ib = cJSON_Parse(artifact_content);
+        if (ib) {
+            char aeh[65];
+            bool have = cj_str(ib, "approval_entry_hash", aeh, sizeof(aeh))
+                        && aeh[0];
+            cJSON_Delete(ib);
+            if (have &&
+                chain_citation_insert_locked(state, session_id, next_seq,
+                                             aeh) != VIRP_OK) {
+                sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+                return VIRP_ERR_CHAIN_DB;
+            }
+        }
+    }
+
     /* COMMIT — sequence is now permanent */
     rc = sqlite3_exec(state->db, "COMMIT;", NULL, NULL, NULL);
     if (rc != SQLITE_OK) {
@@ -2526,28 +2587,17 @@ typedef struct {
     sqlite3_int64 rowid;           /* chain_entries.rowid, to fetch a body */
 } chain_closer_ref_t;
 
-typedef struct {
-    char aeh[65];                  /* approval_entry_hash this intent names */
-} chain_intent_ref_t;
-
 static int cmp_closer_ref(const void *a, const void *b)
 {
     return strcmp(((const chain_closer_ref_t *)a)->cited,
                   ((const chain_closer_ref_t *)b)->cited);
 }
 
-static int cmp_intent_ref(const void *a, const void *b)
-{
-    return strcmp(((const chain_intent_ref_t *)a)->aeh,
-                  ((const chain_intent_ref_t *)b)->aeh);
-}
 
 static void chain_maps_free(virp_chain_state_t *state)
 {
     free(state->closer_map);  state->closer_map = NULL;
     state->closer_map_n = 0;  state->closer_map_built = false;
-    free(state->intent_map);  state->intent_map = NULL;
-    state->intent_map_n = 0;  state->intent_map_built = false;
 }
 
 /* false on a read error, exactly where the old per-entry scan returned
@@ -2603,9 +2653,47 @@ static bool chain_build_closer_map_locked(virp_chain_state_t *state)
     return true;
 }
 
-static bool chain_build_intent_map_locked(virp_chain_state_t *state)
+
+/* Insert one citation, and keep the maintained row count in step, both
+ * inside the caller's transaction. The counter is what makes the
+ * intactness check O(1). */
+static virp_error_t chain_citation_insert_locked(virp_chain_state_t *state,
+                                                 const char *session_id,
+                                                 int64_t sequence,
+                                                 const char *aeh)
 {
-    if (state->intent_map_built) return true;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "INSERT OR REPLACE INTO intent_approval_citation"
+            "(chain_entry_id, approval_entry_hash) "
+            "SELECT rowid, ? FROM chain_entries "
+            "WHERE session_id = ? AND sequence = ?", -1, &st, NULL)
+        != SQLITE_OK)
+        return VIRP_ERR_CHAIN_DB;
+    sqlite3_bind_text(st, 1, aeh, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, session_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, sequence);
+    int step = sqlite3_step(st);
+    int changed = sqlite3_changes(state->db);
+    sqlite3_finalize(st);
+    if (step != SQLITE_DONE) return VIRP_ERR_CHAIN_DB;
+    if (changed != 1) return VIRP_ERR_CHAIN_DB;   /* the entry must exist */
+
+    if (sqlite3_exec(state->db,
+            "INSERT INTO chain_meta(k,v) VALUES('citation_rows','1') "
+            "ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER)+1 "
+            "AS TEXT)", NULL, NULL, NULL) != SQLITE_OK)
+        return VIRP_ERR_CHAIN_DB;
+    return VIRP_OK;
+}
+
+/* The authority: scan every gate_intent body and compare. Slow, correct,
+ * and kept forever as the oracle the fast path is checked against
+ * (constraint 4 of docs/PERF-REPLAY-GUARD.md). */
+static virp_error_t chain_count_intents_scan_locked(
+        virp_chain_state_t *state, const char *aeh, int *count)
+{
+    *count = 0;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(state->db,
             "SELECT a.artifact_content FROM chain_entries c "
@@ -2613,39 +2701,186 @@ static bool chain_build_intent_map_locked(virp_chain_state_t *state)
             "               AND a.artifact_hash = c.artifact_hash "
             "WHERE c.artifact_type = 'gate_intent'", -1, &st, NULL)
         != SQLITE_OK)
-        return false;
-
-    size_t cap = 256, n = 0;
-    chain_intent_ref_t *arr = malloc(cap * sizeof(*arr));
-    if (!arr) { sqlite3_finalize(st); return false; }
-    int step;
+        return VIRP_ERR_CHAIN_DB;
+    int n = 0, step;
     while ((step = sqlite3_step(st)) == SQLITE_ROW) {
         const unsigned char *b = sqlite3_column_text(st, 0);
         if (!b) continue;
         cJSON *o = cJSON_Parse((const char *)b);
         if (!o) continue;
         char got[65];
-        if (cj_str(o, "approval_entry_hash", got, sizeof(got)) && got[0]) {
-            if (n == cap) {
-                size_t ncap = cap * 2;
-                chain_intent_ref_t *g = realloc(arr, ncap * sizeof(*arr));
-                if (!g) { cJSON_Delete(o); free(arr);
-                          sqlite3_finalize(st); return false; }
-                arr = g; cap = ncap;
-            }
-            snprintf(arr[n].aeh, sizeof(arr[n].aeh), "%s", got);
+        if (cj_str(o, "approval_entry_hash", got, sizeof(got)) &&
+            strcmp(got, aeh) == 0)
             n++;
-        }
         cJSON_Delete(o);
     }
     sqlite3_finalize(st);
-    if (step != SQLITE_DONE) { free(arr); return false; }
+    if (step != SQLITE_DONE) return VIRP_ERR_CHAIN_DB;
+    *count = n;
+    return VIRP_OK;
+}
 
-    qsort(arr, n, sizeof(*arr), cmp_intent_ref);
-    state->intent_map = arr;
-    state->intent_map_n = n;
-    state->intent_map_built = true;
-    return true;
+/* Read a chain_meta integer, or -1. */
+static long long chain_meta_int_locked(virp_chain_state_t *state,
+                                       const char *k)
+{
+    sqlite3_stmt *st = NULL;
+    long long v = -1;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT v FROM chain_meta WHERE k = ?", -1, &st, NULL)
+        == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, k, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *t = sqlite3_column_text(st, 0);
+            if (t) v = strtoll((const char *)t, NULL, 10);
+        }
+        sqlite3_finalize(st);
+    }
+    return v;
+}
+
+/* O(1) intactness: the count the daemon maintained inside each append's
+ * transaction, against the rows actually present. */
+static bool chain_citations_intact_locked(virp_chain_state_t *state)
+{
+    long long expect = chain_meta_int_locked(state, "citation_rows");
+    if (expect < 0) return false;
+    sqlite3_stmt *st = NULL;
+    long long actual = -1;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT count(*) FROM intent_approval_citation", -1, &st, NULL)
+        == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW)
+            actual = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    return actual >= 0 && actual == expect;
+}
+
+/*
+ * BACKFILL, ONCE, AND VERIFIED (constraint 3 of
+ * docs/PERF-REPLAY-GUARD.md).
+ *
+ * Every gate_intent written before this table existed needs its
+ * citation, and the result is CHECKED against the authoritative scan
+ * before the fast path is trusted. If anything about that does not add
+ * up, the marker is not set and the guard keeps scanning: slow and
+ * correct beats fast and wrong on the approval path.
+ *
+ * Read-only handles skip it; a verifier cannot write, and does not need
+ * to -- the guard is a daemon path.
+ */
+static void chain_backfill_citations_locked(virp_chain_state_t *state)
+{
+    if (state->read_only) return;
+    if (chain_citations_ready_locked(state)) return;
+
+    if (sqlite3_exec(state->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL)
+        != SQLITE_OK)
+        return;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT c.rowid, a.artifact_content FROM chain_entries c "
+            "JOIN artifacts a ON a.artifact_id = c.artifact_id "
+            "               AND a.artifact_hash = c.artifact_hash "
+            "WHERE c.artifact_type = 'gate_intent'", -1, &st, NULL)
+        != SQLITE_OK) {
+        sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+        return;
+    }
+
+    long long inserted = 0;
+    bool ok = true;
+    int step;
+    while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+        sqlite3_int64 rid = sqlite3_column_int64(st, 0);
+        const unsigned char *b = sqlite3_column_text(st, 1);
+        if (!b) continue;
+        cJSON *o = cJSON_Parse((const char *)b);
+        if (!o) continue;
+        char aeh[65];
+        bool have = cj_str(o, "approval_entry_hash", aeh, sizeof(aeh))
+                    && aeh[0];
+        cJSON_Delete(o);
+        if (!have) continue;
+
+        sqlite3_stmt *ins = NULL;
+        if (sqlite3_prepare_v2(state->db,
+                "INSERT OR REPLACE INTO intent_approval_citation"
+                "(chain_entry_id, approval_entry_hash) VALUES (?, ?)",
+                -1, &ins, NULL) != SQLITE_OK) { ok = false; break; }
+        sqlite3_bind_int64(ins, 1, rid);
+        sqlite3_bind_text(ins, 2, aeh, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(ins) != SQLITE_DONE) ok = false;
+        sqlite3_finalize(ins);
+        if (!ok) break;
+        inserted++;
+    }
+    sqlite3_finalize(st);
+    if (!ok || step != SQLITE_DONE) {
+        sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+        fprintf(stderr, "[Chain] citation backfill failed; the replay guard "
+                        "keeps using the authoritative scan\n");
+        return;
+    }
+
+    /* VERIFY before trusting: the rows we just wrote must equal the rows
+     * present, and the count must be what we counted. A mismatch here is
+     * the difference between a fast guard and a wrong one. */
+    sqlite3_stmt *cq = NULL;
+    long long actual = -1;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT count(*) FROM intent_approval_citation", -1, &cq, NULL)
+        == SQLITE_OK) {
+        if (sqlite3_step(cq) == SQLITE_ROW)
+            actual = sqlite3_column_int64(cq, 0);
+        sqlite3_finalize(cq);
+    }
+    if (actual != inserted) {
+        sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+        fprintf(stderr, "[Chain] citation backfill wrote %lld rows but %lld "
+                        "are present; not trusting the index\n",
+                inserted, actual);
+        return;
+    }
+
+    char v[32];
+    snprintf(v, sizeof(v), "%lld", inserted);
+    sqlite3_stmt *ms = NULL;
+    bool meta_ok = false;
+    if (sqlite3_prepare_v2(state->db,
+            "INSERT OR REPLACE INTO chain_meta(k,v) VALUES('citation_rows',?)",
+            -1, &ms, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(ms, 1, v, -1, SQLITE_TRANSIENT);
+        meta_ok = (sqlite3_step(ms) == SQLITE_DONE);
+        sqlite3_finalize(ms);
+    }
+    if (meta_ok)
+        meta_ok = (sqlite3_exec(state->db,
+                       "INSERT OR REPLACE INTO chain_meta(k,v) "
+                       "VALUES('citation_backfill','1')",
+                       NULL, NULL, NULL) == SQLITE_OK);
+    if (!meta_ok) {
+        sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+        return;
+    }
+    sqlite3_exec(state->db, "COMMIT;", NULL, NULL, NULL);
+    fprintf(stderr, "[Chain] replay-guard citation index ready (%lld "
+                    "intent citations)\n", inserted);
+}
+
+static bool chain_citations_ready_locked(virp_chain_state_t *state)
+{
+    sqlite3_stmt *st = NULL;
+    bool ready = false;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT 1 FROM chain_meta WHERE k='citation_backfill' LIMIT 1",
+            -1, &st, NULL) == SQLITE_OK) {
+        ready = (sqlite3_step(st) == SQLITE_ROW);
+        sqlite3_finalize(st);
+    }
+    return ready;
 }
 
 static virp_error_t chain_count_intents_for_approval_locked(
@@ -2653,20 +2888,52 @@ static virp_error_t chain_count_intents_for_approval_locked(
 {
     *count = 0;
     if (!aeh || !aeh[0]) return VIRP_OK;
-    if (!chain_build_intent_map_locked(state)) return VIRP_ERR_CHAIN_DB;
 
-    chain_intent_ref_t key;
-    snprintf(key.aeh, sizeof(key.aeh), "%s", aeh);
-    const chain_intent_ref_t *arr = state->intent_map;
-    const chain_intent_ref_t *hit = bsearch(&key, arr, state->intent_map_n,
-                                            sizeof(*arr), cmp_intent_ref);
-    if (!hit) return VIRP_OK;
-    /* Duplicates are adjacent after the sort; walk both ways. */
-    size_t i = (size_t)(hit - arr), lo = i, hi = i;
-    while (lo > 0 && strcmp(arr[lo - 1].aeh, aeh) == 0) lo--;
-    while (hi + 1 < state->intent_map_n &&
-           strcmp(arr[hi + 1].aeh, aeh) == 0) hi++;
-    *count = (int)(hi - lo + 1);
+    /* CONSTRAINT 5: the fast path is used ONLY when the backfill has run
+     * and been verified. Until then, and any time it cannot answer, the
+     * authority answers. Absence is never read as "not spent". */
+    if (!chain_citations_ready_locked(state))
+        return chain_count_intents_scan_locked(state, aeh, count);
+
+    /* CONSTRAINT 1: the chain is the authority. The join back to
+     * chain_entries is what makes a forged or orphaned citation count
+     * nothing -- the row is an index INTO the chain, not a claim
+     * alongside it. */
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT count(*) FROM intent_approval_citation ic "
+            "JOIN chain_entries c ON c.rowid = ic.chain_entry_id "
+            "                    AND c.artifact_type = 'gate_intent' "
+            "WHERE ic.approval_entry_hash = ?", -1, &st, NULL) != SQLITE_OK)
+        return chain_count_intents_scan_locked(state, aeh, count);
+    sqlite3_bind_text(st, 1, aeh, -1, SQLITE_TRANSIENT);
+    int n = 0;
+    bool got = false;
+    if (sqlite3_step(st) == SQLITE_ROW) { n = sqlite3_column_int(st, 0);
+                                          got = true; }
+    sqlite3_finalize(st);
+    if (!got)
+        return chain_count_intents_scan_locked(state, aeh, count);
+
+    /* A ZERO is the one answer that lets an apply proceed, so it is the
+     * one answer that must not be trusted blindly: a citation lost to a
+     * partial restore or a hand-edit would read as "never spent".
+     *
+     * Trusting it therefore requires the table to be INTACT, which is
+     * checked in O(1): the row count the daemon maintained inside each
+     * append's transaction, against the row count actually present. A
+     * mismatch means rows went missing behind the daemon's back, and the
+     * authority answers instead -- loudly, because a derived index that
+     * disagrees with what wrote it is a fault to report, not to paper
+     * over (constraint 1). */
+    if (n == 0 && !chain_citations_intact_locked(state)) {
+        fprintf(stderr, "[Chain] intent_approval_citation row count "
+                        "disagrees with the maintained count — falling back "
+                        "to the authoritative scan for the replay guard\n");
+        return chain_count_intents_scan_locked(state, aeh, count);
+    }
+
+    *count = n;
     return VIRP_OK;
 }
 
