@@ -59,6 +59,31 @@ OBS_V2_HEADER_SIZE = 88
 OBS_V2_SIG_SIZE = 32
 OBS_V2_HEADER_FMT = "!BBBBQQQ16sQ32sI"
 
+# v3 observation wire format (include/virp.h, VIRP_VERSION_3): the SAME
+# 88-byte header as v2, then payload, then the 32-byte session-key HMAC,
+# then a 64-byte detached Ed25519 signature over
+# header || payload || HMAC -- everything except the signature itself.
+#
+# HAM review 2026-09-06, item 8. The C observation verifier accepts v1, v2
+# and v3; this module knew v2-else-v1, so a v3 frame fell through to the
+# v1 O-Key path and reported FAIL. Anything the trusted daemon accepts as
+# strong evidence has to be verifiable by the public verifier, or the
+# public verifier is not the check it claims to be.
+#
+# Unlike v2, a v3 frame IS verifiable at rest: the trailer is asymmetric,
+# so a holder of the observation-signing PUBLIC key can check it without
+# being able to forge one. That is the whole point of v3 and it is why
+# teaching this verifier is the right answer rather than refusing v3 at
+# ingestion: the camera/Spark path on 313 is the likely producer and
+# disabling ingestion would break a live pipeline to fix a verifier gap.
+OBS_V3_SIG_SIZE = 64
+OBS_V3_MIN_SIZE = OBS_V2_HEADER_SIZE + OBS_V2_SIG_SIZE + OBS_V3_SIG_SIZE
+
+V3_NO_KEY = (
+    "version 3, Ed25519-signed: no observation-signing public key was "
+    "supplied, so the signature was not checked. Rerun with the key and "
+    "this becomes PASS or FAIL.")
+
 V2_DESIGN_STATEMENT = (
     "version 2, session-key-signed: at-rest cryptographic verification is "
     "not possible with available material (the signing key is "
@@ -607,7 +632,77 @@ def classify_observation_v2(raw):
     return V2_SESSION, V2_DESIGN_STATEMENT
 
 
-def verify_observation_hmac(raw, okey):
+def parse_observation_v3_header(raw):
+    """Parse a v3 header. Identical layout to v2 (include/virp.h): the
+    version byte is what differs, and the trailer."""
+    hdr = parse_observation_v2_header(raw)
+    if hdr is None:
+        return None
+    hdr["type_name"] = "OBSERVATION (v3)"
+    hdr["length"] = (OBS_V2_HEADER_SIZE + hdr["payload_len"]
+                     + OBS_V2_SIG_SIZE + OBS_V3_SIG_SIZE)
+    return hdr
+
+
+def v3_signed_span(raw):
+    """The bytes a v3 Ed25519 signature covers: header || payload || HMAC.
+
+    Mirrors virp_verify_observation_ed25519() in src/virp_crypto.c. The
+    HMAC trailer is INSIDE the signed span, so a relay cannot rewrite it
+    without invalidating the signature."""
+    hdr = parse_observation_v3_header(raw)
+    if hdr is None:
+        return None
+    span = OBS_V2_HEADER_SIZE + hdr["payload_len"] + OBS_V2_SIG_SIZE
+    if span + OBS_V3_SIG_SIZE != len(raw):
+        return None
+    return raw[:span]
+
+
+def classify_observation_v3(raw, obs_pub):
+    """Verdict for a frame whose version byte claims v3.
+
+    Structural sanity BEFORE the signature, exactly as the C verifier
+    orders it, so a caller learns "header illegal" and "signature bad" as
+    distinct answers. The structural gate mirrors virp_obs_header_sanity:
+    known channel, tier present and not BLACK, reserved zero, and exact
+    framing in both directions -- a frame longer than its declared length
+    carries unauthenticated bytes behind a valid signature, which is how
+    splices hide.
+    """
+    if len(raw) < OBS_V3_MIN_SIZE:
+        return FAIL, ("claims version 3 but is %d bytes, shorter than the "
+                      "%d-byte v3 minimum" % (len(raw), OBS_V3_MIN_SIZE))
+    hdr = parse_observation_v3_header(raw)
+    if hdr["length"] != len(raw):
+        return FAIL, ("claims version 3 but declared payload_len %d does "
+                      "not match frame size (%d expected, %d stored)"
+                      % (hdr["payload_len"], hdr["length"], len(raw)))
+    if hdr["channel"] not in CHANNEL_NAMES:
+        return FAIL, "unknown channel 0x%02x" % hdr["channel"]
+    if hdr["tier"] not in TIER_NAMES:
+        return FAIL, "invalid tier 0x%02x" % hdr["tier"]
+    if hdr["tier"] == 0xFF:
+        return FAIL, "BLACK tier is never a signed observation"
+    if raw[3] != 0:
+        return FAIL, "reserved byte is 0x%02x, must be zero" % raw[3]
+
+    if obs_pub is None:
+        return UNCHECKED, V3_NO_KEY
+    backend = _load_ed25519_backend()
+    if backend is None:
+        return UNCHECKED, ("no Ed25519 backend (pip install pynacl or "
+                           "cryptography) — v3 signature not checked")
+    span = v3_signed_span(raw)
+    if span is None:
+        return FAIL, "v3 framing does not resolve to a signed span"
+    sig = raw[len(span):len(span) + OBS_V3_SIG_SIZE]
+    if backend(obs_pub, span, sig):
+        return PASS, ""
+    return FAIL, "v3 Ed25519 observation signature did not verify"
+
+
+def verify_observation_hmac(raw, okey, obs_pub=None):
     """Recompute the O-Key HMAC over a signed VIRP message.
 
     Signed region is header-without-HMAC (bytes 0..24) concatenated with the
@@ -622,10 +717,18 @@ def verify_observation_hmac(raw, okey):
     before the okey check because the O-Key would not verify a v2 frame
     even if supplied.
 
+    A frame whose version byte is 3 goes to classify_observation_v3 for
+    the same reason and with a better outcome: v3 IS verifiable at rest,
+    from the observation-signing PUBLIC key alone. Without that key it is
+    UNCHECKED with a stated reason, never a silent pass and never a FAIL
+    for the crime of being a version this module used to not know.
+
     Returns (verdict, detail).
     """
     if raw is not None and len(raw) >= 1 and raw[0] == 2:
         return classify_observation_v2(raw)
+    if raw is not None and len(raw) >= 1 and raw[0] == 3:
+        return classify_observation_v3(raw, obs_pub)
     if okey is None:
         return UNCHECKED, "no O-Key available"
     if raw is None or len(raw) < VIRP_HEADER_SIZE:
@@ -796,7 +899,8 @@ class EntryVerification:
         return out
 
 
-def verify_entry(entry, artifact_content, okey, chain_key, expected_prev):
+def verify_entry(entry, artifact_content, okey, chain_key, expected_prev,
+                 obs_pub=None):
     """Run every available check against one chain entry."""
     v = EntryVerification(entry)
 
@@ -894,6 +998,13 @@ def verify_entry(entry, artifact_content, okey, chain_key, expected_prev):
             v.header = parse_observation_v2_header(raw)
             v.payload = parse_observation_v2_payload(raw)
             v.obs_hmac, v.obs_hmac_detail = verify_observation_hmac(raw, okey)
+        elif raw[0:1] == b"\x03":
+            # v3 frame: Ed25519-signed, and unlike v2 it IS verifiable at
+            # rest from the public key alone (HAM item 8).
+            v.header = parse_observation_v3_header(raw)
+            v.payload = parse_observation_v2_payload(raw)
+            v.obs_hmac, v.obs_hmac_detail = verify_observation_hmac(
+                raw, okey, obs_pub)
         else:
             v.header = parse_message_header(raw)
             v.payload = parse_observation_payload(raw)
@@ -1087,7 +1198,8 @@ def grade_open_executions(verifications):
 
 
 def verify_chain(entries, artifacts, okey=None, chain_key=None,
-                 heads=None, selection_complete=False, v2_journal=None):
+                 heads=None, selection_complete=False, v2_journal=None,
+                 obs_pub=None):
     """Verify a list of chain entries (dicts) in session/sequence order.
 
     `artifacts` maps (artifact_id, artifact_hash) -> artifact_content (or
@@ -1099,6 +1211,10 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None,
     corroborating v2 (session-key-signed) observations — see
     corroborate_v2. None means "not supplied": v2 frames then carry an
     UNCHECKED corroboration verdict, never a silent pass.
+
+    `obs_pub` is the 32-byte raw Ed25519 observation-signing PUBLIC key.
+    With it, v3 observations verify at rest; without it they are UNCHECKED
+    with a stated reason (HAM review 2026-09-06, item 8).
 
     `heads` maps session_id -> head row dict (last_sequence,
     last_entry_hash, head_hmac) from the chain_heads table, or is None when
@@ -1138,7 +1254,7 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None,
                 expected = None
             v = verify_entry(e, artifacts.get((e["artifact_id"],
                                                e["artifact_hash"])),
-                             okey, chain_key, expected)
+                             okey, chain_key, expected, obs_pub=obs_pub)
             if expected is None and prev_seq is not None:
                 v.link = FAIL
                 v.link_detail = (
