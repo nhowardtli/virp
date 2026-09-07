@@ -30,7 +30,9 @@ with a dated `_removed_asa5525_note` recording why.
 - Secret generated **as `virp-tacacs`**, `openssl rand -base64 24 | tr -d "/+=" | cut -c1-32`,
   the same generator `deploy/tacacs/install-authz-server.sh` uses. Written to
   `/etc/virp/tacacs/secret-asalab`, 0600 `virp-tacacs:virp-tacacs`, 30 bytes.
-  **Never printed, never logged, not in any transcript.**
+  **SUPERSEDED — that first value was disclosed in a transcript and is burned.
+  See [Block 2R](#block-2r--re-key-2026-09-07).** The replacement is generated
+  the same way and must not travel the same route.
 - `/etc/virp/tacacs/recv.json` gained a third relationship —
   `source_addr 10.0.0.253` → `client_identity "ASA-Lab"` — with the same secret
   inline, which is the convention the `LAB-SWITCH-1` entry already follows
@@ -166,8 +168,13 @@ run.
 
 ## Block 2 — the accounting server group
 
+**This block was typed on 2026-09-07 and its key is burned — go to
+[Block 2R](#block-2r--re-key-2026-09-07) after reading it.** The block is kept
+as written because the group, host, port and bindings it creates are all still
+correct; only the key value changed.
+
 You need the shared secret. **Read it on 313, on your own terminal, and type it
-straight into the ASA:**
+straight into the ASA. Do not paste it anywhere.**
 
 ```sh
 ssh nhoward@10.0.0.13 'sudo -n cat /etc/virp/tacacs/secret-asalab'
@@ -205,6 +212,83 @@ show running-config aaa-server VIRP-ACCT
 The `key` renders as `*****` — that is correct, and `src/virp_scrub.c` also
 redacts first-token `key <string>` lines if this config is ever captured
 elsewhere in VIRP.
+
+---
+
+## Block 2R — re-key, 2026-09-07
+
+**Why this block exists.** The Block 2 `key` line was pasted into a session
+transcript in cleartext during the first run, which discloses the shared secret
+to every reader of that transcript. The value is burned. Both sides move
+together: a new secret is generated on 313, and the ASA is re-keyed to match.
+
+Nothing was lost by it. No accounting had reached 313 yet — Block 3 was not
+typed, and `show version` is not accounted anyway — so the rotation costs one
+config line and no evidence.
+
+**The rule this violates, restated.** The secret is read on 313 and typed
+straight into the ASA. It is never pasted into a chat, a ticket, a commit, or a
+terminal that is being recorded. `deploy/tacacs/install-authz-server.sh` never
+prints a secret for exactly this reason, and `src/virp_scrub.c` redacts
+first-token `key <string>` lines so a captured config does not leak one either.
+Those defences only hold if the value does not travel through a transcript by
+hand.
+
+### On 313 — operator runs this
+
+This writes credential material, so it is not an agent action. Run it in a
+terminal that is not being recorded.
+
+```sh
+sudo cp -a /etc/virp/tacacs/recv.json \
+     /etc/virp/tacacs/recv.json.bak-$(date -u +%Y%m%dT%H%M%SZ)-pre-rekey
+
+sudo -u virp-tacacs bash -c 'umask 077; openssl rand -base64 24 \
+     | tr -d "/+=" | cut -c1-32 > /etc/virp/tacacs/secret-asalab'
+
+sudo python3 -c '
+import json
+p = "/etc/virp/tacacs/recv.json"
+new = open("/etc/virp/tacacs/secret-asalab").read().strip()
+d = json.load(open(p))
+hits = [r for r in d["relationships"] if r["source_addr"] == "10.0.0.253"]
+assert len(hits) == 1, hits
+hits[0]["secret"] = new
+open(p, "w").write(json.dumps(d, indent=1) + "\n")
+print("rewritten:", [(r["source_addr"], r["client_identity"])
+                     for r in json.load(open(p))["relationships"]])
+'
+
+sudo chmod 0600 /etc/virp/tacacs/recv.json /etc/virp/tacacs/secret-asalab
+sudo chown virp-tacacs:virp-tacacs /etc/virp/tacacs/recv.json \
+     /etc/virp/tacacs/secret-asalab
+sudo systemctl restart virp-tacacs
+systemctl is-active virp-tacacs
+```
+
+`is-active` must print `active`. The restart is mandatory for the same reason
+it was the first time: the receiver reads its config once at startup and has no
+reload path.
+
+### On the ASA console
+
+Replace the key in place. The group and its bindings stay; only the key
+changes.
+
+```
+configure terminal
+ aaa-server VIRP-ACCT (<IFNAME>) host 10.0.0.13
+  key <the new 29 characters — read from 313, typed not pasted>
+ exit
+end
+```
+
+Read it with `sudo cat /etc/virp/tacacs/secret-asalab` on 313 and type it at
+the console.
+
+**Rollback: none, deliberately.** A re-key has no rollback, because the old
+value must not come back. If the new key is mistyped, `show aaa-server
+VIRP-ACCT` shows a rising error count and you re-type it.
 
 ---
 
