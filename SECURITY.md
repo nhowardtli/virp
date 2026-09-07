@@ -307,6 +307,45 @@ weaken any gate that validates the *content* of an append: an
 indirect-commitment types must still carry a body. Being on the list is
 permission to submit, never a waiver of verification.
 
+## The API server is trusted-side. It must never run on the AI host.
+
+(Added 2026-09-07, HAM review item 14.)
+
+`api/server.py` loads the O-Key (`VIRP_KEY_PATH`, default
+`/etc/virp/keys/onode.key`, `load_okey()` at line 357). The O-Key is
+symmetric: **the key that verifies an observation is the key that mints
+one.** A process holding it can forge any observation the daemon could
+have signed, and nothing downstream — not the chain, not `virp-verify`,
+not Docket — can tell the difference.
+
+So:
+
+- **The API server is a trusted-side component.** It belongs on the same
+  side of the boundary as the O-Node daemon, on a host the operator
+  controls, and nowhere else.
+- **The AI host runs the model, the VIRP client, and a forwarded O-Node
+  socket. Nothing else.** No API server, no key material, no verifier
+  that holds a symmetric key. The forwarded socket is the entire
+  interface, and `SO_PEERCRED` plus the per-uid action allowlist are what
+  constrain it.
+- **This includes a hosted seat.** The whole claim of a walled AI host is
+  that the model cannot mint evidence about what it did. Putting "the API
+  server" next to the agent for convenience — to give it a nicer
+  interface, to let it render its own reports, to avoid a socket forward
+  — hands it the forging key and voids that claim silently. Nothing about
+  the deployment would look wrong afterwards, which is exactly why this
+  is written down here rather than left to judgement at install time.
+- The asymmetric path is the one that may cross the boundary. An
+  observation-signing PUBLIC key (v3, `include/virp_obskey.h`) or a
+  chain-signing PUBLIC key (D-1) can sit anywhere: a holder can verify
+  and cannot forge. That is the difference, and it is the only reason
+  `report/verify.py` and `virp-verify` are safe to hand out.
+
+If an operator needs an HTTP interface reachable from the AI host, the
+supported shape is the API server on the trusted side, exposed through an
+authenticated gateway, with the AI host holding no key. Not the API
+server on the AI host.
+
 ## Trust Boundaries and Transport Paths
 
 **The trusted request boundary for 1.0 is the local Unix domain socket,

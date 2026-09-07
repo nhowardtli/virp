@@ -134,6 +134,53 @@ virp_error_t virp_chain_verify(virp_chain_state_t *state,
     return rc;
 }
 
+bool virp_chain_from_n_temporally_ok(uint64_t first_signed_ns,
+                                     uint64_t cutover_ns)
+{
+    /* At or after. A session whose signed suffix starts BEFORE the
+     * earliest signature on the whole chain is not a cutover session --
+     * signing did not exist yet when those entries claim to have been
+     * signed. */
+    if (cutover_ns == 0) return false;   /* nothing signed: no cutover */
+    return first_signed_ns >= cutover_ns;
+}
+
+virp_error_t virp_chain_cutover_ns(virp_chain_state_t *state,
+                                   uint64_t *out_ns)
+{
+    if (!state || !out_ns) return VIRP_ERR_NULL_PTR;
+    *out_ns = 0;
+    if (!state->db || !state->entry_sig_cols) return VIRP_OK;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT MIN(timestamp_ns) FROM chain_entries "
+            "WHERE chain_sig IS NOT NULL AND chain_sig <> ''",
+            -1, &st, NULL) != SQLITE_OK)
+        return VIRP_ERR_CHAIN_DB;
+    if (sqlite3_step(st) == SQLITE_ROW &&
+        sqlite3_column_type(st, 0) != SQLITE_NULL)
+        *out_ns = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return VIRP_OK;
+}
+
+const char *virp_chain_sig_era_name(virp_chain_sig_era_t era)
+{
+    switch (era) {
+    case VIRP_CHAIN_SIG_ERA_UNSIGNED: return "UNSIGNED_ERA";
+    case VIRP_CHAIN_SIG_ERA_FROM_N:   return "SIGNED_FROM_N";
+    case VIRP_CHAIN_SIG_ERA_SIGNED:   return "SIGNED";
+    default:                          return "NOT_GRADED";
+    }
+}
+
+static void chain_session_sig_state_locked(virp_chain_state_t *state,
+                                           const char *session_id,
+                                           bool *is_signed,
+                                           char *kid_out,
+                                           size_t kid_len);
+
 static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
                                        const char *session_id,
                                        virp_chain_verify_result_t *result)
@@ -215,9 +262,18 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
     bool head_is_signed = (state->head_sig_cols && head_sig[0] != '\0');
     bool head_sig_ok = false;
     state->sig_key_unavailable_session = false;
-    if (state->verify_sig_enabled && head_is_signed &&
-        strcmp(head_key_id, state->verify_key_id_hex) != 0) {
-        state->sig_key_unavailable_session = true;
+    {
+        /* Per SESSION, never per database (HAM item 7). A session with no
+         * head signature and no signed entry is an UNSIGNED session and
+         * the asymmetric tier simply does not apply to it. */
+        bool sess_signed = false;
+        char sess_kid[VIRP_CHAINSIGN_KEYID_HEX] = {0};
+        chain_session_sig_state_locked(state, session_id, &sess_signed,
+                                       sess_kid, sizeof(sess_kid));
+        if (state->verify_sig_enabled && sess_signed &&
+            strcmp(sess_kid, state->verify_key_id_hex) != 0) {
+            state->sig_key_unavailable_session = true;
+        }
     }
 
     /* Authenticate the head itself before trusting its length claim.
@@ -288,6 +344,54 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
         return VIRP_OK;
     }
 
+    /* ===================================================================
+     * THE SIGNATURE ERA (HAM item 7, reworked 2026-09-07).
+     *
+     * Decided here, once, after the walk, from what the walk counted.
+     * `valid` already means "the chain is intact"; this says what the
+     * signatures were, and `valid_signed` is the flag a caller gates a
+     * clean bill of health on.
+     * =================================================================== */
+    if (!state->verify_sig_enabled || !state->entry_sig_cols || unavailable) {
+        /* The asymmetric tier did not run. It claims nothing either way. */
+        result->sig_era = VIRP_CHAIN_SIG_ERA_NOT_GRADED;
+    } else if (result->entries_signed == 0 && !head_is_signed) {
+        /* Nothing signed, anywhere, and the head agrees. Provably a
+         * pre-signing session: nothing was stripped because nothing was
+         * ever there. On 313 this is 17 sessions, every one of them
+         * before 2026-08-23 17:48:11Z or inside the 2m21s window on
+         * 2026-08-23 when the daemon restarted without signing. */
+        result->sig_era = VIRP_CHAIN_SIG_ERA_UNSIGNED;
+    } else if (result->entries_unsigned == 0) {
+        result->sig_era = VIRP_CHAIN_SIG_ERA_SIGNED;
+    } else if (result->sig_transition_seq > 0 && head_is_signed) {
+        /* An unsigned prefix followed by a signed suffix, with all five
+         * conditions met. Conditions 1, 4 and 5 were enforced during the
+         * walk (a signature that stops is fatal there; a suffix entry
+         * that does not verify is fatal there; the hash chain is checked
+         * for every entry). Condition 3 was enforced just after it.
+         * Condition 2, the signed head, is the one only this level knows,
+         * and it matters: without it the length claim is unauthenticated
+         * and the suffix cannot be said to cover the session. */
+        result->sig_era = VIRP_CHAIN_SIG_ERA_FROM_N;
+    } else if (result->sig_transition_seq > 0 && !head_is_signed) {
+        /* Prefix shape, but the head does not vouch for the length. Not
+         * excused: reported as a failure rather than as a cutover. */
+        result->valid = false;
+        result->sig_era = VIRP_CHAIN_SIG_ERA_NOT_GRADED;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "Unsigned entries before sequence %lld and the head "
+                 "carries no signature: the length claim is "
+                 "unauthenticated, so the signed suffix cannot be said to "
+                 "cover this session",
+                 (long long)result->sig_transition_seq);
+    } else {
+        /* Reached only when the walk did not already break: defensive. */
+        result->sig_era = VIRP_CHAIN_SIG_ERA_NOT_GRADED;
+    }
+    result->valid_signed =
+        result->valid && result->sig_era == VIRP_CHAIN_SIG_ERA_SIGNED;
+
     /* Session-level tier outcome (all pure-addition fields). */
     result->head_hmac_ok = state->have_chain_key;
     result->head_sig_ok = head_sig_ok;
@@ -296,6 +400,103 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
     snprintf(result->sig_key_id, sizeof(result->sig_key_id), "%s",
              head_is_signed ? head_key_id : "");
     return VIRP_OK;
+}
+
+/*
+ * IS THIS SESSION SIGNED, AND UNDER WHICH KEY?
+ *
+ * HAM review 2026-09-06, item 7. Enabling optional Ed25519 chain signing
+ * adds the signature columns to the whole DATABASE. The verifier used to
+ * infer "signed" from (columns exist AND a pubkey is available), which is
+ * a property of the database and the operator, not of the session. Every
+ * legitimate pre-signing session in a migrated database therefore
+ * verified as a signed session with missing signatures and FAILED with
+ * "stripped signature" at sequence 0.
+ *
+ * The Python standalone verifier already asked the right question, per
+ * session, and got it right (report/verify.py, verify_chain_signatures):
+ *
+ *     head_signed      = bool(head and head["head_sig"])
+ *     any_entry_signed = any(r["chain_sig"] for r in rows)
+ *     if not head_signed and not any_entry_signed:  -> "unsigned"
+ *     sess_kid = head["head_sig_key_id"] if head_signed
+ *                else rows[0]["chain_sig_key_id"]
+ *
+ * This mirrors that rule exactly, so the two verifiers cannot reach
+ * different conclusions about the same database. THE SHARED RULE IS
+ * docs/VERIFIER-SEMANTICS.md, "Is a session signed?". Both this function
+ * and verify_chain_signatures() in report/verify.py implement it;
+ * neither owns it.
+ *
+ * Stripping remains fatal where it is an attack: a session whose head is
+ * still signed is signed, so a missing entry signature inside it FAILS
+ * exactly as before.
+ */
+static void chain_session_sig_state_locked(virp_chain_state_t *state,
+                                           const char *session_id,
+                                           bool *is_signed,
+                                           char *kid_out, size_t kid_len)
+{
+    *is_signed = false;
+    if (kid_out && kid_len) kid_out[0] = '\0';
+    if (!state->db || !session_id) return;
+
+    sqlite3_stmt *st = NULL;
+
+    if (state->head_sig_cols) {
+        if (sqlite3_prepare_v2(state->db,
+                "SELECT head_sig, head_sig_key_id FROM chain_heads "
+                "WHERE session_id = ?", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, session_id, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                const unsigned char *hs = sqlite3_column_text(st, 0);
+                if (hs && hs[0]) {
+                    *is_signed = true;
+                    const unsigned char *hk = sqlite3_column_text(st, 1);
+                    if (kid_out && kid_len)
+                        snprintf(kid_out, kid_len, "%s",
+                                 hk ? (const char *)hk : "");
+                }
+            }
+            sqlite3_finalize(st);
+            st = NULL;
+        }
+        if (*is_signed) return;
+    }
+
+    if (!state->entry_sig_cols) return;
+
+    /* No head signature. The session is still signed if ANY entry in it
+     * carries one, and the key it claims is the FIRST entry's -- which
+     * may be empty, in a session that began before signing and gained it
+     * mid-way. That is exactly the case Python reports as
+     * key_unavailable rather than as tampering, and the C verifier now
+     * agrees instead of failing it. */
+    bool any_signed = false;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT 1 FROM chain_entries WHERE session_id = ? "
+            "AND chain_sig IS NOT NULL AND chain_sig <> '' LIMIT 1",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, session_id, -1, SQLITE_TRANSIENT);
+        any_signed = (sqlite3_step(st) == SQLITE_ROW);
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (!any_signed) return;
+
+    *is_signed = true;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT chain_sig_key_id FROM chain_entries "
+            "WHERE session_id = ? ORDER BY sequence LIMIT 1",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, session_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *k = sqlite3_column_text(st, 0);
+            if (kid_out && kid_len)
+                snprintf(kid_out, kid_len, "%s", k ? (const char *)k : "");
+        }
+        sqlite3_finalize(st);
+    }
 }
 
 virp_error_t virp_chain_verify_session(virp_chain_state_t *state,
@@ -2144,7 +2345,12 @@ static int chain_verify_binding_locked(virp_chain_state_t *state,
             "SELECT artifact_content FROM artifacts "
             "WHERE artifact_id = ? AND artifact_hash = ?",
             -1, &st, NULL) != SQLITE_OK)
-        return 0;   /* cannot read the store: report unverifiable, not broken */
+        /* HAM item 13. THE VERIFIER could not read the store. This used
+         * to return 0, which is the code for "no body was retained" — an
+         * EVIDENCE grade. An examiner then saw "binding unverifiable" for
+         * what was the verifier failing, and the two are not the same
+         * claim. -2 is the verifier's own failure and stops the walk. */
+        return -2;
 
     sqlite3_bind_text(st, 1, e->artifact_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 2, e->artifact_hash, -1, SQLITE_TRANSIENT);
@@ -2472,14 +2678,33 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
     result->from_sequence = from_sequence;
     result->to_sequence = to_sequence;
     result->first_broken = -1;
+    result->first_unsigned = -1;
+    result->sig_transition_seq = -1;
     result->valid = true;
     /* Tier flags (pure addition). hmac_checked reflects whether K_chain was
      * supplied; sig_checked whether per-entry Ed25519 was actually graded
      * for this range (verify_sig_enabled, columns present, and not a
      * key-unavailable session). */
     result->hmac_checked = state->have_chain_key;
+    /* HAM item 7. `entry_sig_cols` is a property of the DATABASE: once
+     * signing is enabled the columns exist for every session, including
+     * every session written before it. Whether the ASYMMETRIC tier
+     * applies is a property of THIS SESSION, and that is what decides it
+     * now. Asked here rather than only in the session-level entry point
+     * so the range API (virp_chain_verify) reaches the same conclusion. */
+    bool unsigned_prefix = false;
+    int64_t first_signed_seq = -1;
+    uint64_t first_signed_ns = 0;
+    bool session_signed = false;
+    char session_kid[VIRP_CHAINSIGN_KEYID_HEX] = {0};
+    chain_session_sig_state_locked(state, session_id, &session_signed,
+                                   session_kid, sizeof(session_kid));
+    bool key_unavailable =
+        state->sig_key_unavailable_session ||
+        (session_signed && state->verify_sig_enabled &&
+         strcmp(session_kid, state->verify_key_id_hex) != 0);
     bool check_sigs = state->verify_sig_enabled && state->entry_sig_cols &&
-                      !state->sig_key_unavailable_session;
+                      session_signed && !key_unavailable;
     result->sig_checked = check_sigs;
 
     /* The caller asserts this range exists; an inverted or negative range
@@ -2526,6 +2751,7 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
 
     /* Walk entries in range */
     sqlite3_reset(state->stmt_get_range);
+
     sqlite3_bind_text(state->stmt_get_range, 1, session_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(state->stmt_get_range, 2, from_sequence);
     sqlite3_bind_int64(state->stmt_get_range, 3, to_sequence);
@@ -2614,6 +2840,31 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
         if (check_sigs) {
             uint8_t sig[VIRP_CHAINSIGN_SIG_SIZE];
             if (e.chain_sig[0] == '\0') {
+                /* THE UNSIGNED-PREFIX CARVE-OUT (SIGNED_FROM_N).
+                 *
+                 * A session that was open when signing began has a run
+                 * of unsigned entries followed by signed ones. That
+                 * PREFIX is tolerated here and graded after the walk.
+                 *
+                 * Tolerated ONLY while no signed entry has been seen
+                 * yet. The moment one has, an unsigned entry means the
+                 * signatures STOPPED, and a verifier cannot tell that
+                 * from a stripped run -- so it is fatal, immediately.
+                 * That is what keeps 313's autopilot:2026-08-23
+                 * (signed through 23, unsigned 24-35, signed from 36)
+                 * BROKEN forever. See
+                 * docs/notes/SIGNING-WINDOW-2026-08-23.md. */
+                result->entries_unsigned++;
+                if (result->first_unsigned < 0)
+                    result->first_unsigned = e.sequence;
+                if (result->entries_signed == 0) {
+                    /* Still inside the prefix. The entry's hash, link
+                     * and HMAC were all checked above; only the
+                     * signature is absent, and the era decides at the
+                     * end whether that is excusable. */
+                    unsigned_prefix = true;
+                    goto sig_done;
+                }
                 result->valid = false;
                 result->first_broken = e.sequence;
                 snprintf(result->error_detail, sizeof(result->error_detail),
@@ -2642,11 +2893,19 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                          "sequence %lld", (long long)e.sequence);
                 break;
             }
+            if (first_signed_seq < 0) {
+                first_signed_seq = e.sequence;
+                first_signed_ns = e.timestamp_ns;
+            }
             result->entries_signed++;
+sig_done: ;
         } else if (state->verify_sig_enabled && e.chain_sig[0] == '\0') {
-            /* pubkey supplied, but this is an unsigned (pre-D-1) session:
-             * informational count, never a failure. */
+            /* pubkey supplied, but this session took the unsigned path:
+             * counted here, and graded on the ERA axis after the walk.
+             * Never a failure on its own -- the era decides. */
             result->entries_unsigned++;
+            if (result->first_unsigned < 0)
+                result->first_unsigned = e.sequence;
         }
 
         /* ARTIFACT BINDING (2026-08-06). The checks above prove the entry
@@ -2660,6 +2919,20 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
          * counted as verified, not fatal). */
         {
             int bind = chain_verify_binding_locked(state, &e);
+            if (bind == -2) {
+                /* The verifier failed, not the evidence. Say which, stop,
+                 * and do not let an incomplete run read as a verdict. */
+                result->valid = false;
+                result->verifier_error = true;
+                snprintf(result->verifier_error_detail,
+                         sizeof(result->verifier_error_detail),
+                         "artifact store unreadable at sequence %lld: %s",
+                         (long long)e.sequence, sqlite3_errmsg(state->db));
+                snprintf(result->error_detail, sizeof(result->error_detail),
+                         "VERIFIER_ERROR: %.200s",
+                         result->verifier_error_detail);
+                break;
+            }
             if (bind < 0) {
                 result->valid = false;
                 result->first_broken = e.sequence;
@@ -2707,6 +2980,29 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
     }
 
     sqlite3_reset(state->stmt_get_range);
+    /* CONDITION 3 of SIGNED_FROM_N. A session with an unsigned prefix is
+     * a cutover session only if its signed suffix starts at or after the
+     * moment signing began on this chain. The instant is read from the
+     * chain, never from a flag: a caller-supplied one would let whoever
+     * supplies it decide which unsigned prefixes get excused. */
+    if (result->valid && unsigned_prefix && first_signed_seq > 0) {
+        uint64_t cut = 0;
+        if (virp_chain_cutover_ns(state, &cut) != VIRP_OK) {
+            result->valid = false;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "VERIFIER_ERROR: could not read the cutover instant");
+        } else if (!virp_chain_from_n_temporally_ok(first_signed_ns, cut)) {
+            result->valid = false;
+            result->first_broken = first_signed_seq;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "Unsigned entries before sequence %lld, but the first "
+                     "signed entry predates the earliest signature on this "
+                     "chain: this is not a signing cutover",
+                     (long long)first_signed_seq);
+        } else {
+            result->sig_transition_seq = first_signed_seq;
+        }
+    }
 
     /* COMPLETENESS: every sequence in [from, to] must have been verified.
      * Middle deletions are caught by the sequence-gap check above, but a

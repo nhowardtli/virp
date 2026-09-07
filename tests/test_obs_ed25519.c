@@ -20,6 +20,7 @@
  */
 
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sodium.h>
@@ -402,8 +403,69 @@ static void test_v3_requires_active_session_and_loaded_key(void)
     virp_context_destroy(ctx);
 }
 
+/*
+ * Env-gated fixture emitter (HAM review 2026-09-06, item 8).
+ *
+ * When VIRP_OBS_V3_OUT names a file, write the observation-signing PUBLIC
+ * key and a handful of v3 frames THIS code actually produced, and exit.
+ * The Python standalone verifier cross-checks them: anything the trusted
+ * daemon accepts as strong evidence has to be verifiable by the public
+ * verifier, and the only honest way to show that is to make the C side
+ * mint the bytes and the Python side check them.
+ *
+ * Public key only. Nothing secret is written.
+ */
+static int emit_vectors(const char *path)
+{
+    virp_context_t *ctx = virp_context_new();
+    if (!ctx || virp_session_init(ctx, "obs-v3-vectors") != VIRP_OK)
+        return 1;
+    activate_session(ctx, 0x77);
+
+    virp_obskey_t kp;
+    if (virp_obskey_generate(&kp) != VIRP_OK) return 1;
+
+    FILE *f = fopen(path, "w");
+    if (!f) return 1;
+    fprintf(f, "{\n  \"scheme\": \"ed25519\",\n  \"public_key\": \"");
+    for (size_t i = 0; i < VIRP_OBSKEY_PK_SIZE; i++)
+        fprintf(f, "%02x", kp.public_key[i]);
+    fprintf(f, "\",\n  \"frames\": [\n");
+
+    static const char *CMDS[] = {
+        "show ip route 203.0.113.0",
+        "show version",
+        "show clock",
+    };
+    for (size_t n = 0; n < sizeof(CMDS) / sizeof(CMDS[0]); n++) {
+        uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+        size_t out_len = 0;
+        if (virp_build_observation_ed25519(
+                ctx, &kp, TEST_NODE_ID, TEST_DEVICE_ID, VIRP_TIER_GREEN,
+                (uint64_t)(n + 1), CMDS[n], NULL, PAYLOAD, PAYLOAD_LEN,
+                buf, sizeof(buf), &out_len) != VIRP_OK) {
+            fclose(f);
+            return 1;
+        }
+        fprintf(f, "    {\"command\": \"%s\", \"frame\": \"", CMDS[n]);
+        for (size_t i = 0; i < out_len; i++)
+            fprintf(f, "%02x", buf[i]);
+        fprintf(f, "\"}%s\n", n + 1 < sizeof(CMDS) / sizeof(CMDS[0]) ? "," : "");
+    }
+    fprintf(f, "  ]\n}\n");
+    fclose(f);
+    virp_obskey_destroy(&kp);
+    virp_context_destroy(ctx);
+    fprintf(stderr, "emitted v3 observation vectors to %s\n", path);
+    return 0;
+}
+
 int main(void)
 {
+    const char *emit = getenv("VIRP_OBS_V3_OUT");
+    if (emit && emit[0])
+        return emit_vectors(emit);
+
     printf("=== VIRP v3 (Ed25519-signed) Observation Build Tests ===\n");
 
     RUN_TEST(test_wire_layout);

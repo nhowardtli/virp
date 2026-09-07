@@ -59,6 +59,31 @@ OBS_V2_HEADER_SIZE = 88
 OBS_V2_SIG_SIZE = 32
 OBS_V2_HEADER_FMT = "!BBBBQQQ16sQ32sI"
 
+# v3 observation wire format (include/virp.h, VIRP_VERSION_3): the SAME
+# 88-byte header as v2, then payload, then the 32-byte session-key HMAC,
+# then a 64-byte detached Ed25519 signature over
+# header || payload || HMAC -- everything except the signature itself.
+#
+# HAM review 2026-09-06, item 8. The C observation verifier accepts v1, v2
+# and v3; this module knew v2-else-v1, so a v3 frame fell through to the
+# v1 O-Key path and reported FAIL. Anything the trusted daemon accepts as
+# strong evidence has to be verifiable by the public verifier, or the
+# public verifier is not the check it claims to be.
+#
+# Unlike v2, a v3 frame IS verifiable at rest: the trailer is asymmetric,
+# so a holder of the observation-signing PUBLIC key can check it without
+# being able to forge one. That is the whole point of v3 and it is why
+# teaching this verifier is the right answer rather than refusing v3 at
+# ingestion: the camera/Spark path on 313 is the likely producer and
+# disabling ingestion would break a live pipeline to fix a verifier gap.
+OBS_V3_SIG_SIZE = 64
+OBS_V3_MIN_SIZE = OBS_V2_HEADER_SIZE + OBS_V2_SIG_SIZE + OBS_V3_SIG_SIZE
+
+V3_NO_KEY = (
+    "version 3, Ed25519-signed: no observation-signing public key was "
+    "supplied, so the signature was not checked. Rerun with the key and "
+    "this becomes PASS or FAIL.")
+
 V2_DESIGN_STATEMENT = (
     "version 2, session-key-signed: at-rest cryptographic verification is "
     "not possible with available material (the signing key is "
@@ -129,6 +154,54 @@ PASS = "PASS"
 FAIL = "FAIL"
 UNCHECKED = "UNCHECKED"
 UNVERIFIABLE = "UNVERIFIABLE"
+
+# SIGNATURE ERA (HAM item 7, reworked 2026-09-07). The same three names the
+# C verifier uses (virp_chain_sig_era_name in src/virp_chain.c), so the two
+# cannot describe one session with different words.
+#
+#   SIGNED         every entry carries a verifying signature. Clean.
+#   SIGNED_FROM_N  an unsigned PREFIX followed by a signed suffix: the
+#                  session was open across the moment signing began. Every
+#                  condition in include/virp_chain.h must hold, including
+#                  that the first signed entry is at or after the cutover
+#                  instant derived from the chain. Carries the transition
+#                  sequence. NOT clean.
+#   UNSIGNED_ERA   no signature anywhere, head unsigned. Nothing was
+#                  stripped because nothing was ever there. NOT clean.
+#
+# A gap anywhere but sequence 0, or sequence 0 plus any other gap, is a
+# FAIL: the verifier cannot tell a cutover gap from a stripped signature
+# by looking at the entry, so it does not try.
+SIG_ERA_SIGNED = "SIGNED"
+SIG_ERA_FROM_N = "SIGNED_FROM_N"
+SIG_ERA_UNSIGNED = "UNSIGNED_ERA"
+
+# VERIFIER_ERROR (HAM review 2026-09-06, item 13). THE VERIFIER FAILED,
+# not the evidence.
+#
+# The four verdicts above all describe a CHAIN ENTRY. This one describes
+# the RUN. A storage or IO failure while verifying says nothing about
+# whether the evidence is sound, and rendering it on the evidence ladder
+# is how an operational failure gets read as a finding. Before this
+# existed, a failed SQLite prepare in the artifact-binding check returned
+# the same code as "no body was retained", so an examiner saw "binding
+# unverifiable" for a verifier that could not open the store.
+#
+# It is a TOP-LEVEL outcome, never a per-entry verdict: when a verifier
+# error occurs the counts in the summary are INCOMPLETE and the summary
+# says so. It is not a tamper signal and must never be counted as one.
+VERIFIER_ERROR = "VERIFIER_ERROR"
+
+
+class VerifierError(Exception):
+    """Raised when the VERIFIER cannot complete: storage unreadable, IO
+    failure, a database that will not open. Never raised for anything
+    the evidence says about itself."""
+
+    def __init__(self, detail, where=""):
+        super().__init__(detail)
+        self.detail = detail
+        self.where = where
 V2_SESSION = "V2-SESSION"
 NOT_APPLICABLE = "N/A"
 
@@ -521,18 +594,34 @@ def chainsign_verify(pub, tag, msg_bytes, sig_hex):
 def verify_chain_signatures(entries, heads, pub, selection_complete=False):
     """ASYMMETRIC-tier verification of a chain, PUBLIC KEY ONLY.
 
-    Mirrors the C verifier's session-granularity rule: in a head-signed
-    session every entry's chain_sig_key_id must equal the head's key_id
-    (which must equal the given key's id), and every entry signature and the
-    head signature must verify. A missing signature or a key_id that differs
-    is a FAIL. A session signed under a DIFFERENT key_id than `pub` is a soft
-    whole-session 'key_unavailable' (never a FAIL). An unsigned (pre-D-1)
-    session is 'unsigned' (never a FAIL).
+    THE SHARED RULE IS docs/VERIFIER-SEMANTICS.md, "Is a session signed?".
+    Both this function and chain_session_sig_state_locked() in
+    src/virp_chain.c implement it; neither owns it. Signed-ness is a
+    property of the SESSION, never of the database or of which keys the
+    operator holds.
+
+    In a head-signed session every entry's chain_sig_key_id must equal the
+    head's key_id (which must equal the given key's id), and every entry
+    signature and the head signature must verify. A missing signature or a
+    key_id that differs is a FAIL. A session signed under a DIFFERENT
+    key_id than `pub` is a soft whole-session 'key_unavailable' (never a
+    FAIL). An unsigned (pre-D-1) session is 'unsigned' (never a FAIL) --
+    the case the C verifier used to get wrong, because it read the
+    database's columns instead of this session's head.
 
     Returns {session_id: {verdict, detail, entries_signed, entries_total}}
-    where verdict is one of PASS / FAIL / UNCHECKED / 'unsigned' /
-    'key_unavailable'. `heads` maps session_id -> row dict (may be None)."""
+    where verdict is one of PASS / FAIL / UNCHECKED / SIGNED_FROM_1 /
+    UNSIGNED_ERA / 'key_unavailable', and sig_era is SIGNED /
+    SIGNED_FROM_1 / UNSIGNED_ERA / NOT_GRADED. PASS is reserved for a
+    clean, fully signed session; the two era verdicts are separate names
+    precisely so a caller testing `== PASS` cannot be handed a session
+    whose signatures do not cover it. `heads` maps session_id -> row dict (may be None)."""
     want_kid = chainsign_key_id(pub)
+    # THE CUTOVER INSTANT, from the chain itself: the earliest timestamp
+    # on any signed entry in the selection. Mirrors virp_chain_cutover_ns.
+    _signed_ts = [e.get("timestamp_ns") for e in entries
+                  if e.get("chain_sig") and e.get("timestamp_ns") is not None]
+    cutover_ns = min(_signed_ts) if _signed_ts else None
     by_session = {}
     for e in entries:
         by_session.setdefault(e["session_id"], []).append(e)
@@ -545,7 +634,14 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
         any_entry_signed = any(r.get("chain_sig") for r in rows)
 
         if not head_signed and not any_entry_signed:
-            out[sid] = {"verdict": "unsigned", "detail": "no signatures",
+            # HAM item 7, reworked 2026-09-07. Named UNSIGNED_ERA, matching
+            # the C verifier, so the two cannot describe the same session
+            # with different words. Not clean: nothing was stripped, but
+            # nothing is covered either.
+            out[sid] = {"sig_era": SIG_ERA_UNSIGNED,
+                        "verdict": SIG_ERA_UNSIGNED,
+                        "detail": "no signature on any entry and none on "
+                                  "the head: a pre-signing session",
                         "entries_signed": 0, "entries_total": len(rows)}
             continue
 
@@ -553,7 +649,8 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
         sess_kid = (head.get("head_sig_key_id") if head_signed
                     else rows[0].get("chain_sig_key_id")) or ""
         if sess_kid != want_kid:
-            out[sid] = {"verdict": "key_unavailable",
+            out[sid] = {"sig_era": "NOT_GRADED",
+                        "verdict": "key_unavailable",
                         "detail": "session signed under key_id %s, verifier "
                                   "holds %s" % (sess_kid, want_kid),
                         "entries_signed": 0, "entries_total": len(rows),
@@ -568,18 +665,31 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
             hv, hd = chainsign_verify(pub, CHAINSIGN_TAG_HEAD, hc,
                                       head.get("head_sig"))
             if hv == FAIL:
-                out[sid] = {"verdict": FAIL, "detail": "head: " + hd,
+                out[sid] = {"sig_era": "NOT_GRADED",
+                            "verdict": FAIL, "detail": "head: " + hd,
                             "entries_signed": 0, "entries_total": len(rows),
                             "sig_key_id": sess_kid}
                 continue
             if hv == UNCHECKED:
-                out[sid] = {"verdict": UNCHECKED, "detail": hd,
+                out[sid] = {"sig_era": "NOT_GRADED",
+                            "verdict": UNCHECKED, "detail": hd,
                             "entries_signed": 0, "entries_total": len(rows),
                             "sig_key_id": sess_kid}
                 continue
-        # Every entry must be signed under the session key_id and verify.
+        # Every entry must be signed under the session key_id and verify,
+        # with ONE carve-out: sequence 0, alone, may be unsigned. See
+        # SIG_ERA_FROM_1 above. Allowed exactly once and exactly there --
+        # a second gap, or a first one elsewhere, is indistinguishable
+        # from a stripped signature and stays a FAIL.
+        unsigned_seqs = []
+        signed_seen = 0
+        first_signed_ns = None
         for e in rows:
             if not e.get("chain_sig"):
+                unsigned_seqs.append(e["sequence"])
+                if signed_seen == 0:
+                    # still inside the unsigned PREFIX; the era decides
+                    continue
                 verdict, detail = FAIL, ("stripped signature at sequence %d"
                                          % e["sequence"])
                 break
@@ -598,7 +708,35 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
                                          % (e["sequence"], ed))
                 break
             signed += 1
-        out[sid] = {"verdict": verdict, "detail": detail,
+            signed_seen += 1
+            if first_signed_ns is None:
+                first_signed_ns = e.get("timestamp_ns")
+        # PASS keeps its meaning -- a clean, fully signed session -- so
+        # existing callers are untouched. The genesis carve-out gets its
+        # OWN verdict, because a caller testing `== PASS` must not be
+        # handed a session whose first entry nothing covers.
+        era = SIG_ERA_SIGNED
+        if verdict == PASS and unsigned_seqs:
+            # An unsigned PREFIX, contiguous from sequence 0, with every
+            # later entry signed and verified. Condition 3, the cutover
+            # instant, is checked against the whole selection -- the same
+            # question the C verifier asks of the whole database.
+            contiguous = unsigned_seqs == list(range(len(unsigned_seqs)))
+            after_cutover = (cutover_ns is None or first_signed_ns is None
+                             or first_signed_ns >= cutover_ns)
+            if contiguous and head_signed and after_cutover:
+                verdict = SIG_ERA_FROM_N
+                era = SIG_ERA_FROM_N
+                detail = ("sequences 0..%d carry no signature; every later "
+                          "entry is signed and verified"
+                          % (len(unsigned_seqs) - 1))
+            else:
+                verdict, era = FAIL, "NOT_GRADED"
+                detail = ("unsigned entries %s do not form a cutover prefix"
+                          % unsigned_seqs[:8])
+        out[sid] = {"sig_era": era, "verdict": verdict, "detail": detail,
+                    "sig_transition_seq": (len(unsigned_seqs)
+                                           if era == SIG_ERA_FROM_N else -1),
                     "entries_signed": signed, "entries_total": len(rows),
                     "sig_key_id": sess_kid}
     return out
@@ -729,7 +867,77 @@ def classify_observation_v2(raw):
     return V2_SESSION, V2_DESIGN_STATEMENT
 
 
-def verify_observation_hmac(raw, okey):
+def parse_observation_v3_header(raw):
+    """Parse a v3 header. Identical layout to v2 (include/virp.h): the
+    version byte is what differs, and the trailer."""
+    hdr = parse_observation_v2_header(raw)
+    if hdr is None:
+        return None
+    hdr["type_name"] = "OBSERVATION (v3)"
+    hdr["length"] = (OBS_V2_HEADER_SIZE + hdr["payload_len"]
+                     + OBS_V2_SIG_SIZE + OBS_V3_SIG_SIZE)
+    return hdr
+
+
+def v3_signed_span(raw):
+    """The bytes a v3 Ed25519 signature covers: header || payload || HMAC.
+
+    Mirrors virp_verify_observation_ed25519() in src/virp_crypto.c. The
+    HMAC trailer is INSIDE the signed span, so a relay cannot rewrite it
+    without invalidating the signature."""
+    hdr = parse_observation_v3_header(raw)
+    if hdr is None:
+        return None
+    span = OBS_V2_HEADER_SIZE + hdr["payload_len"] + OBS_V2_SIG_SIZE
+    if span + OBS_V3_SIG_SIZE != len(raw):
+        return None
+    return raw[:span]
+
+
+def classify_observation_v3(raw, obs_pub):
+    """Verdict for a frame whose version byte claims v3.
+
+    Structural sanity BEFORE the signature, exactly as the C verifier
+    orders it, so a caller learns "header illegal" and "signature bad" as
+    distinct answers. The structural gate mirrors virp_obs_header_sanity:
+    known channel, tier present and not BLACK, reserved zero, and exact
+    framing in both directions -- a frame longer than its declared length
+    carries unauthenticated bytes behind a valid signature, which is how
+    splices hide.
+    """
+    if len(raw) < OBS_V3_MIN_SIZE:
+        return FAIL, ("claims version 3 but is %d bytes, shorter than the "
+                      "%d-byte v3 minimum" % (len(raw), OBS_V3_MIN_SIZE))
+    hdr = parse_observation_v3_header(raw)
+    if hdr["length"] != len(raw):
+        return FAIL, ("claims version 3 but declared payload_len %d does "
+                      "not match frame size (%d expected, %d stored)"
+                      % (hdr["payload_len"], hdr["length"], len(raw)))
+    if hdr["channel"] not in CHANNEL_NAMES:
+        return FAIL, "unknown channel 0x%02x" % hdr["channel"]
+    if hdr["tier"] not in TIER_NAMES:
+        return FAIL, "invalid tier 0x%02x" % hdr["tier"]
+    if hdr["tier"] == 0xFF:
+        return FAIL, "BLACK tier is never a signed observation"
+    if raw[3] != 0:
+        return FAIL, "reserved byte is 0x%02x, must be zero" % raw[3]
+
+    if obs_pub is None:
+        return UNCHECKED, V3_NO_KEY
+    backend = _load_ed25519_backend()
+    if backend is None:
+        return UNCHECKED, ("no Ed25519 backend (pip install pynacl or "
+                           "cryptography) — v3 signature not checked")
+    span = v3_signed_span(raw)
+    if span is None:
+        return FAIL, "v3 framing does not resolve to a signed span"
+    sig = raw[len(span):len(span) + OBS_V3_SIG_SIZE]
+    if backend(obs_pub, span, sig):
+        return PASS, ""
+    return FAIL, "v3 Ed25519 observation signature did not verify"
+
+
+def verify_observation_hmac(raw, okey, obs_pub=None):
     """Recompute the O-Key HMAC over a signed VIRP message.
 
     Signed region is header-without-HMAC (bytes 0..24) concatenated with the
@@ -744,10 +952,18 @@ def verify_observation_hmac(raw, okey):
     before the okey check because the O-Key would not verify a v2 frame
     even if supplied.
 
+    A frame whose version byte is 3 goes to classify_observation_v3 for
+    the same reason and with a better outcome: v3 IS verifiable at rest,
+    from the observation-signing PUBLIC key alone. Without that key it is
+    UNCHECKED with a stated reason, never a silent pass and never a FAIL
+    for the crime of being a version this module used to not know.
+
     Returns (verdict, detail).
     """
     if raw is not None and len(raw) >= 1 and raw[0] == 2:
         return classify_observation_v2(raw)
+    if raw is not None and len(raw) >= 1 and raw[0] == 3:
+        return classify_observation_v3(raw, obs_pub)
     if okey is None:
         return UNCHECKED, "no O-Key available"
     if raw is None or len(raw) < VIRP_HEADER_SIZE:
@@ -918,7 +1134,8 @@ class EntryVerification:
         return out
 
 
-def verify_entry(entry, artifact_content, okey, chain_key, expected_prev):
+def verify_entry(entry, artifact_content, okey, chain_key, expected_prev,
+                 obs_pub=None):
     """Run every available check against one chain entry."""
     v = EntryVerification(entry)
 
@@ -1016,6 +1233,13 @@ def verify_entry(entry, artifact_content, okey, chain_key, expected_prev):
             v.header = parse_observation_v2_header(raw)
             v.payload = parse_observation_v2_payload(raw)
             v.obs_hmac, v.obs_hmac_detail = verify_observation_hmac(raw, okey)
+        elif raw[0:1] == b"\x03":
+            # v3 frame: Ed25519-signed, and unlike v2 it IS verifiable at
+            # rest from the public key alone (HAM item 8).
+            v.header = parse_observation_v3_header(raw)
+            v.payload = parse_observation_v2_payload(raw)
+            v.obs_hmac, v.obs_hmac_detail = verify_observation_hmac(
+                raw, okey, obs_pub)
         else:
             v.header = parse_message_header(raw)
             v.payload = parse_observation_payload(raw)
@@ -1209,7 +1433,8 @@ def grade_open_executions(verifications):
 
 
 def verify_chain(entries, artifacts, okey=None, chain_key=None,
-                 heads=None, selection_complete=False, v2_journal=None):
+                 heads=None, selection_complete=False, v2_journal=None,
+                 obs_pub=None):
     """Verify a list of chain entries (dicts) in session/sequence order.
 
     `artifacts` maps (artifact_id, artifact_hash) -> artifact_content (or
@@ -1221,6 +1446,10 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None,
     corroborating v2 (session-key-signed) observations — see
     corroborate_v2. None means "not supplied": v2 frames then carry an
     UNCHECKED corroboration verdict, never a silent pass.
+
+    `obs_pub` is the 32-byte raw Ed25519 observation-signing PUBLIC key.
+    With it, v3 observations verify at rest; without it they are UNCHECKED
+    with a stated reason (HAM review 2026-09-06, item 8).
 
     `heads` maps session_id -> head row dict (last_sequence,
     last_entry_hash, head_hmac) from the chain_heads table, or is None when
@@ -1260,7 +1489,7 @@ def verify_chain(entries, artifacts, okey=None, chain_key=None,
                 expected = None
             v = verify_entry(e, artifacts.get((e["artifact_id"],
                                                e["artifact_hash"])),
-                             okey, chain_key, expected)
+                             okey, chain_key, expected, obs_pub=obs_pub)
             if expected is None and prev_seq is not None:
                 v.link = FAIL
                 v.link_detail = (
@@ -1514,4 +1743,9 @@ def summarize(verifications):
         "first_broken_link": first_broken,
         "sessions": len({v.entry["session_id"] for v in verifications}),
         "retention_reasons": retention_reasons(verifications),
+        # HAM item 13. Absent a verifier failure this is None and every
+        # count above is complete. Set, it means the run did not finish
+        # and the counts are a partial view: the caller must say so and
+        # exit distinctly, never fold it into a verdict tally.
+        "verifier_error": None,
     }

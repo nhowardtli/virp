@@ -357,6 +357,15 @@ def stat_is_regular(mode: int) -> bool:
 def load_okey():
     """Load the O-Key for HMAC verification.
 
+    THIS MAKES THIS PROCESS TRUSTED-SIDE. The O-Key is symmetric: the key
+    that verifies an observation is the key that mints one. A process
+    holding it can forge any observation the daemon could have signed,
+    and nothing downstream can tell. This server therefore belongs on the
+    same side of the boundary as the daemon and MUST NEVER run on the AI
+    host, which gets the model, the VIRP client and a forwarded O-Node
+    socket and nothing else. See SECURITY.md, "The API server is
+    trusted-side" (HAM review 2026-09-06, item 14).
+
     Primary path: load via VIRPBridge (C library).
     Fallback: raw Python hmac — only if VIRP_ALLOW_PY_FALLBACK=1.
 

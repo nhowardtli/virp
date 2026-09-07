@@ -91,6 +91,23 @@ compromise: the daemon holds the private key because the daemon is the
 attester. Enforcement (e.g. at chain append) and default-on are NOT
 part of this change; v3 coexists additively with v1/v2.
 
+**Verifier parity (HAM review, 2026-09-06, item 8).** Until 2026-09-07
+the C observation verifier accepted v1, v2 and v3 while
+`report/verify.py` knew v2-else-v1, so a valid v3 frame reported
+`FAIL: declared length 256 != stored bytes 219` in the public verifier.
+Anything the trusted daemon accepts as strong evidence has to be
+verifiable by the public verifier, or the public verifier is not the
+check it claims to be. `report/verify.py` now implements v3, and the
+vectors it is tested against are minted by the C code itself
+(`tests/test_obs_ed25519.c` under `VIRP_OBS_V3_OUT`, checked by
+`tests/test_obs_v3_vectors.py`). Neither side runs the other's crypto.
+
+**v3 remains implementation ahead of specification, experimental
+post-07.** It is on the -08 reconciliation list. Normal execution is
+still capped at v2: the execute path bounds `obs_version` at 2 and
+defaults to 1, and a test pins both, so raising that bound is a change
+somebody has to make deliberately.
+
 Normative comment in-tree: the `VIRP_VERSION_3` block in
 `include/virp.h`. Key custody: `include/virp_obskey.h` and SECURITY.md
 "Ed25519 Observation Signing".
