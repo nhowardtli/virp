@@ -134,6 +134,12 @@ virp_error_t virp_chain_verify(virp_chain_state_t *state,
     return rc;
 }
 
+static void chain_session_sig_state_locked(virp_chain_state_t *state,
+                                           const char *session_id,
+                                           bool *is_signed,
+                                           char *kid_out,
+                                           size_t kid_len);
+
 static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
                                        const char *session_id,
                                        virp_chain_verify_result_t *result)
@@ -215,9 +221,18 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
     bool head_is_signed = (state->head_sig_cols && head_sig[0] != '\0');
     bool head_sig_ok = false;
     state->sig_key_unavailable_session = false;
-    if (state->verify_sig_enabled && head_is_signed &&
-        strcmp(head_key_id, state->verify_key_id_hex) != 0) {
-        state->sig_key_unavailable_session = true;
+    {
+        /* Per SESSION, never per database (HAM item 7). A session with no
+         * head signature and no signed entry is an UNSIGNED session and
+         * the asymmetric tier simply does not apply to it. */
+        bool sess_signed = false;
+        char sess_kid[VIRP_CHAINSIGN_KEYID_HEX] = {0};
+        chain_session_sig_state_locked(state, session_id, &sess_signed,
+                                       sess_kid, sizeof(sess_kid));
+        if (state->verify_sig_enabled && sess_signed &&
+            strcmp(sess_kid, state->verify_key_id_hex) != 0) {
+            state->sig_key_unavailable_session = true;
+        }
     }
 
     /* Authenticate the head itself before trusting its length claim.
@@ -296,6 +311,103 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
     snprintf(result->sig_key_id, sizeof(result->sig_key_id), "%s",
              head_is_signed ? head_key_id : "");
     return VIRP_OK;
+}
+
+/*
+ * IS THIS SESSION SIGNED, AND UNDER WHICH KEY?
+ *
+ * HAM review 2026-09-06, item 7. Enabling optional Ed25519 chain signing
+ * adds the signature columns to the whole DATABASE. The verifier used to
+ * infer "signed" from (columns exist AND a pubkey is available), which is
+ * a property of the database and the operator, not of the session. Every
+ * legitimate pre-signing session in a migrated database therefore
+ * verified as a signed session with missing signatures and FAILED with
+ * "stripped signature" at sequence 0.
+ *
+ * The Python standalone verifier already asked the right question, per
+ * session, and got it right (report/verify.py, verify_chain_signatures):
+ *
+ *     head_signed      = bool(head and head["head_sig"])
+ *     any_entry_signed = any(r["chain_sig"] for r in rows)
+ *     if not head_signed and not any_entry_signed:  -> "unsigned"
+ *     sess_kid = head["head_sig_key_id"] if head_signed
+ *                else rows[0]["chain_sig_key_id"]
+ *
+ * This mirrors that rule exactly, so the two verifiers cannot reach
+ * different conclusions about the same database. THE SHARED RULE IS
+ * docs/VERIFIER-SEMANTICS.md, "Is a session signed?". Both this function
+ * and verify_chain_signatures() in report/verify.py implement it;
+ * neither owns it.
+ *
+ * Stripping remains fatal where it is an attack: a session whose head is
+ * still signed is signed, so a missing entry signature inside it FAILS
+ * exactly as before.
+ */
+static void chain_session_sig_state_locked(virp_chain_state_t *state,
+                                           const char *session_id,
+                                           bool *is_signed,
+                                           char *kid_out, size_t kid_len)
+{
+    *is_signed = false;
+    if (kid_out && kid_len) kid_out[0] = '\0';
+    if (!state->db || !session_id) return;
+
+    sqlite3_stmt *st = NULL;
+
+    if (state->head_sig_cols) {
+        if (sqlite3_prepare_v2(state->db,
+                "SELECT head_sig, head_sig_key_id FROM chain_heads "
+                "WHERE session_id = ?", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, session_id, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                const unsigned char *hs = sqlite3_column_text(st, 0);
+                if (hs && hs[0]) {
+                    *is_signed = true;
+                    const unsigned char *hk = sqlite3_column_text(st, 1);
+                    if (kid_out && kid_len)
+                        snprintf(kid_out, kid_len, "%s",
+                                 hk ? (const char *)hk : "");
+                }
+            }
+            sqlite3_finalize(st);
+            st = NULL;
+        }
+        if (*is_signed) return;
+    }
+
+    if (!state->entry_sig_cols) return;
+
+    /* No head signature. The session is still signed if ANY entry in it
+     * carries one, and the key it claims is the FIRST entry's -- which
+     * may be empty, in a session that began before signing and gained it
+     * mid-way. That is exactly the case Python reports as
+     * key_unavailable rather than as tampering, and the C verifier now
+     * agrees instead of failing it. */
+    bool any_signed = false;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT 1 FROM chain_entries WHERE session_id = ? "
+            "AND chain_sig IS NOT NULL AND chain_sig <> '' LIMIT 1",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, session_id, -1, SQLITE_TRANSIENT);
+        any_signed = (sqlite3_step(st) == SQLITE_ROW);
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (!any_signed) return;
+
+    *is_signed = true;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT chain_sig_key_id FROM chain_entries "
+            "WHERE session_id = ? ORDER BY sequence LIMIT 1",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, session_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *k = sqlite3_column_text(st, 0);
+            if (kid_out && kid_len)
+                snprintf(kid_out, kid_len, "%s", k ? (const char *)k : "");
+        }
+        sqlite3_finalize(st);
+    }
 }
 
 virp_error_t virp_chain_verify_session(virp_chain_state_t *state,
@@ -2478,8 +2590,22 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
      * for this range (verify_sig_enabled, columns present, and not a
      * key-unavailable session). */
     result->hmac_checked = state->have_chain_key;
+    /* HAM item 7. `entry_sig_cols` is a property of the DATABASE: once
+     * signing is enabled the columns exist for every session, including
+     * every session written before it. Whether the ASYMMETRIC tier
+     * applies is a property of THIS SESSION, and that is what decides it
+     * now. Asked here rather than only in the session-level entry point
+     * so the range API (virp_chain_verify) reaches the same conclusion. */
+    bool session_signed = false;
+    char session_kid[VIRP_CHAINSIGN_KEYID_HEX] = {0};
+    chain_session_sig_state_locked(state, session_id, &session_signed,
+                                   session_kid, sizeof(session_kid));
+    bool key_unavailable =
+        state->sig_key_unavailable_session ||
+        (session_signed && state->verify_sig_enabled &&
+         strcmp(session_kid, state->verify_key_id_hex) != 0);
     bool check_sigs = state->verify_sig_enabled && state->entry_sig_cols &&
-                      !state->sig_key_unavailable_session;
+                      session_signed && !key_unavailable;
     result->sig_checked = check_sigs;
 
     /* The caller asserts this range exists; an inverted or negative range

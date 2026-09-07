@@ -392,13 +392,20 @@ def chainsign_verify(pub, tag, msg_bytes, sig_hex):
 def verify_chain_signatures(entries, heads, pub, selection_complete=False):
     """ASYMMETRIC-tier verification of a chain, PUBLIC KEY ONLY.
 
-    Mirrors the C verifier's session-granularity rule: in a head-signed
-    session every entry's chain_sig_key_id must equal the head's key_id
-    (which must equal the given key's id), and every entry signature and the
-    head signature must verify. A missing signature or a key_id that differs
-    is a FAIL. A session signed under a DIFFERENT key_id than `pub` is a soft
-    whole-session 'key_unavailable' (never a FAIL). An unsigned (pre-D-1)
-    session is 'unsigned' (never a FAIL).
+    THE SHARED RULE IS docs/VERIFIER-SEMANTICS.md, "Is a session signed?".
+    Both this function and chain_session_sig_state_locked() in
+    src/virp_chain.c implement it; neither owns it. Signed-ness is a
+    property of the SESSION, never of the database or of which keys the
+    operator holds.
+
+    In a head-signed session every entry's chain_sig_key_id must equal the
+    head's key_id (which must equal the given key's id), and every entry
+    signature and the head signature must verify. A missing signature or a
+    key_id that differs is a FAIL. A session signed under a DIFFERENT
+    key_id than `pub` is a soft whole-session 'key_unavailable' (never a
+    FAIL). An unsigned (pre-D-1) session is 'unsigned' (never a FAIL) --
+    the case the C verifier used to get wrong, because it read the
+    database's columns instead of this session's head.
 
     Returns {session_id: {verdict, detail, entries_signed, entries_total}}
     where verdict is one of PASS / FAIL / UNCHECKED / 'unsigned' /
