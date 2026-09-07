@@ -2870,3 +2870,83 @@ and since the home node defines none of the colo placeholders,
 `render-devices.sh` would FATAL and the daemon would refuse to start
 across every governed device. The target now refuses to run off
 `virp-lab` unless the source is named explicitly.
+
+## 2026-09-07 UTC — 313 is running a binary no commit names
+
+- **Node**: `virp-onode-home` (313, 10.0.0.13)
+- **Installed binary**: `/usr/local/lib/virp/virp-onode-prod`
+- **sha256**: `fdda7fe4fd158c2fa86c5e99530194ffe7a60014d8660e47772882122d35b8b2`
+- **Source commit**: **UNKNOWN.** This stanza records a hash. It does not
+  attribute it, and must not be read as if it did.
+
+Found by a branch audit, not by a deploy: nobody was mid-install when
+this was written. The binary is live — `ExecMainStartTimestamp`
+2026-09-07 17:03:13 UTC, `ActiveState=active`, and the MainPID's
+`/proc/<pid>/exe` resolves to the path above, so this is the running
+image and not merely a file on disk.
+
+### What is actually known
+
+- The binary's mtime is **2026-09-07 17:02 UTC**, one minute before the
+  daemon start. Something installed it that day.
+- The hash appears in **no `DEPLOYED.md` stanza on any branch on origin**
+  — checked against all 58 remote branches as they stood 2026-09-07,
+  before that day's branch cleanup.
+- The deploy tree at `/home/nhoward/virp` was on `feat/2960-governed`
+  @ `e71dfb7` with a clean tree. That commit **is** on `main`, so the
+  tree was not carrying unmerged work.
+- The build artifact in that tree,
+  `/home/nhoward/virp/build/virp-onode-prod`, is
+  `612bcd6b30a5ea40372e09f5a600d51ce0595ba2b62ee3cd3ba95d9e030757da`,
+  dated 2026-09-05 05:27. **It is not the installed binary.** So the
+  running image was not produced by the last build in this tree, and no
+  local artifact matches it.
+
+That is the whole of it. A clean tree on a merged commit is consistent
+with the binary having been built from `e71dfb7` and the tree rebuilt or
+cleaned afterwards, but it is equally consistent with an install from
+somewhere else entirely. Nothing on the host distinguishes the two, which
+is precisely the gap: **the node cannot answer what it is running.**
+
+### The other installed hashes on 313, same observation
+
+Recorded so the next comparison has a baseline, not because any of them
+is in question:
+
+| file | sha256 | matches |
+|---|---|---|
+| `virp-tool` | `0ae0b3ff74d0119d810c2e0cb4151e107679f3337ba3c1096384b0d31e4e9dc1` | not recorded anywhere |
+| `render-devices.sh` | `e35f505f6672549f9bdfd50db89e50911995498784d9d65476caddba3475e231` | differs from virp-lab's |
+| `deployed-state.sh` | `9e55971924d5e938f6dcf136fbb749a5f69c8c32e6c521085debebde6b5aced7` | — |
+| `config-backup-access.sh` | `358aa3aa978a0f220636c444336141f65d62f57136653f0e020fd370219fe022` | `main`, and virp-lab |
+| `evidence-access.sh` | `bcf299794a84b63b0b14b3e9c98dab2009912b8d2fa180493f33834e28a67219` | `main`, and virp-lab |
+| `netclaw-access.sh` | `a36999889421177fa437bf0d5d1fa680cfc92b37a7b761e7298839bfdd3fa8ca` | `main`, and virp-lab |
+| `virp-camera/virp_camera.py` | `8088497f448b62d757a4916bb9c2628344a195c2d7955de659df5bd9c256fb83` | — |
+
+The nine tracked units on this node match `fix/313-unit-manifest`
+**byte-for-byte** — every one of the eleven files on that branch equals
+its installed copy — and its five timers/services are active. That
+branch is unmerged, so those units are live on 313 from a branch tip
+rather than from `main`.
+
+### Deploy tree moved to `main`
+
+Also 2026-09-07: `/home/nhoward/virp` was moved off `feat/2960-governed`
+onto `main` and fast-forwarded 100 commits to
+`d4371651785607f950ec8edba5f96c6f6e76610f` (`v0.2.0-157-gd437165`), tree
+clean. `feat/2960-governed` had been deleted from origin that day as one
+of 32 merged branches; the checkout would otherwise have been sitting on
+a branch name that no longer exists remotely. The node's local branches
+were left alone. No unit executes from this tree —
+`virp-deployed-state.service` names the path only in a comment — so the
+move changed nothing that runs.
+
+### What would close this
+
+`deployed-state.sh --collect` reads the running image's hash as root and
+chains it, which is the mechanism built for exactly this question; the
+unit is present on 313 but not enabled. Failing that, a rebuild from a
+named commit and a reinstall would replace an unattributed binary with
+an attributable one. Until one of those happens, **313's running daemon
+is unverifiable against source** and should be treated that way in any
+claim that depends on what it enforces.
