@@ -1517,6 +1517,49 @@ static void test_verifier_refuses_non_chain_db(void)
  * Main
  * ========================================================================= */
 
+static void test_entry_hash_index_is_created_on_open(void)
+{
+    TEST("schema: chain_entries(chain_entry_hash) is indexed on open");
+
+    virp_chain_state_t state;
+    virp_error_t err = virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "test");
+    ASSERT(err == VIRP_OK, "init failed");
+
+    /* The evidence grading resolves intents and closers by
+     * chain_entry_hash. Without this index every one of those is a full
+     * table scan; on .211 that was about 9 minutes of a single verify.
+     * Created via CREATE INDEX IF NOT EXISTS in the schema, so an
+     * existing database gains it on the next open with no migration step
+     * to run by hand. */
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(state.db,
+            "SELECT count(*) FROM sqlite_master WHERE type='index' "
+            "AND name='idx_chain_entry_hash'", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) found = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    ASSERT(found == 1, "idx_chain_entry_hash must exist after open");
+
+    /* And it must actually be USED for the lookup it exists for. */
+    char plan[512] = "";
+    if (sqlite3_prepare_v2(state.db,
+            "EXPLAIN QUERY PLAN SELECT artifact_type FROM chain_entries "
+            "WHERE chain_entry_hash = 'x'", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *d = sqlite3_column_text(st, 3);
+            if (d) snprintf(plan, sizeof(plan), "%s", (const char *)d);
+        }
+        sqlite3_finalize(st);
+    }
+    ASSERT(strstr(plan, "idx_chain_entry_hash") != NULL,
+           "the lookup must SEARCH the index, not SCAN the table");
+
+    virp_chain_destroy(&state);
+    cleanup();
+    PASS();
+}
+
 int main(void)
 {
     printf("\n=== VIRP Trust Chain (Primitive 6) Tests ===\n\n");
@@ -1551,6 +1594,7 @@ int main(void)
     test_colliding_id_keeps_both_bodies();
     test_colliding_id_identical_content_idempotent();
     test_artifacts_schema_migration();
+    test_entry_hash_index_is_created_on_open();
     test_verifier_readonly_modern_db();
     test_verifier_legacy_reported_not_migrated();
     test_verifier_refuses_non_chain_db();
