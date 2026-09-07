@@ -197,8 +197,17 @@ class CanonicalTemplateTests(_PolicyChecks, unittest.TestCase):
         # tested against whatever set is chosen; see the template's
         # _socket_uid_netclaw_verbs_followup note. When that happens, change
         # the expectation here in the same commit.
+        # 2026-09-07: "health" removed. Not a reconciliation with the
+        # bridge's send set — that follow-up is still open — but a removal
+        # for cause. ONODE_ACTION_HEALTH runs "show version" against a
+        # client-chosen device and did it without the connecting uid, so
+        # uid 993's GREEN ceiling was skipped and the node-wide YELLOW
+        # applied. Measured live as 993 before the change:
+        # "'show version' on 'pbs-lab' (tier=RED max=YELLOW)". The bridge
+        # never sent health (see the template's verbs-followup note), so
+        # nothing the client does is affected.
         self.assertEqual(set(self.policy[UIDS["VIRP_NETCLAW_UID"]]),
-                         {"list_fleet", "health", "chain_verify",
+                         {"list_fleet", "chain_verify",
                           "chain_append", "execute"})
 
     def test_netclaw_chain_append_is_the_federation_set(self):
