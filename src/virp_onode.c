@@ -96,10 +96,35 @@ typedef struct {
 } onode_request_t;
 
 /*
- * Extract a string-valued key from a JSON object. Writes at most
- * out_len-1 bytes plus a NUL. Returns false if the key is absent,
- * null, or not a string; out[0] is set to NUL in that case so the
- * caller's zero-initialized req struct is unchanged.
+ * Extract a string-valued key from a JSON object.
+ *
+ * REJECT, NEVER TRUNCATE (HAM review 2026-09-06, item 10).
+ *
+ * This used to snprintf() into the caller's fixed buffer and return
+ * success on overflow, so two distinct inputs became the same internal
+ * string. session_id is char[64]: a 63-character id and a 64-character
+ * id differing only in their last byte both arrived as the same 63
+ * bytes, and everything downstream -- the chain entry, the artifact
+ * store join, the policy decision -- saw one object where the caller
+ * submitted two. That is the same parser-length divergence class as the
+ * encoded-NUL fix below, arriving through a different door, and the
+ * answer is the same: refuse the request rather than silently reshape
+ * it.
+ *
+ * The check is at the HELPER, so every caller inherits it and nobody
+ * has to remember. `out_len` includes the NUL, so a value of exactly
+ * out_len-1 characters is the longest one that fits.
+ *
+ * KNOWN LEGACY SHAPE: artifact_type is char[16] and the indirect types
+ * "comparator_verdict" (18) and "chainwalk_summary" (17) have always
+ * reached the daemon TRUNCATED, as "comparator_verd" and
+ * "chainwalk_summa". Those truncated spellings are what production
+ * stores and they remain in the policy lists on both sides
+ * (virp_chain_type_is_indirect, report/verify.py). What changes is that
+ * a NEW append carrying the full name is now REJECTED instead of being
+ * quietly renamed: autopilot/virp_autopilot.py, the only client that
+ * sent the long form, now sends the alias explicitly. The width itself
+ * is item 5 of docs/CANONICAL-FORMAT-WINDOW.md; it is not widened here.
  */
 static bool json_extract_string_cjson(cJSON *root, const char *key,
                                        char *out, size_t out_len)
@@ -109,8 +134,27 @@ static bool json_extract_string_cjson(cJSON *root, const char *key,
         out[0] = '\0';
         return false;
     }
+    if (out_len == 0 || strlen(item->valuestring) >= out_len) {
+        /* Over-length: refuse the value. parse_request turns this into a
+         * refusal of the whole request for the chain fields, and every
+         * other optional field is left empty rather than half-copied. */
+        out[0] = '\0';
+        return false;
+    }
     snprintf(out, out_len, "%s", item->valuestring);
     return true;
+}
+
+/*
+ * CANONICAL-STRING CONFORMANCE at the request boundary (HAM item 12).
+ * The one validator lives in src/virp_chain.c, next to the canonicalizer
+ * it protects; this is the ingress calling it, so a client learns its
+ * request was refused rather than discovering later that the chain
+ * recorded a different string than the one it sent.
+ */
+static bool onode_canonical_string_ok(const char *s)
+{
+    return virp_chain_canonical_string_ok(s);
 }
 
 /*
@@ -138,15 +182,74 @@ static const char *onode_typed_profile(onode_state_t *state, int dev_idx)
 }
 
 /*
- * Extract a signed-integer-valued key. Accepts cJSON numbers only.
- * Returns false (leaving *out untouched) if absent or non-numeric.
+ * The largest integer an IEEE-754 double represents exactly: 2^53.
+ *
+ * HAM review 2026-09-06, item 9. cJSON stores every number as a double.
+ * Nanosecond timestamps are around 1.79e18, two orders of magnitude past
+ * this, so the value is ALREADY WRONG by the time an extractor sees
+ * `valuedouble`. Measured on the real parse path:
+ *
+ *     wire   1788722800424766173
+ *     cJSON  1788722800424766208      (+35)
+ *
+ * THE RULE, stated in docs/EVIDENCE-INTEGERS.md and enforced here:
+ * an evidence integer that may exceed 2^53 travels as a DECIMAL STRING.
+ * A consumer accepts a string always, accepts a JSON number only when
+ * the value is inside the safe range, and REJECTS a larger numeric
+ * literal with an explicit failure rather than silently truncating it.
+ *
+ * The check cannot be on the decoded double alone -- precision is gone
+ * by then -- but it does not need to be: any value outside the safe
+ * range is refused whatever it decoded to, so a lossy literal can never
+ * be accepted. `virp_approval.c` has always done the producing half of
+ * this correctly (jadd_u64str / jget_u64str).
+ */
+#define ONODE_JSON_SAFE_INT_MAX  9007199254740992LL   /* 2^53 */
+
+/*
+ * Extract a signed-integer-valued key.
+ *
+ * Accepts a decimal STRING (exact, the required form for any value that
+ * may exceed 2^53) or a JSON number inside the exactly-representable
+ * range. Returns false (leaving *out untouched) if absent, of another
+ * type, non-integral, or numerically out of safe range.
  */
 static bool json_extract_int64_cjson(cJSON *root, const char *key,
                                       int64_t *out)
 {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+
+    if (cJSON_IsString(item) && item->valuestring && item->valuestring[0]) {
+        errno = 0;
+        char *end = NULL;
+        long long v = strtoll(item->valuestring, &end, 10);
+        if (errno != 0 || end == item->valuestring || *end != '\0')
+            return false;
+        *out = (int64_t)v;
+        return true;
+    }
+
     if (cJSON_IsNumber(item)) {
-        *out = (int64_t)item->valuedouble;
+        double d = item->valuedouble;
+        /*
+         * STRICTLY inside the range, not up to it. cJSON has already
+         * decoded the literal by the time we see it, so the check cannot
+         * be on the raw token here -- but it does not have to be, given
+         * a strict bound. The literal 2^53+1 decodes to exactly 2^53 and
+         * is the ONE value that could sneak a lossy literal past a `<=`
+         * test; every other integer above 2^53 rounds to something
+         * strictly greater and is caught. Excluding 2^53 itself costs a
+         * single representable value, which the rule says to send as a
+         * decimal string anyway.
+         *
+         * NaN fails every comparison, so this rejects it too.
+         */
+        if (!(d > -(double)ONODE_JSON_SAFE_INT_MAX &&
+              d < (double)ONODE_JSON_SAFE_INT_MAX))
+            return false;             /* precision may be lost: REFUSE */
+        if (d != (double)(int64_t)d)
+            return false;             /* not an integer */
+        *out = (int64_t)d;
         return true;
     }
     return false;
@@ -413,10 +516,49 @@ static bool parse_request(const char *json, onode_request_t *req)
         }
     }
 
-    /* Chain fields */
-    EXTRACT_STR("session_id", req->session_id, sizeof(req->session_id));
-    EXTRACT_STR("artifact_type", req->artifact_type, sizeof(req->artifact_type));
-    EXTRACT_STR("artifact_id", req->artifact_id, sizeof(req->artifact_id));
+    /* Chain fields.
+     *
+     * These are the ingress for everything that reaches the canonical
+     * object. Over-length is a REJECTION of the whole request (HAM item
+     * 10) rather than a truncation, refused HERE so a client learns its
+     * request was refused instead of discovering later that the chain
+     * recorded a different string than the one it sent. Absent is fine:
+     * these are optional for the actions that do not use them.
+     */
+    {
+        /* Refused BEFORE the copy, on the raw value, so truncation can
+         * never disguise a non-conformant string (HAM item 12). */
+        static const char *const CANON_KEYS[] = {
+            "session_id", "artifact_type", "artifact_id",
+        };
+        for (size_t i = 0; i < sizeof(CANON_KEYS)/sizeof(CANON_KEYS[0]); i++) {
+            cJSON *it = cJSON_GetObjectItemCaseSensitive(root, CANON_KEYS[i]);
+            if (!it) continue;
+            if (!cJSON_IsString(it) || !it->valuestring ||
+                !onode_canonical_string_ok(it->valuestring)) {
+                cJSON_Delete(root);
+                return false;
+            }
+        }
+    }
+    if (cJSON_GetObjectItemCaseSensitive(root, "session_id") &&
+        !EXTRACT_STR("session_id", req->session_id,
+                     sizeof(req->session_id))) {
+        cJSON_Delete(root);
+        return false;
+    }
+    if (cJSON_GetObjectItemCaseSensitive(root, "artifact_type") &&
+        !EXTRACT_STR("artifact_type", req->artifact_type,
+                     sizeof(req->artifact_type))) {
+        cJSON_Delete(root);
+        return false;
+    }
+    if (cJSON_GetObjectItemCaseSensitive(root, "artifact_id") &&
+        !EXTRACT_STR("artifact_id", req->artifact_id,
+                     sizeof(req->artifact_id))) {
+        cJSON_Delete(root);
+        return false;
+    }
     EXTRACT_STR("artifact_hash", req->artifact_hash, sizeof(req->artifact_hash));
     EXTRACT_STR("artifact_content", req->artifact_content,
                 sizeof(req->artifact_content));

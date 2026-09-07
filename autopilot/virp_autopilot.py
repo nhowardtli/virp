@@ -912,6 +912,23 @@ def chain_sessions(db_path=CHAIN_DB):
         con.close()
 
 
+# HAM review 2026-09-06, item 10. artifact_type is char[16] in the
+# daemon, and the daemon now REJECTS an over-length value instead of
+# silently truncating it. These two names do not fit:
+#
+#     "chainwalk_summary"  (17)  ->  stored as "chainwalk_summa"
+#     "comparator_verdict" (18)  ->  stored as "comparator_verd"
+#
+# The truncated forms are what every entry on the live chains already
+# carries and what virp_chain_type_is_indirect() and report/verify.py
+# both list. Sending them EXPLICITLY changes nothing about what is
+# stored; it stops the daemon having to reshape our request for us, and
+# it means a future widening of the field is a decision rather than a
+# behaviour change. Widening is item 5 of
+# docs/CANONICAL-FORMAT-WINDOW.md.
+CHAINWALK_SUMMARY_TYPE = "chainwalk_summa"
+COMPARATOR_VERDICT_TYPE = "comparator_verd"
+
 def run_chainwalk():
     alerts = 0
     total_entries = 0
@@ -983,7 +1000,7 @@ def run_chainwalk():
         onode_send({
             "action": "chain_append",
             "session_id": session,
-            "artifact_type": "chainwalk_summary",
+            "artifact_type": CHAINWALK_SUMMARY_TYPE,
             "artifact_id": "chainwalk:%d" % time.time_ns(),
             "artifact_hash": h,
             "artifact_content": summary_json,
@@ -1177,7 +1194,7 @@ def run_comparator():
         onode_send({
             "action": "chain_append",
             "session_id": session,
-            "artifact_type": "comparator_verdict",
+            "artifact_type": COMPARATOR_VERDICT_TYPE,
             "artifact_id": "comparator:%d" % time.time_ns(),
             "artifact_hash": hashlib.sha256(signed).hexdigest(),
             "artifact_content": verdict_json,

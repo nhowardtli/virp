@@ -608,6 +608,25 @@ virp_error_t virp_chain_cutover_ns(virp_chain_state_t *state,
 bool virp_chain_from_n_temporally_ok(uint64_t first_signed_ns,
                                      uint64_t cutover_ns);
 
+/*
+ * CANONICAL-STRING CONFORMANCE (HAM review 2026-09-06, item 12).
+ *
+ * True iff `s` may appear as a string member of the canonical object
+ * that is hashed and HMAC'd per entry. The canonicalizer pastes strings
+ * with a raw %s and does not escape, so a value needing escaping would
+ * produce canonical bytes that are not JSON -- which producer and
+ * verifier would then agree on, identically and wrongly.
+ *
+ * Rejects '"', '\', control bytes below 0x20, 0x7F, and ill-formed
+ * UTF-8. Called at every ingress that populates session_id, artifact_id,
+ * artifact_type or signer_org_id, so no caller has to remember.
+ *
+ * VALIDATION, not a format change: the canonical form is byte-identical
+ * for every conformant value, and every entry already written
+ * re-verifies unchanged.
+ */
+bool virp_chain_canonical_string_ok(const char *s);
+
 virp_error_t virp_chain_verify_session(virp_chain_state_t *state,
                                        const char *session_id,
                                        virp_chain_verify_result_t *result);

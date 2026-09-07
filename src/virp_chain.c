@@ -1327,6 +1327,69 @@ static void compute_genesis_hash(const char *session_id, char out[65])
 }
 
 /*
+ * CANONICAL-STRING CONFORMANCE (HAM review 2026-09-06, item 12).
+ *
+ * The canonicalizer below pastes every string member with a raw %s. It
+ * does not escape, and -07 says a canonical string member therefore
+ * cannot contain a character that would need escaping. Nothing enforced
+ * that. A session_id containing a double quote produced a canonical
+ * object that is not JSON; the producer and the verifier both built the
+ * SAME malformed bytes, so the hashes agreed and the entry verified.
+ * Producer and verifier agreeing on non-conformant bytes is not
+ * verification, it is two copies of one mistake.
+ *
+ * ONE validator, here, called by every ingress that populates a field
+ * reaching the canonical object: session_id, artifact_id, artifact_type,
+ * signer_org_id, and the head's session_id. Not caller-by-caller
+ * remembering.
+ *
+ * This is VALIDATION, not a format change. No field is added, removed,
+ * renamed or reordered; the canonical form is byte-identical for every
+ * conformant value and every entry already written re-verifies
+ * unchanged. It is inside the canonical-format freeze, not a claim on
+ * the window (docs/CANONICAL-FORMAT-WINDOW.md).
+ *
+ * Rejects: '"', '\\', any control byte below 0x20, 0x7F, and any
+ * sequence that is not well-formed UTF-8. NUL never appears here: a C
+ * string ends at one, and the ingress refuses an encoded \\u0000
+ * outright (json_has_nul_escape in src/virp_onode.c).
+ */
+bool virp_chain_canonical_string_ok(const char *s)
+{
+    if (!s) return false;
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        unsigned char c = *p;
+        if (c == '"' || c == '\\' || c < 0x20 || c == 0x7F)
+            return false;
+        if (c < 0x80) { p++; continue; }
+
+        /* UTF-8 well-formedness, RFC 3629: no over-long encodings, no
+         * surrogates, nothing above U+10FFFF. A verifier that accepted
+         * an ill-formed sequence would let two different byte strings
+         * render as the same text to a reader. */
+        size_t need;
+        uint32_t cp;
+        if      ((c & 0xE0) == 0xC0) { need = 1; cp = c & 0x1Fu; }
+        else if ((c & 0xF0) == 0xE0) { need = 2; cp = c & 0x0Fu; }
+        else if ((c & 0xF8) == 0xF0) { need = 3; cp = c & 0x07u; }
+        else return false;
+
+        for (size_t i = 1; i <= need; i++) {
+            if ((p[i] & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (uint32_t)(p[i] & 0x3Fu);
+        }
+        if (need == 1 && cp < 0x80)    return false;   /* over-long */
+        if (need == 2 && cp < 0x800)   return false;
+        if (need == 3 && cp < 0x10000) return false;
+        if (cp > 0x10FFFF)             return false;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false; /* surrogate */
+        p += need + 1;
+    }
+    return true;
+}
+
+/*
  * Build canonical JSON for hashing/HMAC.
  * Keys are alphabetically sorted. Compact separators (no spaces).
  * Excludes chain_entry_hash and chain_hmac (computed from this).
@@ -1550,6 +1613,17 @@ virp_error_t virp_chain_init(virp_chain_state_t *state,
 {
     if (!state || !db_path || !chain_key_path)
         return VIRP_ERR_NULL_PTR;
+
+    /* signer_org_id reaches the canonical object (HAM item 12). It is
+     * node configuration, so it is checked once here rather than on every
+     * append -- but it IS checked: a non-conformant org_id would put a
+     * raw quote into every entry this node ever writes. */
+    if (org_id && !virp_chain_canonical_string_ok(org_id)) {
+        fprintf(stderr, "[Chain] org_id contains a character the canonical "
+                        "form cannot carry (quote, backslash, control byte "
+                        "or ill-formed UTF-8) — refusing\n");
+        return VIRP_ERR_INVALID_LENGTH;
+    }
 
     memset(state, 0, sizeof(*state));
     pthread_mutex_init(&state->lock, NULL);   /* before any error return below */
@@ -1950,6 +2024,9 @@ virp_error_t virp_chain_open_verifier_ex(virp_chain_state_t *state,
     if (!state || !db_path)
         return VIRP_ERR_NULL_PTR;
 
+    if (org_id && !virp_chain_canonical_string_ok(org_id))
+        return VIRP_ERR_INVALID_LENGTH;      /* HAM item 12, as above */
+
     memset(state, 0, sizeof(*state));
     pthread_mutex_init(&state->lock, NULL);
     state->node_id = node_id;
@@ -2101,6 +2178,19 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
         !artifact_id || !artifact_hash || !entry)
         return VIRP_ERR_NULL_PTR;
 
+    /* CANONICAL-STRING CONFORMANCE (HAM item 12). Every one of these
+     * reaches the canonical object that is hashed and HMAC'd, and the
+     * canonicalizer does not escape. Checked here, at the one place
+     * every append passes through, so no caller can forget: the daemon's
+     * own gate records, the approval path, the federation bridge and
+     * every external submission alike. signer_org_id is validated once
+     * at init, because it is node configuration rather than per-append
+     * input. */
+    if (!virp_chain_canonical_string_ok(session_id) ||
+        !virp_chain_canonical_string_ok(artifact_type) ||
+        !virp_chain_canonical_string_ok(artifact_id))
+        return VIRP_ERR_INVALID_LENGTH;
+
     if (!state->db)
         return VIRP_ERR_CHAIN_DB;
 
@@ -2202,9 +2292,24 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
     snprintf(entry->signer_org_id, sizeof(entry->signer_org_id),
              "%s", state->org_id);
 
-    /* Build canonical JSON (without hash and HMAC) */
+    /* Build canonical JSON (without hash and HMAC).
+     *
+     * HAM review 2026-09-06, item 16. snprintf returns the length it
+     * WOULD have written, not the length it did. That return was fed
+     * straight to sha256_hex, so the day any field widens past what this
+     * buffer holds, the hash would be computed over `clen` bytes of a
+     * buffer that only ever received 2047 -- an out-of-bounds read, on
+     * the hashing path, silently. Current field maxima cannot reach
+     * 2048, so this is not exploitable today; it becomes exploitable the
+     * moment artifact_type widens (item 5 of
+     * docs/CANONICAL-FORMAT-WINDOW.md), which is exactly when nobody
+     * will be looking here. Refuse instead. Nothing is widened. */
     char canonical[2048];
     int clen = build_canonical_json(entry, canonical, sizeof(canonical));
+    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+        sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+        return VIRP_ERR_BUFFER_TOO_SMALL;
+    }
 
     /* Compute chain_entry_hash = sha256(canonical) */
     sha256_hex(canonical, (size_t)clen, entry->chain_entry_hash);
@@ -2782,9 +2887,27 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
             break;
         }
 
-        /* Rebuild canonical JSON and verify hash */
+        /* Rebuild canonical JSON and verify hash. The same clamp as the
+         * append path (HAM item 16): an entry whose canonical form does
+         * not fit is refused, never hashed over bytes the buffer never
+         * received. */
         char canonical[2048];
         int clen = build_canonical_json(&e, canonical, sizeof(canonical));
+        if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+            /* The VERIFIER could not complete on this entry; the entry is
+             * not thereby proven bad. Said as plainly as this struct
+             * allows. (fix/ham-verifier adds a first-class VERIFIER_ERROR
+             * outcome to this result; when both land, this should set it.
+             * See the report's DECISIONS.) */
+            result->valid = false;
+            result->first_broken = e.sequence;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "VERIFIER_ERROR: canonical form of sequence %lld does "
+                     "not fit the %zu-byte buffer; it was not hashed, and "
+                     "nothing about this entry has been proven either way",
+                     (long long)e.sequence, sizeof(canonical));
+            break;
+        }
 
         char computed_hash[65];
         sha256_hex(canonical, (size_t)clen, computed_hash);
