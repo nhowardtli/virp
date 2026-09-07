@@ -4506,6 +4506,21 @@ static void handle_client(onode_state_t *state, int client_fd,
          * chain_append has one, so at runtime a policy is always present
          * for a mapped appender.
          */
+        /*
+         * Session namespace, checked before the type policy so the refusal
+         * names the reason the operator will care about first. Refuse, never
+         * rewrite: req.session_id is passed through untouched either way.
+         */
+        if (!onode_uid_session_prefix_allowed(state, client_uid,
+                                              req.session_id)) {
+            fprintf(stderr, "[O-Node] POLICY REFUSAL: uid %u chain_append "
+                    "session_id '%s' — outside this uid's "
+                    "socket_uid_session_prefix namespace (type=%s id=%s)\n",
+                    (unsigned)client_uid, req.session_id, req.artifact_type,
+                    req.artifact_id);
+            send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+            break;
+        }
         if (onode_uid_has_capp_policy(state, client_uid) &&
             !onode_uid_capp_type_allowed(state, client_uid,
                                          req.artifact_type)) {
@@ -6255,6 +6270,73 @@ bool onode_uid_capp_type_allowed(const onode_state_t *state, uid_t uid,
         return false;   /* uid has a policy; type not in it */
     }
     return false;       /* no policy for this uid */
+}
+
+/*
+ * Per-uid chain_append session namespace.
+ *
+ * A constrained appender (a seat) may hold exactly one artifact type and
+ * still write it into any session it names, because session_id arrives from
+ * the client and was accepted verbatim. That lets its records land inside
+ * "autopilot:...", "camera:...", "gate-enforce:..." or "approval:..." —
+ * sessions a reader takes for the node's own work. Binding the uid to a
+ * prefix closes that without touching what anyone else may do: a uid with no
+ * entry here is unrestricted.
+ *
+ * The comparison is a plain byte prefix, case-sensitive, with no
+ * normalisation, and the daemon NEVER edits the caller's session_id. A
+ * silent rewrite would store something the client did not send and make the
+ * chain disagree with the client's own record of what it wrote; a refusal is
+ * legible on both sides.
+ */
+virp_error_t onode_set_uid_session_prefix(onode_state_t *state, uid_t uid,
+                                          const char *prefix)
+{
+    if (!state || !prefix || prefix[0] == '\0')
+        return VIRP_ERR_NULL_PTR;
+    if (strlen(prefix) >= sizeof(state->uid_sprefix[0]))
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+
+    ssize_t idx = -1;
+    for (size_t i = 0; i < state->uid_sprefix_count; i++)
+        if (state->uid_sprefix_uids[i] == uid) { idx = (ssize_t)i; break; }
+    if (idx < 0) {
+        if (state->uid_sprefix_count >= ONODE_MAX_ALLOWED_UIDS)
+            return VIRP_ERR_MESSAGE_TOO_LARGE;
+        idx = (ssize_t)state->uid_sprefix_count++;
+        state->uid_sprefix_uids[idx] = uid;
+    }
+    snprintf(state->uid_sprefix[idx], sizeof(state->uid_sprefix[idx]),
+             "%s", prefix);
+    return VIRP_OK;
+}
+
+void onode_clear_uid_session_prefixes(onode_state_t *state)
+{
+    if (!state) return;
+    state->uid_sprefix_count = 0;
+}
+
+bool onode_uid_has_session_prefix(const onode_state_t *state, uid_t uid)
+{
+    if (!state) return false;
+    for (size_t i = 0; i < state->uid_sprefix_count; i++)
+        if (state->uid_sprefix_uids[i] == uid) return true;
+    return false;
+}
+
+bool onode_uid_session_prefix_allowed(const onode_state_t *state, uid_t uid,
+                                      const char *session_id)
+{
+    if (!state) return false;
+    for (size_t i = 0; i < state->uid_sprefix_count; i++) {
+        if (state->uid_sprefix_uids[i] != uid) continue;
+        if (!session_id || session_id[0] == '\0')
+            return false;
+        size_t plen = strlen(state->uid_sprefix[i]);
+        return strncmp(session_id, state->uid_sprefix[i], plen) == 0;
+    }
+    return true;        /* no policy for this uid -> unrestricted */
 }
 
 virp_error_t onode_start(onode_state_t *state)

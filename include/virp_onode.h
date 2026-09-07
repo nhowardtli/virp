@@ -527,6 +527,25 @@ typedef struct {
                                       [ONODE_CHAIN_TYPE_MAX];
     size_t              uid_capp_type_counts[ONODE_MAX_ALLOWED_UIDS];
     size_t              uid_capp_count;
+
+    /*
+     * Per-uid chain_append SESSION NAMESPACE, from the device template's
+     * socket_uid_session_prefix object (uid -> prefix). A uid listed here may
+     * only chain_append when session_id STARTS WITH its prefix; anything else
+     * is VIRP_ERR_ACTION_FORBIDDEN. A uid absent here is unrestricted, so this
+     * changes nothing for the service accounts.
+     *
+     * Type narrowing alone does not stop a constrained appender writing into
+     * somebody else's session: session_id is client-supplied and was accepted
+     * verbatim, so a seat could append into "autopilot:..." or
+     * "gate-enforce:..." and its records would sit inside a session a reader
+     * takes for the node's own. The daemon REFUSES rather than rewriting —
+     * a silent namespace-prefix would make the chain disagree with what the
+     * client believes it wrote.
+     */
+    uid_t               uid_sprefix_uids[ONODE_MAX_ALLOWED_UIDS];
+    char                uid_sprefix[ONODE_MAX_ALLOWED_UIDS][64];
+    size_t              uid_sprefix_count;
 } onode_state_t;
 
 /* =========================================================================
@@ -819,6 +838,17 @@ void onode_clear_uid_chain_append_types(onode_state_t *state);
 bool onode_uid_has_capp_policy(const onode_state_t *state, uid_t uid);
 /* True iff `uid` may chain_append `artifact_type` under its policy. Only
  * meaningful when onode_uid_has_capp_policy() is true. */
+/* Per-uid chain_append session namespace. Setting an empty or NULL prefix
+ * removes nothing — pass a real prefix; a uid with no entry is unrestricted. */
+virp_error_t onode_set_uid_session_prefix(onode_state_t *state, uid_t uid,
+                                          const char *prefix);
+void onode_clear_uid_session_prefixes(onode_state_t *state);
+bool onode_uid_has_session_prefix(const onode_state_t *state, uid_t uid);
+/* True when the uid has no prefix policy, or session_id begins with it.
+ * Never modifies session_id. */
+bool onode_uid_session_prefix_allowed(const onode_state_t *state, uid_t uid,
+                                      const char *session_id);
+
 bool onode_uid_capp_type_allowed(const onode_state_t *state, uid_t uid,
                                  const char *artifact_type);
 /* True iff `uid`'s action set includes `action` (used by the boot
