@@ -73,7 +73,41 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+
+
+def _is_repo(path):
+    if not path or not os.path.isdir(path):
+        return False
+    out = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                         capture_output=True, check=False)
+    return out.returncode == 0
+
+
+def repo_root(explicit=None):
+    """The git repo to read the two revisions out of.
+
+    Tried in order: --repo, the current directory, this script's parent.
+    NOT derived from the script's own path alone: this file gets copied
+    around -- into a scratch directory, onto a host -- and inferring the
+    repo from where it happens to sit produced a bare
+    `fatal: not a git repository` the first time it ran from anywhere
+    but tools/. When none of the three is a repo it says so and names
+    the flag, rather than guessing and failing later with git's message
+    instead of ours."""
+    for cand in (explicit, os.getcwd(), os.path.dirname(HERE)):
+        if _is_repo(cand):
+            return subprocess.run(
+                ["git", "-C", cand, "rev-parse", "--show-toplevel"],
+                capture_output=True, check=False).stdout.decode().strip()
+    raise SystemExit(
+        "verifier_baseline: no git repository found. Tried --repo (%r), the "
+        "current directory (%s) and this script's parent (%s). The two "
+        "verifier revisions are read from a repo with `git archive`, so one "
+        "is required: pass --repo /path/to/virp."
+        % (explicit, os.getcwd(), os.path.dirname(HERE)))
+
+
+ROOT = None          # set from --repo in main()
 
 SIDECARS = ("-wal", "-shm")
 COPY_ATTEMPTS = 3
@@ -343,7 +377,14 @@ def main(argv=None):
     ap.add_argument("--out", help="directory to write the JSON artifacts to")
     ap.add_argument("--keep", action="store_true",
                     help="keep the checkpointed copy (prints its path)")
+    ap.add_argument("--repo",
+                    help="the virp git repository to read --old-ref and "
+                         "--new-ref out of. Defaults to the current "
+                         "directory, then this script's parent.")
     a = ap.parse_args(argv)
+
+    global ROOT
+    ROOT = repo_root(a.repo)
 
     if not os.path.exists(a.db):
         raise SystemExit("verifier_baseline: no such file: %s" % a.db)
