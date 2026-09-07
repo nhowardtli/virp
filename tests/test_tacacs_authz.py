@@ -440,10 +440,6 @@ class TestNoLocalFallbackInRenderedConfig(unittest.TestCase):
         self.assertIn("authorization commands 15 CONSOLE", cfg)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestAuthorCodec(unittest.TestCase):
     """RFC 8907 §6.1/§6.2 authorization REQUEST and RESPONSE.
 
@@ -1652,3 +1648,22 @@ class TestCorpusBuilderFence(unittest.TestCase):
     def test_reading_logging_config_is_still_allowed(self):
         m = self._mod()
         m._assert_safe(["show logging"], [])
+
+
+# THE ENTRY POINT LIVES AT THE END OF THE FILE, AND MUST STAY THERE.
+#
+# HAM review 2026-09-06, follow-up 1. This block used to sit at line 442
+# of 1654. `unittest.main()` calls sys.exit(), so running this file
+# directly executed the 37 tests defined ABOVE it and never reached the
+# other 92. Both counts were green, which is why nobody noticed: 37
+# passing tests and 129 passing tests print the same word.
+#
+# The file was also not in `all-tests`, so the only thing that ever ran
+# the whole of it was someone typing pytest by hand. Both halves are
+# fixed together: this block moved, and `make test-tacacs-authz` now runs
+# the file as part of `all-tests`.
+#
+# Nothing below this line. A class appended after an entry point does not
+# run.
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
