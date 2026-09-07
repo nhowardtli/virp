@@ -19,6 +19,7 @@
 
 static virp_error_t chain_count_intents_for_approval_locked(
         virp_chain_state_t *state, const char *aeh, int *count);
+static void chain_maps_free(virp_chain_state_t *state);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -697,8 +698,15 @@ virp_error_t virp_chain_count_intents_for_approval(virp_chain_state_t *state,
 {
     if (!state || !approval_entry_hash || !count) return VIRP_ERR_NULL_PTR;
     pthread_mutex_lock(&state->lock);
+    /* The daemon's apply-time replay guard. It runs OUTSIDE a verify, so
+     * nothing would free the map afterwards, and a cached answer here is
+     * a wrong answer the moment the next intent lands. Build fresh, and
+     * drop it again immediately: this path is called once per apply, not
+     * once per entry, so there is nothing to amortise. */
+    chain_maps_free(state);
     virp_error_t rc = chain_count_intents_for_approval_locked(
                           state, approval_entry_hash, count);
+    chain_maps_free(state);
     pthread_mutex_unlock(&state->lock);
     return rc;
 }
@@ -2120,6 +2128,13 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
     if (state->read_only)
         return VIRP_ERR_CHAIN_READONLY;
 
+    /* Any append invalidates the verify-scoped maps: they are a snapshot
+     * of the closers and intents as they were, and the daemon's
+     * apply-time replay guard calls the intent counter between appends.
+     * Caching across a write is how a second apply came to see a stale
+     * double-spend count. Freed here, rebuilt on next use. */
+    chain_maps_free(state);
+
     /* BEGIN IMMEDIATE — exclusive write lock */
     int rc = sqlite3_exec(state->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
     if (rc != SQLITE_OK)
@@ -2527,7 +2542,7 @@ static int cmp_intent_ref(const void *a, const void *b)
                   ((const chain_intent_ref_t *)b)->aeh);
 }
 
-void chain_maps_free(virp_chain_state_t *state)
+static void chain_maps_free(virp_chain_state_t *state)
 {
     free(state->closer_map);  state->closer_map = NULL;
     state->closer_map_n = 0;  state->closer_map_built = false;
