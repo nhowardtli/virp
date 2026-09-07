@@ -1,0 +1,79 @@
+#!/bin/bash
+#
+# tacacs-reload -- check the config, then reload tac_plus-ng, or refuse.
+#
+# THE POINT: `tac_plus-ng -P` is a syntax check. SIGHUP is NOT checked.
+# spawnd's SIGHUP handler (mavis/spawnd_signals.c:17) calls execve()
+# directly -- if the config on disk is broken at that moment, the master
+# re-execs into a parse failure and DIES, taking authorization with it.
+# Every device then fails closed, which is the safe direction but is
+# still an outage caused by a typo.
+#
+# So: nothing signals this daemon except through here. Check first,
+# signal only on success. This is the same fail-closed rule the systemd
+# unit applies to restart, extended to the reload path, because the
+# reload path is the one VIRP's future approved.conf writer will use
+# and it is the one with no built-in guard.
+#
+# Exit codes:
+#   0  config valid, reload signalled
+#   1  config INVALID, nothing signalled, running policy untouched
+#   2  daemon not running (nothing to reload)
+#   3  usage / environment error
+
+set -u
+
+CONF=${TACACS_CONF:-/etc/tacacs/tac_plus-ng.cfg}
+BIN=${TACACS_BIN:-/usr/local/sbin/tac_plus-ng}
+
+# The pid may be given as $1. The unit passes systemd's $MAINPID that
+# way, which is authoritative and needs no pidfile -- and there IS no
+# pidfile, on purpose: spawnd re-execs on SIGHUP and a pidfile-tracked
+# service dies silently on the second reload (see tac_plus-ng.cfg).
+# Falling back to pgrep keeps this usable by hand.
+ARG_PID=${1:-}
+
+die() { echo "tacacs-reload: $*" >&2; exit "${2:-3}"; }
+
+[ -x "$BIN" ]  || die "no tac_plus-ng binary at $BIN"
+[ -r "$CONF" ] || die "no readable config at $CONF"
+
+# 1. Check. Output is kept so a refusal says WHY -- a reload that is
+#    refused without a reason just gets retried until someone forces it.
+check_out=$("$BIN" -P "$CONF" 2>&1)
+check_rc=$?
+if [ $check_rc -ne 0 ]; then
+    echo "tacacs-reload: REFUSED -- config check failed (rc=$check_rc)" >&2
+    echo "$check_out" >&2
+    echo "tacacs-reload: running policy is UNCHANGED" >&2
+    exit 1
+fi
+
+# 2. Find the master. Reload is meaningless without one, and signalling
+#    the wrong pid is worse than doing nothing.
+pid=""
+if [ -n "$ARG_PID" ] && [ "$ARG_PID" != "0" ]; then
+    pid=$ARG_PID
+else
+    # Lowest-pid tac_plus-ng is the master; the rest are its children.
+    # Signalling a CHILD would tell that child to stop accepting
+    # connections and never reload anything -- a silent no-op that
+    # looks like success.
+    pid=$(pgrep -x tac_plus-ng 2>/dev/null | sort -n | head -1)
+fi
+case "$pid" in
+    ''|*[!0-9]*)
+        echo "tacacs-reload: config OK, but no running tac_plus-ng found" >&2
+        exit 2 ;;
+esac
+kill -0 "$pid" 2>/dev/null || {
+    echo "tacacs-reload: config OK, but pid $pid is not running" >&2
+    exit 2
+}
+
+# 3. Signal. spawnd re-execs; children stop accepting NEW connections and
+#    exit when their last in-flight session finishes (die_when_idle,
+#    tac_plus-ng/main.c:544). No established session is dropped.
+kill -HUP "$pid" || die "failed to signal pid $pid"
+echo "tacacs-reload: config OK, SIGHUP sent to $pid"
+exit 0
