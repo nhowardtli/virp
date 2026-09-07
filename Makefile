@@ -1136,6 +1136,11 @@ test-tacacs-identities:
 # explicit socket_uid_action_allow entry (the daemon refuses to start
 # otherwise) and must not hand shutdown to any of the four service
 # identities. Reads no production path, writes none.
+.PHONY: test-health-uid-passthrough
+test-health-uid-passthrough:
+	@echo "=== ONODE_ACTION_HEALTH carries the client uid into the tier gate ==="
+	python3 tests/test_health_uid_passthrough.py
+
 .PHONY: test-template-uid-policy
 test-template-uid-policy:
 	@echo "=== deployment templates: per-uid action policy ==="
@@ -2179,7 +2184,7 @@ test-release-tools:
 	@scripts/verify-release-bundle.sh --selftest
 	@scripts/check-release-tag.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-identities test-template-uid-policy test-health-uid-passthrough test-evidence test-virp-report test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-obskey test-obs-ed25519 test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 
