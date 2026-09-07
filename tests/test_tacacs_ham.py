@@ -212,5 +212,81 @@ class TestItem1SingleUseUnderConcurrency(unittest.TestCase):
                              "a reservation nothing acted on must return")
 
 
+class TestItem2GrantBindsThePrincipal(unittest.TestCase):
+    """HAM item 2: a grant names a user, and that name is part of the key.
+
+    The reviewed _grant_matches() compared device and command only, and
+    authorize() special-cased virp-ro and routed EVERY other username
+    through write-grant matching. A grant issued for virp-rw therefore
+    passed for nate, for breakglass, for anyone the router authenticated
+    under any name at all."""
+
+    CMD = "interface Loopback99"
+
+    def test_only_the_named_principal_passes(self):
+        p = policy([grant(user="virp-rw")])
+        for user, want in (("virp-rw", az.PASS_ADD),
+                           ("nate", az.FAIL),
+                           ("eviluser", az.FAIL),
+                           ("breakglass", az.FAIL),
+                           ("virp-ro", az.FAIL)):
+            st, reason, _g = az.authorize(p, device="R1", user=user,
+                                          command=self.CMD, now_ns=NOW)
+            self.assertEqual(st, want,
+                             "user %r: got %s (%s)" % (user, st, reason))
+
+    def test_unknown_principal_is_refused_before_any_grant_is_read(self):
+        """Fail closed on the identity, not on the absence of a grant.
+        The reason must name the identity, so an operator reading a denial
+        can tell 'you are not a gate identity' from 'nothing is approved'."""
+        st, reason, gid = az.authorize(policy([grant(user="virp-rw")]),
+                                       device="R1", user="nate",
+                                       command=self.CMD, now_ns=NOW)
+        self.assertEqual(st, az.FAIL)
+        self.assertIsNone(gid)
+        self.assertIn("gate identity", reason.lower())
+
+    def test_a_missing_username_is_refused(self):
+        for user in (None, ""):
+            st, _r, _g = az.authorize(policy([grant(user="virp-rw")]),
+                                      device="R1", user=user,
+                                      command=self.CMD, now_ns=NOW)
+            self.assertEqual(st, az.FAIL, "user %r must fail closed" % user)
+
+    def test_a_grant_issued_for_ro_does_not_pass_for_rw(self):
+        """The grant's own user field is load-bearing, not decoration."""
+        st, _r, _g = az.authorize(policy([grant(user="virp-ro")]),
+                                  device="R1", user="virp-rw",
+                                  command=self.CMD, now_ns=NOW)
+        self.assertEqual(st, az.FAIL)
+
+    def test_gate_identities_have_exactly_one_definition(self):
+        """The allowlist is derived from the same place the gate
+        identities are defined, not typed out again per module."""
+        import virp_tacacs_policy as pol
+        self.assertEqual(tuple(az.GATE_IDENTITIES),
+                         (az.GATE_IDENTITY_RO, az.GATE_IDENTITY_RW))
+        self.assertIs(pol.GATE_IDENTITY_RW, az.GATE_IDENTITY_RW)
+        with open(os.path.join(ROOT, "tacacs",
+                               "virp_tacacs_policy.py")) as f:
+            src = f.read()
+        self.assertNotIn('"virp-rw"', src,
+                         "policy compiler re-types the gate identity")
+
+    def test_compiler_refuses_a_grant_for_a_non_gate_principal(self):
+        """The daemon must not ISSUE one either. An approval naming an
+        operator outside the gate identity set is refused with a reason,
+        never rendered into a grant."""
+        import virp_tacacs_policy as pol
+        appr = {"approval_id": "appr-x", "signature_verified": True,
+                "command": "interface Loopback99", "device": "R1",
+                "issued_utc_ns": NOW, "ttl_ns": 300 * SEC,
+                "repeat_count": 1, "user": "nate"}
+        grants, refusals = pol.compile_grants([appr], now_ns=NOW)
+        self.assertEqual(grants, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("gate identity", refusals[0]["reason"].lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

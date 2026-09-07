@@ -28,7 +28,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from virp_tacacs_authz import (canonical_command, command_spellings,
-                               ios_canonical, is_do_command, SPELLING_RULE)
+                               ios_canonical, is_do_command, SPELLING_RULE,
+                               GATE_IDENTITIES, GATE_IDENTITY_RW)
 
 # 2c: the compiler and the reconciler call the SAME function. If these
 # two ever diverge, a command is authorized under one spelling and
@@ -221,6 +222,23 @@ def compile_grants(approvals, now_ns, default_uses=1):
                              "reason": "approval names no device"})
             continue
 
+        # A dynamic grant is ISSUED to a gate identity only (HAM item 2).
+        # An approval naming any other principal is refused here rather
+        # than rendered under the gate's name, which would put an
+        # operator's approval behind an identity they never named.
+        # Absent means "the gate's write identity", the only subject this
+        # compiler has ever rendered for; anything else present must be
+        # a gate identity or it is refused.
+        principal = a.get("user") or GATE_IDENTITY_RW
+        if principal not in GATE_IDENTITIES:
+            refusals.append({
+                "approval_id": aid,
+                "reason": "approval names principal %r, which is not a "
+                          "gate identity (%s); dynamic grants are issued "
+                          "to the gate only"
+                          % (principal, ", ".join(GATE_IDENTITIES))})
+            continue
+
         issued = int(a.get("issued_utc_ns") or 0)
         ttl = int(a.get("ttl_ns") or DEFAULT_TTL_NS)
         not_after = issued + ttl
@@ -244,7 +262,7 @@ def compile_grants(approvals, now_ns, default_uses=1):
         grants.append({
             "grant_id": "g-%s" % aid,
             "device": device,
-            "user": "virp-rw",
+            "user": GATE_IDENTITY_RW,
             "command": cmd,
             "approval_id": aid,
             "approval_entry_hash": a.get("approval_entry_hash"),
@@ -281,7 +299,7 @@ def compile_grants(approvals, now_ns, default_uses=1):
         grants.append({
             "grant_id": "g-configentry-%s" % device,
             "device": device,
-            "user": "virp-rw",
+            "user": GATE_IDENTITY_RW,
             "command": CONFIG_ENTRY_COMMAND,
             "approval_id": anchor["approval_id"],
             "approval_entry_hash": anchor.get("approval_entry_hash"),
