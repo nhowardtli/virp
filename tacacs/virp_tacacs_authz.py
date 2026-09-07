@@ -69,6 +69,23 @@ def reply_args_for(status):
 # prefix: `terminal monitor` is still denied.
 ALWAYS_PERMITTED = ("exit", "quit", "end", "terminal length 0")
 
+# THE GATE IDENTITIES, defined once.
+#
+# HAM review 2026-09-06, item 2. These names were literals in three
+# places: the virp-ro branch below, and the "user" field the policy
+# compiler wrote into every grant. Nothing checked the request's username
+# against the grant's, so a grant issued for virp-rw authorized nate,
+# breakglass, eviluser -- any name the router happened to authenticate.
+#
+# A dynamic grant is issued to, and honoured for, a GATE identity only.
+# Human principals are tac_plus-ng's static policy, never this daemon's
+# dynamic grants: the whole claim of a dynamic grant is that it traces to
+# one signed approval for one identity, and an identity that is not the
+# gate's cannot be the subject of that approval.
+GATE_IDENTITY_RO = "virp-ro"
+GATE_IDENTITY_RW = "virp-rw"
+GATE_IDENTITIES = (GATE_IDENTITY_RO, GATE_IDENTITY_RW)
+
 # virp-ro is the gate's steady state: GREEN reads and nothing else. This
 # list is deliberately short and explicit -- no "show *" -- because
 # `show running-config` leaks credentials and `show tech-support` is a
@@ -347,7 +364,15 @@ def ios_canonical(text, table=None):
     return " ".join(final)
 
 
-def _grant_matches(g, device, command):
+def _grant_matches(g, device, user, command):
+    """The grant KEY is principal + device + exact command spelling.
+
+    The principal is part of the key, not context around it (HAM item 2).
+    A grant with no `user` matches nothing: absence is never read as
+    "any", which is the same rule the compiler applies to an unverified
+    approval."""
+    if not user or g.get("user") != user:
+        return False
     if g.get("device") != device:
         return False
     accepted = g.get("accepted_spellings")
@@ -399,21 +424,49 @@ def authorize(policy, device, user, command, now_ns):
     if cmd in ALWAYS_PERMITTED:
         return PASS_ADD, "always permitted (%s)" % cmd, None
 
-    if user == "virp-ro":
+    if user == GATE_IDENTITY_RO:
         if cmd in RO_PERMITTED:
-            return PASS_ADD, "virp-ro read allowlist", None
+            return PASS_ADD, "%s read allowlist" % GATE_IDENTITY_RO, None
         return (FAIL,
-                DENY_PREFIX + "virp-ro may not run %r (read allowlist "
-                              "only)" % cmd, None)
+                DENY_PREFIX + "%s may not run %r (read allowlist "
+                              "only)" % (GATE_IDENTITY_RO, cmd), None)
+
+    # Fail closed on the IDENTITY, before any grant is read. Everything
+    # past this line is the write path, and the write path exists only
+    # for the gate. A human principal reaching here is either a
+    # misconfigured method list or someone standing where the gate
+    # stands; both are denials, and both are worth naming distinctly from
+    # "nothing is approved".
+    #
+    # The exemptions above this line (exit / quit / end / terminal length
+    # 0) are deliberately still open to everyone: they cannot alter state
+    # or reveal anything, and denying them would strand a session in
+    # config mode, which loses the accounting for what it did.
+    if user not in GATE_IDENTITIES:
+        return (FAIL,
+                DENY_PREFIX + "%r is not a gate identity (%s); dynamic "
+                              "grants are issued to and honoured for the "
+                              "gate only, and human principals are the "
+                              "static policy's business"
+                % (user, ", ".join(GATE_IDENTITIES)), None)
 
     # virp-rw: nothing is permitted without a grant.
     candidates = [g for g in policy.get("grants", [])
-                  if _grant_matches(g, device, cmd)]
+                  if _grant_matches(g, device, user, cmd)]
     if not candidates:
         # Say WHICH way it missed, because "denied" with no reason is the
         # thing operators disable controls over.
         by_cmd = [g for g in policy.get("grants", [])
                   if canonical_command(g.get("command")) == cmd]
+        by_user = [g for g in by_cmd if g.get("user") != user]
+        if by_user:
+            return (FAIL,
+                    DENY_PREFIX + "no grant for %r on device %r as %r "
+                                  "(approved for %s)"
+                    % (cmd, device, user,
+                       ", ".join(sorted({str(g.get("user"))
+                                         for g in by_user}))),
+                    None)
         if by_cmd:
             return (FAIL,
                     DENY_PREFIX + "no grant for %r on device %r (approved "

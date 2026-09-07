@@ -440,10 +440,6 @@ class TestNoLocalFallbackInRenderedConfig(unittest.TestCase):
         self.assertIn("authorization commands 15 CONSOLE", cfg)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestAuthorCodec(unittest.TestCase):
     """RFC 8907 §6.1/§6.2 authorization REQUEST and RESPONSE.
 
@@ -594,19 +590,28 @@ class TestLabDaemonActionPolicy(unittest.TestCase):
 
 
 class TestApprovalTrustBasis(unittest.TestCase):
-    """FINDING: the chained `approval` record carries `approver_key_id`
-    but NOT the approver's Ed25519 signature -- that lives only in the
-    approval file on the daemon host (virp_approval_write_record). A
-    chain-only consumer therefore CANNOT verify the approver's signature.
+    """FINDING (2026-07): the chained `approval` record carried
+    `approver_key_id` but NOT the approver's Ed25519 signature -- that
+    lived only in the approval file on the daemon host
+    (virp_approval_write_record). A chain-only consumer therefore COULD
+    NOT verify the approver's signature.
 
-    What it CAN verify, and what the compiler must therefore require:
+    What it could verify, and what the compiler required:
       - the proposal and approval agree on command_hash (binding), and
       - sha256(virp_canonicalize_command(proposal.command)) recomputes to
         that same command_hash (so the command text is not free-floating).
 
-    Calling that "signature_verified" would be a lie. The field is named
-    for what was actually checked and carries the basis, so a reader can
-    see the approver signature was never among them."""
+    Calling that "signature_verified" would have been a lie. The field is
+    named for what was actually checked and carries the basis, so a
+    reader can see what was among them.
+
+    CLOSED by the HAM review, 2026-09-06 item 6: the daemon now writes the
+    signature into the approval body (body_version 2) and the compiler
+    verifies it against its own pinned registry. The bindings below are
+    still checked and still named -- they are simply no longer SUFFICIENT.
+    A body with no signature, which is every body these fixtures build,
+    is exactly the legacy case and renders nothing.
+    See tests/test_tacacs_ham.py TestItem6CompilerVerifiesTheApproverSignature."""
 
     def _pair(self, command="interface Loopback77", tamper=None):
         h = pol.command_hash(command)
@@ -621,12 +626,15 @@ class TestApprovalTrustBasis(unittest.TestCase):
             approval["command_hash"] = "b" * 64
         return proposal, approval
 
-    def test_matching_pair_is_trusted_with_a_named_basis(self):
+    def test_matching_pair_names_its_basis_but_is_not_trusted_alone(self):
+        """The bindings are checked and named. They are not enough: with
+        no approver signature in the body there is nothing to verify, and
+        binding correctness is not a signature."""
         pr, ap = self._pair()
         out = pol.approval_from_chain(pr, ap)
-        self.assertTrue(out["approval_trusted"])
         self.assertIn("command_hash_binding", out["trust_basis"])
         self.assertIn("command_hash_recomputed", out["trust_basis"])
+        self.assertFalse(out["approval_trusted"])
 
     def test_basis_never_claims_the_approver_signature(self):
         pr, ap = self._pair()
@@ -1640,3 +1648,22 @@ class TestCorpusBuilderFence(unittest.TestCase):
     def test_reading_logging_config_is_still_allowed(self):
         m = self._mod()
         m._assert_safe(["show logging"], [])
+
+
+# THE ENTRY POINT LIVES AT THE END OF THE FILE, AND MUST STAY THERE.
+#
+# HAM review 2026-09-06, follow-up 1. This block used to sit at line 442
+# of 1654. `unittest.main()` calls sys.exit(), so running this file
+# directly executed the 37 tests defined ABOVE it and never reached the
+# other 92. Both counts were green, which is why nobody noticed: 37
+# passing tests and 129 passing tests print the same word.
+#
+# The file was also not in `all-tests`, so the only thing that ever ran
+# the whole of it was someone typing pytest by hand. Both halves are
+# fixed together: this block moved, and `make test-tacacs-authz` now runs
+# the file as part of `all-tests`.
+#
+# Nothing below this line. A class appended after an entry point does not
+# run.
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
