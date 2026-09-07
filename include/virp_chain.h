@@ -358,6 +358,30 @@ typedef struct {
      * SKIPPED (a soft whole-session outcome) rather than FAILED. Guarded by
      * the chain lock like every other verify field. */
     bool                   sig_key_unavailable_session;
+
+    /* =====================================================================
+     * VERIFY-SCOPED LOOKUP MAPS (perf/verify-closer-map, 2026-09-07).
+     *
+     * The evidence-required grading used to re-scan the whole database
+     * once per entry it graded: every gate_intent triggered a full join
+     * over all closers WITH their bodies, and every intent carrying an
+     * approval hash triggered a full join over all intent bodies. Two
+     * quadratic terms. Measured on .211 (349,697 entries, 21,793
+     * intents, 95,273 closers): 0.37 s per closer scan x 21,793 = 2.3
+     * HOURS, and the intent scan on top of it.
+     *
+     * Both are now built ONCE per verify call, lazily on first use, and
+     * freed when the walk ends. The grading answers are byte-identical:
+     * these are the same rows, read once instead of N times.
+     *
+     * Opaque here; the layout is private to src/virp_chain.c.
+     * ===================================================================== */
+    void                  *closer_map;      /* chain_closer_ref_t[]  */
+    size_t                 closer_map_n;
+    bool                   closer_map_built;
+    void                  *intent_map;      /* chain_intent_ref_t[]  */
+    size_t                 intent_map_n;
+    bool                   intent_map_built;
     /* Verifier tier selection: whether K_chain was supplied (HMAC tier).
      * Keyless verification sets this false — hash+link+completeness only,
      * head length claim UNAUTHENTICATED. The writer path always has the

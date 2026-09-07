@@ -1059,6 +1059,19 @@ static const char *SCHEMA_SQL =
      * next open — no migration step. */
     "CREATE INDEX IF NOT EXISTS idx_chain_artifact_id "
     "  ON chain_entries(artifact_id);"
+    /* The evidence-required grading resolves an intent or a closer by its
+     * chain_entry_hash. Without this index that is a full table scan per
+     * lookup: measured 4.7 ms on .211's 349,697 entries, x 117,066
+     * intents and closers = about 9 minutes of a verify spent on it.
+     *
+     * IF NOT EXISTS, so an existing chain.db gains it on the next open
+     * and there is no migration step to run by hand. DEPLOY COST,
+     * MEASURED on a copy of .211's 571 MB / 349,697-entry chain: the
+     * index builds in 0.37 s and adds 26 MB. The first open after this
+     * ships pays that once, before the daemon starts serving; every
+     * open after it is unaffected. */
+    "CREATE INDEX IF NOT EXISTS idx_chain_entry_hash "
+    "  ON chain_entries(chain_entry_hash);"
     /* Signed per-session head: authenticates chain LENGTH, not just links.
      * Updated in the same transaction as every append. A DB writer without
      * K_chain can neither forge a head for a truncated chain nor delete it
@@ -2479,33 +2492,166 @@ static virp_error_t chain_hash_is_intent_locked(virp_chain_state_t *state,
  * non-empty approval entry hash). Parses each body with cJSON. Used both
  * by the verifier (two intents for one approval is tampering) and,
  * publicly below, by the daemon's apply-time replay guard. */
-static virp_error_t chain_count_intents_for_approval_locked(
-        virp_chain_state_t *state, const char *aeh, int *count)
+/* =========================================================================
+ * VERIFY-SCOPED LOOKUP MAPS (perf/verify-closer-map, 2026-09-07)
+ *
+ * One pass over the closers and one over the intents, per verify call,
+ * instead of one pass per graded entry. See the comment on closer_map in
+ * include/virp_chain.h for the measurement that motivated it.
+ *
+ * The maps hold only what the grading decisions need: the cited hash, the
+ * type, and the rowid to fetch that ONE closer's body if a binding check
+ * is actually required. Bodies are never retained -- on .211 that would
+ * be ~150 MB; this is ~10 MB.
+ * ========================================================================= */
+
+typedef struct {
+    char          cited[65];       /* intent_entry_hash this closer names */
+    char          type[16];        /* gate_execution | outcome            */
+    sqlite3_int64 rowid;           /* chain_entries.rowid, to fetch a body */
+} chain_closer_ref_t;
+
+typedef struct {
+    char aeh[65];                  /* approval_entry_hash this intent names */
+} chain_intent_ref_t;
+
+static int cmp_closer_ref(const void *a, const void *b)
 {
-    *count = 0;
-    if (!aeh || !aeh[0]) return VIRP_OK;
+    return strcmp(((const chain_closer_ref_t *)a)->cited,
+                  ((const chain_closer_ref_t *)b)->cited);
+}
+
+static int cmp_intent_ref(const void *a, const void *b)
+{
+    return strcmp(((const chain_intent_ref_t *)a)->aeh,
+                  ((const chain_intent_ref_t *)b)->aeh);
+}
+
+void chain_maps_free(virp_chain_state_t *state)
+{
+    free(state->closer_map);  state->closer_map = NULL;
+    state->closer_map_n = 0;  state->closer_map_built = false;
+    free(state->intent_map);  state->intent_map = NULL;
+    state->intent_map_n = 0;  state->intent_map_built = false;
+}
+
+/* false on a read error, exactly where the old per-entry scan returned
+ * one, so the caller's fallback behaviour is unchanged. */
+static bool chain_build_closer_map_locked(virp_chain_state_t *state)
+{
+    if (state->closer_map_built) return true;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT c.rowid, c.artifact_type, a.artifact_content "
+            "FROM chain_entries c "
+            "JOIN artifacts a ON a.artifact_id = c.artifact_id "
+            "               AND a.artifact_hash = c.artifact_hash "
+            "WHERE c.artifact_type IN ('gate_execution','outcome')",
+            -1, &st, NULL) != SQLITE_OK)
+        return false;
+
+    size_t cap = 256, n = 0;
+    chain_closer_ref_t *arr = malloc(cap * sizeof(*arr));
+    if (!arr) { sqlite3_finalize(st); return false; }
+    int step;
+    while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+        const unsigned char *ct = sqlite3_column_text(st, 1);
+        const unsigned char *cb = sqlite3_column_text(st, 2);
+        if (!ct || !cb) continue;
+        cJSON *closer = cJSON_Parse((const char *)cb);
+        if (!closer) continue;
+        char cited[65];
+        if (cj_str(closer, "intent_entry_hash", cited, sizeof(cited)) &&
+            cited[0]) {
+            if (n == cap) {
+                size_t ncap = cap * 2;
+                chain_closer_ref_t *g = realloc(arr, ncap * sizeof(*arr));
+                if (!g) { cJSON_Delete(closer); free(arr);
+                          sqlite3_finalize(st); return false; }
+                arr = g; cap = ncap;
+            }
+            snprintf(arr[n].cited, sizeof(arr[n].cited), "%s", cited);
+            snprintf(arr[n].type, sizeof(arr[n].type), "%s",
+                     (const char *)ct);
+            arr[n].rowid = sqlite3_column_int64(st, 0);
+            n++;
+        }
+        cJSON_Delete(closer);
+    }
+    sqlite3_finalize(st);
+    if (step != SQLITE_DONE) { free(arr); return false; }
+
+    qsort(arr, n, sizeof(*arr), cmp_closer_ref);
+    state->closer_map = arr;
+    state->closer_map_n = n;
+    state->closer_map_built = true;
+    return true;
+}
+
+static bool chain_build_intent_map_locked(virp_chain_state_t *state)
+{
+    if (state->intent_map_built) return true;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(state->db,
             "SELECT a.artifact_content FROM chain_entries c "
             "JOIN artifacts a ON a.artifact_id = c.artifact_id "
             "               AND a.artifact_hash = c.artifact_hash "
-            "WHERE c.artifact_type = 'gate_intent'", -1, &st, NULL) != SQLITE_OK)
-        return VIRP_ERR_CHAIN_DB;
-    int n = 0, step;
+            "WHERE c.artifact_type = 'gate_intent'", -1, &st, NULL)
+        != SQLITE_OK)
+        return false;
+
+    size_t cap = 256, n = 0;
+    chain_intent_ref_t *arr = malloc(cap * sizeof(*arr));
+    if (!arr) { sqlite3_finalize(st); return false; }
+    int step;
     while ((step = sqlite3_step(st)) == SQLITE_ROW) {
         const unsigned char *b = sqlite3_column_text(st, 0);
         if (!b) continue;
         cJSON *o = cJSON_Parse((const char *)b);
         if (!o) continue;
         char got[65];
-        if (cj_str(o, "approval_entry_hash", got, sizeof(got)) &&
-            strcmp(got, aeh) == 0)
+        if (cj_str(o, "approval_entry_hash", got, sizeof(got)) && got[0]) {
+            if (n == cap) {
+                size_t ncap = cap * 2;
+                chain_intent_ref_t *g = realloc(arr, ncap * sizeof(*arr));
+                if (!g) { cJSON_Delete(o); free(arr);
+                          sqlite3_finalize(st); return false; }
+                arr = g; cap = ncap;
+            }
+            snprintf(arr[n].aeh, sizeof(arr[n].aeh), "%s", got);
             n++;
+        }
         cJSON_Delete(o);
     }
     sqlite3_finalize(st);
-    if (step != SQLITE_DONE) return VIRP_ERR_CHAIN_DB;
-    *count = n;
+    if (step != SQLITE_DONE) { free(arr); return false; }
+
+    qsort(arr, n, sizeof(*arr), cmp_intent_ref);
+    state->intent_map = arr;
+    state->intent_map_n = n;
+    state->intent_map_built = true;
+    return true;
+}
+
+static virp_error_t chain_count_intents_for_approval_locked(
+        virp_chain_state_t *state, const char *aeh, int *count)
+{
+    *count = 0;
+    if (!aeh || !aeh[0]) return VIRP_OK;
+    if (!chain_build_intent_map_locked(state)) return VIRP_ERR_CHAIN_DB;
+
+    chain_intent_ref_t key;
+    snprintf(key.aeh, sizeof(key.aeh), "%s", aeh);
+    const chain_intent_ref_t *arr = state->intent_map;
+    const chain_intent_ref_t *hit = bsearch(&key, arr, state->intent_map_n,
+                                            sizeof(*arr), cmp_intent_ref);
+    if (!hit) return VIRP_OK;
+    /* Duplicates are adjacent after the sort; walk both ways. */
+    size_t i = (size_t)(hit - arr), lo = i, hi = i;
+    while (lo > 0 && strcmp(arr[lo - 1].aeh, aeh) == 0) lo--;
+    while (hi + 1 < state->intent_map_n &&
+           strcmp(arr[hi + 1].aeh, aeh) == 0) hi++;
+    *count = (int)(hi - lo + 1);
     return VIRP_OK;
 }
 
@@ -2575,42 +2721,62 @@ static bool chain_grade_intent_locked(virp_chain_state_t *state,
         }
     }
 
-    /* Find closers that cite THIS intent by chain_entry_hash. */
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(state->db,
-            "SELECT c.artifact_type, a.artifact_content FROM chain_entries c "
-            "JOIN artifacts a ON a.artifact_id = c.artifact_id "
-            "               AND a.artifact_hash = c.artifact_hash "
-            "WHERE c.artifact_type IN ('gate_execution','outcome')",
-            -1, &st, NULL) != SQLITE_OK) {
+    /* Find closers that cite THIS intent by chain_entry_hash.
+     *
+     * From the verify-scoped map, not a fresh scan. Identical answers:
+     * the map holds exactly the closers the old query returned, keyed on
+     * the same intent_entry_hash extracted from the same body by the same
+     * parser. A build failure returns OPEN, which is where the old
+     * prepare failure returned too. */
+    if (!chain_build_closer_map_locked(state)) {
         if (intent) cJSON_Delete(intent);
         return true;   /* cannot read: report OPEN, never fail on a read error */
     }
-    int nclosers = 0;
-    bool binding_bad = false; char why[288] = "";
-    int step;
-    while ((step = sqlite3_step(st)) == SQLITE_ROW) {
-        const unsigned char *ct = sqlite3_column_text(st, 0);
-        const unsigned char *cb = sqlite3_column_text(st, 1);
-        if (!ct || !cb) continue;
-        cJSON *closer = cJSON_Parse((const char *)cb);
-        if (!closer) continue;
-        char cited[65];
-        if (cj_str(closer, "intent_entry_hash", cited, sizeof(cited)) &&
-            strcmp(cited, e->chain_entry_hash) == 0) {
-            nclosers++;
-            if (intent && !binding_bad &&
-                closer_binding_mismatch(intent, (const char *)ct, closer,
-                                        why, sizeof(why)))
-                binding_bad = true;
-        }
-        cJSON_Delete(closer);
-    }
-    sqlite3_finalize(st);
-    if (intent) cJSON_Delete(intent);
 
-    if (step != SQLITE_DONE)
-        return true;   /* read error: OPEN, not a failure */
+    chain_closer_ref_t key;
+    snprintf(key.cited, sizeof(key.cited), "%s", e->chain_entry_hash);
+    const chain_closer_ref_t *arr = state->closer_map;
+    const chain_closer_ref_t *hit = bsearch(&key, arr, state->closer_map_n,
+                                            sizeof(*arr), cmp_closer_ref);
+    int nclosers = 0;
+    size_t lo = 0, hi = 0;
+    if (hit) {
+        size_t i = (size_t)(hit - arr);
+        lo = hi = i;
+        while (lo > 0 &&
+               strcmp(arr[lo - 1].cited, e->chain_entry_hash) == 0) lo--;
+        while (hi + 1 < state->closer_map_n &&
+               strcmp(arr[hi + 1].cited, e->chain_entry_hash) == 0) hi++;
+        nclosers = (int)(hi - lo + 1);
+    }
+
+    /* The binding check needs the closer's BODY, and only when exactly
+     * one closer cites this intent -- which is the only case the old code
+     * could reach a binding failure in, because two closers fail first.
+     * So at most ONE body is fetched per intent, by rowid. */
+    bool binding_bad = false; char why[288] = "";
+    if (intent && nclosers == 1) {
+        sqlite3_stmt *bs = NULL;
+        if (sqlite3_prepare_v2(state->db,
+                "SELECT a.artifact_content FROM chain_entries c "
+                "JOIN artifacts a ON a.artifact_id = c.artifact_id "
+                "               AND a.artifact_hash = c.artifact_hash "
+                "WHERE c.rowid = ?", -1, &bs, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(bs, 1, arr[lo].rowid);
+            if (sqlite3_step(bs) == SQLITE_ROW) {
+                const unsigned char *cb = sqlite3_column_text(bs, 0);
+                cJSON *closer = cb ? cJSON_Parse((const char *)cb) : NULL;
+                if (closer) {
+                    if (closer_binding_mismatch(intent, arr[lo].type, closer,
+                                                why, sizeof(why)))
+                        binding_bad = true;
+                    cJSON_Delete(closer);
+                }
+            }
+            sqlite3_finalize(bs);
+        }
+    }
+    if (intent) cJSON_Delete(intent);
 
     if (nclosers > 1) {
         result->valid = false;
@@ -2980,6 +3146,11 @@ sig_done: ;
     }
 
     sqlite3_reset(state->stmt_get_range);
+    /* The verify-scoped maps live only as long as this walk. Freeing here
+     * (rather than caching across calls) keeps them consistent with the
+     * database by construction: a second verify re-reads. */
+    chain_maps_free(state);
+
     /* CONDITION 3 of SIGNED_FROM_N. A session with an unsigned prefix is
      * a cutover session only if its signed suffix starts at or after the
      * moment signing began on this chain. The instant is read from the
@@ -3068,6 +3239,8 @@ static virp_error_t chain_get_last_locked(virp_chain_state_t *state,
 void virp_chain_destroy(virp_chain_state_t *state)
 {
     if (!state) return;
+
+    chain_maps_free(state);   /* belt over the braces: the walk frees them */
 
     if (state->stmt_insert)
         sqlite3_finalize(state->stmt_insert);
