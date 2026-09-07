@@ -212,7 +212,13 @@ def collect_journal_hello_acks(unit="virp-onode"):
             capture_output=True, timeout=120)
         tok = head.stdout.split(None, 1)
         if tok:
-            since_ns = int(float(tok[0]) * 1e9)
+            # Integer arithmetic, not int(float(x) * 1e9). This particular
+            # value is a journal timestamp in seconds and small enough that
+            # the float route happened to be safe, but the pattern is the
+            # one item 9 is about and there is no reason to keep an
+            # instance of it in the tree. See docs/EVIDENCE-INTEGERS.md.
+            secs, _, frac = tok[0].decode().partition(".")
+            since_ns = int(secs) * 1_000_000_000 + int((frac + "000000000")[:9])
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return {"session_ids": sids, "since_ns": since_ns}

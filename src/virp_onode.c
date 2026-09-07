@@ -138,15 +138,74 @@ static const char *onode_typed_profile(onode_state_t *state, int dev_idx)
 }
 
 /*
- * Extract a signed-integer-valued key. Accepts cJSON numbers only.
- * Returns false (leaving *out untouched) if absent or non-numeric.
+ * The largest integer an IEEE-754 double represents exactly: 2^53.
+ *
+ * HAM review 2026-09-06, item 9. cJSON stores every number as a double.
+ * Nanosecond timestamps are around 1.79e18, two orders of magnitude past
+ * this, so the value is ALREADY WRONG by the time an extractor sees
+ * `valuedouble`. Measured on the real parse path:
+ *
+ *     wire   1788722800424766173
+ *     cJSON  1788722800424766208      (+35)
+ *
+ * THE RULE, stated in docs/EVIDENCE-INTEGERS.md and enforced here:
+ * an evidence integer that may exceed 2^53 travels as a DECIMAL STRING.
+ * A consumer accepts a string always, accepts a JSON number only when
+ * the value is inside the safe range, and REJECTS a larger numeric
+ * literal with an explicit failure rather than silently truncating it.
+ *
+ * The check cannot be on the decoded double alone -- precision is gone
+ * by then -- but it does not need to be: any value outside the safe
+ * range is refused whatever it decoded to, so a lossy literal can never
+ * be accepted. `virp_approval.c` has always done the producing half of
+ * this correctly (jadd_u64str / jget_u64str).
+ */
+#define ONODE_JSON_SAFE_INT_MAX  9007199254740992LL   /* 2^53 */
+
+/*
+ * Extract a signed-integer-valued key.
+ *
+ * Accepts a decimal STRING (exact, the required form for any value that
+ * may exceed 2^53) or a JSON number inside the exactly-representable
+ * range. Returns false (leaving *out untouched) if absent, of another
+ * type, non-integral, or numerically out of safe range.
  */
 static bool json_extract_int64_cjson(cJSON *root, const char *key,
                                       int64_t *out)
 {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+
+    if (cJSON_IsString(item) && item->valuestring && item->valuestring[0]) {
+        errno = 0;
+        char *end = NULL;
+        long long v = strtoll(item->valuestring, &end, 10);
+        if (errno != 0 || end == item->valuestring || *end != '\0')
+            return false;
+        *out = (int64_t)v;
+        return true;
+    }
+
     if (cJSON_IsNumber(item)) {
-        *out = (int64_t)item->valuedouble;
+        double d = item->valuedouble;
+        /*
+         * STRICTLY inside the range, not up to it. cJSON has already
+         * decoded the literal by the time we see it, so the check cannot
+         * be on the raw token here -- but it does not have to be, given
+         * a strict bound. The literal 2^53+1 decodes to exactly 2^53 and
+         * is the ONE value that could sneak a lossy literal past a `<=`
+         * test; every other integer above 2^53 rounds to something
+         * strictly greater and is caught. Excluding 2^53 itself costs a
+         * single representable value, which the rule says to send as a
+         * decimal string anyway.
+         *
+         * NaN fails every comparison, so this rejects it too.
+         */
+        if (!(d > -(double)ONODE_JSON_SAFE_INT_MAX &&
+              d < (double)ONODE_JSON_SAFE_INT_MAX))
+            return false;             /* precision may be lost: REFUSE */
+        if (d != (double)(int64_t)d)
+            return false;             /* not an integer */
+        *out = (int64_t)d;
         return true;
     }
     return false;

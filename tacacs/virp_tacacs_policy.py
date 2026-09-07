@@ -100,6 +100,45 @@ def is_config_mode_command(cmd):
                for p in CONFIG_MODE_PREFIXES)
 
 
+# The largest integer an IEEE-754 double represents exactly: 2^53.
+#
+# HAM review 2026-09-06, item 9. `int(float(x))` on a nanosecond
+# timestamp is silently wrong: 1788722800424766173 comes back as
+# 1788722800424766208. See docs/EVIDENCE-INTEGERS.md.
+JSON_SAFE_INT_MAX = 2 ** 53
+
+
+def evidence_int(value, field="value"):
+    """An evidence integer, exactly, or a ValueError.
+
+    Accepts an int, or a decimal string (the required wire form for
+    anything that may exceed 2^53). Accepts a float ONLY inside the
+    exactly-representable range: past that the value is already wrong
+    and rounding it again would launder the loss into a number that
+    looks precise."""
+    if isinstance(value, bool):
+        raise ValueError("%s is a bool, not an integer" % field)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        t = value.strip()
+        if not t or (t[0] in "+-" and len(t) == 1):
+            raise ValueError("%s is not a decimal integer: %r" % (field, value))
+        if not (t[0] in "+-" and t[1:].isdigit()) and not t.isdigit():
+            raise ValueError("%s is not a decimal integer: %r" % (field, value))
+        return int(t)
+    if isinstance(value, float):
+        if not (-JSON_SAFE_INT_MAX <= value <= JSON_SAFE_INT_MAX):
+            raise ValueError(
+                "%s arrived as a float outside the exactly-representable "
+                "range (|v| > 2^53); its value is already wrong and will "
+                "not be rounded into looking precise: %r" % (field, value))
+        if value != int(value):
+            raise ValueError("%s is not an integer: %r" % (field, value))
+        return int(value)
+    raise ValueError("%s has no integer form: %r" % (field, value))
+
+
 def command_hash(command):
     """sha256 over VIRP's canonical command form.
 
@@ -150,7 +189,12 @@ def approval_from_chain(proposal, approval):
         "device": approval.get("device"),
         "command": proposal.get("command"),
         "command_hash": a_hash,
-        "issued_utc_ns": int(float(approval.get("approved_at_ns") or 0)),
+        # NOT int(float(...)): approved_at_ns is ~1.79e18, two orders of
+        # magnitude past 2^53, and the float round-trip moved it by 35ns
+        # (HAM item 9). The daemon writes it as a decimal string
+        # (jadd_u64str in src/virp_approval.c) for exactly this reason.
+        "issued_utc_ns": evidence_int(approval.get("approved_at_ns") or 0,
+                                      "approved_at_ns"),
         "ttl_ns": ttl_s * 1_000_000_000,
         "repeat_count": approval.get("repeat_count"),
         "approver_key_id": approval.get("approver_key_id"),
@@ -221,8 +265,13 @@ def compile_grants(approvals, now_ns, default_uses=1):
                              "reason": "approval names no device"})
             continue
 
-        issued = int(a.get("issued_utc_ns") or 0)
-        ttl = int(a.get("ttl_ns") or DEFAULT_TTL_NS)
+        try:
+            issued = evidence_int(a.get("issued_utc_ns") or 0,
+                                  "issued_utc_ns")
+            ttl = evidence_int(a.get("ttl_ns") or DEFAULT_TTL_NS, "ttl_ns")
+        except ValueError as e:
+            refusals.append({"approval_id": aid, "reason": str(e)})
+            continue
         not_after = issued + ttl
         if not_after <= now_ns:
             refusals.append({
