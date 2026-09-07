@@ -1,0 +1,23 @@
+# Rotation for the autopilot's alert sink.
+#
+# emit_alert() appends one JSON line per alert to this file and nothing
+# ever pruned it. 3895 failing cycles x 17 alerts grew it to 15 MB by
+# 2026-09-06 with no bound in sight.
+#
+# NOT copytruncate: the existing file is 14 days of evidence that the
+# failure was silent, and it is kept, not emptied. virp-autopilot is a
+# oneshot -- no process holds the fd between cycles -- so rename+create
+# is safe and loses nothing.
+#
+# `su virp virp` is required: /var/lib/virp/autopilot is group-writable
+# by virp, which logrotate refuses to act on without an explicit owner.
+/var/lib/virp/autopilot/alerts.jsonl {
+    su virp virp
+    size 5M
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0664 virp virp
+}
