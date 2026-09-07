@@ -194,9 +194,21 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             # that no driver will ever read.
             "LAB_PASSWORD", "LAB_ENABLE",
             # virp-onode-home (10.0.0.13), added 2026-09-03 when that
-            # node's fleet was first tracked. Four values, confirmed by
-            # hashing every credential in its live config and its eleven
-            # backups: no fifth exists. VIRP_LABNET_PASSWORD is the
+            # node's fleet was first tracked. FOUR values then, confirmed
+            # by hashing every credential in its live config and its
+            # eleven backups. A FIFTH exists as of 2026-09-06:
+            # VIRP_LABSWITCH1_PASSWORD, the virp-ro TACACS identity the
+            # gate authenticates to LAB-SWITCH-1 (10.0.0.10) with. It is
+            # deliberately NOT ${SWITCH_PASS}. That name already meant
+            # cat3850-lab (10.0.10.2) on the colo node AND, from
+            # 2026-09-05 to 2026-09-06, LAB-SWITCH-1 on this one: one
+            # placeholder standing for two different credentials on two
+            # different switches on two different nodes, which is how a
+            # secret reaches the wrong box and how a rotation misses
+            # half its targets. Split here. One name, one switch.
+            # SWITCH_PASS keeps its colo meaning and is still defined in
+            # this node's autopilot.env, but this node's template no
+            # longer names it. VIRP_LABNET_PASSWORD is the
             # aiops-svc login shared by ALL 35 GNS3 routers — one name
             # rather than 35 for the same reason LAB_PASSWORD is one name
             # for the colo fleet, and the sharing is a property of the lab
@@ -206,7 +218,8 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             # equivalent of LAB_ENABLE, so no enable secret is loaded into
             # the daemon's address space.
             "VIRP_PVE_PASSWORD", "VIRP_LABNET_PASSWORD",
-            "VIRP_WAZUH_HOME_PASSWORD", "VIRP_FORTIGATE_HOME_PASSWORD"):
+            "VIRP_WAZUH_HOME_PASSWORD", "VIRP_FORTIGATE_HOME_PASSWORD",
+            "VIRP_LABSWITCH1_PASSWORD"):
     if var not in used:
         continue
     val = os.environ.get(var)
