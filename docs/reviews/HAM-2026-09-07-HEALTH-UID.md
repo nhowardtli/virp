@@ -172,3 +172,132 @@ the fix. `make prod` builds clean under `-Wall -Wextra -Werror`.
 - **993 and 994 are untouched.** They are the live exposure.
 - Neither branch is merged. `feat/virp-sean-seat` carries the seat plus the
   config mitigation; `fix/health-uid-passthrough` carries the code fix.
+
+---
+
+## 9. Post-deploy verify (close-out run, 2026-09-07)
+
+### 9.1 Mitigation extended to uids 993 and 994
+
+Same config-only removal, deployed `.211` **16:17:37Z**, binary sha
+`c541fc72…` **unchanged**, one restart, stop 91s. Template rollback point kept
+at `/etc/virp/devices.template.json.bak-20260907T161603Z-pre993` and a
+WAL-aware chain backup alongside it; neither was needed.
+
+Measured as each uid over the real socket (SO_PEERCRED), before and after:
+
+| probe | 993 before | 993 after |
+|---|---|---|
+| `health device=pbs-lab` | `390B signed — 'show version' … (tier=RED max=YELLOW)` | **`-50`** |
+| `health device=virp-lab` | `94B signed — found` | **`-50`** |
+| `list_fleet` | `2358B signed` | `2358B signed` |
+| `chain_verify node-config` | `166B signed` | `166B signed` |
+| `execute` GREEN pbs read | `223B signed — HTTP 200` | `223B signed — HTTP 200` |
+| `list_devices` / `heartbeat` | `-50` | `-50` |
+| `chain_append evidence_item` | `-50` | `-50` |
+| `chain_append fed_observation` | `-27` | `-27` |
+
+**Nothing that worked before stopped working**, so no rollback was taken.
+`max=YELLOW` in the "before" column is this document's defect, observed on the
+live remote-requester identity rather than inferred.
+
+**uid 994 has no live reach at all, before or after.** Every probe returns
+`Permission denied` at `connect()`: it is in `socket_allowed_uids` and carries
+an action map, but holds **no ACL** on `/run/virp/onode.sock`. Its row has
+never been exercised. Recorded because it is the second gate — the daemon
+allowlist alone never admitted it, and a reader of the template would not
+guess that.
+
+Seat uid 987 re-proved after the same restart: `health` `-50`, `execute` `-50`,
+`list_fleet` `-50`, `chain_verify` 166B signed, `chain_append evidence_item`
+337B signed.
+
+`broker/virp_broker.py` lost `health` from `ALLOWED_ACTIONS` in the same
+commit, because `test_broker_matches_its_own_relay_allowlist` asserts the
+relay's allowlist equals the template's row for that uid.
+
+### 9.2 Chain verify — DID NOT COMPLETE, and that is the finding
+
+Full-chain verify was run twice against the post-deploy chain (352,613
+entries). **It did not finish either time.** Recorded as-is rather than
+rounded up to a pass.
+
+| | |
+|---|---|
+| sessions graded | **219** |
+| failures | **0** (no FAIL, BROKEN or INVALID line in either run) |
+| wall time | started 16:08:55Z, killed 16:38Z — **~29 min, still running** |
+| last session graded | `gate-enforce:SW-3850` (18 entries) |
+| large `gate-enforce:*` sessions | **NOT graded — never reached** |
+| transcript | `/var/backups/virp/chainverify-postdeploy-partial.txt` on `.211` |
+
+So the answer to "do the large gate-enforce sessions grade VALID" is: **unknown
+— they were never reached.** The 219 sessions that were graded are all VALID.
+
+The cost is not linear in session size, measured per session:
+
+| session | entries | wall |
+|---|---|---|
+| `autopilot:2026-08-18` | 5,184 | **1 s** |
+| `gate-enforce:clab-frr-ospf-frr4` | 15,200 | **TIMED OUT at 150 s** |
+
+3× the entries, >150× the time. Four sessions of that class remain
+(`pbs-lab` 29,905; `clab-frr-ospf-frr1/2/3` ~15,200 each), which is why a
+whole-chain walk does not terminate in a useful window on this node.
+**Caveat on the numbers:** these were taken while the full-chain run was
+pegging a core, so they are contended and the absolute figures are pessimistic;
+the *shape* is not explained by contention.
+
+Worth its own branch. Two things to check first: whether the per-entry cost in
+`virp_chain_verify()` is super-linear within a session, and whether the
+`gate-enforce:*` sessions differ from `autopilot:*` in something other than
+size (they carry gate decisions and proposals; the autopilot ones carry
+observations).
+
+**Consequence for deploy practice:** "chain_verify the full chain after
+restart" is not currently an executable post-deploy step on `.211`. What *is*
+executable, and what was done here, is per-session verification — including
+`chain_verify session=node-config`, which every daemon start writes to and
+which returned a signed result after every restart today.
+
+An earlier note in this session that the verify had "stalled" or "hung" was
+**wrong**: `stdout` is block-buffered when redirected, so the last flushed line
+lagged far behind the real position. Re-run under `stdbuf -oL` it advanced
+normally. The process was at 99.9% CPU in state R throughout — grinding, not
+blocked.
+
+### 9.3 Disconnect alarm — NOT CONFIRMED, and why
+
+The test itself was clean. The Wazuh agent on the seat VM was stopped
+**16:04:57Z** and restarted **16:21:45Z**, reconnecting at **16:21:33Z**
+(`Connected to the server ([10.0.20.10]:1514/tcp)`, `status='connected'`,
+`last_ack 16:21:58`). Outage **16 min 36 s**, comfortably past Wazuh's
+10-minute `agents_disconnection_time` default — unlike the first attempt's
+9 min 22 s, which was inside it and proved nothing.
+
+**I could not read `alerts.json`, so I cannot say whether the alert fired.**
+Absence of evidence, not evidence of absence. Three paths were tried:
+
+1. **SSH to 10.0.20.10** — no shell. `nhoward`, `root`, `ubuntu`, `wazuh`
+   against two keys: `Permission denied (publickey)` every time.
+2. **`GET /manager/logs` through the gate** — refused, correctly:
+   `(tier=RED max=GREEN)`, `proposal_id=6373ce50937834bf19f97bcb8474e49f`.
+   Only `/manager/logs/summary` is GREEN, and it returns counts by daemon with
+   no agent detail. **The proposal was left unapproved**: self-approving a RED
+   read while the operator is away is his call, not mine.
+3. **The Wazuh API does not serve `alerts.json` at all.** Alerts are written by
+   `analysisd` and shipped to the Indexer; the manager API exposes
+   `/manager/logs` (ossec.log) and never the alert stream. So even an approved
+   RED read would not have answered the question.
+
+What the manager *did* confirm, read GREEN through the gate as uid 1000
+(`GET /agents?agents_list=012`): agent `012` `sean-agent`, `status: active`,
+`lastKeepAlive 2026-09-07T16:22:33+00:00`, `dateAdd 2026-09-07T03:13:14+00:00`.
+
+**To close this, one of:** shell on 10.0.20.10 and
+`grep -iE 'disconnect|sean-agent' /var/ossec/logs/alerts/alerts.json` for
+**Sep 7 12:04:57–12:21:33 EDT** (the dashboard renders UTC−4); or the same
+window in the dashboard filtered on `agent.name: sean-agent`; or approve
+proposal `6373ce50…` — though by (3) that still will not show alerts.
+No rule was changed, and no rule was read, because the ruleset is not
+reachable from here.
