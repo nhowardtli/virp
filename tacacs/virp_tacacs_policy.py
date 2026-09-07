@@ -101,6 +101,161 @@ def is_config_mode_command(cmd):
                for p in CONFIG_MODE_PREFIXES)
 
 
+# ── the approver signature, verified by THIS compiler ──────────────────
+#
+# HAM review 2026-09-06, item 6. -07 requires the party issuing temporary
+# write authority to verify the approver's signature itself rather than
+# trusting the gate's word for it. Until now this compiler could not:
+# the chained approval body carried approver_key_id but no signature, and
+# `approval_trusted` was built from binding correctness, which is a real
+# check and is not a signature.
+#
+# The daemon now writes the signature into the approval body
+# (body_version 2, src/virp_approval.c). This compiler RECONSTRUCTS the
+# 72-byte canonical payload from the body's own fields and verifies the
+# signature against ITS OWN pinned registry. Two consequences worth
+# stating:
+#
+#   - reconstructing, rather than reading a carried payload, is what
+#     makes the signature bind the fields. A payload travelling beside
+#     the body could verify while the body said something else.
+#   - the ALGORITHM comes from the pinned registry entry, never from the
+#     body. A body-declared scheme would be attacker material deciding
+#     how the body gets checked.
+#
+# Layout from include/virp_approval.h:
+#   off  0  magic "VAP1"          off 52  device_node_id  (8, big-endian)
+#   off  4  proposal_id  (16)     off 60  approved_at_ns  (8, big-endian)
+#   off 20  command_hash (32)     off 68  ttl_seconds     (4, big-endian)
+APPROVAL_CANON_MAGIC = b"VAP1"
+APPROVAL_CANON_SIZE = 72
+
+
+def build_approval_canonical(proposal_id_hex, command_hash_hex,
+                             device_node_id, approved_at_ns, ttl_seconds):
+    """The exact bytes virp_approval_build_canonical() produces."""
+    pid = bytes.fromhex(proposal_id_hex)
+    ch = bytes.fromhex(command_hash_hex)
+    if len(pid) != 16:
+        raise ValueError("proposal_id is %d bytes, not 16" % len(pid))
+    if len(ch) != 32:
+        raise ValueError("command_hash is %d bytes, not 32" % len(ch))
+    out = (APPROVAL_CANON_MAGIC + pid + ch
+           + int(device_node_id).to_bytes(8, "big")
+           + int(approved_at_ns).to_bytes(8, "big")
+           + int(ttl_seconds).to_bytes(4, "big"))
+    assert len(out) == APPROVAL_CANON_SIZE
+    return out
+
+
+class ApproverRegistry:
+    """The COMPILER's pinned approver public keys.
+
+    Deliberately its own file, under the compiler's control, in the same
+    shape as the daemon's /etc/virp/approvers.json. It is NOT read from
+    the gate and NOT read from the chain: a registry the checked party
+    supplies is not an independent check."""
+
+    def __init__(self, entries):
+        self.entries = {}
+        for e in entries or []:
+            kid = e.get("key_id")
+            if kid and kid not in self.entries:
+                self.entries[kid] = e
+
+    @classmethod
+    def load(cls, path):
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("%s is not a JSON array of approver entries"
+                             % path)
+        return cls(data)
+
+    def find(self, key_id):
+        return self.entries.get(key_id)
+
+
+def _load_pubkey(entry):
+    """Raw verifying key from a base64 SPKI, cross-checked against the
+    entry's declared key_id exactly as the C loader does. An entry whose
+    declared key_id does not match its own public key is a
+    misconfiguration and is refused, never trusted."""
+    import base64
+    import hashlib as _h
+    from cryptography.hazmat.primitives import serialization
+    spki = base64.b64decode(entry["public_key"])
+    pub = serialization.load_der_public_key(spki)
+    alg = (entry.get("algorithm") or "").lower()
+    if alg == "ed25519":
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        if not isinstance(pub, ed25519.Ed25519PublicKey):
+            raise ValueError("entry declares ed25519 but the key is not")
+        raw = pub.public_bytes_raw()
+    elif alg == "ecdsa-p256":
+        from cryptography.hazmat.primitives.asymmetric import ec
+        if not isinstance(pub, ec.EllipticCurvePublicKey):
+            raise ValueError("entry declares ecdsa-p256 but the key is not")
+        raw = pub.public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint)
+    else:
+        raise ValueError("unknown algorithm %r" % entry.get("algorithm"))
+    if _h.sha256(raw).hexdigest()[:32] != entry.get("key_id"):
+        raise ValueError("entry key_id does not match its own public key")
+    return alg, pub
+
+
+def verify_approver_signature(approval, registry):
+    """(verified, reason). Never raises for hostile input.
+
+    `verified` is True only when a key THIS compiler pinned, and which is
+    enabled, signed the 72-byte payload reconstructed from this body's
+    own fields."""
+    if registry is None:
+        return False, ("no approver registry is pinned; this compiler can "
+                       "verify nothing and therefore renders nothing")
+    sig_hex = approval.get("approver_signature")
+    if not sig_hex:
+        return False, ("approval body carries no approver_signature "
+                       "(body_version %r); pre-2026-09-06 bodies cannot be "
+                       "verified by any consumer and are not upgraded by "
+                       "silence" % approval.get("body_version"))
+    kid = approval.get("approver_key_id")
+    entry = registry.find(kid)
+    if entry is None:
+        return False, ("approver_key_id %r is not in this compiler's pinned "
+                       "registry" % kid)
+    if entry.get("enabled") is not True:
+        return False, "approver_key_id %r is pinned but disabled" % kid
+    try:
+        alg, pub = _load_pubkey(entry)
+        canon = build_approval_canonical(
+            approval.get("proposal_id"), approval.get("command_hash"),
+            int(approval.get("device_node_id") or 0),
+            int(approval.get("approved_at_ns") or 0),
+            int(approval.get("ttl_seconds") or 0))
+        sig = bytes.fromhex(sig_hex)
+    except (ValueError, TypeError, KeyError) as e:
+        return False, "approval could not be reconstructed for verification: %s" % e
+    try:
+        if alg == "ed25519":
+            pub.verify(sig, canon)
+        else:
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import ec, utils
+            if len(sig) != 64:
+                return False, "ecdsa-p256 signature is not 64 raw bytes"
+            r = int.from_bytes(sig[:32], "big")
+            sv = int.from_bytes(sig[32:], "big")
+            pub.verify(utils.encode_dss_signature(r, sv), canon,
+                       ec.ECDSA(hashes.SHA256()))
+    except Exception as e:                      # noqa: BLE001 - any failure is a failure
+        return False, ("approver signature did not verify under pinned key "
+                       "%s: %s" % (kid, type(e).__name__))
+    return True, "approver signature verified under pinned key %s" % kid
+
+
 def command_hash(command):
     """sha256 over VIRP's canonical command form.
 
@@ -113,21 +268,32 @@ def command_hash(command):
         canonical_command(command).encode("utf-8")).hexdigest()
 
 
-def approval_from_chain(proposal, approval):
+def approval_from_chain(proposal, approval, registry=None):
     """Join a chained proposal to its approval and state, honestly, what
     was verified.
 
-    FINDING, encoded here rather than in a comment nobody reads: the
-    chained `approval` record carries `approver_key_id` but NOT the
-    approver's signature -- that lives only in the approval file on the
-    daemon host. A chain-only consumer cannot verify it. So this returns
-    `trust_basis` (checks that ran and passed) alongside
-    `trust_not_established` (checks that could not run at all), and the
-    approver signature is permanently in the second list for this read
-    path. Naming the flag "signature_verified" would claim a check that
-    never happened.
+    `trust_basis` lists the checks that ran and passed;
+    `trust_not_established` lists the checks that could not run at all.
+    Nothing is ever upgraded by silence.
+
+    HISTORY, kept because it explains the shape: until 2026-09-06 the
+    chained approval body carried `approver_key_id` but NOT the
+    approver's signature, so a chain-only consumer could not verify it
+    and "approver_signature" sat permanently in the second list. The
+    daemon now writes the signature into the body (body_version 2) and
+    this function verifies it against the caller's OWN pinned registry.
+    A body without one still lands in the second list, exactly as before:
+    a legacy record is not made trustworthy by being old.
+
+    `registry` is required for `approval_trusted` to be True. Absent, the
+    compiler can verify nothing and says so, which renders nothing.
     """
-    basis, missing = [], ["approver_signature"]
+    basis, missing = [], []
+    sig_ok, sig_detail = verify_approver_signature(approval, registry)
+    if sig_ok:
+        basis.append("approver_signature_verified")
+    else:
+        missing.append("approver_signature")
 
     p_hash = proposal.get("command_hash")
     a_hash = approval.get("command_hash")
@@ -141,7 +307,11 @@ def approval_from_chain(proposal, approval):
     if proposal.get("device") and proposal.get("device") == approval.get("device"):
         basis.append("device_agreement")
 
-    trusted = ("command_hash_binding" in basis
+    # The signature is a REQUIREMENT, not a bonus. Binding correctness
+    # says the proposal and the approval agree; only the signature says a
+    # human this compiler pinned actually approved it.
+    trusted = (sig_ok
+               and "command_hash_binding" in basis
                and "command_hash_recomputed" in basis
                and "device_agreement" in basis)
 
@@ -160,20 +330,37 @@ def approval_from_chain(proposal, approval):
         "approval_trusted": trusted,
         "trust_basis": basis,
         "trust_not_established": missing,
+        "approver_signature_detail": sig_detail,
     }
 
 
-def compile_grants(approvals, now_ns, default_uses=1):
+def compile_grants(approvals, now_ns, default_uses=1,
+                   compiled_approval_ids=()):
     """(grants, refusals).
 
     One approval, one command, one device, one grant. No approval ever
     produces two grants and no grant ever covers two commands: the whole
     point is that the blast radius of a compromised approval is exactly
     what a human approved.
+
+    `compiled_approval_ids` is the set of approval ids this compiler has
+    already rendered, read from its own prior policy_rendered records.
+    One approval, one compilation: a second render of the same approval
+    is a REPLAY, refused with its own reason rather than quietly minting
+    another use of authority a human granted once.
     """
+    already = set(compiled_approval_ids or ())
     grants, refusals = [], []
     for a in approvals:
         aid = a.get("approval_id")
+
+        if aid in already:
+            refusals.append({
+                "approval_id": aid,
+                "reason": "approval was already compiled into a policy "
+                          "(policy_rendered record on chain); a second "
+                          "render is a replay"})
+            continue
 
         # Absence of the flag is NEVER treated as verified. An approval
         # whose signature was not checked is indistinguishable, to this
@@ -190,10 +377,13 @@ def compile_grants(approvals, now_ns, default_uses=1):
             refusals.append({
                 "approval_id": aid,
                 "reason": "approval not verified (approval_trusted=%r, "
-                          "signature_verified=%r); basis=%r"
+                          "signature_verified=%r); basis=%r; "
+                          "approver_signature: %s"
                           % (a.get("approval_trusted"),
                              a.get("signature_verified"),
-                             a.get("trust_basis"))})
+                             a.get("trust_basis"),
+                             a.get("approver_signature_detail")
+                             or "not checked by this caller")})
             continue
 
         raw = a.get("command")
@@ -473,11 +663,14 @@ def build_rendered_record(device, policy, refusals, policy_path):
 
 # ── CLI: chain -> policy -> verified load -> policy_rendered record ────
 
-def compile_from_chain(db_path, now_ns):
+def compile_from_chain(db_path, now_ns, registry=None):
     """(approvals, refusals_from_join). Reads through the reconciler's
     shared reader, joins approval to proposal by proposal_id, and refuses
     any approval whose proposal is absent -- command text must never
-    enter the policy from an unbound source."""
+    enter the policy from an unbound source.
+
+    `registry` is this compiler's own pinned approver keys. Without it
+    nothing verifies and nothing renders."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import virp_tacacs_reconcile as rc
 
@@ -502,8 +695,27 @@ def compile_from_chain(db_path, now_ns):
                 "reason": "no proposal on chain for this approval; the "
                           "command text is unbound and will not be rendered"})
             continue
-        joined.append(approval_from_chain(pr, a))
+        joined.append(approval_from_chain(pr, a, registry=registry))
     return joined, refusals
+
+
+def compiled_approval_ids_from_chain(db_path):
+    """Approval ids this compiler has already rendered, read from its own
+    prior `tacacs_authz_policy_rendered/1` records on the chain.
+
+    The compiler's replay check is answered from the chain rather than
+    from a local file, because a local file is exactly the thing an
+    attacker who can re-run the compiler would delete."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import virp_tacacs_reconcile as rc
+    out = set()
+    for r in rc.read_entries(db_path, artifact_types=("evidence_item",)):
+        b = r["body"]
+        if b.get("schema") != RENDERED_SCHEMA:
+            continue
+        for aid in (b.get("approval_ids") or []):
+            out.add(aid)
+    return out
 
 
 def main(argv=None):
@@ -522,11 +734,25 @@ def main(argv=None):
     ap.add_argument("--producer-key")
     ap.add_argument("--onode-socket")
     ap.add_argument("--chain-session", default="tacacs-authz-policy")
+    ap.add_argument("--approver-registry", required=True,
+                    help="THIS compiler's pinned approver public keys "
+                         "(approvers.json shape). Required: an issuer of "
+                         "write authority that cannot verify the approval "
+                         "signature itself is taking the gate's word for "
+                         "it, which -07 does not allow.")
+    ap.add_argument("--allow-recompile", action="store_true",
+                    help="render an approval that a prior policy_rendered "
+                         "record already compiled. Off by default: one "
+                         "approval, one compilation.")
     a = ap.parse_args(argv)
 
+    registry = ApproverRegistry.load(a.approver_registry)
     now = time.time_ns()
-    joined, join_refusals = compile_from_chain(a.db, now)
-    grants, refusals = compile_grants(joined, now_ns=now)
+    joined, join_refusals = compile_from_chain(a.db, now, registry=registry)
+    already = (set() if a.allow_recompile
+               else compiled_approval_ids_from_chain(a.db))
+    grants, refusals = compile_grants(joined, now_ns=now,
+                                      compiled_approval_ids=already)
     refusals = join_refusals + refusals
 
     devices = a.device or sorted({g["device"] for g in grants}) or ["R1"]

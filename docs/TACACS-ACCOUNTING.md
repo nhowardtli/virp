@@ -236,6 +236,62 @@ the same trap `camera/README.md` documents for `sensor_signature`.
 | `MALFORMED` | lengths did not reconcile, or the body was short. **The record still ships**, with every field that did parse, `args` truncated to what was recoverable, and `raw_body_sha256` over what arrived |
 | `NOT_ATTEMPTED` | pairs with `decode: NO_SECRET_CONFIGURED` — the body was never decoded, so no parse was tried. Deliberately **not** `MALFORMED`: the body is not known to be broken, it was never read, and accusing a possibly well-formed packet of being malformed is the vocabulary abuse this design refuses everywhere else |
 
+#### The compiler verifies the approval itself
+
+The party that issues temporary write authority verifies the human
+approval signature ITSELF; it does not take the gate's word for it.
+
+Since 2026-09-06 the daemon writes `approver_signature` into the
+`approval` artifact body (`body_version: 2`, `src/virp_approval.c`). The
+policy compiler RECONSTRUCTS the 72-byte canonical payload from that
+body's own fields (`proposal_id`, `command_hash`, `device_node_id`,
+`approved_at_ns`, `ttl_seconds`, layout in `include/virp_approval.h`) and
+verifies the signature against its OWN pinned registry, passed as
+`--approver-registry`. Two deliberate choices:
+
+- the signed payload is reconstructed, never carried. A payload
+  travelling beside the body could verify while the body said something
+  else; reconstructing is what makes the signature bind the fields.
+- the algorithm comes from the pinned registry entry, never from the
+  body. A body-declared scheme would be attacker material deciding how
+  the body gets checked.
+
+A grant is emitted only when ALL of these hold, and each failure is its
+own refusal reason: the signature verified under a pinned, enabled key;
+the proposal/approval hash binding holds; the command hash recomputes
+from the proposal text; the devices agree; the approval has not expired;
+and the approval has not already been compiled. That last one is a
+replay check, answered from the compiler's own prior
+`tacacs_authz_policy_rendered/1` records on the chain rather than from a
+local file, because a local file is what an attacker who can re-run the
+compiler would delete.
+
+Approval bodies written before this change carry no signature. They are
+not upgraded by silence: they read as trust-not-established and render
+nothing.
+
+#### Identity follows the operation
+
+Identity follows the operation through authorization, execution and
+accounting; a break in that line downgrades the evidence, it never fails
+silently.
+
+Three records name the same principal, and each names it independently:
+
+| record | field | set by |
+|---|---|---|
+| `tacacs_authorization/1` | `user` | the AUTHOR request the router sent, as decisioned |
+| `gate_execution` | `device_principal` | the trusted executor, from the credential it actually selected |
+| `tacacs_accounting/1` \| `/2` | `user` | the device's own accounting record |
+
+A grant is honoured only for the principal it names (`_grant_matches`),
+the decision record carries the principal it decisioned including on a
+refusal, and reconciliation requires the two sides to agree before it
+will call a pair MATCHED. Where the gate record predates
+`device_principal` the match grades `MATCHED_LEGACY_NO_PRINCIPAL`, which
+is visibly distinct and is never promoted to the strong grade. Missing
+identity is reported, not assumed.
+
 #### The authorization listener does the opposite, on purpose
 
 `virp_tacacs_authzd.py` refuses a packet that sets

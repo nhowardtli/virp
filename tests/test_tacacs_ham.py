@@ -508,5 +508,248 @@ class TestItem2GrantBindsThePrincipal(unittest.TestCase):
         self.assertIn("gate identity", refusals[0]["reason"].lower())
 
 
+class TestItem5dIdentityFollowsTheOperation(unittest.TestCase):
+    """HAM item 5d: the authorization decision names the principal it
+    decisioned, so authorization, execution and accounting all carry the
+    same identity through.
+
+    tacacs_authorization/1 already carries `user`. What was never pinned
+    is that the field holds the principal the DECISION was made for, and
+    that a refusal carries it too. A break in that line must downgrade
+    the evidence, never disappear."""
+
+    def _chained(self, h):
+        bodies = []
+        for a in h.onode.appends:
+            bodies.append(json.loads(a["artifact_content"]))
+        return bodies
+
+    def test_a_pass_records_the_principal_it_decisioned(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = AuthzDaemonHarness(d, grants=[live_grant()])
+            try:
+                r = h.request("interface Loopback99", user="virp-rw")
+                self.assertEqual(r["status_name"], "PASS_ADD")
+                bodies = self._chained(h)
+                self.assertEqual(len(bodies), 1)
+                self.assertEqual(bodies[0]["user"], "virp-rw")
+                self.assertEqual(bodies[0]["decision"], "PASS_ADD")
+                self.assertEqual(bodies[0]["schema"],
+                                 "tacacs_authorization/1")
+            finally:
+                h.close()
+
+    def test_a_denial_records_the_principal_too(self):
+        """A denial for the wrong principal must say WHICH principal was
+        denied. A record that only said FAIL would lose the identity at
+        exactly the moment it matters."""
+        with tempfile.TemporaryDirectory() as d:
+            h = AuthzDaemonHarness(d, grants=[live_grant()])
+            try:
+                r = h.request("interface Loopback99", user="eviluser")
+                self.assertEqual(r["status_name"], "FAIL")
+                bodies = self._chained(h)
+                self.assertEqual(bodies[-1]["user"], "eviluser")
+                self.assertEqual(bodies[-1]["decision"], "FAIL")
+                self.assertIn("gate identity",
+                              bodies[-1]["decision_reason"].lower())
+            finally:
+                h.close()
+
+    def test_a_cleartext_refusal_still_records_the_principal(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = AuthzDaemonHarness(d, grants=[live_grant()])
+            try:
+                h.request("interface Loopback99", user="virp-rw",
+                          unencrypted=True)
+                bodies = self._chained(h)
+                self.assertEqual(bodies[-1]["decision"], "FAIL")
+                self.assertIn("cleartext",
+                              bodies[-1]["decision_reason"].lower())
+            finally:
+                h.close()
+
+
+# ── item 6 fixtures: a real approver key and a real signed approval ─────
+
+def _ed25519():
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    return ed25519
+
+
+def approver_keypair():
+    """A THROWAWAY approver key, generated per test. Nothing in the repo
+    is a key and nothing here is reused."""
+    import base64
+    import hashlib
+    from cryptography.hazmat.primitives import serialization
+    sk = _ed25519().Ed25519PrivateKey.generate()
+    pk = sk.public_key()
+    raw = pk.public_bytes_raw()
+    spki = pk.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo)
+    key_id = hashlib.sha256(raw).hexdigest()[:32]
+    entry = {"key_id": key_id, "algorithm": "ed25519",
+             "public_key": base64.b64encode(spki).decode(),
+             "operator": "ham-test", "enabled": True}
+    return sk, entry
+
+
+def signed_approval(sk, entry, command="interface Loopback99", device="R1",
+                    device_node_id=0x0badf00d, proposal_id=None,
+                    approved_at_ns=None, ttl_seconds=300):
+    """The pair of chained bodies the compiler joins: a proposal and an
+    approval whose approver_signature is real."""
+    import hashlib
+    import virp_tacacs_policy as pol
+    pid = proposal_id or ("a" * 32)
+    approved_at_ns = approved_at_ns if approved_at_ns is not None else NOW
+    chash = hashlib.sha256(
+        az.canonical_command(command).encode("utf-8")).hexdigest()
+    canon = pol.build_approval_canonical(pid, chash, device_node_id,
+                                         approved_at_ns, ttl_seconds)
+    sig = sk.sign(canon)
+    proposal = {"proposal_id": pid, "device": device, "command": command,
+                "command_hash": chash, "device_node_id": device_node_id}
+    approval = {"proposal_id": pid, "command_hash": chash, "device": device,
+                "device_node_id": device_node_id,
+                "approved_at_ns": str(approved_at_ns),
+                "ttl_seconds": ttl_seconds,
+                "approver_key_id": entry["key_id"], "operator": "ham-test",
+                "body_version": 2, "approver_signature": sig.hex(),
+                "_entry_hash": "e" * 64}
+    return proposal, approval
+
+
+class TestItem6CompilerVerifiesTheApproverSignature(unittest.TestCase):
+    """HAM item 6: the party issuing temporary write authority verifies
+    the human approval signature ITSELF.
+
+    The reviewed compiler built `approval_trusted` from binding
+    correctness alone: proposal and approval agree about the command
+    hash, the hash recomputes from the proposal text, and the devices
+    match. Those are real checks and none of them is a signature. The
+    chained approval body did not even carry one, so the compiler could
+    not have checked it, and `trust_not_established` listed
+    "approver_signature" permanently.
+
+    -07 does not accept that. A grant is temporary write authority on a
+    real device, and the issuer must verify the approver's signature
+    against ITS OWN pinned registry, not the gate's word."""
+
+    def setUp(self):
+        import virp_tacacs_policy as pol
+        self.pol = pol
+        self.sk, self.entry = approver_keypair()
+        self.registry = pol.ApproverRegistry([self.entry])
+
+    def _compile(self, proposal, approval, registry=None, compiled=()):
+        a = self.pol.approval_from_chain(
+            proposal, approval,
+            registry=self.registry if registry is None else registry)
+        grants, refusals = self.pol.compile_grants(
+            [a], now_ns=NOW, compiled_approval_ids=compiled)
+        # The derived `configure terminal` prerequisite is not something a
+        # human approved and is counted separately.
+        return [g for g in grants if not g.get("derived")], refusals
+
+    def test_a_verified_approval_becomes_a_grant(self):
+        pr, ap = signed_approval(self.sk, self.entry)
+        grants, refusals = self._compile(pr, ap)
+        self.assertEqual(len(grants), 1, refusals)
+        self.assertEqual(grants[0]["device"], "R1")
+
+    def test_the_trust_basis_names_the_signature(self):
+        pr, ap = signed_approval(self.sk, self.entry)
+        a = self.pol.approval_from_chain(pr, ap, registry=self.registry)
+        self.assertIn("approver_signature_verified", a["trust_basis"])
+        self.assertEqual(a["trust_not_established"], [])
+        self.assertIs(a["approval_trusted"], True)
+
+    def test_a_signature_by_an_unpinned_key_yields_no_grant(self):
+        """The fail-first case. The bindings are perfect; the key is not
+        one this compiler pinned. Nothing may be rendered."""
+        other_sk, other_entry = approver_keypair()
+        pr, ap = signed_approval(other_sk, other_entry)
+        grants, refusals = self._compile(pr, ap)
+        self.assertEqual(grants, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("approver_signature", str(refusals[0]))
+
+    def test_a_key_pinned_but_disabled_yields_no_grant(self):
+        entry = dict(self.entry)
+        entry["enabled"] = False
+        reg = self.pol.ApproverRegistry([entry])
+        pr, ap = signed_approval(self.sk, self.entry)
+        a = self.pol.approval_from_chain(pr, ap, registry=reg)
+        self.assertIs(a["approval_trusted"], False)
+        self.assertIn("approver_signature", a["trust_not_established"])
+
+    def test_a_tampered_command_digest_yields_no_grant(self):
+        pr, ap = signed_approval(self.sk, self.entry)
+        ap = dict(ap)
+        ap["command_hash"] = "b" * 64
+        pr = dict(pr)
+        pr["command_hash"] = "b" * 64
+        grants, refusals = self._compile(pr, ap)
+        self.assertEqual(grants, [])
+
+    def test_a_tampered_ttl_yields_no_grant(self):
+        """Every field the 72-byte payload covers is bound, not just the
+        command. Extending the TTL after the fact must break it."""
+        pr, ap = signed_approval(self.sk, self.entry)
+        ap = dict(ap)
+        ap["ttl_seconds"] = 86400
+        grants, refusals = self._compile(pr, ap)
+        self.assertEqual(grants, [])
+
+    def test_a_replayed_approval_yields_no_grant(self):
+        """One approval, one compilation. A second render of the same
+        approval id is a replay and is refused with its own reason."""
+        pr, ap = signed_approval(self.sk, self.entry)
+        grants, _r = self._compile(pr, ap)
+        self.assertEqual(len(grants), 1)
+        grants2, refusals2 = self._compile(pr, ap,
+                                           compiled=(ap["proposal_id"],))
+        self.assertEqual(grants2, [])
+        self.assertIn("already", str(refusals2).lower())
+
+    def test_no_registry_at_all_renders_nothing(self):
+        """Fail closed on the absence of the registry, never open. A
+        compiler with nothing pinned can verify nothing."""
+        pr, ap = signed_approval(self.sk, self.entry)
+        a = self.pol.approval_from_chain(pr, ap, registry=None)
+        self.assertIs(a["approval_trusted"], False)
+        grants, refusals = self.pol.compile_grants([a], now_ns=NOW)
+        self.assertEqual(grants, [])
+
+    def test_a_body_with_no_signature_is_legacy_and_untrusted(self):
+        """The pre-change approval bodies carry no signature at all. They
+        are not upgraded by silence: they read as trust-not-established,
+        exactly as they did before, and render nothing."""
+        pr, ap = signed_approval(self.sk, self.entry)
+        ap = dict(ap)
+        ap.pop("approver_signature")
+        ap.pop("body_version")
+        a = self.pol.approval_from_chain(pr, ap, registry=self.registry)
+        self.assertIs(a["approval_trusted"], False)
+        self.assertIn("approver_signature", a["trust_not_established"])
+
+    def test_canonical_payload_matches_the_c_layout(self):
+        """The Python reconstruction is the C daemon's 72 bytes or it is
+        nothing. Layout from include/virp_approval.h."""
+        canon = self.pol.build_approval_canonical(
+            "0" * 30 + "ff", "1" * 64, 0x0badf00d, 1788722800424766173, 300)
+        self.assertEqual(len(canon), 72)
+        self.assertEqual(canon[:4], b"VAP1")
+        self.assertEqual(canon[4:20], bytes.fromhex("0" * 30 + "ff"))
+        self.assertEqual(canon[20:52], bytes.fromhex("1" * 64))
+        self.assertEqual(int.from_bytes(canon[52:60], "big"), 0x0badf00d)
+        self.assertEqual(int.from_bytes(canon[60:68], "big"),
+                         1788722800424766173)
+        self.assertEqual(int.from_bytes(canon[68:72], "big"), 300)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

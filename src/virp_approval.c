@@ -478,10 +478,39 @@ virp_error_t virp_approval_load_proposal(const char *dir,
 static pthread_mutex_t submit_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* Metadata JSON for the approval record (line 1). NOT the signed bytes —
- * the signature is over the 72-byte canonical payload. */
+ * the signature is over the 72-byte canonical payload.
+ *
+ * HAM review 2026-09-06, item 6. Until now this body carried
+ * approver_key_id but not the SIGNATURE, so a chain-only consumer (the
+ * TACACS+ policy compiler, Docket, any external party) could check that
+ * the proposal and approval agreed about the command and the device but
+ * could not check that a human had signed anything. It had to take the
+ * daemon's word. RFC-draft -07 requires the party issuing temporary
+ * write authority to verify the approver's signature ITSELF.
+ *
+ * The signature now travels in the body, which is the bytes artifact_hash
+ * commits to. The canonical form (build_canonical_json in virp_chain.c)
+ * is NOT touched: every existing entry re-verifies unchanged.
+ *
+ * The 72-byte signed payload is deliberately NOT carried. A consumer
+ * RECONSTRUCTS it from proposal_id, command_hash, device_node_id,
+ * approved_at_ns and ttl_seconds in this same body, so the signature
+ * binds those fields rather than sitting beside a payload that could
+ * disagree with them. Carrying the payload would let a forger present
+ * bytes that verify while the body says something else.
+ *
+ * Nor does the body state the signature ALGORITHM. A consumer resolves
+ * approver_key_id in its OWN pinned registry, which declares the
+ * algorithm for that key. A scheme named by the body would be attacker
+ * material deciding how the body gets checked. */
 static virp_error_t approval_json(const virp_approval_rec_t *a,
                                   char *out, size_t out_len)
 {
+    char sig_hex[2 * VIRP_APPROVER_SIG_SIZE + 1];
+    for (size_t i = 0; i < VIRP_APPROVER_SIG_SIZE; i++)
+        snprintf(sig_hex + i * 2, 3, "%02x", a->sig[i]);
+    sig_hex[2 * VIRP_APPROVER_SIG_SIZE] = '\0';
+
     cJSON *o = cJSON_CreateObject();
     if (!o) return VIRP_ERR_BUFFER_TOO_SMALL;
     bool ok =
@@ -492,7 +521,11 @@ static virp_error_t approval_json(const virp_approval_rec_t *a,
         jadd_u64str(o, "approved_at_ns", a->approved_at_ns) &&
         cJSON_AddNumberToObject(o, "ttl_seconds", (double)a->ttl_seconds) &&
         cJSON_AddStringToObject(o, "approver_key_id", a->approver_key_id) &&
-        cJSON_AddStringToObject(o, "operator", a->operator);
+        cJSON_AddStringToObject(o, "operator", a->operator) &&
+        /* body_version 2 = carries the approver signature. Absent reads
+         * as 1, the shape every entry before this change has. */
+        cJSON_AddNumberToObject(o, "body_version", 2) &&
+        cJSON_AddStringToObject(o, "approver_signature", sig_hex);
     if (!ok) { cJSON_Delete(o); return VIRP_ERR_BUFFER_TOO_SMALL; }
     char *s = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -518,8 +551,15 @@ virp_error_t virp_approval_write_record(const char *dir,
     virp_error_t err = ensure_dirs(dir);
     if (err != VIRP_OK) return err;
 
+    /* The body now carries the signature (body_version 2), so it must be
+     * built from the signature this call was given, never from whatever
+     * the caller happened to leave in rec->sig. One record, one
+     * signature, in both halves of the file. */
+    virp_approval_rec_t bound = *rec;
+    memcpy(bound.sig, sig, VIRP_APPROVER_SIG_SIZE);
+
     char body[1700];
-    err = approval_json(rec, body, sizeof(body));
+    err = approval_json(&bound, body, sizeof(body));
     if (err != VIRP_OK) return err;
 
     char sig_hex[2 * VIRP_APPROVER_SIG_SIZE + 1];
