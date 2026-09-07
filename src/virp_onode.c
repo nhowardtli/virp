@@ -96,16 +96,48 @@ typedef struct {
 } onode_request_t;
 
 /*
- * Extract a string-valued key from a JSON object. Writes at most
- * out_len-1 bytes plus a NUL. Returns false if the key is absent,
- * null, or not a string; out[0] is set to NUL in that case so the
- * caller's zero-initialized req struct is unchanged.
+ * Extract a string-valued key from a JSON object.
+ *
+ * REJECT, NEVER TRUNCATE (HAM review 2026-09-06, item 10).
+ *
+ * This used to snprintf() into the caller's fixed buffer and return
+ * success on overflow, so two distinct inputs became the same internal
+ * string. session_id is char[64]: a 63-character id and a 64-character
+ * id differing only in their last byte both arrived as the same 63
+ * bytes, and everything downstream -- the chain entry, the artifact
+ * store join, the policy decision -- saw one object where the caller
+ * submitted two. That is the same parser-length divergence class as the
+ * encoded-NUL fix below, arriving through a different door, and the
+ * answer is the same: refuse the request rather than silently reshape
+ * it.
+ *
+ * The check is at the HELPER, so every caller inherits it and nobody
+ * has to remember. `out_len` includes the NUL, so a value of exactly
+ * out_len-1 characters is the longest one that fits.
+ *
+ * KNOWN LEGACY SHAPE: artifact_type is char[16] and the indirect types
+ * "comparator_verdict" (18) and "chainwalk_summary" (17) have always
+ * reached the daemon TRUNCATED, as "comparator_verd" and
+ * "chainwalk_summa". Those truncated spellings are what production
+ * stores and they remain in the policy lists on both sides
+ * (virp_chain_type_is_indirect, report/verify.py). What changes is that
+ * a NEW append carrying the full name is now REJECTED instead of being
+ * quietly renamed: autopilot/virp_autopilot.py, the only client that
+ * sent the long form, now sends the alias explicitly. The width itself
+ * is item 5 of docs/CANONICAL-FORMAT-WINDOW.md; it is not widened here.
  */
 static bool json_extract_string_cjson(cJSON *root, const char *key,
                                        char *out, size_t out_len)
 {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
     if (!cJSON_IsString(item) || item->valuestring == NULL) {
+        out[0] = '\0';
+        return false;
+    }
+    if (out_len == 0 || strlen(item->valuestring) >= out_len) {
+        /* Over-length: refuse the value. parse_request turns this into a
+         * refusal of the whole request for the chain fields, and every
+         * other optional field is left empty rather than half-copied. */
         out[0] = '\0';
         return false;
     }
@@ -472,10 +504,33 @@ static bool parse_request(const char *json, onode_request_t *req)
         }
     }
 
-    /* Chain fields */
-    EXTRACT_STR("session_id", req->session_id, sizeof(req->session_id));
-    EXTRACT_STR("artifact_type", req->artifact_type, sizeof(req->artifact_type));
-    EXTRACT_STR("artifact_id", req->artifact_id, sizeof(req->artifact_id));
+    /* Chain fields.
+     *
+     * These are the ingress for everything that reaches the canonical
+     * object. Over-length is a REJECTION of the whole request (HAM item
+     * 10) rather than a truncation, refused HERE so a client learns its
+     * request was refused instead of discovering later that the chain
+     * recorded a different string than the one it sent. Absent is fine:
+     * these are optional for the actions that do not use them.
+     */
+    if (cJSON_GetObjectItemCaseSensitive(root, "session_id") &&
+        !EXTRACT_STR("session_id", req->session_id,
+                     sizeof(req->session_id))) {
+        cJSON_Delete(root);
+        return false;
+    }
+    if (cJSON_GetObjectItemCaseSensitive(root, "artifact_type") &&
+        !EXTRACT_STR("artifact_type", req->artifact_type,
+                     sizeof(req->artifact_type))) {
+        cJSON_Delete(root);
+        return false;
+    }
+    if (cJSON_GetObjectItemCaseSensitive(root, "artifact_id") &&
+        !EXTRACT_STR("artifact_id", req->artifact_id,
+                     sizeof(req->artifact_id))) {
+        cJSON_Delete(root);
+        return false;
+    }
     EXTRACT_STR("artifact_hash", req->artifact_hash, sizeof(req->artifact_hash));
     EXTRACT_STR("artifact_content", req->artifact_content,
                 sizeof(req->artifact_content));

@@ -93,10 +93,50 @@ static void item9(void)
          "a lossy sequence literal was accepted");
 }
 
+/* --------------------------------------------------------------- 10 -- */
+
+/* session_id is char[64]: 63 usable characters. */
+#define S63 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define S64 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+
+static void item10(void)
+{
+    TEST("10: a session_id that exactly fills the buffer is accepted");
+    WANT(parse("{\"action\":\"chain_append\",\"session_id\":\"" S63 "\","
+               "\"artifact_type\":\"observation\",\"artifact_id\":\"a\","
+               "\"artifact_hash\":\"" S63 "a\"}"),
+         "the longest legal id was refused");
+
+    TEST("10: one byte over is REFUSED, not truncated to the same string");
+    WANT(!parse("{\"action\":\"chain_append\",\"session_id\":\"" S64 "\","
+                "\"artifact_type\":\"observation\",\"artifact_id\":\"a\","
+                "\"artifact_hash\":\"" S63 "a\"}"),
+         "an over-length session_id was accepted (and truncated)");
+
+    TEST("10: an over-length artifact_type is REFUSED");
+    WANT(!parse("{\"action\":\"chain_append\",\"session_id\":\"s\","
+                "\"artifact_type\":\"comparator_verdict\","
+                "\"artifact_id\":\"a\",\"artifact_hash\":\"" S63 "a\"}"),
+         "an 18-character artifact_type was accepted into a char[16]");
+
+    TEST("10: the truncated alias production stores is still accepted");
+    WANT(parse("{\"action\":\"chain_append\",\"session_id\":\"s\","
+               "\"artifact_type\":\"comparator_verd\","
+               "\"artifact_id\":\"a\",\"artifact_hash\":\"" S63 "a\"}"),
+         "the legacy spelling was refused; existing entries carry it");
+
+    TEST("10: the chainwalk alias is still accepted");
+    WANT(parse("{\"action\":\"chain_append\",\"session_id\":\"s\","
+               "\"artifact_type\":\"chainwalk_summa\","
+               "\"artifact_id\":\"a\",\"artifact_hash\":\"" S63 "a\"}"),
+         "the legacy spelling was refused");
+}
+
 int main(void)
 {
     printf("\n=== JSON ingress hygiene (HAM 2026-09-06) ===\n");
     item9();
+    item10();
     printf("\n=== Results: %d passed, %d failed (of %d) ===\n",
            tests_passed, tests_failed, tests_run);
     return tests_failed ? 1 : 0;

@@ -6180,7 +6180,15 @@ TEST(test_chain_append_accepts_comparator_verdict)
     ca_sha256_hex("the signed observation this verdict is about", h);
 
     uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
-    ssize_t n = ca_append("comparator:2026", "comparator_verdict",
+    /* HAM review 2026-09-06, item 10: over-length artifact_type is now
+     * REJECTED rather than truncated. "comparator_verdict" is 18
+     * characters and artifact_type is char[16], so what production has
+     * always STORED is "comparator_verd" -- the alias is now sent
+     * explicitly instead of being produced by a silent snprintf. Both
+     * spellings remain in the indirect-type policy list, because the
+     * entries already written carry the truncated one forever. Widening
+     * the field is item 5 of docs/CANONICAL-FORMAT-WINDOW.md. */
+    ssize_t n = ca_append("comparator:2026", "comparator_verd",
                           "cmp-1", h, body, resp, sizeof(resp));
 
     ASSERT_TRUE(n > 4);
@@ -6194,7 +6202,10 @@ TEST(test_chain_append_accepts_chainwalk_summary)
     ca_sha256_hex("the signed observation this summary is about", h);
 
     uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
-    ssize_t n = ca_append("chainwalk:2026", "chainwalk_summary",
+    /* "chainwalk_summary" is 17 characters; the stored form has always
+     * been "chainwalk_summa". Sent explicitly now. See the comparator
+     * case above and HAM item 10. */
+    ssize_t n = ca_append("chainwalk:2026", "chainwalk_summa",
                           "walk-1", h, body, resp, sizeof(resp));
 
     ASSERT_TRUE(n > 4);
