@@ -134,8 +134,20 @@ def esc(text):
 
 # ── evidence loading ──────────────────────────────────────────────────────
 
+# HAM review 2026-09-06, item 13. A distinct exit code, so a caller can
+# tell "the chain is broken" (1) from "the verifier did not complete" (4).
+# An operational failure of the verifier must never be reported on the
+# evidence ladder, and it must never share an exit code with a finding.
+VERIFIER_ERROR_EXIT = 4
+
+
 def load_evidence(reader, session=None, since_ns=None, until_ns=None):
-    """Pull the selected chain entries plus every artifact body they name."""
+    """Pull the selected chain entries plus every artifact body they name.
+
+    A storage failure here is the VERIFIER failing, not the evidence
+    (HAM review 2026-09-06, item 13): it is raised as VerifierError and
+    reported as VERIFIER_ERROR, never graded as UNVERIFIABLE and never
+    counted as a failed entry."""
     sql = ("SELECT " + ",".join(verify.ENTRY_COLUMNS) +
            " FROM chain_entries WHERE 1=1")
     params = []
@@ -150,16 +162,25 @@ def load_evidence(reader, session=None, since_ns=None, until_ns=None):
         params.append(until_ns)
     sql += " ORDER BY session_id, sequence"
 
-    entries = [dict(r) for r in reader.conn.execute(sql, params)]
+    try:
+        entries = [dict(r) for r in reader.conn.execute(sql, params)]
+    except sqlite3.Error as exc:
+        raise verify.VerifierError(
+            "chain_entries unreadable: %s" % exc, "load_evidence") from exc
     # Keyed by (artifact_id, artifact_hash) — the pair the entry commits
     # to and the artifacts table is keyed by. An id-only key silently
     # keeps one body per colliding id and grades every sibling entry
     # against it: on 2026-08-16 that misreported 50 healthy federation
     # entries (the bridge's re-serialized retries) as FAILED.
-    artifacts = {(r["artifact_id"], r["artifact_hash"]): r["artifact_content"]
-                 for r in reader.conn.execute(
-                     "SELECT artifact_id, artifact_hash, artifact_content "
-                     "FROM artifacts")}
+    try:
+        artifacts = {(r["artifact_id"], r["artifact_hash"]):
+                     r["artifact_content"]
+                     for r in reader.conn.execute(
+                         "SELECT artifact_id, artifact_hash, "
+                         "artifact_content FROM artifacts")}
+    except sqlite3.Error as exc:
+        raise verify.VerifierError(
+            "artifact store unreadable: %s" % exc, "load_evidence") from exc
     return entries, artifacts
 
 
@@ -173,8 +194,18 @@ def load_heads(reader):
         return {r["session_id"]: dict(r) for r in reader.conn.execute(
             "SELECT session_id, last_sequence, last_entry_hash, head_hmac "
             "FROM chain_heads")}
-    except sqlite3.OperationalError:
-        return None
+    except sqlite3.OperationalError as exc:
+        # "no such table: chain_heads" is a LEGACY DATABASE, a fact about
+        # the evidence. Any other operational error is the verifier
+        # failing to read a table that is there, which is a fact about
+        # this run (HAM item 13) and must not be laundered into None.
+        if "no such table" in str(exc):
+            return None
+        raise verify.VerifierError(
+            "chain_heads unreadable: %s" % exc, "load_heads") from exc
+    except sqlite3.Error as exc:
+        raise verify.VerifierError(
+            "chain_heads unreadable: %s" % exc, "load_heads") from exc
 
 
 def collect_journal_hello_acks(unit="virp-onode"):
@@ -1262,20 +1293,47 @@ def main(argv=None):
         return 1
 
     with reader:
-        total = reader.conn.execute(
-            "SELECT count(*) FROM chain_entries").fetchone()[0]
-        entries, artifacts = load_evidence(
-            reader, args.session, since_ns, until_ns)
-        heads = load_heads(reader)
+        # HAM item 13. Everything from here to the verdicts can fail for
+        # reasons that are about THE VERIFIER, not about the evidence.
+        # Those exit VERIFIER_ERROR with their own code and say plainly
+        # that the verdicts are incomplete. They are never rendered as a
+        # verdict, never counted as a failed entry, and never diluted
+        # into UNVERIFIABLE.
+        try:
+            total = reader.conn.execute(
+                "SELECT count(*) FROM chain_entries").fetchone()[0]
+            entries, artifacts = load_evidence(
+                reader, args.session, since_ns, until_ns)
+            heads = load_heads(reader)
+        except sqlite3.Error as exc:
+            print("virp report: VERIFIER_ERROR: chain database unreadable: "
+                  "%s\n  This run did not complete. The verdicts below are "
+                  "INCOMPLETE and no conclusion about the chain may be "
+                  "drawn from them." % exc, file=sys.stderr)
+            return VERIFIER_ERROR_EXIT
+        except verify.VerifierError as exc:
+            print("virp report: VERIFIER_ERROR in %s: %s\n  This run did "
+                  "not complete. No conclusion about the chain may be drawn "
+                  "from it." % (exc.where or "verification", exc.detail),
+                  file=sys.stderr)
+            return VERIFIER_ERROR_EXIT
         v2_journal = (None if args.no_journal
                       else collect_journal_hello_acks(args.journal_unit))
         if v2_journal is None and not args.no_journal:
             print("virp report: daemon journal unreadable here; v2 session "
                   "corroboration will be reported UNCHECKED", file=sys.stderr)
-        verifications, summary = verify.verify_chain(
-            entries, artifacts, okey=okey, chain_key=chain_key,
-            heads=heads, selection_complete=since_ns is None and until_ns is None,
-            v2_journal=v2_journal)
+        try:
+            verifications, summary = verify.verify_chain(
+                entries, artifacts, okey=okey, chain_key=chain_key,
+                heads=heads,
+                selection_complete=since_ns is None and until_ns is None,
+                v2_journal=v2_journal)
+        except verify.VerifierError as exc:
+            print("virp report: VERIFIER_ERROR in %s: %s\n  This run did "
+                  "not complete. No conclusion about the chain may be drawn "
+                  "from it." % (exc.where or "verification", exc.detail),
+                  file=sys.stderr)
+            return VERIFIER_ERROR_EXIT
 
         identity = load_node_identity(args.node_identity)
         ctx = {
@@ -1337,6 +1395,15 @@ def main(argv=None):
               "Not a chain failure.)" % len(open_execs))
     if failed:
         print("  FAILED ENTRIES  : %d" % failed)
+    if summary.get("verifier_error"):
+        # Reached only if verification produced a partial result rather
+        # than raising. Say the verdicts are incomplete, and exit with the
+        # verifier's own code so a caller can tell "the chain is broken"
+        # from "the check did not run" (HAM item 13).
+        print("  VERIFIER_ERROR  : %s" % summary["verifier_error"])
+        print("  The verdicts above are INCOMPLETE. No conclusion about "
+              "the chain may be drawn from this run.")
+        return VERIFIER_ERROR_EXIT
     # Exit 1 on any verification failure so a caller can gate on it. The PDF
     # is still written — a report of a broken chain is exactly when you most
     # need the report.

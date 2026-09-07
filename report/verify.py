@@ -154,6 +154,33 @@ PASS = "PASS"
 FAIL = "FAIL"
 UNCHECKED = "UNCHECKED"
 UNVERIFIABLE = "UNVERIFIABLE"
+
+# VERIFIER_ERROR (HAM review 2026-09-06, item 13). THE VERIFIER FAILED,
+# not the evidence.
+#
+# The four verdicts above all describe a CHAIN ENTRY. This one describes
+# the RUN. A storage or IO failure while verifying says nothing about
+# whether the evidence is sound, and rendering it on the evidence ladder
+# is how an operational failure gets read as a finding. Before this
+# existed, a failed SQLite prepare in the artifact-binding check returned
+# the same code as "no body was retained", so an examiner saw "binding
+# unverifiable" for a verifier that could not open the store.
+#
+# It is a TOP-LEVEL outcome, never a per-entry verdict: when a verifier
+# error occurs the counts in the summary are INCOMPLETE and the summary
+# says so. It is not a tamper signal and must never be counted as one.
+VERIFIER_ERROR = "VERIFIER_ERROR"
+
+
+class VerifierError(Exception):
+    """Raised when the VERIFIER cannot complete: storage unreadable, IO
+    failure, a database that will not open. Never raised for anything
+    the evidence says about itself."""
+
+    def __init__(self, detail, where=""):
+        super().__init__(detail)
+        self.detail = detail
+        self.where = where
 V2_SESSION = "V2-SESSION"
 NOT_APPLICABLE = "N/A"
 
@@ -1508,4 +1535,9 @@ def summarize(verifications):
         "first_broken_link": first_broken,
         "sessions": len({v.entry["session_id"] for v in verifications}),
         "retention_reasons": retention_reasons(verifications),
+        # HAM item 13. Absent a verifier failure this is None and every
+        # count above is complete. Set, it means the run did not finish
+        # and the counts are a partial view: the caller must say so and
+        # exit distinctly, never fold it into a verdict tally.
+        "verifier_error": None,
     }

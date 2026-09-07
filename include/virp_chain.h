@@ -137,6 +137,24 @@ typedef struct {
      * ===================================================================== */
     int64_t  executions_open;
     int64_t  executions_closed;
+
+    /* =====================================================================
+     * VERIFIER_ERROR (HAM review 2026-09-06, item 13). THE VERIFIER
+     * FAILED, not the evidence.
+     *
+     * A storage or IO failure while verifying is a statement about this
+     * RUN, never about the chain. Before this existed, a failed SQLite
+     * prepare in the artifact-binding check returned the same 0 that
+     * "no body was retained" returns, so an operator saw "binding
+     * unverifiable" — an evidence grade — for what was actually the
+     * verifier being unable to read the store.
+     *
+     * When set, `valid` is false and every count in this struct is
+     * INCOMPLETE. It is not a tamper signal and must never be rendered
+     * as one, and it must never be diluted into UNVERIFIABLE.
+     * ===================================================================== */
+    bool     verifier_error;
+    char     verifier_error_detail[256];
 } virp_chain_verify_result_t;
 
 /* =========================================================================

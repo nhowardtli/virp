@@ -1082,10 +1082,36 @@ static void test_append_with_artifact_rolls_back_together(void)
     ASSERT(strcmp(last.artifact_id, "outcome:rb-0") == 0,
            "last entry must be the seed, not the failed append");
 
+    /* HAM review 2026-09-06, item 13. With the artifact store dropped the
+     * VERIFIER cannot read it, and that is now said as VERIFIER_ERROR
+     * rather than graded as "no body was retained". The two are different
+     * claims and an examiner is entitled to know which one they are
+     * looking at. */
     virp_chain_verify_result_t result;
+    err = virp_chain_verify_session(&state, "session-rollback", &result);
+    ASSERT(err == VIRP_OK, "verify must return cleanly");
+    ASSERT(result.verifier_error,
+           "a missing artifact store is the verifier failing, and must say so");
+    ASSERT(!result.valid, "an incomplete run must not read as valid");
+
+    /* Restore the store (empty) and re-verify: the chain itself is intact,
+     * which is what this test is actually about. The seed's body is gone,
+     * so its binding is legitimately UNVERIFIABLE — counted, never fatal. */
+    sqlite3_exec(state.db,
+                 "CREATE TABLE artifacts ("
+                 "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                 "  artifact_id TEXT NOT NULL,"
+                 "  artifact_type TEXT NOT NULL,"
+                 "  artifact_content TEXT NOT NULL,"
+                 "  artifact_hash TEXT NOT NULL,"
+                 "  session_id TEXT NOT NULL,"
+                 "  created_at_ns INTEGER NOT NULL,"
+                 "  UNIQUE(artifact_id, artifact_hash));",
+                 NULL, NULL, NULL);
     err = virp_chain_verify_session(&state, "session-rollback", &result);
     ASSERT(err == VIRP_OK && result.valid,
            "session must still verify after rolled-back append");
+    ASSERT(!result.verifier_error, "the store is readable again");
     ASSERT(result.to_sequence == 0, "head must not have advanced");
 
     virp_chain_destroy(&state);

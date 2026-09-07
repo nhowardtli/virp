@@ -2256,7 +2256,12 @@ static int chain_verify_binding_locked(virp_chain_state_t *state,
             "SELECT artifact_content FROM artifacts "
             "WHERE artifact_id = ? AND artifact_hash = ?",
             -1, &st, NULL) != SQLITE_OK)
-        return 0;   /* cannot read the store: report unverifiable, not broken */
+        /* HAM item 13. THE VERIFIER could not read the store. This used
+         * to return 0, which is the code for "no body was retained" — an
+         * EVIDENCE grade. An examiner then saw "binding unverifiable" for
+         * what was the verifier failing, and the two are not the same
+         * claim. -2 is the verifier's own failure and stops the walk. */
+        return -2;
 
     sqlite3_bind_text(st, 1, e->artifact_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 2, e->artifact_hash, -1, SQLITE_TRANSIENT);
@@ -2786,6 +2791,20 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
          * counted as verified, not fatal). */
         {
             int bind = chain_verify_binding_locked(state, &e);
+            if (bind == -2) {
+                /* The verifier failed, not the evidence. Say which, stop,
+                 * and do not let an incomplete run read as a verdict. */
+                result->valid = false;
+                result->verifier_error = true;
+                snprintf(result->verifier_error_detail,
+                         sizeof(result->verifier_error_detail),
+                         "artifact store unreadable at sequence %lld: %s",
+                         (long long)e.sequence, sqlite3_errmsg(state->db));
+                snprintf(result->error_detail, sizeof(result->error_detail),
+                         "VERIFIER_ERROR: %.200s",
+                         result->verifier_error_detail);
+                break;
+            }
             if (bind < 0) {
                 result->valid = false;
                 result->first_broken = e.sequence;
