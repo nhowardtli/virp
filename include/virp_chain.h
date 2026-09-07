@@ -63,6 +63,21 @@ typedef struct {
  * Chain Verify Result
  * ========================================================================= */
 
+/*
+ * Which signature era a session belongs to. See sig_era in the verify
+ * result for what each value means and why this is a separate axis from
+ * `valid`.
+ */
+typedef enum {
+    VIRP_CHAIN_SIG_ERA_NOT_GRADED = 0,
+    VIRP_CHAIN_SIG_ERA_UNSIGNED   = 1,
+    VIRP_CHAIN_SIG_ERA_FROM_1     = 2,
+    VIRP_CHAIN_SIG_ERA_SIGNED     = 3,
+} virp_chain_sig_era_t;
+
+/* Stable lowercase name for an era, for output and JSON. Never NULL. */
+const char *virp_chain_sig_era_name(virp_chain_sig_era_t era);
+
 typedef struct {
     bool     valid;
     int64_t  from_sequence;
@@ -118,6 +133,41 @@ typedef struct {
      * could not be checked. Set only when sig_checked would otherwise apply
      * and the key_id did not match verify_key_id. */
     bool     sig_key_unavailable;
+
+    /* =====================================================================
+     * SIGNATURE ERA (HAM item 7, reworked 2026-09-07).
+     *
+     * `valid` answers "is the chain intact". It does NOT answer "were the
+     * signatures checked", and conflating the two is how an unsigned-era
+     * session came to read exactly like a fully verified one. On 313 that
+     * was 17 sessions printing VALID with nothing behind it.
+     *
+     * The era is a SEPARATE axis, always reported:
+     *
+     *   NOT_GRADED  no public key supplied, or the columns do not exist:
+     *               the asymmetric tier did not run and claims nothing.
+     *   UNSIGNED    no signature on any entry and none on the head. There
+     *               is nothing to strip because nothing was ever there.
+     *               Provably a pre-signing session. NOT clean.
+     *   FROM_1      sequence 0 carries no signature; EVERY later entry
+     *               does, and every one verified, and the head is signed.
+     *               The genesis entry predates the key; everything after
+     *               it is covered. NOT clean.
+     *   SIGNED      every entry carries a verifying signature. Clean.
+     *
+     * Any other shape -- a gap anywhere but sequence 0, or sequence 0
+     * unsigned with any other gap -- clears `valid` and is a FAILURE. A
+     * verifier cannot tell a cutover gap from a stripped signature by
+     * looking at the entry, so it does not try.
+     *
+     * `valid_signed` is the one flag a caller should gate a clean bill of
+     * health on: valid AND the era is SIGNED. It is deliberately not
+     * `valid`, so existing callers that check `valid` keep their meaning
+     * ("the chain is intact") and have to opt in to the stronger claim.
+     * ===================================================================== */
+    virp_chain_sig_era_t sig_era;
+    bool     valid_signed;      /* valid && sig_era == SIGNED */
+    int64_t  first_unsigned;    /* lowest unsigned sequence, or -1 */
     char     sig_key_id[VIRP_CHAINSIGN_KEYID_HEX]; /* the session's signing
                                  * key_id as read from the head/entries, or
                                  * "" if the session is unsigned            */

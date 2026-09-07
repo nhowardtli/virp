@@ -155,6 +155,23 @@ FAIL = "FAIL"
 UNCHECKED = "UNCHECKED"
 UNVERIFIABLE = "UNVERIFIABLE"
 
+# SIGNATURE ERA (HAM item 7, reworked 2026-09-07). The same three names the
+# C verifier uses (virp_chain_sig_era_name in src/virp_chain.c), so the two
+# cannot describe one session with different words.
+#
+#   SIGNED         every entry carries a verifying signature. Clean.
+#   SIGNED_FROM_1  sequence 0 unsigned, every later entry signed and
+#                  verifying. The genesis entry predates the key. NOT clean.
+#   UNSIGNED_ERA   no signature anywhere, head unsigned. Nothing was
+#                  stripped because nothing was ever there. NOT clean.
+#
+# A gap anywhere but sequence 0, or sequence 0 plus any other gap, is a
+# FAIL: the verifier cannot tell a cutover gap from a stripped signature
+# by looking at the entry, so it does not try.
+SIG_ERA_SIGNED = "SIGNED"
+SIG_ERA_FROM_1 = "SIGNED_FROM_1"
+SIG_ERA_UNSIGNED = "UNSIGNED_ERA"
+
 # VERIFIER_ERROR (HAM review 2026-09-06, item 13). THE VERIFIER FAILED,
 # not the evidence.
 #
@@ -460,8 +477,12 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
     database's columns instead of this session's head.
 
     Returns {session_id: {verdict, detail, entries_signed, entries_total}}
-    where verdict is one of PASS / FAIL / UNCHECKED / 'unsigned' /
-    'key_unavailable'. `heads` maps session_id -> row dict (may be None)."""
+    where verdict is one of PASS / FAIL / UNCHECKED / SIGNED_FROM_1 /
+    UNSIGNED_ERA / 'key_unavailable', and sig_era is SIGNED /
+    SIGNED_FROM_1 / UNSIGNED_ERA / NOT_GRADED. PASS is reserved for a
+    clean, fully signed session; the two era verdicts are separate names
+    precisely so a caller testing `== PASS` cannot be handed a session
+    whose signatures do not cover it. `heads` maps session_id -> row dict (may be None)."""
     want_kid = chainsign_key_id(pub)
     by_session = {}
     for e in entries:
@@ -475,7 +496,14 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
         any_entry_signed = any(r.get("chain_sig") for r in rows)
 
         if not head_signed and not any_entry_signed:
-            out[sid] = {"verdict": "unsigned", "detail": "no signatures",
+            # HAM item 7, reworked 2026-09-07. Named UNSIGNED_ERA, matching
+            # the C verifier, so the two cannot describe the same session
+            # with different words. Not clean: nothing was stripped, but
+            # nothing is covered either.
+            out[sid] = {"sig_era": SIG_ERA_UNSIGNED,
+                        "verdict": SIG_ERA_UNSIGNED,
+                        "detail": "no signature on any entry and none on "
+                                  "the head: a pre-signing session",
                         "entries_signed": 0, "entries_total": len(rows)}
             continue
 
@@ -483,7 +511,8 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
         sess_kid = (head.get("head_sig_key_id") if head_signed
                     else rows[0].get("chain_sig_key_id")) or ""
         if sess_kid != want_kid:
-            out[sid] = {"verdict": "key_unavailable",
+            out[sid] = {"sig_era": "NOT_GRADED",
+                        "verdict": "key_unavailable",
                         "detail": "session signed under key_id %s, verifier "
                                   "holds %s" % (sess_kid, want_kid),
                         "entries_signed": 0, "entries_total": len(rows),
@@ -498,18 +527,28 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
             hv, hd = chainsign_verify(pub, CHAINSIGN_TAG_HEAD, hc,
                                       head.get("head_sig"))
             if hv == FAIL:
-                out[sid] = {"verdict": FAIL, "detail": "head: " + hd,
+                out[sid] = {"sig_era": "NOT_GRADED",
+                            "verdict": FAIL, "detail": "head: " + hd,
                             "entries_signed": 0, "entries_total": len(rows),
                             "sig_key_id": sess_kid}
                 continue
             if hv == UNCHECKED:
-                out[sid] = {"verdict": UNCHECKED, "detail": hd,
+                out[sid] = {"sig_era": "NOT_GRADED",
+                            "verdict": UNCHECKED, "detail": hd,
                             "entries_signed": 0, "entries_total": len(rows),
                             "sig_key_id": sess_kid}
                 continue
-        # Every entry must be signed under the session key_id and verify.
+        # Every entry must be signed under the session key_id and verify,
+        # with ONE carve-out: sequence 0, alone, may be unsigned. See
+        # SIG_ERA_FROM_1 above. Allowed exactly once and exactly there --
+        # a second gap, or a first one elsewhere, is indistinguishable
+        # from a stripped signature and stays a FAIL.
+        unsigned_seqs = []
         for e in rows:
             if not e.get("chain_sig"):
+                unsigned_seqs.append(e["sequence"])
+                if e["sequence"] == 0 and len(unsigned_seqs) == 1:
+                    continue
                 verdict, detail = FAIL, ("stripped signature at sequence %d"
                                          % e["sequence"])
                 break
@@ -528,7 +567,17 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
                                          % (e["sequence"], ed))
                 break
             signed += 1
-        out[sid] = {"verdict": verdict, "detail": detail,
+        # PASS keeps its meaning -- a clean, fully signed session -- so
+        # existing callers are untouched. The genesis carve-out gets its
+        # OWN verdict, because a caller testing `== PASS` must not be
+        # handed a session whose first entry nothing covers.
+        era = SIG_ERA_SIGNED
+        if verdict == PASS and unsigned_seqs == [0]:
+            verdict = SIG_ERA_FROM_1
+            era = SIG_ERA_FROM_1
+            detail = ("sequence 0 carries no signature; every later entry "
+                      "is signed and verified")
+        out[sid] = {"sig_era": era, "verdict": verdict, "detail": detail,
                     "entries_signed": signed, "entries_total": len(rows),
                     "sig_key_id": sess_kid}
     return out

@@ -134,6 +134,16 @@ virp_error_t virp_chain_verify(virp_chain_state_t *state,
     return rc;
 }
 
+const char *virp_chain_sig_era_name(virp_chain_sig_era_t era)
+{
+    switch (era) {
+    case VIRP_CHAIN_SIG_ERA_UNSIGNED: return "UNSIGNED_ERA";
+    case VIRP_CHAIN_SIG_ERA_FROM_1:   return "SIGNED_FROM_1";
+    case VIRP_CHAIN_SIG_ERA_SIGNED:   return "SIGNED";
+    default:                          return "NOT_GRADED";
+    }
+}
+
 static void chain_session_sig_state_locked(virp_chain_state_t *state,
                                            const char *session_id,
                                            bool *is_signed,
@@ -302,6 +312,36 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
                  "at sequence %lld", (long long)head_seq);
         return VIRP_OK;
     }
+
+    /* ===================================================================
+     * THE SIGNATURE ERA (HAM item 7, reworked 2026-09-07).
+     *
+     * Decided here, once, after the walk, from what the walk counted.
+     * `valid` already means "the chain is intact"; this says what the
+     * signatures were, and `valid_signed` is the flag a caller gates a
+     * clean bill of health on.
+     * =================================================================== */
+    if (!state->verify_sig_enabled || !state->entry_sig_cols || unavailable) {
+        /* The asymmetric tier did not run. It claims nothing either way. */
+        result->sig_era = VIRP_CHAIN_SIG_ERA_NOT_GRADED;
+    } else if (result->entries_signed == 0 && !head_is_signed) {
+        /* Nothing signed, anywhere, and the head agrees. Provably a
+         * pre-signing session: nothing was stripped because nothing was
+         * ever there. On 313 this is 17 sessions, every one of them
+         * before 2026-08-23 17:48:11Z or inside the 2m21s window on
+         * 2026-08-23 when the daemon restarted without signing. */
+        result->sig_era = VIRP_CHAIN_SIG_ERA_UNSIGNED;
+    } else if (result->entries_unsigned == 0) {
+        result->sig_era = VIRP_CHAIN_SIG_ERA_SIGNED;
+    } else if (result->entries_unsigned == 1 && result->first_unsigned == 0) {
+        /* The genesis carve-out, and only that. */
+        result->sig_era = VIRP_CHAIN_SIG_ERA_FROM_1;
+    } else {
+        /* Reached only when the walk did not already break: defensive. */
+        result->sig_era = VIRP_CHAIN_SIG_ERA_NOT_GRADED;
+    }
+    result->valid_signed =
+        result->valid && result->sig_era == VIRP_CHAIN_SIG_ERA_SIGNED;
 
     /* Session-level tier outcome (all pure-addition fields). */
     result->head_hmac_ok = state->have_chain_key;
@@ -2589,6 +2629,7 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
     result->from_sequence = from_sequence;
     result->to_sequence = to_sequence;
     result->first_broken = -1;
+    result->first_unsigned = -1;
     result->valid = true;
     /* Tier flags (pure addition). hmac_checked reflects whether K_chain was
      * supplied; sig_checked whether per-entry Ed25519 was actually graded
@@ -2745,6 +2786,29 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
         if (check_sigs) {
             uint8_t sig[VIRP_CHAINSIGN_SIG_SIZE];
             if (e.chain_sig[0] == '\0') {
+                /* THE GENESIS CARVE-OUT (HAM item 7, reworked).
+                 *
+                 * Sequence 0 with no signature, in a session whose later
+                 * entries are signed, is the shape a node produces when
+                 * the session was opened before the signing key was
+                 * loaded. It is graded SIGNED_FROM_1 after the walk --
+                 * visibly not VALID -- rather than called a stripped
+                 * signature.
+                 *
+                 * It is allowed EXACTLY ONCE and EXACTLY at sequence 0.
+                 * A second unsigned entry anywhere, or a first one
+                 * anywhere else, is a gap the verifier cannot distinguish
+                 * from a stripped signature, so it stays fatal. That is
+                 * deliberate: 313's 30 cutover-spanning sessions have
+                 * runs of unsigned entries and MUST NOT be excused. */
+                result->entries_unsigned++;
+                if (result->first_unsigned < 0)
+                    result->first_unsigned = e.sequence;
+                if (e.sequence == 0 && result->entries_unsigned == 1) {
+                    /* Carry on; the era decides at the end. The entry's
+                     * hash, link and HMAC were all checked above. */
+                    goto sig_done;
+                }
                 result->valid = false;
                 result->first_broken = e.sequence;
                 snprintf(result->error_detail, sizeof(result->error_detail),
@@ -2774,10 +2838,14 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                 break;
             }
             result->entries_signed++;
+sig_done: ;
         } else if (state->verify_sig_enabled && e.chain_sig[0] == '\0') {
-            /* pubkey supplied, but this is an unsigned (pre-D-1) session:
-             * informational count, never a failure. */
+            /* pubkey supplied, but this session took the unsigned path:
+             * counted here, and graded on the ERA axis after the walk.
+             * Never a failure on its own -- the era decides. */
             result->entries_unsigned++;
+            if (result->first_unsigned < 0)
+                result->first_unsigned = e.sequence;
         }
 
         /* ARTIFACT BINDING (2026-08-06). The checks above prove the entry

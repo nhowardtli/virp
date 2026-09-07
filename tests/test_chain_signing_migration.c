@@ -252,9 +252,194 @@ static void test_range_api_agrees_with_the_session_api(void)
     PASS();
 }
 
+/* =====================================================================
+ * SIGNATURE-ERA VERDICTS (HAM item 7, reworked 2026-09-07)
+ *
+ * The first cut of item 7 graded an unsigned-era session VALID. Measured
+ * on 313's real chain, that is 17 sessions and it is wrong: VALID is
+ * what a fully verified signed session gets, and a reader who sees VALID
+ * has no way to tell "every signature checked out" from "there were no
+ * signatures to check".
+ *
+ * 313's actual shapes, from the 2026-09-07 baseline:
+ *
+ *   ALL_UNSIGNED  17 sessions. No signature on any entry, head unsigned.
+ *                 Every one starts before 2026-08-23 17:48:11Z, when
+ *                 chain signing was first enabled on that node, except
+ *                 burnin-rollback:2026-08-23, which falls inside a
+ *                 2m21s window where the daemon restarted WITHOUT
+ *                 signing. Journal-confirmed, both ends.
+ *   MIXED         30 sessions that span the cutover: unsigned entries
+ *                 early, signed entries later, head signed. These are
+ *                 NOT clean and must stay BROKEN under the real key --
+ *                 the verifier cannot tell a cutover gap from a stripped
+ *                 signature by looking at the entry alone.
+ *   ALL_SIGNED    40 sessions.
+ *
+ * So there are three outcomes, not two:
+ *
+ *   VALID          every applicable check passed. Signed sessions only.
+ *   UNSIGNED_ERA   no signature anywhere, head unsigned. Nothing was
+ *                  stripped because nothing was ever there. Not clean.
+ *   SIGNED_FROM_1  sequence 0 unsigned, EVERY later entry signed and
+ *                  verifying, head signed. The genesis entry predates
+ *                  the signing key; everything after it is covered.
+ *   BROKEN         anything else, including a gap anywhere but seq 0,
+ *                  and seq 0 unsigned with any other unsigned entry.
+ * ===================================================================== */
+
+/* Build a session with an explicit per-entry signing pattern.
+ * pattern[i] != 0 means "entry i is signed". */
+static void build_patterned_session(const char *sess, const char *pattern)
+{
+    virp_chain_state_t st;
+    if (virp_chain_init(&st, DB, CK, 1, "local") != VIRP_OK) abort();
+
+    virp_chain_entry_t e;
+    for (const char *p = pattern; *p; p++) {
+        bool want = (*p == 'S');
+        if (want && !st.sign_enabled) {
+            if (virp_chain_enable_signing(&st, SK) != VIRP_OK) abort();
+        } else if (!want && st.sign_enabled) {
+            /* Model a daemon restarted WITHOUT signing: the columns stay,
+             * the process simply does not sign. That is exactly what
+             * 313's 18:05:30 restart did. */
+            st.sign_enabled = false;
+        }
+        char aid[32];
+        snprintf(aid, sizeof(aid), "%s-%d", sess, (int)(p - pattern));
+        if (virp_chain_append(&st, sess, "observation", aid, H1, &e)
+            != VIRP_OK) abort();
+    }
+    virp_chain_destroy(&st);
+}
+
+static void verdict_of(const char *sess, virp_chain_verify_result_t *r)
+{
+    virp_chain_state_t v;
+    if (virp_chain_open_verifier_ex(&v, DB, CK, PK, 1, "local") != VIRP_OK)
+        abort();
+    if (virp_chain_verify_session(&v, sess, r) != VIRP_OK) abort();
+    virp_chain_destroy(&v);
+}
+
+static void test_all_unsigned_is_not_valid(void)
+{
+    TEST("era: an ALL-UNSIGNED session is UNSIGNED_ERA, not VALID");
+    cleanup(); make_chain_key(); make_sign_key();
+    /* A signed session in the same database, so the signature COLUMNS
+     * exist while the unsigned session sits beside them. That is exactly
+     * 313: 40 signed sessions, 17 with no signature at all, one set of
+     * columns. Without this the columns would be absent and the test
+     * would prove nothing about the case that actually occurs. */
+    build_patterned_session("s-other", "SSS");
+    build_patterned_session("s-era", "uuuu");
+
+    virp_chain_verify_result_t r;
+    verdict_of("s-era", &r);
+    ASSERT(r.sig_era == VIRP_CHAIN_SIG_ERA_UNSIGNED,
+           "an unsigned-era session must say so, not read as VALID");
+    ASSERT(!r.valid_signed,
+           "valid_signed is reserved for a session whose signatures checked out");
+    ASSERT(r.entries_unsigned == 4, "all four entries are unsigned");
+    ASSERT(r.entries_signed == 0, "none is signed");
+    cleanup();
+    PASS();
+}
+
+static void test_unsigned_genesis_then_all_signed(void)
+{
+    TEST("era: seq 0 unsigned, every later entry signed -> SIGNED_FROM_1");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-gen", "uSSS");
+
+    virp_chain_verify_result_t r;
+    verdict_of("s-gen", &r);
+    ASSERT(r.valid, "the chain itself is intact");
+    ASSERT(r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_1,
+           "must be SIGNED_FROM_1, visibly not VALID");
+    ASSERT(!r.valid_signed, "not a fully signed session");
+    ASSERT(r.entries_signed == 3 && r.entries_unsigned == 1,
+           "three signed, one unsigned");
+    ASSERT(r.first_unsigned == 0, "the unsigned entry is the genesis one");
+    cleanup();
+    PASS();
+}
+
+static void test_gap_after_genesis_is_broken(void)
+{
+    TEST("era: an unsigned entry anywhere but seq 0 stays BROKEN");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-gap", "SSuS");
+
+    virp_chain_verify_result_t r;
+    verdict_of("s-gap", &r);
+    ASSERT(!r.valid, "a mid-session signature gap is a FAILURE");
+    ASSERT(r.first_broken == 2, "must name the gap");
+    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_1,
+           "a mid-session gap is not the genesis carve-out");
+    cleanup();
+    PASS();
+}
+
+static void test_unsigned_genesis_plus_later_gap_is_broken(void)
+{
+    TEST("era: seq 0 unsigned AND a later gap stays BROKEN");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-two", "uSuS");
+
+    virp_chain_verify_result_t r;
+    verdict_of("s-two", &r);
+    ASSERT(!r.valid, "two unsigned entries is not the genesis carve-out");
+    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_FROM_1,
+           "the carve-out is EXACTLY one unsigned entry, at seq 0");
+    cleanup();
+    PASS();
+}
+
+static void test_the_313_mixed_shape_stays_broken(void)
+{
+    TEST("era: 313's MIXED cutover shape stays BROKEN under the real key");
+    cleanup(); make_chain_key(); make_sign_key();
+    /* gate-enforce:R1 on 313: unsigned run, then signed run, head signed. */
+    build_patterned_session("s-mix313", "uuuuuSSSSS");
+
+    virp_chain_verify_result_t r;
+    verdict_of("s-mix313", &r);
+    ASSERT(!r.valid,
+           "a session that spans the cutover has real gaps and must not "
+           "be quietly excused");
+    ASSERT(r.sig_era != VIRP_CHAIN_SIG_ERA_UNSIGNED,
+           "it is not an unsigned-era session: it carries signatures");
+    cleanup();
+    PASS();
+}
+
+static void test_fully_signed_is_still_plain_valid(void)
+{
+    TEST("era: a fully signed session is still VALID, unqualified");
+    cleanup(); make_chain_key(); make_sign_key();
+    build_patterned_session("s-full", "SSSS");
+
+    virp_chain_verify_result_t r;
+    verdict_of("s-full", &r);
+    ASSERT(r.valid && r.valid_signed, "must be a clean signed VALID");
+    ASSERT(r.sig_era == VIRP_CHAIN_SIG_ERA_SIGNED,
+           "the era must say fully signed");
+    ASSERT(r.entries_unsigned == 0, "nothing unsigned");
+    cleanup();
+    PASS();
+}
+
 int main(void)
 {
     printf("\n=== VIRP chain-signing MIGRATION tests (HAM item 7) ===\n");
+    test_all_unsigned_is_not_valid();
+    test_unsigned_genesis_then_all_signed();
+    test_gap_after_genesis_is_broken();
+    test_unsigned_genesis_plus_later_gap_is_broken();
+    test_the_313_mixed_shape_stays_broken();
+    test_fully_signed_is_still_plain_valid();
     test_presigning_session_passes_with_pubkey();
     test_postsigning_session_still_verifies();
     test_stripping_a_signature_is_still_fatal();

@@ -1642,9 +1642,25 @@ static int cmd_chain_tail(int argc, char **argv)
 static void chain_verify_print(const char *sess,
                                const virp_chain_verify_result_t *r)
 {
-    printf("%-32s %s  entries=%lld to_seq=%lld",
-           sess, r->valid ? "VALID" : "BROKEN",
+    /* HAM item 7, reworked 2026-09-07. VALID alone conflated "the chain
+     * is intact" with "the signatures checked out". An unsigned-era
+     * session printed exactly like a fully verified one. The era is now
+     * part of the headline, so a reader cannot miss it. */
+    const char *verdict = "BROKEN";
+    if (r->valid) {
+        switch (r->sig_era) {
+        case VIRP_CHAIN_SIG_ERA_UNSIGNED: verdict = "UNSIGNED_ERA";  break;
+        case VIRP_CHAIN_SIG_ERA_FROM_1:   verdict = "SIGNED_FROM_1"; break;
+        default:                          verdict = "VALID";         break;
+        }
+    }
+    printf("%-32s %-13s  entries=%lld to_seq=%lld",
+           sess, verdict,
            (long long)r->entries_checked, (long long)r->to_sequence);
+    if (r->sig_era == VIRP_CHAIN_SIG_ERA_FROM_1)
+        printf(" unsigned_genesis=seq0");
+    if (r->sig_era == VIRP_CHAIN_SIG_ERA_UNSIGNED)
+        printf(" signed_entries=0");
 
     /* Tier annotation (D-1). Which checks actually ran, and whether the
      * head length claim is authenticated — a keyless VALID means the rows
@@ -1772,7 +1788,7 @@ static int chain_verify_offline(const char *db_path, const char *key_path,
         return 1;
     }
 
-    int sessions = 0, broken = 0;
+    int sessions = 0, broken = 0, unclean = 0;
     if (only_session) {
         virp_chain_verify_result_t r;
         memset(&r, 0, sizeof(r));
@@ -1784,6 +1800,8 @@ static int chain_verify_offline(const char *db_path, const char *key_path,
         }
         sessions = 1;
         if (!r.valid) broken++;
+        else if (r.sig_era == VIRP_CHAIN_SIG_ERA_UNSIGNED ||
+                 r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_1) unclean++;
         chain_verify_print(only_session, &r);
     } else {
         /* Enumerate sessions with a second read-only handle; the public
@@ -1818,6 +1836,8 @@ static int chain_verify_offline(const char *db_path, const char *key_path,
             }
             sessions++;
             if (!r.valid) broken++;
+            else if (r.sig_era == VIRP_CHAIN_SIG_ERA_UNSIGNED ||
+                     r.sig_era == VIRP_CHAIN_SIG_ERA_FROM_1) unclean++;
             chain_verify_print(sess, &r);
         }
         sqlite3_finalize(st);
@@ -1825,12 +1845,26 @@ static int chain_verify_offline(const char *db_path, const char *key_path,
     }
 
     virp_chain_destroy(&chain);
-    printf("sessions=%d broken=%d\n", sessions, broken);
+    printf("sessions=%d broken=%d unclean=%d\n", sessions, broken, unclean);
     if (sessions == 0) {
         fprintf(stderr, "Error: no sessions found — nothing was verified\n");
         return 1;
     }
-    return broken ? 1 : 0;
+    /* EXIT CODES (HAM item 7, reworked 2026-09-07).
+     *
+     *   0  every session VALID with era SIGNED: a clean bill of health.
+     *   1  at least one session BROKEN. Tampering, or a gap the verifier
+     *      cannot distinguish from one.
+     *   3  nothing broken, but at least one session did NOT reach a clean
+     *      signed VALID: UNSIGNED_ERA or SIGNED_FROM_1.
+     *
+     * 3 is separate from both on purpose. Sharing 0 with a clean chain is
+     * what let 17 unsigned-era sessions on 313 read as verified; sharing
+     * 1 with a broken chain would cry tampering over a documented
+     * cutover. A caller that wants the old "is the chain intact"
+     * behaviour tests `code != 1`. */
+    if (broken) return 1;
+    return unclean ? 3 : 0;
 }
 
 static void chain_verify_usage(void)
@@ -1853,6 +1887,10 @@ static void chain_verify_usage(void)
         "  --pubkey PATH  ASYMMETRIC: verify the Ed25519 chain-signing\n"
         "                 signature with the PUBLIC key ONLY — no secret\n"
         "                 material is loaded. This is the third-party path.\n"
+        "Exit: 0 clean (every session VALID, era SIGNED); 1 a session is\n"
+        "      BROKEN; 3 nothing broken but a session is UNSIGNED_ERA or\n"
+        "      SIGNED_FROM_1 (intact, but its signatures do not cover it).\n"
+        "\n"
         "  --keyless      KEYLESS: hash+link+completeness only. Required to\n"
         "                 run with NEITHER key (so a keyless run is a\n"
         "                 deliberate choice, not a forgotten key). The head\n"
