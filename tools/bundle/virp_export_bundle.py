@@ -231,7 +231,15 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--producer", default="virp-export-bundle (lab)")
     a = p.parse_args(argv)
-    r = export(a.db, a.out, a.producer)
+    try:
+        r = export(a.db, a.out, a.producer)
+    except InconsistentSnapshot as e:
+        # An operator gets the sentence, not a traceback: this is an
+        # expected outcome (a writer was busy), not a crash, and the
+        # message already names the session and both sequence numbers.
+        print("virp_export_bundle.py: refusing to write a bundle: %s" % e,
+              file=sys.stderr)
+        return 2
     print("bundle written to %s" % a.out)
     for k, v in sorted(r.items()):
         print("  %-18s %s" % (k, v))
