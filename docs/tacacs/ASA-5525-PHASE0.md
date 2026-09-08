@@ -507,20 +507,29 @@ Operator decisions, 2026-09-07. Later phases are written to these.
   that `show running-config username` lists `admin` and nothing else, so
   `aiops-svc` is removed there. Phase 1 leaves it alone because Phase 1 changes
   no authentication path.
-- **To rotate — and be precise about WHICH secret.** What was disclosed into a
-  session transcript during this survey was the value of the fleet row's
-  `enable` field: **the ASA's enable password**, which on this platform is a
-  device-wide credential, not `aiops-svc`'s login password (that field was
-  redacted and never appeared). The `aiops-svc` LOGIN password was
-  independently rotated on the console 2026-09-08, which is good hygiene but
-  addresses a different credential and does **not** close this.
+- **CLOSED 2026-09-08 — both disclosed credentials rotated.** Two secrets
+  reached a session transcript during this work and both are now dead:
 
-  The enable password still needs rotating (`enable password <new>` from
-  config mode, console). It matters even though the gate never uses it:
-  `aaa authorization exec LOCAL auto-enable` means a priv-15 local user
-  auto-enables without presenting it, but a priv-1 account could use the
-  leaked value to escalate to priv 15, and the console `enable` prompt
-  accepts it. It stops mattering entirely at Phase 3, when `aiops-svc` is
-  removed and the only local account left is console-only `admin`.
-  It was `${LAB_ENABLE}` in `virp-lab`'s template; that row is now gone, so
-  the only place it still lives is the ASA itself.
+  1. The fleet row's `enable` value — **the ASA's device-wide enable
+     password**, disclosed during the Phase 0 survey when a redaction filter
+     keyed on `pass`/`token` and the field was named `enable`. Rotated on the
+     console 2026-09-08.
+  2. The `VIRP-ACCT` TACACS+ shared secret, pasted in cleartext during Phase 1
+     Block 2. Rotated by Block 2R the same day, both sides together.
+
+  `aiops-svc`'s LOGIN password was never disclosed — that field was redacted —
+  but it was rotated anyway on 2026-09-08 before the fleet row went live, and
+  it is the value now held as `VIRP_ASALAB_PASSWORD` in this node's
+  `autopilot.env`.
+
+  **No VIRP-side change was required by the enable rotation**, and that is a
+  property of the row rather than luck: it carries `asa_auto_enable: true` and
+  no `enable` field, so the daemon never loads an enable secret into its
+  address space and there is nothing on 313 to update when that password
+  changes. A row written the other way — carrying an `enable` credential to
+  satisfy refusal #14 — would have needed a coordinated edit and a restart.
+
+  The enable password was `${LAB_ENABLE}` in `virp-lab`'s template; that row
+  is gone, so the ASA was the only place the old value still lived. Residual
+  exposure ends completely at Phase 3, when `aiops-svc` is removed and the
+  only local account left is console-only `admin`.
