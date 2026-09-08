@@ -623,54 +623,20 @@ void onode_destroy(onode_state_t *state);
 uint8_t gate_obs_tier(virp_trust_tier_t t);
 
 /*
- * Execute a command on a device and return a signed OBSERVATION.
+ * NOTE (2026-09-08): onode_execute() and onode_execute_obs() are GONE.
  *
- * state:       O-Node state
- * device_name: Hostname of device to execute on
- * command:     Command string to execute
- * out_buf:     Output buffer for VIRP OBSERVATION message
- * out_buf_len: Size of output buffer
- * out_len:     Actual bytes written
+ * Both were thin wrappers that forwarded to onode_execute_obs_ex() with
+ * client_uid hardcoded to (uid_t)-1. onode_effective_max_tier() returns the
+ * node-wide gate_max_tier immediately for that sentinel, so any caller of a
+ * wrapper silently escaped the per-uid tier ceiling. That is not a property
+ * you want reachable by accident: it cost a live ceiling bypass on the
+ * ONODE_ACTION_HEALTH path, found on 10.0.10.211 2026-09-07.
+ *
+ * onode_execute_obs_ex() is now the only entry point, and it takes the uid as
+ * a required argument. Pass a real one. If a caller genuinely has no client
+ * identity it must say so explicitly at its own call site and justify it
+ * there, not inherit it from a convenience wrapper.
  */
-virp_error_t onode_execute(onode_state_t *state,
-                           const char *device_name,
-                           const char *command,
-                           uint8_t *out_buf, size_t out_buf_len,
-                           size_t *out_len);
-
-/*
- * Versioned execute. obs_version selects the observation signing path:
- *
- *   1 — legacy: v1 message signed with the static master O-Key.
- *       Compatibility default for clients that predate session-bound
- *       observations (they cannot derive the session key; the
- *       handshake transcript includes server-stamped timestamps the
- *       socket protocol does not yet echo back).
- *
- *   2 — session-bound: the SUCCESS observation is a v2 wire message
- *       ([88-byte header][payload][32-byte sig]) signed with the
- *       HKDF-derived session key via virp_sign_observation_v2. The
- *       header binds session_id, device_id, seq_num, timestamp and
- *       SHA-256(canonical command). Requires an ACTIVE session; if
- *       none exists the call FAILS with VIRP_ERR_SESSION_INVALID —
- *       there is deliberately no silent fallback to v1, because a
- *       client that asked for session binding must never accept a
- *       downgraded observation.
- *
- * Scope note: error observations (device not found, connect/driver
- * failure, tier-gate rejection) are still emitted as v1 messages even
- * when obs_version == 2. They carry no device output; binding them is
- * follow-up work. A v2-requesting client must treat any v1 response as
- * unverified diagnostics, never as device truth.
- *
- * onode_execute() is exactly onode_execute_obs(..., obs_version=1).
- */
-virp_error_t onode_execute_obs(onode_state_t *state,
-                               const char *device_name,
-                               const char *command,
-                               int obs_version,
-                               uint8_t *out_buf, size_t out_buf_len,
-                               size_t *out_len);
 
 /*
  * Configure the approval flow: `dir` is the approval store directory

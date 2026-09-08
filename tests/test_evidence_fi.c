@@ -37,6 +37,26 @@
 #include <unistd.h>
 #include <pthread.h>
 
+/*
+ * t_execute() was deleted 2026-09-08. It forwarded to
+ * onode_execute_obs_ex() with client_uid hardcoded to (uid_t)-1, which
+ * onode_effective_max_tier() reads as "no per-uid ceiling, use the node-wide
+ * one" — the bypass that cost a live ceiling escape on the HEALTH path. The
+ * uid is now a required argument, so these tests pass a real one.
+ *
+ * getuid() is the honest choice here: it is the identity actually running the
+ * test, it is not the (uid_t)-1 sentinel, and no fixture in this suite sets a
+ * per-uid ceiling for it — so onode_effective_max_tier() resolves to the
+ * node-wide ceiling exactly as before and every existing expectation holds.
+ */
+static virp_error_t t_execute(onode_state_t *s, const char *dev,
+                              const char *cmd, uint8_t *buf, size_t buf_len,
+                              size_t *out_len)
+{
+    return onode_execute_obs_ex(s, dev, cmd, 1, NULL, getuid(),
+                                buf, buf_len, out_len);
+}
+
 static const char *DB  = "/tmp/virp-evfi-chain.db";
 static const char *WAL = "/tmp/virp-evfi-chain.db-wal";
 static const char *SHM = "/tmp/virp-evfi-chain.db-shm";
@@ -102,7 +122,7 @@ int main(void)
 
     /* 1. One clean execution: a normal intent+closer pair. */
     (void)virp_driver_mock_exec_attempts_reset();
-    onode_execute(&st, "EVFI-DEV", "show version", buf, sizeof(buf), &len);
+    t_execute(&st, "EVFI-DEV", "show version", buf, sizeof(buf), &len);
 
     /* 2. Arm the closer-append fault. The intent commits, the device runs,
      * the gate_execution append fails. */
@@ -110,7 +130,7 @@ int main(void)
     st.evidence_fail_closer_once = true;
     pthread_mutex_unlock(&st.state_mutex);
     (void)virp_driver_mock_exec_attempts_reset();
-    onode_execute(&st, "EVFI-DEV", "show version", buf, sizeof(buf), &len);
+    t_execute(&st, "EVFI-DEV", "show version", buf, sizeof(buf), &len);
     int ran = virp_driver_mock_exec_attempts_reset();
     CHECK(ran == 1, "the device DID act (execute attempted)");
     CHECK(obs_of(&st, buf, len, &type, payload, sizeof(payload)) == 0, "parse");
@@ -123,7 +143,7 @@ int main(void)
     /* 3. Degraded: the next dispatch refuses at the intent step. */
     CHECK(st.evidence_degraded, "daemon latched degraded");
     (void)virp_driver_mock_exec_attempts_reset();
-    onode_execute(&st, "EVFI-DEV", "show version", buf, sizeof(buf), &len);
+    t_execute(&st, "EVFI-DEV", "show version", buf, sizeof(buf), &len);
     int ran2 = virp_driver_mock_exec_attempts_reset();
     CHECK(ran2 == 0, "nothing dispatched while degraded");
     CHECK(obs_of(&st, buf, len, &type, payload, sizeof(payload)) == 0, "parse2");

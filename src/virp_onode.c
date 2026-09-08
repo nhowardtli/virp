@@ -1645,29 +1645,6 @@ static virp_error_t gate_refuse_evidence_obs(onode_state_t *state,
                                   &state->okey);
 }
 
-virp_error_t onode_execute(onode_state_t *state,
-                           const char *device_name,
-                           const char *command,
-                           uint8_t *out_buf, size_t out_buf_len,
-                           size_t *out_len)
-{
-    return onode_execute_obs_ex(state, device_name, command, 1, NULL,
-                                (uid_t)-1,
-                                out_buf, out_buf_len, out_len);
-}
-
-virp_error_t onode_execute_obs(onode_state_t *state,
-                               const char *device_name,
-                               const char *command,
-                               int obs_version,
-                               uint8_t *out_buf, size_t out_buf_len,
-                               size_t *out_len)
-{
-    return onode_execute_obs_ex(state, device_name, command, obs_version,
-                                NULL, (uid_t)-1,
-                                out_buf, out_buf_len, out_len);
-}
-
 virp_error_t onode_set_approvers(onode_state_t *state,
                                  const char *dir,
                                  const char *registry_path)

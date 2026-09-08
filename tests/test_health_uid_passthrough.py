@@ -45,6 +45,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 ONODE_C = os.path.join(ROOT, "src", "virp_onode.c")
+ONODE_H = os.path.join(ROOT, "include", "virp_onode.h")
 
 # Tier ordering as virp.h defines it: GREEN < YELLOW < RED < BLACK.
 GREEN, YELLOW, RED = 0, 1, 2
@@ -165,6 +166,8 @@ class TestHealthCallSite(unittest.TestCase):
         with open(ONODE_C, encoding="utf-8") as fh:
             raw = fh.read()
         cls.src = _strip_comments(raw)
+        with open(ONODE_H, encoding="utf-8") as fh:
+            cls.hdr = _strip_comments(fh.read())
         cls.body = _health_case_body(cls.src)
 
     def test_health_uses_the_uid_carrying_variant(self):
@@ -187,21 +190,46 @@ class TestHealthCallSite(unittest.TestCase):
                       self.body, re.S),
             "the health call must pass client_uid, not (uid_t)-1")
 
-    def test_plain_wrapper_has_no_other_client_reachable_caller(self):
-        """The enumeration, enforced rather than written down.
+    def test_the_plain_wrappers_no_longer_exist(self):
+        """Stronger than the original: the symbols are GONE.
 
-        Every call to the plain wrapper outside its own definition must sit
-        in a context no client request can reach. Today the only one is the
-        health handler; when it is fixed the list is empty. A new caller
-        added inside a request handler fails here.
+        This started life as "no request handler calls the plain wrapper",
+        which left the wrapper in place for someone to reach for again. Both
+        onode_execute() and onode_execute_obs() were deleted 2026-09-08, so
+        the property is now structural rather than a convention: there is no
+        entry point that can omit the uid, because onode_execute_obs_ex()
+        takes it as a required argument.
+
+        Asserted against the DEFINITIONS, not call sites — a definition is
+        what makes the hazard available at all.
         """
-        handler = self.src[self.src.index("case ONODE_ACTION_"):]
-        offenders = re.findall(r"\bonode_execute_obs\s*\(", handler)
-        self.assertEqual(
-            offenders, [],
-            "a request handler calls the plain onode_execute_obs(); it "
-            "cannot apply a per-uid ceiling. Use onode_execute_obs_ex() "
-            "with the connecting client's uid.")
+        for sym in ("onode_execute", "onode_execute_obs"):
+            defn = re.search(
+                r"^virp_error_t\s+" + sym + r"\s*\(", self.src, re.M)
+            self.assertIsNone(
+                defn,
+                f"{sym}() is defined again in src/virp_onode.c. It forwarded "
+                f"to onode_execute_obs_ex() with client_uid hardcoded to "
+                f"(uid_t)-1, which onode_effective_max_tier() reads as "
+                f"'use the node-wide ceiling' — the bypass this branch "
+                f"removed. Call onode_execute_obs_ex() with a real uid.")
+            decl = re.search(
+                r"^virp_error_t\s+" + sym + r"\s*\(", self.hdr, re.M)
+            self.assertIsNone(
+                decl, f"{sym}() is declared again in include/virp_onode.h")
+
+    def test_no_caller_passes_the_sentinel_as_a_client_uid(self):
+        """(uid_t)-1 may still be COMPARED against, never PASSED as an
+        argument to an execute path. The comparisons are legitimate: they
+        render a null uid in a record and guard the unknown-identity refusal.
+        Passing it is what re-creates the bypass."""
+        for m in re.finditer(r"onode_execute_obs_ex\s*\(([^;]*?)\)\s*;",
+                             self.src, re.S):
+            self.assertNotIn(
+                "(uid_t)-1", m.group(1),
+                "a call to onode_execute_obs_ex() passes the (uid_t)-1 "
+                "sentinel as client_uid; that is the bypass. Pass a real "
+                "uid, or justify the absence of one at the call site.")
 
 
 if __name__ == "__main__":
