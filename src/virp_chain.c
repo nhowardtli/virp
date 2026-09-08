@@ -1078,7 +1078,19 @@ static const char *SCHEMA_SQL =
      * index builds in 0.37 s and adds 26 MB. The first open after this
      * ships pays that once, before the daemon starts serving; every
      * open after it is unaffected. */
-    "CREATE INDEX IF NOT EXISTS idx_chain_entry_hash "
+    /* UNIQUE, and that is a correctness statement rather than a hint to
+     * the planner. chain_entry_hash is sha256 over the canonical JSON in
+     * build_canonical_json(), which includes session_id and sequence — and
+     * (session_id, sequence) is already UNIQUE on this table. Two distinct
+     * rows therefore cannot canonicalise identically, and the only way to
+     * collide is a genuine SHA-256 collision. That is something the
+     * database should REFUSE loudly, not store quietly: a duplicate entry
+     * hash makes every hash-keyed lookup here ambiguous and the LIMIT 1 in
+     * chain_body_by_entry_hash_locked() would silently pick one of them.
+     * Verified on a copy of .211's chain 2026-09-08: 367,751 rows,
+     * 367,751 distinct hashes, no NULL or empty, and the UNIQUE index
+     * built with no constraint violation. */
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_entry_hash "
     "  ON chain_entries(chain_entry_hash);"
     /* Signed per-session head: authenticates chain LENGTH, not just links.
      * Updated in the same transaction as every append. A DB writer without
