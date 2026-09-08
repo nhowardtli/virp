@@ -1,0 +1,15 @@
+[Unit]
+Description=Egress lockdown for virp-sean (uid 987) — TCP-forward denial
+# See /etc/nftables-virp-sean-egress.nft for why this exists instead
+# of AllowTcpForwarding=no in sshd_config.d/62-virp-sean.conf.
+After=network-pre.target
+Before=network.target ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables-virp-sean-egress.nft
+ExecStop=/usr/sbin/nft delete table inet virp_sean_egress
+
+[Install]
+WantedBy=multi-user.target

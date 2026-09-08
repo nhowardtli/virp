@@ -62,6 +62,14 @@ broker/virp-broker.service /etc/systemd/system/virp-broker.service
 deploy/virp-netclaw-egress.service /etc/systemd/system/virp-netclaw-egress.service
 deploy/nftables-virp-netclaw-egress.nft /etc/nftables-virp-netclaw-egress.nft
 
+# ── virp-sean egress lockdown ─────────────────────────────────────────
+# Same shape and same reason as the netclaw pair above, for uid 987 —
+# Sean's isolated agent VM (10.0.70.10), added 2026-09-06. Tracked from
+# the start rather than after it is deployed: the netclaw ruleset spent
+# time in force and unowned because nobody listed it here first.
+deploy/virp-sean-egress.service /etc/systemd/system/virp-sean-egress.service
+deploy/nftables-virp-sean-egress.nft /etc/nftables-virp-sean-egress.nft
+
 # ── virp-onode-home (10.0.0.13), tracked 2026-09-03 ───────────────────
 # The home node runs the SAME base unit as the colo node — deploy/
 # virp-onode.service above — and expresses its three differences in a
@@ -128,6 +136,7 @@ integrations/prometheus/virp-prometheus-exporter.service /etc/systemd/system/vir
 deploy/virp-onode-runbook.dropin.conf /etc/systemd/system/virp-onode.service.d/50-config-backup.conf
 deploy/virp-onode-evidence.dropin.conf /etc/systemd/system/virp-onode.service.d/51-evidence.conf
 deploy/virp-onode-netclaw.dropin.conf /etc/systemd/system/virp-onode.service.d/52-netclaw.conf
+deploy/virp-onode-sean.dropin.conf /etc/systemd/system/virp-onode.service.d/53-sean.conf
 # Lab-only, opt-in, installed by `make install-wazuh-lab-dropin` and by
 # nothing else. Listed so that IF it is installed it is still compared
 # against its tracked source — being deliberate is not the same as being
