@@ -2,7 +2,7 @@
 
 - **Role**: production reference instance
 
-## Current live state (verified 2026-09-05 05:25 UTC)
+## Current live state (verified 2026-09-08 18:45 UTC)
 
 **This block is authoritative for what is running right now.** Everything below
 it is a chronological, append-only log: each section describes the state at the
@@ -10,18 +10,16 @@ time it was written and is deliberately *not* corrected in place. Where a fact
 below disagrees with this block, this block wins. A copy of this file without
 this block is stale — check the commit before relying on it.
 
-- **Commit**: `1dab8560a478ab55ee3d8705a83de832fbf9c6aa` (short `1dab8560`)
-  — deployed 2026-09-05 05:23:42 UTC, `v0.2.0-57-g1dab8560`, superseding
-  `dc49b748` (2026-09-03 20:18:37 UTC, the fed_error cherry-pick). That
-  commit is not on `main`'s history; its daemon sources were byte-identical
-  to `d54aeb3`, which is. See "Deploy 2026-09-05" below.
+- **Commit**: `ea997943794c3e8e0b3163fa36aa372e6ea738d7` (short `ea997943`)
+  — deployed 2026-09-08 18:38:50 UTC, `v0.2.0-164-gea997943`, superseding
+  `1dab8560` (2026-09-05 05:23:42 UTC). See "Deploy 2026-09-08" below.
 - **Branch**: `main` (the checkout at `/opt/virp` was moved off
   `deploy/fed-error-2026-09-03` onto `main` for this deploy; that branch is
   retained locally and on origin)
 - **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
   socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
   — binary sha256
-  `c541fc729fd178f6732291c6105c28050d9f9b64ec40a98de91bd71e32b46575`
+  `46ee5eaea9e453444aca520cee9845f739625a67d2832e63f4f08ab83889255b`
 - **Client**: `/usr/local/lib/virp/virp-tool` (+ `virp` alias), sha256
   `338cd33107566d8e6eae866e548e11a8d744085bdb40cfdbbba313e2f70568c8` —
   installed by `make install-prod` as the fourth artifact class; the
@@ -50,9 +48,16 @@ this block is stale — check the commit before relying on it.
   (pa-850, ASA-5525, srx-300 and two lab devices unreachable, watchdog
   cycling — unchanged from before this deploy).
 - **Socket allowlist**: uids 999 (`virp`), 1000 (`nhoward`), 997
-  (`virp-backup`), 995 (`virp-evidence`). **uid 0 is deliberately excluded** —
+  (`virp-backup`), 995 (`virp-evidence`), 993 (`virp-netclaw`), 994
+  (`virp-broker`), 987 (`virp-sean`). **uid 0 is deliberately excluded** —
   a client running as root is rejected with
   `peer uid=0 not in socket_allowed_uids`.
+- **`health` is no longer granted to 987, 993 or 994** (2026-09-07/08). It is
+  not a liveness ping on this daemon: it runs `show version` against a
+  client-chosen device via the plain `onode_execute_obs()` wrapper, which
+  passes `(uid_t)-1` and so skips the per-uid tier ceiling. The underlying
+  daemon fix is on `fix/health-uid-passthrough`, unmerged and NOT deployed;
+  what is live is the config mitigation only.
 
 ### What this corrects
 The 2026-07-29 deploy-time header (retained verbatim below) named commit
@@ -66,6 +71,86 @@ are now stale on two counts:
    classifier it was waiting on has been live ever since.
 2. The deployed commit has advanced through the update log below and is now
    `b6e9602c`, not `0c9c7338`.
+
+## Deploy 2026-09-08 18:38:50 UTC — main `ea997943` (107 commits, and the first completed full-chain verify)
+
+Unattended. An earlier attempt the same day ABORTED at pre-flight and that abort
+was correct: `origin/main` did not carry the socket policy actually running
+here, and the tracked device template disagreed with the live one. Both were
+fixed on `main` first, then the deploy was re-run.
+
+| | |
+|---|---|
+| binary sha256 before | `c541fc729fd178f6732291c6105c28050d9f9b64ec40a98de91bd71e32b46575` |
+| binary sha256 after | `46ee5eaea9e453444aca520cee9845f739625a67d2832e63f4f08ab83889255b` |
+| version before -> after | `v0.2.0-57-g1dab8560` -> `v0.2.0-164-gea997943` |
+| commits deployed | 107 (`1dab8560..ea997943`) |
+| merge commit | `e10bc5c4d7947f3e9314ce47d22d5bac5a94754c` |
+| template commit | `ea997943794c3e8e0b3163fa36aa372e6ea738d7` |
+| snapshot | `/var/backups/virp/snap-20260908-183640` (binary, `/etc/virp`, chain.db) |
+| stop -> start | 18:37:17Z -> 18:38:50Z (93 s: SIGTERM timeout then SIGKILL, documented) |
+| **full chain_verify** | **54 s** — 436 sessions, `broken=0 unclean=0` |
+
+### What went onto main first, and why
+
+Deploying `main` as it stood would have been a regression, so two commits landed
+ahead of it:
+
+- `e10bc5c` merges `feat/virp-sean-seat`. Without it `main`'s template had no
+  uid 987 at all and still granted `health` to 993 and 994 — the tree would have
+  read as authoritative while disagreeing with the running policy, and the next
+  `install-devices-template` would have silently dropped the seat and restored
+  the ceiling bypass on both remote identities. Clean merge, no conflicts.
+- `ea99794` removes the `ASA-5525` row (10.0.0.253), recording a hand edit made
+  directly on this box at 2026-09-07 22:54:20 UTC that never reached git. That
+  edit also explains the previously unattributed restart at 22:56:17.
+  **The device answers ICMP and has tcp/22 open as of 2026-09-08**, so "powered
+  off" does not explain the removal and nothing written down does. A reachable
+  firewall is currently outside the gate — see that commit message.
+
+### The full-chain verify, which had never completed before
+
+`chain verify` over the whole database finished in **54 seconds**: 436 sessions,
+`broken=0 unclean=0`, every large `gate-enforce:*` session VALID including
+`pbs-lab` at 32,187 entries. Before this deploy the same run was killed twice
+after >29 minutes without ever reaching those sessions.
+
+The cause was never the chain — it was a missing index. `chain_entry_hash` had
+none, so the per-entry body lookup in `chain_body_by_entry_hash_locked()`
+full-scanned ~368k rows once per `gate_intent` and once per closer: measured
+55 ms per entry, flat, i.e. linear in session size with a constant proportional
+to the whole table. `aeacde9` (included here) adds `idx_chain_entry_hash`; the
+daemon created it on first open, chain.db grew 576 -> 602 MB (+26 MB), and the
+isolated query went 0.143 s -> 0.001 s.
+
+**Caveat to carry forward:** `virp_chain_open_verifier()` opens
+`SQLITE_OPEN_READONLY` and runs no schema, so the OFFLINE verifier can never
+create this index itself. It benefits only from a database that a daemon
+carrying `aeacde9` has already opened read-write. A third party handed a copy of
+an older chain still gets the full scan.
+
+### Post-deploy checks
+
+- `idx_chain_entry_hash` present after first open; 43 devices loaded; socket
+  policy lines confirm 7 uids mapped, 6 with explicit `chain_append` type
+  policies, ceilings `999/1000/994/993/997/995/987 = GREEN` under node-wide
+  YELLOW; `[sean-access] virp-sean: socket ACL ready, secrets unreadable`.
+- Tracked `deploy/devices.template.json` byte-identical to
+  `/etc/virp/devices.template.json` (sha256 `76e2fa7b...`) — by construction,
+  which is what the template commit above is for.
+- Two autopilot cycles after the restart (18:40:19, 18:45:03), each
+  `18 observations, 4 alerts`. Alerts were 6 before and 4 after with the
+  observation count unchanged; the remainder are the chronic
+  `battery_not_green_verified` for `virp-node2-peer` (device not found) and
+  `baseline_deviation`. `Result=exit-code` on both units is the documented
+  alerts>0 resting state, not a failure.
+
+### Not deployed, deliberately
+
+`fix/health-uid-passthrough` (the daemon fix that makes `health` honour the
+per-uid ceiling) and `feat/seat-session-namespace` (binds a seat's
+`chain_append` to its own `session_id` prefix) are both tested and pushed but
+unmerged. What is live for `health` is the config mitigation only.
 
 ## Deploy 2026-09-05 05:23:42 UTC — main `1dab8560` (approver binding + unchained-execution)
 
