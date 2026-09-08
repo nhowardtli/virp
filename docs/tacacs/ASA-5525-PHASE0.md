@@ -507,9 +507,20 @@ Operator decisions, 2026-09-07. Later phases are written to these.
   that `show running-config username` lists `admin` and nothing else, so
   `aiops-svc` is removed there. Phase 1 leaves it alone because Phase 1 changes
   no authentication path.
-- **To rotate:** the `aiops-svc` enable secret for this device was disclosed
-  into a session transcript during this survey and should be treated as burned.
-  It is `${LAB_ENABLE}` in `virp-lab`'s template and is changed on the ASA and
-  in that node's `autopilot.env`. Not blocking Phase 1, because Phase 1 does
-  not authenticate as `aiops-svc`; blocking nothing later either, because the
-  account leaves the picture entirely at Phase 3.
+- **To rotate — and be precise about WHICH secret.** What was disclosed into a
+  session transcript during this survey was the value of the fleet row's
+  `enable` field: **the ASA's enable password**, which on this platform is a
+  device-wide credential, not `aiops-svc`'s login password (that field was
+  redacted and never appeared). The `aiops-svc` LOGIN password was
+  independently rotated on the console 2026-09-08, which is good hygiene but
+  addresses a different credential and does **not** close this.
+
+  The enable password still needs rotating (`enable password <new>` from
+  config mode, console). It matters even though the gate never uses it:
+  `aaa authorization exec LOCAL auto-enable` means a priv-15 local user
+  auto-enables without presenting it, but a priv-1 account could use the
+  leaked value to escalate to priv 15, and the console `enable` prompt
+  accepts it. It stops mattering entirely at Phase 3, when `aiops-svc` is
+  removed and the only local account left is console-only `admin`.
+  It was `${LAB_ENABLE}` in `virp-lab`'s template; that row is now gone, so
+  the only place it still lives is the ASA itself.
