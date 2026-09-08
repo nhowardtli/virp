@@ -147,6 +147,58 @@ Measured 2026-09-08, against the pre-deploy snapshot of virp-lab's chain
 It is idempotent (a second run reports the index is already present and does
 nothing) and refuses a database with no `chain_entries` table rather than
 indexing whatever was named by mistake.
+### Reference figure — a whole-database verify completes
+
+**Measured 2026-09-08 on virp-lab (10.0.10.211), binary `46ee5eae`
+(`v0.2.0-164-gea997943`):**
+
+| | |
+|---|---|
+| chain | **367,751 entries**, 436 sessions |
+| whole-database `chain verify` | **54 seconds** |
+| result | `sessions=436 broken=0 unclean=0` |
+| large sessions | all VALID, including `gate-enforce:pbs-lab` at 32,187 entries |
+
+Use that as the yardstick: on a chain of this size the commands above are a
+post-restart gate you can actually run, not an aspiration. If a verify on a
+comparable chain takes minutes rather than under two, something is wrong —
+start by checking the database has `idx_chain_entry_hash`.
+
+**This was not always true, and the history matters when you meet an older
+database.** Before `aeacde9` there was no index on `chain_entries.chain_entry_hash`,
+so the per-entry body lookup full-scanned the table once per `gate_intent` and
+once per closer — 55 ms per entry, flat. The same verify was killed twice at
+over 29 minutes without reaching the large sessions. The chain was never at
+fault; the index was missing.
+
+**Two conditions before you trust the 54 s figure on a given database:**
+
+1. **The database must already carry `idx_chain_entry_hash`.** The daemon
+   creates it on first open. But `virp_chain_open_verifier()` opens
+   `SQLITE_OPEN_READONLY` and runs no schema, so a verifier can never create it
+   — a copy taken from a chain no updated daemon has opened still full-scans.
+   Check with:
+
+       sqlite3 chain.db "select count(*) from sqlite_master \
+                         where name='idx_chain_entry_hash';"
+
+   A `0` there means you are about to wait half an hour, not a minute.
+
+2. **Verify a cleanly copied file, never the live WAL DB** — as the top of this
+   section already says. The 54 s run was against a `.backup` copy.
+
+### What a completed verify still does not cover
+
+A whole-database verify checks every link, hash and keyed `chain_hmac` it can
+see. It cannot see history that was removed before it looked: a truncated
+chain whose head record was rewritten by a `K_chain` holder verifies clean.
+
+Closing that needs a head-hash comparison against an off-box witness.
+**Not available on virp-lab as of 2026-09-08** — no witness units are
+installed there and `virp-witness-tunnel` is inactive; the witness submitter
+runs on `virp-onode-home`. Until it is installed on the colo node, the
+whole-history truncation class is **unchecked** there, and a deploy record
+should say so rather than let a green verify imply otherwise.
 
 ## Boundaries / open items for the draft-07 text
 
