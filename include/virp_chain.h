@@ -310,6 +310,11 @@ typedef struct {
     sqlite3_stmt       *stmt_insert;
     sqlite3_stmt       *stmt_get_last;
     sqlite3_stmt       *stmt_get_range;
+    /* Body-by-entry-hash lookup, cached. Called once per gate_intent
+     * and once per closer during a verify, so re-compiling it per call
+     * paid sqlite3_prepare_v2 tens of thousands of times per session.
+     * Prepared lazily on first use and finalized with the rest. */
+    sqlite3_stmt       *stmt_body_by_hash;
     sqlite3_stmt       *stmt_insert_milestone;
     /* Signed per-session head record (chain_heads table) */
     sqlite3_stmt       *stmt_head_upsert;

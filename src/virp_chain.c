@@ -1078,7 +1078,18 @@ static const char *SCHEMA_SQL =
      * index builds in 0.37 s and adds 26 MB. The first open after this
      * ships pays that once, before the daemon starts serving; every
      * open after it is unaffected. */
-    "CREATE INDEX IF NOT EXISTS idx_chain_entry_hash "
+    /* UNIQUE, and that is a correctness statement rather than a hint
+     * to the planner. chain_entry_hash is sha256 over the canonical
+     * JSON in build_canonical_json(), which includes session_id and
+     * sequence — and (session_id, sequence) is already UNIQUE on this
+     * table. So two distinct rows cannot canonicalise identically, and
+     * the only way to collide is a genuine SHA-256 collision. That is
+     * something the database should REFUSE loudly, not store quietly:
+     * a duplicate entry hash would make every hash-keyed lookup here
+     * ambiguous, and LIMIT 1 would silently pick one. Verified on a
+     * copy of .211's chain 2026-09-08: 367,751 rows, 367,751 distinct
+     * hashes, no NULL or empty. */
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_entry_hash "
     "  ON chain_entries(chain_entry_hash);"
     /* Signed per-session head: authenticates chain LENGTH, not just links.
      * Updated in the same transaction as every append. A DB writer without
@@ -2560,13 +2571,31 @@ static bool cj_str(const cJSON *o, const char *key, char *out, size_t cap)
 static char *chain_body_by_entry_hash_locked(virp_chain_state_t *state,
                                              const char *h)
 {
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(state->db,
-            "SELECT a.artifact_content FROM chain_entries c "
-            "JOIN artifacts a ON a.artifact_id = c.artifact_id "
-            "               AND a.artifact_hash = c.artifact_hash "
-            "WHERE c.chain_entry_hash = ? LIMIT 1", -1, &st, NULL) != SQLITE_OK)
-        return NULL;
+    /*
+     * Cached statement, reset and rebound per call — the same shape as
+     * stmt_get_range. This is called once per gate_intent and once per
+     * closer, so on a session like gate-enforce:pbs-lab (31k of the two)
+     * the old code compiled this SQL 31k times in one verify.
+     *
+     * Prepared lazily rather than in the two open paths: there are two of
+     * them, they can fail independently, and a NULL handle here is
+     * indistinguishable from "not yet used". Finalized with the rest in
+     * the close path.
+     */
+    if (!state->stmt_body_by_hash) {
+        if (sqlite3_prepare_v2(state->db,
+                "SELECT a.artifact_content FROM chain_entries c "
+                "JOIN artifacts a ON a.artifact_id = c.artifact_id "
+                "               AND a.artifact_hash = c.artifact_hash "
+                "WHERE c.chain_entry_hash = ? LIMIT 1", -1,
+                &state->stmt_body_by_hash, NULL) != SQLITE_OK) {
+            state->stmt_body_by_hash = NULL;
+            return NULL;
+        }
+    }
+    sqlite3_stmt *st = state->stmt_body_by_hash;
+    sqlite3_reset(st);
+    sqlite3_clear_bindings(st);
     sqlite3_bind_text(st, 1, h, -1, SQLITE_TRANSIENT);
     char *body = NULL;
     if (sqlite3_step(st) == SQLITE_ROW) {
@@ -2577,7 +2606,9 @@ static char *chain_body_by_entry_hash_locked(virp_chain_state_t *state,
             if (body) memcpy(body, b, n);
         }
     }
-    sqlite3_finalize(st);
+    /* Reset before returning so the statement holds no read lock and no
+     * row reference between calls. */
+    sqlite3_reset(st);
     return body;
 }
 
@@ -3386,6 +3417,8 @@ void virp_chain_destroy(virp_chain_state_t *state)
         sqlite3_finalize(state->stmt_get_last);
     if (state->stmt_get_range)
         sqlite3_finalize(state->stmt_get_range);
+    if (state->stmt_body_by_hash)
+        sqlite3_finalize(state->stmt_body_by_hash);
     if (state->stmt_insert_milestone)
         sqlite3_finalize(state->stmt_insert_milestone);
     if (state->stmt_head_upsert)
