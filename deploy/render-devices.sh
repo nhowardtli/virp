@@ -219,7 +219,16 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             # the daemon's address space.
             "VIRP_PVE_PASSWORD", "VIRP_LABNET_PASSWORD",
             "VIRP_WAZUH_HOME_PASSWORD", "VIRP_FORTIGATE_HOME_PASSWORD",
-            "VIRP_LABSWITCH1_PASSWORD"):
+            # SIXTH, added 2026-09-08: VIRP_ASALAB_PASSWORD, the login the
+            # gate authenticates to ASA-Lab (10.0.0.253) with. Its own name
+            # for the same reason VIRP_LABSWITCH1_PASSWORD got one: this is
+            # a different box with a different credential, and a shared
+            # placeholder is how a rotation misses half its targets. It is
+            # the local `admin` account in Phase 2 and becomes the virp-ro
+            # TACACS identity in Phase 3 -- the NAME survives that change,
+            # the value does not, which is the point of naming it here
+            # rather than reusing an existing placeholder.
+            "VIRP_LABSWITCH1_PASSWORD", "VIRP_ASALAB_PASSWORD"):
     if var not in used:
         continue
     val = os.environ.get(var)
