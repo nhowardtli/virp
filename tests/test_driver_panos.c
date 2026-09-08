@@ -18,6 +18,27 @@
 #include <string.h>
 #include <strings.h>
 #include <assert.h>
+#include <unistd.h>   /* getuid() for t_execute */
+
+/*
+ * t_execute() was deleted 2026-09-08. It forwarded to
+ * onode_execute_obs_ex() with client_uid hardcoded to (uid_t)-1, which
+ * onode_effective_max_tier() reads as "no per-uid ceiling, use the node-wide
+ * one" — the bypass that cost a live ceiling escape on the HEALTH path. The
+ * uid is now a required argument, so these tests pass a real one.
+ *
+ * getuid() is the honest choice here: it is the identity actually running the
+ * test, it is not the (uid_t)-1 sentinel, and no fixture in this suite sets a
+ * per-uid ceiling for it — so onode_effective_max_tier() resolves to the
+ * node-wide ceiling exactly as before and every existing expectation holds.
+ */
+static virp_error_t t_execute(onode_state_t *s, const char *dev,
+                              const char *cmd, uint8_t *buf, size_t buf_len,
+                              size_t *out_len)
+{
+    return onode_execute_obs_ex(s, dev, cmd, 1, NULL, getuid(),
+                                buf, buf_len, out_len);
+}
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -660,7 +681,7 @@ static void gate_black_one_mode(onode_gate_mode_t mode, const char *sock,
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    assert(onode_execute(&st, "PA-GATE", "request restart system",
+    assert(t_execute(&st, "PA-GATE", "request restart system",
                          obs, sizeof(obs), &olen) == VIRP_OK);
 
     virp_header_t hdr;

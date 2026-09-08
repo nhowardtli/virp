@@ -42,6 +42,26 @@
 #include <sqlite3.h>
 #include <openssl/evp.h>
 
+/*
+ * t_execute() was deleted 2026-09-08. It forwarded to
+ * onode_execute_obs_ex() with client_uid hardcoded to (uid_t)-1, which
+ * onode_effective_max_tier() reads as "no per-uid ceiling, use the node-wide
+ * one" — the bypass that cost a live ceiling escape on the HEALTH path. The
+ * uid is now a required argument, so these tests pass a real one.
+ *
+ * getuid() is the honest choice here: it is the identity actually running the
+ * test, it is not the (uid_t)-1 sentinel, and no fixture in this suite sets a
+ * per-uid ceiling for it — so onode_effective_max_tier() resolves to the
+ * node-wide ceiling exactly as before and every existing expectation holds.
+ */
+static virp_error_t t_execute(onode_state_t *s, const char *dev,
+                              const char *cmd, uint8_t *buf, size_t buf_len,
+                              size_t *out_len)
+{
+    return onode_execute_obs_ex(s, dev, cmd, 1, NULL, getuid(),
+                                buf, buf_len, out_len);
+}
+
 /* =========================================================================
  * Test infrastructure
  * ========================================================================= */
@@ -304,7 +324,7 @@ TEST(test_over_tier_enforce_refused_without_connecting)
     /* Isolated LOCAL daemon state + a FRESH mock device: no other test's
      * cached connection can mask (or fake) the connect attempt, and the
      * global mock connect-fail is reset before any assertion can return
-     * early. Drive onode_execute() directly — the same gate/connect path a
+     * early. Drive t_execute() directly — the same gate/connect path a
      * socket request takes. */
     onode_state_t tmp;
     ASSERT_OK(onode_init(&tmp, 0xDEAD00A1, NULL,
@@ -329,11 +349,11 @@ TEST(test_over_tier_enforce_refused_without_connecting)
 
     virp_driver_mock_set_connect_fail(1);   /* every connect now fails */
     /* Over-tier: UNCLASSIFIED under the YELLOW ceiling, ENFORCE. */
-    virp_error_t e_over = onode_execute(&tmp, "R-L1G",
+    virp_error_t e_over = t_execute(&tmp, "R-L1G",
                             "frobnicate the flux capacitor",
                             over, sizeof(over), &over_len);
     /* Control: an ADMITTED (GREEN) command must still reach the device. */
-    virp_error_t e_adm = onode_execute(&tmp, "R-L1G", "show version",
+    virp_error_t e_adm = t_execute(&tmp, "R-L1G", "show version",
                             adm, sizeof(adm), &adm_len);
     virp_driver_mock_set_connect_fail(0);   /* reset before asserting */
 
@@ -584,7 +604,7 @@ static int shadow_exec_obs_type(onode_state_t *tmp, const char *host,
     uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
     size_t len = 0;
     *echoed = false;
-    if (onode_execute(tmp, host, cmd, buf, sizeof(buf), &len) != VIRP_OK)
+    if (t_execute(tmp, host, cmd, buf, sizeof(buf), &len) != VIRP_OK)
         return -1;
 
     virp_header_t hdr;
@@ -2234,7 +2254,7 @@ TEST(test_error_obs_connect_failure_is_error_with_true_tier)
     virp_driver_mock_set_connect_fail(1);
     uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
     size_t len = 0;
-    virp_error_t err = onode_execute(&tmp, "R-UNREACH", "show version",
+    virp_error_t err = t_execute(&tmp, "R-UNREACH", "show version",
                                      buf, sizeof(buf), &len);
     virp_driver_mock_set_connect_fail(0);
     ASSERT_OK(err);
@@ -2271,7 +2291,7 @@ TEST(test_error_obs_driver_refusal_is_error_not_output)
     size_t len = 0;
     /* "clear counters" is YELLOW for the mock classifier: allowed through
      * the gate (max=YELLOW), refused by the driver. */
-    virp_error_t err = onode_execute(&tmp, "R-WZ", "clear counters",
+    virp_error_t err = t_execute(&tmp, "R-WZ", "clear counters",
                                      buf, sizeof(buf), &len);
     virp_driver_mock_set_soft_fail(NULL);
     ASSERT_OK(err);
@@ -2313,7 +2333,7 @@ TEST(test_unprovable_dispatch_unknown_not_retried)
         "response lost after write on R-UNK");
     uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
     size_t len = 0;
-    virp_error_t err = onode_execute(&tmp, "R-UNK", "show version",
+    virp_error_t err = t_execute(&tmp, "R-UNK", "show version",
                                      buf, sizeof(buf), &len);
     virp_driver_mock_set_unknown_fail(NULL);
     int attempts = virp_driver_mock_exec_attempts_reset();
@@ -2354,7 +2374,7 @@ TEST(test_provable_no_dispatch_retry_retained)
     virp_driver_mock_set_soft_fail("refused before device I/O");
     uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
     size_t len = 0;
-    virp_error_t err = onode_execute(&tmp, "R-RETRY", "show version",
+    virp_error_t err = t_execute(&tmp, "R-RETRY", "show version",
                                      buf, sizeof(buf), &len);
     virp_driver_mock_set_soft_fail(NULL);
     int attempts = virp_driver_mock_exec_attempts_reset();
@@ -2403,7 +2423,7 @@ TEST(test_error_obs_gate_block_logs_as_error_not_change)
     uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
     size_t len = 0;
     /* "reload" is RED for the mock classifier — blocked under max=YELLOW */
-    virp_error_t err = onode_execute(&tmp, "R-GATE", "reload",
+    virp_error_t err = t_execute(&tmp, "R-GATE", "reload",
                                      buf, sizeof(buf), &len);
 
     fflush(stderr);
@@ -2548,7 +2568,7 @@ TEST(test_shadow_executes_unclassified_with_honest_tier)
      * output) and the observation must record UNCLASSIFIED honestly */
     uint8_t obs_buf[VIRP_MAX_MESSAGE_SIZE];
     size_t obs_len = 0;
-    ASSERT_OK(onode_execute(&tmp, "R-SHADOW", "frobnicate the widget",
+    ASSERT_OK(t_execute(&tmp, "R-SHADOW", "frobnicate the widget",
                             obs_buf, sizeof(obs_buf), &obs_len));
 
     virp_header_t hdr;
@@ -3211,7 +3231,7 @@ TEST(test_gate_rejection_reason_body_is_retained_and_matches_commitment)
     const char *blocked = "frobnicate the flux capacitor";
     uint8_t obs_buf[VIRP_MAX_MESSAGE_SIZE];
     size_t obs_len = 0;
-    ASSERT_OK(onode_execute(&tmp, "R-REASON", blocked,
+    ASSERT_OK(t_execute(&tmp, "R-REASON", blocked,
                             obs_buf, sizeof(obs_buf), &obs_len));
 
     /* The response is a signed ERROR observation — nothing executed. */
@@ -3551,7 +3571,7 @@ TEST(test_declared_refusal_with_body_routes_to_error)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+    virp_error_t err = t_execute(&st, "PVE-LAB", "show version",
                                      obs, sizeof(obs), &olen);
     virp_driver_mock_set_declared_refusal(NULL);
     ASSERT_OK(err);
@@ -3618,7 +3638,7 @@ TEST(test_refusal_with_body_is_not_an_execution)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+    virp_error_t err = t_execute(&st, "PVE-LAB", "show version",
                                      obs, sizeof(obs), &olen);
     virp_driver_mock_set_refusal_with_body(NULL);
     ASSERT_OK(err);
@@ -3678,7 +3698,7 @@ TEST(test_refusal_with_body_is_not_recorded_executed)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+    virp_error_t err = t_execute(&st, "PVE-LAB", "show version",
                                      obs, sizeof(obs), &olen);
     virp_driver_mock_set_refusal_with_body(NULL);
     ASSERT_OK(err);
@@ -3721,11 +3741,11 @@ TEST(test_green_execution_chains_signed_observation)
     size_t olen = 0;
 
     /* Refused RED command, so the execution below has a prior entry. */
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "reload now",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "reload now",
                             obs, sizeof(obs), &olen));
 
     /* The GREEN auto-execution under test. */
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show version",
                             obs, sizeof(obs), &olen));
 
     /* The caller still gets its O-Key-signed observation, unchanged. */
@@ -3845,7 +3865,7 @@ TEST(test_evidence_append_failure_refuses_and_executes_nothing)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show version",
                             obs, sizeof(obs), &olen));
     int attempts = virp_driver_mock_exec_attempts_reset();
 
@@ -3890,7 +3910,7 @@ TEST(test_evidence_not_required_runs_and_warns)
     ASSERT_TRUE(saved >= 0);
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+    virp_error_t err = t_execute(&st, "PVE-LAB", "show version",
                                      obs, sizeof(obs), &olen);
     ev_stderr_end(saved, log, sizeof(log));
     ASSERT_OK(err);
@@ -3941,7 +3961,7 @@ TEST(test_evidence_required_without_chain_refuses_dispatch)
     (void)virp_driver_mock_exec_attempts_reset();
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    ASSERT_OK(onode_execute(&tmp, "EV-NOCHAIN", "show version",
+    ASSERT_OK(t_execute(&tmp, "EV-NOCHAIN", "show version",
                             obs, sizeof(obs), &olen));
     int attempts = virp_driver_mock_exec_attempts_reset();
 
@@ -3978,7 +3998,7 @@ TEST(test_evidence_normal_path_leaves_two_linked_entries)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show version",
                             obs, sizeof(obs), &olen));
     ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 1);
     virp_header_t hdr;
@@ -4015,7 +4035,17 @@ TEST(test_evidence_normal_path_leaves_two_linked_entries)
     ASSERT_TRUE(strstr(rows[0].body, "\"command\":\"show version\"") != NULL);
     ASSERT_TRUE(strstr(rows[0].body, "\"classified_tier\":\"GREEN\"") != NULL);
     ASSERT_TRUE(strstr(rows[0].body, "\"decision\":\"auto-execute\"") != NULL);
-    ASSERT_TRUE(strstr(rows[0].body, "\"uid\":null") != NULL);
+    /* The chained intent now NAMES the caller. It said "uid":null only
+     * because onode_execute() hardcoded the (uid_t)-1 sentinel; with that
+     * wrapper deleted the record carries the real identity, which is the
+     * point of the change — a gate_intent that cannot say who asked is a
+     * weaker record than one that can. */
+    {
+        char uid_field[48];
+        snprintf(uid_field, sizeof(uid_field), "\"uid\":%u",
+                 (unsigned)getuid());
+        ASSERT_TRUE(strstr(rows[0].body, uid_field) != NULL);
+    }
     ASSERT_TRUE(strstr(rows[0].body, "\"session\":null") != NULL);
     ASSERT_TRUE(strstr(rows[0].body, "\"proposal_id\":null") != NULL);
     /* No device output existed yet, so none can be in here. */
@@ -4048,7 +4078,7 @@ TEST(test_evidence_degraded_latch_refuses_further_dispatch)
     size_t olen = 0;
     /* Clean execution first. */
     (void)virp_driver_mock_exec_attempts_reset();
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show version",
                             obs, sizeof(obs), &olen));
     ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 1);
 
@@ -4058,7 +4088,7 @@ TEST(test_evidence_degraded_latch_refuses_further_dispatch)
     pthread_mutex_unlock(&st.state_mutex);
 
     (void)virp_driver_mock_exec_attempts_reset();
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show version",
                             obs, sizeof(obs), &olen));
     int ran = virp_driver_mock_exec_attempts_reset();
 
@@ -4092,7 +4122,7 @@ static int ev_crash_child(void)
     virp_driver_mock_set_crash_in_execute(true);
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    (void)onode_execute(&st, "PVE-LAB", "show version",
+    (void)t_execute(&st, "PVE-LAB", "show version",
                         obs, sizeof(obs), &olen);
     return 91;                          /* not reached: the mock killed us */
 }
@@ -4176,7 +4206,7 @@ TEST(test_execution_record_commits_to_digest_not_response_body)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show status",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show status",
                             obs, sizeof(obs), &olen));
     virp_driver_mock_set_output(NULL);
 
@@ -4262,7 +4292,7 @@ TEST(test_errored_execution_still_chains_no_gap)
     virp_driver_mock_set_forced_error(VIRP_ERR_CRYPTO);
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show version",
                             obs, sizeof(obs), &olen));
     virp_driver_mock_set_forced_error(VIRP_OK);
 
@@ -4322,7 +4352,7 @@ TEST(test_separator_refusal_chains_rejection_without_proposing)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version ; reload",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show version ; reload",
                             obs, sizeof(obs), &olen));
 
     virp_header_t hdr;
@@ -4386,7 +4416,7 @@ TEST(test_pipe_refusal_chains_and_mints_no_execution)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    ASSERT_OK(onode_execute(&st, "PVE-LAB",
+    ASSERT_OK(t_execute(&st, "PVE-LAB",
                             "show running-config | include hostname",
                             obs, sizeof(obs), &olen));
 
@@ -4424,7 +4454,7 @@ TEST(test_refused_action_still_chains_gate_rejection)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "reload now",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "reload now",
                             obs, sizeof(obs), &olen));
 
     virp_header_t hdr;
@@ -4467,15 +4497,15 @@ TEST(test_chain_verify_over_mixed_executions_and_rejections)
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
 
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show version",
                             obs, sizeof(obs), &olen));
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "reload now",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "reload now",
                             obs, sizeof(obs), &olen));
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show interfaces brief",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show interfaces brief",
                             obs, sizeof(obs), &olen));
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "erase startup-config",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "erase startup-config",
                             obs, sizeof(obs), &olen));
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "get status",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "get status",
                             obs, sizeof(obs), &olen));
 
     virp_chain_verify_result_t vr;
@@ -4595,7 +4625,7 @@ TEST(test_scrub_G1_clean_capture_verifies)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+    virp_error_t err = t_execute(&st, "PVE-LAB", "show version",
                                      obs, sizeof(obs), &olen);
     virp_driver_mock_set_output(NULL);
     ASSERT_OK(err);
@@ -4648,7 +4678,7 @@ TEST(test_scrub_G2_planted_secrets_redacted_and_verifies)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    virp_error_t err = onode_execute(&st, "PVE-LAB", "show running-config",
+    virp_error_t err = t_execute(&st, "PVE-LAB", "show running-config",
                                      obs, sizeof(obs), &olen);
     virp_driver_mock_set_output(NULL);
     ASSERT_OK(err);
@@ -4711,7 +4741,7 @@ TEST(test_scrub_G3_fail_closed_full_redaction)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    virp_error_t err = onode_execute(&st, "PVE-LAB", "show version",
+    virp_error_t err = t_execute(&st, "PVE-LAB", "show version",
                                      obs, sizeof(obs), &olen);
     virp_scrub_test_force_error(false);
     virp_driver_mock_set_output(NULL);
@@ -4755,7 +4785,7 @@ TEST(test_scrub_G4_existing_entries_untouched)
     size_t olen = 0;
 
     /* the pre-existing entry (clean capture) */
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "show version",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "show version",
                             obs, sizeof(obs), &olen));
 
     /* snapshot it BEFORE the scrubbed append, through a separate
@@ -4765,7 +4795,7 @@ TEST(test_scrub_G4_existing_entries_untouched)
 
     /* the scrubbed capture */
     virp_driver_mock_set_output("enable secret 5 $1$CANARYg4\n");
-    virp_error_t err = onode_execute(&st, "PVE-LAB", "show running-config",
+    virp_error_t err = t_execute(&st, "PVE-LAB", "show running-config",
                                      obs, sizeof(obs), &olen);
     virp_driver_mock_set_output(NULL);
     ASSERT_OK(err);
@@ -4827,7 +4857,7 @@ TEST(test_black_enforce_refused_at_gate)
 
     uint8_t obs[VIRP_MAX_MESSAGE_SIZE];
     size_t olen = 0;
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "selfdestruct now",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "selfdestruct now",
                             obs, sizeof(obs), &olen));
 
     virp_header_t hdr;
@@ -4879,7 +4909,7 @@ TEST(test_shadow_black_refused_recorded_driver_never_invoked)
      * UNCLASSIFIED command EXECUTES — so the refusal below cannot be
      * ENFORCE quietly doing the work. */
     virp_driver_mock_exec_attempts_reset();
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "frobnicate the widget",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "frobnicate the widget",
                             obs, sizeof(obs), &olen));
     {
         virp_header_t hdr;
@@ -4895,7 +4925,7 @@ TEST(test_shadow_black_refused_recorded_driver_never_invoked)
     }
 
     /* The BLACK command: refused, driver untouched. */
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "selfdestruct now",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "selfdestruct now",
                             obs, sizeof(obs), &olen));
 
     virp_header_t hdr;
@@ -4977,12 +5007,12 @@ TEST(test_shadow_yellow_red_still_proceed_and_are_recorded)
 
     /* YELLOW, within the ceiling: would-allow, proceeds. */
     virp_driver_mock_exec_attempts_reset();
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "clear counters",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "clear counters",
                             obs, sizeof(obs), &olen));
     ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 1);
 
     /* RED, over the ceiling: would-block under ENFORCE, proceeds. */
-    ASSERT_OK(onode_execute(&st, "PVE-LAB", "reload now",
+    ASSERT_OK(t_execute(&st, "PVE-LAB", "reload now",
                             obs, sizeof(obs), &olen));
     ASSERT_EQ(virp_driver_mock_exec_attempts_reset(), 1);
 
@@ -5370,7 +5400,7 @@ TEST(test_watchdog_health_check_serialized_with_execute)
 
     uint8_t obs_buf[VIRP_MAX_MESSAGE_SIZE];
     size_t obs_len = 0;
-    virp_error_t err = onode_execute(&tmp, "R-RACE", "show version",
+    virp_error_t err = t_execute(&tmp, "R-RACE", "show version",
                                      obs_buf, sizeof(obs_buf), &obs_len);
 
     virp_driver_mock_set_delay(0);
