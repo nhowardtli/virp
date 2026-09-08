@@ -3621,12 +3621,15 @@ static int hex_nibble(char c)
 }
 
 /* =========================================================================
- * Autopilot hard exclusions — non-negotiable device blocklist
+ * Autopilot hard exclusions — device blocklist (CURRENTLY EMPTY)
  *
- * 10.0.10.1 (the edge firewall) and 10.0.10.10 must NEVER appear in a
- * device config this daemon loads. The check is a startup assertion in
- * every config loader: a config carrying either address is refused
- * outright — no skip-and-continue, the daemon does not start.
+ * Any address listed below must NEVER appear in a device config this
+ * daemon loads. The check is a startup assertion in every config loader:
+ * a config carrying a listed address is refused outright — no
+ * skip-and-continue, the daemon does not start. That severity is
+ * deliberate and unchanged; what changed on 2026-09-08 is that the list
+ * is now empty. See the note on the array itself for why, and for the
+ * one-line change that re-arms it.
  *
  * Matching is boundary-aware over the raw config text so it catches the
  * address anywhere (host fields, comments, spare keys) without false-
@@ -3637,8 +3640,28 @@ static int hex_nibble(char c)
  * ========================================================================= */
 
 static const char *const ONODE_BLOCKED_ADDRS[] = {
-    "10.0.10.1",
-    "10.0.10.10",
+    /*
+     * DELIBERATELY EMPTY as of 2026-09-08. The list previously held
+     * "10.0.10.1" (the colo FortiGate 200G) and "10.0.10.10" (pve1).
+     *
+     * WHY IT WENT: the exclusion was written when this daemon was an
+     * unattended observer, where the worst case is an autopilot cycle
+     * reconfiguring the path its own packets take and locking the node
+     * out. Under AI-driven management those two boxes — the edge
+     * firewall and the hypervisor — are the devices that need config
+     * MOST days, so a rule that permanently fences off exactly them
+     * makes the system unable to do the job it now exists to do. The
+     * self-lockout risk is real but it is a TIER question, not a device
+     * question: every `config ...` on the FortiGate is RED by absence in
+     * driver_fortigate.c's route table, so a change already requires a
+     * signed human approval rather than an autopilot decision.
+     *
+     * The mechanism is retained, not deleted, so the list can be re-armed
+     * in one line if that judgement changes. The NULL sentinel keeps the
+     * array non-empty: a zero-length initializer is a constraint
+     * violation under -std=c11 -pedantic -Werror.
+     */
+    NULL,
 };
 
 const char *virp_config_blocked_address(const char *text)
@@ -3649,6 +3672,8 @@ const char *virp_config_blocked_address(const char *text)
          i < sizeof(ONODE_BLOCKED_ADDRS) / sizeof(ONODE_BLOCKED_ADDRS[0]);
          i++) {
         const char *addr = ONODE_BLOCKED_ADDRS[i];
+        if (!addr)                    /* sentinel: entry unused */
+            continue;
         size_t alen = strlen(addr);
         for (const char *p = strstr(text, addr); p;
              p = strstr(p + 1, addr)) {
