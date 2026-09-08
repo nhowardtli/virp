@@ -25,7 +25,7 @@ authorization (`aaa authorization exec`), not for *command* authorization;
 Cisco TAC doc 215792 states command authorization "applies to all the ASA
 sessions (serial console, ssh, telnet)".
 
-**So with `aaa authorization command GRP-VIRPAZ` and no `LOCAL`, if CT 215 goes
+**So with `aaa authorization command VIRP-AUTHZ` and no `LOCAL`, if CT 215 goes
 down your serial console is locked out too.** You would be holding a console
 cable at a prompt that refuses every command, and the only documented recovery
 is a reload to an unsaved configuration. This is why `reload in` is armed
@@ -36,9 +36,9 @@ ways:
 
 | | setting | CT 215 up | CT 215 down |
 |---|---|---|---|
-| SSH authentication | `aaa authentication ssh console GRP-VIRPAZ` — **no `LOCAL`** | `virp-ro`, `nhoward` via 215 | **nobody can SSH in.** Gate fails closed; `admin` has no SSH path |
+| SSH authentication | `aaa authentication ssh console VIRP-AUTHZ` — **no `LOCAL`** | `virp-ro`, `nhoward` via 215 | **nobody can SSH in.** Gate fails closed; `admin` has no SSH path |
 | serial authentication | `aaa authentication serial console LOCAL` | `admin`, local | `admin`, local — unaffected |
-| command authorization | `aaa authorization command GRP-VIRPAZ LOCAL` | every command decisioned on 215 | console `admin` works via priv-15 local fallback |
+| command authorization | `aaa authorization command VIRP-AUTHZ LOCAL` | every command decisioned on 215 — **including the console's, as `enable_15`** | console works via priv-15 local fallback |
 
 **Dropping `LOCAL` from the SSH authentication line is what makes "admin stays
 console-only" true by construction rather than by convention.** With `LOCAL`
@@ -47,8 +47,53 @@ authorization's own `LOCAL` fallback would then authorize it by privilege
 level — everything. That is the IOS §9.3 self-escalation route reappearing in
 a different shape.
 
-**Keeping `LOCAL` on the command-authorization line is what preserves the
-console break-glass.** Without it, a 215 outage locks out the console as well.
+### CORRECTION, 2026-09-08 — `LOCAL` on command authorization is NOT the whole console story, and this caused a real lockout
+
+The original analysis said: *"keeping `LOCAL` on the command-authorization line
+is what preserves the console break-glass."* **That is true only for the case
+where CT 215 is UNREACHABLE, and it is the less likely failure.** Two facts
+were missed, and together they locked the console during the live switchover:
+
+1. **The serial console does not present `admin`. It presents `enable_15`.**
+   An unauthenticated console session on this ASA authorizes its commands as
+   user `enable_15`, with no usable `rem-addr`. Cisco TAC doc 215792 says this
+   about *accounting* — "command accounting will still show username
+   `enable_15` instead of the real username" — and that sentence was quoted in
+   the Phase 0 survey without following it through to **authorization**, which
+   uses the same identity.
+
+2. **`LOCAL` fallback engages on UNREACHABLE, never on DENY.** Cisco is
+   explicit: fallback happens only when "no server in the group responds". A
+   server that responds with a denial is a completed transaction, not a
+   failure, so no fallback occurs.
+
+Put together: with 215 **up** and no `enable_15` account on it, every console
+command was sent to 215, denied for an unknown user, and **not** covered by
+`LOCAL`. The console refused everything while the server was perfectly healthy.
+The `LOCAL` keyword protects against the outage case and does nothing at all
+about this one.
+
+**The fix, applied on CT 215:** a `user enable_15` with a
+`console_breakglass_profile` — **no source acl** (the console has no usable
+`rem-addr` to test), `nas`-scoped to `asa_devices` so the identity is
+meaningless on any other device, priv-lvl 15, permit-all. It is reachable only
+from the console in practice: SSH must authenticate through 215 first, and no
+password is defined for `enable_15`.
+
+**This does not weaken the identity plan; it relocates the break-glass.** Every
+command `enable_15` types is accounted by the ASA to 313 and grades
+`BREAKGLASS_USED` / RED there, exactly as `admin` would have. What changed is
+that the console's break-glass now depends on 215 holding an account — so the
+honest statement of the failure modes is:
+
+| CT 215 state | console |
+|---|---|
+| up, `enable_15` present | works, every command decisioned and graded RED |
+| up, `enable_15` ABSENT | **locked out** — denied, and `LOCAL` does not cover it |
+| unreachable | works, via `LOCAL` priv-15 fallback |
+
+The middle row is the one that bit. `reload in` is the recovery for it, which
+is why the net is armed from Step 2.
 
 **The gate fails closed at AUTHENTICATION, not at authorization.** With no
 LOCAL `virp-ro` on the ASA, a 215 outage means `virp-ro` cannot authenticate at
@@ -101,6 +146,18 @@ daemon's **MainPID stayed 174** across both, and LAB-SWITCH-1's 60-second
    DHCP-assigned, like 10.0.0.45, and both want FortiGate reservations**: the
    day either lease moves, that operator is refused on every enrolled device at
    once.
+
+6. **`user enable_15` + `console_breakglass_profile`** — added during the live
+   switchover, for the reason argued in the CORRECTION above. `nas`-scoped to
+   `asa_devices`, no source acl, priv 15, permit-all.
+
+**Naming note.** The `host` block on 215 is called **`ASA-5525`**, while the
+fleet row, the accounting `client_identity` on 313 and this document all use
+**`ASA-Lab`**. That is cosmetic and not a broken join: the `authorization log`
+format writes `${nas}`, which renders the **address** (`10.0.0.253`), not the
+block name, and the device-scoping match is `net asa_devices` on the address
+too. Recorded so nobody later assumes the two names must agree, or "fixes" one
+of them expecting a correlation to change.
 
 ### Still to do on 215 — the key, which is yours
 
@@ -172,11 +229,20 @@ Two things to read out:
 
 - **`show running-config username`** — expect `admin` and `aiops-svc`. Record
   it; Step 6 has to reduce this to `admin` alone.
-- **`show clock`** against 313. As of the Phase 2 handover the ASA was
-  **13m26s behind** with NTP configured but not converged. It cannot corrupt
-  ASA accounting records (no device timestamp is carried) but the three-column
-  timeline at the end of this runbook is unreadable with that skew. Fix it
-  before Step 7.
+- **`show clock`** against 313. At the Phase 2 handover the ASA was **13m26s
+  behind** with NTP configured but not converged. It cannot corrupt ASA
+  accounting records — no device timestamp is carried, per Phase 1's second
+  finding — but the three-column timeline at the end of this runbook is
+  unreadable with that skew.
+
+  **FINDING 2026-09-08 — NTP needed a default route on `management`.** The
+  server was configured and reachable-looking, and still never synced, because
+  the ASA had no route to it out the management interface. This is the *same*
+  failure shape as the `aaa-server` `(INSIDE)`/`(management)` defect in Phase 1
+  and it presents the same way: configured, plausible, silently doing nothing.
+  Two pre-existing outside default routes were removed as part of the fix.
+  **On this device, assume nothing management-plane works until its path out
+  of `management` is proven.**
 
 ---
 
@@ -184,8 +250,8 @@ Two things to read out:
 
 ```
 configure terminal
- aaa-server GRP-VIRPAZ protocol tacacs+
- aaa-server GRP-VIRPAZ (management) host 10.0.0.215
+ aaa-server VIRP-AUTHZ protocol tacacs+
+ aaa-server VIRP-AUTHZ (management) host 10.0.0.215
   key <the 32 characters from CT 215>
   server-port 49
  exit
@@ -204,19 +270,27 @@ on the standard port.
 the step Phase 1 did not have and should have:
 
 ```
-test aaa-server authentication GRP-VIRPAZ host 10.0.0.215 username virp-ro password <virp-ro password>
+test aaa-server authentication VIRP-AUTHZ host 10.0.0.215 username virp-ro password <virp-ro password>
 ```
 
 `INFO: Authentication Successful` means key, interface, route and account are
 all correct. Anything else — stop, fix, and do not proceed to Step 3. A failure
 here is harmless; the same failure discovered in Step 3 is a lockout.
 
+**Test `virp-ro`, not `nhoward`, and know why.** `test aaa-server` sends
+`0.0.0.0` as the remote address, so `nhoward` fails it with `AUTHC-FAIL-ACL` —
+`operator_profile`'s acl compares the source against `operator_sources` and
+`0.0.0.0` is not in it. **That failure is expected and is not a fault**;
+measured 2026-09-08. `virp-ro`'s profile has no source acl, so it is the
+identity that gives a meaningful answer here. The operator path is proven for
+real in Step 5a, from an actual SSH session with a real source address.
+
 **Rollback (do Step 3's rollback first if both are in):**
 
 ```
 configure terminal
- no aaa-server GRP-VIRPAZ (management) host 10.0.0.215
- no aaa-server GRP-VIRPAZ protocol tacacs+
+ no aaa-server VIRP-AUTHZ (management) host 10.0.0.215
+ no aaa-server VIRP-AUTHZ protocol tacacs+
 end
 ```
 
@@ -235,14 +309,33 @@ Keep the console session open the entire time.
 configure terminal
  aaa authentication serial console LOCAL
  aaa authorization exec authentication-server auto-enable
- aaa authorization command GRP-VIRPAZ LOCAL
- aaa authentication ssh console GRP-VIRPAZ
+ aaa authorization command VIRP-AUTHZ LOCAL
+ no aaa authentication ssh console LOCAL
+ aaa authentication ssh console VIRP-AUTHZ
 end
 ```
 
 Order within the block matters. Serial-console LOCAL is asserted **first**, so
 the recovery path is explicit before anything else moves. SSH authentication
 changes **last**, because it is the line that can lock you out.
+
+**FINDING 2026-09-08 — the old SSH authentication line must be REMOVED first,
+not overwritten.** `aaa authentication ssh console LOCAL` already existed on
+this device (it is how `aiops-svc` and `admin` logged in through Phase 2).
+Typing the new line on top of it does **not** replace it: the ASA refuses with
+
+```
+ERROR: Range already exists
+```
+
+and the old `LOCAL` line stays in force, which means the switchover silently
+does not happen — you would be left believing SSH authenticates against 215
+while it still authenticates locally. Hence the explicit `no` line above.
+
+This is not the general ASA idiom: `aaa authorization exec` and
+`aaa authentication serial console` **do** overwrite in place, which is why the
+other lines in this block need no `no`. Only the `ssh console` list behaved
+this way here.
 
 **`aaa authorization exec authentication-server auto-enable` replaces
 `aaa authorization exec LOCAL auto-enable`** and is not optional. With `LOCAL`,
@@ -257,7 +350,7 @@ aaa` during Phase 2.
 ```
 configure terminal
  aaa authentication ssh console LOCAL
- no aaa authorization command GRP-VIRPAZ LOCAL
+ no aaa authorization command VIRP-AUTHZ LOCAL
  aaa authorization exec LOCAL auto-enable
 end
 ```
@@ -393,6 +486,137 @@ write memory
 ```
 
 Only once Step 5 has passed and Step 6's invariant reads clean.
+
+---
+
+## Test results — 2026-09-08 02:52Z–02:56Z
+
+### 5b — GREEN read, permitted
+
+```
+device=ASA-Lab command="show version"
+trust_tier=GREEN (0x01)  seq=105  obs_type=0x07 (signed observation)
+signature=VALID
+gate_decision=allowed
+```
+
+Output **unpaged** — `grep -c "More"` over a full `show version` returns 0.
+CT 215: `02:55:53 … virp-ro … virp_ro_profile permit shell show version
+AUTHZ-PASS`.
+
+### 5c — RED refusal, both other recorders silent
+
+```
+device=ASA-Lab command="configure terminal"
+trust_tier=RED (0x03)  seq=110  obs_type=0x0f (ERROR — signed rejection, nothing executed)
+gate_decision=blocked
+ERROR: tier gate blocked 'configure terminal' on 'ASA-Lab' (tier=RED max=GREEN)
+       proposal_id=2ebb7593abec1abdede11f5a913578d8
+```
+
+Refused at 02:56:01. **CT 215 has no line for `configure terminal` at all** —
+its decisions either side are `02:55:54 show version` and `02:56:09 show
+clock`. **313 has no accounting record** — the last one is the EXEC START at
+02:52:04. Two empty cells, same finding as the 2960.
+
+The cadence witness works as designed and on the recorder the Phase 1 finding
+predicted: 215's authorization log carries an unbroken `show clock` rhythm
+across the refusal — 02:55:50, 02:56:09, 02:56:27, 02:56:46 — on a different
+host from the gate. The accounting log could not have provided it, because the
+ASA accounts no `show` commands.
+
+### Settled: the ASA does NOT send `<cr>`
+
+215 logs the command as `show version`, not `show version <cr>`. IOS on
+LAB-SWITCH-1 logs `show clock <cr>`. This was flagged as an open measurement
+in `green-asa.conf`'s header and in Step 5b; it is now answered. The generated
+rules make the terminator optional, so they were correct for both platforms —
+but the reason they are correct is now measured rather than hoped.
+
+### Confirmed: `enable_15` console commands are accounted and attributable
+
+313's chain carries the console work under `user=enable_15`, e.g.
+`cmd=route management 0.0.0.0 0.0.0.0 10.0.0.1 1`, `cmd=ping management
+8.8.8.8`, `cmd=write`. The break-glass identity is fully visible in the
+accounting stream and grades `BREAKGLASS_USED` / RED, which is what makes
+relocating the break-glass to `enable_15` acceptable rather than a hole.
+
+The console lockout is also visible in 215's denial log as its own artefact —
+`show running-config`, `show running-config aaa`, `end` and `exit` denied for
+the console before `user enable_15` existed.
+
+---
+
+## Finding `ASA-DRIVER-SETUP-UNAUTHORIZED`
+
+**CT 215 denies `terminal pager 0`, which the driver issues itself on every
+connect.** Observed three times, once per gate connection:
+
+```
+02:52:05 10.0.0.253  virp-ro  22  10.0.0.13  virp_ro_profile  deny  shell  terminal pager 0  AUTHZ-FAIL
+03:00:17 10.0.0.253  virp-ro  22  10.0.0.13  virp_ro_profile  deny  shell  terminal pager 0  AUTHZ-FAIL
+```
+
+**Why it happens.** `gen-green-conf.py` derives the permitted set from the
+driver's **gate table** — the commands a *caller* may ask the gate to run.
+`driver_asa.c` also issues commands of its own as transport conditioning
+(`terminal pager 0`, `terminal width 512` on the enable path; `exit` on
+teardown). Those never traverse the gate and are in no tier table, so the
+generated policy has no rule for them and the trailing `deny` catches them.
+The gate and the policy server do not disagree about what GREEN means — they
+disagree about whether the driver's own housekeeping is a command at all. The
+ASA has no such category: it authorizes every line.
+
+**Why it is harmless here.** Global `pager lines 0` is configured on this
+device, so paging is already off and the denied command was redundant. Measured
+above: a full `show version` through the gate returns unpaged. Note the
+denial also means the command is never executed, so — unlike Phase 2, where it
+was permitted and produced `cmd=terminal pager 0` in accounting — there is now
+no accounting record for it either.
+
+**Why it is not nothing.** It writes an `AUTHZ-FAIL` into the decision log on
+every single gate connection, shaped exactly like a real policy violation. That
+is the log a reader consults to establish that nothing leaked past a refusal,
+and a permanent benign denial in it trains readers to skim denials. It also
+means the "215 is silent" argument for a refused cell needs a caveat, which is
+precisely the kind of caveat that erodes an evidence claim.
+
+**Scope: it is a class, not one command.** `exit` is denied on the same
+grounds (observed for `aiops-svc` at 02:50:09). `terminal width 512` does not
+appear in the log at all, permitted or denied, and no claim is made here about
+why — it was not investigated.
+
+### Decision: the driver stops sending it. The generator does NOT widen.
+
+**Rejected — adding driver setup commands to the generated permit set.** It
+would make the authorization server **looser than the gate**: `terminal pager
+0` is RED-by-absence in `ASA_ROUTE_TABLE`, so the gate refuses it from any
+caller, and 215 would then permit a command the gate itself would not. The
+whole point of generating the policy from the driver table is that the two
+cannot silently disagree, and `check_no_green_shadows_worse` exists to stop the
+policy admitting more than the gate does. Buying log tidiness by inverting that
+relationship is the wrong trade, especially when the functional need is already
+met by `pager lines 0`.
+
+**Chosen — the driver should not send a pager command to a device whose pager
+is already disabled**, declared per device in the same idiom as
+`asa_auto_enable`: a row-level flag (working name `asa_pager_preset`) meaning
+*this device has `pager lines 0` globally; do not issue the session command*.
+That keeps the fence exactly equal to the gate table, removes the recurring
+denial, and — like `asa_auto_enable` — makes the driver's behaviour follow an
+operator's declaration about the device rather than a guess.
+
+It is deliberately **not** "skip the pager when the pager is already 0" as a
+runtime check: reading the current setting means `show running-config pager`,
+which matches the YELLOW `show running-config` prefix and would itself be
+refused. The declaration avoids needing to ask.
+
+**Not implemented this run.** Phase 0 Decision 2 said no driver patch, and that
+still holds; this is the change that decision deferred, now with a measured
+reason to make it. **Interim state: the denial stands and is documented**, and
+any reader of 215's log for this device should expect exactly one benign
+`terminal pager 0` `AUTHZ-FAIL` per gate connection. Anything else denied is
+real.
 
 ---
 

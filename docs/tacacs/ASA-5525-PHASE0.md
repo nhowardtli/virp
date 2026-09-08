@@ -331,6 +331,48 @@ when 215 is down. The two lines pull in opposite directions on purpose.
   LAB-SWITCH-1. **No LOCAL `virp-ro` on the ASA, ever.**
 - Nothing else in the ASA's local database.
 
+**CORRECTION, 2026-09-08 — this analysis was incomplete and it caused a real
+console lockout during the Phase 3 switchover.** Two things above are wrong or
+missing, and they compound:
+
+1. **The serial console does not present `admin`.** It presents **`enable_15`**
+   — an unauthenticated console session authorizes its commands under that
+   identity, with no usable `rem-addr`. The Cisco TAC source cited in §2 says
+   exactly this about *accounting* ("command accounting will still show
+   username `enable_15` instead of the real username") and it was quoted here
+   without following it through to *authorization*, which uses the same
+   identity. Every statement above about "console `admin`" is therefore about
+   an identity the console never sends.
+
+2. **`LOCAL` fallback engages on UNREACHABLE, never on DENY.** §2 records this
+   correctly — "fallback only happens when no server in the group responds" —
+   and then the lockout table below silently assumed `LOCAL` would cover the
+   console in *all* server-side failures. A server that responds with a denial
+   has completed a transaction, not failed, so nothing falls back.
+
+Together: with CT 215 **up** and holding no `enable_15` account, every console
+command was denied for an unknown user, and `LOCAL` did not apply. **The
+console refused everything while the authorization server was perfectly
+healthy** — the failure mode the `LOCAL` keyword was chosen to prevent, arrived
+by a route the keyword does not cover.
+
+Fixed by adding `user enable_15` on CT 215 with a `console_breakglass_profile`:
+no source acl (the console has no usable `rem-addr` to test), `nas`-scoped to
+`asa_devices`, priv-lvl 15, permit-all. The break-glass is **relocated, not
+weakened** — every command it types is still accounted to 313 and still grades
+`BREAKGLASS_USED` / RED. The honest failure table is:
+
+| CT 215 state | console |
+|---|---|
+| up, `enable_15` present | works; every command decisioned and graded RED |
+| up, `enable_15` ABSENT | **locked out** — denied, and `LOCAL` does not cover it |
+| unreachable | works, via `LOCAL` priv-15 fallback |
+
+**So the identity plan gains a fourth entry**: `enable_15`, existing only on CT
+215, never on the ASA, `nas`-scoped to this one device, permit-all, graded RED
+in accounting. It is the console's identity, not a person's, and it is what
+makes the console break-glass real rather than assumed.
+
 **The invariant to assert, not assume.** The safety of the priv-15 path chosen
 in [Decision 2](#decisions-taken-at-this-gate) rests entirely on "no LOCAL
 `virp-ro` on the ASA." Phase 3 must check it rather than trust it:
