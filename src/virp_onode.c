@@ -3639,40 +3639,47 @@ static int hex_nibble(char c)
  * "10.0.10.10" rules.
  * ========================================================================= */
 
-static const char *const ONODE_BLOCKED_ADDRS[] = {
-    /*
-     * DELIBERATELY EMPTY as of 2026-09-08. The list previously held
-     * "10.0.10.1" (the colo FortiGate 200G) and "10.0.10.10" (pve1).
-     *
-     * WHY IT WENT: the exclusion was written when this daemon was an
-     * unattended observer, where the worst case is an autopilot cycle
-     * reconfiguring the path its own packets take and locking the node
-     * out. Under AI-driven management those two boxes — the edge
-     * firewall and the hypervisor — are the devices that need config
-     * MOST days, so a rule that permanently fences off exactly them
-     * makes the system unable to do the job it now exists to do. The
-     * self-lockout risk is real but it is a TIER question, not a device
-     * question: every `config ...` on the FortiGate is RED by absence in
-     * driver_fortigate.c's route table, so a change already requires a
-     * signed human approval rather than an autopilot decision.
-     *
-     * The mechanism is retained, not deleted, so the list can be re-armed
-     * in one line if that judgement changes. The NULL sentinel keeps the
-     * array non-empty: a zero-length initializer is a constraint
-     * violation under -std=c11 -pedantic -Werror.
-     */
-    NULL,
-};
+/*
+ * The PRODUCTION list is DELIBERATELY EMPTY as of 2026-09-08. It
+ * previously held "10.0.10.1" (the colo FortiGate 200G) and "10.0.10.10"
+ * (pve1).
+ *
+ * WHY IT WENT: the exclusion was written when this daemon was an
+ * unattended observer, where the worst case is an autopilot cycle
+ * reconfiguring the path its own packets take and locking the node out.
+ * Under AI-driven management those two boxes — the edge firewall and the
+ * hypervisor — are the devices that need config MOST days, so a rule
+ * that permanently fences off exactly them makes the system unable to do
+ * the job it now exists to do. The self-lockout risk is real but it is a
+ * TIER question, not a device question: every `config ...` on the
+ * FortiGate is RED by absence in driver_fortigate.c's route table, so a
+ * change already requires a signed human approval rather than an
+ * autopilot decision.
+ *
+ * A NULL pointer with count 0 rather than an empty initializer: a
+ * zero-length array initializer is a constraint violation under
+ * -std=c11 -pedantic -Werror. Re-arming is a one-line change — point
+ * this at a static array and set the count.
+ */
+static const char *const *const ONODE_BLOCKED_ADDRS = NULL;
+static const size_t ONODE_BLOCKED_ADDRS_N = 0;
 
-const char *virp_config_blocked_address(const char *text)
+/*
+ * The matcher takes its list explicitly so the boundary-aware scan stays
+ * under test independently of what production happens to block. Testing
+ * the scan through the production list would mean the tests only cover
+ * the matcher while that list is non-empty — exactly backwards, since an
+ * empty list is when a silent matcher bug is least likely to be noticed.
+ */
+const char *virp_config_blocked_address_in(const char *text,
+                                           const char *const *addrs,
+                                           size_t n_addrs)
 {
-    if (!text) return NULL;
+    if (!text || !addrs) return NULL;
 
-    for (size_t i = 0;
-         i < sizeof(ONODE_BLOCKED_ADDRS) / sizeof(ONODE_BLOCKED_ADDRS[0]);
-         i++) {
-        const char *addr = ONODE_BLOCKED_ADDRS[i];
-        if (!addr)                    /* sentinel: entry unused */
+    for (size_t i = 0; i < n_addrs; i++) {
+        const char *addr = addrs[i];
+        if (!addr)
             continue;
         size_t alen = strlen(addr);
         for (const char *p = strstr(text, addr); p;
@@ -3686,6 +3693,12 @@ const char *virp_config_blocked_address(const char *text)
         }
     }
     return NULL;
+}
+
+const char *virp_config_blocked_address(const char *text)
+{
+    return virp_config_blocked_address_in(text, ONODE_BLOCKED_ADDRS,
+                                          ONODE_BLOCKED_ADDRS_N);
 }
 
 /* File variant for the config loaders: reads up to 1 MiB of the config
