@@ -1965,19 +1965,147 @@ static int cmd_chain_verify(int argc, char **argv)
                                          : ONODE_DEFAULT_SOCKET, session);
 }
 
+/*
+ * `virp chain index --db PATH` — create idx_chain_entry_hash on a chain
+ * database, so the READ-ONLY verifier path is usable on it.
+ *
+ * Why this exists. The daemon creates this index on first open, from
+ * SCHEMA_SQL. The verifier does not: virp_chain_open_verifier() opens
+ * SQLITE_OPEN_READONLY and runs no schema, deliberately — a verifier must not
+ * be able to write to the artefact it is judging. The consequence is that a
+ * copy taken from a chain no updated daemon has ever opened has no index, and
+ * every hash-keyed body lookup during a verify full-scans the table: measured
+ * 55 ms per entry on a 367k-entry chain, which is the difference between a
+ * verify that finishes in under a minute and one that does not finish at all.
+ *
+ * So this is an explicit, opt-in, operator-run step on a COPY — never
+ * something the verifier does behind your back. It writes, and it says so.
+ *
+ * It does not touch content. CREATE UNIQUE INDEX derives an index from rows
+ * that are already there; it cannot alter an entry, a hash or an HMAC, and a
+ * verify run afterwards reaches exactly the same verdict it would have reached
+ * on the unindexed file — just sooner. The UNIQUE-ness is itself a check: it
+ * fails rather than builds if two entries share a chain_entry_hash, which on
+ * this schema can only mean a SHA-256 collision or a tampered database.
+ */
+static void chain_index_usage(void)
+{
+    fprintf(stderr,
+        "Usage: virp chain index --db PATH\n"
+        "\n"
+        "Creates idx_chain_entry_hash on a chain database so the read-only\n"
+        "verifier can use it. Run this on a COPY, then verify the copy:\n"
+        "\n"
+        "    sqlite3 /var/lib/virp/chain.db \".backup copy.db\"\n"
+        "    virp chain index  --db copy.db\n"
+        "    virp chain verify --db copy.db --pubkey chain-sign.pub\n"
+        "\n"
+        "WRITES to the named file. Never point it at a live chain the daemon\n"
+        "has open, and never at the only copy you hold.\n");
+}
+
+static int cmd_chain_index(int argc, char **argv)
+{
+    const char *db_path = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
+            db_path = argv[++i];
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            chain_index_usage();
+            return 1;
+        }
+    }
+    if (!db_path) {
+        fprintf(stderr, "Error: --db is required\n");
+        chain_index_usage();
+        return 1;
+    }
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
+        fprintf(stderr, "Error: cannot open %s read-write: %s\n",
+                db_path, db ? sqlite3_errmsg(db) : "(no handle)");
+        if (db) sqlite3_close(db);
+        return 1;
+    }
+
+    /* Refuse a database that is not a chain, rather than creating an index on
+     * whatever was named by mistake. */
+    sqlite3_stmt *st = NULL;
+    int have_table = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT count(*) FROM sqlite_master "
+            "WHERE type='table' AND name='chain_entries'", -1, &st, NULL)
+        == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW)
+            have_table = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    if (!have_table) {
+        fprintf(stderr, "Error: %s has no chain_entries table — not a chain "
+                        "database\n", db_path);
+        sqlite3_close(db);
+        return 1;
+    }
+
+    int already = 0;
+    st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT count(*) FROM sqlite_master "
+            "WHERE name='idx_chain_entry_hash'", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW)
+            already = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    if (already) {
+        printf("idx_chain_entry_hash already present on %s — nothing to do\n",
+               db_path);
+        sqlite3_close(db);
+        return 0;
+    }
+
+    char *err = NULL;
+    if (sqlite3_exec(db,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_entry_hash "
+            "  ON chain_entries(chain_entry_hash);", NULL, NULL, &err)
+        != SQLITE_OK) {
+        /* A UNIQUE violation here is a finding, not a nuisance: on this schema
+         * two entries cannot share a hash unless something is wrong. */
+        fprintf(stderr, "Error: could not create idx_chain_entry_hash: %s\n",
+                err ? err : "(unknown)");
+        fprintf(stderr, "If this is a uniqueness violation, two entries share a "
+                        "chain_entry_hash. That is not a normal condition — "
+                        "investigate before verifying.\n");
+        if (err) sqlite3_free(err);
+        sqlite3_close(db);
+        return 1;
+    }
+    sqlite3_close(db);
+    printf("idx_chain_entry_hash created on %s\n", db_path);
+    printf("The read-only verifier can now use it: "
+           "virp chain verify --db %s --pubkey <pub>\n", db_path);
+    return 0;
+}
+
 static int cmd_chain(int argc, char **argv)
 {
     if (argc >= 1 && strcmp(argv[0], "tail") == 0)
         return cmd_chain_tail(argc - 1, argv + 1);
     if (argc >= 1 && strcmp(argv[0], "verify") == 0)
         return cmd_chain_verify(argc - 1, argv + 1);
+    if (argc >= 1 && strcmp(argv[0], "index") == 0)
+        return cmd_chain_index(argc - 1, argv + 1);
     fprintf(stderr,
         "Usage: virp chain tail [-n N] [--db PATH]\n"
         "       virp chain verify --session S [--socket PATH]\n"
         "       virp chain verify --db PATH --key PATH [--session S]\n"
+        "       virp chain index  --db PATH\n"
         "`tail` prints the last N chain entries (default 10, oldest\n"
         "first), read-only. `verify` checks whole sessions against the\n"
-        "signed head record — see `virp chain verify` for details.\n");
+        "signed head record — see `virp chain verify` for details.\n"
+        "`index` WRITES idx_chain_entry_hash to the named database so the\n"
+        "read-only verifier can use it — run it on a copy, then verify.\n");
     return 1;
 }
 

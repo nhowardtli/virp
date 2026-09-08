@@ -98,6 +98,56 @@ virp chain verify --db chain.db --keyless
 `report/verify.py` gains the same asymmetric tier (optional PyNaCl/
 `cryptography` backend; UNCHECKED with a reason if absent).
 
+### Index the copy first, then verify
+
+**If you are handed a chain database, run this before you verify it:**
+
+    sqlite3 chain.db ".backup copy.db"     # verify a copy, never the live DB
+    virp chain index  --db copy.db         # WRITES the index to the copy
+    virp chain verify --db copy.db --pubkey chain-sign.pub
+
+Skipping the middle step is the difference between a verify that finishes in
+under a minute and one that does not finish at all.
+
+**Why it is needed.** Every hash-keyed body lookup during a verify resolves an
+entry by `chain_entry_hash`. Without `idx_chain_entry_hash` that is a full
+table scan per lookup — measured 55 ms per entry on a 367k-entry chain, once
+per `gate_intent` and once per closer.
+
+The daemon creates that index on first open. **A verifier never can:**
+`virp_chain_open_verifier()` opens `SQLITE_OPEN_READONLY` and runs no schema,
+deliberately — a verifier must not be able to write to the artefact it is
+judging. So a database that no updated daemon has opened read-write arrives
+without the index and stays that way, and the third-party path above is exactly
+the case where that happens.
+
+`virp chain index` is the explicit, opt-in way to close that gap. It **writes**,
+which is why it is a separate operator-run command on a copy rather than
+something the verifier does quietly on your behalf.
+
+**It cannot change a verdict.** `CREATE UNIQUE INDEX` derives an index from
+rows that are already present; it cannot alter an entry, a hash or an HMAC. A
+verify afterwards reaches the verdict it would have reached on the unindexed
+file, sooner. The UNIQUE-ness is itself a check: on this schema
+`chain_entry_hash` is sha256 over a canonical form that includes
+`(session_id, sequence)`, which is already UNIQUE — so the index *failing* to
+build means two entries share a hash, which is a SHA-256 collision or a
+tampered database. Treat that as a finding, not an inconvenience.
+
+Measured 2026-09-08, against the pre-deploy snapshot of virp-lab's chain
+(368,183 entries, genuinely unindexed):
+
+| | |
+|---|---|
+| `chain index` build | **2.00 s** |
+| size added | ~26 MB |
+| `verify --session gate-enforce:pbs-lab` after | **6.94 s** |
+| the same verify before | **did not finish in 119 s** |
+
+It is idempotent (a second run reports the index is already present and does
+nothing) and refuses a database with no `chain_entries` table rather than
+indexing whatever was named by mistake.
+
 ## Boundaries / open items for the draft-07 text
 
 - **Daemon-compromise boundary is unchanged.** A compromised daemon holds
