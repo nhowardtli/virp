@@ -454,6 +454,59 @@ static char *load_socket_path_override(struct json_object *root)
  * action set includes chain_append has no entry here. A malformed entry
  * installs a deny-all-types policy (fail closed) for that uid.
  */
+/*
+ *   "socket_uid_session_prefix": { "987": "seat987:" }
+ *
+ * Binds a uid's chain_append to one session_id namespace. A uid named here
+ * may append only when session_id starts with its prefix; a uid absent is
+ * unrestricted, so the service accounts are unaffected. Malformed entries are
+ * fatal rather than ignored: a namespace policy that silently failed to load
+ * would look identical to one that was never written, and the uid it was meant
+ * to constrain would append anywhere.
+ */
+static void load_uid_session_prefix(onode_state_t *state,
+                                    struct json_object *root)
+{
+    struct json_object *obj = NULL;
+    if (!json_object_object_get_ex(root, "socket_uid_session_prefix", &obj))
+        return;
+    if (!json_object_is_type(obj, json_type_object)) {
+        fprintf(stderr, "[O-Node] ERROR: socket_uid_session_prefix must be an "
+                        "object (uid -> prefix)\n");
+        exit(1);
+    }
+    onode_clear_uid_session_prefixes(state);
+    json_object_object_foreach(obj, key, val) {
+        char *end = NULL;
+        long uid = strtol(key, &end, 10);
+        if (!end || *end != '\0' || uid < 0) {
+            fprintf(stderr, "[O-Node] ERROR: socket_uid_session_prefix key "
+                            "'%s' is not a uid\n", key);
+            exit(1);
+        }
+        if (!json_object_is_type(val, json_type_string)) {
+            fprintf(stderr, "[O-Node] ERROR: socket_uid_session_prefix[%s] "
+                            "must be a string\n", key);
+            exit(1);
+        }
+        const char *pfx = json_object_get_string(val);
+        if (!pfx || pfx[0] == '\0') {
+            fprintf(stderr, "[O-Node] ERROR: socket_uid_session_prefix[%s] is "
+                            "empty; remove the row instead of writing a prefix "
+                            "that matches everything\n", key);
+            exit(1);
+        }
+        virp_error_t e = onode_set_uid_session_prefix(state, (uid_t)uid, pfx);
+        if (e != VIRP_OK) {
+            fprintf(stderr, "[O-Node] onode_set_uid_session_prefix(uid %ld) "
+                            "failed: %d\n", uid, (int)e);
+            exit(1);
+        }
+        fprintf(stderr, "[O-Node] session namespace: uid %ld may chain_append "
+                        "only under '%s'\n", uid, pfx);
+    }
+}
+
 static void load_uid_chain_append_types(onode_state_t *state,
                                         struct json_object *root)
 {
@@ -679,6 +732,7 @@ int load_devices(onode_state_t *state, const char *path)
     load_uid_tier_ceilings(state, root);
     load_uid_action_allow(state, root);
     load_uid_chain_append_types(state, root);
+    load_uid_session_prefix(state, root);
 
     /* Tier-enforcement gate (Phase B): override SHADOW/YELLOW defaults
      * from config if present. Installed before onode_start(). A strict
