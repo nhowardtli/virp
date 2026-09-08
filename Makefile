@@ -1479,6 +1479,22 @@ $(TEST_OBS_NEG): tests/test_obs_ed25519_neg.c $(LIB)
 test-obs-ed25519-neg: $(TEST_OBS_NEG)
 	./$(TEST_OBS_NEG)
 
+# v3 through the SHIPPED binaries: a real virp-onode-prod started with
+# -O <key written by the real `virp-tool keygen obskey`>, executes over
+# the real socket, and the result is checked by `virp-tool obs-verify`
+# holding ONLY the public key. Also proves the fallback (no -O → v3
+# refused, v1/v2 unchanged) and that a configured-but-unloadable key
+# is FATAL. Builds its own prerequisites; needs no Python deps beyond
+# the stdlib, so it never skips for a missing module.
+.PHONY: test-obs-v3-e2e
+# NOT in all-tests: this suite came from rescue/feat/v3-observation-wiring
+# (242 commits behind) and still asserts the pre-refactor protocol -- it
+# expects typed refusals -30 / -14 where current main answers -4. The
+# daemon-side wiring it exercises (-O / onode_set_obskey) IS merged and
+# does work; the SUITE needs a protocol refresh before it can gate.
+test-obs-v3-e2e: $(ONODE_PROD) $(TOOL_BIN)
+	python3 tests/test_obs_v3_e2e.py
+
 # Session key derivation tests
 TEST_SESSION_KEY = $(BUILD_DIR)/test_session_key
 

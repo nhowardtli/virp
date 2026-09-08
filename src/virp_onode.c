@@ -6245,6 +6245,49 @@ virp_error_t onode_set_previous_okey(onode_state_t *state,
     return VIRP_OK;
 }
 
+virp_error_t onode_set_obskey(onode_state_t *state, const char *path)
+{
+    if (!state || !path)
+        return VIRP_ERR_NULL_PTR;
+
+    /* One key per node, loaded once. A second load is an operator
+     * error (two -O flags, or a retry after a partial start), not a
+     * rotation mechanism — refuse rather than silently swap the key
+     * every observation since startup was signed under. */
+    if (state->obskey_loaded) {
+        fprintf(stderr, "[O-Node] observation-signing key refused: one is "
+                        "already loaded (key_id ");
+        for (int i = 0; i < VIRP_OBSKEY_KEYID_SIZE; i++)
+            fprintf(stderr, "%02x", state->obskey.key_id[i]);
+        fprintf(stderr, ") — rotation is a restart, not a reload\n");
+        return VIRP_ERR_KEY_NOT_LOADED;
+    }
+
+    /* Custody gate lives in virp_obskey_load: regular file, no symlink,
+     * no group/world bits, owner == euid (or root), exactly 64 bytes.
+     * It opens exactly `path` — no default, no search, nothing
+     * generated. Each refusal prints its own specific reason. */
+    virp_error_t err = virp_obskey_load(&state->obskey, path);
+    if (err != VIRP_OK) {
+        fprintf(stderr, "[O-Node] Failed to load observation-signing key "
+                        "from %s: %s\n", path, virp_error_str(err));
+        memset(&state->obskey, 0, sizeof(state->obskey));
+        state->obskey_loaded = false;
+        return err;
+    }
+    state->obskey_loaded = true;
+
+    fprintf(stderr, "[O-Node] Loaded Ed25519 observation-signing key from "
+                    "%s (key_id ", path);
+    for (int i = 0; i < VIRP_OBSKEY_KEYID_SIZE; i++)
+        fprintf(stderr, "%02x", state->obskey.key_id[i]);
+    fprintf(stderr, "): v3 observations ENABLED — execute/health/batch with "
+                    "obs_version 3 are Ed25519-signed and chain_append "
+                    "verifies v3 bodies under the public half. v1/v2 "
+                    "unchanged.\n");
+    return VIRP_OK;
+}
+
 virp_error_t onode_set_allowed_uids(onode_state_t *state,
                                     const uid_t *uids, size_t count)
 {
