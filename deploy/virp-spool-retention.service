@@ -1,0 +1,27 @@
+# Declare-then-delete the O-node spool's done/ after 14 days, every
+# batch chained as a camera_retention/1 record signed with this host's
+# own producer key. See camera/RETENTION.md: a failed delivery deletes
+# nothing.
+[Unit]
+Description=VIRP spool retention — 14-day declare-then-delete of done/
+After=virp-onode.service
+Wants=virp-onode.service
+
+[Service]
+Type=oneshot
+User=virp
+Group=virp
+ExecStart=/usr/bin/python3 /usr/local/lib/virp-camera/virp_camera.py \
+  retention --tier spool \
+  --dir /var/spool/virp-capture/done \
+  --days 14 \
+  --data-dir /var/lib/virp/camera \
+  --sock /run/virp/onode.sock \
+  --db /var/lib/virp/chain.db
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/spool/virp-capture /var/lib/virp/camera /run/virp
+CapabilityBoundingSet=
+UMask=0027

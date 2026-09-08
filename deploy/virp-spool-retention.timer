@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily VIRP spool retention (02:30 UTC)
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

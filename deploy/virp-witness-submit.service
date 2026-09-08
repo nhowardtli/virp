@@ -1,0 +1,21 @@
+# Submit this node chain heads to the witness. See
+# /usr/local/lib/virp/virp-witness-submit for why this is a timer and not
+# part of the daemon: it must never be able to fail an append.
+[Unit]
+Description=Submit VIRP chain heads to the witness
+After=virp-witness-tunnel.service
+Wants=virp-witness-tunnel.service
+
+[Service]
+Type=oneshot
+User=virp
+Group=virp
+Environment=VIRP_WITNESS_URL=http://127.0.0.1:8790
+ExecStart=/usr/local/lib/virp/virp-witness-submit
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/virp/witness
+CapabilityBoundingSet=
+UMask=0027

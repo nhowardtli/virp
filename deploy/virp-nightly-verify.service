@@ -1,0 +1,22 @@
+# Snapshot -> export yesterday's camera sessions -> verify with the
+# released examiner binary and pinned keys -> append to
+# /var/lib/virp/nightly-verify.log. Alerts are lines beginning
+# NIGHTLY-ALERT. Read-only against the chain; writes only its own
+# work dir and log.
+[Unit]
+Description=VIRP nightly verify — export and verify yesterday's camera sessions
+After=virp-onode.service virp-witness-tunnel.service
+Wants=virp-witness-tunnel.service
+
+[Service]
+Type=oneshot
+User=virp
+Group=virp
+ExecStart=/usr/bin/python3 /usr/local/lib/virp/virp-nightly-verify
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/virp/nightly /var/lib/virp/nightly-verify.log
+CapabilityBoundingSet=
+UMask=0027

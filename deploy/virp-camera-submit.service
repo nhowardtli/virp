@@ -1,0 +1,31 @@
+# Relay complete camera spool jobs into the chain, continuously.
+# The same submit-spool the README documents as a manual --once run,
+# under the same identity (virp — the only camera producer trusted for
+# chain_append); Restart=always makes the spool drain survive anything.
+[Unit]
+Description=VIRP camera spool submitter (submit-spool, continuous)
+After=virp-onode.service
+Wants=virp-onode.service
+
+[Service]
+User=virp
+Group=virp
+ExecStart=/usr/bin/python3 /usr/local/lib/virp-camera/virp_camera.py \
+  submit-spool \
+  --data-dir /var/lib/virp/camera \
+  --sock /run/virp/onode.sock \
+  --db /var/lib/virp/chain.db \
+  --incoming /var/spool/virp-capture/incoming \
+  --interval 2.0
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/spool/virp-capture /var/lib/virp/camera /run/virp
+CapabilityBoundingSet=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

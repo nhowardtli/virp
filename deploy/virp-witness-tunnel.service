@@ -1,0 +1,49 @@
+# SSH tunnel from this node to the VIRP witness on 18.217.153.230.
+#
+# The witness's SUBMIT listener is 127.0.0.1:8081 on that host and is not
+# reachable from the internet. This tunnel is how heads get there. The key it
+# uses is authorized with restrict,permitopen="127.0.0.1:8081" — it can open
+# this one forward and nothing else, and cannot get a shell.
+#
+# 8081 rather than 8080 deliberately: the submit listener never believes
+# X-Forwarded-For, so a client arriving through this tunnel cannot choose the
+# identity it is rate-limited under. Forwarding to 8080 would put this tunnel
+# on the port where forwarded metadata IS believed, which is the hole the
+# split closes.
+#
+# The host key is PINNED in known_hosts with StrictHostKeyChecking=yes, so the
+# tunnel fails rather than silently reconnecting to somewhere else.
+
+[Unit]
+Description=SSH tunnel to the VIRP witness
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=virp
+Group=virp
+Type=exec
+ExecStart=/usr/bin/ssh -N -T \
+  -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=/var/lib/virp/witness/ssh/known_hosts \
+  -o IdentitiesOnly=yes \
+  -o IdentityFile=/var/lib/virp/witness/ssh/id_tunnel \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -L 127.0.0.1:8790:127.0.0.1:8081 \
+  ubuntu@18.217.153.230
+Restart=always
+RestartSec=15s
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/virp/witness
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
