@@ -449,6 +449,17 @@
       "port": 22,
       "username": "aiops-svc",
       "vendor": "cisco_ios"
+    },
+    {
+      "_comment": "ASA-Lab -- the Cisco ASA 5525-X at 10.0.0.253, added 2026-09-08 for the TACACS+ work, read-only by construction. HOSTNAME IS THE DEVICE'S OWN: the colo node carried this box as ASA-5525 while the unit answers to ASA-Lab, and that row is now removed from virp-lab entirely -- see the _removed_asa5525_note in deploy/devices.template.json for why one node had to stop governing it rather than both governing it at once. ssh_legacy IS DELIBERATELY NOT SET, AND THAT WAS MEASURED, NOT ASSUMED: a forced-algorithm handshake from this node on 2026-09-08 negotiated kex=diffie-hellman-group14-sha1 hostkey=ssh-rsa cipher=aes128-ctr mac=hmac-sha1 against banner SSH-1.99-Cisco-1.25, and all of those are already in driver_asa.c's DEFAULT preference lists. The legacy path would change exactly one thing -- forcing aes256-cbc -- i.e. it would replace a measured working combination with an unmeasured one. This is the OPPOSITE of LAB-SWITCH-1, where legacy was required and tested. HOST KEY PINNED 2026-09-08: ssh-rsa 2048-bit, SHA256:HkGx2HW+0jcp7iSa1EQnMJnBlrW47ivLwmIBHzfYZZM, written plain (unhashed, matching every other entry) into /var/lib/virp/.virp/known_hosts. This is NOT optional here: prod builds carry no -DVIRP_SSH_TOFU_DEFAULT, so an unknown key is fatal, not learned. asa_auto_enable IS TRUE AND IS AN OBSERVED FACT, NOT A HOPE: this ASA runs `aaa authorization exec LOCAL auto-enable`, so an SSH login as admin lands directly at ASA-Lab# while the SERIAL console lands at ASA-Lab> and must type `enable`. Because the session starts in enable mode, driver_asa.c's connect path takes its ENABLE branch and DOES send `terminal pager 0` and `terminal width 512`. That matters: the driver only sends those on paths through enable mode, and a priv-1 identity with no enable credential would read paged output. The flag also clears the cisco_asa-only load-time refusal (#14, virp_onode_prod.c:984) that skips an ASA row carrying no `enable` secret -- which is the right trade here, since declaring the observed behaviour beats loading a priv-15 enable secret into the daemon's address space to satisfy a check. CREDENTIAL IS TEMPORARY. `admin` is the ASA's LOCAL priv-15 break-glass account and is the wrong identity for a gate; it is used in Phase 2 only so the row can be proven end to end before authorization exists. Phase 3 replaces the VALUE with the virp-ro TACACS identity served by CT 215 and the name VIRP_ASALAB_PASSWORD survives unchanged. Until then every gate read of this firewall authenticates as a priv-15 local account, and the only thing standing between that credential and a configuration change is the gate's own route table -- 39 GREEN rows, RED by absence, ENFORCE at GREEN on this node. Say so plainly rather than let the row imply the fencing already exists.",
+      "hostname": "ASA-Lab",
+      "node_id": 167772413,
+      "host": "10.0.0.253",
+      "vendor": "cisco_asa",
+      "username": "admin",
+      "password": "${VIRP_ASALAB_PASSWORD}",
+      "port": 22,
+      "asa_auto_enable": true
     }
   ]
 }
