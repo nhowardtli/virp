@@ -40,8 +40,15 @@ CLIENT_TIMEOUT = 15
 # sign_outcome, chain_verify, chain_verify_session, batch_execute,
 # validate_turn, session_hello, session_bind, session_close) and any
 # unknown action — is rejected here and never reaches the socket.
+# "health" was removed 2026-09-07. It is not a node-liveness ping on the
+# O-Node: ONODE_ACTION_HEALTH takes a client-chosen device and runs
+# "show version" against it, and it did so without the connecting uid, so the
+# per-uid tier ceiling was skipped and the node-wide one applied. A relay must
+# not offer a verb the gate should not honour, and the broker's allowlist is
+# asserted equal to the template's row for this uid by
+# tests/test_template_uid_policy.py, so the two move together or not at all.
 ALLOWED_ACTIONS = frozenset({
-    "execute", "list_devices", "health", "heartbeat",
+    "execute", "list_devices", "heartbeat",
     "intent_store", "intent_get", "approval_challenge", "approval_submit",
 })
 
