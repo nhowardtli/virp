@@ -264,17 +264,6 @@
       "port": 22
     },
     {
-      "_comment": "IronClaw colo fleet stage 1. The only stage-1 row with enable: the ASA driver enters (and re-enters) enable mode. ssh_legacy is deliberately NOT set \u2014 verified 2026-08-09 from this node that the driver's default algorithm set negotiates with this unit (kex diffie-hellman-group14-sha1, hostkey ssh-rsa, cipher aes256-ctr; the ASA offers nothing newer and all three are in the default preference list).",
-      "hostname": "ASA-5525",
-      "node_id": "0A0000FD",
-      "host": "10.0.0.253",
-      "vendor": "cisco_asa",
-      "username": "aiops-svc",
-      "password": "${LAB_PASSWORD}",
-      "enable": "${LAB_ENABLE}",
-      "port": 22
-    },
-    {
       "_comment": "IronClaw colo fleet stage 1. JunOS has a flat privilege model \u2014 no enable. IronClaw's own inventory carries ssh_legacy=true for this device, but that is stale: the unit runs OpenSSH 6.9 and offers ecdh-sha2-nistp256, first in the juniper driver's default kex list (verified 2026-08-09 from this node), so it is imported without ssh_legacy.",
       "hostname": "srx-300",
       "node_id": "0A0000FE",
