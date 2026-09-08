@@ -348,6 +348,22 @@ other than show commands." IOS 12.2(55)SE6 on LAB-SWITCH-1 accounts every
 command including `show clock`, and the 2026-09-07 milestone's method depends
 on that.
 
+**Confirmed on hardware, 2026-09-07 23:57Z.** In one SSH session on ASA-Lab an
+operator ran `show aaa-server VIRP-ACCT` and `terminal pager 24`. The ASA
+emitted an accounting record for `terminal pager 24` (`user=admin`,
+`priv_lvl=15`, `service=shell`) and **no record at all** for the `show`. The
+finding is measured, not merely cited.
+
+**A second gap found in the same decode: ASA accounting carries no device
+clock.** The record bodies carry `task_id`, `elapsed_time`, `service`, `port`,
+`foreign_ip`, `local_ip` — and no absolute device timestamp. There is no
+`start_time` arg of the kind IOS 12.2(55)SE6 sends, which the 2026-09-07
+milestone used (`start_time=1788815267` → 21:07:47Z) to place the switch's own
+clock in the timeline. So on ASA the device column of a timeline is timed by
+the receiver's chain timestamp — 313's clock — and must say so. The upside is
+that device clock skew cannot corrupt an ASA record: this unit was found ~13
+minutes slow, which on IOS would have poisoned every `start_time`.
+
 Two consequences, both structural:
 
 1. **A permitted GREEN read on the ASA has no device-side accounting record.**

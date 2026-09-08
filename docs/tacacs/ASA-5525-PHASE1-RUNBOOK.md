@@ -405,6 +405,111 @@ Once the gate passes: `reload cancel`, then `write memory`.
 
 ---
 
+---
+
+## Gate result — PASSED 2026-09-07 23:57Z
+
+Three records delivered, chained and decoded on 313.
+
+| chained (313 clock) | flags | user | priv_lvl | port | cmd |
+|---|---|---|---|---|---|
+| 23:57:06.191Z | STOP | `admin` | 15 | 22 | `server-port 4949` |
+| 23:57:21.627Z | START | `admin` | 1 | 0 | *(EXEC session; `service=shell`, `foreign_ip=10.0.0.36`)* |
+| 23:57:33.558Z | STOP | `admin` | 15 | 22 | **`terminal pager 24`** |
+
+All three carry `schema: tacacs_accounting/2`, `client_identity: ASA-Lab`,
+`client_identity_source: configured_by_source_address`, `source_addr:
+10.0.0.253`, `decode: OBFUSCATED_MD5`, `parse: COMPLETE`,
+`tacacs_unencrypted: false`, and `producer_key_id
+0e3f34ab8a40d7d690d3005e79192584` — `virp-tacacs`'s own key, not the chain
+key and not the gate's.
+
+Chain sequences 1740, 1741, 1742 under session `tacacs:virp-onode-home`.
+Artifact ids are `tacacs:10.0.0.253:<tacacs_session_id>:1:<hash>`, so the
+source address is carried in the id itself.
+
+Receiver counters for the window: **accepted 17, recorded 17, malformed 0,
+refused_authen 0, refused_author 0, unconfigured_source 0, append_failed 0,
+short_read 0, oversize 0, cleartext 0.** Seventeen is fourteen from
+LAB-SWITCH-1's one-per-minute cadence plus these three; the arithmetic closes
+with nothing unaccounted for.
+
+Gate criterion by criterion, per Phase 0 Decision 4 (option (i)):
+
+- EXEC session record — **START present.** The matching STOP arrives on
+  logout and is not a separate condition.
+- One command record with a real `cmd` and `priv_lvl` — **`cmd=terminal pager
+  24`, `user=admin`, `priv_lvl=15`.**
+- Clean decode and parse in the closed vocabularies — **yes, no error state.**
+- Counters clean — **yes.**
+
+### `ASA-SHOW-UNACCOUNTED` confirmed on hardware
+
+In the same SSH session that produced the `terminal pager 24` record, the
+operator also ran `show aaa-server VIRP-ACCT`. **It produced no accounting
+record.** The finding is no longer a documentation citation; it is a measured
+property of this device. One session, two commands, one record — and the one
+that is missing is the `show`.
+
+### Second finding: ASA accounting carries no device clock
+
+The record bodies carry `task_id`, `elapsed_time`, `service`, `port`,
+`foreign_ip` and `local_ip`. They carry **no absolute device timestamp** —
+there is no `start_time` or `stop_time` arg of the kind IOS 12.2(55)SE6 sends,
+which the 2026-09-07 milestone used (`start_time=1788815267` decoding to
+21:07:47Z) to put the switch's own clock in the timeline.
+
+Two consequences:
+
+1. **The three-clock discipline loses its third clock on ASA.** A timeline row
+   for this platform has the gate's clock and CT 215's clock, and for the
+   device column only the receiver's chain timestamp — which is 313's clock,
+   not the firewall's. That must be stated in any ASA timeline rather than
+   letting a reader assume the device column is device-timed.
+
+2. **Device clock skew does not corrupt the records.** This device was found
+   running ~13 minutes behind (§ Block 0 clock check). On IOS that would have
+   poisoned every `start_time`. Here it cannot, because no device time is
+   carried. The skew still matters for the ASA's own logs and for
+   `show aaa-server`'s "Last transaction" line, and was corrected, but it is
+   not an evidence-integrity problem on this platform.
+
+### What this run cost, and what it taught
+
+Four defects were found and fixed between the runbook being written and the
+gate passing. All four are recorded because each is a thing the 2960 work did
+not have to face:
+
+1. **The shared secret was disclosed** into a session transcript and had to be
+   rotated (Block 2R). Cost: one config line, no evidence.
+2. **The wrong interface.** The runbook guessed `inside`; the route to
+   10.0.0.13 is via `management`. The ASA accepted `(INSIDE)` because that
+   nameif exists, then sent 54 accounting requests into a black hole and
+   counted 54 timeouts. **Block 0's `show nameif` step exists precisely to
+   prevent this and was skipped.** The lesson is not "check the interface" —
+   it is that an `aaa-server` host line naming a wrong-but-real interface
+   fails silently at the ASA and is only visible in the timeout counter.
+3. **The server group was destroyed** by a remove-after-add sequence in which
+   the add had failed, leaving `show aaa-server VIRP-ACCT` with no output at
+   all. Rebuild required re-entering the key.
+4. **A ~13 minute clock skew**, found by comparing `show clock` against 313.
+
+None of these were failures of the accounting design; all four were failures
+of assumption about this specific device.
+
+### Note: `authen_method=TACACSPLUS`
+
+Every record reports `authen_method: TACACSPLUS`, `authen_service: LOGIN`,
+`authen_type: ASCII` — although this login was authenticated by the **local**
+database, and `show aaa-server VIRP-ACCT` reports `Number of authentication
+requests 0`, so no authentication traffic was sent anywhere. The ASA is
+labelling the accounting record's method field, not reporting where the
+credential was actually checked. **Do not read this field as evidence of how a
+principal authenticated.** It is recorded here so a later reader does not
+mistake it for a TACACS+ authentication that did not happen — and it becomes
+important in Phase 3, where authentication genuinely does move to CT 215 and
+this field will look identical before and after.
+
 ## Full rollback
 
 If Phase 1 is abandoned, in this order, from the console:
