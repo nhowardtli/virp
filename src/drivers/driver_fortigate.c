@@ -124,6 +124,22 @@ static int fg_ssh_connect(struct virp_conn *conn)
 
     libssh2_session_set_timeout(session, 30000);
 
+    /*
+     * Prefer the RSA host key. FortiOS offers ssh-ed25519 first, and with
+     * no preference set libssh2 follows the server — but its ed25519
+     * known-host lookup (libssh2 1.11) returns NOTFOUND against a pinned
+     * ed25519 line that fingerprint-matches, so verification fails on a
+     * host we do know. Both keys are pinned in known_hosts; steering
+     * negotiation to RSA matches the entry that libssh2 checks reliably,
+     * exactly as the cat3850 (rsa-only) verifies today. ed25519 stays as
+     * a fallback. Same idiom as driver_panos.c / driver_juniper.c, which
+     * set this for their own devices; the FortiGate driver simply lacked
+     * it. This is a negotiation preference, NOT a downgrade of
+     * verification: the pinned RSA key is still checked.
+     */
+    libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY,
+        "rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-ed25519");
+
     rc = libssh2_session_handshake(session, sock);
     if (rc != 0) {
         libssh2_session_last_error(session, &errmsg, &errlen, 0);
