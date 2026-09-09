@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # t06-disposition-matrix.sh — regression matrix for the termination-mode
 # classifier that replaced `success = (get_exit_status() == 0)`.
 #

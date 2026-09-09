@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # f1-approve-race.sh — fire N *simultaneous* approvals at ONE proposal.
 #
 # Usage: f1-approve-race.sh <N> [label]

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # config-backup-access.sh — root pre-step for virp-config-backup.service.
 #

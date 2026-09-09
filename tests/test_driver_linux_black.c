@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * test_driver_linux_black.c — the linux/proxmox driver must refuse a
  * BLACK-tier command inside its own execute(), regardless of gate mode.

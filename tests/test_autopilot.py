@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Unit tests for the autopilot client — pure logic only: evaluators,
 baseline math, corpus/battery policy invariants, and the exclusion

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # f1-ttl-refresh.sh — decide F1's "each re-approval mints a fresh 300s TTL" limb
 # EMPIRICALLY, not from source reading.
 #

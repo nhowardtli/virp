@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * virp_driver_juniper.h — Juniper JunOS device driver for VIRP
  *

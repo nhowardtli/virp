@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * parser_asa.h — Output parsers for Cisco ASA CLI commands
  *

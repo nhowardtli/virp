@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # check-key-registry.sh — every key_id in deploy/keys/registry.json must
 # derive from that entry's own public key bytes.

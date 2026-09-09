@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Response validator client — CT 210 side.
 

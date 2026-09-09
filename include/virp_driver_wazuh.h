@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * virp_driver_wazuh.h — Wazuh Manager REST API driver for VIRP
  *

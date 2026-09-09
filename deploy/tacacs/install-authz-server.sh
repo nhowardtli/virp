@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # install-authz-server.sh -- install the VIRP TACACS+ AUTHORIZATION server.
 #

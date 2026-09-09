@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # netclaw-access.sh — root post-step for virp-onode.service.
 #

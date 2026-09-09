@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Test for V42 remediation — the /api/gate endpoint has been removed.
 

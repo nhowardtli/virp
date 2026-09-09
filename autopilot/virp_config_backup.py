@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 virp_config_backup.py — hourly FRR config backup + drift runbook.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * test_driver_linux_connect.c — device connect must be time-bounded
  *

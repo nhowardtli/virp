@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Tests for retention-as-a-signed-record (camera_retention/1).
 
 Pure python against fakes: no daemon, no camera, no network. Pins, per

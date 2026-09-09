@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * driver_panos.h — PAN-OS device driver for VIRP
  *

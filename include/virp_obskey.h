@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
  * VIRP — O-Node Ed25519 observation-signing key (custody)

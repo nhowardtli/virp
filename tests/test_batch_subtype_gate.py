@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Batch execution must enforce the same observation sub-type gate as the
 single-command path (audit §4.1 / adversarial follow-up 2026-08-03).

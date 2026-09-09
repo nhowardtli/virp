@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * test_virp_scrub.c — scrub-at-capture (S-1) unit suite
  *

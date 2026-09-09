@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * virp_driver_cisco_modes.h — IOS prompt-mode classification
  *

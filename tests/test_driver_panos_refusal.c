@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * The PAN-OS driver's BLACK-tier backstop must obey the refusal
  * contract. Source is #included directly: pa_execute() and struct

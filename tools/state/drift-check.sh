@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # drift-check.sh — judge a deployed_state/1 document. Never touch a node.
 #

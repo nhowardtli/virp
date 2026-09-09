@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * The ASA driver's BLACK-tier backstop must obey the refusal contract.
  * Source is #included directly: asa_execute() and struct virp_conn are

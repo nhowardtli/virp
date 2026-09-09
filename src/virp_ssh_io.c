@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * virp_ssh_io.c — shared interactive-shell read path for the SSH drivers
  *

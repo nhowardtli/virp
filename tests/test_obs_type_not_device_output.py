@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Audit §4.1 (Half B) — an intent/outcome signature must not render as
 authenticated DEVICE OUTPUT.

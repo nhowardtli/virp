@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
  * VIRP — defect D: an approval is spent only when the device was reachable

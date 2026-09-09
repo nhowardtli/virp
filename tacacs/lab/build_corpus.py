@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Phase 2a: build the IOS command-respelling corpus from a real router.
 
 For each command we type, capture what IOS put in the accounting `cmd=`

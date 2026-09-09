@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * Copyright (c) 2026 Third Level IT LLC. All rights reserved.
  * VIRP — evidence-required intent/closer binding (Sep 1 review, 1.1-1.2)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * test_driver_wazuh.c — Wazuh REST API driver tests
  *

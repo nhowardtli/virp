@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # evidence-access.sh — root pre-step for virp-evidence.service.
 #

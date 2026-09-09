@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # camera-spool-access.sh — provision the Option B capture spool on the
 # O-node host, in the same shape and spirit as netclaw-access.sh.

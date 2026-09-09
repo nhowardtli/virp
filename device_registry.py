@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 VIRP Device Registry — Single Source of Truth Reference Implementation
 ======================================================================

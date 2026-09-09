@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Startup bind-safety guard tests for api/server.py.
 

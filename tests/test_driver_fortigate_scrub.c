@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * test_driver_fortigate_scrub.c — FortiGate reply scrubbing (N1 / 2c)
  *

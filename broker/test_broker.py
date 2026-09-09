@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 test_broker.py — Stage-1 acceptance tests for the VIRP intent-broker.
 

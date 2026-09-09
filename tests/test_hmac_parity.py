@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Test: C and Python HMAC verification produce identical results (audit item 3).
 

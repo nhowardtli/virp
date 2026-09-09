@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * The JunOS driver has TWO refusal paths and both must obey the contract:
  * the BLACK-tier backstop, and the multi-command separator guard — a

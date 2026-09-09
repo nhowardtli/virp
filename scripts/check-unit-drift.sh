@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # check-unit-drift.sh — compare the systemd units RUNNING on this host
 # against the ones tracked in the repo.

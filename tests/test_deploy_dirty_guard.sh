@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # The deploy dirty-tree guard must fail CLOSED.
 #
 # scripts/require-clean-tree.sh replaced four hand-copied guards that

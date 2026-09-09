@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """ONODE_ACTION_HEALTH must carry the client uid into the tier gate.
 
 Found live on 2026-09-07, through the virp-sean seat (uid 987) minutes after

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Tests for the config-backup-and-drift runbook.
 
 Covers, per the runbook's contract:

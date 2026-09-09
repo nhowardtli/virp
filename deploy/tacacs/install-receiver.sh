@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # install-receiver.sh — install the TACACS+ accounting receiver on an O-node.
 #

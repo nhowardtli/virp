@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Auth + CORS + bind-host tests for api/server.py.
 

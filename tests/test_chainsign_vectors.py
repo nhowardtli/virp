@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 D-1 asymmetric tier — Python verifier cross-check (report/verify.py).
 

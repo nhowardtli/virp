@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * test_driver_cisco_reconnect.c — defect C: stale-session dispatch
  *

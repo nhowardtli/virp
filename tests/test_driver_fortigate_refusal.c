@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * The FortiGate driver had TWO false-execution paths by two different
  * mechanisms, and both are covered here:

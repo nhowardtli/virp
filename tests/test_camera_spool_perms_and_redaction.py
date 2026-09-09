@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Tests for two capture-host defects found live on 2026-09-05.
 
 1. SPOOL MODE. `sftp put` stamps the destination with the LOCAL file's

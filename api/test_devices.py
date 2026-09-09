@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Tests for /api/devices/add + /api/devices/{name} DELETE hardening:
 

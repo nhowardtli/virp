@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Phase 2 tests: the Option B split — capture-host live path (build,
 sign, ship, continuity) and the O-node submit-spool relay.
 

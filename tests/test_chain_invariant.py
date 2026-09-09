@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Chain canonical-bytes INVARIANT — Python half (D-1 gate).
 

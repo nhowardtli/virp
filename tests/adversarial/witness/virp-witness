@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # virp-witness — target-side witness for the VIRP adversarial test program.
 #
 # WHAT THIS IS

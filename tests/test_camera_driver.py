@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Tests for the camera driver (camera/virp_camera.py).
 
 Pure python against fakes: no daemon, no camera, no chain database

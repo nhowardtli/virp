@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * driver_panos.c — PAN-OS device driver implementation
  *

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * test_driver_cisco_scrub.c — IOS config credential scrubbing
  *

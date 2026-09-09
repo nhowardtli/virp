@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 virp_tacacs_codec.py — RFC 8907 TACACS+ codec. LAB ONLY.
 

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # install-witness.sh — install/remove the target-side witness on sacrificial
 # containerlab FRR containers.
 #

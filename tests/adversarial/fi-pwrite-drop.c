@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * fi-pwrite-drop.c — LD_PRELOAD write-loss shim for the torn-write escalation
  * (adversarial test #3b). See tests/adversarial/MEMO-torn-write-escalation.md.

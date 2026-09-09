@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Attack list A1-A9 for TACACS+ per-command authorization.
 

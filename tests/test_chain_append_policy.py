@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Per-uid chain_append TYPE policy (v0.2.1) — fixture replay + invariants.
 
 Two things are pinned here:

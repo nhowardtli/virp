@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Every TACACS+ relationship must name a real fleet device.
 
 virp_tacacs_reconcile.py groups receipts by (client_identity or

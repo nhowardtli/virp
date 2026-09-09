@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 virp-verify — CLI tool for verifying claims against signed VIRP observations.
 

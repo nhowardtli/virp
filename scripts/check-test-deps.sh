@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # check-test-deps.sh — assert the optional Python modules that whole test
 # suites depend on are importable, so a SKIPPED suite can never let

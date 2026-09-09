@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * virp-chain-verify.c — a minimal auditor's verifier.
  *

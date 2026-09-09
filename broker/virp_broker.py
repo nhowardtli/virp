@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 virp_broker.py — network intent-broker for the VIRP O-Node (Stage 1).
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 virp_tacacs_policy.py — compile VIRP approvals into TACACS+ authorization
 policy, and render the router-side AAA config. LAB ONLY.

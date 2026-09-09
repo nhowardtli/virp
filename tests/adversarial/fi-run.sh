@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # fi-run.sh — drive one propose -> approve -> apply cycle against the ISOLATED
 # fault-injection daemon, with the daemon armed to SIGKILL itself at a chosen
 # boundary. Then report, from three independent sources, what survived.

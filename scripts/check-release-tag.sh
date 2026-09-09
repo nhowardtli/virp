@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Is this tag one whose message can safely BE the GitHub Release body?
 #
 # The release pipeline publishes with `gh release create --notes-from-tag`,

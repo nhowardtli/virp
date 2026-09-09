@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # test-witness-noshell.sh — the witness executes ARGV, never a shell.
 #
 # Proves the three claims of the 2026-08-09 eval removal:

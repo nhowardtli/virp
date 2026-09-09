@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 VIRP Appliance API Server
 REST API wrapping virp-onode for consumption by any automation platform.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * test_driver_asa_scrub.c — ASA config credential scrubbing
  *

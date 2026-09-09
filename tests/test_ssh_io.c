@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * test_ssh_io.c — shared SSH read path (finding N1, part 2a)
  *

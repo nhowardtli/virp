@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # virp-evidence-header.sh — emit the header/footer identity block required by
 # the adversarial test program's evidence contract.
 #

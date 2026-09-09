@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """gen-green-conf.py -- generate the virp-ro permit rules for tac_plus-ng.
 
 The GREEN table is NOT copied by hand. It is parsed out of

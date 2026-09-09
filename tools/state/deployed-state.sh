@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # deployed-state.sh — report what THIS node is actually running, as one
 # JSON document, and (optionally) land that document on the chain.

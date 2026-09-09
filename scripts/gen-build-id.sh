@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Generate the build-id translation unit.
 #
 # WHY THIS EXISTS: v0.2.0 shipped reporting build_id="unknown" in its

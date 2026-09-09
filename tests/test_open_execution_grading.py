@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Evidence-required execution (Sep 1 review, Task 5) — Python parity.
 
 The daemon commits a gate_intent chain entry BEFORE it dispatches a

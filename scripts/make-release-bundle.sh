@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # make-release-bundle.sh — cut a release ZIP from an exact commit and write
 # the manifest that binds bundle, tree, and test evidence together.

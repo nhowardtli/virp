@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * refusal_contract.h — shared assertions for the driver refusal contract
  * (Defect B, 2026-08-26).

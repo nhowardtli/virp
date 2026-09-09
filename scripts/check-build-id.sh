@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Build-id provenance test (v0.2.1 Fix 2).
 #
 # v0.2.0 shipped node_config entries reading build_id="unknown" for the

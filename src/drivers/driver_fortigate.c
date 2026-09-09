@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * driver_fortigate.c — FortiGate device driver implementation
  *

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #ifndef VIRP_FAULT_INJECT_H
 #define VIRP_FAULT_INJECT_H
 /*

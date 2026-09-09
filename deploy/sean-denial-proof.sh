@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # sean-denial-proof.sh — the eight denial checks for the virp-sean seat
 # on virp-lab (10.0.10.211). Same eight as the virp-netclaw proof of

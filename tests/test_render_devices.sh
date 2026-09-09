@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # test_render_devices.sh — deploy/render-devices.sh must FAIL LOUDLY when
 # a placeholder the template names is absent from autopilot.env.
