@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 #
 # check-wazuh-dropins.sh — scan a systemd drop-in directory for units that
 # disable Wazuh TLS verification (VIRP_WAZUH_INSECURE), allowing ONLY the

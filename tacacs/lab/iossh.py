@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """Minimal interactive SSH client for the lab routers.
 
 IOS does not support `exec_command` reliably, so this drives an

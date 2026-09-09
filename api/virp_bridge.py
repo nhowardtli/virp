@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """
 virp_bridge.py — Python ctypes bridge to libvirp.so
 

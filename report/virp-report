@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # virp-report — thin launcher for the consumer-side chain PDF generator.
 #
 # The `virp` CLI is a compiled C binary (src/virp_tool.c); the report

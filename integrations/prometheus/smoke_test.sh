@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # Smoke test: start the exporter, hit /metrics and /health, verify output.
 set -euo pipefail
 

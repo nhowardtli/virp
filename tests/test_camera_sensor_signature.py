@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """Sensor-signature tests for the camera driver (camera_segment/3).
 
 A camera that signs its own video asserts two things this producer

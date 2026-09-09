@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """Restart-integrity tests for the camera driver.
 
 Written against the 2026-08-24 session `camera:tapo-c100:2026-08-24`,

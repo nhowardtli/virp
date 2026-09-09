@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 #
 # gen-test-attestation.sh — run the named test commands and write a
 # machine-readable attestation pinning EXACTLY which tree they ran against.

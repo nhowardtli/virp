@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-Proprietary
 // Copyright (c) 2026 Third Level IT LLC. All rights reserved.
 // VIRP -- Verified Infrastructure Response Protocol
 // Tests -- crypto, message building, channel enforcement, O-Node interop

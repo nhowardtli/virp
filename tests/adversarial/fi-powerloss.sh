@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # fi-powerloss.sh — adversarial test #3. Take the chain writer past the SIGKILL
 # ceiling to a real storage cut, on a DISPOSABLE loop-backed filesystem we own
 # end to end, and ask the one question SIGKILL-on-tmpfs cannot:

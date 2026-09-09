@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """Q1(c)(i) evidence: commitment-only observations, FIELD vs ROLL-UP.
 
 chain_append GATE 3 (src/virp_onode.c:2548, inside the body-present

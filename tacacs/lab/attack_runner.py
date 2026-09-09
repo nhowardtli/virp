@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """Phase 4: run attacks A1-A9 against the live lab and capture evidence.
 
 One directory per attack under ~/tacacs-overnight/authz/, each holding

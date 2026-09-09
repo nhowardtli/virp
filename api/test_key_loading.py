@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """
 Tests for api/server.py load_okey() permission gate. Mirrors the C
 daemon's virp_key_load_file hardening so the API server and the

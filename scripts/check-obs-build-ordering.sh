@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 #
 # check-obs-build-ordering.sh — assert that nothing carrying captured
 # result bytes is committed or signed above the scrub barrier in

@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # The deploy dirty-tree guard, in one place.
 #
 # What gets installed must be exactly what a commit hash names, so every

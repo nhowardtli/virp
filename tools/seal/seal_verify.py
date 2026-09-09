@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """
 seal_verify.py — virp-seal/1 Phase A ceremony verifier (standalone, read-only).
 

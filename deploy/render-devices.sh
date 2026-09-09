@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 #
 # render-devices.sh — render /run/virp/devices.json from the credential
 # env file + the no-secrets template, at virp-onode start.

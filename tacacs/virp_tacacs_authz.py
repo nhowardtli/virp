@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """
 virp_tacacs_authz.py — TACACS+ per-command AUTHORIZATION decision engine.
 LAB ONLY.

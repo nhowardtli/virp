@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # Does the INSTALLED binary come from the deploy tree that is checked out?
 #
 # v0.2.0's node_config entry said build_id="unknown", so the chain could

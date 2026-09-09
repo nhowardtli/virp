@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-Proprietary
 // Copyright (c) 2026 Third Level IT LLC. All rights reserved.
 // VIRP -- C/Go interop test
 //

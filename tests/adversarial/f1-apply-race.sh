@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # f1-apply-race.sh — fire N *simultaneous* applies at ONE approved proposal.
 #
 # Usage: f1-apply-race.sh <N>

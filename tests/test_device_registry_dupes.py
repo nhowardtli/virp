@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """Duplicate device identity rejection in the Python registry.
 
 Counterpart of the C-side onode_add_device()/load_devices() duplicate

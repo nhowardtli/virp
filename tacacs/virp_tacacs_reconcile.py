@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """
 virp_tacacs_reconcile.py — reconcile TACACS+ receipts against gate
 records. LAB ONLY.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 #
 # broker-access.sh — root pre-step for virp-broker.service.
 # Modeled on deploy/config-backup-access.sh.

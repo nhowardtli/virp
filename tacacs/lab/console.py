@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """Minimal IOS console driver over the GNS3 telnet console, with login."""
 import socket, time, re
 

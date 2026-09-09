@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """
 test_template_uid_policy.py — the SHIPPED deployment templates must give
 every allowed uid an explicit per-uid action policy, none of the

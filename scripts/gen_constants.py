@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """
 Generate api/_virp_constants.py from include/virp.h.
 
@@ -64,7 +64,7 @@ def main():
         print("ERROR: no matching #defines found", file=sys.stderr)
         sys.exit(1)
 
-    print("# SPDX-License-Identifier: Apache-2.0")
+    print("# SPDX-License-Identifier: LicenseRef-Proprietary")
     print('"""')
     print("Auto-generated from include/virp.h by scripts/gen_constants.py.")
     print("Do not edit by hand.")

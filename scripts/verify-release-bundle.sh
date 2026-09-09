@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 #
 # verify-release-bundle.sh — one command for a downloader (or CI, before it
 # publishes) to check that a release bundle is exactly what its manifest and

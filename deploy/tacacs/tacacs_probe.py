@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """tacacs_probe.py -- a dependency-free TACACS+ client, for proving policy.
 
 Stdlib only, single file, no install. That is deliberate: this has to run

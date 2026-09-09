@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # fi-torn-write.sh — adversarial test #3b. Try to manufacture a SILENT
 # TRUNCATION: a recovered chain whose signed head claims sequence N while only
 # M<N entries survive, with `virp chain verify` still VALID. See

@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # fi-inflight.sh — the "during send" boundary of test #2.
 #
 # The other crash points are reached by the daemon's own instrumentation, which

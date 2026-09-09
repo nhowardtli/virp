@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # witness-count.sh — count what the TARGET actually did, from the witness log.
 # This produces column 1 of the results table. It must never consult VIRP.
 #

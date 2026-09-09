@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # VIRP demo container.
 #
 # Builds the reference implementation and runs demo/run.sh against a

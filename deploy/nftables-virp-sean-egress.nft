@@ -1,5 +1,5 @@
 #!/usr/sbin/nft -f
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # virp-sean egress lockdown — compensating control for the OpenSSH
 # 9.6 quirk where AllowTcpForwarding=no also blocks streamlocal (Unix
 # socket) forwards: the Match block for virp-sean therefore carries

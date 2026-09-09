@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """Fail-closed tests for the camera driver's trust roots, and tests for
 the two axes an intact chain cannot answer on its own.
 

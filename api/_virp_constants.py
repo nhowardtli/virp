@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """
 Auto-generated from include/virp.h by scripts/gen_constants.py.
 Do not edit by hand.

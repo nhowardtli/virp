@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-Proprietary
 // Copyright (c) 2026 Third Level IT LLC. All rights reserved.
 //
 // The Go port implements none of the approval flow (propose → approve →

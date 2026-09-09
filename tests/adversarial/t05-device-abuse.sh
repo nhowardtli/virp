@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # t05-device-abuse.sh — drive one propose -> approve -> apply cycle against a
 # GENUINELY ISOLATED sacrificial target, then report what the TARGET did
 # (witness + device-side artifact) versus what VIRP claims (client, chain).

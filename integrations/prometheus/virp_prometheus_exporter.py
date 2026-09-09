@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 """VIRP Prometheus Exporter — reads chain.db (read-only) and exposes /metrics."""
 
 from __future__ import annotations

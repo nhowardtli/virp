@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: LicenseRef-Proprietary
 # Every line of the deploy record is a claim, so every line must be
 # established or the target must fail.
 #

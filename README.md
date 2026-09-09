@@ -1,5 +1,5 @@
 <p align="center">
-  <img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg">
+  <img alt="License: mixed; see LICENSING.md" src="https://img.shields.io/badge/License-Mixed-blue.svg">
   <img alt="C11" src="https://img.shields.io/badge/C-11-00599C?logo=c&logoColor=white">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white">
   <img alt="IETF Draft" src="https://img.shields.io/badge/IETF-draft--howard--virp--06-orange">
@@ -373,7 +373,7 @@ Yes. VIRP is a protocol and a reference implementation. IronClaw is one consumer
   Tamarin — and §17.1 names the second-tool cross-check as future work.
   (The -05 text carried the older, broader claim; -06 Appendix A records
   the correction.)
-- **License:** Apache 2.0
+- **License:** Apache-2.0 core; proprietary SDK/services/tooling policy. See [LICENSING.md](LICENSING.md); prior Apache grants are preserved.
 
 ---
 
@@ -398,3 +398,9 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup, code standards, and the new-
 
 > *A responsible system does not guess when evidence is absent.*
 > *It says: I don't know, and here's why.*
+
+
+Current licensing policy: see [LICENSING.md](LICENSING.md). Only the named core
+or standalone-verifier boundary is Apache-2.0. SDK, exporter, and other product
+tooling carry a proprietary policy; previous Apache grants remain valid for
+covered material. Missing terms and ownership conflicts are documented there.
