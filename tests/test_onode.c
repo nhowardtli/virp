@@ -2897,28 +2897,53 @@ TEST(test_load_devices_duplicate_identities_fatal)
 }
 
 /* =========================================================================
- * Autopilot hard exclusions — 10.0.10.1 / 10.0.10.10 must never load
+ * Autopilot hard exclusions — the matcher, and the (empty) production list
  *
  * The text scan is boundary-aware: the LibreNMS host 10.0.10.12 and a
- * hypothetical 10.0.10.100 must NOT trip the assertion, while either
- * blocked address anywhere in the file (host field, spare key, comment)
- * must refuse the whole config.
+ * hypothetical 10.0.10.100 must NOT trip a rule for 10.0.10.1, while a
+ * listed address anywhere in the file (host field, spare key, comment)
+ * must refuse the whole config. The scan is exercised against a
+ * synthetic list so that coverage does not depend on production blocking
+ * anything. As of 2026-09-08 production blocks nothing — see the note on
+ * ONODE_BLOCKED_ADDRS in virp_onode.c — and that posture is pinned here
+ * too, so re-arming the list is a visible, deliberate act.
  * ========================================================================= */
 
 TEST(test_blocked_address_text_scan)
 {
-    /* Hits */
-    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"10.0.10.1\"") != NULL);
-    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"10.0.10.10\"") != NULL);
-    ASSERT_TRUE(virp_config_blocked_address("x 10.0.10.1 y") != NULL);
-    ASSERT_TRUE(virp_config_blocked_address("10.0.10.10") != NULL);
-    /* Non-hits: neighbors that merely share the prefix */
-    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"10.0.10.12\"") == NULL);
-    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"10.0.10.100\"") == NULL);
-    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"110.0.10.1\"") == NULL);
-    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"210.0.10.10\"") == NULL);
-    ASSERT_TRUE(virp_config_blocked_address("") == NULL);
-    ASSERT_TRUE(virp_config_blocked_address(NULL) == NULL);
+    /*
+     * The MATCHER is tested against a caller-supplied list, not against
+     * whatever production happens to block. Testing it through the
+     * production list means the boundary logic is only covered while that
+     * list is non-empty — backwards, since an empty list is exactly when
+     * a silent matcher bug would go unnoticed.
+     */
+    static const char *const addrs[] = { "10.0.10.1", "10.0.10.10" };
+    const size_t n = sizeof(addrs) / sizeof(addrs[0]);
+
+    /* Hits — anywhere in the text, not just a host field */
+    ASSERT_TRUE(virp_config_blocked_address_in("\"host\": \"10.0.10.1\"", addrs, n) != NULL);
+    ASSERT_TRUE(virp_config_blocked_address_in("\"host\": \"10.0.10.10\"", addrs, n) != NULL);
+    ASSERT_TRUE(virp_config_blocked_address_in("x 10.0.10.1 y", addrs, n) != NULL);
+    ASSERT_TRUE(virp_config_blocked_address_in("10.0.10.10", addrs, n) != NULL);
+    /* Non-hits: neighbours that merely share the prefix */
+    ASSERT_TRUE(virp_config_blocked_address_in("\"host\": \"10.0.10.12\"", addrs, n) == NULL);
+    ASSERT_TRUE(virp_config_blocked_address_in("\"host\": \"10.0.10.100\"", addrs, n) == NULL);
+    ASSERT_TRUE(virp_config_blocked_address_in("\"host\": \"110.0.10.1\"", addrs, n) == NULL);
+    ASSERT_TRUE(virp_config_blocked_address_in("\"host\": \"210.0.10.10\"", addrs, n) == NULL);
+    ASSERT_TRUE(virp_config_blocked_address_in("", addrs, n) == NULL);
+    ASSERT_TRUE(virp_config_blocked_address_in(NULL, addrs, n) == NULL);
+    /* Degenerate lists must not match rather than crash. */
+    ASSERT_TRUE(virp_config_blocked_address_in("10.0.10.1", addrs, 0) == NULL);
+    ASSERT_TRUE(virp_config_blocked_address_in("10.0.10.1", NULL, 0) == NULL);
+
+    /*
+     * And the PRODUCTION posture, pinned separately: the list is empty as
+     * of 2026-09-08, so nothing is excluded. If someone re-arms it, this
+     * fails and they are made to say so deliberately.
+     */
+    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"10.0.10.1\"") == NULL);
+    ASSERT_TRUE(virp_config_blocked_address("\"host\": \"10.0.10.10\"") == NULL);
 }
 
 #define EXCLUSION_CFG "/tmp/virp-onode-exclusion.json"
@@ -3076,18 +3101,30 @@ TEST(test_load_devices_accepts_boolean_evidence_required)
     unlink(CFG);
 }
 
-TEST(test_load_devices_refuses_blocked_address)
+TEST(test_load_devices_allows_former_blocked_addresses)
 {
-    /* A config that is VALID in every respect except the blocked host:
-     * the refusal must be the exclusion, not a parse error, and it must
-     * refuse the WHOLE config (no skip-and-continue). */
+    /*
+     * INVERTED 2026-09-08, when the production blocklist was emptied.
+     * This test previously asserted that 10.0.10.1 (the colo FortiGate)
+     * refused the whole config. It now asserts the opposite, because
+     * governing that box is the point.
+     *
+     * NOTE ON WHY IT IS WRITTEN THIS WAY: in its previous form the two
+     * device rows carried NO node_id. Once the blocklist stopped
+     * refusing them, load_devices still returned -1 — for an unrelated
+     * reason ("node_id 0 ... duplicate identities") — so the test kept
+     * reporting PASS while testing nothing it claimed to. A test whose
+     * assertion is satisfiable by a second code path is worse than one
+     * that fails. Both rows therefore carry distinct valid node_ids, so
+     * the ONLY thing this can be measuring is the exclusion.
+     */
     FILE *f = fopen(EXCLUSION_CFG, "w");
     ASSERT_TRUE(f != NULL);
     fprintf(f,
         "{\n"
         "  \"devices\": [\n"
-        "    { \"hostname\": \"ok-device\", \"host\": \"10.0.10.12\", \"vendor\": \"mock\" },\n"
-        "    { \"hostname\": \"edge-fw\", \"host\": \"10.0.10.1\", \"vendor\": \"mock\" }\n"
+        "    { \"hostname\": \"ok-device\", \"host\": \"10.0.10.12\", \"vendor\": \"mock\", \"node_id\": \"0A000A0C\" },\n"
+        "    { \"hostname\": \"edge-fw\", \"host\": \"10.0.10.1\", \"vendor\": \"mock\", \"node_id\": \"0A000A01\" }\n"
         "  ]\n"
         "}\n");
     fclose(f);
@@ -3099,8 +3136,8 @@ TEST(test_load_devices_refuses_blocked_address)
     ASSERT_TRUE(tmp.ctx != NULL);
 
     int loaded = load_devices(&tmp, EXCLUSION_CFG);
-    ASSERT_EQ(loaded, -1);
-    ASSERT_EQ(tmp.device_count, 0);
+    ASSERT_EQ(loaded, 2);
+    ASSERT_EQ(tmp.device_count, 2);
 
     onode_destroy(&tmp);
     virp_context_destroy(tmp.ctx);
@@ -8231,13 +8268,13 @@ int main(int argc, char **argv)
     RUN_TEST(test_add_device_rejects_duplicate_identities);
     RUN_TEST(test_load_devices_duplicate_identities_fatal);
 
-    printf("\n[Autopilot hard exclusions (10.0.10.1 / 10.0.10.10)]\n");
+    printf("\n[Autopilot hard exclusions (matcher tested; production list empty)]\n");
     RUN_TEST(test_blocked_address_text_scan);
     RUN_TEST(test_node_config_fatal_when_evidence_required);
     RUN_TEST(test_node_config_best_effort_when_not_required);
     RUN_TEST(test_load_devices_refuses_nonboolean_evidence_required);
     RUN_TEST(test_load_devices_accepts_boolean_evidence_required);
-    RUN_TEST(test_load_devices_refuses_blocked_address);
+    RUN_TEST(test_load_devices_allows_former_blocked_addresses);
     RUN_TEST(test_load_devices_allows_neighbor_addresses);
 
     printf("\n[Gate-reason retention (chain body recoverable)]\n");

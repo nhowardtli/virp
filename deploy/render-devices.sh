@@ -219,7 +219,25 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             # the daemon's address space.
             "VIRP_PVE_PASSWORD", "VIRP_LABNET_PASSWORD",
             "VIRP_WAZUH_HOME_PASSWORD", "VIRP_FORTIGATE_HOME_PASSWORD",
-            "VIRP_LABSWITCH1_PASSWORD"):
+            "VIRP_LABSWITCH1_PASSWORD",
+            # fortigate-200g (10.0.10.1), the COLO gateway, added
+            # 2026-09-08 on virp-lab. Deliberately NOT
+            # ${VIRP_FORTIGATE_HOME_PASSWORD}: that name means the
+            # FortiWiFi 60F at 10.0.0.1 on the home node, a physically
+            # different unit with a different account and a different
+            # licence state. One name, one firewall — the same split
+            # SWITCH_PASS and VIRP_LABSWITCH1_PASSWORD exist to enforce,
+            # and for the same reason: a shared placeholder is how a
+            # secret reaches the wrong box and how a rotation misses half
+            # its targets. THIS TUPLE IS THE SUBSTITUTION ALLOWLIST, not
+            # documentation: a placeholder the template names but this
+            # tuple omits is never substituted AND is then caught by the
+            # leftover check below, so the render FATALs and the daemon
+            # does not start — across every governed device, not just the
+            # new one. Adding a credential to autopilot.env is therefore
+            # necessary but NOT sufficient; the name must be added here
+            # too, in the same change.
+            "VIRP_FORTIGATE_COLO_PASSWORD"):
     if var not in used:
         continue
     val = os.environ.get(var)

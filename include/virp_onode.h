@@ -838,6 +838,13 @@ int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len);
  * call one of these and refuse to start on a hit.
  */
 const char *virp_config_blocked_address(const char *text);
+
+/* Same boundary-aware scan against a caller-supplied list. Exposed so the
+ * matcher stays testable when the production list is empty; production
+ * callers want virp_config_blocked_address() above. */
+const char *virp_config_blocked_address_in(const char *text,
+                                           const char *const *addrs,
+                                           size_t n_addrs);
 const char *virp_config_file_blocked(const char *path);
 
 /*
