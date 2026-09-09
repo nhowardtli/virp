@@ -240,6 +240,69 @@ TEST(test_missing_command_echo_is_refused)
     CHECK(out_len == 0, "expected zero length on refusal, got %zu", out_len);
 }
 
+/* =========================================================================
+ * Prompt / pager detection (2026-09-09, FortiGate 200G, FortiOS 7.6.7).
+ *
+ * The read loop used to declare "no prompt" whenever the last byte was
+ * not '#'. On the 200G every command failed that way while the device had
+ * answered in full: the prompt may end in '$' or carry an ANSI tail, and
+ * long output stops at the pager's "--More--". These pin the helpers the
+ * loop now uses, without a device.
+ * ========================================================================= */
+
+TEST(test_prompt_hash_dollar_and_ansi_tail)
+{
+    const char *a = "get hardware status\r\nModel: 200G\r\n\r\nFortiGate-200G # ";
+    CHECK(fg_reply_ends_with_prompt(a, strlen(a)), "'#' prompt not recognised");
+
+    const char *b = "output\r\nFortiGate-200G $ ";
+    CHECK(fg_reply_ends_with_prompt(b, strlen(b)),
+          "read-only '$' prompt not recognised");
+
+    const char *c = "output\r\nFortiGate-200G # \x1b[K";
+    CHECK(fg_reply_ends_with_prompt(c, strlen(c)),
+          "ANSI CSI tail after the prompt defeated detection");
+
+    const char *d = "line1\r\nline2\r\n--More-- ";
+    CHECK(!fg_reply_ends_with_prompt(d, strlen(d)),
+          "'--More--' must NOT be taken for a prompt");
+
+    CHECK(!fg_reply_ends_with_prompt("", 0), "empty reply counted as a prompt");
+
+    const char *e = "not a prompt line\r\n";
+    CHECK(!fg_reply_ends_with_prompt(e, strlen(e)),
+          "plain text counted as a prompt");
+}
+
+TEST(test_pager_pending_detection)
+{
+    const char *p = "line1\r\nline2\r\n--More-- ";
+    CHECK(fg_pager_pending(p, strlen(p)), "pager marker not detected");
+
+    const char *q = "line1\r\nFortiGate-200G # ";
+    CHECK(!fg_pager_pending(q, strlen(q)), "prompt misdetected as pager");
+
+    const char *r = "--More--\r\n";
+    CHECK(fg_pager_pending(r, strlen(r)),
+          "pager marker with trailing CRLF not detected");
+}
+
+TEST(test_strip_pager_removes_marker_and_erase_run)
+{
+    char raw[] = "line1\r\n--More-- \r        \rline2\r\nFortiGate-200G # ";
+    size_t n = fg_strip_pager(raw, strlen(raw));
+
+    CHECK(strstr(raw, "--More--") == NULL, "marker survived strip");
+    CHECK(strstr(raw, "line1") != NULL && strstr(raw, "line2") != NULL,
+          "body content lost");
+    CHECK(strstr(raw, "line1") < strstr(raw, "line2"), "line order changed");
+    CHECK(strchr(raw, '\n') != NULL, "newlines must survive the strip");
+    CHECK(strstr(raw, "\r        \r") == NULL, "pager erase run survived");
+    CHECK(n == strlen(raw), "returned length disagrees with terminator");
+    CHECK(fg_reply_ends_with_prompt(raw, n),
+          "prompt no longer detected after strip");
+}
+
 /* ========================================================================= */
 
 int main(void)
@@ -250,6 +313,9 @@ int main(void)
     RUN_TEST(test_plain_command_body_is_output_only);
     RUN_TEST(test_config_end_line_does_not_truncate_body);
     RUN_TEST(test_missing_command_echo_is_refused);
+    RUN_TEST(test_prompt_hash_dollar_and_ansi_tail);
+    RUN_TEST(test_pager_pending_detection);
+    RUN_TEST(test_strip_pager_removes_marker_and_erase_run);
 
     printf("\n================================================================\n");
     printf("  Results: %d/%d passed%s\n", tests_run - tests_failed, tests_run,

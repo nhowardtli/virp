@@ -59,4 +59,17 @@ char *fg_scrub_reply(char *raw, size_t total, const char *command,
 char *fg_line_after_containing(char *buf, const char *needle);
 char *fg_find_last_echo_line(char *buf, const char *word);
 
+/*
+ * Prompt / pager detection (2026-09-09, FortiOS 7.6 on the 200G).
+ * fg_trim_prompt_tail strips trailing whitespace and ANSI CSI sequences;
+ * fg_reply_ends_with_prompt accepts the read-write '#' AND read-only '$'
+ * prompt; fg_pager_pending spots the "--More--" wait state so the read
+ * loop can answer it; fg_strip_pager removes the marker and its erase run
+ * before the body is signed. Exported for tests/test_driver_fortigate_scrub.c.
+ */
+size_t fg_trim_prompt_tail(const char *raw, size_t t);
+bool   fg_reply_ends_with_prompt(const char *raw, size_t total);
+bool   fg_pager_pending(const char *raw, size_t total);
+size_t fg_strip_pager(char *raw, size_t total);
+
 #endif /* VIRP_DRIVER_FORTIGATE_H */

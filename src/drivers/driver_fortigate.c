@@ -178,6 +178,101 @@ static bool fg_command_needs_vdom(const char *command)
 }
 
 /*
+ * Prompt / pager detection.
+ *
+ * Found live on the FortiGate 200G (FortiOS 7.6.7, 2026-09-09): the
+ * read loop declared "no prompt" on every command while the device had
+ * answered in full. Two independent causes stacked, both invisible to a
+ * test that only asks "is the last byte '#'?":
+ *
+ *   1. The prompt character. FortiOS ends the prompt with '#' for a
+ *      read-write context and '$' for a read-only one, and on an xterm
+ *      PTY may follow it with an ANSI CSI sequence (e.g. ESC[K). The old
+ *      test trimmed only ' ', '\r', '\n'.
+ *   2. The pager. With `config system console / set output more` (the
+ *      factory default; the 60F is on `standard`) long output stops at
+ *      "--More--" and waits for a key. FortiOS has no per-session
+ *      "terminal length 0", so unlike the Cisco/ASA drivers this cannot
+ *      be switched off with a command at connect; it has to be answered.
+ *
+ * These helpers are non-static so tests/test_driver_fortigate_scrub.c can
+ * exercise them without a device.
+ */
+
+/* Length of `raw` after removing trailing whitespace and trailing ANSI CSI
+ * sequences (ESC '[' <params 0x20-0x3F>* <final 0x40-0x7E>), repeated
+ * until neither applies. '#' (0x23) and '$' (0x24) are never CSI final
+ * bytes, so a prompt is never mistaken for one. */
+size_t fg_trim_prompt_tail(const char *raw, size_t t)
+{
+    for (;;) {
+        while (t > 0 && (raw[t - 1] == ' ' || raw[t - 1] == '\r' ||
+                         raw[t - 1] == '\n'))
+            t--;
+        if (t >= 3) {
+            unsigned char fin = (unsigned char)raw[t - 1];
+            if (fin >= 0x40 && fin <= 0x7E) {
+                size_t i = t - 1;
+                while (i > 0) {
+                    unsigned char c = (unsigned char)raw[i - 1];
+                    if (c < 0x20 || c > 0x3F) break;
+                    i--;
+                }
+                if (i >= 2 && raw[i - 1] == '[' && raw[i - 2] == '\x1b') {
+                    t = i - 2;
+                    continue;
+                }
+            }
+        }
+        return t;
+    }
+}
+
+/* True when the reply, trimmed as above, ends on a FortiOS prompt. */
+bool fg_reply_ends_with_prompt(const char *raw, size_t total)
+{
+    size_t t = fg_trim_prompt_tail(raw, total);
+    return t > 0 && (raw[t - 1] == '#' || raw[t - 1] == '$');
+}
+
+/* True when the reply, trimmed as above, ends on the pager's "--More--"
+ * and the device is waiting for a keypress before sending more. */
+bool fg_pager_pending(const char *raw, size_t total)
+{
+    static const char more[] = "--More--";
+    const size_t ml = sizeof(more) - 1;
+    size_t t = fg_trim_prompt_tail(raw, total);
+    return t >= ml && memcmp(raw + t - ml, more, ml) == 0;
+}
+
+/*
+ * Remove every "--More--" marker together with the CR / space / backspace
+ * runs the pager uses to erase it, so none of it lands in the SIGNED
+ * observation body. In place; returns the new length; never removes '\n',
+ * so line structure survives. */
+size_t fg_strip_pager(char *raw, size_t total)
+{
+    static const char more[] = "--More--";
+    const size_t ml = sizeof(more) - 1;
+    size_t w = 0;
+    for (size_t r = 0; r < total; ) {
+        if (total - r >= ml && memcmp(raw + r, more, ml) == 0) {
+            r += ml;
+            while (r < total && (raw[r] == '\r' || raw[r] == ' ' ||
+                                 raw[r] == '\b'))
+                r++;
+            while (w > 0 && (raw[w - 1] == '\r' || raw[w - 1] == ' ' ||
+                             raw[w - 1] == '\b'))
+                w--;
+            continue;
+        }
+        raw[w++] = raw[r++];
+    }
+    raw[w] = '\0';
+    return w;
+}
+
+/*
  * FortiGate output scrubbing.
  *
  * FortiOS echoes every line it is sent, each preceded by a prompt, so a
@@ -393,16 +488,23 @@ static virp_error_t fg_ssh_execute(struct virp_conn *conn,
             idle_cycles = 0;
 
             /*
-             * Trim trailing padding before testing, rather than
-             * requiring the read to land exactly on "# ". The old test
-             * only fired when a fragment boundary happened to sit on
-             * those two bytes.
+             * The pager stops at "--More--" and waits. Answer it with a
+             * space and keep reading; the marker is scrubbed out below
+             * before anything is signed. Checked BEFORE the prompt test
+             * because "--More--" ends in '-' and would otherwise sit
+             * there until the 3s idle timeout declared a partial body.
              */
-            size_t t = total;
-            while (t > 0 && (raw[t - 1] == ' ' || raw[t - 1] == '\r' ||
-                             raw[t - 1] == '\n'))
-                t--;
-            if (t > 0 && raw[t - 1] == '#') {
+            if (fg_pager_pending(raw, total)) {
+                libssh2_channel_write(channel, " ", 1);
+                idle_cycles = 0;
+                continue;
+            }
+            /*
+             * Trim trailing padding (and any ANSI tail) before testing,
+             * rather than requiring the read to land exactly on "# ",
+             * and accept the read-only '$' prompt as well as '#'.
+             */
+            if (fg_reply_ends_with_prompt(raw, total)) {
                 prompt_seen = true;
                 break;
             }
@@ -428,6 +530,27 @@ static virp_error_t fg_ssh_execute(struct virp_conn *conn,
                 "bytes=%zu (buffer_full=%s) — reporting as error\n",
                 conn->device.hostname, total,
                 (total >= FG_SSH_BUFFER_SIZE - 1) ? "yes" : "no");
+        /*
+         * Show what the tail actually was, escaped, so the NEXT such
+         * failure is a ten-second read rather than an hour of inference
+         * about prompt characters and pagers. Raw, pre-scrub, on purpose.
+         */
+        {
+            size_t n = total < 48 ? total : 48;
+            char esc[48 * 4 + 1];
+            size_t o = 0;
+            for (size_t i = total - n; i < total; i++) {
+                unsigned char c = (unsigned char)raw[i];
+                if (c >= 0x20 && c < 0x7f && c != '\\') {
+                    esc[o++] = (char)c;
+                } else {
+                    int k = snprintf(esc + o, sizeof(esc) - o, "\\x%02x", c);
+                    if (k > 0) o += (size_t)k;
+                }
+            }
+            esc[o] = '\0';
+            fprintf(stderr, "[FortiGate] tail(%zu)=\"%s\"\n", n, esc);
+        }
         free(raw);
         libssh2_channel_close(channel);
         libssh2_channel_free(channel);
