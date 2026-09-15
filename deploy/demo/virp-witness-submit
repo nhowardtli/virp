@@ -296,7 +296,7 @@ def main():
                     leaf += line.split()[-1] + " "
             print("virp-witness-submit: %s seq %d -> leaf/tree %s" % (session_id, last_sequence, leaf.strip()))
         else:
-            if re.search(r"\b403\b", result.stderr + result.stdout):
+            if re.search(r"(?:HTTP\s*|\b)403\b", result.stderr + result.stdout, re.IGNORECASE):
                 write_head("/var/lib/virp/witness/STOP-403", "Registry refused403; operator intervention required\n")
             failed += 1
             print(
