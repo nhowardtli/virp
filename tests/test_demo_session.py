@@ -78,7 +78,7 @@ class DemoSession(unittest.TestCase):
                 sh._print_signed(info, [info['text']])
                 text = out.getvalue()
                 self.assertIn('O 192.0.2.0/24 via 192.0.2.1', text)
-                self.assertLess(text.index(vs.TRAILER), text.index('% WARNING:'))
+                self.assertLess(text.index(vs.trailer()), text.index('% WARNING:'))
                 self.assertIn('do not retry automatically', text)
                 self.assertEqual(calls, ['chain_append', 'execute', 'chain_append'])
             finally:

@@ -350,6 +350,16 @@ class TestDecode(unittest.TestCase):
 # ── 4. end-to-end through a fake gate: requests + output contract ─────
 
 class TestCommands(unittest.TestCase):
+    def test_demo_tty_enable_keeps_read_seat(self):
+        from unittest.mock import patch
+        buf = io.StringIO()
+        sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h")
+        sh.demo_session = "demo-" + "a" * 32
+        with patch.object(vs.os, "geteuid", return_value=988), patch.object(vs.sys.stdin, "isatty", return_value=True):
+            self.assertFalse(sh.cmd_enable([]))
+        self.assertTrue(sh.privileged)
+        self.assertNotIn("Escalating", buf.getvalue())
+
     def test_device_command_at_exec_prompt_prints_hint_without_crashing(self):
         buf = io.StringIO()
         sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h")

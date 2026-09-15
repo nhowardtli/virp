@@ -1,0 +1,3 @@
+#!/bin/sh
+# VM219 visitor always stays at the uid988 gate seat.
+exec sudo -u virp-shell -- /usr/bin/python3 /usr/local/lib/virp/virp-shell "$@"

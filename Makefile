@@ -1871,6 +1871,15 @@ VIRP_INSTALL_SHELL         = $(VIRP_INSTALL_DIR)/virp-shell
 VIRP_INSTALL_SHELL_WRAPPER = /usr/local/bin/virp-shell
 VIRP_INSTALL_SHELL_SUDOERS = /etc/sudoers.d/virp-shell
 
+ifeq ($(VIRP_SHELL_DEMO_ONLY),1)
+.PHONY: install-virp-shell
+install-virp-shell:
+	@python3 -c 'import sys; sys.path.insert(0,"deploy/demo"); from network import require_demo_vm; require_demo_vm()'
+	@scripts/require-clean-tree.sh "refusing to install demo shell from dirty tree"
+	@test "$$(id -u virp-shell)" = 988
+	install -m 0755 -o root -g virp $(VIRP_SHELL_SRC) $(VIRP_INSTALL_SHELL)
+	install -m 0755 -o root -g root deploy/demo/shell.wrapper $(VIRP_INSTALL_SHELL_WRAPPER)
+else
 .PHONY: install-virp-shell
 install-virp-shell:
 	@test -f $(VIRP_SHELL_SRC) || { echo "FAIL: $(VIRP_SHELL_SRC) missing"; exit 1; }
@@ -1910,6 +1919,8 @@ install-virp-shell:
 	@echo "  The gate accepts uid $(VIRP_SHELL_UID) only after the template row for it is"
 	@echo "  installed (make install-devices-template) and virp-onode restarted."
 	@echo "  Add your own sudoers rule for the operators who may run the wrapper."
+
+endif
 
 # -------------------------------------------------------------------------
 # install-autopilot — the autopilot Python ONLY.

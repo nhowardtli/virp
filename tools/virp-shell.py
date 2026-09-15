@@ -1267,7 +1267,7 @@ class VirpShell(cmd.Cmd):
     def cmd_enable(self, args):
         if self.privileged:
             return False
-        if os.geteuid() == SHELL_UID and sys.stdin.isatty():
+        if not self.demo_session and os.geteuid() == SHELL_UID and sys.stdin.isatty():
             # Real escalation: hand back to the wrapper, which re-runs this
             # program as virp-shell-admin through a PASSWD sudo rule. The
             # password prompt is sudo's; a wrong password lands you back
