@@ -456,6 +456,42 @@ class TestCommands(unittest.TestCase):
         out, _, _ = self._config_session(lambda r: error_frame(-50), ["show clock"])
         self.assertIn("% gate refused: VIRP_ERR_ACTION_FORBIDDEN (-50)", out)
 
+    def test_device_question_mark_lists_the_fleet_through_the_gate(self):
+        g = FakeGate(lambda r: observation(0x05, FLEET_TEXT))
+        try:
+            buf = io.StringIO()
+            sh = vs.VirpShell(sock_path=g.path, stdout=buf, host="virp-lab")
+            sh.default("enable"); sh.default("configure terminal")
+            buf.truncate(0); buf.seek(0)
+            sh.default("device ?")
+            out = buf.getvalue()
+            self.assertIn("sw-3850", out)
+            self.assertIn("cisco_ios", out)
+            self.assertIn("connected", out)
+            self.assertNotIn("<name>", out)
+            self.assertEqual(g.requests, [{"action": "list_fleet"}])
+            buf.truncate(0); buf.seek(0)
+            sh.default("device sw?")                     # partial filters, cache reused
+            self.assertIn("sw-3850", buf.getvalue())
+            self.assertNotIn("pbs-lab", buf.getvalue())
+            self.assertEqual(len(g.requests), 1)
+            buf.truncate(0); buf.seek(0)
+            sh.default("device zz?")
+            self.assertIn("% no device matches 'zz'", buf.getvalue())
+            sh.default("end")
+            buf.truncate(0); buf.seek(0)
+            sh.default("show device ?")                  # same listing in exec
+            self.assertIn("fortigate-200g", buf.getvalue())
+            self.assertEqual(sh.device_names("sw"), ["sw-3850"])
+        finally:
+            g.close()
+
+    def test_device_question_mark_falls_back_when_gate_is_down(self):
+        buf = io.StringIO()
+        sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="virp-lab")
+        sh.default("show device ?")
+        self.assertIn("<name>", buf.getvalue())
+
     def test_shell_words_still_win_inside_a_device_context(self):
         out, reqs, sh = self._config_session(lambda r: heartbeat(), ["show node"])
         self.assertEqual(reqs, [{"action": "heartbeat"}])   # not execute

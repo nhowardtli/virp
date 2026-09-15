@@ -658,6 +658,18 @@ class VirpShell(cmd.Cmd):
         if not words:
             self.out("% Invalid input")
             return
+        if "<name>" in words:
+            # A device argument: list the fleet (through the gate) instead
+            # of the bare placeholder, IOS-style. Falls back when the gate
+            # cannot be reached.
+            rows = self.fleet_rows()
+            if rows is not None:
+                shown = [r for r in rows if r[0].lower().startswith(partial.lower())]
+                if not shown:
+                    self.out("%% no device matches '%s'" % partial)
+                    return
+                self.out(table(shown, ("name", "vendor", "status")))
+                return
         for w in words:
             if w == "<cr>":
                 self.out("  <cr>")
@@ -682,10 +694,34 @@ class VirpShell(cmd.Cmd):
             self.completion_matches = [w + " " for w in words
                                        if w != "<cr>" and w != "WORD"
                                        and not is_placeholder(w)]
+            if "<name>" in words:
+                self.completion_matches = [n + " " for n in self.device_names(text)]
         try:
             return self.completion_matches[state]
         except IndexError:
             return None
+
+    # -- fleet cache for device-name listing / completion ------------------
+    FLEET_TTL = 30.0
+
+    def fleet_rows(self):
+        """[(name, vendor, status)] via list_fleet, cached FLEET_TTL seconds.
+        None when the gate cannot answer (the caller falls back)."""
+        now = time.time()
+        cached = getattr(self, "_fleet", None)
+        if cached and now - cached[0] < self.FLEET_TTL:
+            return cached[1]
+        try:
+            info = self._reply({"action": COMMAND_ACTIONS["show devices"]})
+        except GateError:
+            return None
+        _, rows, _ = parse_fleet_text(info.get("text", ""))
+        self._fleet = (now, rows)
+        return rows
+
+    def device_names(self, partial=""):
+        rows = self.fleet_rows() or []
+        return [r[0] for r in rows if r[0].lower().startswith(partial.lower())]
 
     def _display_matches(self, substitution, matches, longest):
         """IOS-style '?' listing: word + one-line help, then the prompt
@@ -730,6 +766,7 @@ class VirpShell(cmd.Cmd):
     def cmd_show_devices(self, args):
         info = self._reply({"action": COMMAND_ACTIONS["show devices"]})
         count, rows, refused = parse_fleet_text(info.get("text", ""))
+        self._fleet = (time.time(), rows)      # warm the ?/Tab device cache
         body = []
         if count is not None:
             body.append("VIRP fleet: %d devices" % count)
