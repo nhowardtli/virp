@@ -10,6 +10,14 @@ spec.loader.exec_module(m)
 
 
 class DemoNetwork(unittest.TestCase):
+    def test_caddy_access_is_uid_scoped_and_private_egress_stays_denied(self):
+        rules = m.render('eth0', 'br-demo', ['10.0.20.1'], ['10.0.20.1'], True, 995)
+        self.assertIn('meta nfproto ipv4 iifname "eth0" tcp dport 443', rules)
+        self.assertIn('meta skuid 995 tcp dport 443', rules)
+        self.assertIn('172.16.0.0/12', rules)
+        with self.assertRaises(ValueError):
+            m.render('eth0', 'br-demo', ['10.0.20.1'], ['10.0.20.1'], True, 0)
+
     def test_rejects_interface_injection(self):
         for value in ['eth0"; accept', 'eth0\n', '*', 'x' * 16]:
             with self.subTest(value=value), self.assertRaises(ValueError):

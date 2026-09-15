@@ -34,24 +34,28 @@ def interface(value):
     return value
 
 
-def endpoints(values):
+def endpoints(values, public_dns=False):
     result = []
     for value in values:
         addr = ipaddress.IPv4Address(value)
-        if str(addr) != '10.0.20.1':
-            raise ValueError('Phase A permits DNS/NTP only at 10.0.20.1')
+        if str(addr) not in (('10.0.20.1', '1.1.1.1') if public_dns else ('10.0.20.1',)):
+            raise ValueError('Only enrolled DNS/NTP endpoints are permitted')
         result.append(str(addr))
     if not result:
         raise ValueError('at least one explicit endpoint required')
     return ', '.join(sorted(set(result)))
 
 
-def render(management, bridge, dns, ntp, witness_ssh=False):
+def render(management, bridge, dns, ntp, witness_ssh=False, caddy_uid=None):
     management, bridge = interface(management), interface(bridge)
     if management == bridge:
         raise ValueError('management and fake-fleet interfaces must differ')
     blocked = ', '.join(FORBIDDEN)
     witness_rule = (f'  oifname "{management}" ip daddr 18.217.153.230 tcp dport 22 counter accept\n' if witness_ssh else '')
+    if caddy_uid is not None and (not isinstance(caddy_uid, int) or caddy_uid < 1):
+        raise ValueError('Caddy requires an explicit non-root uid')
+    https_input = (f'  meta nfproto ipv4 iifname "{management}" tcp dport 443 counter accept\n' if caddy_uid is not None else '')
+    https_output = (f'  oifname "{management}" ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }} meta skuid {caddy_uid} counter reject\n  oifname "{management}" meta skuid {caddy_uid} tcp dport 443 counter accept\n' if caddy_uid is not None else '')
     # Own table only. Conntrack has already run by priority -50; replies to
     # admitted SSH are allowed without granting new arbitrary egress.
     return f'''add table inet virp_demo
@@ -65,17 +69,17 @@ table inet virp_demo {{
   ct state established,related accept
   iifname "{bridge}" ip saddr {FLEET} accept
   meta nfproto ipv4 iifname "{management}" tcp dport 22 counter accept
- }}
+{https_input} }}
  chain output {{
   type filter hook output priority -50; policy drop;
   oifname "lo" accept
   ip daddr {{ {blocked} }} counter reject
   ct state invalid drop
   ct state established,related accept
-  oifname "{management}" ip daddr {{ {endpoints(dns)} }} udp dport 53 counter accept
-  oifname "{management}" ip daddr {{ {endpoints(dns)} }} tcp dport 53 counter accept
+  oifname "{management}" ip daddr {{ {endpoints(dns, True)} }} udp dport 53 counter accept
+  oifname "{management}" ip daddr {{ {endpoints(dns, True)} }} tcp dport 53 counter accept
   oifname "{management}" ip daddr {{ {endpoints(ntp)} }} udp dport 123 counter accept
-{witness_rule}  oifname "{bridge}" ip daddr {FLEET} counter accept
+{witness_rule}{https_output}  oifname "{bridge}" ip daddr {FLEET} counter accept
  }}
  chain forward {{
   type filter hook forward priority -50; policy drop;
@@ -120,8 +124,9 @@ def main():
     p.add_argument('--ntp', action='append', required=True)
     p.add_argument('--apply', action='store_true', help='VM219 only; otherwise render to stdout')
     p.add_argument('--demo-witness-ssh', action='store_true', help='Owner-authorized EC2 tcp/22 only')
+    p.add_argument("--demo-caddy-uid", type=int, help="Owner-authorized ACME HTTPS egress for Caddy only")
     a = p.parse_args()
-    rules = render(a.management_interface, a.container_bridge, a.dns, a.ntp, a.demo_witness_ssh)
+    rules = render(a.management_interface, a.container_bridge, a.dns, a.ntp, a.demo_witness_ssh, a.demo_caddy_uid)
     if a.apply:
         apply(rules, a.management_interface)
     else:
