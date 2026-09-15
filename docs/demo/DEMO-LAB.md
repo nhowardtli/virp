@@ -1,3 +1,11 @@
+> 2026-09-15 owner update: Claude independently verified A5 from his own
+> session via ProxyJump10.0.20.30 at04e4e29, proposal
+> 023ab763c9af4c8ba7ae2934f3f5d159 (not applied). Earlier headless claude -p
+> evidence was a builder-initiated automated check, proposal
+> 03c3fac7a471b9b596e078139057e642. No pve1 relay is approved or installed.
+> The eth1 literal fix and full demo-session sequence range complete Phase A.
+> Runtime report: ~/audits/virp-demo-lab-2026-09-15/PHASE-A-REPORT.md.
+
 # VIRP Demo Lab — Phase A
 
 Status: VM219 deployed; six devices connected; two manual resets passed.
