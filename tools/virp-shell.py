@@ -559,8 +559,8 @@ def deployed_head(path=DEPLOYED_MD, limit=6):
 # ── the REPL ───────────────────────────────────────────────────────────
 
 class VirpShell(cmd.Cmd):
-    intro = ("virp-shell — read-only operator REPL for the VIRP O-Node "
-             "(phase 1). Type ? for commands.")
+    intro = ("virp-shell — operator REPL for the VIRP O-Node (reads execute; "
+             "config mode proposes, never applies). Type ? for commands.")
     doc_header = "Commands (abbreviations accepted, e.g. sh dev):"
 
     def __init__(self, sock_path=None, stdout=None, host=None):
