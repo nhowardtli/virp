@@ -409,6 +409,70 @@ def expand_ios(line):
     return " ".join(out)
 
 
+READ_VERBS = ("show", "ping", "traceroute", "dir", "more", "test")
+
+
+def is_read_verb(cmd):
+    """A command that only reads/probes: a YELLOW/RED one still needs an
+    approval to RUN, but nothing would be 'applied'. Drives the wording."""
+    first = cmd.split()[0].lower() if cmd.split() else ""
+    return first in READ_VERBS
+
+
+OUTPUT_FILTERS = ("include", "exclude", "begin", "section", "count")
+
+
+def split_output_filter(line):
+    """'show run | include ntp' -> ('show run', ('include', 'ntp')).
+    Only the IOS output filters are recognised; anything else after a
+    pipe is left on the line for the gate to judge (it refuses '|')."""
+    if " | " not in line:
+        return line, None
+    base, _, rest = line.partition(" | ")
+    parts = rest.strip().split(None, 1)
+    if not parts:
+        return line, None
+    kw = parts[0].lower()
+    matches = [f for f in OUTPUT_FILTERS if f.startswith(kw)]
+    if len(matches) != 1:
+        return line, None
+    kw = matches[0]
+    arg = parts[1] if len(parts) > 1 else ""
+    if kw != "count" and not arg:
+        return line, None
+    return base.rstrip(), (kw, arg)
+
+
+def apply_output_filter(lines, filt):
+    """Apply an IOS-style output filter to already-received lines."""
+    kw, arg = filt
+    try:
+        rx = re.compile(arg) if arg else None
+    except re.error:
+        rx = re.compile(re.escape(arg))
+    if kw == "include":
+        return [l for l in lines if rx.search(l)]
+    if kw == "exclude":
+        return [l for l in lines if not rx.search(l)]
+    if kw == "begin":
+        for i, l in enumerate(lines):
+            if rx.search(l):
+                return lines[i:]
+        return []
+    if kw == "section":
+        out, keep = [], False
+        for l in lines:
+            if l and not l[0].isspace():
+                keep = bool(rx.search(l))
+            if keep:
+                out.append(l)
+        return out
+    if kw == "count":
+        n = len([l for l in lines if (rx.search(l) if rx else True)])
+        return ["Number of lines which match regexp = %d" % n]
+    return lines
+
+
 # ── the command tree + IOS-style abbreviation resolver ─────────────────
 # node: {word: (subtree-or-None, min_args, max_args)}; None max = any.
 
@@ -700,6 +764,14 @@ class VirpShell(cmd.Cmd):
     def parseline(self, line):
         # Route EVERYTHING through the resolver so abbreviations work.
         return None, None, line
+
+    def precmd(self, line):
+        # Scripted use (stdin not a terminal): input() does not echo, so a
+        # transcript would show the prompt glued to the output. Echo the
+        # command after the prompt the way a terminal would.
+        if not sys.stdin.isatty() and line.strip():
+            self.stdout.write(line + "\n")
+        return line
 
     def emptyline(self):
         return False
@@ -1016,10 +1088,14 @@ class VirpShell(cmd.Cmd):
         for u in want:
             if u not in allowed and u not in actions:
                 raise GateError("uid %s is not in the loaded allowlist" % u)
-            rows.append((u, username(u),
-                         ceilings.get(u, "node-wide"),
-                         " ".join(actions.get(u, [])) or "-",
-                         " ".join(types.get(u, [])) or "-"))
+            import textwrap
+            acts = textwrap.wrap(" ".join(actions.get(u, [])) or "-", 56) or ["-"]
+            typs = textwrap.wrap(" ".join(types.get(u, [])) or "-", 30) or ["-"]
+            for i in range(max(len(acts), len(typs))):
+                rows.append((u if i == 0 else "", username(u) if i == 0 else "",
+                             ceilings.get(u, "node-wide") if i == 0 else "",
+                             acts[i] if i < len(acts) else "",
+                             typs[i] if i < len(typs) else ""))
         self.out("policy source: %s" % src)
         self.out(table(rows, ("uid", "user", "ceiling", "actions",
                               "chain_append types")))
@@ -1077,13 +1153,16 @@ class VirpShell(cmd.Cmd):
         """(config-<device>)#: send one line to the device through the gate.
         IOS abbreviations are expanded first for cisco_ios/cisco_iosxe
         devices (see expand_ios); the operator is told what was sent."""
-        sent = line
+        # IOS output filters ("| include x") are applied HERE, to the signed
+        # output, never sent: the gate refuses '|' as a separator by design.
+        base, filt = split_output_filter(line)
+        sent = base
         if self.device_vendor(self.device) in IOS_VENDORS:
-            sent = expand_ios(line)
+            sent = expand_ios(base)
         info = self._reply({"action": COMMAND_ACTIONS["config execute"],
                             "device": self.device, "command": sent})
         text = info.get("text", "").rstrip("\n")
-        note = ["sent as: %s" % sent] if sent != line else []
+        note = ["sent as: %s" % sent] if sent != base else []
         if info.get("obs_type_name") == "error":
             m = BLOCKED_RE.search(text)
             pid = PROPOSAL_RE.search(text)
@@ -1091,8 +1170,10 @@ class VirpShell(cmd.Cmd):
                 tier = m.group(3)
                 self.proposals.append((time.time(), self.device, sent, tier,
                                        pid.group(1)))
-                body = ["PROPOSED, not applied: '%s' on %s is %s; this seat's "
-                        "ceiling is %s" % (sent, self.device, tier, m.group(4)),
+                verb = ("PROPOSED (needs approval to run)" if is_read_verb(sent)
+                        else "PROPOSED, not applied")
+                body = ["%s: '%s' on %s is %s; this seat's ceiling is %s"
+                        % (verb, sent, self.device, tier, m.group(4)),
                         "proposal_id %s" % pid.group(1),
                         "operator: virp-tool approve %s && virp-tool apply %s"
                         % (pid.group(1), pid.group(1))]
@@ -1104,9 +1185,16 @@ class VirpShell(cmd.Cmd):
                         % (info["tier_name"], re.sub(r"^ERROR:\s*", "", text))]
             self._print_signed(info, note + body)
             return False
+        lines = text.splitlines()
+        if filt:
+            kept = apply_output_filter(lines, filt)
+            note.append("filtered locally: | %s %s (%d of %d lines shown; the "
+                        "chained observation is the full output)"
+                        % (filt[0], filt[1], len(kept), len(lines)))
+            lines = kept
         self._print_signed(info, note + ["%s: '%s' executed (%s)"
                                          % (self.device, sent, info["tier_name"])]
-                           + text.splitlines())
+                           + lines)
         return False
 
     def device_vendor(self, name):

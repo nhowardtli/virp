@@ -559,6 +559,48 @@ class TestCommands(unittest.TestCase):
         finally:
             g.close()
 
+    def test_output_filters_are_applied_locally_not_sent(self):
+        sof = vs.split_output_filter
+        self.assertEqual(sof("show run | include ntp"), ("show run", ("include", "ntp")))
+        self.assertEqual(sof("show run | inc ntp"), ("show run", ("include", "ntp")))
+        self.assertEqual(sof("show run | sec router bgp"), ("show run", ("section", "router bgp")))
+        self.assertEqual(sof("show run | count"), ("show run", ("count", "")))
+        self.assertEqual(sof("show run | bogus x"), ("show run | bogus x", None))
+        self.assertEqual(sof("show run"), ("show run", None))
+        lines = ["a ntp 1", " child", "b other", "c ntp 2"]
+        self.assertEqual(vs.apply_output_filter(lines, ("include", "ntp")), ["a ntp 1", "c ntp 2"])
+        self.assertEqual(vs.apply_output_filter(lines, ("exclude", "ntp")), [" child", "b other"])
+        self.assertEqual(vs.apply_output_filter(lines, ("begin", "other")), ["b other", "c ntp 2"])
+        self.assertEqual(vs.apply_output_filter(lines, ("section", "^a")), ["a ntp 1", " child"])
+        self.assertEqual(vs.apply_output_filter(lines, ("count", "ntp")),
+                         ["Number of lines which match regexp = 2"])
+
+        out, reqs, _ = self._config_session(
+            lambda r: observation(0x07, "Vlan1 down\nVlan10 up\nGi1/0/1 up\n"),
+            ["show ip interface brief | include Vlan"])
+        self.assertEqual(reqs[0]["command"], "show ip interface brief")   # pipe never sent
+        self.assertIn("filtered locally: | include Vlan (2 of 3 lines shown", out)
+        self.assertIn("Vlan10 up", out)
+        self.assertNotIn("Gi1/0/1 up", out)
+
+    def test_yellow_read_says_needs_approval_to_run(self):
+        pid = "abcdef0123456789abcdef0123456789"
+        out, _, _ = self._config_session(
+            lambda r: observation(0x0F, self.BLOCKED % (r.get("command", ""), "YELLOW", pid), tier=0x02),
+            ["show users"])
+        self.assertIn("PROPOSED (needs approval to run): 'show users'", out)
+        out, _, _ = self._config_session(
+            lambda r: observation(0x0F, self.BLOCKED % (r.get("command", ""), "RED", pid), tier=0x03),
+            ["interface Gi1/0/1 shutdown"])
+        self.assertIn("PROPOSED, not applied: 'interface Gi1/0/1 shutdown'", out)
+
+    def test_scripted_stdin_echoes_the_command_after_the_prompt(self):
+        import subprocess
+        p = subprocess.run([sys.executable, SHELL_PATH, "--socket", "/nonexistent"],
+                           input="enable\nshow chain\nexit\n", capture_output=True, text=True)
+        self.assertIn(">enable\n", p.stdout)
+        self.assertIn("#show chain\n", p.stdout)
+
     def test_device_error_frame_is_rendered_once(self):
         out, _, _ = self._config_session(
             lambda r: observation(0x0F, "ERROR: cannot connect to 'R1'"),
