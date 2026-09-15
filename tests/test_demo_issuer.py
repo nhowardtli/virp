@@ -5,7 +5,7 @@ def key(n=1):
  return 'ssh-ed25519 '+base64.b64encode(f(b'ssh-ed25519')+f(bytes([n])*32)).decode()
 class Tests(unittest.TestCase):
  def setUp(self):
-  self.tmp=tempfile.TemporaryDirectory();self.p=pathlib.Path(self.tmp.name)/'keys';self.p.touch();self.events=[];self.now=1789490000;self.issuer=m.Issuer(self.p,self.events.append,lambda:self.now)
+  self.tmp=tempfile.TemporaryDirectory();self.p=pathlib.Path(self.tmp.name)/'keys';self.p.touch();self.events=[];self.now=1789490000;self.issuer=m.Issuer(self.p,self.events.append,lambda:self.now,lambda:dict(url="https://demo.virp.systems",username="demo-approver",password="fixture-only"))
  def tearDown(self):self.tmp.cleanup()
  def request(self,k=None):return dict(name='Fixture Visitor',email='fixture@example.invalid',pubkey=k or key(),ts=self.now)
  def test_hmac_and_timestamp(self):
@@ -32,10 +32,20 @@ class Tests(unittest.TestCase):
   self.assertEqual(self.issuer.prune(),1);self.assertEqual(self.p.read_text(),'');self.assertEqual(self.events[-1]['event'],'expiry-prune');self.assertEqual(self.events[-1]['email_sha256'],hashlib.sha256(b'fixture@example.invalid').hexdigest())
  def test_gate_failure_cannot_issue_or_prune(self):
   def fail(e):raise RuntimeError('fixture gate refusal')
-  issuer=m.Issuer(self.p,fail,lambda:self.now)
+  issuer=m.Issuer(self.p,fail,lambda:self.now,lambda:{})
   with self.assertRaises(RuntimeError):issuer.issue(self.request())
   self.assertEqual(self.p.read_bytes(),b'')
   self.issuer.issue(self.request());self.now+=86460;before=self.p.read_bytes()
   with self.assertRaises(RuntimeError):issuer.prune()
   self.assertEqual(before,self.p.read_bytes())
+ def test_response_credentials_are_current_and_not_evidence(self):
+  r=self.issuer.issue(self.request());self.assertEqual(r['console']['password'],'fixture-only')
+  self.assertNotIn('fixture-only',json.dumps(self.events));self.assertNotIn('fixture-only',self.p.read_text())
+  self.issuer.details=lambda:dict(password='rotated-fixture')
+  r=self.issuer.issue(self.request(key(2)));self.assertEqual(r['console']['password'],'rotated-fixture')
+ def test_missing_console_details_refuses_before_grant(self):
+  def fail():raise RuntimeError('unavailable credential file')
+  self.issuer.details=fail
+  with self.assertRaises(RuntimeError):self.issuer.issue(self.request())
+  self.assertEqual(self.p.read_bytes(),b'');self.assertEqual(self.events,[])
 if __name__=='__main__':unittest.main()

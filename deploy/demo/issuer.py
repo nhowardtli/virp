@@ -4,6 +4,14 @@ import base64,datetime,fcntl,hashlib,hmac,http.server,importlib.util,json,os,re,
 from pathlib import Path
 KEYS=Path('/etc/ssh/authorized_keys.d/virp-demo')
 SECRET=Path('/etc/virp-demo-issuer/site.hmac')
+CONSOLE_ACCESS=Path('/etc/virp-demo/console-access.json')
+
+def console_access():
+    d=json.loads(CONSOLE_ACCESS.read_text())
+    if d.get('demo') is not True or d.get('username')!='demo-approver' or not isinstance(d.get('password'),str) or not d['password']:
+        raise RuntimeError('DEMO console credentials unavailable')
+    return dict(url='https://demo.virp.systems',username=d['username'],password=d['password'])
+
 
 def key_info(value):
     if not isinstance(value,str) or len(value.encode())>1024 or '\n' in value or '\r' in value:
@@ -60,7 +68,7 @@ def gate_event(event):
     return result
 
 class Issuer:
-    def __init__(self,path=KEYS,evidence=gate_event,clock=time.time):self.path=Path(path);self.evidence=evidence;self.clock=clock
+    def __init__(self,path=KEYS,evidence=gate_event,clock=time.time,details=console_access):self.path=Path(path);self.evidence=evidence;self.clock=clock;self.details=details
     def event(self,event,seat='',fp='',email='',expiry='',**detail):
         return self.evidence(dict(schema='virp-demo-signup/1',event=event,seat_id=seat,key_fingerprint=fp,email_sha256=hashlib.sha256(email.encode()).hexdigest() if email else seat[:64] if len(seat)==96 else '',expires_at=expiry,**detail))
     def prune(self):
@@ -81,6 +89,7 @@ class Issuer:
         email=d.get('email','');seat=hashlib.sha256(email.encode()).hexdigest()+uuid.uuid4().hex;fp=''
         try:
             key,fp=key_info(d['pubkey'])
+            access=self.details()  # Refuse before issuing if response credentials are unavailable.
             now=int(self.clock());expires=datetime.datetime.fromtimestamp(now+86400,datetime.timezone.utc)
             expiry=expires.strftime('%Y%m%d%H%M')
             with self.path.open('r+') as f:
@@ -96,7 +105,7 @@ class Issuer:
                 f.seek(0,2)
                 f.write(('\n' if original and not original.endswith('\n') else '')+'restrict,pty,expiry-time="'+expiry+'",command="/usr/local/bin/virp-shell" '+key+' demo:'+seat+'\n')
                 f.flush();os.fsync(f.fileno())
-            return dict(seat_id=seat,expires_at=datetime.datetime.strptime(expiry,'%Y%m%d%H%M').replace(tzinfo=datetime.timezone.utc).isoformat(),host='216.234.102.178',ssh_command='ssh -tt -i ./virp-demo-key virp-demo@216.234.102.178',docket_url='/demo/session/'+seat,receipt=receipt)
+            return dict(seat_id=seat,expires_at=datetime.datetime.strptime(expiry,'%Y%m%d%H%M').replace(tzinfo=datetime.timezone.utc).isoformat(),host='216.234.102.178',ssh_command='ssh -tt -i ./virp-demo-key virp-demo@216.234.102.178',docket_url='/demo/session/'+seat,receipt=receipt,console=access)
         except ValueError as e:
             self.event('refusal',seat,fp,email,reason=str(e));raise
 
