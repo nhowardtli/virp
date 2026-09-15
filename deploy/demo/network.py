@@ -46,11 +46,12 @@ def endpoints(values):
     return ', '.join(sorted(set(result)))
 
 
-def render(management, bridge, dns, ntp):
+def render(management, bridge, dns, ntp, witness_ssh=False):
     management, bridge = interface(management), interface(bridge)
     if management == bridge:
         raise ValueError('management and fake-fleet interfaces must differ')
     blocked = ', '.join(FORBIDDEN)
+    witness_rule = (f'  oifname "{management}" ip daddr 18.217.153.230 tcp dport 22 counter accept\n' if witness_ssh else '')
     # Own table only. Conntrack has already run by priority -50; replies to
     # admitted SSH are allowed without granting new arbitrary egress.
     return f'''add table inet virp_demo
@@ -74,7 +75,7 @@ table inet virp_demo {{
   oifname "{management}" ip daddr {{ {endpoints(dns)} }} udp dport 53 counter accept
   oifname "{management}" ip daddr {{ {endpoints(dns)} }} tcp dport 53 counter accept
   oifname "{management}" ip daddr {{ {endpoints(ntp)} }} udp dport 123 counter accept
-  oifname "{bridge}" ip daddr {FLEET} counter accept
+{witness_rule}  oifname "{bridge}" ip daddr {FLEET} counter accept
  }}
  chain forward {{
   type filter hook forward priority -50; policy drop;
@@ -118,8 +119,9 @@ def main():
     p.add_argument('--dns', action='append', required=True)
     p.add_argument('--ntp', action='append', required=True)
     p.add_argument('--apply', action='store_true', help='VM219 only; otherwise render to stdout')
+    p.add_argument('--demo-witness-ssh', action='store_true', help='Owner-authorized EC2 tcp/22 only')
     a = p.parse_args()
-    rules = render(a.management_interface, a.container_bridge, a.dns, a.ntp)
+    rules = render(a.management_interface, a.container_bridge, a.dns, a.ntp, a.demo_witness_ssh)
     if a.apply:
         apply(rules, a.management_interface)
     else:

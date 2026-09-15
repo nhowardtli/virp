@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Submit this node's VIRP chain heads to the witness.
+
+This is the SHIM described in INTEGRATION.md, not the daemon integration. It
+deliberately lives outside the daemon:
+
+  * it reads chain.db read-only and never writes to it;
+  * it cannot fail an append, because it is a separate timer — which is the
+    one property INTEGRATION.md insists on. Head signing in VIRP is
+    fail-closed on purpose, but a witness is a third party over a network, and
+    a chain that stopped appending because someone else's endpoint was down
+    would have made availability depend on the party it exists to not trust;
+  * its state is the receipt files themselves. A failed run leaves no USABLE
+    receipt, and the next run retries. Submission is idempotent at the witness,
+    so a retry after an ambiguous timeout returns the ORIGINAL receipt rather
+    than minting a second leaf.
+
+EXISTENCE IS NOT STATE. This used to skip a head whenever its receipt path
+existed. A receipt truncated by a crash, or left zero-byte by a full disk, or
+belonging to a different head at the same path, all satisfy os.path.exists —
+so the head looked witnessed forever while nothing had witnessed it, and no
+run would ever retry it. That is the failure this entire system exists to make
+visible, produced by a power cut and then hidden by its own bookkeeping.
+
+A receipt is now believed only when it parses, names THIS session, THIS
+sequence and THIS head hash, and carries a witness signature that verifies
+under the PINNED witness public key. Anything else is treated as no receipt at
+all and the head is submitted again — which is safe, because submission is
+idempotent: a resubmission of an identical leaf returns the original receipt,
+original index and original timestamp, and the tree does not grow.
+
+It signs with the node's own chain-signing key — the same key that signed the
+head — so the witness leaf's key_id matches the head's head_sig_key_id and a
+verifier can tie the two together.
+"""
+
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+CHAIN_DB = "/var/lib/virp/chain.db"
+KEY = "/etc/virp/keys/demo-producer.key"
+HEADS = "/var/lib/virp/witness/heads"
+WITNESS = os.environ.get("VIRP_WITNESS_URL", "http://127.0.0.1:8790")
+CLIENT = "/usr/local/bin/virp-witness-client"
+
+# The witness's public key, obtained OUT OF BAND and pinned here. Checking a
+# receipt against a key fetched from the witness that issued it would establish
+# nothing; that is why this is a file on this node and not an endpoint.
+WITNESS_PUBKEY = os.environ.get("VIRP_WITNESS_PUBKEY", "/etc/virp/witness.pub")
+
+RECEIPT_V = "virp-witness-receipt/1"
+
+# The three links that must hold before a receipt is allowed to mean "this head
+# is witnessed, skip it". `submitter signature` is deliberately not among them:
+# this node holds the signing key, not its public counterpart, and the leaf
+# binding below already ties the receipt to the exact head bytes.
+REQUIRED_PROPERTIES = ("leaf binding", "head binding", "witness signature")
+
+# Pace below the witness's per-key_id budget (60/min, burst 30) so a first run
+# over every session does not spend the burst and collect 429s.
+PACE_SECONDS = 1.2
+MAX_PER_RUN = 120
+
+HEAD_V = "VIRP-CHAIN-HEAD-v1"
+SAFE_SESSION = re.compile(r"^[A-Za-z0-9._:@+-]+$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def head_canonical(session_id, last_sequence, last_entry_hash):
+    """Byte-for-byte ~/virp/src/virp_chain.c:1113. No escaping, by design —
+    which is why session_id is charset-checked before it gets here."""
+    return (
+        '{"last_entry_hash":"%s","last_sequence":%d,"session_id":"%s","v":"%s"}'
+        % (last_entry_hash, last_sequence, session_id, HEAD_V)
+    )
+
+
+def write_head(path, canonical):
+    """Write the head canonical atomically and durably.
+
+    Same four steps as `witness_core::atomic`: temp file in the same
+    directory, fsync it, rename, fsync the directory. The receipt check below
+    hashes this file, so a torn write here would make a good receipt look like
+    it was for a different head — and the resubmission that followed would be
+    for bytes the daemon never produced.
+
+    A file that already holds exactly these bytes is left alone; the canonical
+    for a given session and sequence never changes, so rewriting it every five
+    minutes would be fsync traffic for nothing.
+    """
+    data = canonical.encode()
+    try:
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return
+    except OSError:
+        pass
+
+    directory = os.path.dirname(path) or "."
+    tmp = os.path.join(directory, ".%s.tmp-%d" % (os.path.basename(path), os.getpid()))
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    # The rename is metadata: without this the bytes can be durable under a
+    # name that is not.
+    dfd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def chain_id_for(session_id):
+    """SHA-256(session_id), matching virp-witness-client's default mapping."""
+    return hashlib.sha256(session_id.encode()).hexdigest()
+
+
+def receipt_gap(receipt_path, head_path, session_id, sequence, head_hash):
+    """Why this head still needs submitting, or None if it is genuinely witnessed.
+
+    Every path out of here that is not None causes a resubmission, which is
+    safe and idempotent. The expensive mistake is the other direction — saying
+    None about a file that does not actually witness this head — so every check
+    is stated positively and anything unexpected is a gap.
+    """
+    try:
+        with open(receipt_path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return "no receipt"
+    except OSError as e:
+        return "receipt unreadable: %s" % e
+
+    if not raw.strip():
+        # The crash case, and the one the old existence test called "done".
+        return "receipt is %d bytes" % len(raw)
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        return "receipt does not parse: %s" % e
+    if not isinstance(doc, dict) or doc.get("v") != RECEIPT_V:
+        return "receipt is not %s" % RECEIPT_V
+
+    # It must be about THIS head. A receipt for a different head sitting at
+    # this path is not evidence about this one, however well it verifies.
+    submission = doc.get("submission")
+    if not isinstance(submission, dict):
+        return "receipt has no submission block"
+    for field, want in (
+        ("chain_id", chain_id_for(session_id)),
+        ("sequence", sequence),
+        ("head_hash", head_hash),
+    ):
+        got = submission.get(field)
+        if got != want:
+            return "receipt is for %s %r, this head is %r" % (field, got, want)
+
+    # And the witness must actually have signed it, under the key pinned on
+    # this node. `verify` is offline and opens no socket.
+    if not os.path.exists(WITNESS_PUBKEY):
+        return "pinned witness key %s is missing" % WITNESS_PUBKEY
+    try:
+        result = subprocess.run(
+            [
+                CLIENT,
+                "verify",
+                "--receipt",
+                receipt_path,
+                "--head-file",
+                head_path,
+                "--witness-pubkey",
+                WITNESS_PUBKEY,
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as e:
+        return "cannot run %s: %s" % (CLIENT, e)
+    # The report is read before the exit code, so the journal line names the
+    # link that did not hold rather than a tail of JSON.
+    try:
+        report = json.loads(result.stdout)
+    except ValueError:
+        return "verify exited %d without a report: %s" % (
+            result.returncode,
+            (result.stderr or result.stdout).strip()[-200:],
+        )
+
+    status = {p.get("name"): p.get("status") for p in report.get("properties", [])}
+    for name in REQUIRED_PROPERTIES:
+        if status.get(name) != "VERIFIED":
+            return "%s is %s, not VERIFIED" % (name, status.get(name))
+    if result.returncode != 0:
+        # Every required link held and the tool still refused: believe the
+        # tool, and say what it called the result.
+        return "verify exited %d (%s)" % (result.returncode, report.get("verdict_id"))
+    return None
+
+
+def main():
+    if not os.path.exists(CHAIN_DB):
+        print("virp-witness-submit: no chain at %s" % CHAIN_DB, file=sys.stderr)
+        return 1
+    os.makedirs(HEADS, mode=0o750, exist_ok=True)
+
+    conn = sqlite3.connect("file:%s?mode=ro" % CHAIN_DB, uri=True)
+    rows = list(
+        conn.execute(
+            "SELECT session_id, last_sequence, last_entry_hash "
+            "FROM chain_heads WHERE session_id LIKE 'demo-%' ORDER BY updated_at_ns DESC"
+        )
+    )
+    conn.close()
+
+    submitted = failed = skipped = resubmitted = 0
+    for session_id, last_sequence, last_entry_hash in rows:
+        if submitted + failed >= MAX_PER_RUN:
+            print("virp-witness-submit: hit MAX_PER_RUN, rest next cycle")
+            break
+
+        # The head canonical does no JSON escaping, so a session id carrying a
+        # quote or a backslash would produce bytes that are not the head the
+        # daemon hashed. Refuse rather than witness the wrong thing.
+        if not SAFE_SESSION.match(session_id or ""):
+            print("virp-witness-submit: SKIP unsafe session_id %r" % session_id, file=sys.stderr)
+            skipped += 1
+            continue
+        if not HEX64.match(last_entry_hash or ""):
+            print("virp-witness-submit: SKIP %s: last_entry_hash is not 64 hex" % session_id, file=sys.stderr)
+            skipped += 1
+            continue
+
+        safe = session_id.replace(":", "_").replace("/", "_")
+        head_path = os.path.join(HEADS, "%s-%d.head" % (safe, last_sequence))
+        receipt_path = head_path + ".witness.json"
+
+        # The head file is written FIRST, because the receipt check verifies
+        # the receipt against these exact bytes.
+        canonical = head_canonical(session_id, last_sequence, last_entry_hash)
+        head_hash = hashlib.sha256(canonical.encode()).hexdigest()
+        write_head(head_path, canonical)
+
+        # The receipt file is the state — but only a receipt that actually
+        # witnesses THIS head, verified under the pinned key. Existence is not
+        # state; see the module docstring.
+        gap = receipt_gap(receipt_path, head_path, session_id, last_sequence, head_hash)
+        if gap is None:
+            skipped += 1
+            continue
+        if gap != "no receipt":
+            # Loud, because a receipt that is present and not usable is a
+            # different and more interesting fact than a head not yet
+            # submitted, and it is the state the old check called "done".
+            print(
+                "virp-witness-submit: RESUBMIT %s seq %d: %s" % (session_id, last_sequence, gap),
+                file=sys.stderr,
+            )
+            resubmitted += 1
+
+        result = subprocess.run(
+            [CLIENT, "submit", "--witness", WITNESS, "--head-file", head_path, "--key", KEY],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            submitted += 1
+            leaf = ""
+            for line in result.stdout.splitlines():
+                if "leaf_index" in line or "tree_size" in line:
+                    leaf += line.split()[-1] + " "
+            print("virp-witness-submit: %s seq %d -> leaf/tree %s" % (session_id, last_sequence, leaf.strip()))
+        else:
+            failed += 1
+            print(
+                "virp-witness-submit: FAILED %s seq %d: %s"
+                % (session_id, last_sequence, (result.stderr or result.stdout).strip().splitlines()[-1:]),
+                file=sys.stderr,
+            )
+            # A failure here is almost always the tunnel or the witness being
+            # down; there is no point hammering the rest of the sessions.
+            break
+
+        time.sleep(PACE_SECONDS)
+
+    print(
+        "virp-witness-submit: %d submitted (%d of them replacing an unusable receipt), "
+        "%d already witnessed, %d failed, %d sessions total"
+        % (submitted, resubmitted, skipped, failed, len(rows))
+    )
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

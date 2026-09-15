@@ -45,7 +45,7 @@ def main():
         subprocess.run(['systemctl', 'stop', 'virp-onode'], check=True)
         if args.capture:
             PRISTINE.mkdir(mode=0o700)
-            shutil.copytree(STATE, PRISTINE / 'state', copy_function=shutil.copy2)
+            shutil.copytree(STATE, PRISTINE / 'state', copy_function=shutil.copy2, ignore=shutil.ignore_patterns('witness'))
             # copytree does not preserve owners; record and restore explicitly.
             (PRISTINE / 'manifest.json').write_text(json.dumps(manifest(PRISTINE / 'state'), sort_keys=True))
             print('CAPTURE: quiescent chain, approvals, proposal state, WAL/SHM if present')
@@ -53,6 +53,10 @@ def main():
             shutil.rmtree(STATE)
             shutil.copytree(PRISTINE / 'state', STATE, copy_function=shutil.copy2)
             subprocess.run(['chown', '-R', 'virp:virp', str(STATE)], check=True)
+            # Tunnel identity and immutable witness receipts outlive daily chain reset.
+            witness = Path('/var/lib/virp-demo-witness')
+            if witness.is_dir():
+                (STATE / 'witness').symlink_to(witness, target_is_directory=True)
             # The console is stopped: retire yesterday's approvals and receipts.
             # Persistent login rate limits and the VM-only key remain intact.
             for suffix in ('', '-wal', '-shm', '-journal'):
