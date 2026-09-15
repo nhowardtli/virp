@@ -1,0 +1,33 @@
+#!/bin/sh
+# Node2 qualification: only this checkout is writable; no host network or state.
+# Adapted from virp-rust/scripts/isolated; production keys/home are not mounted.
+set -eu
+[ "$#" -gt 0 ] || { echo 'usage: scripts/isolated COMMAND [ARG ...]' >&2; exit 2; }
+qualification_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+qualification_uid=$(id -u)
+qualification_gid=$(id -g)
+[ "$qualification_uid" -ne 0 ] || { echo 'Run as an ordinary user' >&2; exit 2; }
+[ "$(pwd -P)" = "$qualification_root" ] || { echo 'Run from checkout root' >&2; exit 2; }
+# Fixed optional dependency-only virtualenv, read-only. No whole-home bind.
+qualification_venv=/home/nhoward/virp-api-venv
+if [ -d "$qualification_venv" ]; then
+    set -- --ro-bind "$qualification_venv" "$qualification_venv" --setenv PATH "$qualification_venv/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin" -- unshare --map-user="$qualification_uid" --map-group="$qualification_gid" -- "$@"
+else
+    set -- -- unshare --map-user="$qualification_uid" --map-group="$qualification_gid" -- "$@"
+fi
+exec unshare -Umr bwrap \
+    --tmpfs / --ro-bind /usr /usr \
+    --symlink usr/bin /bin --symlink usr/sbin /sbin \
+    --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+    --tmpfs /etc --ro-bind /etc/ssl /etc/ssl \
+    --ro-bind /etc/alternatives /etc/alternatives \
+    --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
+    --ro-bind /etc/passwd /etc/passwd --ro-bind /etc/group /etc/group \
+    --dir /var --dir /run --dir /opt \
+    --dir "$(dirname "$qualification_root")" \
+    --bind "$qualification_root" "$qualification_root" \
+    --dev /dev --proc /proc --perms 1777 --tmpfs /tmp \
+    --dir /tmp/home --setenv HOME /tmp/home --setenv PYTHONDONTWRITEBYTECODE 1 \
+    --setenv GOTOOLCHAIN local --setenv GOPROXY off --setenv GOSUMDB off \
+    --unshare-pid --unshare-net --unshare-ipc --die-with-parent \
+    --chdir "$qualification_root" "$@"

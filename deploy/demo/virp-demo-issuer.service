@@ -1,0 +1,27 @@
+[Unit]
+Description=VIRP demo signup issuer (VM219 only)
+Requires=virp-onode.service
+After=virp-onode.service
+[Service]
+User=virp-issuer
+Group=virp-issuer
+SupplementaryGroups=virp
+Environment=PYTHONDONTWRITEBYTECODE=1 TZ=UTC
+ExecStart=/usr/bin/python3 /usr/local/lib/virp/demo/issuer.py
+Restart=on-failure
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadWritePaths=/etc/ssh/authorized_keys.d/virp-demo
+InaccessiblePaths=/etc/virp/keys /etc/virp/autopilot.env
+[Install]
+WantedBy=multi-user.target

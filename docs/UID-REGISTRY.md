@@ -73,3 +73,9 @@ the 2026-08 notes, marked unverified.
 4. A test that pins the verbs the client actually sends
    (`tests/test_template_uid_policy.py`, or a client-specific one such as
    `tests/test_virp_shell.py`).
+
+## Demo issuer (VM219 only)
+
+| UID | Account | Ceiling | Actions | Append types |
+|---|---|---|---|---|
+| 1502 | virp-issuer (nologin, no sudo; group virp-issuer, supplementary virp for socket) | GREEN | chain_append only | evidence_item only |

@@ -71,6 +71,8 @@ def main():
         subprocess.run(['systemctl', 'start', 'virp-onode'], check=True)
         if console:
             subprocess.run(['systemctl', 'start', 'virp-demo-console.service'], check=True)
+        if Path('/usr/local/lib/virp/demo/issuer.py').exists():
+            subprocess.run(['runuser', '-u', 'virp-issuer', '--', '/usr/bin/python3', '/usr/local/lib/virp/demo/issuer.py', '--prune'], check=True)
         # The marker remains on failure, refusing visitors until repaired.
         MARKER.unlink()
         print('PASS: virp-onode started; visitor logins reopened')
