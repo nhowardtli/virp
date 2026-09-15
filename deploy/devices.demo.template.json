@@ -6,11 +6,13 @@
   "gate_max_tier": "yellow",
   "socket_allowed_uids": [
     "${VIRP_UID}",
-    988
+    988,
+    1501
   ],
   "socket_uid_tier_ceilings": {
     "${VIRP_UID}": "yellow",
-    "988": "green"
+    "988": "green",
+    "1501": "yellow"
   },
   "socket_uid_action_allow": {
     "${VIRP_UID}": [
@@ -28,6 +30,16 @@
       "chain_verify",
       "execute",
       "chain_append"
+    ],
+    "1501": [
+      "execute",
+      "approval_challenge",
+      "approval_submit",
+      "list_fleet",
+      "list_sessions",
+      "chain_verify",
+      "health",
+      "heartbeat"
     ]
   },
   "socket_uid_chain_append_types": {
@@ -90,5 +102,6 @@
       "vendor": "mock",
       "_note": "In-process repository mock driver (tests/test_onode.c); no network endpoint or credentials."
     }
-  ]
+  ],
+  "_demo_console": "Phase B: uid1501 is the VM-only demo approver console; uid988 remains GREEN with no approve/apply authority."
 }

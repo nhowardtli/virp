@@ -24,7 +24,7 @@ AllowAgentForwarding no
 X11Forwarding no
 PermitTunnel no
 PermitTTY yes
-ForceCommand /usr/bin/vtysh
+ForceCommand /demo-cli.sh
 CONF
 /usr/sbin/sshd -t
 pgrep -x sshd >/dev/null || /usr/sbin/sshd

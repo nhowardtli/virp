@@ -1262,6 +1262,7 @@ static int cmd_approve(int argc, char **argv)
         return 1;
     }
     const char *proposal_id = argv[0];
+    const char *expect_device = NULL, *expect_command = NULL, *expect_node = NULL;
     struct approve_opts o = {
         .sock = ONODE_DEFAULT_SOCKET,
         .key_path = APPROVAL_DEFAULT_KEY,   /* the 64-byte SECRET key file */
@@ -1270,6 +1271,9 @@ static int cmd_approve(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) o.sock = argv[++i];
         else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) o.key_path = argv[++i];
+        else if (strcmp(argv[i], "--expect-device") == 0 && i + 1 < argc) expect_device = argv[++i];
+        else if (strcmp(argv[i], "--expect-command") == 0 && i + 1 < argc) expect_command = argv[++i];
+        else if (strcmp(argv[i], "--expect-node-id") == 0 && i + 1 < argc) expect_node = argv[++i];
         /* --sk kept as a back-compat alias for --key (both = secret file). */
         else if (strcmp(argv[i], "--sk") == 0 && i + 1 < argc) o.key_path = argv[++i];
         else if (strcmp(argv[i], "--pkcs11") == 0 && i + 1 < argc) o.pkcs11_module = argv[++i];
@@ -1280,6 +1284,12 @@ static int cmd_approve(int argc, char **argv)
     if (strspn(proposal_id, "0123456789abcdef") != VIRP_APPROVAL_ID_HEX_LEN ||
         proposal_id[VIRP_APPROVAL_ID_HEX_LEN] != '\0') {
         fprintf(stderr, "Error: proposal-id must be 32 lowercase hex\n");
+        return 1;
+    }
+
+    if ((expect_device || expect_command || expect_node) &&
+        !(expect_device && expect_command && expect_node)) {
+        fprintf(stderr, "Error: --expect-device, --expect-command and --expect-node-id must be supplied together\n");
         return 1;
     }
 
@@ -1330,6 +1340,31 @@ static int cmd_approve(int argc, char **argv)
             != (int)sizeof(canon)) {
         fprintf(stderr, "Error: bad canonical hex\n");
         cJSON_Delete(ch); return 1;
+    }
+
+    /* Optional UI binding: never sign a different challenge than the
+     * selected device/command, including the signed numeric device id. */
+    if (expect_device) {
+        char normalized[512], *endptr = NULL;
+        uint8_t digest[32];
+        errno = 0;
+        unsigned long node = strtoul(expect_node, &endptr, 0);
+        bool valid = !errno && endptr && *endptr == '\0' &&
+                     endptr != expect_node && node <= UINT32_MAX;
+        uint64_t signed_node = 0;
+        for (int i = 0; i < 8; i++) signed_node = (signed_node << 8) | canon[52 + i];
+        if (virp_canonicalize_command(expect_command, normalized, sizeof(normalized)) < 0)
+            valid = false;
+        if (valid) SHA256((const unsigned char *)normalized, strlen(normalized), digest);
+        if (!valid || !cJSON_IsString(j_dev) || !cJSON_IsString(j_cmd) ||
+            strcmp(j_dev->valuestring, expect_device) != 0 ||
+            strcmp(j_cmd->valuestring, expect_command) != 0 ||
+            signed_node != node || memcmp(canon + 20, digest, 32) != 0) {
+            fprintf(stderr, "Error: challenge does not match selected device/command; nothing signed or submitted\n");
+            cJSON_Delete(ch);
+            if (sw_loaded) virp_fed_destroy(&sw_kp);
+            return 2;
+        }
     }
 
     printf("Proposal %s:\n", proposal_id);
