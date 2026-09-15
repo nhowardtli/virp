@@ -1,6 +1,7 @@
 # VIRP Demo Lab — Phase A
 
-Status: VM219 answers administrator SSH; demo deployment and visitor verification pending.
+Status: VM219 deployed; six devices connected; two manual resets passed.
+Final network isolation and independent visitor acceptance remain open.
 Phase B/C must not start until Claude Code verifies the deployed Phase A
 commit with a second visitor key.
 
@@ -65,7 +66,8 @@ owner approval. No public FortiGate VIP is part of Phase A.
   from VIRP_UID. Four proposed FRR endpoints use isolated172.31.219.11–14
   and IOS-style SSH/vtysh so the exact printed `show ip route` can work.
   R5/R6 use the repository's in-process mock driver, not licensed IOS.
-  Container SSH/vtysh compatibility remains to be tested on VM219.
+  Container SSH/vtysh compatibility is verified on VM219: all four FRR
+  endpoints connect through the Cisco driver; R5/R6 connect through mock.
 
 ## Owner rulings and bootstrap findings
 
@@ -128,3 +130,70 @@ make -j2 CISCO=1 build/virp-tool build/virp-onode-prod
 These prove local parser/record behavior and compilation only. They do not
 prove container networking, forced SSH authentication, FRR command behavior,
 reset isolation, or guest deployment.
+
+## VM deployment evidence — 2026-09-15
+
+- containerlab0.79.0; offline image frr-ssh:10.2.1, local image ID prefix
+  8e500662b906. No Docker image pull. Ring retains supplied OSPF link
+  addresses (10.10.12/23/34/41), which are distinct from forbidden10.0.10/24.
+  Management addresses are172.31.219.11–14. `br-demo` inside VM219 connects
+  the containers and eth1 to isolated pve1 vmbr9; vmbr9 still has no host IP.
+- [Containerlab bridge configuration](https://containerlab.dev/manual/network/)
+  supports reusing the bridge. Masquerading and external access are disabled;
+  the guest nft forward policy additionally denies external forwarding.
+- Cisco SSH failure reproduced using Ubuntu libssh2 1.11.0 with custom KEX
+  plus AES-CTR: handshake -43, server reported corrupted MAC. Including
+  ext-info-c and kex-strict-c-v00@openssh.com succeeded. Both Cisco KEX lists
+  now retain these extension markers. Cisco driver tests54/54 passed.
+- Fresh demo-frr account uses /bin/sh with container sshd ForceCommand vtysh.
+  Demo password and approver private key are VM-local. Root password is locked
+  in the containers; newly generated host keys are pinned through Docker's
+  local control interface, not through unverified network keyscan.
+- Visitor `/bin/sh` exec request demonstrably enters virp-shell. The owner
+  Match settings are installed in40-virp-demo.conf and effective MaxSessions
+  is8. Keys have restrict,pty. UID1500 has no virp/docker/containerlab group.
+- The demo seat's systemd-journal membership is removed after the standard
+  installer: otherwise yesterday's command text could remain visible after
+  chain reset. This is a demo-only privacy restriction.
+- Daily reset files are deploy/demo/reset.py and virp-demo-reset.{service,timer}.
+  Pristine state is /var/lib/virp-demo-pristine (root-only). Two hand runs
+  verified its manifest, restored all /var/lib/virp state, and started onode.
+  Signing/approval secrets under /etc are preserved. VM timezone is UTC;
+  the timer's04:00 is UTC. New logins refuse during reset; old seats terminate.
+- Evidence on the builder laptop: ~/audits/virp-demo-lab-2026-09-15/infra/.
+  SSH-READY.md contains the first required checkpoint and render results.
+
+### Reproduce source checks
+
+```sh
+python3 tests/test_demo_motd.py
+python3 tests/test_demo_session.py
+python3 tests/test_demo_network.py
+python3 tests/test_virp_shell.py
+python3 tests/test_template_uid_policy.py
+bash tests/test_render_devices.sh
+make CISCO=1 build/test_driver_cisco
+build/test_driver_cisco
+```
+
+### Reproduce on enrolled VM219 only
+
+```sh
+cd /opt/virp
+sudo bash deploy/demo/install-seat.sh
+sudo install -d /usr/local/lib/virp/demo
+sudo install -m0755 deploy/demo/*.py deploy/demo/*.sh /usr/local/lib/virp/demo/
+sudo install -m0644 deploy/demo/*.service deploy/demo/*.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start virp-demo-fleet
+sudo systemctl start virp-onode
+sudo -u virp-shell python3 /usr/local/lib/virp/virp-shell -c 'show devices'
+# Capture only once, with visitors excluded and a clean intended baseline:
+# sudo python3 /usr/local/lib/virp/demo/reset.py --capture
+sudo python3 /usr/local/lib/virp/demo/reset.py
+sudo python3 /usr/local/lib/virp/demo/reset.py
+```
+
+Do not invoke these on any other host. Network activation, reboot persistence,
+packet capture, pristine-phaseA snapshot and Claude's final second-key run
+must still be recorded before declaring Phase A DONE.
