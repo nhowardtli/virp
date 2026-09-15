@@ -17,6 +17,7 @@ Gate actions this shell can emit (and nothing else):
     show device <name>      health      (a chained `show version` on that device)
     show node               heartbeat   (node liveness)
     verify chain <sid> ...  chain_verify
+    show chain [n]          list_sessions + chain_verify per session
     (config-R1)# <line>     execute     (phase 2a — see below)
 
 Config mode (phase 2a, 2026-09-15): `enable` → `configure terminal` →
@@ -90,6 +91,7 @@ COMMAND_ACTIONS = {
     "show node": "heartbeat",
     "verify chain": "chain_verify",
     "config execute": "execute",       # only inside (config-<device>)#
+    "show chain": "list_sessions",     # + one chain_verify per listed session
 }
 
 PROPOSAL_RE = re.compile(r"proposal_id=([0-9a-f]{32})")
@@ -418,7 +420,7 @@ COMMAND_TREE = {
         "device": (None, 1, 1),
         "node": (None, 0, 0),
         "services": (None, 0, 0),
-        "chain": (None, 0, 0),
+        "chain": (None, 0, 1),
         "proposals": (None, 0, 0),
         "uid": (None, 0, 1),
         "log": (None, 0, 1),
@@ -447,7 +449,7 @@ COMMAND_HELP = {
     "show device": "Chained `show version` on one device via the gate (health), green ceiling",
     "show node": "O-Node liveness via the gate (heartbeat)",
     "show services": "systemctl list-units 'virp-*' (local, read-only)",
-    "show chain": "Not built in phase 1 (needs a daemon list_sessions action)",
+    "show chain": "Recent chain sessions (list_sessions), each verified (chain_verify)",
     "show proposals": "Proposals filed by THIS session (the daemon has no node-wide listing)",
     "show uid": "Per-uid allowlist and ceiling from the loaded template",
     "show log": "Last N journal lines for virp-onode (local, read-only)",
@@ -545,6 +547,7 @@ ARG_HELP = {
     "device": [("<name>", "Device hostname (see show devices)")],
     "show uid": [("[uid]", "One uid, or all allowlisted uids")],
     "show log": [("[lines]", "Number of journal lines (default 20)")],
+    "show chain": [("[sessions]", "Recent sessions to list and verify (default 10, max 200)")],
     "verify chain": [("<session-id>", "Chain session id (hex)"),
                      ("[from-sequence]", "First sequence to check"),
                      ("[to-sequence]", "Last sequence to check")],
@@ -1025,8 +1028,47 @@ class VirpShell(cmd.Cmd):
                               "chain_append types")))
 
     def cmd_show_chain(self, args):
-        self.out("% show chain is not built in phase 1: the daemon exposes "
-                 "no list_sessions action; use  verify chain <session-id>")
+        """Recent sessions via list_sessions, then chain_verify on each:
+        sessions / entries / broken / seconds since the last write."""
+        n = 10
+        if args:
+            try:
+                n = max(1, min(int(args[0]), 200))
+            except ValueError:
+                raise GateError("session count must be an integer")
+        info = self._reply({"action": COMMAND_ACTIONS["show chain"], "limit": n})
+        try:
+            doc = json.loads(info.get("text", "") or "{}")
+            sessions = doc["sessions"]
+        except (ValueError, KeyError):
+            raise GateError("list_sessions reply was not the expected JSON")
+        now_ns = time.time() * 1e9
+        rows, broken = [], 0
+        for s in sessions:
+            sid = s.get("session_id", "?")
+            try:
+                v = self._reply({"action": COMMAND_ACTIONS["verify chain"],
+                                 "session_id": sid})
+                res = json.loads(v.get("text", "") or "{}")
+                valid = "yes" if res.get("valid") else "NO"
+                checked = res.get("entries_checked", "?")
+                fb = res.get("first_broken", -1)
+                opened = res.get("executions_open", "?")
+                if not res.get("valid"):
+                    broken += 1
+            except GateError as e:
+                valid, checked, fb, opened = "% " + str(e), "?", "?", "?"
+            age = max(0, (now_ns - s.get("last_timestamp_ns", now_ns)) / 1e9)
+            rows.append((sid, s.get("entries", "?"),
+                         "%s-%s" % (s.get("first_sequence", "?"), s.get("last_sequence", "?")),
+                         valid, checked, fb if fb not in (-1, None) else "-",
+                         opened, "%ds" % age))
+        body = ["chain sessions: %d listed of the most recent %d%s; %d broken"
+                % (doc.get("count", len(rows)), doc.get("limit", n),
+                   " (listing truncated)" if doc.get("truncated") else "", broken),
+                table(rows, ("session", "entries", "range", "valid", "checked",
+                             "first_broken", "exec_open", "last_write"))]
+        self._print_signed(info, body)
 
     def cmd_show_proposals(self, args):
         if not self.proposals:

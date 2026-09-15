@@ -656,6 +656,28 @@ virp_error_t virp_chain_verify_session(virp_chain_state_t *state,
                                        virp_chain_verify_result_t *result);
 
 /*
+ * List sessions, most recently written first (2026-09-15, for the
+ * operator shell's `show chain`). READ-ONLY. Writes a JSON document
+ *
+ *   {"sessions":[{"session_id":"…","first_sequence":N,"last_sequence":N,
+ *                 "entries":N,"last_timestamp_ns":N}, …],
+ *    "count":N,"limit":N,"truncated":false}
+ *
+ * into out (NUL-terminated), at most `limit` sessions (1..
+ * VIRP_CHAIN_LIST_SESSIONS_MAX; 0 means the default). count is the number
+ * of sessions actually listed. truncated is true when the buffer filled
+ * before `limit` rows were written — rows are whole or absent, never cut.
+ * session_id values are embedded raw: every one passed
+ * virp_chain_canonical_string_ok at ingress, so none carries a quote,
+ * backslash or control byte.
+ */
+#define VIRP_CHAIN_LIST_SESSIONS_DEFAULT 20
+#define VIRP_CHAIN_LIST_SESSIONS_MAX     200
+virp_error_t virp_chain_list_sessions(virp_chain_state_t *state, int limit,
+                                      char *out, size_t out_len,
+                                      size_t *written);
+
+/*
  * Get the last chain entry for a session.
  * Returns VIRP_ERR_CHAIN_SEQUENCE if no entries exist.
  */

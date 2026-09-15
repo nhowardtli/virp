@@ -7889,6 +7889,71 @@ TEST(test_uid_action_allowlist_blocks_unlisted_actions)
     onode_clear_uid_actions(&ca_state);
 }
 
+/* list_sessions (2026-09-15): a read-only listing so a client that may
+ * not open chain.db can discover what to chain_verify. Signed reply,
+ * JSON body with session ids / ranges / counts only, honours limit, is a
+ * per-uid allowlist verb like any other. */
+TEST(test_list_sessions_lists_ranges_only_and_is_allowlisted)
+{
+    uint8_t resp[VIRP_MAX_MESSAGE_SIZE];
+    /* Seed two sessions straight into the chain library. */
+    virp_chain_entry_t e;
+    for (int i = 0; i < 2; i++) {
+        char id[64], h[65];
+        snprintf(id, sizeof(id), "ls-seed-a-%d", i);
+        snprintf(h, sizeof(h), "%064x", 0xA0 + i);
+        ASSERT_OK(virp_chain_append(&ca_state.chain, "ls-session-a",
+                                    "observation", id, h, &e));
+    }
+    ASSERT_OK(virp_chain_append(&ca_state.chain, "ls-session-b", "observation",
+                                "ls-seed-b-0", "0000000000000000000000000000000000000000000000000000000000000b00", &e));
+
+    ssize_t n = ca_request("{\"action\": \"list_sessions\"}", resp, sizeof(resp));
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+    virp_header_t hdr;
+    ASSERT_OK(virp_validate_message(resp, (size_t)n, &ca_state.okey, &hdr));
+    ASSERT_EQ(hdr.type, VIRP_MSG_OBSERVATION);
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t data_len;
+    ASSERT_OK(virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                                     (size_t)n - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    char body[8192];
+    size_t bl = data_len < sizeof(body) - 1 ? data_len : sizeof(body) - 1;
+    memcpy(body, data, bl); body[bl] = '\0';
+    ASSERT_TRUE(strstr(body, "\"session_id\":\"ls-session-a\"") != NULL);
+    ASSERT_TRUE(strstr(body, "\"session_id\":\"ls-session-b\"") != NULL);
+    ASSERT_TRUE(strstr(body, "\"last_sequence\":1,\"entries\":2") != NULL);
+    ASSERT_TRUE(strstr(body, "hash") == NULL);       /* listing only */
+    ASSERT_TRUE(strstr(body, "\"truncated\":false") != NULL);
+
+    /* limit=1 caps the rows and is echoed. */
+    n = ca_request("{\"action\": \"list_sessions\", \"limit\": 1}", resp, sizeof(resp));
+    ASSERT_TRUE(n > (ssize_t)VIRP_HEADER_SIZE);
+    ASSERT_OK(virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                                     (size_t)n - VIRP_HEADER_SIZE,
+                                     &obs, &data, &data_len));
+    bl = data_len < sizeof(body) - 1 ? data_len : sizeof(body) - 1;
+    memcpy(body, data, bl); body[bl] = '\0';
+    ASSERT_TRUE(strstr(body, "\"count\":1,\"limit\":1") != NULL);
+
+    /* A negative limit is present-but-invalid: the request is rejected
+     * at parse, never silently defaulted. */
+    n = ca_request("{\"action\": \"list_sessions\", \"limit\": -1}", resp, sizeof(resp));
+    ASSERT_TRUE(n <= 4);
+
+    /* Per-uid allowlist applies: a uid mapped without list_sessions is
+     * refused with ACTION_FORBIDDEN, exactly like every other verb. */
+    static const onode_action_t NO_LS[2] = { ONODE_ACTION_LIST_FLEET,
+                                             ONODE_ACTION_CHAIN_VERIFY };
+    ASSERT_OK(onode_set_uid_actions(&ca_state, getuid(), NO_LS, 2));
+    n = ca_request("{\"action\": \"list_sessions\"}", resp, sizeof(resp));
+    ASSERT_EQ((int)n, 4);
+    ASSERT_EQ(typed_error_of(resp, n), (int32_t)VIRP_ERR_ACTION_FORBIDDEN);
+    onode_clear_uid_actions(&ca_state);
+}
+
 /* v0.2.1 HANDLER REPLAY. A local service account carrying an explicit
  * type policy may append exactly the types production actually appends
  * (the fixture shape: observation, comparator_verd, chainwalk_summa,
@@ -8464,6 +8529,7 @@ int main(int argc, char **argv)
         RUN_TEST(test_uid_request_refused_rejects_unknown_identity);
         RUN_TEST(test_uid_action_allowlist_blocks_unlisted_actions);
         RUN_TEST(test_chain_append_type_policy_admits_service_types);
+        RUN_TEST(test_list_sessions_lists_ranges_only_and_is_allowlisted);
     RUN_TEST(test_uid_chain_append_type_policy_narrows_types);
         RUN_TEST(test_uid_action_map_absent_uid_fully_unchanged);
         RUN_TEST(test_uid_action_map_foreign_uid_keeps_shutdown);

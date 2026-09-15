@@ -38,6 +38,7 @@
       "heartbeat",
       "list_devices",
       "list_fleet",
+      "list_sessions",
       "sign_intent",
       "sign_outcome",
       "chain_append",
@@ -60,6 +61,7 @@
       "heartbeat",
       "list_devices",
       "list_fleet",
+      "list_sessions",
       "sign_intent",
       "sign_outcome",
       "chain_append",
@@ -106,6 +108,7 @@
     ],
     "988": [
       "list_fleet",
+      "list_sessions",
       "health",
       "heartbeat",
       "chain_verify",

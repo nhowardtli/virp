@@ -511,6 +511,72 @@ virp_error_t virp_chain_verify_session(virp_chain_state_t *state,
     return rc;
 }
 
+virp_error_t virp_chain_list_sessions(virp_chain_state_t *state, int limit,
+                                      char *out, size_t out_len,
+                                      size_t *written)
+{
+    if (!state || !out || !written) return VIRP_ERR_NULL_PTR;
+    if (out_len < 64) return VIRP_ERR_BUFFER_TOO_SMALL;
+    if (limit <= 0) limit = VIRP_CHAIN_LIST_SESSIONS_DEFAULT;
+    if (limit > VIRP_CHAIN_LIST_SESSIONS_MAX) limit = VIRP_CHAIN_LIST_SESSIONS_MAX;
+
+    pthread_mutex_lock(&state->lock);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT session_id, MIN(sequence), MAX(sequence), COUNT(*), "
+            "MAX(timestamp_ns) FROM chain_entries GROUP BY session_id "
+            "ORDER BY MAX(timestamp_ns) DESC, session_id LIMIT ?",
+            -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&state->lock);
+        return VIRP_ERR_CHAIN_DB;
+    }
+    sqlite3_bind_int(st, 1, limit);
+
+    /* Rows are whole or absent: a row that does not fit (leaving room for
+     * the closing fields) is dropped and the document says truncated. */
+    size_t off = 0;
+    int n = snprintf(out, out_len, "{\"sessions\":[");
+    if (n < 0 || (size_t)n >= out_len) { sqlite3_finalize(st); pthread_mutex_unlock(&state->lock); return VIRP_ERR_BUFFER_TOO_SMALL; }
+    off = (size_t)n;
+    const size_t tail_reserve = 64;      /* "],"count":…,"limit":…,"truncated":…} */
+    int count = 0;
+    bool truncated = false;
+    int rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const unsigned char *sid = sqlite3_column_text(st, 0);
+        char row[256];
+        int rw = snprintf(row, sizeof(row),
+                          "%s{\"session_id\":\"%s\",\"first_sequence\":%lld,"
+                          "\"last_sequence\":%lld,\"entries\":%lld,"
+                          "\"last_timestamp_ns\":%lld}",
+                          count ? "," : "",
+                          sid ? (const char *)sid : "",
+                          (long long)sqlite3_column_int64(st, 1),
+                          (long long)sqlite3_column_int64(st, 2),
+                          (long long)sqlite3_column_int64(st, 3),
+                          (long long)sqlite3_column_int64(st, 4));
+        if (rw < 0 || (size_t)rw >= sizeof(row) ||
+            off + (size_t)rw + tail_reserve >= out_len) {
+            truncated = true;
+            break;
+        }
+        memcpy(out + off, row, (size_t)rw);
+        off += (size_t)rw;
+        count++;
+    }
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&state->lock);
+    if (rc != SQLITE_DONE && rc != SQLITE_ROW) return VIRP_ERR_CHAIN_DB;
+
+    n = snprintf(out + off, out_len - off,
+                 "],\"count\":%d,\"limit\":%d,\"truncated\":%s}",
+                 count, limit, truncated ? "true" : "false");
+    if (n < 0 || (size_t)n >= out_len - off) return VIRP_ERR_BUFFER_TOO_SMALL;
+    off += (size_t)n;
+    *written = off;
+    return VIRP_OK;
+}
+
 virp_error_t virp_chain_get_last(virp_chain_state_t *state,
                                  const char *session_id,
                                  virp_chain_entry_t *entry)

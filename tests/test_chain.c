@@ -254,6 +254,73 @@ static void test_milestone(void)
  * Test: Get last entry
  * ========================================================================= */
 
+/* =========================================================================
+ * Test: list_sessions — read-only enumeration for the operator shell
+ * ========================================================================= */
+
+static void test_list_sessions(void)
+{
+    TEST("List sessions (most recent first, count/limit/truncated)");
+    cleanup();
+    create_test_key();
+
+    virp_chain_state_t state;
+    virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local");
+
+    char out[4096];
+    size_t written = 0;
+    virp_error_t err = virp_chain_list_sessions(&state, 0, out, sizeof(out), &written);
+    ASSERT(err == VIRP_OK, "empty chain should list zero sessions");
+    ASSERT(strstr(out, "\"count\":0") != NULL, "empty count");
+    ASSERT(strstr(out, "\"sessions\":[]") != NULL, "empty array");
+
+    virp_chain_entry_t e;
+    for (int s = 0; s < 3; s++) {
+        char sess[32];
+        snprintf(sess, sizeof(sess), "session-ls-%d", s);
+        for (int i = 0; i <= s; i++) {
+            char id[32], hash[65];
+            snprintf(id, sizeof(id), "ls-%d-%d", s, i);
+            snprintf(hash, sizeof(hash), "%064d", s * 10 + i);
+            ASSERT(virp_chain_append(&state, sess, "observation", id, hash, &e) == VIRP_OK,
+                   "append");
+        }
+    }
+
+    err = virp_chain_list_sessions(&state, 0, out, sizeof(out), &written);
+    ASSERT(err == VIRP_OK, "list failed");
+    ASSERT(written == strlen(out), "written == strlen");
+    ASSERT(strstr(out, "\"count\":3") != NULL, "three sessions");
+    ASSERT(strstr(out, "\"truncated\":false") != NULL, "not truncated");
+    /* session-ls-2 was written last: it must come first. */
+    const char *p2 = strstr(out, "\"session_id\":\"session-ls-2\"");
+    const char *p0 = strstr(out, "\"session_id\":\"session-ls-0\"");
+    ASSERT(p2 && p0 && p2 < p0, "most recent session first");
+    ASSERT(strstr(out, "\"session_id\":\"session-ls-2\",\"first_sequence\":0,"
+                       "\"last_sequence\":2,\"entries\":3,") != NULL,
+           "range and entry count for session-ls-2");
+    /* Nothing but the listing fields: no hashes, no bodies. */
+    ASSERT(strstr(out, "hash") == NULL, "no hashes in the listing");
+
+    /* limit caps the rows and is echoed back. */
+    err = virp_chain_list_sessions(&state, 2, out, sizeof(out), &written);
+    ASSERT(err == VIRP_OK, "list limit 2");
+    ASSERT(strstr(out, "\"count\":2") != NULL && strstr(out, "\"limit\":2") != NULL,
+           "limit 2 honoured");
+    ASSERT(strstr(out, "session-ls-0") == NULL, "oldest dropped by limit");
+
+    /* A buffer too small for every row: whole rows only, truncated=true. */
+    char small[200];
+    err = virp_chain_list_sessions(&state, 0, small, sizeof(small), &written);
+    ASSERT(err == VIRP_OK, "small buffer still returns a document");
+    ASSERT(strstr(small, "\"truncated\":true") != NULL, "truncated flagged");
+    ASSERT(strstr(small, "\"count\":1") != NULL, "one whole row fits");
+    ASSERT(small[written - 1] == '}', "document closed");
+
+    virp_chain_destroy(&state);
+    PASS();
+}
+
 static void test_get_last(void)
 {
     TEST("Get last entry");
@@ -1598,6 +1665,7 @@ int main(void)
     test_verifier_readonly_modern_db();
     test_verifier_legacy_reported_not_migrated();
     test_verifier_refuses_non_chain_db();
+    test_list_sessions();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

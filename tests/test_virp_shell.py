@@ -22,6 +22,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -162,7 +163,7 @@ class TestShellMatchesAllowlist(unittest.TestCase):
         # with the ceiling kept GREEN. No spare verbs, no dead grants.
         allow = set(self.doc["socket_uid_action_allow"][SHELL_UID])
         self.assertEqual(allow, {"list_fleet", "health", "heartbeat", "chain_verify",
-                                 "execute"})
+                                 "execute", "list_sessions"})
         self.assertEqual(allow, set(vs.COMMAND_ACTIONS.values()))
 
     def test_shell_actions_are_real_daemon_action_names(self):
@@ -592,11 +593,41 @@ class TestCommands(unittest.TestCase):
     def test_phase1_gaps_say_so(self):
         buf = io.StringIO()
         sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h")
-        sh.default("show chain")
         sh.default("show proposals")
         out = buf.getvalue()
-        self.assertIn("% show chain is not built in phase 1", out)
         self.assertIn("% no proposals filed by this session", out)
+
+    def test_show_chain_lists_sessions_and_verifies_each(self):
+        listing = {"sessions": [
+            {"session_id": "sess-b", "first_sequence": 0, "last_sequence": 4,
+             "entries": 5, "last_timestamp_ns": int(time.time() * 1e9) - 120_000_000_000},
+            {"session_id": "sess-a", "first_sequence": 0, "last_sequence": 1,
+             "entries": 2, "last_timestamp_ns": int(time.time() * 1e9) - 3_600_000_000_000},
+        ], "count": 2, "limit": 3, "truncated": False}
+
+        def reply(r):
+            if r["action"] == "list_sessions":
+                return observation(0x05, json.dumps(listing))
+            ok = r["session_id"] == "sess-b"
+            return observation(0x0B, json.dumps({
+                "entries_checked": 5 if ok else 2, "executions_open": 0,
+                "first_broken": -1 if ok else 1, "from_sequence": 0,
+                "to_sequence": 4 if ok else 1, "valid": ok}))
+
+        out, reqs = run(None, "show chain 3", reply)
+        self.assertEqual(reqs[0], {"action": "list_sessions", "limit": 3})
+        self.assertEqual([r["session_id"] for r in reqs[1:]], ["sess-b", "sess-a"])
+        self.assertTrue(all(r["action"] == "chain_verify" for r in reqs[1:]))
+        self.assertIn("chain sessions: 2 listed of the most recent 3; 1 broken", out)
+        self.assertIn("sess-b", out)
+        self.assertIn("NO", out)                       # sess-a is broken at 1
+        self.assertIn("120s", out)
+        self.assertTrue(out.rstrip().endswith(vs.TRAILER))
+        self.assertNotIn("VALID", out)
+
+    def test_show_chain_refusal_is_a_percent_line(self):
+        out, _ = run(None, "show chain", lambda r: error_frame(-50))
+        self.assertTrue(out.startswith("% gate refused: VIRP_ERR_ACTION_FORBIDDEN (-50)"))
 
     def test_show_uid_reads_the_rendered_policy(self):
         doc = tpl.render(TEMPLATE)
