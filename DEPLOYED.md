@@ -2,7 +2,7 @@
 
 - **Role**: production reference instance
 
-## Current live state (verified 2026-09-15 11:50 UTC)
+## Current live state (verified 2026-09-15 16:40 UTC)
 
 **This block is authoritative for what is running right now.** Everything below
 it is a chronological, append-only log: each section describes the state at the
@@ -16,8 +16,9 @@ boot log. The previous block (2026-09-08, `ea997943`) had drifted: three
 deploys happened on 2026-09-15 without it being rewritten, which `virp-shell
 show version` exposed. That drift is what this rewrite closes.
 
-- **Commit**: `335b45da` on branch `fix/cisco-description-yellow` = `main`
-  (`9054b8c`) + one commit: the Cisco `interface <name> description <text>`
+- **Commit**: `52d3c053` on branch `main` (the checkout was moved onto `main` 2026-09-15
+  16:30Z; config-only restart for the `virp-node2-peer` row). The daemon binary is
+  still the 11:38Z build. History: `335b45da` = `main` (`9054b8c`) + one commit: the Cisco `interface <name> description <text>`
   YELLOW typed op (docs/notes/cisco-description-yellow-2026-09-15.md). The
   daemon and virp-tool were built from `33aadc9c`, whose C sources are
   byte-identical to `335b45da` (the rebase carried shell/doc commits only).
@@ -28,7 +29,8 @@ show version` exposed. That drift is what this rewrite closes.
   install-prod` from `cef8ace3` — daemon + virp-tool rebuilt for the
   `list_sessions` action**; 10:51Z template row for uid 985 `virp-shell-admin`; **11:38Z `make
   install-prod` from `33aadc9c` — description typed op**.
-  Last daemon start: 2026-09-15 11:38:22 UTC.
+  16:30Z template row for `virp-node2-peer` (10.0.10.212, comparator peer).
+  Last daemon start: 2026-09-15 16:29:31 UTC.
 - **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
   socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
   — binary sha256
@@ -58,10 +60,11 @@ show version` exposed. That drift is what this rewrite closes.
 - **Gate**: pure ENFORCE, node-wide ceiling YELLOW, no per-driver SHADOW
   override. Per-uid ceilings (boot log): `999=GREEN 1000=GREEN 994=GREEN
   993=GREEN 997=GREEN 995=GREEN 987=GREEN 988=GREEN 985=YELLOW`.
-- **Devices**: 44/44 loaded from `/run/virp/devices.json` (rendered at
+- **Devices**: 45/45 loaded from `/run/virp/devices.json` (rendered at
   daemon start; sha256 of the rendered file
-  `ed04e6094bc685b63a93500c9a2955f70ae9e00078fbb0b993a0fb81ae403f34`).
-  Connected at capture: **6/44** — R1–R35 are down until the GNS3 project
+  `881b9b2195900276bb43c811cd3791207037499406001afb76f698af79561835`).
+  Connected at 11:05Z capture: **6/44**; by 16:32Z R1–R35 and `virp-node2-peer` were back and the
+  cross-node comparator reported peer_live=True (GREEN/VALID head) — — R1–R35 are down until the GNS3 project
   inside VM 104 is started (pve1 was rebooted 2026-09-14 and most guests
   had no start-at-boot), the four `clab-frr-ospf` containers on this host
   need a `containerlab deploy --reconfigure` with pinned mgmt IPs (their
