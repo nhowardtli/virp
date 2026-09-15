@@ -33,3 +33,6 @@ build-fuzz/
 
 # Release bundles (make release-bundle / release.yml build outputs)
 dist/
+
+# Local qualification evidence and disposable state; never production keys.
+.qualification/
