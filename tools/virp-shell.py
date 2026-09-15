@@ -688,6 +688,8 @@ class VirpShell(cmd.Cmd):
         self.demo_session = ("demo-" + uuid.uuid4().hex
                              if os.environ.get("VIRP_SHELL_DEMO_SESSION") == "1"
                              else None)
+        self.demo_first_sequence = None
+        self.demo_last_sequence = None
         self._set_prompt()
         if readline is not None:
             # IOS: '?' lists what can come next, at any point on the line,
@@ -921,6 +923,16 @@ class VirpShell(cmd.Cmd):
         }, self.sock_path))
         if reply.get("kind") == "error" or reply.get("obs_type_name") == "error":
             raise GateError("demo session append refused: %s" % reply)
+        try:
+            seq = json.loads(reply.get("text", ""))["sequence"]
+            if type(seq) is not int or seq < 0:
+                raise ValueError("invalid sequence")
+        except (ValueError, KeyError, TypeError):
+            raise GateError("demo append receipt lacks a valid chain sequence")
+        self.demo_first_sequence = (seq if self.demo_first_sequence is None
+                                    else min(self.demo_first_sequence, seq))
+        self.demo_last_sequence = (seq if self.demo_last_sequence is None
+                                   else max(self.demo_last_sequence, seq))
 
     def _print_signed(self, info, body_lines):
         for line in header_lines(info):
@@ -1094,7 +1106,8 @@ class VirpShell(cmd.Cmd):
             self.out("Your demo session: %s" % self.demo_session)
             # Check it explicitly even if concurrent visitors push it out
             # of the requested recent-session window between the two calls.
-            self.cmd_verify_chain([self.demo_session])
+            self.cmd_verify_chain([self.demo_session, self.demo_first_sequence,
+                                   self.demo_last_sequence])
         info = self._reply({"action": COMMAND_ACTIONS["show chain"], "limit": n})
         try:
             doc = json.loads(info.get("text", "") or "{}")

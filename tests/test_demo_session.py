@@ -58,7 +58,7 @@ class DemoSession(unittest.TestCase):
                     with self.assertRaises(vs.GateError):
                         sh._demo_record('request', {})
                     call.assert_not_called()
-            with patch.object(vs.json, 'dumps', return_value='x' * 8190), patch.object(vs, 'gate', return_value=observation(1, '{}')) as call:
+            with patch.object(vs.json, 'dumps', return_value='x' * 8190), patch.object(vs, 'gate', return_value=observation(1, '{"sequence":0}')) as call:
                 sh._demo_record('request', {})
                 call.assert_called_once()
 
@@ -81,6 +81,29 @@ class DemoSession(unittest.TestCase):
                 self.assertLess(text.index(vs.TRAILER), text.index('% WARNING:'))
                 self.assertIn('do not retry automatically', text)
                 self.assertEqual(calls, ['chain_append', 'execute', 'chain_append'])
+            finally:
+                gate.close()
+
+    def test_own_session_verifies_full_acknowledged_range_outside_recent_window(self):
+        sequence = -1
+        def answer(req):
+            nonlocal sequence
+            if req['action'] == 'chain_append':
+                sequence += 1
+                return observation(1, json.dumps({'sequence': sequence}))
+            if req['action'] == 'list_sessions':
+                return observation(1, '{"sessions":[],"count":0}')
+            return observation(1, '{"valid":true,"entries_checked":4}')
+        with patch.dict(os.environ, {'VIRP_SHELL_DEMO_SESSION': '1'}):
+            gate = FakeGate(answer)
+            try:
+                sh = vs.VirpShell(sock_path=gate.path, stdout=io.StringIO())
+                for _ in range(3):
+                    sh._demo_record('request', {})
+                sh.cmd_show_chain(['1'])
+                checks = [r for r in gate.requests if r['action'] == 'chain_verify']
+                self.assertEqual(len(checks), 1)
+                self.assertEqual((checks[0]['from_sequence'], checks[0]['to_sequence']), (0, 3))
             finally:
                 gate.close()
 
