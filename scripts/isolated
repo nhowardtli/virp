@@ -11,15 +11,17 @@ qualification_gid=$(id -g)
 # Fixed optional dependency-only virtualenv, read-only. No whole-home bind.
 qualification_venv=/home/nhoward/virp-api-venv
 if [ -d "$qualification_venv" ]; then
-    set -- --ro-bind "$qualification_venv" "$qualification_venv" --setenv PATH "$qualification_venv/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin" -- "$@"
+    set -- --ro-bind "$qualification_venv" "$qualification_venv" --setenv PATH "$qualification_venv/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin" -- unshare --map-user="$qualification_uid" --map-group="$qualification_gid" -- "$@"
 else
-    set -- -- "$@"
+    set -- -- unshare --map-user="$qualification_uid" --map-group="$qualification_gid" -- "$@"
 fi
 exec unshare -Umr bwrap \
     --tmpfs / --ro-bind /usr /usr \
     --symlink usr/bin /bin --symlink usr/sbin /sbin \
     --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
-    --ro-bind /etc /etc --tmpfs /etc/virp --tmpfs /etc/ssh \
+    --tmpfs /etc --ro-bind /etc/ssl /etc/ssl \
+    --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
+    --ro-bind /etc/passwd /etc/passwd --ro-bind /etc/group /etc/group \
     --dir /var --dir /run --dir /opt \
     --dir "$(dirname "$qualification_root")" \
     --bind "$qualification_root" "$qualification_root" \
