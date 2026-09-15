@@ -1443,7 +1443,7 @@ def main(argv=None):
         else:
             sys.stderr.write("usage: virp-shell [--socket PATH] [--privileged [--red]] [-c 'command']\n")
             return 2
-    if privileged and os.geteuid() not in (ADMIN_UID, RED_UID):
+    if privileged and not own and os.geteuid() not in (ADMIN_UID, RED_UID):
         # The flag only means something when the wrapper actually re-seated
         # us; a bare uid asking for it gets the mode, not the ceiling.
         sys.stderr.write("%% note: --privileged as uid %d, not %d (%s) or %d (%s); the gate "
