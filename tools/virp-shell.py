@@ -420,19 +420,48 @@ def resolve(tokens):
     return " ".join(path), []  # pragma: no cover
 
 
+# Argument placeholders shown by '?' at a leaf, by position. IOS shows
+# "WORD" for a free-form argument; these are never Tab-inserted.
+ARG_HELP = {
+    "show device": [("<name>", "Device hostname (see show devices)")],
+    "show uid": [("[uid]", "One uid, or all allowlisted uids")],
+    "show log": [("[lines]", "Number of journal lines (default 20)")],
+    "verify chain": [("<session-id>", "Chain session id (hex)"),
+                     ("[from-sequence]", "First sequence to check"),
+                     ("[to-sequence]", "Last sequence to check")],
+}
+
+
+def is_placeholder(word):
+    return word.startswith("<") or word.startswith("[")
+
+
 def completions(tokens, partial):
-    """Words that could follow `tokens` and start with `partial`."""
+    """Words that could follow `tokens` and start with `partial`. At a
+    leaf: the next argument placeholder while more are accepted, and
+    <cr> once enough have been typed."""
     node = COMMAND_TREE
-    for word in tokens:
+    path = []
+    for i, word in enumerate(tokens):
         if not isinstance(node, dict):
-            return []
+            break
         cands = _match(word.lower(), list(node.keys()))
         if len(cands) != 1:
             return []
+        path.append(cands[0])
         node = node[cands[0]]
-    if not isinstance(node, dict):
-        return ["<cr>"] if not partial else []
-    return sorted(w for w in node if w.startswith(partial.lower()))
+    if isinstance(node, dict):
+        return sorted(w for w in node if w.startswith(partial.lower()))
+    _, lo, hi = node
+    typed = tokens[len(path):]
+    nargs = len(typed)
+    out = []
+    if hi is None or nargs < hi:
+        slots = ARG_HELP.get(" ".join(path), [])
+        out.append(slots[nargs][0] if nargs < len(slots) else "WORD")
+    if nargs >= lo and not partial:
+        out.append("<cr>")
+    return out
 
 
 # ── local (non-gate) read-only helpers ─────────────────────────────────
@@ -595,6 +624,9 @@ class VirpShell(cmd.Cmd):
         for w in words:
             if w == "<cr>":
                 self.out("  <cr>")
+            elif is_placeholder(w) or w == "WORD":
+                help_ = dict(sum(ARG_HELP.values(), [])).get(w, "")
+                self.out("  %-16s %s" % (w, help_))
             else:
                 self.out("  %-12s %s" % (w, COMMAND_HELP.get(
                     " ".join(tokens + [w]), "")))
@@ -610,7 +642,9 @@ class VirpShell(cmd.Cmd):
             begidx = readline.get_begidx() if readline else 0
             tokens = line[:begidx].split()
             words = completions(tokens, text)
-            self.completion_matches = [w + " " for w in words if w != "<cr>"]
+            self.completion_matches = [w + " " for w in words
+                                       if w != "<cr>" and w != "WORD"
+                                       and not is_placeholder(w)]
         try:
             return self.completion_matches[state]
         except IndexError:

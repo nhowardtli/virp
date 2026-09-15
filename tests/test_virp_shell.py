@@ -242,6 +242,14 @@ class TestResolver(unittest.TestCase):
         self.assertIn("device", vs.completions(["sh"], "dev"))
         self.assertEqual(vs.completions(["show", "node"], ""), ["<cr>"])
         self.assertEqual(vs.completions(["bogus"], ""), [])
+        # leaves that take arguments: placeholder first, <cr> once enough typed
+        self.assertEqual(vs.completions(["show", "device"], ""), ["<name>"])
+        self.assertEqual(vs.completions(["show", "device", "R1"], ""), ["<cr>"])
+        self.assertEqual(vs.completions(["verify", "chain"], ""), ["<session-id>"])
+        self.assertEqual(vs.completions(["verify", "chain", "s"], ""),
+                         ["[from-sequence]", "<cr>"])
+        self.assertEqual(vs.completions(["verify", "chain", "s", "1", "9"], ""), ["<cr>"])
+        self.assertEqual(vs.completions(["show", "log"], ""), ["[lines]", "<cr>"])
 
     def test_every_tree_word_has_help(self):
         for w in vs.COMMAND_TREE:
@@ -385,6 +393,13 @@ class TestCommands(unittest.TestCase):
         buf.truncate(0); buf.seek(0)
         sh.default("sh dev?")
         self.assertIn("devices", buf.getvalue())
+        buf.truncate(0); buf.seek(0)
+        sh.default("show device ?")
+        self.assertIn("<name>", buf.getvalue())
+        self.assertNotIn("<cr>", buf.getvalue())
+        buf.truncate(0); buf.seek(0)
+        sh.default("show device R1 ?")
+        self.assertIn("<cr>", buf.getvalue())
 
     def test_phase1_gaps_say_so(self):
         buf = io.StringIO()
