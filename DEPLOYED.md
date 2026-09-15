@@ -2,7 +2,7 @@
 
 - **Role**: production reference instance
 
-## Current live state (verified 2026-09-08 18:45 UTC)
+## Current live state (verified 2026-09-15 11:05 UTC)
 
 **This block is authoritative for what is running right now.** Everything below
 it is a chronological, append-only log: each section describes the state at the
@@ -10,54 +10,70 @@ time it was written and is deliberately *not* corrected in place. Where a fact
 below disagrees with this block, this block wins. A copy of this file without
 this block is stale — check the commit before relying on it.
 
-- **Commit**: `ea997943794c3e8e0b3163fa36aa372e6ea738d7` (short `ea997943`)
-  — deployed 2026-09-08 18:38:50 UTC, `v0.2.0-164-gea997943`, superseding
-  `1dab8560` (2026-09-05 05:23:42 UTC). See "Deploy 2026-09-08" below.
-- **Branch**: `main` (the checkout at `/opt/virp` was moved off
-  `deploy/fed-error-2026-09-03` onto `main` for this deploy; that branch is
-  retained locally and on origin)
+Facts below were captured by `make deploy-record` on virp-lab against the
+installed artifacts (not copied from a build tree), plus the daemon's own
+boot log. The previous block (2026-09-08, `ea997943`) had drifted: three
+deploys happened on 2026-09-15 without it being rewritten, which `virp-shell
+show version` exposed. That drift is what this rewrite closes.
+
+- **Commit**: `4916aa809558c89e69b15a8178390995b4bba6d1` (short `4916aa8`)
+  — the same commit as `main` (fast-forwarded 2026-09-15; the checkout at
+  `/opt/virp` still names the branch `feat/onode-list-sessions`, byte-identical
+  to `main`). Supersedes `ea997943` (2026-09-08).
+- **Deploys on 2026-09-15 (all config-only restarts except the first):**
+  00:52Z template row for uid 988 `virp-shell`; 00:55Z R1–R35 re-addressed to
+  10.0.50.5x (reconciled to what the box already ran); **03:13Z `make
+  install-prod` from `cef8ace3` — daemon + virp-tool rebuilt for the
+  `list_sessions` action**; 10:51Z template row for uid 985 `virp-shell-admin`.
+  Last daemon start: 2026-09-15 10:51:15 UTC.
 - **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
   socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
   — binary sha256
-  `46ee5eaea9e453444aca520cee9845f739625a67d2832e63f4f08ab83889255b`
+  `020188758400781e5b89a2710dbe4e37c84900ed49661b1500309e2157fdd1c9`
 - **Client**: `/usr/local/lib/virp/virp-tool` (+ `virp` alias), sha256
-  `338cd33107566d8e6eae866e548e11a8d744085bdb40cfdbbba313e2f70568c8` —
-  installed by `make install-prod` as the fourth artifact class; the
-  autopilot shells out to this path. The build-tree copy is no longer a
-  production dependency (the "Chain gap 2026-08-09" defect is closed).
-- **Chain ingestion gate**: `chain_append` GATE 3 is LIVE as of this deploy.
-  An `artifact_type=observation` submitted WITH a body must now carry a
-  valid v1/v2/v3 signature or it is refused. Commitment-only (no body)
-  appends remain accepted by design — see SECURITY.md.
-- **Systemd unit: NOT updated in this deploy.** The installed unit is still
-  the pre-`ef6cfa6c` one and still sets `VIRP_WAZUH_INSECURE=1`. That was a
-  deliberate choice: the canonical unit drops that variable, no lab CA
-  exists yet, and `wazuh-lab` is live. Wazuh collection verified working
-  after the restart. Installing the new unit REQUIRES the Wazuh drop-in or
-  a CA bundle first.
-- **Gate**: `default=ENFORCE max_tier=YELLOW overrides=0` — pure ENFORCE.
-  There is **no per-driver SHADOW override for any driver**, `linux` included.
-  The FRR/vtysh classifier is **live**: `vtysh -c "show ..."` reads classify as
-  GREEN and are allowed on their own tier, not waved through by a shadow mode.
-  Journal evidence: `[GATE] mode=ENFORCE device=clab-frr-ospf-frr1 driver=linux
-  tier=GREEN threshold=YELLOW decision=allow`.
-- **Devices**: 43/43 loaded from `/run/virp/devices.json`
-  (rendered at daemon start; sha256 of the rendered file
-  `c6e5af7bec4d59f5e62891f1ea33bfa24f70a9df7b52b20ebc3050fcbd07d3f3`) —
-  full fleet since the 2026-08-10 import; steady-state connected 38/43
-  (pa-850, ASA-5525, srx-300 and two lab devices unreachable, watchdog
-  cycling — unchanged from before this deploy).
+  `1bbf46b6bbbfe1c2cab1f4166937fc3415f7a29fab38489f32c6f089612795e8`,
+  reports `virp-tool cef8ace3` (the build-time hash; the tree has advanced
+  by shell/doc commits only since, no daemon source change).
+- **Helper scripts** (`/usr/local/lib/virp/`): render-devices.sh
+  `f10a443a…`, config-backup-access.sh `358aa3aa…`, evidence-access.sh
+  `bcf29979…`, netclaw-access.sh `a3699988…`, sean-access.sh `1dc60c07…`.
+  **Autopilot modules** (`/usr/local/lib/virp/autopilot/`): virp_autopilot.py
+  `f087541f…`, virp_config_backup.py `6dfc726d…`, virp_evidence.py
+  `b596b6de…`. Full digests: run `make deploy-record` on the node.
+- **Operator shell** (new 2026-09-15): `/usr/local/lib/virp/virp-shell`
+  (`tools/virp-shell.py`) behind `/usr/local/bin/virp-shell`
+  (`deploy/virp-shell.wrapper`) and `/etc/sudoers.d/virp-shell`
+  (`deploy/sudoers-virp-shell`). Read seat uid 988 GREEN; `enable` re-seats
+  as uid 985 YELLOW by sudo password. See docs/VIRP-SHELL.md.
+- **New daemon action**: `list_sessions` (18) — read-only chain session
+  listing; granted to 999, 1000, 988, 985. Live since the 03:13Z restart.
+- **Chain ingestion gate**: `chain_append` GATE 3 LIVE (unchanged since
+  2026-09-08): an `artifact_type=observation` submitted WITH a body must
+  carry a valid v1/v2/v3 signature or it is refused.
+- **Systemd unit: still NOT updated** (unchanged since 2026-09-08): the
+  installed unit still sets `VIRP_WAZUH_INSECURE=1`; the canonical unit
+  needs the Wazuh drop-in or a CA bundle first.
+- **Gate**: pure ENFORCE, node-wide ceiling YELLOW, no per-driver SHADOW
+  override. Per-uid ceilings (boot log): `999=GREEN 1000=GREEN 994=GREEN
+  993=GREEN 997=GREEN 995=GREEN 987=GREEN 988=GREEN 985=YELLOW`.
+- **Devices**: 44/44 loaded from `/run/virp/devices.json` (rendered at
+  daemon start; sha256 of the rendered file
+  `ed04e6094bc685b63a93500c9a2955f70ae9e00078fbb0b993a0fb81ae403f34`).
+  Connected at capture: **6/44** — R1–R35 are down until the GNS3 project
+  inside VM 104 is started (pve1 was rebooted 2026-09-14 and most guests
+  had no start-at-boot), the four `clab-frr-ospf` containers on this host
+  need a `containerlab deploy --reconfigure` with pinned mgmt IPs (their
+  sshd is an exec hook; a plain `docker start` re-deals the addresses and
+  does not start it), pa-850/zammad unchanged. This is reachability, not
+  the gate; autopilot exits 1 (alerts>0) by design until it clears.
 - **Socket allowlist**: uids 999 (`virp`), 1000 (`nhoward`), 997
   (`virp-backup`), 995 (`virp-evidence`), 993 (`virp-netclaw`), 994
-  (`virp-broker`), 987 (`virp-sean`). **uid 0 is deliberately excluded** —
-  a client running as root is rejected with
-  `peer uid=0 not in socket_allowed_uids`.
-- **`health` is no longer granted to 987, 993 or 994** (2026-09-07/08). It is
-  not a liveness ping on this daemon: it runs `show version` against a
-  client-chosen device via the plain `onode_execute_obs()` wrapper, which
-  passes `(uid_t)-1` and so skips the per-uid tier ceiling. The underlying
-  daemon fix is on `fix/health-uid-passthrough`, unmerged and NOT deployed;
-  what is live is the config mitigation only.
+  (`virp-broker`), 987 (`virp-sean`), **988 (`virp-shell`)**, **985
+  (`virp-shell-admin`)**. uid 0 deliberately excluded. Registry:
+  docs/UID-REGISTRY.md.
+- **`health`**: granted to 988/985 (the handler now passes `client_uid`, so
+  the chained `show version` is judged under the seat's own ceiling); still
+  not granted to 987, 993, 994.
 
 ### What this corrects
 The 2026-07-29 deploy-time header (retained verbatim below) named commit
