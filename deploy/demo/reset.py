@@ -36,6 +36,11 @@ def main():
         # New demo logins refuse while marker exists. Retire all old REPLs.
         for uid in ('1500', '988'):
             subprocess.run(['pkill', '-KILL', '-u', uid], check=False)
+        console = subprocess.run(
+            ['systemctl', 'is-active', '--quiet', 'virp-demo-console.service'],
+            check=False).returncode == 0
+        if console:
+            subprocess.run(['systemctl', 'stop', 'virp-demo-console.service'], check=True)
         subprocess.run(['systemctl', 'stop', 'virp-onode'], check=True)
         if args.capture:
             PRISTINE.mkdir(mode=0o700)
@@ -47,8 +52,14 @@ def main():
             shutil.rmtree(STATE)
             shutil.copytree(PRISTINE / 'state', STATE, copy_function=shutil.copy2)
             subprocess.run(['chown', '-R', 'virp:virp', str(STATE)], check=True)
-            print('RESTORE: pristine manifest verified; all mutable O-Node state restored')
+            # The console is stopped: retire yesterday's approvals and receipts.
+            # Persistent login rate limits and the VM-only key remain intact.
+            for suffix in ('', '-wal', '-shm', '-journal'):
+                Path('/var/lib/virp-demo-console/console.db' + suffix).unlink(missing_ok=True)
+            print('RESTORE: pristine manifest verified; O-Node and console proposal state reset')
         subprocess.run(['systemctl', 'start', 'virp-onode'], check=True)
+        if console:
+            subprocess.run(['systemctl', 'start', 'virp-demo-console.service'], check=True)
         # The marker remains on failure, refusing visitors until repaired.
         MARKER.unlink()
         print('PASS: virp-onode started; visitor logins reopened')
