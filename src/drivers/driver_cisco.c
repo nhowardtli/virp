@@ -187,6 +187,9 @@ static void kbd_interactive_callback(const char *name, int name_len,
  * the default list is unaffected when ssh_legacy is false.
  * ========================================================================= */
 
+/* Preserve extension markers when replacing libssh2 defaults. Ubuntu 24.04
+ * libssh2 with AES-CTR otherwise resets only one side of the sequence
+ * counters against OpenSSH 9.7, failing the first encrypted MAC. */
 static const char CISCO_KEX_DEFAULT[] =
     "ecdh-sha2-nistp256,"
     "ecdh-sha2-nistp384,"
@@ -194,7 +197,8 @@ static const char CISCO_KEX_DEFAULT[] =
     "diffie-hellman-group14-sha256,"
     "diffie-hellman-group14-sha1,"
     "diffie-hellman-group-exchange-sha256,"
-    "diffie-hellman-group-exchange-sha1";
+    "diffie-hellman-group-exchange-sha1,"
+    "ext-info-c,kex-strict-c-v00@openssh.com";
 
 static const char CISCO_KEX_LEGACY[] =
     "ecdh-sha2-nistp256,"
@@ -204,7 +208,8 @@ static const char CISCO_KEX_LEGACY[] =
     "diffie-hellman-group14-sha1,"
     "diffie-hellman-group-exchange-sha256,"
     "diffie-hellman-group-exchange-sha1,"
-    "diffie-hellman-group1-sha1";
+    "diffie-hellman-group1-sha1,"
+    "ext-info-c,kex-strict-c-v00@openssh.com";
 
 const char *virp_cisco_kex_list(bool ssh_legacy)
 {

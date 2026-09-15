@@ -50,6 +50,9 @@ static void test_kex_default_is_unchanged(void)
 
     const char *kex = virp_cisco_kex_list(false);
     assert(kex != NULL);
+    TEST("custom KEX retains strict exchange extension markers");
+    assert(strstr(kex, "ext-info-c,kex-strict-c-v00@openssh.com") != NULL);
+    PASS();
 
     TEST("default KEX includes ecdh-sha2-nistp256");
     assert(strstr(kex, "ecdh-sha2-nistp256") != NULL);
@@ -99,6 +102,9 @@ static void test_kex_legacy_adds_group1(void)
 
     const char *kex = virp_cisco_kex_list(true);
     assert(kex != NULL);
+    TEST("custom KEX retains strict exchange extension markers");
+    assert(strstr(kex, "ext-info-c,kex-strict-c-v00@openssh.com") != NULL);
+    PASS();
 
     TEST("legacy KEX includes diffie-hellman-group1-sha1");
     assert(strstr(kex, "diffie-hellman-group1-sha1") != NULL);
