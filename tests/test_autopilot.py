@@ -10,6 +10,7 @@ Run: make test-autopilot   (or python3 tests/test_autopilot.py)
 
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -722,10 +723,34 @@ class TestHomeHostAndEdgeRows(unittest.TestCase):
 
 class TestTemplateExclusions(unittest.TestCase):
     """Mirror of the C-side boundary scan (virp_config_blocked_address):
-    the shipped device template must never carry 10.0.10.1 / 10.0.10.10,
-    while the legitimate LibreNMS host 10.0.10.12 stays present."""
+    the shipped device template must never carry an address the daemon
+    refuses at load, while the legitimate LibreNMS host 10.0.10.12 stays
+    present.
 
-    BLOCKED = ["10.0.10.1", "10.0.10.10"]
+    The list is READ FROM THE C SOURCE rather than repeated here. It was
+    hard-coded as ["10.0.10.1", "10.0.10.10"] and went stale on 2026-09-08
+    when the daemon's list was deliberately emptied (ONODE_BLOCKED_ADDRS =
+    NULL — the edge firewall and the hypervisor are the devices that need
+    governing most, and self-lockout is a TIER question, see the comment
+    above the array in src/virp_onode.c); the template then gained the
+    FortiGate at 10.0.10.1 (92fd924) and this mirror failed for a week
+    without anyone noticing, first seen in the node2 qualification run.
+    A mirror that can drift from what it mirrors is not a mirror."""
+
+    @staticmethod
+    def c_blocked_addresses():
+        src = open(os.path.join(REPO_ROOT, "src", "virp_onode.c")).read()
+        m = re.search(r"ONODE_BLOCKED_ADDRS\s*=\s*(NULL|\{[^}]*\})", src)
+        assert m, "ONODE_BLOCKED_ADDRS not found in src/virp_onode.c"
+        if m.group(1) == "NULL":
+            return []
+        return re.findall(r'"([0-9.]+)"', m.group(1))
+
+    BLOCKED = []   # replaced from the C source in setUpClass
+
+    @classmethod
+    def setUpClass(cls):
+        cls.BLOCKED = cls.c_blocked_addresses()
 
     @staticmethod
     def blocked_hit(text, addr):
