@@ -350,6 +350,13 @@ class TestDecode(unittest.TestCase):
 # ── 4. end-to-end through a fake gate: requests + output contract ─────
 
 class TestCommands(unittest.TestCase):
+    def test_device_command_at_exec_prompt_prints_hint_without_crashing(self):
+        buf = io.StringIO()
+        sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h")
+        self.assertFalse(sh.default("show ip route"))
+        self.assertIn("% this prompt is the O-Node", buf.getvalue())
+        self.assertIn("device <name> → show ip route", buf.getvalue())
+
 
     def test_show_devices_sends_list_fleet_and_renders_a_table(self):
         out, reqs = run(None, "sh dev",
