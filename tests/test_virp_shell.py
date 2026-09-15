@@ -243,6 +243,10 @@ class TestResolver(unittest.TestCase):
         self.assertEqual(vs.completions(["show", "node"], ""), ["<cr>"])
         self.assertEqual(vs.completions(["bogus"], ""), [])
 
+    def test_every_tree_word_has_help(self):
+        for w in vs.COMMAND_TREE:
+            self.assertIn(w, vs.COMMAND_HELP)
+
     def test_every_tree_leaf_has_help(self):
         def walk(node, path):
             for w, sub in node.items():

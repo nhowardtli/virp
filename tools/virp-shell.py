@@ -323,6 +323,9 @@ COMMAND_TREE = {
 }
 
 COMMAND_HELP = {
+    "show": "Show gate, fleet and node information (read-only)",
+    "verify": "Verify a chain session through the gate",
+    "configure": "Enter configuration mode (not built in phase 1)",
     "show devices": "Fleet listing via the gate (list_fleet)",
     "show device": "Chained `show version` on one device via the gate (health), green ceiling",
     "show node": "O-Node liveness via the gate (heartbeat)",
@@ -520,9 +523,16 @@ class VirpShell(cmd.Cmd):
         self.privileged = False
         self._set_prompt()
         if readline is not None:
-            # IOS: '?' lists what can come next, at any point on the line.
-            readline.parse_and_bind('"?": possible-completions')
+            # IOS: '?' lists what can come next, at any point on the line,
+            # with help text, and never submits the line.
+            # '?' is a macro: insert it and submit. default() sees the
+            # trailing '?', prints the list, and pre_input_hook re-types
+            # the line so the operator keeps going, IOS-style.
+            readline.parse_and_bind('"?": "\\C-v?\\n"')   # quoted-insert: no recursion
             readline.set_completer_delims(" \t\n")
+            readline.set_completion_display_matches_hook(self._display_matches)
+            readline.set_pre_input_hook(self._prefill_hook)
+        self._prefill = ""
 
     # -- prompt / modes ---------------------------------------------------
     def _set_prompt(self):
@@ -544,10 +554,13 @@ class VirpShell(cmd.Cmd):
         if not line:
             return False
         if line.endswith("?"):
-            self.show_completions(line[:-1])
-            return False
-        if line in ("?",):
-            self.show_completions("")
+            prefix = line[:-1]
+            self.show_completions(prefix)
+            self._prefill = prefix.rstrip() + (" " if prefix.endswith(" ") else "")
+            if readline is not None:
+                n = readline.get_current_history_length()
+                if n and readline.get_history_item(n) == line:
+                    readline.remove_history_item(n - 1)
             return False
         try:
             tokens = shlex.split(line)
@@ -586,13 +599,46 @@ class VirpShell(cmd.Cmd):
                 self.out("  %-12s %s" % (w, COMMAND_HELP.get(
                     " ".join(tokens + [w]), "")))
 
-    # readline tab completion over the same tree
-    def completenames(self, text, *ignored):
-        return [w + " " for w in completions([], text) if w != "<cr>"]
+    # readline completion over the same tree. cmd.Cmd.complete() is NOT
+    # used: it re-parses the line through parseline(), which this shell
+    # short-circuits (cmd=None), and 'complete_' + None raises inside the
+    # completer — readline swallows that silently and Tab/? after the
+    # first word never completed (found live on virp-lab, 2026-09-15).
+    def complete(self, text, state):
+        if state == 0:
+            line = readline.get_line_buffer() if readline else ""
+            begidx = readline.get_begidx() if readline else 0
+            tokens = line[:begidx].split()
+            words = completions(tokens, text)
+            self.completion_matches = [w + " " for w in words if w != "<cr>"]
+        try:
+            return self.completion_matches[state]
+        except IndexError:
+            return None
 
-    def completedefault(self, text, line, begidx, endidx):
-        tokens = line[:begidx].split()
-        return [w + " " for w in completions(tokens, text) if w != "<cr>"]
+    def _display_matches(self, substitution, matches, longest):
+        """IOS-style '?' listing: word + one-line help, then the prompt
+        and the line the operator was typing are redrawn."""
+        line = readline.get_line_buffer()
+        tokens = line[:readline.get_begidx()].split()
+        self.stdout.write("\n")
+        for m in matches:
+            w = m.strip()
+            self.stdout.write("  %-12s %s\n" % (
+                w, COMMAND_HELP.get(" ".join(tokens + [w]), "")))
+        self.stdout.write(self.prompt + line)
+        self.stdout.flush()
+        if hasattr(readline, "redisplay"):
+            readline.redisplay()
+
+    def _prefill_hook(self):
+        """After a '?' listing, re-type the operator's line at the new
+        prompt (IOS keeps what you had typed)."""
+        if self._prefill:
+            readline.insert_text(self._prefill)
+            self._prefill = ""
+            if hasattr(readline, "redisplay"):
+                readline.redisplay()
 
     # -- gate-backed commands ---------------------------------------------
     def _reply(self, request):
