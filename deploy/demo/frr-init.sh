@@ -2,7 +2,8 @@
 set -eu
 # DEMO secret, created only on VM219. Never bake a password into an image.
 VIRP_DEMO_FRR_PASSWORD=$(cat /run/demo-password)
-id demo-frr >/dev/null 2>&1 || adduser -D -s /usr/bin/vtysh demo-frr
+id demo-frr >/dev/null 2>&1 || adduser -D -s /bin/sh demo-frr
+sed -i '/^demo-frr:/s|:[^:]*$|:/bin/sh|' /etc/passwd
 addgroup demo-frr frrvty 2>/dev/null || true
 printf 'demo-frr:%s\n' "${VIRP_DEMO_FRR_PASSWORD}" | chpasswd
 unset VIRP_DEMO_FRR_PASSWORD

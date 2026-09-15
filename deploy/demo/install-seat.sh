@@ -31,7 +31,10 @@ if not p.exists():
     fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     with os.fdopen(fd,'wb') as f: f.write(os.urandom(32))
 PY
-chown virp:virp /etc/virp/keys/chain.key
+if [ ! -f /etc/virp/keys/onode.key ]; then
+    /usr/local/lib/virp/virp-tool keygen okey /etc/virp/keys/onode.key
+fi
+chown virp:virp /etc/virp/keys/chain.key /etc/virp/keys/onode.key
 install -d -m 0755 /etc/systemd/system/virp-onode.service.d
 install -m 0644 deploy/virp-onode.service /etc/systemd/system/virp-onode.service
 cat > /etc/systemd/system/virp-onode.service.d/demo.conf <<'CONF'
