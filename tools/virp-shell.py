@@ -11,7 +11,7 @@ uid 988's tier ceiling and action allowlist and lands on the chain like any
 other client. This file never reads chain.db, never runs anything as root,
 and refuses to start as uid 0.
 
-Gate actions this shell can emit (and nothing else):
+Normal gate actions this shell can emit:
 
     show devices            list_fleet
     show device <name>      health      (a chained `show version` on that device)
@@ -49,6 +49,9 @@ uid 988 holds no key, so this client CANNOT verify them. Every reply ends
 with a fixed trailer saying so. This client never prints "VALID".
 """
 
+# Demo deployments may set VIRP_SHELL_DEMO_SESSION=1 to record login and
+# command correlations with chain_append/evidence_item. This additionally
+# requires the DEMO template's uid policy; the production seat cannot append.
 import cmd
 import hashlib
 import json
@@ -60,6 +63,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 
 try:
     import readline          # noqa: F401  (side effect: line editing in cmd)
@@ -183,7 +187,9 @@ def onode_send(request, sock_path=ONODE_SOCKET, timeout=60):
 def gate(request, sock_path=None):
     """Submit one request; map transport failures to '% ' errors."""
     action = request.get("action")
-    if action not in COMMAND_ACTIONS.values():
+    demo_append = (os.environ.get("VIRP_SHELL_DEMO_SESSION") == "1"
+                   and action == "chain_append")
+    if action not in COMMAND_ACTIONS.values() and not demo_append:
         # Belt and braces: the map above is the whole vocabulary.
         raise GateError("internal: action %r is not in this shell's vocabulary"
                         % action)
@@ -675,6 +681,12 @@ class VirpShell(cmd.Cmd):
         self.mode = "exec"          # exec | config
         self.device = None          # (config-<device>)# context
         self.proposals = []         # (when, device, command, tier, proposal_id)
+        # Opt-in ONLY in the demo deployment. The production template does
+        # not grant this seat chain_append. Session ids are random login
+        # identifiers, not assertions of a visitor's real identity.
+        self.demo_session = ("demo-" + uuid.uuid4().hex
+                             if os.environ.get("VIRP_SHELL_DEMO_SESSION") == "1"
+                             else None)
         self._set_prompt()
         if readline is not None:
             # IOS: '?' lists what can come next, at any point on the line,
@@ -864,12 +876,49 @@ class VirpShell(cmd.Cmd):
 
     # -- gate-backed commands ---------------------------------------------
     def _reply(self, request):
+        record = self.demo_session and request.get("action") in ("execute", "health")
+        if record:
+            self._demo_record("request", request)
         raw = gate(request, self.sock_path)
         info = decode_reply(raw)
+        if record:
+            try:
+                self._demo_record("reply", {
+                    "request": request,
+                    "observation_sha256": hashlib.sha256(raw).hexdigest(),
+                    "proposal_ids": PROPOSAL_RE.findall(info.get("text", "")),
+                    "reply_kind": info.get("kind"),
+                    "observation_type": info.get("obs_type_name"),
+                })
+            except GateError as exc:
+                raise GateError("device request returned, but demo receipt failed; "
+                                "do not retry automatically: %s" % exc)
         if info["kind"] == "error":
             raise GateError("gate refused: VIRP_ERR_%s (%d); no device "
                             "output was produced" % (info["name"], info["code"]))
         return info
+
+    def _demo_record(self, event, detail):
+        """Demo-only correlation metadata; never pretends to verify an HMAC.
+
+        The daemon owns signing and admission. These evidence_item bodies
+        name the visitor session and correlate a reply by digest; they are
+        not copies of the full observation, nor daemon execution outcomes.
+        """
+        body = json.dumps({"schema": "virp-demo-session/1", "event": event,
+                           "session_id": self.demo_session, "detail": detail},
+                          sort_keys=True, separators=(",", ":"))
+        if len(body.encode()) >= 8192:
+            raise GateError("demo session record too large; request not submitted")
+        reply = decode_reply(gate({
+            "action": "chain_append", "artifact_type": "evidence_item",
+            "artifact_id": "demo-" + uuid.uuid4().hex,
+            "session_id": self.demo_session,
+            "artifact_hash": hashlib.sha256(body.encode()).hexdigest(),
+            "artifact_content": body,
+        }, self.sock_path))
+        if reply.get("kind") == "error" or reply.get("obs_type_name") == "error":
+            raise GateError("demo session append refused: %s" % reply)
 
     def _print_signed(self, info, body_lines):
         for line in header_lines(info):
@@ -1036,6 +1085,12 @@ class VirpShell(cmd.Cmd):
                 n = max(1, min(int(args[0]), 200))
             except ValueError:
                 raise GateError("session count must be an integer")
+        if self.demo_session:
+            self._demo_record("view_chain", {})
+            self.out("Your demo session: %s" % self.demo_session)
+            # Check it explicitly even if concurrent visitors push it out
+            # of the requested recent-session window between the two calls.
+            self.cmd_verify_chain([self.demo_session])
         info = self._reply({"action": COMMAND_ACTIONS["show chain"], "limit": n})
         try:
             doc = json.loads(info.get("text", "") or "{}")
@@ -1210,6 +1265,26 @@ def main(argv=None):
     if once is not None:
         sh.default(once)
         return 0
+    if sh.demo_session:
+        try:
+            sh._demo_record("login", {})
+        except GateError as exc:
+            sys.stderr.write("%% demo session could not start: %s\n" % exc)
+            return 2
+        sh.intro += "\nYour demo session: %s" % sh.demo_session
+    motd_path = os.environ.get("VIRP_SHELL_MOTD")
+    if motd_path:
+        try:
+            with open(motd_path, encoding="utf-8") as motd_file:
+                motd = motd_file.read(16385)
+            if len(motd) > 16384:
+                raise ValueError("MOTD exceeds 16384 characters")
+            if any(ord(c) < 32 and c not in "\n\t" for c in motd):
+                raise ValueError("MOTD contains terminal control characters")
+        except (OSError, UnicodeError, ValueError) as exc:
+            sys.stderr.write("%% cannot load VIRP_SHELL_MOTD: %s\n" % exc)
+            return 2
+        sh.intro += "\n\n" + motd.rstrip()
     try:
         sh.cmdloop()
     except KeyboardInterrupt:
