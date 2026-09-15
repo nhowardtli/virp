@@ -15,6 +15,17 @@ Gate actions this shell can emit (and nothing else):
     show device <name>      health      (a chained `show version` on that device)
     show node               heartbeat   (node liveness)
     verify chain <sid> ...  chain_verify
+    (config-R1)# <line>     execute     (phase 2a — see below)
+
+Config mode (phase 2a, 2026-09-15): `enable` → `configure terminal` →
+`device <name>` gives a `host(config-<name>)#` context where every line
+is sent to that device THROUGH THE GATE as `execute`. uid 988 keeps its
+GREEN ceiling, so: a GREEN read executes and returns signed output; a
+YELLOW/RED change is NOT applied — the gate files a signed PROPOSAL and
+this shell prints its id for an operator to `virp-tool approve` / `apply`
+as uid 1000; BLACK is refused outright. Nothing on a device can be
+changed from this seat alone. `show proposals` lists the proposals THIS
+session filed (the daemon exposes no node-wide listing).
 
 tests/test_virp_shell.py asserts that this set is exactly uid 988's
 allowlist in deploy/devices.template.json, so a new command the uid cannot
@@ -76,7 +87,11 @@ COMMAND_ACTIONS = {
     "show device": "health",
     "show node": "heartbeat",
     "verify chain": "chain_verify",
+    "config execute": "execute",       # only inside (config-<device>)#
 }
+
+PROPOSAL_RE = re.compile(r"proposal_id=([0-9a-f]{32})")
+BLOCKED_RE = re.compile(r"tier gate blocked '(.*)' on '([^']+)' \(tier=([A-Z]+) max=([A-Z]+)\)")
 
 # ── wire constants (include/virp.h) ────────────────────────────────────
 
@@ -314,6 +329,7 @@ COMMAND_TREE = {
     "configure": {
         "terminal": (None, 0, 0),
     },
+    "device": (None, 1, 1),
     "enable": (None, 0, 0),
     "disable": (None, 0, 0),
     "end": (None, 0, 0),
@@ -325,21 +341,22 @@ COMMAND_TREE = {
 COMMAND_HELP = {
     "show": "Show gate, fleet and node information (read-only)",
     "verify": "Verify a chain session through the gate",
-    "configure": "Enter configuration mode (not built in phase 1)",
+    "configure": "Enter configuration mode (from enable)",
     "show devices": "Fleet listing via the gate (list_fleet)",
     "show device": "Chained `show version` on one device via the gate (health), green ceiling",
     "show node": "O-Node liveness via the gate (heartbeat)",
     "show services": "systemctl list-units 'virp-*' (local, read-only)",
     "show chain": "Not built in phase 1 (needs a daemon list_sessions action)",
-    "show proposals": "Not available: the daemon exposes no read-only proposal listing",
+    "show proposals": "Proposals filed by THIS session (the daemon has no node-wide listing)",
     "show uid": "Per-uid allowlist and ceiling from the loaded template",
     "show log": "Last N journal lines for virp-onode (local, read-only)",
     "show version": "Installed binary sha256, build string, node_id, DEPLOYED.md head",
     "verify chain": "chain_verify <session-id> [from] [to] via the gate",
-    "configure terminal": "Not built in phase 1",
+    "configure terminal": "Enter config mode; then `device <name>` to pick the target",
+    "device": "(config) Select the device the next lines are sent to, through the gate",
     "enable": "Enter privileged mode (mode only, no password in phase 1)",
     "disable": "Leave privileged mode",
-    "end": "Return to exec mode",
+    "end": "Return to privileged exec mode",
     "exit": "Leave the shell",
     "quit": "Leave the shell",
     "help": "This list",
@@ -424,6 +441,7 @@ def resolve(tokens):
 # "WORD" for a free-form argument; these are never Tab-inserted.
 ARG_HELP = {
     "show device": [("<name>", "Device hostname (see show devices)")],
+    "device": [("<name>", "Device hostname (see show devices)")],
     "show uid": [("[uid]", "One uid, or all allowlisted uids")],
     "show log": [("[lines]", "Number of journal lines (default 20)")],
     "verify chain": [("<session-id>", "Chain session id (hex)"),
@@ -550,6 +568,9 @@ class VirpShell(cmd.Cmd):
         self.sock_path = sock_path or ONODE_SOCKET
         self.host = host or socket.gethostname().split(".")[0]
         self.privileged = False
+        self.mode = "exec"          # exec | config
+        self.device = None          # (config-<device>)# context
+        self.proposals = []         # (when, device, command, tier, proposal_id)
         self._set_prompt()
         if readline is not None:
             # IOS: '?' lists what can come next, at any point on the line,
@@ -565,7 +586,11 @@ class VirpShell(cmd.Cmd):
 
     # -- prompt / modes ---------------------------------------------------
     def _set_prompt(self):
-        self.prompt = "%s%s" % (self.host, "#" if self.privileged else ">")
+        if self.mode == "config":
+            ctx = "config-%s" % self.device if self.device else "config"
+            self.prompt = "%s(%s)#" % (self.host, ctx)
+        else:
+            self.prompt = "%s%s" % (self.host, "#" if self.privileged else ">")
 
     def out(self, text=""):
         self.stdout.write(text + "\n")
@@ -603,6 +628,18 @@ class VirpShell(cmd.Cmd):
                      % (a.word, ", ".join(a.choices)))
             return False
         except ValueError as e:
+            if self.mode == "config" and self.device:
+                # Not a shell word: it is a line for the device, via the gate.
+                # shlex may have mangled quotes; send the operator's raw line.
+                try:
+                    return self.cmd_config_execute(line)
+                except GateError as ge:
+                    self.out("% " + str(ge))
+                    return False
+            if self.mode == "config" and not self.device and \
+               str(e).startswith("Invalid input"):
+                self.out("% no device selected: device <name>")
+                return False
             self.out("% " + str(e))
             return False
         handler = getattr(self, "cmd_" + path.replace(" ", "_"))
@@ -839,8 +876,14 @@ class VirpShell(cmd.Cmd):
                  "no list_sessions action; use  verify chain <session-id>")
 
     def cmd_show_proposals(self, args):
-        self.out("% not available: the daemon exposes no read-only proposal "
-                 "listing at this uid (show node reports a count only)")
+        if not self.proposals:
+            self.out("% no proposals filed by this session (the daemon "
+                     "exposes no node-wide listing; show node reports a count)")
+            return
+        rows = [(ts_iso(w * 1e9), d, tier, pid, c)
+                for (w, d, c, tier, pid) in self.proposals]
+        self.out(table(rows, ("filed", "device", "tier", "proposal_id", "command")))
+        self.out("approve/apply as an operator:  virp-tool approve <id>  then  virp-tool apply <id>")
 
     # -- modes / misc -----------------------------------------------------
     def cmd_enable(self, args):
@@ -849,16 +892,69 @@ class VirpShell(cmd.Cmd):
 
     def cmd_disable(self, args):
         self.privileged = False
+        self.mode, self.device = "exec", None
         self._set_prompt()
 
     def cmd_end(self, args):
-        self.privileged = False
+        # IOS: end leaves config mode and lands in privileged exec.
+        self.mode, self.device = "exec", None
         self._set_prompt()
 
     def cmd_configure_terminal(self, args):
-        self.out("% config mode not built")
+        if not self.privileged:
+            self.out("% configure terminal requires enable")
+            return
+        self.mode, self.device = "config", None
+        self._set_prompt()
+        self.out("Config mode: device <name>, then each line goes to that "
+                 "device through the gate as uid %d (GREEN ceiling)." % SHELL_UID)
+        self.out("Changes are NOT applied here: YELLOW/RED file a signed "
+                 "proposal for an operator to approve; BLACK is refused.")
+
+    def cmd_device(self, args):
+        if self.mode != "config":
+            self.out("% device is a config-mode command (configure terminal)")
+            return
+        self.device = args[0]
+        self._set_prompt()
+
+    def cmd_config_execute(self, line):
+        """(config-<device>)#: send one line to the device through the gate."""
+        info = self._reply({"action": COMMAND_ACTIONS["config execute"],
+                            "device": self.device, "command": line})
+        text = info.get("text", "").rstrip("\n")
+        if info.get("obs_type_name") == "error":
+            m = BLOCKED_RE.search(text)
+            pid = PROPOSAL_RE.search(text)
+            if m and pid:
+                tier = m.group(3)
+                self.proposals.append((time.time(), self.device, line, tier,
+                                       pid.group(1)))
+                body = ["PROPOSED, not applied: '%s' on %s is %s; this seat's "
+                        "ceiling is %s" % (line, self.device, tier, m.group(4)),
+                        "proposal_id %s" % pid.group(1),
+                        "operator: virp-tool approve %s && virp-tool apply %s"
+                        % (pid.group(1), pid.group(1))]
+            elif m:
+                body = ["REFUSED: '%s' on %s is %s (ceiling %s); no proposal "
+                        "was filed" % (line, self.device, m.group(3), m.group(4))]
+            else:
+                body = ["GATE ERROR: " + text]
+            self._print_signed(info, body)
+            return False
+        self._print_signed(info, ["%s: '%s' executed (%s)"
+                                  % (self.device, line, info["tier_name"])]
+                           + text.splitlines())
+        return False
 
     def cmd_exit(self, args):
+        if self.mode == "config":
+            if self.device:
+                self.device = None
+            else:
+                self.mode = "exec"
+            self._set_prompt()
+            return False
         return True
 
     cmd_quit = cmd_exit

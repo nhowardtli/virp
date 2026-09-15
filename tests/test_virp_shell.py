@@ -157,10 +157,12 @@ class TestShellMatchesAllowlist(unittest.TestCase):
                          % sorted(used - allow))
 
     def test_uid_988_allowlist_is_exactly_what_the_shell_uses(self):
-        # The ruling (2026-09-14): exactly [list_fleet, health, heartbeat,
-        # chain_verify]. No spare verbs on the seat, no dead grants.
+        # Rulings: 2026-09-14 exactly [list_fleet, health, heartbeat,
+        # chain_verify]; 2026-09-15 phase 2a adds execute for config mode
+        # with the ceiling kept GREEN. No spare verbs, no dead grants.
         allow = set(self.doc["socket_uid_action_allow"][SHELL_UID])
-        self.assertEqual(allow, {"list_fleet", "health", "heartbeat", "chain_verify"})
+        self.assertEqual(allow, {"list_fleet", "health", "heartbeat", "chain_verify",
+                                 "execute"})
         self.assertEqual(allow, set(vs.COMMAND_ACTIONS.values()))
 
     def test_shell_actions_are_real_daemon_action_names(self):
@@ -170,15 +172,16 @@ class TestShellMatchesAllowlist(unittest.TestCase):
 
     def test_uid_988_cannot_append_execute_or_shut_down(self):
         allow = set(self.doc["socket_uid_action_allow"][SHELL_UID])
-        for verb in ("execute", "batch_execute", "chain_append", "shutdown",
-                     "intent_execute", "approval_submit"):
+        for verb in ("batch_execute", "chain_append", "shutdown",
+                     "intent_execute", "approval_submit", "approval_challenge"):
             self.assertNotIn(verb, allow)
         self.assertNotIn(SHELL_UID, self.doc.get("socket_uid_chain_append_types", {}))
 
     def test_gate_refuses_an_action_outside_the_vocabulary(self):
         with self.assertRaises(vs.GateError):
-            vs.gate({"action": "execute", "device": "x", "command": "reload"},
-                    "/nonexistent")
+            vs.gate({"action": "shutdown"}, "/nonexistent")
+        with self.assertRaises(vs.GateError):
+            vs.gate({"action": "batch_execute", "device": "x"}, "/nonexistent")
 
 
 # ── 2. parser + abbreviation resolver ─────────────────────────────────
@@ -267,6 +270,8 @@ class TestResolver(unittest.TestCase):
 
     def test_every_gate_command_is_in_the_tree(self):
         for path in vs.COMMAND_ACTIONS:
+            if path == "config execute":
+                continue            # pseudo-path: any line in (config-<dev>)#
             self.assertEqual(vs.resolve(path.split() + (["x"] if path == "show device"
                                                         else ["s"] if path == "verify chain"
                                                         else []))[0], path)
@@ -371,17 +376,90 @@ class TestCommands(unittest.TestCase):
         sh.default("show devices")
         self.assertTrue(buf.getvalue().startswith("% gate unreachable"))
 
-    def test_config_mode_not_built_and_modes(self):
+    def test_modes_ios_style(self):
         buf = io.StringIO()
         sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="virp-lab")
         self.assertEqual(sh.prompt, "virp-lab>")
+        sh.default("conf t")
+        self.assertIn("% configure terminal requires enable", buf.getvalue())
         sh.default("en")
         self.assertEqual(sh.prompt, "virp-lab#")
         sh.default("conf t")
-        self.assertIn("% config mode not built", buf.getvalue())
-        sh.default("end")
+        self.assertEqual(sh.prompt, "virp-lab(config)#")
+        buf.truncate(0); buf.seek(0)
+        sh.default("interface Gi1/0/1")
+        self.assertIn("% no device selected", buf.getvalue())
+        sh.default("device R1")
+        self.assertEqual(sh.prompt, "virp-lab(config-R1)#")
+        self.assertFalse(sh.default("exit"))          # leaves the device context
+        self.assertEqual(sh.prompt, "virp-lab(config)#")
+        self.assertFalse(sh.default("exit"))          # leaves config
+        self.assertEqual(sh.prompt, "virp-lab#")
+        sh.default("conf t"); sh.default("dev R1"); sh.default("end")
+        self.assertEqual(sh.prompt, "virp-lab#")     # end -> privileged exec
+        sh.default("disable")
         self.assertEqual(sh.prompt, "virp-lab>")
         self.assertTrue(sh.default("exit"))
+        buf.truncate(0); buf.seek(0)
+        sh.default("device R1")
+        self.assertIn("% device is a config-mode command", buf.getvalue())
+
+    def _config_session(self, reply_for, lines):
+        g = FakeGate(reply_for)
+        try:
+            buf = io.StringIO()
+            sh = vs.VirpShell(sock_path=g.path, stdout=buf, host="virp-lab")
+            for l in ("enable", "configure terminal", "device R1") + tuple(lines):
+                sh.default(l)
+            return buf.getvalue(), g.requests, sh
+        finally:
+            g.close()
+
+    BLOCKED = ("ERROR: tier gate blocked '%s' on 'R1' (tier=%s max=GREEN)"
+               " reason: configuration change proposal_id=%s")
+
+    def test_config_line_is_sent_as_execute_to_the_selected_device(self):
+        out, reqs, _ = self._config_session(
+            lambda r: observation(0x07, "Gi1/0/1 is up\n"),
+            ["show ip interface brief"])
+        self.assertEqual(reqs, [{"action": "execute", "device": "R1",
+                                 "command": "show ip interface brief"}])
+        self.assertIn("R1: 'show ip interface brief' executed (GREEN)", out)
+        self.assertIn("Gi1/0/1 is up", out)
+        self.assertTrue(out.rstrip().endswith(vs.TRAILER))
+
+    def test_yellow_change_is_proposed_not_applied(self):
+        pid = "0123456789abcdef0123456789abcdef"
+        out, reqs, sh = self._config_session(
+            lambda r: observation(0x0F, self.BLOCKED % (r["command"], "YELLOW", pid), tier=0x02),
+            ["interface Gi1/0/1 description uplink"])
+        self.assertEqual(reqs[0]["command"], "interface Gi1/0/1 description uplink")
+        self.assertIn("PROPOSED, not applied", out)
+        self.assertIn("proposal_id " + pid, out)
+        self.assertIn("virp-tool approve " + pid, out)
+        self.assertEqual(sh.proposals[0][4], pid)
+        self.assertNotIn("VALID", out)
+        buf = io.StringIO(); sh.stdout = buf
+        sh.default("end"); sh.default("show proposals")
+        self.assertIn(pid, buf.getvalue())
+        self.assertIn("R1", buf.getvalue())
+
+    def test_black_is_refused_without_a_proposal(self):
+        out, _, sh = self._config_session(
+            lambda r: observation(0x0F, "ERROR: tier gate blocked 'reload' on 'R1' (tier=BLACK max=GREEN)", tier=0xFF),
+            ["reload"])
+        self.assertIn("REFUSED: 'reload' on R1 is BLACK", out)
+        self.assertIn("no proposal was filed", out)
+        self.assertEqual(sh.proposals, [])
+
+    def test_config_gate_refusal_is_a_percent_line(self):
+        out, _, _ = self._config_session(lambda r: error_frame(-50), ["show clock"])
+        self.assertIn("% gate refused: VIRP_ERR_ACTION_FORBIDDEN (-50)", out)
+
+    def test_shell_words_still_win_inside_a_device_context(self):
+        out, reqs, sh = self._config_session(lambda r: heartbeat(), ["show node"])
+        self.assertEqual(reqs, [{"action": "heartbeat"}])   # not execute
+        self.assertEqual(sh.prompt, "virp-lab(config-R1)#")
 
     def test_question_mark_lists_completions(self):
         buf = io.StringIO()
@@ -408,7 +486,7 @@ class TestCommands(unittest.TestCase):
         sh.default("show proposals")
         out = buf.getvalue()
         self.assertIn("% show chain is not built in phase 1", out)
-        self.assertIn("% not available", out)
+        self.assertIn("% no proposals filed by this session", out)
 
     def test_show_uid_reads_the_rendered_policy(self):
         doc = tpl.render(TEMPLATE)
@@ -426,7 +504,9 @@ class TestCommands(unittest.TestCase):
             self.assertIn("988", out)
             self.assertIn("green", out)
             self.assertIn("list_fleet", out)
-            self.assertNotIn("execute", out.split("\n", 3)[-1].replace("chain_verify", ""))
+            row = [l for l in out.splitlines() if l.startswith("988")][0]
+            for verb in ("chain_append", "shutdown", "batch_execute"):
+                self.assertNotIn(verb, row)
         finally:
             vs.RENDERED_DEVICES = old
 
