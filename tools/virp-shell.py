@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-virp-shell — a Cisco-IOS-style, READ-ONLY operator REPL for the VIRP O-Node.
+virp-shell — a Cisco-IOS-style operator REPL for the VIRP O-Node.
 
-Phase 1 (2026-09-14). Runs as uid 988 (`virp-shell`, group virp) and talks
+Reads execute; config mode proposes and never applies (see below).
+Phase 1 2026-09-14, phase 2a 2026-09-15. Runs as uid 988 (`virp-shell`,
+group virp) and talks
 to /run/virp/onode.sock as an ordinary socket client. Everything that
 touches a device or the chain goes THROUGH the gate, so it is judged under
 uid 988's tier ceiling and action allowlist and lands on the chain like any
