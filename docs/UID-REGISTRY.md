@@ -39,7 +39,7 @@ the 2026-08 notes, marked unverified.
 | 991 | systemd-resolve | systemd-resolve | — | distro — never allocate |
 | 990 | fwupd-refresh | fwupd-refresh | — | distro |
 | 989 | polkitd | polkitd | — | distro |
-| 988 | **`virp-shell`** — read-only operator REPL seat (this branch; `list_fleet health heartbeat chain_verify`, GREEN) | *free — reserved for the same identity* | — | new 2026-09-14; the older "reserved for Spark" note in the colo template was wrong (Spark is 997 on 313) and is corrected there |
+| 988 | **`virp-shell`** — operator REPL seat (this branch; `list_fleet health heartbeat chain_verify execute`, GREEN — config mode proposes, never applies) | *free — reserved for the same identity* | — | new 2026-09-14; the older "reserved for Spark" note in the colo template was wrong (Spark is 997 on 313) and is corrected there |
 | 987 | `virp-sean` — Sean's agent-VM requester (`chain_verify`, `chain_append`→`evidence_item`) | *free — reserved for the same identity* | — | .211 only |
 | 1000 | operator (nhoward) | operator | operator | full vocabulary incl. `shutdown` |
 | 1001 | — | `virp-laptop` — forward-only approver identity (laptop → 313 socket) | — | 313 only |
