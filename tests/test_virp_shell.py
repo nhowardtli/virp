@@ -157,6 +157,10 @@ class TestShellMatchesAllowlist(unittest.TestCase):
                          "shell emits actions uid 988 cannot run: %s"
                          % sorted(used - allow))
 
+    def test_demo_actions_are_disjoint_from_production_seat(self):
+        allow = set(self.doc["socket_uid_action_allow"][SHELL_UID])
+        self.assertEqual(set(vs.DEMO_ACTIONS.values()) & allow, set())
+
     def test_uid_988_allowlist_is_exactly_what_the_shell_uses(self):
         # Rulings: 2026-09-14 exactly [list_fleet, health, heartbeat,
         # chain_verify]; 2026-09-15 phase 2a adds execute for config mode

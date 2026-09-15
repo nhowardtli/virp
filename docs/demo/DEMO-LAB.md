@@ -1,6 +1,6 @@
 # VIRP Demo Lab — Phase A
 
-Status: local implementation started; NOT deployed, NOT visitor-verified.
+Status: VM219 answers administrator SSH; demo deployment and visitor verification pending.
 Phase B/C must not start until Claude Code verifies the deployed Phase A
 commit with a second visitor key.
 
@@ -8,7 +8,7 @@ commit with a second visitor key.
 
 Owner: Nate. Builder: Astra. Verifier: Claude Code.
 Repository: nhowardtli/virp. Branch: feat/demo-lab.
-Base: feat/onode-list-sessions, cef8ace.
+Base: feat/onode-list-sessions, b7548fc (owner-pinned revision).
 Authoritative field prompt: VIRP-Demo-Lab-Prompt-2026-09-15.md supplied by Nate.
 
 No work in this phase may contact 10.0.10.211, 10.0.50.102, 10.0.0.211,
@@ -17,27 +17,32 @@ install-prod, or restart outside the new demo VM. Stop and ask before
 changing any repository template except deploy/devices.demo.template.json,
 opening a route to the colo, or using a real approver/witness key.
 
-## VM inventory — Nate supplies actual values
+## VM inventory — observed 2026-09-15
 
-| Field | Required / observed |
+| Field | Observed |
 |---|---|
-| Hypervisor | pve1 (planned; not queried for this phase) |
-| VM ID | 219 (planned; creation unconfirmed) |
-| Name | virp-demo |
-| OS | Ubuntu24.04 |
-| Resources | 2vCPU /4GiB /32GiB |
-| NIC1 | new vmbr9, no uplink; MAC pending |
-| NIC2 | VLAN20 management; MAC and IP pending |
-| Builder sudo user / SSH alias | pending |
-| Guest DMI UUID | pending; record before installing anything |
-| Original clab-frr-ospf topology | not found locally; offline copy needed |
+| Hypervisor | pve1, 10.0.10.10 |
+| VM ID / name | 219 / virp-demo |
+| OS | Ubuntu 24.04 cloud image, SHA256 checked against Ubuntu manifest |
+| Resources | 2 vCPU / 4 GiB / 32 GiB |
+| net0 / eth0 | vmbr0, VLAN20, BC:24:11:CF:51:36, 10.0.20.219/24 |
+| net1 / eth1 | vmbr9, BC:24:11:FE:AC:C4, 172.31.219.1/24 |
+| Management gateway | 10.0.20.1 (owner supplied; VM110 confirms VLAN20) |
+| Builder sudo user | demo-admin |
+| Guest DMI UUID | c88c6f10-aafb-44ca-ba27-95a5ae95da67 |
+| Offline assets | ~/virp-demo-assets/frr-ssh-10.2.1.tar.gz and frr-ospf-lab.tgz |
 
-The builder does not create the VM or change the hypervisor network.
-No public FortiGate VIP until Phase A is verified internally; Nate owns
-that later step. Inbound management must originate from an allowed VLAN20
-address (or be translated upstream by Nate): a home/VLAN10 source would
-conflict with the required prohibited return routes. Do not relax those
-routes to make the first SSH connection work.
+Nate authorized VM creation and specific PVE startup settings on 2026-09-15.
+The builder created vmbr9 without ports or an address using `ifup vmbr9`,
+avoiding a reload of existing bridges. VMs104/212 were already running;
+no restart was needed. Onboot was set for103/104/110/211/212/219 and startup
+orders for211 (1) and103 (2), exactly as authorized. No guest connections
+to excluded nodes were made.
+
+Administrator SSH works before final isolation. A management source inside
+VLAN20 is needed for final SSH acceptance: prohibited home/VLAN10 return
+routes must not be relaxed. An additional pve1 VLAN20 relay is awaiting
+owner approval. No public FortiGate VIP is part of Phase A.
 
 ## Implemented locally
 
@@ -62,24 +67,24 @@ routes to make the first SSH connection work.
   R5/R6 use the repository's in-process mock driver, not licensed IOS.
   Container SSH/vtysh compatibility remains to be tested on VM219.
 
-## Decisions and missing inputs
+## Owner rulings and bootstrap findings
 
-1. Nate must provide VM219's management IP, sudo user, SSH key/alias, and
-   confirm creation. Actual MACs/IPs must replace the pending inventory.
-2. Literal /usr/sbin/nologin conflicts with ForceCommand: sshd invokes the
-   account's shell with -c, and nologin exits before virp-shell can start.
-   A restricted login wrapper which accepts only the exact forced command
-   is proposed; Nate's answer is pending. Do not silently use /bin/bash.
-3. Supply an offline copy/path for the existing four-router clab-frr-ospf
-   topology. Do not fetch it from the excluded live O-Node.
-4. Choose approved external DNS/NTP endpoints and provide offline Ubuntu,
-   containerlab/Docker/FRR dependencies. Do not temporarily open general
-   VM egress for package installation.
+- Visitor uid1500 uses `/bin/sh`, with sshd ForceCommand and forwarding
+  disabled. `restrict,pty` retains key restrictions while allowing the
+  explicitly required terminal; `restrict` alone disables PTY allocation.
+- Dependencies may be installed during bootstrap, then egress closes.
+  Initial cloud-init package installation failed DNS resolution using
+  10.0.20.1. A temporary public resolver was used during bootstrap only.
+  Ubuntu repositories required HTTPS (HTTP returned403). The final
+  firewall admits DNS/NTP only to10.0.20.1; its availability needs checking.
+- Review fixes: renderer recognizes VIRP_DEMO_FRR_PASSWORD; records reject
+  bodies of8191 bytes or more; reply-record errors warn after signed output;
+  DEMO_ACTIONS is separate from production shell actions. Home-template
+  commit06848ba is excluded from this branch.
 
 ## Remaining Phase A implementation and validation
 
-No deployment instructions below have been executed. These are acceptance
-requirements, not assertions of a working installation.
+These acceptance requirements remain open until evidence is recorded below.
 
 - Stage the fake fleet and pin/record image digests; use FRR plus R5/R6
   mocks, with no IOS image and no production credential. Generate the

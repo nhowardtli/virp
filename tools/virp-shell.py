@@ -98,6 +98,8 @@ COMMAND_ACTIONS = {
     "show chain": "list_sessions",     # + one chain_verify per listed session
 }
 
+DEMO_ACTIONS = {"session record": "chain_append"}
+
 PROPOSAL_RE = re.compile(r"proposal_id=([0-9a-f]{32})")
 BLOCKED_RE = re.compile(r"tier gate blocked '(.*)' on '([^']+)' \(tier=([A-Z]+) max=([A-Z]+)\)")
 
@@ -188,7 +190,7 @@ def gate(request, sock_path=None):
     """Submit one request; map transport failures to '% ' errors."""
     action = request.get("action")
     demo_append = (os.environ.get("VIRP_SHELL_DEMO_SESSION") == "1"
-                   and action == "chain_append")
+                   and action in DEMO_ACTIONS.values())
     if action not in COMMAND_ACTIONS.values() and not demo_append:
         # Belt and braces: the map above is the whole vocabulary.
         raise GateError("internal: action %r is not in this shell's vocabulary"
@@ -891,8 +893,9 @@ class VirpShell(cmd.Cmd):
                     "observation_type": info.get("obs_type_name"),
                 })
             except GateError as exc:
-                raise GateError("device request returned, but demo receipt failed; "
-                                "do not retry automatically: %s" % exc)
+                info["demo_record_warning"] = (
+                    "device request returned, but demo receipt failed; "
+                    "do not retry automatically: %s" % exc)
         if info["kind"] == "error":
             raise GateError("gate refused: VIRP_ERR_%s (%d); no device "
                             "output was produced" % (info["name"], info["code"]))
@@ -908,7 +911,7 @@ class VirpShell(cmd.Cmd):
         body = json.dumps({"schema": "virp-demo-session/1", "event": event,
                            "session_id": self.demo_session, "detail": detail},
                           sort_keys=True, separators=(",", ":"))
-        if len(body.encode()) >= 8192:
+        if len(body.encode()) >= 8191:
             raise GateError("demo session record too large; request not submitted")
         reply = decode_reply(gate({
             "action": "chain_append", "artifact_type": "evidence_item",
@@ -926,6 +929,8 @@ class VirpShell(cmd.Cmd):
         for line in body_lines:
             self.out(line)
         self.out(TRAILER)
+        if info.get("demo_record_warning"):
+            self.out("% WARNING: " + info["demo_record_warning"])
 
     def cmd_show_devices(self, args):
         info = self._reply({"action": COMMAND_ACTIONS["show devices"]})
