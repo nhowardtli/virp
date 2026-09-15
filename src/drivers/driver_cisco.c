@@ -40,7 +40,13 @@
  * Constants
  * ========================================================================= */
 
+#include <ctype.h>                       /* cisco_parse_interface_description */
+
 #define SSH_READ_TIMEOUT_MS     10000   /* 10 seconds per read */
+#define SSH_MODE_SETTLE_MS      1500    /* a line that moves the prompt: the
+                                           old prompt will not return, so do
+                                           not wait the full read timeout
+                                           before re-learning */
 #define SSH_CONNECT_TIMEOUT_SEC 10
 #define SSH_PROMPT_WAIT_MS      500     /* Wait after command for output */
 #define SSH_READ_BUF_SIZE       32768
@@ -722,6 +728,83 @@ const char *cisco_gate_table_entry(size_t i, virp_trust_tier_t *tier)
     return CISCO_GATE_TABLE[i].prefix;
 }
 
+/* =========================================================================
+ * Typed config operation: interface <name> description <text>
+ *
+ * C-04 Option A (ruled 2026-09-14 for the Rust line, ported here
+ * 2026-09-15): a port description is a YELLOW change — it alters no
+ * forwarding, admin state, VLAN, address or credential. Everything else in
+ * config mode stays RED. The command is a typed operation in the sense of
+ * docs/DRIVER-TYPED-OPS.md: the classified string names the object
+ * (interface) and the field (description) and the driver, not the
+ * operator, decides the exact IOS sequence. See the header for the
+ * grammar.
+ * ========================================================================= */
+
+bool cisco_parse_interface_description(const char *command,
+                                       char *ifname, size_t ifname_len,
+                                       char *desc, size_t desc_len,
+                                       bool *negate)
+{
+    if (!command) return false;
+    while (*command == ' ' || *command == '\t') command++;
+
+    static const char kw[] = "interface";
+    if (strncmp(command, kw, sizeof(kw) - 1) != 0) return false;
+    const char *p = command + (sizeof(kw) - 1);
+    if (*p != ' ') return false;
+    while (*p == ' ') p++;
+
+    /* interface name: letter first, then [A-Za-z0-9/.:-], 1..63 bytes */
+    const char *ifs = p;
+    if (!isalpha((unsigned char)*p)) return false;
+    while (*p && *p != ' ') {
+        unsigned char c = (unsigned char)*p;
+        if (!(isalnum(c) || c == '/' || c == '.' || c == ':' || c == '-'))
+            return false;
+        p++;
+    }
+    size_t iflen = (size_t)(p - ifs);
+    if (iflen == 0 || iflen > 63) return false;
+    if (*p != ' ') return false;
+    while (*p == ' ') p++;
+
+    bool neg = false;
+    const char *text;
+    if (strncmp(p, "no description", 14) == 0 &&
+        (p[14] == '\0' || p[14] == ' ')) {
+        neg = true;
+        p += 14;
+        while (*p == ' ') p++;
+        if (*p != '\0') return false;          /* nothing may follow */
+        text = p;
+    } else if (strncmp(p, "description ", 12) == 0) {
+        p += 12;
+        while (*p == ' ') p++;
+        text = p;
+    } else {
+        return false;
+    }
+
+    size_t tlen = strlen(text);
+    while (tlen > 0 && (text[tlen - 1] == ' ' || text[tlen - 1] == '\t'))
+        tlen--;
+    if (!neg && (tlen == 0 || tlen > 200)) return false;
+    for (size_t i = 0; i < tlen; i++) {
+        unsigned char c = (unsigned char)text[i];
+        /* printable ASCII only; '?' is IOS help, the rest are separators
+         * or shell metacharacters that have no business in a description */
+        if (c < 0x20 || c >= 0x7f || c == '?' || c == ';' || c == '|' ||
+            c == '`')
+            return false;
+    }
+
+    if (ifname) snprintf(ifname, ifname_len, "%.*s", (int)iflen, ifs);
+    if (desc) snprintf(desc, desc_len, "%.*s", (int)tlen, text);
+    if (negate) *negate = neg;
+    return true;
+}
+
 virp_trust_tier_t cisco_gate_tier(const char *command)
 {
     if (!command) return VIRP_TIER_RED;              /* fail closed */
@@ -738,6 +821,11 @@ virp_trust_tier_t cisco_gate_tier(const char *command)
         return VIRP_TIER_RED;
 
     while (*command == ' ' || *command == '\t') command++;
+
+    /* Typed config op (C-04 Option A): a port description is YELLOW. The
+     * driver executes it as a fixed transaction, never as this literal. */
+    if (cisco_parse_interface_description(command, NULL, 0, NULL, 0, NULL))
+        return VIRP_TIER_YELLOW;
 
     const cisco_route_t *best = NULL;
     size_t best_len = 0;
@@ -1246,6 +1334,191 @@ static bool cisco_reconnect_in_place(virp_conn_t *conn)
  * runs cisco_reconnect_in_place. */
 static bool (*cisco_reconnect_fn)(virp_conn_t *) = cisco_reconnect_in_place;
 
+/* =========================================================================
+ * Config transaction primitives (typed op: interface description)
+ * ========================================================================= */
+
+/*
+ * Send ONE line and settle on a known IOS prompt. Same mode-transition
+ * handling as cisco_execute, minus the reconnect-retry: inside a
+ * transaction a reconnect would land in EXEC mode and change what the
+ * remaining lines mean, so a dropped session is a failure, never a retry.
+ * `moves_prompt` shortens the read timeout: the old prompt is not coming
+ * back, so wait SSH_MODE_SETTLE_MS instead of SSH_READ_TIMEOUT_MS before
+ * re-learning. conn->current_mode is updated from the settled prompt.
+ * `out` receives the device text with the echo stripped.
+ */
+static virp_error_t cisco_send_settle(virp_conn_t *conn, const char *line,
+                                      bool moves_prompt,
+                                      char *out, size_t out_cap)
+{
+    char raw[VIRP_OUTPUT_MAX];
+    size_t n = 0;
+    virp_error_t rerr = virp_ssh_exec(&conn->io, &conn->prompt, line,
+                                      raw, sizeof(raw), &n,
+                                      moves_prompt ? SSH_MODE_SETTLE_MS
+                                                   : SSH_READ_TIMEOUT_MS,
+                                      conn->device.hostname);
+    if (rerr == VIRP_ERR_NO_PROMPT) {
+        virp_ssh_learn_opts_t mc_opts = { .channel_has_spoken = true };
+        if (virp_ssh_learn_prompt(&conn->io, conn->device.hostname,
+                                  &mc_opts, &conn->prompt) == VIRP_OK &&
+            cisco_parse_mode(conn->prompt.prompt) != CISCO_MODE_UNKNOWN) {
+            conn->current_mode = cisco_parse_mode(conn->prompt.prompt);
+            conn->in_enable =
+                (conn->prompt.prompt_len > 0 &&
+                 conn->prompt.prompt[conn->prompt.prompt_len - 1] == '#');
+            rerr = VIRP_OK;
+        }
+    } else if (rerr == VIRP_OK) {
+        conn->current_mode = cisco_parse_mode(conn->prompt.prompt);
+    }
+    if (rerr != VIRP_OK) {
+        out[0] = '\0';
+        return rerr;
+    }
+    if (n < sizeof(raw)) raw[n] = '\0'; else raw[sizeof(raw) - 1] = '\0';
+    const char *body = virp_ssh_strip_echo(raw, line);
+    snprintf(out, out_cap, "%s", body);
+    return VIRP_OK;
+}
+
+static bool cisco_ios_rejected(const char *out)
+{
+    return strstr(out, "% Invalid input") || strstr(out, "% Incomplete") ||
+           strstr(out, "% Ambiguous") || strstr(out, "% Unrecognized") ||
+           strstr(out, "% Bad ");
+}
+
+/*
+ * interface <name> description <text>  — the four-step transaction.
+ *
+ *   precondition  privileged EXEC (refused before any byte otherwise)
+ *   1  configure terminal   -> (config)#
+ *   2  interface <name>     -> (config-if)#   (any config sub-mode)
+ *   3  description <text> | no description  -> prompt unchanged, no "% "
+ *   4  end                  -> #             (ALWAYS attempted after 1)
+ *
+ * A step that fails stops the transaction; "end" still runs so the
+ * session is left in EXEC. If it cannot be, the connection is marked
+ * down so the next request reconnects fresh (a reconnect lands in EXEC)
+ * rather than issuing an EXEC-shaped literal into a config prompt. The
+ * signed body is the whole transcript, prefixed with the classified
+ * command exactly as every other Cisco observation is.
+ */
+static virp_error_t cisco_exec_interface_description(virp_conn_t *conn,
+                                                     const char *command,
+                                                     const char *ifname,
+                                                     const char *desc,
+                                                     bool negate,
+                                                     virp_exec_result_t *result)
+{
+    if (conn->current_mode != CISCO_MODE_EXEC || !conn->in_enable) {
+        result->success = false;
+        result->exit_code = 1;
+        result->no_dispatch = true;
+        result->disposition = VIRP_DISPOSITION_NOT_SENT;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Config transaction on %s requires privileged EXEC "
+                 "(mode=%d enable=%d): refused before any byte was sent",
+                 conn->device.hostname, (int)conn->current_mode,
+                 conn->in_enable ? 1 : 0);
+        return VIRP_OK;
+    }
+
+    char line_if[128], line_desc[300];   /* "description " + desc[256] */
+    snprintf(line_if, sizeof(line_if), "interface %s", ifname);
+    if (negate)
+        snprintf(line_desc, sizeof(line_desc), "no description");
+    else
+        snprintf(line_desc, sizeof(line_desc), "description %s", desc);
+
+    const char *steps[4] = { "configure terminal", line_if, line_desc, "end" };
+    const bool  moves[4] = { true, true, false, true };
+    const char *expect[4] = { "config", "config-sub", "config-sub", "exec" };
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    static _Thread_local char transcript[VIRP_OUTPUT_MAX];
+    size_t off = 0;
+    char why[200] = "";
+    bool failed = false;
+    bool sent_any = false;
+
+    for (int i = 0; i < 4; i++) {
+        if (failed && i < 3) continue;          /* skip to "end" */
+        char out[8192];
+        virp_error_t e = cisco_send_settle(conn, steps[i], moves[i],
+                                           out, sizeof(out));
+        sent_any = true;
+        int w = snprintf(transcript + off, sizeof(transcript) - off,
+                         "%s\n%s%s", steps[i], out,
+                         (out[0] && out[strlen(out) - 1] != '\n') ? "\n" : "");
+        if (w > 0 && (size_t)w < sizeof(transcript) - off) off += (size_t)w;
+        if (e != VIRP_OK) {
+            if (!failed)
+                snprintf(why, sizeof(why), "transport/prompt failure at "
+                         "'%s': %s", steps[i], virp_error_str(e));
+            failed = true;
+            if (i == 3) conn->connected = false;   /* could not settle on exec */
+            break;
+        }
+        bool ok_mode;
+        if (i == 0)      ok_mode = conn->current_mode == CISCO_MODE_CONFIG;
+        else if (i == 3) ok_mode = conn->current_mode == CISCO_MODE_EXEC;
+        else             ok_mode = conn->current_mode == CISCO_MODE_CONFIG_SUB;
+        if (!ok_mode) {
+            if (!failed)
+                snprintf(why, sizeof(why), "unexpected prompt after '%s' "
+                         "(wanted %s, got mode %d)", steps[i], expect[i],
+                         (int)conn->current_mode);
+            failed = true;
+            if (i == 3) conn->connected = false;
+            continue;
+        }
+        if (cisco_ios_rejected(out)) {
+            if (!failed)
+                snprintf(why, sizeof(why), "IOS rejected '%s'", steps[i]);
+            failed = true;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
+                                       (end.tv_nsec - start.tv_nsec) / 1000000);
+
+    if (conn->current_mode != CISCO_MODE_EXEC) {
+        /* Never leave a session parked in config mode. */
+        conn->connected = false;
+        fprintf(stderr, "[Cisco] %s: config transaction did not return to "
+                "EXEC — connection marked down for a fresh reconnect\n",
+                conn->device.hostname);
+    }
+
+    virp_error_t werr = cisco_store_output(result, conn->device.hostname,
+                                           command, transcript, false);
+    if (werr != VIRP_OK) {
+        fprintf(stderr, "[Cisco] %s\n", result->error_msg);
+        return werr;
+    }
+    if (failed) {
+        result->success = false;
+        result->exit_code = 1;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Config transaction failed on %s: %s%s",
+                 conn->device.hostname, why,
+                 sent_any ? "" : " (nothing sent)");
+        fprintf(stderr, "[Cisco] %s: %s\n", conn->device.hostname,
+                result->error_msg);
+        return VIRP_OK;
+    }
+    result->exit_code = 0;
+    fprintf(stderr, "[Cisco] %s: config transaction applied: %s\n",
+            conn->device.hostname, command);
+    return VIRP_OK;
+}
+
 static virp_error_t cisco_execute(virp_conn_t *conn,
                                   const char *command,
                                   virp_exec_result_t *result)
@@ -1282,6 +1555,17 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Not connected to %s", conn->device.hostname);
         return VIRP_OK;
+    }
+
+    /* Typed config op: executed as a fixed transaction, never as the
+     * literal (IOS would reject "interface X description Y" in EXEC). */
+    {
+        char ifn[64], dsc[256];
+        bool neg = false;
+        if (cisco_parse_interface_description(command, ifn, sizeof(ifn),
+                                              dsc, sizeof(dsc), &neg))
+            return cisco_exec_interface_description(conn, command, ifn, dsc,
+                                                    neg, result);
     }
 
     /* Commands that may legitimately move the prompt (config mode). */

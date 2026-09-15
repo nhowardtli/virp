@@ -54,7 +54,7 @@ judges the new uid with its own ceiling:
 | seat | uid | ceiling | what a config line does |
 |---|---|---|---|
 | read (`>`) | 988 `virp-shell` | GREEN | reads execute; YELLOW/RED → proposal |
-| admin (`#`) | 985 `virp-shell-admin` | YELLOW | reads execute; **YELLOW applies**; RED → proposal |
+| admin (`#`) | 985 `virp-shell-admin` | YELLOW | reads execute; **YELLOW applies** (on IOS today that is `interface <name> description …` — see docs/notes/cisco-description-yellow-2026-09-15.md); RED → proposal |
 
 BLACK never runs from either seat, and neither seat can approve anything:
 proposer and approver stay two people. Every `[GATE]` line and chain entry

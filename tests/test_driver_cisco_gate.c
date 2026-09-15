@@ -130,6 +130,63 @@ static void test_fail_closed(void)
     assert(cisco_gate_tier("   show version") == VIRP_TIER_GREEN); PASS();
 }
 
+/* C-04 Option A on the C node (2026-09-15): a port description is the one
+ * config-mode command graded YELLOW. The grammar is strict, and everything
+ * else under "interface" stays RED. */
+static void test_description_yellow(void)
+{
+    printf("\n[interface description -> YELLOW, everything else under interface RED]\n");
+    TEST("interface Gi1/0/48 description uplink -> YELLOW");
+    assert(cisco_gate_tier("interface GigabitEthernet1/0/48 description uplink to core") == VIRP_TIER_YELLOW); PASS();
+    TEST("short name Gi1/0/48 -> YELLOW");
+    assert(cisco_gate_tier("interface Gi1/0/48 description x") == VIRP_TIER_YELLOW); PASS();
+    TEST("Loopback0 / Vlan10 / Port-channel1 / Te1/1/1.100 -> YELLOW");
+    assert(cisco_gate_tier("interface Loopback0 description lo") == VIRP_TIER_YELLOW);
+    assert(cisco_gate_tier("interface Vlan10 description mgmt") == VIRP_TIER_YELLOW);
+    assert(cisco_gate_tier("interface Port-channel1 description po") == VIRP_TIER_YELLOW);
+    assert(cisco_gate_tier("interface TenGigabitEthernet1/1/1.100 description sub") == VIRP_TIER_YELLOW); PASS();
+    TEST("no description -> YELLOW");
+    assert(cisco_gate_tier("interface Gi1/0/48 no description") == VIRP_TIER_YELLOW); PASS();
+    TEST("description with spaces/punctuation -> YELLOW");
+    assert(cisco_gate_tier("interface Gi1/0/48 description To-FortiGate (port 3), rack A") == VIRP_TIER_YELLOW); PASS();
+
+    TEST("interface Gi1/0/48 shutdown -> RED");
+    assert(cisco_gate_tier("interface Gi1/0/48 shutdown") == VIRP_TIER_RED); PASS();
+    TEST("interface Gi1/0/48 switchport access vlan 10 -> RED");
+    assert(cisco_gate_tier("interface Gi1/0/48 switchport access vlan 10") == VIRP_TIER_RED); PASS();
+    TEST("interface Gi1/0/48 (bare) -> RED");
+    assert(cisco_gate_tier("interface Gi1/0/48") == VIRP_TIER_RED); PASS();
+    TEST("interface Gi1/0/48 description (empty) -> RED");
+    assert(cisco_gate_tier("interface Gi1/0/48 description") == VIRP_TIER_RED);
+    assert(cisco_gate_tier("interface Gi1/0/48 description   ") == VIRP_TIER_RED); PASS();
+    TEST("no description with trailing text -> RED");
+    assert(cisco_gate_tier("interface Gi1/0/48 no description shutdown") == VIRP_TIER_RED); PASS();
+    TEST("separator / metachar in description -> RED");
+    assert(cisco_gate_tier("interface Gi1/0/48 description a;reload") == VIRP_TIER_RED);
+    assert(cisco_gate_tier("interface Gi1/0/48 description a | include x") == VIRP_TIER_RED);
+    assert(cisco_gate_tier("interface Gi1/0/48 description a?") == VIRP_TIER_RED);
+    assert(cisco_gate_tier("interface Gi1/0/48 description a`b") == VIRP_TIER_RED); PASS();
+    TEST("abbreviations / case -> RED (literal spellings only)");
+    assert(cisco_gate_tier("int Gi1/0/48 description x") == VIRP_TIER_RED);
+    assert(cisco_gate_tier("interface Gi1/0/48 desc x") == VIRP_TIER_RED);
+    assert(cisco_gate_tier("Interface Gi1/0/48 description x") == VIRP_TIER_RED); PASS();
+    TEST("bad interface names -> RED");
+    assert(cisco_gate_tier("interface 1/0/48 description x") == VIRP_TIER_RED);
+    assert(cisco_gate_tier("interface Gi1/0/48;reload description x") == VIRP_TIER_RED);
+    assert(cisco_gate_tier("interface Gi1/0/48 Gi1/0/49 description x") == VIRP_TIER_RED); PASS();
+    TEST("201-byte description -> RED, 200 -> YELLOW");
+    {
+        char cmd[320];
+        char d[202]; memset(d, 'a', 201); d[201] = '\0';
+        snprintf(cmd, sizeof(cmd), "interface Gi1/0/48 description %s", d);
+        assert(cisco_gate_tier(cmd) == VIRP_TIER_RED);
+        d[200] = '\0';
+        snprintf(cmd, sizeof(cmd), "interface Gi1/0/48 description %s", d);
+        assert(cisco_gate_tier(cmd) == VIRP_TIER_YELLOW);
+    }
+    PASS();
+}
+
 static void test_promotions(void)
 {
     printf("\n=== Shadow-evidence promotions ===\n");
@@ -422,6 +479,7 @@ int main(void)
     test_no_case_folding();
     test_fail_closed();
     test_promotions();
+    test_description_yellow();
     test_prefix_safety();
     test_multicommand_bypass();
     test_separator_fails_closed();

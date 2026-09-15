@@ -107,6 +107,30 @@ virp_trust_tier_t cisco_gate_tier(const char *command);
 bool cisco_is_black_tier(const char *command);
 
 /*
+ * Typed config operation (2026-09-15, C-04 Option A ported to the C node):
+ *
+ *     interface <name> description <text>
+ *     interface <name> no description
+ *
+ * is the ONE config-mode command the classifier grades YELLOW instead of
+ * RED. The driver does not send that literal (IOS would reject it in EXEC
+ * mode); it runs a fixed four-step transaction — configure terminal /
+ * interface <name> / description … / end — checking the prompt mode after
+ * every step and always returning to EXEC. Nothing else moves: shutdown,
+ * switchport, ip address, routing and every other config line stay RED.
+ *
+ * Parses strictly: exact keyword spellings (no abbreviations — the gate
+ * table's rule), an interface name of [A-Za-z][A-Za-z0-9/.:-]* up to 63
+ * bytes, a printable description of 1..200 bytes with no '?', ';', '|',
+ * '`' or control bytes. Any output pointer may be NULL. Returns true only
+ * for a command this driver will execute as the transaction.
+ */
+bool cisco_parse_interface_description(const char *command,
+                                       char *ifname, size_t ifname_len,
+                                       char *desc, size_t desc_len,
+                                       bool *negate);
+
+/*
  * Credential scrub for config-bearing reads (2026-08-10).
  *
  * cisco_scrub_config rewrites IOS config text so credential material
