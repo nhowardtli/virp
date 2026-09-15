@@ -1047,8 +1047,12 @@ class VirpShell(cmd.Cmd):
         for s in sessions:
             sid = s.get("session_id", "?")
             try:
+                # verify the WHOLE listed range; without to_sequence the
+                # daemon checks 0..0 (one entry) and reports valid for it
                 v = self._reply({"action": COMMAND_ACTIONS["verify chain"],
-                                 "session_id": sid})
+                                 "session_id": sid,
+                                 "from_sequence": int(s.get("first_sequence", 0)),
+                                 "to_sequence": int(s.get("last_sequence", 0))})
                 res = json.loads(v.get("text", "") or "{}")
                 valid = "yes" if res.get("valid") else "NO"
                 checked = res.get("entries_checked", "?")

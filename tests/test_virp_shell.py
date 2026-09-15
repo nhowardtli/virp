@@ -617,6 +617,7 @@ class TestCommands(unittest.TestCase):
         out, reqs = run(None, "show chain 3", reply)
         self.assertEqual(reqs[0], {"action": "list_sessions", "limit": 3})
         self.assertEqual([r["session_id"] for r in reqs[1:]], ["sess-b", "sess-a"])
+        self.assertEqual((reqs[1]["from_sequence"], reqs[1]["to_sequence"]), (0, 4))
         self.assertTrue(all(r["action"] == "chain_verify" for r in reqs[1:]))
         self.assertIn("chain sessions: 2 listed of the most recent 3; 1 broken", out)
         self.assertIn("sess-b", out)
