@@ -13,6 +13,9 @@ install -d -m 0700 /etc/virp-demo/approval
 make install-prod
 make install-devices-template VIRP_DEVICES_TEMPLATE_SRC=deploy/devices.demo.template.json
 make install-virp-shell
+# Shared guest journal can retain yesterday's command text after chain reset.
+# Visitors get signed gate output, not access to previous visitors' journals.
+gpasswd -d virp-shell systemd-journal >/dev/null 2>&1 || true
 install -m 0644 docs/demo/WELCOME.txt /etc/virp-demo/WELCOME.txt
 # Public MOTD must be accessible to the seat; secret subdirectories stay 0700.
 chmod 0755 /etc/virp-demo

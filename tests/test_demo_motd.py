@@ -29,6 +29,12 @@ class DemoMotd(unittest.TestCase):
                 rc = shell.main([])
             return rc, intro, err.getvalue()
 
+    def test_reset_marker_refuses_login_before_chain_write(self):
+        with patch.dict(os.environ, {'VIRP_SHELL_DEMO_SESSION': '1'}), patch.object(shell.os, 'geteuid', return_value=988), patch.object(shell.os.path, 'exists', return_value=True), patch.object(shell, 'gate') as gate, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(shell.main([]), 2)
+            gate.assert_not_called()
+            self.assertIn('reset in progress', err.getvalue())
+
     def test_welcome_is_literal_text(self):
         text = (ROOT / 'docs/demo/WELCOME.txt').read_text() + '\n$(touch never)'
         rc, intro, _ = self.invoke(text)
