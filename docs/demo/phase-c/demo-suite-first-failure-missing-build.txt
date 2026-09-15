@@ -1,0 +1,122 @@
+test_matching_challenge_submits (test_demo_approve_binding.Binding.test_matching_challenge_submits) ... ERROR
+test_mismatches_refuse_before_signing_or_submission (test_demo_approve_binding.Binding.test_mismatches_refuse_before_signing_or_submission) ... 
+  test_mismatches_refuse_before_signing_or_submission (test_demo_approve_binding.Binding.test_mismatches_refuse_before_signing_or_submission) (field='device') ... ERROR
+  test_mismatches_refuse_before_signing_or_submission (test_demo_approve_binding.Binding.test_mismatches_refuse_before_signing_or_submission) (field='command') ... ERROR
+  test_mismatches_refuse_before_signing_or_submission (test_demo_approve_binding.Binding.test_mismatches_refuse_before_signing_or_submission) (field='hash') ... ERROR
+  test_mismatches_refuse_before_signing_or_submission (test_demo_approve_binding.Binding.test_mismatches_refuse_before_signing_or_submission) (field='node') ... ERROR
+test_duplicate_and_cap (test_demo_issuer.Tests.test_duplicate_and_cap) ... ok
+test_gate_failure_cannot_issue_or_prune (test_demo_issuer.Tests.test_gate_failure_cannot_issue_or_prune) ... ok
+test_hmac_and_timestamp (test_demo_issuer.Tests.test_hmac_and_timestamp) ... ok
+test_issue_expiry_and_no_pii (test_demo_issuer.Tests.test_issue_expiry_and_no_pii) ... ok
+test_key_validation (test_demo_issuer.Tests.test_key_validation) ... ok
+test_prune (test_demo_issuer.Tests.test_prune) ... ok
+test_missing_file_refuses_instead_of_silently_omitting_instructions (test_demo_motd.DemoMotd.test_missing_file_refuses_instead_of_silently_omitting_instructions) ... ok
+test_reset_marker_refuses_login_before_chain_write (test_demo_motd.DemoMotd.test_reset_marker_refuses_login_before_chain_write) ... ok
+test_terminal_escape_and_oversize_refused (test_demo_motd.DemoMotd.test_terminal_escape_and_oversize_refused) ... ok
+test_welcome_is_literal_text (test_demo_motd.DemoMotd.test_welcome_is_literal_text) ... ok
+test_no_private_service_exceptions (test_demo_network.DemoNetwork.test_no_private_service_exceptions) ... ok
+test_no_shared_interface (test_demo_network.DemoNetwork.test_no_shared_interface) ... ok
+test_policy_separates_internal_fleet_from_management (test_demo_network.DemoNetwork.test_policy_separates_internal_fleet_from_management) ... ok
+test_rejects_interface_injection (test_demo_network.DemoNetwork.test_rejects_interface_injection) ... ok
+test_chain_content_limit_rejects_8191_bytes (test_demo_session.DemoSession.test_chain_content_limit_rejects_8191_bytes) ... ok
+test_demo_policy_matches_shell_without_approval_actions (test_demo_session.DemoSession.test_demo_policy_matches_shell_without_approval_actions) ... ok
+test_distinct_sessions_record_before_and_after_execute (test_demo_session.DemoSession.test_distinct_sessions_record_before_and_after_execute) ... ok
+test_own_session_verifies_full_acknowledged_range_outside_recent_window (test_demo_session.DemoSession.test_own_session_verifies_full_acknowledged_range_outside_recent_window) ... ok
+test_production_does_not_gain_append (test_demo_session.DemoSession.test_production_does_not_gain_append) ... ok
+test_refused_record_prevents_device_request (test_demo_session.DemoSession.test_refused_record_prevents_device_request) ... ok
+test_reply_record_refusal_preserves_signed_output_before_warning (test_demo_session.DemoSession.test_reply_record_refusal_preserves_signed_output_before_warning) ... ok
+
+======================================================================
+ERROR: test_matching_challenge_submits (test_demo_approve_binding.Binding.test_matching_challenge_submits)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/nhoward/virp-demo-phase-c/tests/test_demo_approve_binding.py", line 32, in test_matching_challenge_submits
+    r,actions=self.attempt(None)
+              ^^^^^^^^^^^^^^^^^^
+  File "/home/nhoward/virp-demo-phase-c/tests/test_demo_approve_binding.py", line 26, in attempt
+    subprocess.run([str(TOOL),'keygen','approval',str(key)],check=True,capture_output=True)
+  File "/usr/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: '/home/nhoward/virp-demo-phase-c/build/virp-tool'
+
+======================================================================
+ERROR: test_mismatches_refuse_before_signing_or_submission (test_demo_approve_binding.Binding.test_mismatches_refuse_before_signing_or_submission) (field='device')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/nhoward/virp-demo-phase-c/tests/test_demo_approve_binding.py", line 38, in test_mismatches_refuse_before_signing_or_submission
+    r,actions=self.attempt(field)
+              ^^^^^^^^^^^^^^^^^^^
+  File "/home/nhoward/virp-demo-phase-c/tests/test_demo_approve_binding.py", line 26, in attempt
+    subprocess.run([str(TOOL),'keygen','approval',str(key)],check=True,capture_output=True)
+  File "/usr/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: '/home/nhoward/virp-demo-phase-c/build/virp-tool'
+
+======================================================================
+ERROR: test_mismatches_refuse_before_signing_or_submission (test_demo_approve_binding.Binding.test_mismatches_refuse_before_signing_or_submission) (field='command')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/nhoward/virp-demo-phase-c/tests/test_demo_approve_binding.py", line 38, in test_mismatches_refuse_before_signing_or_submission
+    r,actions=self.attempt(field)
+              ^^^^^^^^^^^^^^^^^^^
+  File "/home/nhoward/virp-demo-phase-c/tests/test_demo_approve_binding.py", line 26, in attempt
+    subprocess.run([str(TOOL),'keygen','approval',str(key)],check=True,capture_output=True)
+  File "/usr/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: '/home/nhoward/virp-demo-phase-c/build/virp-tool'
+
+======================================================================
+ERROR: test_mismatches_refuse_before_signing_or_submission (test_demo_approve_binding.Binding.test_mismatches_refuse_before_signing_or_submission) (field='hash')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/nhoward/virp-demo-phase-c/tests/test_demo_approve_binding.py", line 38, in test_mismatches_refuse_before_signing_or_submission
+    r,actions=self.attempt(field)
+              ^^^^^^^^^^^^^^^^^^^
+  File "/home/nhoward/virp-demo-phase-c/tests/test_demo_approve_binding.py", line 26, in attempt
+    subprocess.run([str(TOOL),'keygen','approval',str(key)],check=True,capture_output=True)
+  File "/usr/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: '/home/nhoward/virp-demo-phase-c/build/virp-tool'
+
+======================================================================
+ERROR: test_mismatches_refuse_before_signing_or_submission (test_demo_approve_binding.Binding.test_mismatches_refuse_before_signing_or_submission) (field='node')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/nhoward/virp-demo-phase-c/tests/test_demo_approve_binding.py", line 38, in test_mismatches_refuse_before_signing_or_submission
+    r,actions=self.attempt(field)
+              ^^^^^^^^^^^^^^^^^^^
+  File "/home/nhoward/virp-demo-phase-c/tests/test_demo_approve_binding.py", line 26, in attempt
+    subprocess.run([str(TOOL),'keygen','approval',str(key)],check=True,capture_output=True)
+  File "/usr/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: '/home/nhoward/virp-demo-phase-c/build/virp-tool'
+
+----------------------------------------------------------------------
+Ran 23 tests in 0.040s
+
+FAILED (errors=5)

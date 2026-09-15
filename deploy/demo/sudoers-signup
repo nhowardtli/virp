@@ -1,0 +1,3 @@
+# VM219 only: the root-owned SSH wrapper derives this seat from SSH_USER_AUTH.
+# Keep the same uid988 gate seat; allow no extra flags or alternate paths.
+virp-demo ALL=(virp-shell) NOPASSWD: /usr/bin/python3 ^/usr/local/lib/virp/virp-shell --demo-seat [a-f0-9]{96}$

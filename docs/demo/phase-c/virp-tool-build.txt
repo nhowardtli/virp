@@ -1,0 +1,27 @@
+mkdir -p build
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_crypto.c -o build/virp_crypto.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_message.c -o build/virp_message.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_driver.c -o build/virp_driver.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/drivers/driver_mock.c -o build/driver_mock.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_onode.c -o build/virp_onode.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_chain.c -o build/virp_chain.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_federation.c -o build/virp_federation.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_seqstore.c -o build/virp_seqstore.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_session.c -o build/virp_session.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_handshake.c -o build/virp_handshake.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_transcript.c -o build/virp_transcript.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_validator.c -o build/virp_validator.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_approval.c -o build/virp_approval.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_approver_registry.c -o build/virp_approver_registry.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_obskey.c -o build/virp_obskey.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_chainsign.c -o build/virp_chainsign.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_ssh_io.c -o build/virp_ssh_io.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_scrub.c -o build/virp_scrub.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_body_filter.c -o build/virp_body_filter.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c build/virp_build_id.c -o build/virp_build_id.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/third_party/cJSON.c -o build/cJSON.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/drivers/driver_cisco.c -o build/driver_cisco.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -c src/virp_ssh_hostkey.c -o build/virp_ssh_hostkey.o
+ar rcs build/libvirp.a build/virp_crypto.o build/virp_message.o build/virp_driver.o build/driver_mock.o build/virp_onode.o build/virp_chain.o build/virp_federation.o build/virp_seqstore.o build/virp_session.o build/virp_handshake.o build/virp_transcript.o build/virp_validator.o build/virp_approval.o build/virp_approver_registry.o build/virp_obskey.o build/virp_chainsign.o build/virp_ssh_io.o build/virp_scrub.o build/virp_body_filter.o build/virp_build_id.o build/cJSON.o build/driver_cisco.o build/virp_ssh_hostkey.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_GIT_HASH='"6404a51"' src/virp_tool.c build/libvirp.a -lcrypto -lpthread -lsqlite3 -lsodium  -lssh2 -o build/virp-tool
+ln -f build/virp-tool build/virp   # `virp approve <id>` alias

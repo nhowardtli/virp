@@ -14,4 +14,4 @@ if auth:
             for registered in Path('/etc/ssh/authorized_keys.d/virp-demo').read_text().splitlines():
                 m=re.search(r' (ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)) ([A-Za-z0-9+/=]+) demo:([a-f0-9]{96})$',registered)
                 if m and m[1]+' '+m[2]==key:args=['--demo-seat',m[3]];break
-os.execv('/usr/bin/sudo',['sudo','-u','virp-shell','--','/usr/bin/python3','/usr/local/lib/virp/virp-shell',*args,*sys.argv[1:]])
+os.execv('/usr/bin/sudo',['sudo','-n','-u','virp-shell','--','/usr/bin/python3','/usr/local/lib/virp/virp-shell',*args,*sys.argv[1:]])
