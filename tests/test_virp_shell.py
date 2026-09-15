@@ -411,7 +411,10 @@ class TestCommands(unittest.TestCase):
             sh = vs.VirpShell(sock_path=g.path, stdout=buf, host="virp-lab")
             for l in ("enable", "configure terminal", "device R1") + tuple(lines):
                 sh.default(l)
-            return buf.getvalue(), g.requests, sh
+            # the vendor lookup for abbreviation expansion is a list_fleet;
+            # these tests assert on the device-bound requests only
+            reqs = [r for r in g.requests if r["action"] != "list_fleet"]
+            return buf.getvalue(), reqs, sh
         finally:
             g.close()
 
@@ -431,7 +434,7 @@ class TestCommands(unittest.TestCase):
     def test_yellow_change_is_proposed_not_applied(self):
         pid = "0123456789abcdef0123456789abcdef"
         out, reqs, sh = self._config_session(
-            lambda r: observation(0x0F, self.BLOCKED % (r["command"], "YELLOW", pid), tier=0x02),
+            lambda r: observation(0x0F, self.BLOCKED % (r.get("command", ""), "YELLOW", pid), tier=0x02),
             ["interface Gi1/0/1 description uplink"])
         self.assertEqual(reqs[0]["command"], "interface Gi1/0/1 description uplink")
         self.assertIn("PROPOSED, not applied", out)
@@ -491,6 +494,77 @@ class TestCommands(unittest.TestCase):
         sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="virp-lab")
         sh.default("show device ?")
         self.assertIn("<name>", buf.getvalue())
+
+    def test_ios_abbreviations_expand_to_canonical_spellings(self):
+        x = vs.expand_ios
+        self.assertEqual(x("sh ip int br"), "show ip interface brief")
+        self.assertEqual(x("SH VER"), "show version")
+        self.assertEqual(x("sh run"), "show running-config")
+        self.assertEqual(x("int g1/0/48 des uplink"),
+                         "interface GigabitEthernet1/0/48 description uplink")
+        self.assertEqual(x("sh int te1/1/1 status"),
+                         "show interface TenGigabitEthernet1/1/1 status")
+        self.assertEqual(x("wr mem"), "write memory")
+        self.assertEqual(x("relo"), "reload")
+        self.assertEqual(x("show foo bar"), "show foo bar")      # unknown: untouched
+        self.assertEqual(x("show ip interface brief"), "show ip interface brief")
+
+    def test_expansions_land_on_the_cisco_classifier_table(self):
+        # The expander must produce spellings the gate's classifier
+        # literally knows (src/drivers/driver_cisco.c), or it is pointless.
+        src = open(os.path.join(ROOT, "src", "drivers", "driver_cisco.c")).read()
+        i = src.index("CISCO_GATE_TABLE[] = {"); j = src.index("};", i)
+        import re
+        table = dict(re.findall(r'\{\s*"([^"]+)",\s*VIRP_TIER_([A-Z]+)', src[i:j]))
+        i = src.index("CISCO_BLACK_COMMANDS[] = {"); j = src.index("};", i)
+        black = re.findall(r'"([^"]+)"', src[i:j])
+
+        def tier_of(cmd):
+            if any(cmd.lower().startswith(b) for b in black):
+                return "BLACK"
+            best = max((p for p in table if cmd.startswith(p)), key=len, default=None)
+            return table.get(best, "RED(unmatched)")
+
+        for abbr, want in (("sh ip int br", "GREEN"), ("sh ver", "GREEN"),
+                           ("sh int status", "GREEN"), ("sh mac add", "GREEN"),
+                           ("sh clo", "GREEN"), ("sh run", "YELLOW"),
+                           ("int g1/0/48 des x", "RED"), ("conf t", "RED"),
+                           ("relo", "BLACK"), ("wr era", "BLACK")):
+            self.assertEqual(tier_of(vs.expand_ios(abbr)), want,
+                             "%r -> %r" % (abbr, vs.expand_ios(abbr)))
+        # and the unexpanded abbreviation really would have fallen through
+        self.assertEqual(tier_of("sh ip int br"), "RED(unmatched)")
+        self.assertEqual(tier_of("relo"), "RED(unmatched)")       # the gap the expander closes
+
+    def test_config_line_is_expanded_for_ios_devices_and_shown(self):
+        def reply(r):
+            if r["action"] == "list_fleet":
+                return observation(0x05, FLEET_TEXT)
+            return observation(0x07, "Interface  IP-Address  Status\n")
+        g = FakeGate(reply)
+        try:
+            buf = io.StringIO()
+            sh = vs.VirpShell(sock_path=g.path, stdout=buf, host="virp-lab")
+            for l in ("enable", "configure terminal", "device sw-3850", "sh ip int br"):
+                sh.default(l)
+            ex = [r for r in g.requests if r["action"] == "execute"]
+            self.assertEqual(ex, [{"action": "execute", "device": "sw-3850",
+                                   "command": "show ip interface brief"}])
+            out = buf.getvalue()
+            self.assertIn("sent as: show ip interface brief", out)
+            self.assertIn("sw-3850: 'show ip interface brief' executed (GREEN)", out)
+            # a non-IOS device is never rewritten
+            sh.default("device pbs-lab"); sh.default("sh clo")
+            self.assertEqual(g.requests[-1]["command"], "sh clo")
+        finally:
+            g.close()
+
+    def test_device_error_frame_is_rendered_once(self):
+        out, _, _ = self._config_session(
+            lambda r: observation(0x0F, "ERROR: cannot connect to 'R1'"),
+            ["show ip interface brief"])
+        self.assertIn("device error (signed, GREEN): cannot connect to 'R1'", out)
+        self.assertNotIn("GATE ERROR: ERROR", out)
 
     def test_shell_words_still_win_inside_a_device_context(self):
         out, reqs, sh = self._config_session(lambda r: heartbeat(), ["show node"])

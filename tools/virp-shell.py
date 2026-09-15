@@ -310,6 +310,105 @@ def parse_fleet_text(text):
     return count, rows, refused
 
 
+# ── IOS abbreviation expansion for device lines ────────────────────────
+# The gate's Cisco classifier is deliberately literal and fail-closed:
+# it vouches only for the canonical spellings in its table, so
+# "sh ip int br" is unmatched and falls through RED (a proposal) while
+# "show ip interface brief" is GREEN. The device would expand the
+# abbreviation itself, so the honest fix is to expand BEFORE sending —
+# then the classified bytes, the executed bytes and the chained bytes
+# are all the canonical form, and the operator is shown what was sent.
+# Only tokens in this curated map (or interface short names) change;
+# anything else is passed through untouched. Applied only to devices
+# whose fleet class is cisco_ios / cisco_iosxe.
+
+IOS_VENDORS = ("cisco_ios", "cisco_iosxe")
+
+IOS_WORDS = {
+    "show": ("sh", "sho"),
+    "interface": ("int", "inte", "inter", "interf", "interfa"),
+    "brief": ("br", "bri", "brie"),
+    "version": ("ver", "vers", "versi"),
+    "running-config": ("run", "runn", "running", "running-c", "running-conf"),
+    "startup-config": ("start", "startup", "startup-c", "startup-conf"),
+    "configure": ("conf", "confi", "config"),
+    "terminal": ("t", "term", "termi"),
+    "description": ("des", "desc", "descr", "descri"),
+    "route": ("ro", "rou", "rout"),
+    "neighbors": ("nei", "neig", "neigh", "neighb", "neighbor"),
+    "summary": ("sum", "summ", "summa"),
+    "detail": ("det", "deta", "detai"),
+    "clock": ("clo", "cloc"),
+    "inventory": ("inv", "inve", "invent"),
+    "environment": ("env", "envi", "environ"),
+    "processes": ("proc", "proce", "process"),
+    "memory": ("mem", "memo"),
+    "logging": ("log", "logg", "loggi"),
+    "users": ("us", "use"),
+    "access-lists": ("acc", "acce", "access", "access-l", "access-list"),
+    "spanning-tree": ("span", "spann", "spanning", "spanning-t"),
+    "address-table": ("add", "addr", "address", "address-t"),
+    "protocols": ("prot", "proto", "protoc"),
+    "switchport": ("sw", "swi", "switch", "switchp"),
+    "status": ("stat", "statu"),
+    "counters": ("coun", "count", "counter"),
+    "trunk": ("tr", "tru", "trun"),
+    "shutdown": ("shut", "shutd"),
+    "reload": ("rel", "relo", "reloa"),
+    "write": ("wr", "wri", "writ"),
+    "erase": ("era", "eras"),
+    "copy": ("cop",),
+    "ping": ("pi", "pin"),
+    "traceroute": ("tra", "trac", "trace", "tracer"),
+    "enable": ("en", "ena"),
+    "password": ("pass", "passw"),
+    "secret": ("sec", "secr"),
+    "vlan": ("vl", "vla"),
+    "hostname": ("host", "hostn"),
+    "translations": ("trans", "transl"),
+    "protocol": (),
+}
+IOS_ABBREV = {}
+for _canon, _abbrs in IOS_WORDS.items():
+    for _a in _abbrs:
+        IOS_ABBREV[_a] = _canon
+
+IOS_IFACES = [
+    (re.compile(r"^(?:gi|gig|g|gigabitethernet)(\d[\d/.]*)$", re.I), "GigabitEthernet"),
+    (re.compile(r"^(?:te|ten|tengigabitethernet)(\d[\d/.]*)$", re.I), "TenGigabitEthernet"),
+    (re.compile(r"^(?:twe|twentyfivegige)(\d[\d/.]*)$", re.I), "TwentyFiveGigE"),
+    (re.compile(r"^(?:hu|hundredgige)(\d[\d/.]*)$", re.I), "HundredGigE"),
+    (re.compile(r"^(?:fa|fast|f|fastethernet)(\d[\d/.]*)$", re.I), "FastEthernet"),
+    (re.compile(r"^(?:eth|e|ethernet)(\d[\d/.]*)$", re.I), "Ethernet"),
+    (re.compile(r"^(?:lo|loop|loopback)(\d+)$", re.I), "Loopback"),
+    (re.compile(r"^(?:po|port-channel)(\d+)$", re.I), "Port-channel"),
+    (re.compile(r"^(?:vl|vlan)(\d+)$", re.I), "Vlan"),
+    (re.compile(r"^(?:tu|tunnel)(\d+)$", re.I), "Tunnel"),
+]
+
+
+def expand_ios(line):
+    """Expand curated IOS abbreviations and interface short names to
+    their canonical spellings. Unknown tokens pass through unchanged.
+    Returns the (possibly identical) line."""
+    out = []
+    for tok in line.split():
+        low = tok.lower()
+        if low in IOS_ABBREV:
+            out.append(IOS_ABBREV[low])
+            continue
+        if low in IOS_WORDS:
+            out.append(low)
+            continue
+        for rx, canon in IOS_IFACES:
+            m = rx.match(tok)
+            if m:
+                tok = canon + m.group(1)
+                break
+        out.append(tok)
+    return " ".join(out)
+
+
 # ── the command tree + IOS-style abbreviation resolver ─────────────────
 # node: {word: (subtree-or-None, min_args, max_args)}; None max = any.
 
@@ -969,33 +1068,47 @@ class VirpShell(cmd.Cmd):
         self._set_prompt()
 
     def cmd_config_execute(self, line):
-        """(config-<device>)#: send one line to the device through the gate."""
+        """(config-<device>)#: send one line to the device through the gate.
+        IOS abbreviations are expanded first for cisco_ios/cisco_iosxe
+        devices (see expand_ios); the operator is told what was sent."""
+        sent = line
+        if self.device_vendor(self.device) in IOS_VENDORS:
+            sent = expand_ios(line)
         info = self._reply({"action": COMMAND_ACTIONS["config execute"],
-                            "device": self.device, "command": line})
+                            "device": self.device, "command": sent})
         text = info.get("text", "").rstrip("\n")
+        note = ["sent as: %s" % sent] if sent != line else []
         if info.get("obs_type_name") == "error":
             m = BLOCKED_RE.search(text)
             pid = PROPOSAL_RE.search(text)
             if m and pid:
                 tier = m.group(3)
-                self.proposals.append((time.time(), self.device, line, tier,
+                self.proposals.append((time.time(), self.device, sent, tier,
                                        pid.group(1)))
                 body = ["PROPOSED, not applied: '%s' on %s is %s; this seat's "
-                        "ceiling is %s" % (line, self.device, tier, m.group(4)),
+                        "ceiling is %s" % (sent, self.device, tier, m.group(4)),
                         "proposal_id %s" % pid.group(1),
                         "operator: virp-tool approve %s && virp-tool apply %s"
                         % (pid.group(1), pid.group(1))]
             elif m:
                 body = ["REFUSED: '%s' on %s is %s (ceiling %s); no proposal "
-                        "was filed" % (line, self.device, m.group(3), m.group(4))]
+                        "was filed" % (sent, self.device, m.group(3), m.group(4))]
             else:
-                body = ["GATE ERROR: " + text]
-            self._print_signed(info, body)
+                body = ["device error (signed, %s): %s"
+                        % (info["tier_name"], re.sub(r"^ERROR:\s*", "", text))]
+            self._print_signed(info, note + body)
             return False
-        self._print_signed(info, ["%s: '%s' executed (%s)"
-                                  % (self.device, line, info["tier_name"])]
+        self._print_signed(info, note + ["%s: '%s' executed (%s)"
+                                         % (self.device, sent, info["tier_name"])]
                            + text.splitlines())
         return False
+
+    def device_vendor(self, name):
+        """Fleet class of a device from the cached list_fleet, or None."""
+        for n, vendor, _ in (self.fleet_rows() or []):
+            if n == name:
+                return vendor
+        return None
 
     def cmd_exit(self, args):
         if self.mode == "config":
