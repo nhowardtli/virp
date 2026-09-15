@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import re
 from network import require_demo_vm
 
 STATE = Path('/var/lib/virp')
@@ -56,6 +57,12 @@ def main():
             # Persistent login rate limits and the VM-only key remain intact.
             for suffix in ('', '-wal', '-shm', '-journal'):
                 Path('/var/lib/virp-demo-console/console.db' + suffix).unlink(missing_ok=True)
+            for path in Path('/var/lib/virp-demo-console').glob('export-*'):
+                if re.fullmatch(r'export-[0-9a-f-]{36}', path.name):
+                    if path.is_symlink():
+                        path.unlink()
+                    elif path.is_dir():
+                        shutil.rmtree(path)
             print('RESTORE: pristine manifest verified; O-Node and console proposal state reset')
         subprocess.run(['systemctl', 'start', 'virp-onode'], check=True)
         if console:
