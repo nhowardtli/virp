@@ -77,6 +77,7 @@ typedef struct {
     char            artifact_content[8192]; /* Raw payload for artifact store */
     int64_t         from_sequence;
     int64_t         to_sequence;
+    int64_t         limit;                  /* list_sessions: rows wanted (0 = default) */
     /* Intent fields (durable intent store) */
     char            intent_id[128];
     char            intent_hash[65];
@@ -360,6 +361,7 @@ ONODE_ACTION_NAMES[] = {
     { "heartbeat",            ONODE_ACTION_HEARTBEAT },
     { "list_devices",         ONODE_ACTION_LIST },
     { "list_fleet",           ONODE_ACTION_LIST_FLEET },
+    { "list_sessions",        ONODE_ACTION_LIST_SESSIONS },
     { "sign_intent",          ONODE_ACTION_SIGN_INTENT },
     { "sign_outcome",         ONODE_ACTION_SIGN_OUTCOME },
     { "chain_append",         ONODE_ACTION_CHAIN_APPEND },
@@ -584,6 +586,15 @@ static bool parse_request(const char *json, onode_request_t *req)
                                      (uint64_t)INT64_MAX, &v))
             req->to_sequence = (int64_t)v;
         else if (cJSON_GetObjectItemCaseSensitive(root, "to_sequence")) {
+            cJSON_Delete(root);
+            return false;
+        }
+        /* list_sessions row cap: optional, non-negative, clamped in the
+         * chain library. Same present-but-invalid rule as the sequences. */
+        if (json_extract_u64_bounded(root, "limit",
+                                     (uint64_t)VIRP_CHAIN_LIST_SESSIONS_MAX, &v))
+            req->limit = (int64_t)v;
+        else if (cJSON_GetObjectItemCaseSensitive(root, "limit")) {
             cJSON_Delete(root);
             return false;
         }
@@ -4887,6 +4898,39 @@ static void handle_client(onode_state_t *state, int client_fd,
                                           state->node_id, onode_next_seq(state),
                                           VIRP_OBS_CHAIN_VERIFY, VIRP_SCOPE_LOCAL,
                                           (const uint8_t *)json_buf, (uint16_t)jlen,
+                                          &state->okey);
+            if (err == VIRP_OK && resp_len > 0) {
+                if (send_framed(client_fd, resp_buf, resp_len) == 0)
+                    onode_inc_observations(state);
+            } else {
+                send_framed_error(client_fd, err);
+            }
+        }
+        break;
+
+    case ONODE_ACTION_LIST_SESSIONS:
+        /* Read-only enumeration of chain sessions (2026-09-15), so a
+         * client that may not open chain.db — the operator shell at uid
+         * 988 — can discover what to chain_verify. Names, sequence range,
+         * entry count and last write time ONLY: no hashes, no bodies, no
+         * device output. Signed like every other reply. */
+        if (!state->chain_enabled) {
+            send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
+            break;
+        }
+        {
+            static _Thread_local char ls_buf[32768];
+            size_t ls_len = 0;
+            err = virp_chain_list_sessions(&state->chain, (int)req.limit,
+                                           ls_buf, sizeof(ls_buf), &ls_len);
+            if (err != VIRP_OK) {
+                send_framed_error(client_fd, err);
+                break;
+            }
+            err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
+                                          state->node_id, onode_next_seq(state),
+                                          VIRP_OBS_RESOURCE_STATE, VIRP_SCOPE_LOCAL,
+                                          (const uint8_t *)ls_buf, (uint16_t)ls_len,
                                           &state->okey);
             if (err == VIRP_OK && resp_len > 0) {
                 if (send_framed(client_fd, resp_buf, resp_len) == 0)
