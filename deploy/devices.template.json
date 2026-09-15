@@ -181,6 +181,15 @@
   "node_id": "0A000A01"
 },
     {
+      "hostname": "virp-node2-peer",
+      "node_id": "0A000AD4",
+      "host": "10.0.10.212",
+      "vendor": "linux",
+      "username": "${PEER_USER}",
+      "password": "${PEER_PASS}",
+      "port": 22
+    },
+    {
       "hostname": "clab-frr-ospf-frr1",
       "node_id": "AC141405",
       "host": "172.20.20.5",
