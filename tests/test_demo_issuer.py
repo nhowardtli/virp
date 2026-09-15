@@ -29,7 +29,7 @@ class Tests(unittest.TestCase):
   self.assertEqual(before,self.p.read_bytes());self.assertEqual(self.events[-1]['event'],'refusal')
  def test_prune(self):
   self.issuer.issue(self.request());self.assertEqual(self.issuer.prune(),0);self.now+=86460
-  self.assertEqual(self.issuer.prune(),1);self.assertEqual(self.p.read_text(),'');self.assertEqual(self.events[-1]['event'],'expiry-prune')
+  self.assertEqual(self.issuer.prune(),1);self.assertEqual(self.p.read_text(),'');self.assertEqual(self.events[-1]['event'],'expiry-prune');self.assertEqual(self.events[-1]['email_sha256'],hashlib.sha256(b'fixture@example.invalid').hexdigest())
  def test_gate_failure_cannot_issue_or_prune(self):
   def fail(e):raise RuntimeError('fixture gate refusal')
   issuer=m.Issuer(self.p,fail,lambda:self.now)

@@ -35,7 +35,7 @@ def key_info(value):
             if check.returncode:raise ValueError("invalid curve point")
         if pos!=len(raw):raise ValueError('trailing key bytes')
     except (ValueError,UnicodeError,struct.error) as e:raise ValueError('malformed public key') from e
-    return parts[0]+' '+parts[1], 'SHA256:'+base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip('=')
+    return parts[0]+' '+base64.b64encode(raw).decode(), 'SHA256:'+base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip('=')
 
 def signed_request(raw,signature,secret,now):
     if not isinstance(signature,str) or not hmac.compare_digest(hmac.new(secret,raw,hashlib.sha256).hexdigest(),signature):
@@ -47,7 +47,6 @@ def signed_request(raw,signature,secret,now):
     return d
 
 def gate_event(event):
-    spec=importlib.util.spec_from_file_location('issuer_gate','/usr/local/lib/virp/virp-shell')
     # Installed shell has no .py suffix.
     from importlib.machinery import SourceFileLoader
     m=SourceFileLoader('issuer_gate','/usr/local/lib/virp/virp-shell').load_module()
@@ -61,7 +60,7 @@ def gate_event(event):
 class Issuer:
     def __init__(self,path=KEYS,evidence=gate_event,clock=time.time):self.path=Path(path);self.evidence=evidence;self.clock=clock
     def event(self,event,seat='',fp='',email='',expiry='',**detail):
-        return self.evidence(dict(schema='virp-demo-signup/1',event=event,seat_id=seat,key_fingerprint=fp,email_sha256=hashlib.sha256(email.encode()).hexdigest() if email else '',expires_at=expiry,**detail))
+        return self.evidence(dict(schema='virp-demo-signup/1',event=event,seat_id=seat,key_fingerprint=fp,email_sha256=hashlib.sha256(email.encode()).hexdigest() if email else seat[:64] if len(seat)==96 else '',expires_at=expiry,**detail))
     def prune(self):
         now=datetime.datetime.fromtimestamp(self.clock(),datetime.timezone.utc).strftime('%Y%m%d%H%M')
         with self.path.open('r+') as f:
@@ -77,7 +76,7 @@ class Issuer:
             if removed:f.seek(0);f.write(''.join(keep));f.truncate();f.flush();os.fsync(f.fileno())
             return len(removed)
     def issue(self,d):
-        seat=uuid.uuid4().hex;fp='';email=d.get('email','')
+        email=d.get('email','');seat=hashlib.sha256(email.encode()).hexdigest()+uuid.uuid4().hex;fp=''
         try:
             key,fp=key_info(d['pubkey'])
             now=int(self.clock());expires=datetime.datetime.fromtimestamp(now+86400,datetime.timezone.utc)
@@ -95,7 +94,7 @@ class Issuer:
                 f.seek(0,2)
                 f.write(('\n' if original and not original.endswith('\n') else '')+'restrict,pty,expiry-time="'+expiry+'",command="/usr/local/bin/virp-shell" '+key+' demo:'+seat+'\n')
                 f.flush();os.fsync(f.fileno())
-            return dict(seat_id=seat,expires_at=expires.isoformat(),host='216.234.102.178',ssh_command='ssh -tt -i ./virp-demo-key virp-demo@216.234.102.178',docket_url='/demo/session/'+seat,receipt=receipt)
+            return dict(seat_id=seat,expires_at=datetime.datetime.strptime(expiry,'%Y%m%d%H%M').replace(tzinfo=datetime.timezone.utc).isoformat(),host='216.234.102.178',ssh_command='ssh -tt -i ./virp-demo-key virp-demo@216.234.102.178',docket_url='/demo/session/'+seat,receipt=receipt)
         except ValueError as e:
             self.event('refusal',seat,fp,email,reason=str(e));raise
 
