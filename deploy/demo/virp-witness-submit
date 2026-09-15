@@ -216,6 +216,9 @@ def receipt_gap(receipt_path, head_path, session_id, sequence, head_hash):
 
 
 def main():
+    if os.path.exists("/var/lib/virp/witness/STOP-403"):
+        print("STOP: demo witness registry returned403; Nate must resolve it before resuming", file=sys.stderr)
+        return 1
     if not os.path.exists(CHAIN_DB):
         print("virp-witness-submit: no chain at %s" % CHAIN_DB, file=sys.stderr)
         return 1
@@ -225,7 +228,7 @@ def main():
     rows = list(
         conn.execute(
             "SELECT session_id, last_sequence, last_entry_hash "
-            "FROM chain_heads WHERE session_id LIKE 'demo-%' ORDER BY updated_at_ns DESC"
+            "FROM chain_heads WHERE session_id LIKE 'demo-%' AND head_sig_key_id='0572220fff65745d5f4685431ad063f5' AND head_sig IS NOT NULL ORDER BY updated_at_ns DESC"
         )
     )
     conn.close()
@@ -281,6 +284,11 @@ def main():
             text=True,
         )
         if result.returncode == 0:
+            gap = receipt_gap(receipt_path, head_path, session_id, last_sequence, head_hash)
+            if gap is not None:
+                print("STOP: newly submitted receipt did not verify: " + gap, file=sys.stderr)
+                failed += 1
+                break
             submitted += 1
             leaf = ""
             for line in result.stdout.splitlines():
@@ -288,6 +296,8 @@ def main():
                     leaf += line.split()[-1] + " "
             print("virp-witness-submit: %s seq %d -> leaf/tree %s" % (session_id, last_sequence, leaf.strip()))
         else:
+            if re.search(r"\b403\b", result.stderr + result.stdout):
+                write_head("/var/lib/virp/witness/STOP-403", "Registry refused403; operator intervention required\n")
             failed += 1
             print(
                 "virp-witness-submit: FAILED %s seq %d: %s"
