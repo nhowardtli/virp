@@ -136,8 +136,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (ValueError,KeyError):
             if self.path=='/bundle':
                 try:self.server.issuer.event('refusal',reason='bundle request refused')
-                except Exception:pass
-            result={'error':'Request refused; check the key or try later.'};code=400
+                except Exception:
+                    result={'error':'Evidence unavailable; request refused.'};code=503
+                else:result={'error':'Request refused; check the key or try later.'};code=400
+            else:result={'error':'Request refused; check the key or try later.'};code=400
         except Exception:result={'error':'Evidence unavailable; no seat confirmed.'};code=503
         data=json.dumps(result).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 

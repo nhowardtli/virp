@@ -1,5 +1,11 @@
-......
+test_duplicate_and_cap (test_demo_issuer.Tests.test_duplicate_and_cap) ... ok
+test_gate_failure_cannot_issue_or_prune (test_demo_issuer.Tests.test_gate_failure_cannot_issue_or_prune) ... ok
+test_hmac_and_timestamp (test_demo_issuer.Tests.test_hmac_and_timestamp) ... ok
+test_issue_expiry_and_no_pii (test_demo_issuer.Tests.test_issue_expiry_and_no_pii) ... ok
+test_key_validation (test_demo_issuer.Tests.test_key_validation) ... ok
+test_prune (test_demo_issuer.Tests.test_prune) ... ok
+
 ----------------------------------------------------------------------
-Ran 6 tests in 0.020s
+Ran 6 tests in 0.035s
 
 OK
