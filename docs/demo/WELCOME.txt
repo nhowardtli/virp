@@ -1,23 +1,26 @@
-DEMO LAB — nothing here is real
+THE PRACTICE NETWORK — it resets every night
 
-You are using fake FRR routers and two in-process Cisco-like mock targets.
-Reads execute through the gate. This seat cannot approve or apply changes.
-The node signs observations; this shell cannot verify HMACs without its key.
-State resets daily at 04:00 in the VM's configured timezone.
-
-Type these commands, one per line. Replace <yourname> with your name:
+1. Try to break it.
+A look answers. A change stops and asks a person. reload is refused.
+Type these commands one line at a time:
 
 show devices
-show device frr1
 enable
 configure terminal
 device frr1
 show ip route
-interface eth1 description hello-from-<yourname>
+interface eth1 description hello-from-visitor
+reload
 end
-show proposals
 show chain 5
 
-Expected: show ip route executes as GREEN. The description becomes a
-PROPOSED change, not an applied configuration. Do not paste these explanatory
-paragraphs into the prompt. Type exit to leave.
+2. Here is your receipt.
+Use the page where you got your login for today. Choose "Get your receipt".
+The log code starts with demo-. The notary stamp can take a few minutes.
+Your receipt shows what you typed, what the switch said, when, and who said yes.
+
+3. Change one letter.
+Edit receipt.html, then choose "Check my receipt" on that page.
+Untouched shows green. Changed shows red.
+
+The commands above stay in the switch's own language.

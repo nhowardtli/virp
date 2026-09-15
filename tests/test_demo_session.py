@@ -1,4 +1,5 @@
 """Demo login correlation uses the real wire encoder and fake UNIX gate."""
+import base64
 import hashlib
 import io
 import json
@@ -28,14 +29,36 @@ class DemoSession(unittest.TestCase):
                 req = {'action': 'execute', 'device': 'frr1', 'command': 'show ip route'}
                 first._reply(req)
                 self.assertEqual([r['action'] for r in gate.requests],
-                                 ['chain_append', 'execute', 'chain_append'])
+                                 ['chain_append', 'execute', 'chain_append', 'chain_append'])
                 before = json.loads(gate.requests[0]['artifact_content'])
                 after = json.loads(gate.requests[2]['artifact_content'])
                 self.assertEqual(before['session_id'], first.demo_session)
-                self.assertEqual(before['detail'], req)
+                self.assertEqual(before['detail'], dict(req, typed='show ip route'))
+                part = json.loads(gate.requests[3]['artifact_content'])
+                self.assertEqual(part['event'], 'reply_part')
+                self.assertEqual(base64.b64decode(part['detail']['data']), observation(7, 'O 192.0.2.0/24 via 192.0.2.1'))
                 self.assertEqual(after['event'], 'reply')
                 self.assertEqual(after['detail']['observation_sha256'],
                                  hashlib.sha256(observation(7, 'O 192.0.2.0/24 via 192.0.2.1')).hexdigest())
+            finally:
+                gate.close()
+
+    def test_large_reply_is_preserved_in_bounded_parts(self):
+        raw = observation(7, 'route ' * 2000)
+        def answer(req):
+            return self.answer(req) if req['action'] == 'chain_append' else raw
+        with patch.dict(os.environ, {'VIRP_SHELL_DEMO_SESSION': '1'}):
+            gate = FakeGate(answer)
+            try:
+                sh = vs.VirpShell(sock_path=gate.path, stdout=io.StringIO())
+                sh._reply({'action':'execute','device':'frr1','command':'show ip route'})
+                records = [json.loads(r['artifact_content']) for r in gate.requests if r['action']=='chain_append']
+                parts = [r['detail'] for r in records if r['event']=='reply_part']
+                self.assertGreater(len(parts), 1)
+                self.assertEqual(b''.join(base64.b64decode(p['data']) for p in parts), raw)
+                self.assertEqual([p['index'] for p in parts], list(range(len(parts))))
+                self.assertTrue(all(p['count']==len(parts) for p in parts))
+                self.assertTrue(all(len(r['artifact_content'].encode()) < 8191 for r in gate.requests if r['action']=='chain_append'))
             finally:
                 gate.close()
 

@@ -101,7 +101,7 @@ class Issuer:
                     if not m or m[1]>datetime.datetime.fromtimestamp(now,datetime.timezone.utc).strftime('%Y%m%d%H%M'):live+=1
                 if live>=50:raise ValueError('demo has 50 live seats')
                 # Durable authorization precedes granting SSH access; it does not assert login.
-                receipt=self.event('issue',seat,fp,email,expiry,phase='authorized')
+                receipt=self.event('issue',seat,fp,email,expiry,phase='authorized',visitor_name=d.get('name','Visitor'))
                 f.seek(0,2)
                 f.write(('\n' if original and not original.endswith('\n') else '')+'restrict,pty,expiry-time="'+expiry+'",command="/usr/local/bin/virp-shell" '+key+' demo:'+seat+'\n')
                 f.flush();os.fsync(f.fileno())

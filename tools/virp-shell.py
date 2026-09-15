@@ -981,10 +981,10 @@ class VirpShell(cmd.Cmd):
                 readline.redisplay()
 
     # -- gate-backed commands ---------------------------------------------
-    def _reply(self, request):
+    def _reply(self, request, typed=None):
         record = self.demo_session and request.get("action") in ("execute", "health")
         if record:
-            self._demo_record("request", request)
+            self._demo_record("request", dict(request, typed=typed or request.get("command") or ("show device " + request["device"] if request.get("device") else "show devices")))
         raw = gate(request, self.sock_path)
         info = decode_reply(raw)
         if record:
@@ -995,7 +995,17 @@ class VirpShell(cmd.Cmd):
                     "proposal_ids": PROPOSAL_RE.findall(info.get("text", "")),
                     "reply_kind": info.get("kind"),
                     "observation_type": info.get("obs_type_name"),
+                    "reply_tier": info.get("tier_name"),
                 })
+                # Preserve original reply bytes in bounded, protected artifacts.
+                import base64
+                chunks = [raw[i:i+3072] for i in range(0, len(raw), 3072)]
+                for index, chunk in enumerate(chunks):
+                    self._demo_record("reply_part", {
+                        "observation_sha256": hashlib.sha256(raw).hexdigest(),
+                        "index": index, "count": len(chunks),
+                        "data": base64.b64encode(chunk).decode("ascii"),
+                    })
             except GateError as exc:
                 info["demo_record_warning"] = (
                     "device request returned, but demo receipt failed; "
@@ -1351,7 +1361,7 @@ class VirpShell(cmd.Cmd):
         if self.device_vendor(self.device) in IOS_VENDORS:
             sent = expand_ios(base)
         info = self._reply({"action": COMMAND_ACTIONS["config execute"],
-                            "device": self.device, "command": sent})
+                            "device": self.device, "command": sent}, typed=line)
         text = info.get("text", "").rstrip("\n")
         note = ["sent as: %s" % sent] if sent != base else []
         if info.get("obs_type_name") == "error":
