@@ -1,0 +1,18 @@
+........../home/nhoward/virp-demo-phase-c/tests/test_virp_shell.py:575: ResourceWarning: unclosed file <_io.TextIOWrapper name='/home/nhoward/virp-demo-phase-c/src/drivers/driver_cisco.c' mode='r' encoding='UTF-8'>
+  src = open(os.path.join(ROOT, "src", "drivers", "driver_cisco.c")).read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+........% refusing to run as root; use the virp-shell wrapper (uid 988)
+................................./home/nhoward/virp-demo-phase-c/tests/test_template_uid_policy.py:65: ResourceWarning: unclosed file <_io.TextIOWrapper name='/home/nhoward/virp-demo-phase-c/src/virp_onode.c' mode='r' encoding='UTF-8'>
+  src = open(os.path.join(ROOT, "src", "virp_onode.c")).read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+..../home/nhoward/virp-demo-phase-c/tests/test_virp_shell.py:188: ResourceWarning: unclosed file <_io.TextIOWrapper name='/home/nhoward/virp-demo-phase-c/deploy/virp-shell.wrapper' mode='r' encoding='UTF-8'>
+  wrapper = open(os.path.join(ROOT, "deploy", "virp-shell.wrapper")).read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/nhoward/virp-demo-phase-c/tests/test_virp_shell.py:189: ResourceWarning: unclosed file <_io.TextIOWrapper name='/home/nhoward/virp-demo-phase-c/deploy/sudoers-virp-shell' mode='r' encoding='UTF-8'>
+  sudoers = open(os.path.join(ROOT, "deploy", "sudoers-virp-shell")).read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.
+----------------------------------------------------------------------
+Ran 56 tests in 0.228s
+
+OK

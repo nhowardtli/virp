@@ -102,17 +102,42 @@ class Issuer:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self,*args):pass  # Never log visitor PII, signatures or request bodies.
+    def bundle(self, raw):
+        import http.client
+        signature=self.headers.get('X-VIRP-Signature','')
+        if not hmac.compare_digest(hmac.new(SECRET.read_bytes(),raw,hashlib.sha256).hexdigest(),signature):raise ValueError('invalid request signature')
+        d=json.loads(raw)
+        if set(d)!={'seat','session','ts'} or type(d['ts']) is not int or abs(time.time()-d['ts'])>120:raise ValueError('expired request')
+        if not re.fullmatch(r'[a-f0-9]{96}',d['seat']) or not re.fullmatch(r'demo-[a-f0-9]{32}',d['session']):raise ValueError('invalid session')
+        now=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M')
+        with KEYS.open() as f:
+            fcntl.flock(f,fcntl.LOCK_SH)
+            lines=f.readlines()
+        if not any(line.rstrip().endswith(' demo:'+d['seat']) and (match:=re.search(r'expiry-time="(\d{12})"',line)) and match[1]>now for line in lines):raise ValueError('seat expired or absent')
+        conn=http.client.HTTPConnection('127.0.0.1',8096,timeout=35)
+        try:
+            conn.request('POST','/api/visitor/docket',json.dumps({'seat':d['seat'],'session':d['session']}),{'Content-Type':'application/json'})
+            response=conn.getresponse();data=response.read(32*1024*1024+1)
+            if len(data)>32*1024*1024:raise ValueError('bundle exceeds budget')
+            self.send_response(response.status);self.send_header('Cache-Control','no-store');self.send_header('Content-Type','application/x-tar' if response.status==200 else 'application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+        finally:conn.close()
     def do_POST(self):
         try:
-            if self.path!='/issue':raise ValueError('unknown route')
+            if self.path not in ('/issue','/bundle'):raise ValueError('unknown route')
             n=int(self.headers.get('Content-Length','0'))
             if n<1 or n>4096:raise ValueError('request size')
             raw=self.rfile.read(n)
+            if self.path=="/bundle":
+                self.bundle(raw);return
             try:d=signed_request(raw,self.headers.get('X-VIRP-Signature',''),SECRET.read_bytes(),int(time.time()))
             except (ValueError,TypeError) as e:
                 self.server.issuer.event('refusal',reason=str(e));raise ValueError('invalid request')
             result=self.server.issuer.issue(d);code=201
-        except (ValueError,KeyError):result={'error':'Request refused; check the key or try later.'};code=400
+        except (ValueError,KeyError):
+            if self.path=='/bundle':
+                try:self.server.issuer.event('refusal',reason='bundle request refused')
+                except Exception:pass
+            result={'error':'Request refused; check the key or try later.'};code=400
         except Exception:result={'error':'Evidence unavailable; no seat confirmed.'};code=503
         data=json.dumps(result).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 

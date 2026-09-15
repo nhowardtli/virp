@@ -1436,12 +1436,17 @@ def main(argv=None):
     sock_path = None
     once = None
     privileged = False
+    signup_seat = None
     while argv:
         a = argv.pop(0)
         if a == "--socket" and argv:
             sock_path = argv.pop(0)
         elif a == "-c" and argv:
             once = argv.pop(0)
+        elif a == "--demo-seat" and argv:
+            signup_seat = argv.pop(0)
+            if os.geteuid() != SHELL_UID or not re.fullmatch(r"[a-f0-9]{96}", signup_seat) or os.environ.get("VIRP_SHELL_DEMO_SESSION") != "1":
+                return 2
         elif a == "--privileged":
             privileged = True
         else:
@@ -1462,7 +1467,7 @@ def main(argv=None):
         return 0
     if sh.demo_session:
         try:
-            sh._demo_record("login", {})
+            sh._demo_record("login", {"signup_seat_id": signup_seat} if signup_seat else {})
         except GateError as exc:
             sys.stderr.write("%% demo session could not start: %s\n" % exc)
             return 2
