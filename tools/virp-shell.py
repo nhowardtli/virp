@@ -656,7 +656,12 @@ class VirpShell(cmd.Cmd):
             partial = tokens.pop()
         words = completions(tokens, partial)
         if not words:
-            self.out("% Invalid input")
+            if self.mode == "config" and self.device:
+                self.out("% no device-side help through the gate: the line is "
+                         "sent to %s exactly as typed (full command per line)"
+                         % self.device)
+            else:
+                self.out("% Invalid input")
             return
         if "<name>" in words:
             # A device argument: list the fleet (through the gate) instead
@@ -823,7 +828,11 @@ class VirpShell(cmd.Cmd):
             ("from_sequence", res.get("from_sequence", "?")),
             ("to_sequence", res.get("to_sequence", "?")),
         ]
-        self._print_signed(info, [table(rows, ("field", "value"))])
+        body = [table(rows, ("field", "value"))]
+        if not res.get("entries_checked"):
+            body.append("(no entries under this session id — check the id; "
+                        "valid=NO here means nothing was checked)")
+        self._print_signed(info, body)
 
     # -- local read-only commands -----------------------------------------
     def cmd_show_services(self, args):
@@ -947,6 +956,8 @@ class VirpShell(cmd.Cmd):
                  "device through the gate as uid %d (GREEN ceiling)." % SHELL_UID)
         self.out("Changes are NOT applied here: YELLOW/RED file a signed "
                  "proposal for an operator to approve; BLACK is refused.")
+        self.out("Each line is sent on its own (no interface sub-mode): write "
+                 "full commands, e.g.  interface Gi1/0/48 description uplink")
 
     def cmd_device(self, args):
         if self.mode != "config":
