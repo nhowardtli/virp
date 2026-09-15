@@ -985,6 +985,15 @@ class VirpShell(cmd.Cmd):
         record = self.demo_session and request.get("action") in ("execute", "health")
         if record:
             self._demo_record("request", dict(request, typed=typed or request.get("command") or ("show device " + request["device"] if request.get("device") else "show devices")))
+        if record and request.get("action") == "execute" and request.get("command", "").strip().lower().split()[:1] == ["reload"]:
+            # Visitor-only denial, recorded as a local policy decision, not a
+            # fabricated device reply or daemon classification. No execute call.
+            self._demo_record("reply", {
+                "request": request, "reply_kind": "local_refusal",
+                "demo_refusal": True, "proposal_ids": [],
+                "reason": "reload is never available in the practice network",
+            })
+            raise GateError("reload is refused on the practice network; request not sent")
         raw = gate(request, self.sock_path)
         info = decode_reply(raw)
         if record:
@@ -1020,7 +1029,8 @@ class VirpShell(cmd.Cmd):
 
         The daemon owns signing and admission. These evidence_item bodies
         name the visitor session and correlate a reply by digest; they are
-        not copies of the full observation, nor daemon execution outcomes.
+        not daemon execution outcomes. reply_part records preserve original
+        binary bytes; local_refusal records are labelled shell policy decisions.
         """
         body = json.dumps({"schema": "virp-demo-session/1", "event": event,
                            "session_id": self.demo_session, "detail": detail},

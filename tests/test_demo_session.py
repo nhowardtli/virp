@@ -62,6 +62,24 @@ class DemoSession(unittest.TestCase):
             finally:
                 gate.close()
 
+    def test_demo_reload_is_recorded_and_never_submitted(self):
+        with patch.dict(os.environ, {'VIRP_SHELL_DEMO_SESSION':'1'}):
+            gate=FakeGate(self.answer)
+            try:
+                sh=vs.VirpShell(sock_path=gate.path,stdout=io.StringIO())
+                with self.assertRaisesRegex(vs.GateError,'reload is refused'):
+                    sh._reply({'action':'execute','device':'frr1','command':'reload'})
+                self.assertEqual([r['action'] for r in gate.requests],['chain_append','chain_append'])
+                reply=json.loads(gate.requests[-1]['artifact_content'])['detail']
+                self.assertTrue(reply['demo_refusal'])
+                self.assertEqual(reply['reply_kind'],'local_refusal')
+                self.assertNotIn('reply_tier',reply)
+                self.assertEqual(reply['proposal_ids'],[])
+            finally:gate.close()
+        with patch.dict(os.environ,{},clear=True), patch.object(vs,'gate',return_value=observation(7,'answer')) as call:
+            vs.VirpShell(stdout=io.StringIO())._reply({'action':'execute','device':'frr1','command':'reload'})
+            call.assert_called_once()
+
     def test_refused_record_prevents_device_request(self):
         with patch.dict(os.environ, {'VIRP_SHELL_DEMO_SESSION': '1'}):
             gate = FakeGate(lambda req: error_frame(-50))
