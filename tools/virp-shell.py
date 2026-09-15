@@ -1187,6 +1187,10 @@ class VirpShell(cmd.Cmd):
             return False
         lines = text.splitlines()
         if filt:
+            # The device echoes the command as its first line ("SW-3850#show
+            # clock"); it is not output, so it is neither filtered nor counted.
+            if lines and lines[0].rstrip().endswith(sent) and "#" in lines[0]:
+                lines = lines[1:]
             kept = apply_output_filter(lines, filt)
             note.append("filtered locally: | %s %s (%d of %d lines shown; the "
                         "chained observation is the full output)"

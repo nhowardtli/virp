@@ -576,7 +576,7 @@ class TestCommands(unittest.TestCase):
                          ["Number of lines which match regexp = 2"])
 
         out, reqs, _ = self._config_session(
-            lambda r: observation(0x07, "Vlan1 down\nVlan10 up\nGi1/0/1 up\n"),
+            lambda r: observation(0x07, "R1#show ip interface brief\nVlan1 down\nVlan10 up\nGi1/0/1 up\n"),
             ["show ip interface brief | include Vlan"])
         self.assertEqual(reqs[0]["command"], "show ip interface brief")   # pipe never sent
         self.assertIn("filtered locally: | include Vlan (2 of 3 lines shown", out)
