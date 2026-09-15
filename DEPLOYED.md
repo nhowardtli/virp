@@ -2,7 +2,7 @@
 
 - **Role**: production reference instance
 
-## Current live state (verified 2026-09-15 11:05 UTC)
+## Current live state (verified 2026-09-15 11:50 UTC)
 
 **This block is authoritative for what is running right now.** Everything below
 it is a chronological, append-only log: each section describes the state at the
@@ -16,24 +16,26 @@ boot log. The previous block (2026-09-08, `ea997943`) had drifted: three
 deploys happened on 2026-09-15 without it being rewritten, which `virp-shell
 show version` exposed. That drift is what this rewrite closes.
 
-- **Commit**: `4916aa809558c89e69b15a8178390995b4bba6d1` (short `4916aa8`)
-  — the same commit as `main` (fast-forwarded 2026-09-15; the checkout at
-  `/opt/virp` still names the branch `feat/onode-list-sessions`, byte-identical
-  to `main`). Supersedes `ea997943` (2026-09-08).
+- **Commit**: `335b45da` on branch `fix/cisco-description-yellow` = `main`
+  (`9054b8c`) + one commit: the Cisco `interface <name> description <text>`
+  YELLOW typed op (docs/notes/cisco-description-yellow-2026-09-15.md). The
+  daemon and virp-tool were built from `33aadc9c`, whose C sources are
+  byte-identical to `335b45da` (the rebase carried shell/doc commits only).
+  Supersedes `4916aa8` (earlier the same day) and `ea997943` (2026-09-08).
 - **Deploys on 2026-09-15 (all config-only restarts except the first):**
   00:52Z template row for uid 988 `virp-shell`; 00:55Z R1–R35 re-addressed to
   10.0.50.5x (reconciled to what the box already ran); **03:13Z `make
   install-prod` from `cef8ace3` — daemon + virp-tool rebuilt for the
-  `list_sessions` action**; 10:51Z template row for uid 985 `virp-shell-admin`.
-  Last daemon start: 2026-09-15 10:51:15 UTC.
+  `list_sessions` action**; 10:51Z template row for uid 985 `virp-shell-admin`; **11:38Z `make
+  install-prod` from `33aadc9c` — description typed op**.
+  Last daemon start: 2026-09-15 11:38:22 UTC.
 - **Daemon**: `/usr/local/lib/virp/virp-onode-prod`, unit `virp-onode.service`,
   socket `/run/virp/onode.sock`, chain `/var/lib/virp/chain.db`
   — binary sha256
-  `020188758400781e5b89a2710dbe4e37c84900ed49661b1500309e2157fdd1c9`
+  `0fd7e3042ec2dda976de0e671241a46522b41bc79fb983bfe8b835e62fdacefe`
 - **Client**: `/usr/local/lib/virp/virp-tool` (+ `virp` alias), sha256
-  `1bbf46b6bbbfe1c2cab1f4166937fc3415f7a29fab38489f32c6f089612795e8`,
-  reports `virp-tool cef8ace3` (the build-time hash; the tree has advanced
-  by shell/doc commits only since, no daemon source change).
+  `cfd46504e30b2afebf088a060742e1a891342ea2a346dbf97d462608a3b3b1c2`,
+  reports `virp-tool 33aadc9c`.
 - **Helper scripts** (`/usr/local/lib/virp/`): render-devices.sh
   `f10a443a…`, config-backup-access.sh `358aa3aa…`, evidence-access.sh
   `bcf29979…`, netclaw-access.sh `a3699988…`, sean-access.sh `1dc60c07…`.
