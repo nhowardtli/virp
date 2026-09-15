@@ -85,10 +85,44 @@ The expected verdict is FAILED and a nonzero exit status. Editing only unsigned
 README/report metadata is a different test; the verifier identifies those files
 as uncovered rather than claiming they are signed.
 
+## Witnessed first-submission proof (B3)
+
+On 2026-09-15, the complete one-entry visitor login session
+`demo-9dc771c4060d43b791d58bd8e2d43047` was exported with its real witness receipt:
+leaf index0, tree size1. This session contains no device command or proposal.
+The artifact is `b3/visitor-witnessed.tar` in Nate's Phase A/B audit directory.
+The console download described above still exports un-witnessed sessions.
+
+Save the independently supplied demo witness public key as `witness-demo.hex`:
+
+```text
+b7c71bde39f35896a0ebe7f5458d21da901103563e2d7adf0bfc913465f67fe2
+```
+
+With both public pin files obtained independently, verify the extracted bundle:
+
+```sh
+virp-verify --pin demo-chain.hex --witness-key witness-demo.hex --require-witness ./bundle
+virp-verify --json --pin demo-chain.hex --witness-key witness-demo.hex --require-witness ./bundle > checked-report.json
+```
+
+Observed: `CRYPTOGRAPHICALLY-VERIFIED — native witness delivery verified (1/1 verified; metadata missing)`, exit0.
+Artifact tamper yields FAILED/exit1. Witness-signature tamper is rejected by
+`--require-witness` with exit7; the unchanged chain's integrity remains separate.
+
+The C export retains its original signed bytes and HMAC fields. It is not the
+Rust native-chain profile. `delivery.json` carries the actual submission and
+receipt, including its signed tree head and inclusion proof. There is no
+`native-export.json`: that filename asserts a different producer profile in the
+current verifier. Scope is described separately in unsigned README/metadata.
+The missing native metadata is explicit in the report and is not a crypto pass.
+No signature was reconstructed or reissued to manufacture prefix coverage.
+
 ## Remaining Phase B acceptance
 
-Nate must provision the separate witness demo submitter/producer registration,
-heads path and public witness key. STOP before witness configuration.
-Witness-backed delivery and independent Claude verification of this B4 commit
-remain open. Claude independently verified B1/B2 at C9b6595a / Rustdee60a3;
-CLAUDE-VERIFY-B-9b6595a.md in the audit directory records that separate run.
+The demo witness is live and VM219's restricted tunnel and submission timer are
+enabled. Claude independently verified un-witnessed B4 (CLAUDE-VERIFY-B4-89cceb9.md).
+The B3 checks above were builder-run; independent Claude reproduction remains open.
+Capturing every historical signed prefix of longer sessions and adding that
+coverage to the console download remain open. Current-head receipts alone do
+not establish complete delivery for a multi-entry session.
