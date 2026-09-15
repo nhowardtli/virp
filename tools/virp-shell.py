@@ -389,7 +389,6 @@ IOS_IFACES = [
     (re.compile(r"^(?:twe|twentyfivegige)(\d[\d/.]*)$", re.I), "TwentyFiveGigE"),
     (re.compile(r"^(?:hu|hundredgige)(\d[\d/.]*)$", re.I), "HundredGigE"),
     (re.compile(r"^(?:fa|fast|f|fastethernet)(\d[\d/.]*)$", re.I), "FastEthernet"),
-    (re.compile(r"^(?:eth|e|ethernet)(\d[\d/.]*)$", re.I), "Ethernet"),
     (re.compile(r"^(?:lo|loop|loopback)(\d+)$", re.I), "Loopback"),
     (re.compile(r"^(?:po|port-channel)(\d+)$", re.I), "Port-channel"),
     (re.compile(r"^(?:vl|vlan)(\d+)$", re.I), "Vlan"),
