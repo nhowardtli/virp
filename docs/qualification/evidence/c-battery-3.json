@@ -1,0 +1,19 @@
+{
+  "command": [
+    "scripts/isolated",
+    "make",
+    "CISCO=1",
+    "FORTIGATE=1",
+    "PANOS=1",
+    "ASA=1",
+    "LINUX=1",
+    "WAZUH=1",
+    "JUNIPER=1",
+    "LIBRENMS=1",
+    "PBS=1",
+    "ZAMMAD=1",
+    "all-tests"
+  ],
+  "exit": 2,
+  "wall_time": 126.09076070785522
+}

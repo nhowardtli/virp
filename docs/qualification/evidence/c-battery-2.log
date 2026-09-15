@@ -1,0 +1,202 @@
+=== checking deploy/virp-onode.service for chain flags ===
+  PASS: chain flags present in deploy/virp-onode.service
+=== checking no unit executes a path inside a source worktree ===
+  PASS: every Exec* path is an installed artifact
+=== checking no unit rebuilds anything at start ===
+  PASS: no unit rebuilds from source at start
+=== checking ExecStart matches the documented install path ===
+  PASS: ExecStart=/usr/local/lib/virp/virp-onode-prod
+=== checking canonical unit does not disable Wazuh TLS ===
+  PASS: no VIRP_WAZUH_INSECURE in canonical virp-onode.service
+=== checking no drop-in disables Wazuh TLS (except the lab drop-in) ===
+  PASS: no drop-in in deploy disables Wazuh TLS outside 'virp-onode-wazuh-lab.dropin.conf'
+=== self-testing the unit drift checker ===
+  selftest 1/5 PASS: clean fixture reports clean
+  selftest 2/5 PASS: one added line is detected
+  selftest 3/5 PASS: non-unit file drift is detected
+  selftest 4/5 PASS: an untracked unit is detected
+  selftest 5/5 PASS: an untracked drop-in in any virp unit's .d is detected
+=== checking installed units match tracked units ===
+    tracked:   /home/nhoward/virp-node2-epoch-qualification
+    installed: /etc/systemd/system
+  SKIP: no virp-* units installed under /etc/systemd/system
+=== self-testing the deploy build-id checker ===
+  PASS: agrees when the ids match
+  PASS: fails when the installed id differs from the tree
+  PASS: fails when the binary cannot report a build id
+  PASS: skips cleanly when there is no deploy tree
+=== deploy build-id checker selftest OK ===
+=== checking installed binary against the deploy tree ===
+  SKIP: no deploy tree at /opt/virp (not a deploy host)
+=== self-testing the key registry check ===
+  selftest ok: a key_id that does not derive from its bytes rejected
+  selftest ok: a duplicated key_id rejected
+  selftest ok: public key bytes swapped between two entries rejected
+  selftest ok: a DER-wrapped key where raw bytes belong rejected
+  selftest ok: a status outside {active, retired} rejected
+  selftest ok: a blank private_half_host rejected
+  selftest ok: an empty registry rejected
+  selftest passed: the check can fail
+
+=== checking /home/nhoward/virp-node2-epoch-qualification/deploy/keys/registry.json ===
+  PASS: 17 key(s), every key_id re-derived from its own public key bytes
+        13 active, 4 retired, 0 duplicate ids
+=== checking the PBS driver has no TLS escape hatch ===
+  PASS: pin is mandatory, no env var, no redirect following
+=== checking live-contact sources are opt-in guarded ===
+    guarded: tests/test_driver_wazuh.c
+    guarded: tests/test_live.c
+  PASS: every live-capable test/tool source is opt-in guarded
+=== checking daemon/client socket-path agreement ===
+  PASS: daemon and client both default to /run/virp/onode.sock
+=== Checking SSH drivers use the shared read path ===
+  OK: all four SSH drivers use the shared read path
+mkdir -p build
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_crypto.c -o build/virp_crypto.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_message.c -o build/virp_message.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_driver.c -o build/virp_driver.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/driver_mock.c -o build/driver_mock.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_onode.c -o build/virp_onode.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_chain.c -o build/virp_chain.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_federation.c -o build/virp_federation.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_seqstore.c -o build/virp_seqstore.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_session.c -o build/virp_session.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_handshake.c -o build/virp_handshake.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_transcript.c -o build/virp_transcript.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_validator.c -o build/virp_validator.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_approval.c -o build/virp_approval.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_approver_registry.c -o build/virp_approver_registry.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_obskey.c -o build/virp_obskey.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_chainsign.c -o build/virp_chainsign.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_ssh_io.c -o build/virp_ssh_io.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_scrub.c -o build/virp_scrub.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_body_filter.c -o build/virp_body_filter.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c build/virp_build_id.c -o build/virp_build_id.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/third_party/cJSON.c -o build/cJSON.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/driver_cisco.c -o build/driver_cisco.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/driver_fortigate.c -o build/driver_fortigate.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/driver_panos.c -o build/driver_panos.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/driver_asa.c -o build/driver_asa.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/parser_asa.c -o build/parser_asa.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/driver_wazuh.c -o build/driver_wazuh.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/driver_juniper.c -o build/driver_juniper.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/driver_linux.c -o build/driver_linux.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/driver_librenms.c -o build/driver_librenms.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/driver_pbs.c -o build/driver_pbs.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/drivers/driver_zammad.c -o build/driver_zammad.o
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -c src/virp_ssh_hostkey.c -o build/virp_ssh_hostkey.o
+ar rcs build/libvirp.a build/virp_crypto.o build/virp_message.o build/virp_driver.o build/driver_mock.o build/virp_onode.o build/virp_chain.o build/virp_federation.o build/virp_seqstore.o build/virp_session.o build/virp_handshake.o build/virp_transcript.o build/virp_validator.o build/virp_approval.o build/virp_approver_registry.o build/virp_obskey.o build/virp_chainsign.o build/virp_ssh_io.o build/virp_scrub.o build/virp_body_filter.o build/virp_build_id.o build/cJSON.o build/driver_cisco.o build/driver_fortigate.o build/driver_panos.o build/driver_asa.o build/parser_asa.o build/driver_wazuh.o build/driver_juniper.o build/driver_linux.o build/driver_librenms.o build/driver_pbs.o build/driver_zammad.o build/virp_ssh_hostkey.o
+rm -f build/test_virp
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  tests/test_virp.c build/libvirp.a -lcrypto -lpthread -lsqlite3 -lsodium  -lssh2 -lcurl  -lssl -o build/test_virp
+./build/test_virp
+
+================================================================
+  VIRP — Verified Infrastructure Response Protocol
+  Test Suite v1.0
+  Copyright (c) 2026 Third Level IT LLC
+================================================================
+
+[Structural Guarantees]
+  test_header_size                                             [PASS]
+  test_black_tier_rejected                                     [PASS]
+  test_black_tier_validation                                   [PASS]
+  test_okey_signs_oc                                           [PASS]
+  test_okey_cannot_sign_ic                                     [PASS]
+  test_rkey_signs_ic                                           [PASS]
+  test_rkey_cannot_sign_oc                                     [PASS]
+  test_proposal_requires_evidence                              [PASS]
+
+[HMAC Integrity]
+  test_hmac_detects_tamper                                     [PASS]
+  test_hmac_detects_header_tamper                              [PASS]
+  test_observation_tier_honesty                                [PASS]
+  test_observation_wrapper_unchanged_green                     [PASS]
+  test_wrong_key_fails_verify                                  [PASS]
+  test_trailing_bytes_rejected                                 [PASS]
+
+[Channel-Type Consistency]
+  test_observation_on_ic_rejected                              [PASS]
+  test_proposal_on_oc_rejected                                 [PASS]
+  test_heartbeat_on_ic_rejected                                [PASS]
+  test_teardown_on_both_channels                               [PASS]
+
+[Round-Trip Serialization]
+  test_observation_round_trip                                  [PASS]
+  test_proposal_round_trip                                     [PASS]
+  test_heartbeat_round_trip                                    [PASS]
+  test_approval_round_trip                                     [PASS]
+  test_intent_advertise_round_trip                             [PASS]
+  test_intent_withdraw_round_trip                              [PASS]
+  test_hello_round_trip                                        [PASS]
+
+[Key Management]
+  test_key_generate_and_destroy                                [PASS]
+  test_key_save_and_load                                       [PASS]
+  test_key_load_rejects_insecure_mode                         [VIRP] key file /tmp/virp_test_key_perms.bin has insecure mode 0644 — any group/world access hands the key to every local reader. Refusing to load. Run: chmod 0600 /tmp/virp_test_key_perms.bin
+[VIRP] key file /tmp/virp_test_key_perms.bin has insecure mode 0604 — any group/world access hands the key to every local reader. Refusing to load. Run: chmod 0600 /tmp/virp_test_key_perms.bin
+[VIRP] key file /tmp/virp_test_key_perms.bin has insecure mode 0640 — any group/world access hands the key to every local reader. Refusing to load. Run: chmod 0600 /tmp/virp_test_key_perms.bin
+ [PASS]
+  test_key_load_rejects_symlink                               [VIRP] key file /tmp/virp_test_key_link.bin is a symlink — refusing to follow (O_NOFOLLOW)
+ [PASS]
+  test_key_load_rejects_truncated                             [VIRP] key file /tmp/virp_test_key_short.bin is 28 bytes, expected exactly 32 — malformed or truncated, refusing to load
+ [PASS]
+
+[Edge Cases]
+  test_null_pointers                                           [PASS]
+  test_buffer_too_small                                        [PASS]
+  test_reserved_nonzero_rejected                               [PASS]
+
+[Embedded-Length Bounds]
+  test_parse_obs_truncated_claim                               [PASS]
+  test_parse_obs_oversized_length                              [PASS]
+  test_parse_obs_zero_length_data                              [PASS]
+  test_parse_obs_exact_boundary                                [PASS]
+  test_parse_obs_trailer_allowed                               [PASS]
+  test_parse_proposal_refs_overrun                             [PASS]
+  test_parse_proposal_count_over_max                           [PASS]
+  test_parse_proposal_zero_refs                                [PASS]
+
+[Teardown Messages]
+  test_teardown_on_oc                                          [PASS]
+  test_teardown_on_ic                                          [PASS]
+  test_teardown_null_reason                                    [PASS]
+
+[TLV Extensions]
+  test_tlv_round_trip                                          [PASS]
+  test_tlv_chain                                               [PASS]
+  test_tlv_buffer_overflow_protection                          [PASS]
+
+[Key-File Ownership Gate]
+  test_key_owner_check_predicate                               [PASS]
+  test_key_load_ownership_integration                          [PASS]
+
+[Durable Symlink-Safe File Write]
+  test_wfd_writes_exact_bytes_and_mode                         [PASS]
+  test_wfd_symlink_at_target_not_followed                      [PASS]
+  test_wfd_symlink_at_temp_path_not_followed                   [PASS]
+  test_wfd_stale_temp_does_not_wedge_writes                    [PASS]
+
+[Key Save / Load Symmetry]
+  test_key_save_roundtrip_is_0600_and_intact                   [PASS]
+  test_key_save_does_not_follow_symlink                        [PASS]
+  test_key_save_tightens_mode_on_existing_file                 [PASS]
+
+[Key Generation Entropy]
+  test_key_generate_fills_full_length                          [PASS]
+  test_key_generate_two_keys_differ                            [PASS]
+  test_key_generate_rejects_null                               [PASS]
+  test_key_generate_distinct_across_key_types                  [PASS]
+  test_key_lock_lifecycle_generated_and_loaded                 [PASS]
+
+================================================================
+  Results: 61/61 passed
+================================================================
+
+gcc -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g -fPIC -I./include -I./src/third_party  -MMD -MP -DVIRP_DRIVER_CISCO -DVIRP_DRIVER_FORTINET -DVIRP_DRIVER_PALOALTO -DVIRP_DRIVER_CISCO_ASA -DVIRP_DRIVER_WAZUH -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_JUNIPER -DVIRP_DRIVER_LINUX -DVIRP_DRIVER_LIBRENMS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_PBS -I/usr/include/x86_64-linux-gnu  -DVIRP_DRIVER_ZAMMAD -I/usr/include/x86_64-linux-gnu  -DVIRP_ONODE_PROD_NO_MAIN -c src/virp_onode_prod.c -o build/virp_onode_prod_lib.o
+src/virp_onode_prod.c: In function ‘load_devices’:
+src/virp_onode_prod.c:1075:17: error: implicit declaration of function ‘wazuh_gate_set_protected_agents’; did you mean ‘linux_gate_set_protected_vmids’? [-Werror=implicit-function-declaration]
+ 1075 |             if (wazuh_gate_set_protected_agents(device.protected_agents) != 0) {
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      |                 linux_gate_set_protected_vmids
+cc1: all warnings being treated as errors
+make: *** [Makefile:354: build/virp_onode_prod_lib.o] Error 1

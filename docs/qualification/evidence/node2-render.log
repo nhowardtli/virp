@@ -1,0 +1,13 @@
+[render-devices] rendered /tmp/node2-render-2mk6xks1/rendered.json from deploy/devices.node2.template.json (secrets from /tmp/node2-render-2mk6xks1/fixture.env, values not logged)
+{
+  "check": "node2_template_render",
+  "result": "PASS",
+  "devices": [
+    "wazuh-lab",
+    "librenms-lab",
+    "virp-lab-peer"
+  ],
+  "rendered_sha256": "b6ffa2c842fe9e3e665f0e0a5fbe1a9b93aac555cd82b2439049eb5edea34b3f",
+  "credentials": "synthetic; no production values",
+  "limit": "override path does not exercise root:virp production ownership"
+}

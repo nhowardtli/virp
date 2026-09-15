@@ -1,0 +1,65 @@
+=== checking deploy/virp-onode.service for chain flags ===
+  PASS: chain flags present in deploy/virp-onode.service
+=== checking no unit executes a path inside a source worktree ===
+  PASS: every Exec* path is an installed artifact
+=== checking no unit rebuilds anything at start ===
+  PASS: no unit rebuilds from source at start
+=== checking ExecStart matches the documented install path ===
+  PASS: ExecStart=/usr/local/lib/virp/virp-onode-prod
+=== checking canonical unit does not disable Wazuh TLS ===
+  PASS: no VIRP_WAZUH_INSECURE in canonical virp-onode.service
+=== checking no drop-in disables Wazuh TLS (except the lab drop-in) ===
+  PASS: no drop-in in deploy disables Wazuh TLS outside 'virp-onode-wazuh-lab.dropin.conf'
+=== self-testing the unit drift checker ===
+  selftest 1/5 PASS: clean fixture reports clean
+  selftest 2/5 PASS: one added line is detected
+  selftest 3/5 PASS: non-unit file drift is detected
+  selftest 4/5 PASS: an untracked unit is detected
+  selftest 5/5 PASS: an untracked drop-in in any virp unit's .d is detected
+=== checking installed units match tracked units ===
+    tracked:   /home/nhoward/virp-node2-epoch-qualification
+    installed: /etc/systemd/system
+  SKIP: no virp-* units installed under /etc/systemd/system
+=== self-testing the deploy build-id checker ===
+  PASS: agrees when the ids match
+  PASS: fails when the installed id differs from the tree
+  PASS: fails when the binary cannot report a build id
+  PASS: skips cleanly when there is no deploy tree
+=== deploy build-id checker selftest OK ===
+=== checking installed binary against the deploy tree ===
+  SKIP: no deploy tree at /opt/virp (not a deploy host)
+=== self-testing the key registry check ===
+  selftest ok: a key_id that does not derive from its bytes rejected
+  selftest ok: a duplicated key_id rejected
+  selftest ok: public key bytes swapped between two entries rejected
+  selftest ok: a DER-wrapped key where raw bytes belong rejected
+  selftest ok: a status outside {active, retired} rejected
+  selftest ok: a blank private_half_host rejected
+  selftest ok: an empty registry rejected
+  selftest passed: the check can fail
+
+=== checking /home/nhoward/virp-node2-epoch-qualification/deploy/keys/registry.json ===
+  PASS: 17 key(s), every key_id re-derived from its own public key bytes
+        13 active, 4 retired, 0 duplicate ids
+=== checking the PBS driver has no TLS escape hatch ===
+  PASS: pin is mandatory, no env var, no redirect following
+=== checking live-contact sources are opt-in guarded ===
+    guarded: tests/test_driver_wazuh.c
+    guarded: tests/test_live.c
+  PASS: every live-capable test/tool source is opt-in guarded
+=== checking daemon/client socket-path agreement ===
+  PASS: daemon and client both default to /run/virp/onode.sock
+=== Checking SSH drivers use the shared read path ===
+/bin/sh: 10: awk: not found
+  FAIL: src/drivers/driver_cisco.c calls libssh2_channel_read outside its *_io_read
+        adapter — a direct read bypasses the shared read path.
+/bin/sh: 10: awk: not found
+  FAIL: src/drivers/driver_asa.c calls libssh2_channel_read outside its *_io_read
+        adapter — a direct read bypasses the shared read path.
+/bin/sh: 10: awk: not found
+  FAIL: src/drivers/driver_juniper.c calls libssh2_channel_read outside its *_io_read
+        adapter — a direct read bypasses the shared read path.
+/bin/sh: 10: awk: not found
+  FAIL: src/driver_panos.c calls libssh2_channel_read outside its *_io_read
+        adapter — a direct read bypasses the shared read path.
+make: *** [Makefile:2256: check-shared-readpath] Error 1

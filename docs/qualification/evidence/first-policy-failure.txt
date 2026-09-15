@@ -1,0 +1,12 @@
+FAIL: test_template_carries_no_blocked_address (__main__.TestTemplateExclusions.test_template_carries_no_blocked_address)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/nhoward/virp-node2-epoch-qualification/tests/test_autopilot.py", line 747, in test_template_carries_no_blocked_address
+    self.assertFalse(self.blocked_hit(text, addr),
+AssertionError: True is not false : 10.0.10.1 present in devices template
+
+----------------------------------------------------------------------
+Ran 65 tests in 0.005s
+
+FAILED (failures=1)
+make: *** [Makefile:1107: test-autopilot] Error 1

@@ -1,0 +1,38 @@
+{
+  "preflight.log": {
+    "bytes": 52,
+    "sha256": "44d4df748856bc4135e9e58f32b3eae9f9ff08c03b498f36fd52e6bd6ed2773e"
+  },
+  "preflight-2.log": {
+    "bytes": 102,
+    "sha256": "0d53170993d68b580865c41df885b3c430229a76549105607ea1d62d4b24e86f"
+  },
+  "c-battery-1.log": {
+    "bytes": 3586,
+    "sha256": "b3b148a253f22d1dc12beab16a96db53adf5cdcb06a2e214b85206634ae733b4"
+  },
+  "c-battery-1.json": {
+    "bytes": 277,
+    "sha256": "efbc12ff1bbec4723f4ee27caee4662e32e53041c026b2e6ca373cb10a0df2b8"
+  },
+  "c-battery-2.log": {
+    "bytes": 27475,
+    "sha256": "13487f3304fdaba45a65167a9ea00d1faf64d9de6fb07701c272b62a07775efb"
+  },
+  "c-battery-2.json": {
+    "bytes": 278,
+    "sha256": "d5b6306ff9b7790853e7845d8262f9187e11c125f9a86c4618e02752ed4d77f9"
+  },
+  "c-battery-3.log": {
+    "bytes": 670844,
+    "sha256": "28d4e4afe5017ac4cf6ecb5ae91907c7f81f46d285e1e0a1b6eb5622ff18b9a1"
+  },
+  "c-battery-3.json": {
+    "bytes": 278,
+    "sha256": "fede2f84bacebed8ebeddf7f5e6abe90b256d32e5ad905939a041ec114869062"
+  },
+  "node2-render.log": {
+    "bytes": 534,
+    "sha256": "269614bcd5dc0d12ec2084234422da75ce358c61d067565699b2dd864faf905b"
+  }
+}
