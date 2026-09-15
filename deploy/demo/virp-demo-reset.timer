@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily 04:00 VIRP demo reset (VM timezone)
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+Unit=virp-demo-reset.service
+[Install]
+WantedBy=timers.target
