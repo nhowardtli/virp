@@ -535,6 +535,8 @@ class TestCommands(unittest.TestCase):
         self.assertEqual(x("wr mem"), "write memory")
         self.assertEqual(x("relo"), "reload")
         self.assertEqual(x("show foo bar"), "show foo bar")      # unknown: untouched
+        # Linux/FRR interface names are literal: never rewrite eth1 -> Ethernet1
+        self.assertEqual(x("interface eth1 description x"), "interface eth1 description x")
         self.assertEqual(x("show ip interface brief"), "show ip interface brief")
 
     def test_expansions_land_on_the_cisco_classifier_table(self):
