@@ -1187,6 +1187,15 @@ test-template-uid-policy:
 	@echo "=== deployment templates: per-uid action policy ==="
 	python3 tests/test_template_uid_policy.py
 
+# virp-shell: parser, decoder, output contract, and the build gate that
+# ties the shell's vocabulary to uid 988's allowlist in the colo template.
+# Pure python against a fake UNIX socket: no daemon, no devices, no chain.
+.PHONY: test-virp-shell
+test-virp-shell:
+	@echo "=== virp-shell: resolver, decoder, uid 988 allowlist gate ==="
+	python3 -m py_compile tools/virp-shell.py
+	python3 tests/test_virp_shell.py
+
 # Compliance-evidence collector + its control-mapped report. Pure python
 # against fakes: no daemon, no devices, no chain database. The report
 # tests need reportlab and SKIP with a warning without it (same policy as
@@ -2387,7 +2396,7 @@ test-release-tools:
 	@scripts/verify-release-bundle.sh --selftest
 	@scripts/check-release-tag.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-evidence-ham test-tacacs-authz test-tacacs-ham test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-verifier-error test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-json-hygiene test-obskey test-obs-ed25519 test-obs-v3-vectors test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chain-signing-migration test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api test-health-uid-passthrough
+all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-evidence-ham test-tacacs-authz test-tacacs-ham test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-verifier-error test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-json-hygiene test-obskey test-obs-ed25519 test-obs-v3-vectors test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chain-signing-migration test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api test-health-uid-passthrough test-virp-shell
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 
