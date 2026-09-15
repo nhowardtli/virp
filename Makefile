@@ -1843,6 +1843,60 @@ install-devices-template:
 	@echo "  as a literal \$${TOKEN}. See tests/test_render_devices.sh."
 
 # -------------------------------------------------------------------------
+# install-virp-shell — the read-only operator REPL ONLY.
+#
+# Installs tools/virp-shell.py as $(VIRP_INSTALL_DIR)/virp-shell
+# (root:virp 0755) and deploy/virp-shell.wrapper as /usr/local/bin/virp-shell,
+# which execs `sudo -u virp-shell`. The daemon binary, virp-tool, the units
+# and the template are UNTOUCHED; the shell takes effect immediately, but
+# the gate only accepts uid 988 once the template row for 988 has been
+# installed (install-devices-template) AND virp-onode restarted.
+#
+# Precondition: the service account exists with the pinned uid. This
+# target refuses rather than creating it — identities are made by hand:
+#   useradd --system --uid 988 -g virp --shell /usr/sbin/nologin virp-shell
+# Journal read for `show log` / `show services` comes from membership in
+# systemd-journal; added here when that group exists.
+#
+# Refuses on a dirty tree for the reason install-prod does.
+# -------------------------------------------------------------------------
+VIRP_SHELL_SRC     = tools/virp-shell.py
+VIRP_SHELL_WRAPPER = deploy/virp-shell.wrapper
+VIRP_SHELL_UID     = 988
+VIRP_SHELL_USER    = virp-shell
+VIRP_INSTALL_SHELL         = $(VIRP_INSTALL_DIR)/virp-shell
+VIRP_INSTALL_SHELL_WRAPPER = /usr/local/bin/virp-shell
+
+.PHONY: install-virp-shell
+install-virp-shell:
+	@test -f $(VIRP_SHELL_SRC) || { echo "FAIL: $(VIRP_SHELL_SRC) missing"; exit 1; }
+	@test -f $(VIRP_SHELL_WRAPPER) || { echo "FAIL: $(VIRP_SHELL_WRAPPER) missing"; exit 1; }
+	@scripts/require-clean-tree.sh "refusing to install virp-shell"
+	@python3 -m py_compile $(VIRP_SHELL_SRC)
+	@id -u $(VIRP_SHELL_USER) >/dev/null 2>&1 || { \
+	    echo "FAIL: user $(VIRP_SHELL_USER) does not exist. Create it first:"; \
+	    echo "  useradd --system --uid $(VIRP_SHELL_UID) -g virp --shell /usr/sbin/nologin $(VIRP_SHELL_USER)"; \
+	    exit 1; }
+	@[ "$$(id -u $(VIRP_SHELL_USER))" = "$(VIRP_SHELL_UID)" ] || { \
+	    echo "FAIL: $(VIRP_SHELL_USER) is uid $$(id -u $(VIRP_SHELL_USER)), not $(VIRP_SHELL_UID)"; exit 1; }
+	@[ "$$(id -gn $(VIRP_SHELL_USER))" = "virp" ] || { \
+	    echo "FAIL: $(VIRP_SHELL_USER)'s primary group is $$(id -gn $(VIRP_SHELL_USER)), not virp (the socket is group-rw)"; exit 1; }
+	install -m 0755 -o root -g virp $(VIRP_SHELL_SRC) $(VIRP_INSTALL_SHELL)
+	install -m 0755 -o root -g root $(VIRP_SHELL_WRAPPER) $(VIRP_INSTALL_SHELL_WRAPPER)
+	@if getent group systemd-journal >/dev/null; then \
+	    usermod -a -G systemd-journal $(VIRP_SHELL_USER) && \
+	    echo "  $(VIRP_SHELL_USER) added to systemd-journal (show log / show services)"; \
+	else \
+	    echo "  note: no systemd-journal group here; show log will report '% journal not readable at this uid'"; \
+	fi
+	@echo
+	@echo "  Installed $(VIRP_INSTALL_SHELL) and $(VIRP_INSTALL_SHELL_WRAPPER)."
+	@echo "  The daemon binary, virp-tool, the units and the template are UNTOUCHED."
+	@echo "  The gate accepts uid $(VIRP_SHELL_UID) only after the template row for it is"
+	@echo "  installed (make install-devices-template) and virp-onode restarted."
+	@echo "  Add your own sudoers rule for the operators who may run the wrapper."
+
+# -------------------------------------------------------------------------
 # install-autopilot — the autopilot Python ONLY.
 #
 # install-prod rebuilds and reinstalls the daemon binary, virp-tool and

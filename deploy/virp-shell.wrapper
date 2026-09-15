@@ -1,0 +1,11 @@
+#!/bin/sh
+# /usr/local/bin/virp-shell — run the read-only operator REPL as uid 988.
+#
+# The shell is a plain socket client; the O-Node judges it by SO_PEERCRED,
+# so the seat IS the uid. This wrapper only changes identity, never
+# privilege: it execs sudo -u virp-shell (a nologin system account in
+# group virp), never root. The sudoers rule that lets an operator do this
+# is the operator's own, e.g.
+#   %virp ALL=(virp-shell) NOPASSWD: /usr/bin/python3 /usr/local/lib/virp/virp-shell
+# Installed by `make install-virp-shell` from deploy/virp-shell.wrapper.
+exec sudo -u virp-shell -- /usr/bin/python3 /usr/local/lib/virp/virp-shell "$@"
