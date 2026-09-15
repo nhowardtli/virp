@@ -7,12 +7,14 @@
   "socket_allowed_uids": [
     "${VIRP_UID}",
     988,
-    1501
+    1501,
+    1502
   ],
   "socket_uid_tier_ceilings": {
     "${VIRP_UID}": "yellow",
     "988": "green",
-    "1501": "yellow"
+    "1501": "yellow",
+    "1502": "green"
   },
   "socket_uid_action_allow": {
     "${VIRP_UID}": [
@@ -40,10 +42,16 @@
       "chain_verify",
       "health",
       "heartbeat"
+    ],
+    "1502": [
+      "chain_append"
     ]
   },
   "socket_uid_chain_append_types": {
     "988": [
+      "evidence_item"
+    ],
+    "1502": [
       "evidence_item"
     ]
   },
@@ -103,5 +111,6 @@
       "_note": "In-process repository mock driver (tests/test_onode.c); no network endpoint or credentials."
     }
   ],
-  "_demo_console": "Phase B: uid1501 is the VM-only demo approver console; uid988 remains GREEN with no approve/apply authority."
+  "_demo_console": "Phase B: uid1501 is the VM-only demo approver console; uid988 remains GREEN with no approve/apply authority.",
+  "_demo_issuer": "Phase C: uid1502 virp-issuer may append signup evidence_item only; no execute, approval or sudo."
 }
