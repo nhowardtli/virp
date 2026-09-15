@@ -357,7 +357,7 @@ class TestCommands(unittest.TestCase):
         self.assertIn("cisco_ios", out)
         self.assertIn("dup-host", out)
         self.assertIn("node_id 0x0a0b0c0d  seq 7  tier GREEN", out)
-        self.assertTrue(out.rstrip().endswith(vs.TRAILER))
+        self.assertTrue(out.rstrip().endswith(vs.trailer()))
         self.assertNotIn("{", out)                           # no JSON dumps
 
     def test_show_device_sends_health_for_that_device(self):
@@ -366,14 +366,14 @@ class TestCommands(unittest.TestCase):
         self.assertEqual(reqs, [{"action": "health", "device": "sw-3850"}])
         self.assertIn("chained `show version`", out)
         self.assertIn("Cisco IOS Software", out)
-        self.assertTrue(out.rstrip().endswith(vs.TRAILER))
+        self.assertTrue(out.rstrip().endswith(vs.trailer()))
 
     def test_show_node_sends_heartbeat(self):
         out, reqs = run(None, "sh node", lambda r: heartbeat())
         self.assertEqual(reqs, [{"action": "heartbeat"}])
         self.assertIn("1d 01h 01m 01s", out)
         self.assertIn("active_proposals", out)
-        self.assertTrue(out.rstrip().endswith(vs.TRAILER))
+        self.assertTrue(out.rstrip().endswith(vs.trailer()))
 
     def test_verify_chain_sends_session_and_range(self):
         res = {"entries_checked": 12, "executions_open": 0, "first_broken": -1,
@@ -384,12 +384,12 @@ class TestCommands(unittest.TestCase):
                                  "from_sequence": 1, "to_sequence": 12}])
         self.assertIn("entries_checked", out)
         self.assertIn("12", out)
-        self.assertTrue(out.rstrip().endswith(vs.TRAILER))
+        self.assertTrue(out.rstrip().endswith(vs.trailer()))
 
     def test_gate_refusal_is_a_percent_line(self):
         out, _ = run(None, "show devices", lambda r: error_frame(-50))
         self.assertTrue(out.startswith("% gate refused: VIRP_ERR_ACTION_FORBIDDEN (-50)"))
-        self.assertNotIn(vs.TRAILER, out)
+        self.assertNotIn(vs.trailer(), out)
 
     def test_never_prints_valid(self):
         res = {"entries_checked": 1, "executions_open": 0, "first_broken": -1,
@@ -458,7 +458,7 @@ class TestCommands(unittest.TestCase):
                                  "command": "show ip interface brief"}])
         self.assertIn("R1: 'show ip interface brief' executed (GREEN)", out)
         self.assertIn("Gi1/0/1 is up", out)
-        self.assertTrue(out.rstrip().endswith(vs.TRAILER))
+        self.assertTrue(out.rstrip().endswith(vs.trailer()))
 
     def test_yellow_change_is_proposed_not_applied(self):
         pid = "0123456789abcdef0123456789abcdef"
@@ -536,6 +536,14 @@ class TestCommands(unittest.TestCase):
         self.assertEqual(x("wr mem"), "write memory")
         self.assertEqual(x("relo"), "reload")
         self.assertEqual(x("show foo bar"), "show foo bar")      # unknown: untouched
+        # unique 2+ char prefixes expand (IOS rule); ambiguous ones do not
+        self.assertEqual(x("sh cdp ne"), "show cdp neighbors")
+        self.assertEqual(x("sh inv"), "show inventory")
+        self.assertEqual(x("sh in"), "show in")                   # interface? inventory? ambiguous
+        self.assertEqual(x("s ver"), "s version")                 # one char: never expanded
+        # free text after description/hostname is never rewritten
+        self.assertEqual(x("int g1/0/1 des pro to core ver 2"),
+                         "interface GigabitEthernet1/0/1 description pro to core ver 2")
         # Linux/FRR interface names are literal: never rewrite eth1 -> Ethernet1
         self.assertEqual(x("interface eth1 description x"), "interface eth1 description x")
         self.assertEqual(x("show ip interface brief"), "show ip interface brief")
@@ -695,7 +703,7 @@ class TestCommands(unittest.TestCase):
         self.assertIn("sess-b", out)
         self.assertIn("NO", out)                       # sess-a is broken at 1
         self.assertIn("120s", out)
-        self.assertTrue(out.rstrip().endswith(vs.TRAILER))
+        self.assertTrue(out.rstrip().endswith(vs.trailer()))
         self.assertNotIn("VALID", out)
 
     def test_show_chain_refusal_is_a_percent_line(self):

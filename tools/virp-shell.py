@@ -88,7 +88,14 @@ TOOL_BIN = os.path.join(INSTALL_DIR, "virp-tool")
 DEPLOYED_MD = "/opt/virp/DEPLOYED.md"
 ONODE_UNIT = "virp-onode"
 
-TRAILER = "HMAC present, not verified by this client (no O-Key at uid %d)" % SHELL_UID
+TRAILER_FMT = "HMAC present, not verified by this client (no O-Key at uid %d)"
+
+
+def trailer():
+    """The fixed honesty line under every gate reply, naming the seat that
+    actually received it (988 read seat, 985 admin seat, or whatever uid
+    is running the file)."""
+    return TRAILER_FMT % os.geteuid()
 
 # ── the ONLY gate actions this shell emits ─────────────────────────────
 # Keyed by resolved command path. tests/test_virp_shell.py compares the
@@ -402,20 +409,32 @@ def expand_ios(line):
     their canonical spellings. Unknown tokens pass through unchanged.
     Returns the (possibly identical) line."""
     out = []
-    for tok in line.split():
+    toks = line.split()
+    for i, tok in enumerate(toks):
         low = tok.lower()
         if low in IOS_ABBREV:
             out.append(IOS_ABBREV[low])
-            continue
-        if low in IOS_WORDS:
+        elif low in IOS_WORDS:
             out.append(low)
-            continue
-        for rx, canon in IOS_IFACES:
-            m = rx.match(tok)
-            if m:
-                tok = canon + m.group(1)
-                break
-        out.append(tok)
+        else:
+            # IOS rule: a unique prefix (2+ chars) of a known keyword is
+            # that keyword; an ambiguous one is left alone (the gate then
+            # fails closed to RED, exactly as the device would say
+            # "% Ambiguous command").
+            cands = [w for w in IOS_WORDS if len(low) >= 2 and w.startswith(low)]
+            if len(cands) == 1:
+                out.append(cands[0])
+            else:
+                for rx, canon in IOS_IFACES:
+                    m = rx.match(tok)
+                    if m:
+                        tok = canon + m.group(1)
+                        break
+                out.append(tok)
+        # Free text follows these keywords: copy the rest verbatim.
+        if out[-1] in ("description", "hostname", "password", "secret"):
+            out.extend(toks[i + 1:])
+            break
     return " ".join(out)
 
 
@@ -959,7 +978,7 @@ class VirpShell(cmd.Cmd):
             self.out(line)
         for line in body_lines:
             self.out(line)
-        self.out(TRAILER)
+        self.out(trailer())
 
     def cmd_show_devices(self, args):
         info = self._reply({"action": COMMAND_ACTIONS["show devices"]})
