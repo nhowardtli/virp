@@ -1256,6 +1256,8 @@ static int cmd_approve(int argc, char **argv)
             "                 from `virp-tool keygen approval <prefix>`;\n"
             "                 default %s)\n"
             "  PKCS#11/PIV:   --pkcs11 <module.so> --slot 9c [--key-label L]\n"
+            "  Optional binding (all three): --expect-device NAME\n"
+            "                 --expect-command COMMAND --expect-node-id HEX\n"
             "Fetches the challenge from the daemon, signs the canonical bytes,\n"
             "and submits. The daemon appends the APPROVAL chain entry.\n",
             APPROVAL_DEFAULT_KEY);
