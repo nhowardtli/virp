@@ -1265,8 +1265,34 @@ class VirpShell(cmd.Cmd):
         except GateError as e:
             rows.append(("policy", "% " + str(e)))
         self.out(table(rows, ("field", "value")))
-        self.out("GREEN reads execute; YELLOW applies only at or above a YELLOW ceiling, "
-                 "else a proposal; RED is always a proposal; BLACK never runs.")
+        self.out(self.ceiling_sentence())
+
+    def seat_ceiling(self):
+        """This uid's tier ceiling from the rendered policy: 'green',
+        'yellow', 'red', or None when the policy cannot be read."""
+        try:
+            doc, _ = load_uid_policy()
+        except GateError:
+            return None
+        u = str(os.geteuid())
+        ceilings = {str(k): v for k, v in (doc.get("socket_uid_tier_ceilings") or {}).items()}
+        return (ceilings.get(u) or doc.get("gate_max_tier") or "").lower() or None
+
+    def ceiling_sentence(self):
+        """What a command does from THIS seat, derived from its ceiling —
+        never a fixed claim. BLACK is unreachable from every seat."""
+        c = self.seat_ceiling()
+        if c == "red":
+            return ("This seat's ceiling is RED: GREEN reads, YELLOW and RED changes all "
+                    "apply; BLACK never runs.")
+        if c == "yellow":
+            return ("This seat's ceiling is YELLOW: GREEN reads and YELLOW changes apply; "
+                    "RED files a proposal for an approver; BLACK never runs.")
+        if c == "green":
+            return ("This seat's ceiling is GREEN: reads execute; YELLOW and RED file a "
+                    "proposal for an approver; BLACK never runs.")
+        return ("Ceiling unknown (policy not readable): the gate applies at or below "
+                "the seat's ceiling, proposes above it; BLACK never runs.")
 
     def cmd_end(self, args):
         # IOS: end leaves config mode and lands in privileged exec.
@@ -1280,9 +1306,8 @@ class VirpShell(cmd.Cmd):
         self.mode, self.device = "config", None
         self._set_prompt()
         self.out("Config mode: device <name>, then each line goes to that "
-                 "device through the gate as uid %d (GREEN ceiling)." % SHELL_UID)
-        self.out("Changes are NOT applied here: YELLOW/RED file a signed "
-                 "proposal for an operator to approve; BLACK is refused.")
+                 "device through the gate as uid %d." % os.geteuid())
+        self.out(self.ceiling_sentence())
         self.out("Each line is sent on its own (no interface sub-mode): write "
                  "full commands, e.g.  interface Gi1/0/48 description uplink")
 
