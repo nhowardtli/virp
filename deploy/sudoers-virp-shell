@@ -1,0 +1,11 @@
+# /etc/sudoers.d/virp-shell — installed by `make install-virp-shell` (mode 0440,
+# checked with visudo -c before it lands). Who may sit at the VIRP shell.
+#
+# Members of group virp may become the READ seat without a password, and the
+# ADMIN seat with their own password (PAM — point it at TACACS+ later and the
+# enable password becomes the network team's real one). Neither rule grants
+# root, a shell, or anything beyond running this one program as that uid.
+# The O-Node judges the uid on the socket: 988 has a GREEN ceiling, 985 YELLOW.
+Defaults:%virp timestamp_timeout=0
+%virp ALL=(virp-shell)       NOPASSWD: /usr/bin/python3 /usr/local/lib/virp/virp-shell, /usr/bin/python3 /usr/local/lib/virp/virp-shell *
+%virp ALL=(virp-shell-admin) PASSWD:   /usr/bin/python3 /usr/local/lib/virp/virp-shell --privileged, /usr/bin/python3 /usr/local/lib/virp/virp-shell --privileged *

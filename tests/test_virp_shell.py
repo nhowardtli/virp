@@ -165,6 +165,34 @@ class TestShellMatchesAllowlist(unittest.TestCase):
                                  "execute"})
         self.assertEqual(allow, set(vs.COMMAND_ACTIONS.values()))
 
+    def test_admin_seat_985_is_yellow_with_the_same_verbs_and_no_approval(self):
+        # `enable` = a real uid change to 985 (deploy/virp-shell.wrapper +
+        # deploy/sudoers-virp-shell). Same vocabulary, higher ceiling, and
+        # still no way to approve: proposer and approver stay two people.
+        doc = self.doc
+        admin = str(vs.ADMIN_UID)
+        self.assertIn(admin, [str(u) for u in doc["socket_allowed_uids"]])
+        self.assertEqual(doc["socket_uid_tier_ceilings"][admin], "yellow")
+        self.assertEqual(set(doc["socket_uid_action_allow"][admin]),
+                         set(doc["socket_uid_action_allow"][SHELL_UID]))
+        for verb in ("approval_submit", "approval_challenge", "chain_append", "shutdown"):
+            self.assertNotIn(verb, doc["socket_uid_action_allow"][admin])
+        self.assertNotIn(admin, doc.get("socket_uid_chain_append_types", {}))
+
+    def test_wrapper_and_sudoers_agree_on_seats_and_exit_codes(self):
+        wrapper = open(os.path.join(ROOT, "deploy", "virp-shell.wrapper")).read()
+        sudoers = open(os.path.join(ROOT, "deploy", "sudoers-virp-shell")).read()
+        self.assertIn("42) seat=virp-shell-admin", wrapper)
+        self.assertIn("43) seat=virp-shell", wrapper)
+        self.assertEqual((vs.EXIT_ENABLE, vs.EXIT_DISABLE), (42, 43))
+        self.assertIn("sudo -k", wrapper)                       # ask every time
+        self.assertIn("-u virp-shell-admin -- /usr/bin/python3", wrapper)
+        self.assertIn("--privileged", wrapper)
+        self.assertRegex(sudoers, r"\(virp-shell\)\s+NOPASSWD:")
+        self.assertRegex(sudoers, r"\(virp-shell-admin\)\s+PASSWD:.*--privileged")
+        self.assertNotIn("ALL=(ALL", sudoers)                   # never root
+        self.assertNotIn("(root)", sudoers)
+
     def test_shell_actions_are_real_daemon_action_names(self):
         names = tpl.daemon_action_names()
         for a in vs.COMMAND_ACTIONS.values():
@@ -661,6 +689,66 @@ class TestCommands(unittest.TestCase):
                 self.assertNotIn(verb, row)
         finally:
             vs.RENDERED_DEVICES = old
+
+    def test_enable_and_disable_reseat_through_the_wrapper(self):
+        real_uid, real_tty = os.geteuid, sys.stdin.isatty
+        try:
+            sys.stdin.isatty = lambda: True
+            # read seat: enable hands back to the wrapper with EXIT_ENABLE
+            os.geteuid = lambda: vs.SHELL_UID
+            buf = io.StringIO()
+            sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h")
+            self.assertTrue(sh.default("enable"))
+            self.assertEqual(sh.exit_code, vs.EXIT_ENABLE)
+            self.assertIn("sudo will ask for your password", buf.getvalue())
+            # admin seat: starts privileged, disable hands back with EXIT_DISABLE
+            os.geteuid = lambda: vs.ADMIN_UID
+            buf = io.StringIO()
+            sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h", privileged=True)
+            self.assertEqual(sh.prompt, "h#")
+            self.assertFalse(sh.default("enable"))             # already there
+            self.assertTrue(sh.default("disable"))
+            self.assertEqual(sh.exit_code, vs.EXIT_DISABLE)
+            # any other uid: mode only, with the honest note
+            os.geteuid = lambda: 1000
+            buf = io.StringIO()
+            sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h")
+            self.assertFalse(sh.default("enable"))
+            self.assertEqual(sh.prompt, "h#")
+            self.assertIn("% mode only: uid 1000 keeps its own ceiling", buf.getvalue())
+            self.assertFalse(sh.default("disable"))
+            self.assertEqual(sh.prompt, "h>")
+            # scripted stdin never re-seats (no terminal for sudo to ask on)
+            sys.stdin.isatty = lambda: False
+            os.geteuid = lambda: vs.SHELL_UID
+            sh = vs.VirpShell(sock_path="/nonexistent", stdout=io.StringIO(), host="h")
+            self.assertFalse(sh.default("enable"))
+            self.assertEqual(sh.exit_code, 0)
+        finally:
+            os.geteuid, sys.stdin.isatty = real_uid, real_tty
+
+    def test_show_whoami_reports_seat_and_ceiling(self):
+        doc = tpl.render(TEMPLATE)
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "devices.json")
+        with open(path, "w") as f:
+            json.dump(doc, f)
+        old, real_uid = vs.RENDERED_DEVICES, os.geteuid
+        vs.RENDERED_DEVICES = path
+        try:
+            for uid, seat, ceiling in ((vs.SHELL_UID, "read seat", "green"),
+                                       (vs.ADMIN_UID, "admin seat", "yellow")):
+                os.geteuid = lambda uid=uid: uid
+                buf = io.StringIO()
+                sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h")
+                sh.default("show whoami")
+                out = buf.getvalue()
+                self.assertIn(seat, out)
+                self.assertIn(ceiling, out)
+                self.assertIn("allowlisted  yes", out)
+                self.assertIn("execute", out)
+        finally:
+            vs.RENDERED_DEVICES, os.geteuid = old, real_uid
 
     def test_refuses_root_and_notes_wrong_uid(self):
         # main() must refuse euid 0 without touching anything.

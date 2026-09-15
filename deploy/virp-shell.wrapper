@@ -1,11 +1,38 @@
 #!/bin/sh
-# /usr/local/bin/virp-shell — run the read-only operator REPL as uid 988.
+# /usr/local/bin/virp-shell — run the operator REPL as a VIRP seat.
 #
 # The shell is a plain socket client; the O-Node judges it by SO_PEERCRED,
-# so the seat IS the uid. This wrapper only changes identity, never
-# privilege: it execs sudo -u virp-shell (a nologin system account in
-# group virp), never root. The sudoers rule that lets an operator do this
-# is the operator's own, e.g.
-#   %virp ALL=(virp-shell) NOPASSWD: /usr/bin/python3 /usr/local/lib/virp/virp-shell
+# so the SEAT IS THE UID. This wrapper only changes identity, never
+# privilege, and never runs anything as root:
+#
+#   read seat   virp-shell        uid 988  GREEN ceiling   sudo NOPASSWD
+#   admin seat  virp-shell-admin  uid 985  YELLOW ceiling  sudo PASSWD (your password)
+#
+# `enable` inside the shell exits with 42: this loop re-runs the program as
+# virp-shell-admin through the PASSWD rule (sudo -k, so it asks every time,
+# IOS-style). `disable` exits with 43 and the loop comes back to the read
+# seat. A wrong password lands you back at the read seat. Everything else
+# is the shell's own exit status. Rules: deploy/sudoers-virp-shell.
 # Installed by `make install-virp-shell` from deploy/virp-shell.wrapper.
-exec sudo -u virp-shell -- /usr/bin/python3 /usr/local/lib/virp/virp-shell "$@"
+
+SHELL_PY=/usr/local/lib/virp/virp-shell
+seat=virp-shell
+while :; do
+    if [ "$seat" = virp-shell-admin ]; then
+        sudo -k -p 'Password: ' -u virp-shell-admin -- /usr/bin/python3 "$SHELL_PY" --privileged "$@"
+    else
+        sudo -u virp-shell -- /usr/bin/python3 "$SHELL_PY" "$@"
+    fi
+    rc=$?
+    case "$rc" in
+        42) seat=virp-shell-admin ;;
+        43) seat=virp-shell ;;
+        *)  if [ "$seat" = virp-shell-admin ] && [ "$rc" -ne 0 ]; then
+                # sudo refused (bad password, no rule): stay usable at the read seat.
+                echo "% enable failed (sudo exit $rc); back at the read seat" >&2
+                seat=virp-shell
+            else
+                exit "$rc"
+            fi ;;
+    esac
+done

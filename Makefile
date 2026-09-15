@@ -1864,8 +1864,12 @@ VIRP_SHELL_SRC     = tools/virp-shell.py
 VIRP_SHELL_WRAPPER = deploy/virp-shell.wrapper
 VIRP_SHELL_UID     = 988
 VIRP_SHELL_USER    = virp-shell
+VIRP_SHELL_ADMIN_UID  = 985
+VIRP_SHELL_ADMIN_USER = virp-shell-admin
+VIRP_SHELL_SUDOERS = deploy/sudoers-virp-shell
 VIRP_INSTALL_SHELL         = $(VIRP_INSTALL_DIR)/virp-shell
 VIRP_INSTALL_SHELL_WRAPPER = /usr/local/bin/virp-shell
+VIRP_INSTALL_SHELL_SUDOERS = /etc/sudoers.d/virp-shell
 
 .PHONY: install-virp-shell
 install-virp-shell:
@@ -1881,8 +1885,19 @@ install-virp-shell:
 	    echo "FAIL: $(VIRP_SHELL_USER) is uid $$(id -u $(VIRP_SHELL_USER)), not $(VIRP_SHELL_UID)"; exit 1; }
 	@[ "$$(id -gn $(VIRP_SHELL_USER))" = "virp" ] || { \
 	    echo "FAIL: $(VIRP_SHELL_USER)'s primary group is $$(id -gn $(VIRP_SHELL_USER)), not virp (the socket is group-rw)"; exit 1; }
+	@id -u $(VIRP_SHELL_ADMIN_USER) >/dev/null 2>&1 || { \
+	    echo "FAIL: user $(VIRP_SHELL_ADMIN_USER) does not exist (the 'enable' seat). Create it first:"; \
+	    echo "  useradd --system --uid $(VIRP_SHELL_ADMIN_UID) -g virp --shell /usr/sbin/nologin $(VIRP_SHELL_ADMIN_USER)"; \
+	    exit 1; }
+	@[ "$$(id -u $(VIRP_SHELL_ADMIN_USER))" = "$(VIRP_SHELL_ADMIN_UID)" ] || { \
+	    echo "FAIL: $(VIRP_SHELL_ADMIN_USER) is uid $$(id -u $(VIRP_SHELL_ADMIN_USER)), not $(VIRP_SHELL_ADMIN_UID)"; exit 1; }
+	@[ "$$(id -gn $(VIRP_SHELL_ADMIN_USER))" = "virp" ] || { \
+	    echo "FAIL: $(VIRP_SHELL_ADMIN_USER)'s primary group is $$(id -gn $(VIRP_SHELL_ADMIN_USER)), not virp"; exit 1; }
+	@visudo -cf $(VIRP_SHELL_SUDOERS) >/dev/null || { echo "FAIL: $(VIRP_SHELL_SUDOERS) does not parse"; exit 1; }
 	install -m 0755 -o root -g virp $(VIRP_SHELL_SRC) $(VIRP_INSTALL_SHELL)
 	install -m 0755 -o root -g root $(VIRP_SHELL_WRAPPER) $(VIRP_INSTALL_SHELL_WRAPPER)
+	install -m 0440 -o root -g root $(VIRP_SHELL_SUDOERS) $(VIRP_INSTALL_SHELL_SUDOERS)
+	@visudo -c >/dev/null || { echo "FAIL: sudoers no longer parses after install"; exit 1; }
 	@if getent group systemd-journal >/dev/null; then \
 	    usermod -a -G systemd-journal $(VIRP_SHELL_USER) && \
 	    echo "  $(VIRP_SHELL_USER) added to systemd-journal (show log / show services)"; \

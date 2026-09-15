@@ -15,7 +15,7 @@ Deployed on virp-lab (10.0.10.211) 2026-09-15. Source: `tools/virp-shell.py`
 | Prompt | Mode | How you get there |
 |---|---|---|
 | `virp-lab>` | exec | start |
-| `virp-lab#` | privileged exec | `enable` (mode only; sudoers is the real gate) |
+| `virp-lab#` | privileged exec = **the admin seat, uid 985** | `enable` → sudo asks **your** password, the wrapper re-runs the shell as `virp-shell-admin` (ceiling YELLOW); `disable` returns to uid 988 |
 | `virp-lab(config)#` | config | `configure terminal` (from `#`) |
 | `virp-lab(config-SW-3850)#` | device context | `device <name>` |
 
@@ -42,6 +42,28 @@ IOS conventions: abbreviations (`sh dev`, `sh dev SW-3850`, `conf t`, `en`),
 `?` at any point lists what can come next **without submitting** (your
 line is re-typed for you), Tab completes words and device names. Errors
 begin with `% `.
+
+## `enable` — the tier is chained with your password
+
+`enable` is a real identity change, not a prompt character. The wrapper
+(`/usr/local/bin/virp-shell`) re-runs the shell as **`virp-shell-admin`
+(uid 985)** through a sudo **PASSWD** rule, so sudo asks for *your* login
+password (PAM — TACACS-able later), logs the escalation, and the O-Node
+judges the new uid with its own ceiling:
+
+| seat | uid | ceiling | what a config line does |
+|---|---|---|---|
+| read (`>`) | 988 `virp-shell` | GREEN | reads execute; YELLOW/RED → proposal |
+| admin (`#`) | 985 `virp-shell-admin` | YELLOW | reads execute; **YELLOW applies**; RED → proposal |
+
+BLACK never runs from either seat, and neither seat can approve anything:
+proposer and approver stay two people. Every `[GATE]` line and chain entry
+carries the uid, so `show chain` / the daemon log show which seat did what.
+`show whoami` prints the live seat, ceiling and verbs. A wrong password
+lands you back at `>`. `disable` re-runs the shell as uid 988.
+
+Note: session-local state (`show proposals`) does not cross the seat
+boundary — the chain has it.
 
 ## Config mode — what actually happens
 

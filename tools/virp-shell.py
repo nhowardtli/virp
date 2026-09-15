@@ -69,6 +69,15 @@ except ImportError:          # pragma: no cover
 
 SHELL_UID = 988
 SHELL_USER = "virp-shell"
+# `enable` is a real identity change, not a flag: the wrapper re-runs this
+# program as the admin seat through sudo (PASSWD rule, so the operator's own
+# password is asked), and the gate judges that uid with its own (YELLOW)
+# ceiling. The chain and the daemon log carry the uid, so the escalation is
+# on the record. `disable` goes back the same way.
+ADMIN_UID = 985
+ADMIN_USER = "virp-shell-admin"
+EXIT_ENABLE = 42       # wrapper: re-run as virp-shell-admin (sudo asks a password)
+EXIT_DISABLE = 43      # wrapper: re-run as virp-shell
 ONODE_SOCKET = os.environ.get("VIRP_SHELL_SOCKET", "/run/virp/onode.sock")
 RENDERED_DEVICES = "/run/virp/devices.json"        # what the daemon loaded
 TEMPLATE_DEVICES = "/etc/virp/devices.template.json"
@@ -487,6 +496,7 @@ COMMAND_TREE = {
         "uid": (None, 0, 1),
         "log": (None, 0, 1),
         "version": (None, 0, 0),
+        "whoami": (None, 0, 0),
     },
     "verify": {
         "chain": (None, 1, 3),
@@ -516,11 +526,12 @@ COMMAND_HELP = {
     "show uid": "Per-uid allowlist and ceiling from the loaded template",
     "show log": "Last N journal lines for virp-onode (local, read-only)",
     "show version": "Installed binary sha256, build string, node_id, DEPLOYED.md head",
+    "show whoami": "This seat: uid, user, tier ceiling and verbs the gate grants it",
     "verify chain": "chain_verify <session-id> [from] [to] via the gate",
     "configure terminal": "Enter config mode; then `device <name>` to pick the target",
     "device": "(config) Select the device the next lines are sent to, through the gate",
-    "enable": "Enter privileged mode (mode only, no password in phase 1)",
-    "disable": "Leave privileged mode",
+    "enable": "Become the admin seat (uid 985, YELLOW ceiling) — your password is asked",
+    "disable": "Back to the read seat (uid 988, GREEN ceiling)",
     "end": "Return to privileged exec mode",
     "exit": "Leave the shell",
     "quit": "Leave the shell",
@@ -728,11 +739,12 @@ class VirpShell(cmd.Cmd):
              "config mode proposes, never applies). Type ? for commands.")
     doc_header = "Commands (abbreviations accepted, e.g. sh dev):"
 
-    def __init__(self, sock_path=None, stdout=None, host=None):
+    def __init__(self, sock_path=None, stdout=None, host=None, privileged=False):
         super().__init__(stdout=stdout)
         self.sock_path = sock_path or ONODE_SOCKET
         self.host = host or socket.gethostname().split(".")[0]
-        self.privileged = False
+        self.privileged = privileged
+        self.exit_code = 0          # EXIT_ENABLE / EXIT_DISABLE ask the wrapper to re-seat
         self.mode = "exec"          # exec | config
         self.device = None          # (config-<device>)# context
         self.proposals = []         # (when, device, command, tier, proposal_id)
@@ -1116,13 +1128,55 @@ class VirpShell(cmd.Cmd):
 
     # -- modes / misc -----------------------------------------------------
     def cmd_enable(self, args):
+        if self.privileged:
+            return False
+        if os.geteuid() == SHELL_UID and sys.stdin.isatty():
+            # Real escalation: hand back to the wrapper, which re-runs this
+            # program as virp-shell-admin through a PASSWD sudo rule. The
+            # password prompt is sudo's; a wrong password lands you back
+            # here at '>'. Session-local state (show proposals) does not
+            # cross the seat boundary — the chain has it.
+            self.out("Escalating to the admin seat (%s, uid %d) — sudo will ask "
+                     "for your password." % (ADMIN_USER, ADMIN_UID))
+            self.exit_code = EXIT_ENABLE
+            return True
+        # Not the read seat (a bare uid running the file, tests, scripts):
+        # mode only, and say so — the gate still judges this uid's ceiling.
         self.privileged = True
         self._set_prompt()
+        if os.geteuid() not in (SHELL_UID, ADMIN_UID):
+            self.out("%% mode only: uid %d keeps its own ceiling (see show whoami)"
+                     % os.geteuid())
 
     def cmd_disable(self, args):
+        if os.geteuid() == ADMIN_UID and sys.stdin.isatty():
+            self.out("Back to the read seat (%s, uid %d)." % (SHELL_USER, SHELL_UID))
+            self.exit_code = EXIT_DISABLE
+            return True
         self.privileged = False
         self.mode, self.device = "exec", None
         self._set_prompt()
+
+    def cmd_show_whoami(self, args):
+        uid = os.geteuid()
+        seat = {SHELL_UID: "read seat", ADMIN_UID: "admin seat"}.get(uid, "not a shell seat")
+        rows = [("uid", uid), ("user", username(uid)), ("seat", seat),
+                ("mode", "privileged" if self.privileged else "exec")]
+        try:
+            doc, src = load_uid_policy()
+            u = str(uid)
+            ceilings = {str(k): v for k, v in (doc.get("socket_uid_tier_ceilings") or {}).items()}
+            actions = {str(k): v for k, v in (doc.get("socket_uid_action_allow") or {}).items()}
+            allowed = [str(x) for x in doc.get("socket_allowed_uids", [])]
+            rows.append(("allowlisted", "yes" if u in allowed else "NO — the gate refuses this uid"))
+            rows.append(("ceiling", ceilings.get(u, "node-wide (%s)" % doc.get("gate_max_tier", "?"))))
+            rows.append(("verbs", " ".join(actions.get(u, [])) or "-"))
+            rows.append(("policy", src))
+        except GateError as e:
+            rows.append(("policy", "% " + str(e)))
+        self.out(table(rows, ("field", "value")))
+        self.out("GREEN reads execute; YELLOW applies only at or above a YELLOW ceiling, "
+                 "else a proposal; RED is always a proposal; BLACK never runs.")
 
     def cmd_end(self, args):
         # IOS: end leaves config mode and lands in privileged exec.
@@ -1237,22 +1291,31 @@ def main(argv=None):
         sys.stderr.write("%% refusing to run as root; use the %s wrapper "
                          "(uid %d)\n" % (SHELL_USER, SHELL_UID))
         return 2
-    if os.geteuid() != SHELL_UID:
-        sys.stderr.write("%% note: running as uid %d, not %d (%s); the gate "
-                         "judges the PEER uid, so this session is not the "
-                         "virp-shell seat\n" % (os.geteuid(), SHELL_UID, SHELL_USER))
+    if os.geteuid() not in (SHELL_UID, ADMIN_UID):
+        sys.stderr.write("%% note: running as uid %d, not %d (%s) or %d (%s); the "
+                         "gate judges the PEER uid, so this session is not a "
+                         "virp-shell seat\n" % (os.geteuid(), SHELL_UID, SHELL_USER,
+                                                ADMIN_UID, ADMIN_USER))
     sock_path = None
     once = None
+    privileged = False
     while argv:
         a = argv.pop(0)
         if a == "--socket" and argv:
             sock_path = argv.pop(0)
         elif a == "-c" and argv:
             once = argv.pop(0)
+        elif a == "--privileged":
+            privileged = True
         else:
-            sys.stderr.write("usage: virp-shell [--socket PATH] [-c 'command']\n")
+            sys.stderr.write("usage: virp-shell [--socket PATH] [--privileged] [-c 'command']\n")
             return 2
-    sh = VirpShell(sock_path=sock_path)
+    if privileged and os.geteuid() != ADMIN_UID:
+        # The flag only means something when the wrapper actually re-seated
+        # us; a bare uid asking for it gets the mode, not the ceiling.
+        sys.stderr.write("%% note: --privileged as uid %d, not %d (%s); the gate "
+                         "judges the PEER uid\n" % (os.geteuid(), ADMIN_UID, ADMIN_USER))
+    sh = VirpShell(sock_path=sock_path, privileged=privileged)
     if once is not None:
         sh.default(once)
         return 0
@@ -1260,7 +1323,7 @@ def main(argv=None):
         sh.cmdloop()
     except KeyboardInterrupt:
         sh.out("")
-    return 0
+    return sh.exit_code
 
 
 if __name__ == "__main__":
