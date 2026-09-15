@@ -1,0 +1,23 @@
+DEMO LAB — nothing here is real
+
+You are using fake FRR routers and two in-process Cisco-like mock targets.
+Reads execute through the gate. This seat cannot approve or apply changes.
+The node signs observations; this shell cannot verify HMACs without its key.
+State resets daily at 04:00 in the VM's configured timezone.
+
+Type these commands, one per line. Replace <yourname> with your name:
+
+show devices
+show device frr1
+enable
+configure terminal
+device frr1
+show ip route
+interface eth1 description hello-from-<yourname>
+end
+show proposals
+show chain 5
+
+Expected: show ip route executes as GREEN. The description becomes a
+PROPOSED change, not an applied configuration. Do not paste these explanatory
+paragraphs into the prompt. Type exit to leave.

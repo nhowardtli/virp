@@ -1,0 +1,94 @@
+{
+  "_demo_only": "DEMO LAB: VM219 only. Never render a production template here. No real device or credential.",
+  "_demo_approver_key": "Generate a DEMO approval key on VM219 with virp-tool keygen approval and enroll its public half locally. The private key exists nowhere else; never export it.",
+  "_visitor_session": "uid988 can append only evidence_item correlation records in this demo. Production templates are unchanged. Visitor identity is a random login session, not a verified human identity.",
+  "gate_default_mode": "enforce",
+  "gate_max_tier": "yellow",
+  "socket_allowed_uids": [
+    "${VIRP_UID}",
+    988
+  ],
+  "socket_uid_tier_ceilings": {
+    "${VIRP_UID}": "yellow",
+    "988": "green"
+  },
+  "socket_uid_action_allow": {
+    "${VIRP_UID}": [
+      "list_fleet",
+      "list_sessions",
+      "heartbeat",
+      "chain_verify",
+      "chain_verify_session"
+    ],
+    "988": [
+      "list_fleet",
+      "list_sessions",
+      "health",
+      "heartbeat",
+      "chain_verify",
+      "execute",
+      "chain_append"
+    ]
+  },
+  "socket_uid_chain_append_types": {
+    "988": [
+      "evidence_item"
+    ]
+  },
+  "devices": [
+    {
+      "hostname": "frr1",
+      "node_id": "DE002101",
+      "host": "172.31.219.11",
+      "vendor": "cisco",
+      "username": "demo-frr",
+      "password": "${VIRP_DEMO_FRR_PASSWORD}",
+      "port": 22,
+      "_note": "Fake FRR container with vtysh login; IOS-style SSH driver preserves printed show commands. No Cisco image or real credential."
+    },
+    {
+      "hostname": "frr2",
+      "node_id": "DE002102",
+      "host": "172.31.219.12",
+      "vendor": "cisco",
+      "username": "demo-frr",
+      "password": "${VIRP_DEMO_FRR_PASSWORD}",
+      "port": 22,
+      "_note": "Fake FRR container with vtysh login; IOS-style SSH driver preserves printed show commands. No Cisco image or real credential."
+    },
+    {
+      "hostname": "frr3",
+      "node_id": "DE002103",
+      "host": "172.31.219.13",
+      "vendor": "cisco",
+      "username": "demo-frr",
+      "password": "${VIRP_DEMO_FRR_PASSWORD}",
+      "port": 22,
+      "_note": "Fake FRR container with vtysh login; IOS-style SSH driver preserves printed show commands. No Cisco image or real credential."
+    },
+    {
+      "hostname": "frr4",
+      "node_id": "DE002104",
+      "host": "172.31.219.14",
+      "vendor": "cisco",
+      "username": "demo-frr",
+      "password": "${VIRP_DEMO_FRR_PASSWORD}",
+      "port": 22,
+      "_note": "Fake FRR container with vtysh login; IOS-style SSH driver preserves printed show commands. No Cisco image or real credential."
+    },
+    {
+      "hostname": "R5",
+      "node_id": "DE002105",
+      "host": "R5",
+      "vendor": "mock",
+      "_note": "In-process repository mock driver (tests/test_onode.c); no network endpoint or credentials."
+    },
+    {
+      "hostname": "R6",
+      "node_id": "DE002106",
+      "host": "R6",
+      "vendor": "mock",
+      "_note": "In-process repository mock driver (tests/test_onode.c); no network endpoint or credentials."
+    }
+  ]
+}
