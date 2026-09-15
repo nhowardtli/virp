@@ -20,6 +20,7 @@ exec unshare -Umr bwrap \
     --symlink usr/bin /bin --symlink usr/sbin /sbin \
     --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
     --tmpfs /etc --ro-bind /etc/ssl /etc/ssl \
+    --ro-bind /etc/alternatives /etc/alternatives \
     --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
     --ro-bind /etc/passwd /etc/passwd --ro-bind /etc/group /etc/group \
     --dir /var --dir /run --dir /opt \
