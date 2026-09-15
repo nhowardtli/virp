@@ -763,7 +763,7 @@ class VirpShell(cmd.Cmd):
             if self.mode != "config" and str(e).startswith("Invalid input") \
                and tokens and _match(tokens[0].lower(), ["show"]) == ["show"]:
                 # Looks like a device command typed at the O-Node prompt.
-                self.out("% this prompt is the O-Node, not a device. To run "
+                self.out("%% this prompt is the O-Node, not a device. To run "
                          "that on a device:  enable → configure terminal → "
                          "device <name> → %s" % line)
             return False
