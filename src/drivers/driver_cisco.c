@@ -1528,8 +1528,16 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
 
     memset(result, 0, sizeof(*result));
 
-    /* ── BLACK tier safety: never execute destructive commands ── */
-    if (cisco_is_black_tier(command)) {
+    /* ── BLACK tier safety: never execute destructive commands ──
+     * … except under the PASSTHROUGH ceiling (2026-09-15), where the
+     * daemon has already decided and said so on its own line; this is
+     * the driver's own loud record of the same fact. */
+    if (cisco_is_black_tier(command) && virp_exec_passthrough) {
+        fprintf(stderr, "[Cisco] BLACK PASSTHROUGH: '%s' on %s — the "
+                "backstop yields to the passthrough ceiling; any "
+                "confirmation prompt will be answered\n",
+                command, conn->device.hostname);
+    } else if (cisco_is_black_tier(command)) {
         result->success = false;
         result->exit_code = 1;
         snprintf(result->error_msg, sizeof(result->error_msg),
@@ -1625,6 +1633,57 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
     clock_gettime(CLOCK_MONOTONIC, &end);
     result->exec_time_ms = (uint64_t)((end.tv_sec - start.tv_sec) * 1000 +
                                        (end.tv_nsec - start.tv_nsec) / 1000000);
+
+    /* PASSTHROUGH confirmation (2026-09-15). A BLACK command under the
+     * passthrough ceiling typically stops at a confirmation prompt that
+     * is not the learned prompt — IOS "[confirm]", NX-OS "(y/n)? [n]",
+     * "[yes/no]" — and the read times out there. Answer it ONCE, then
+     * treat the session as gone: a reload drops the channel, an erase
+     * may not, and neither outcome can be proven from here. The result
+     * is recorded honestly as sent-and-confirmed with the outcome
+     * unknown, never as success, and the connection is marked down so
+     * the next request reconnects fresh. Nothing but a BLACK passthrough
+     * command ever gets a confirmation answered. */
+    if (rerr == VIRP_ERR_NO_PROMPT && virp_exec_passthrough &&
+        cisco_is_black_tier(command)) {
+        if (n >= sizeof(raw_output)) n = sizeof(raw_output) - 1;
+        raw_output[n] = '\0';
+        const char *answer = NULL;
+        if (strstr(raw_output, "[confirm]"))
+            answer = "";                       /* Enter */
+        else if (strstr(raw_output, "(y/n)") || strstr(raw_output, "[yes/no]") ||
+                 strstr(raw_output, "(yes/no)"))
+            answer = "y";
+        if (answer) {
+            char raw2[4096];
+            size_t n2 = 0;
+            fprintf(stderr, "[Cisco] BLACK PASSTHROUGH on %s: '%s' asked for "
+                    "confirmation — answering '%s'\n", conn->device.hostname,
+                    command, answer[0] ? answer : "<Enter>");
+            (void)virp_ssh_exec(&conn->io, &conn->prompt, answer,
+                                raw2, sizeof(raw2), &n2, SSH_MODE_SETTLE_MS,
+                                conn->device.hostname);
+            if (n2 >= sizeof(raw2)) n2 = sizeof(raw2) - 1;
+            raw2[n2] = '\0';
+            conn->connected = false;
+            char transcript[VIRP_OUTPUT_MAX];
+            /* Bounded on both halves so the whole line always fits. */
+            snprintf(transcript, sizeof(transcript),
+                     "%.30000s\n[passthrough answered: %s]\n%.30000s",
+                     raw_output, answer[0] ? answer : "<Enter>", raw2);
+            virp_error_t werr = cisco_store_output(result, conn->device.hostname,
+                                                   command, transcript, false);
+            result->success = false;           /* never claimed: outcome unknown */
+            result->exit_code = 1;
+            result->exit_code_trusted = false;
+            snprintf(result->error_msg, sizeof(result->error_msg),
+                     "BLACK PASSTHROUGH: '%s' sent and confirmed on %s; the "
+                     "session is treated as ended — outcome unknown (expected "
+                     "for reload/erase)", command, conn->device.hostname);
+            fprintf(stderr, "[Cisco] %s\n", result->error_msg);
+            return werr;
+        }
+    }
 
     if (rerr == VIRP_ERR_NO_PROMPT && is_mode_changing) {
         /*

@@ -918,7 +918,10 @@ static virp_error_t fg_execute(virp_conn_t *base_conn,
     memset(result, 0, sizeof(*result));
 
     /* ── BLACK tier safety: never execute destructive commands ── */
-    if (fg_is_black_tier(command)) {
+    if (fg_is_black_tier(command) && virp_exec_passthrough) {
+        fprintf(stderr, "[FortiGate] BLACK PASSTHROUGH: '%s' on %s — backstop "
+                "yields to the passthrough ceiling\n", command, conn->device.hostname);
+    } else if (fg_is_black_tier(command)) {
         result->success = false;
         result->exit_code = 1;
         snprintf(result->error_msg, sizeof(result->error_msg),

@@ -57,6 +57,7 @@ judges the new uid with its own ceiling:
 | admin (`#`) | 985 `virp-shell-admin` | YELLOW | reads execute; **YELLOW applies** (on IOS today that is `interface <name> description …` — see docs/notes/cisco-description-yellow-2026-09-15.md); RED → proposal |
 
 | RED (`#`, via `enable red` / `enable 15`) | 984 `virp-shell-red` | RED | reads execute; **YELLOW and RED apply**; BLACK never |
+| **own login (open seat)** — the wrapper runs the shell as *you* when your uid has its own policy row; no sudo, no `enable` | your uid | whatever your row says: `green` / `yellow` / `red` / **`black`** | `black` = **passthrough**: everything applies, `reload` and `write erase` included, confirmation prompts answered, every line chained under your name. ISE accounting with a hash chain behind it. |
 
 `enable red` is a third seat, not a wider admin seat: the password is asked
 again (even from `#`), the daemon judges uid 984, and every change made

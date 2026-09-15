@@ -1020,7 +1020,10 @@ static virp_error_t asa_execute(virp_conn_t *conn,
      * invariant. Consider moving this one before asa's connected check to
      * match. Left as-is for now to keep this change scoped to linux. */
     virp_trust_tier_t tier = asa_route_command(command);
-    if (tier == VIRP_TIER_BLACK) {
+    if (tier == VIRP_TIER_BLACK && virp_exec_passthrough) {
+        fprintf(stderr, "[ASA] BLACK PASSTHROUGH: '%s' on %s — backstop yields "
+                "to the passthrough ceiling\n", command, conn->device.hostname);
+    } else if (tier == VIRP_TIER_BLACK) {
         result->success = false;
         result->exit_code = 1;
         snprintf(result->error_msg, sizeof(result->error_msg),

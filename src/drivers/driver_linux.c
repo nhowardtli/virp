@@ -349,7 +349,10 @@ static virp_error_t linux_execute(virp_conn_t *conn,
      * than the ASA driver, which refuses BLACK only after the connected
      * check.)
      */
-    if (linux_gate_tier(command) == VIRP_TIER_BLACK) {
+    if (linux_gate_tier(command) == VIRP_TIER_BLACK && virp_exec_passthrough) {
+        fprintf(stderr, "[Linux] BLACK PASSTHROUGH: '%s' on %s — backstop yields "
+                "to the passthrough ceiling\n", command, conn->device.hostname);
+    } else if (linux_gate_tier(command) == VIRP_TIER_BLACK) {
         result->success = false;
         result->exit_code = 1;
         result->no_dispatch = true;   /* nothing was ever sent */

@@ -19,6 +19,20 @@
 #include <stdbool.h>
 
 /* =========================================================================
+ * BLACK passthrough (2026-09-15)
+ *
+ * A uid whose per-uid tier ceiling is "black" is a PASSTHROUGH identity:
+ * the gate still classifies and records the tier, but applies everything,
+ * BLACK included — the CCIE who has to reload a hung core at 2 a.m., on the
+ * record, under their own name. The daemon sets this thread-local for the
+ * duration of ONE execute() call from such a uid and clears it after; the
+ * calling worker thread is the only reader, so no lock is involved and no
+ * other request on the same device connection can observe it. Every CLI
+ * driver's BLACK backstop honours it (and logs it); REST drivers do not.
+ * ========================================================================= */
+extern _Thread_local bool virp_exec_passthrough;
+
+/* =========================================================================
  * Driver Identification
  * ========================================================================= */
 

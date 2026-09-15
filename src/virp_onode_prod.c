@@ -287,9 +287,18 @@ static void load_uid_tier_ceilings(onode_state_t *state,
         if      (strcasecmp(s, "green")  == 0) tier = VIRP_TIER_GREEN;
         else if (strcasecmp(s, "yellow") == 0) tier = VIRP_TIER_YELLOW;
         else if (strcasecmp(s, "red")    == 0) tier = VIRP_TIER_RED;
+        else if (strcasecmp(s, "black")  == 0) {
+            /* PASSTHROUGH (2026-09-15): this uid applies everything, BLACK
+             * included, on the record. Loud on purpose. */
+            tier = VIRP_TIER_BLACK;
+            fprintf(stderr, "[O-Node] socket_uid_tier_ceilings['%s'] = black: "
+                            "PASSTHROUGH identity — BLACK commands (reload, "
+                            "erase, format) will be APPLIED for this uid and "
+                            "recorded as BLACK PASSTHROUGH\n", key);
+        }
         else {
             fprintf(stderr, "[O-Node] socket_uid_tier_ceilings['%s'] = '%s' "
-                            "unrecognized (want green/yellow/red) — "
+                            "unrecognized (want green/yellow/red/black) — "
                             "skipping\n", key, s);
             continue;
         }

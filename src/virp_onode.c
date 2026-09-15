@@ -807,7 +807,11 @@ static const char *gate_tier_name(virp_trust_tier_t t)
 static bool gate_tier_blocks(virp_trust_tier_t tier, virp_trust_tier_t max_tier)
 {
     if (tier == VIRP_TIER_UNCLASSIFIED) return true;
-    if (tier == VIRP_TIER_BLACK)        return true;
+    /* BLACK is inexpressible for every ceiling except the explicit
+     * PASSTHROUGH ceiling (2026-09-15): a uid whose per-uid ceiling is
+     * literally "black" applies BLACK on the record. Nothing else — not
+     * RED, not the node-wide ceiling, not SHADOW — reaches it. */
+    if (tier == VIRP_TIER_BLACK)        return max_tier != VIRP_TIER_BLACK;
     return tier > max_tier;
 }
 
@@ -826,8 +830,16 @@ static virp_trust_tier_t onode_effective_max_tier(const onode_state_t *state,
     if (client_uid == (uid_t)-1) return eff;
     for (size_t i = 0; i < state->uid_ceiling_count; i++) {
         if (state->uid_ceiling_uids[i] == client_uid) {
-            if (state->uid_ceiling_tiers[i] < eff)
-                eff = state->uid_ceiling_tiers[i];
+            /* 2026-09-15: an EXPLICIT per-uid entry is authoritative in
+             * both directions. Until now a looser entry never bound
+             * ("only tightens"), which meant a seat written as RED on a
+             * node whose node-wide ceiling is YELLOW silently got YELLOW —
+             * found when the RED seat (uid 984) was added. The node-wide
+             * ceiling remains the default for every uid WITHOUT an entry,
+             * and the template's per-uid rows are policy the operator
+             * wrote on purpose: honour them, and say which one decided
+             * (onode_ceiling_source). "black" is the passthrough ceiling. */
+            eff = state->uid_ceiling_tiers[i];
             break;
         }
     }
@@ -849,8 +861,9 @@ static const char *onode_ceiling_source(const onode_state_t *state,
     if (client_uid == (uid_t)-1) return "node-wide";
     for (size_t i = 0; i < state->uid_ceiling_count; i++) {
         if (state->uid_ceiling_uids[i] == client_uid) {
-            return (state->uid_ceiling_tiers[i] <= state->gate_max_tier)
-                       ? "per-uid" : "node-wide";
+            /* Mirrors onode_effective_max_tier: an explicit entry decides. */
+            return (state->uid_ceiling_tiers[i] == VIRP_TIER_BLACK)
+                       ? "per-uid passthrough" : "per-uid";
         }
     }
     return "node-wide";
@@ -2518,7 +2531,8 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                 gate_tier_name(gate_tier),
                 gate_tier_name(eff_max),
                 (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
-                (gate_tier == VIRP_TIER_BLACK) ? "block"
+                (gate_tier == VIRP_TIER_BLACK)
+                    ? (eff_max == VIRP_TIER_BLACK ? "BLACK-PASSTHROUGH" : "block")
                 : mode == GATE_MODE_ENFORCE
                     ? (block ? "block" : "allow")
                     : (block ? "would-block" : "would-allow"),
@@ -2540,12 +2554,24 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
          * from an absence. Several drivers carry their own BLACK
          * backstop in execute(); this branch is what makes the
          * guarantee driver-independent (PAN-OS had no backstop). */
-        if (gate_tier == VIRP_TIER_BLACK) {
+        if (gate_tier == VIRP_TIER_BLACK && eff_max != VIRP_TIER_BLACK) {
             pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
             return gate_refuse_obs(state, device_name, dev_idx, drv,
                                    command, gate_tier, eff_max, mode,
                                    client_uid, obs_version,
                                    out_buf, out_buf_len, out_len);
+        }
+        if (gate_tier == VIRP_TIER_BLACK) {
+            /* PASSTHROUGH (2026-09-15): the ONLY way a BLACK command is
+             * ever dispatched — a uid whose per-uid ceiling is literally
+             * "black". Not mode-dependent, not approvable, never a
+             * proposal: it is a named human's own hand, on the record.
+             * The driver backstop reads virp_exec_passthrough (set just
+             * before dispatch below) and logs its own line. */
+            fprintf(stderr, "[GATE] BLACK PASSTHROUGH: uid=%ld device=%s "
+                    "command=\"%s\" — applying under the passthrough "
+                    "ceiling; recorded as tier=BLACK\n",
+                    (long)client_uid, device_name, command);
         }
 
         if (mode == GATE_MODE_ENFORCE && block &&
@@ -2896,7 +2922,10 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     memset(&result, 0, sizeof(result));   /* no_dispatch=false unless the
                                              driver proves otherwise */
     VIRP_FI("pre_exec");
+    /* Passthrough is scoped to exactly this dispatch on this thread. */
+    virp_exec_passthrough = (gate_eff_max == VIRP_TIER_BLACK);
     virp_error_t err = drv->execute(conn, command, &result);
+    virp_exec_passthrough = false;
     VIRP_FI("post_exec");
     if (err != VIRP_OK) {
         drop_connection(state, dev_idx);
@@ -2954,7 +2983,9 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         conn = get_connection(state, dev_idx);
         if (conn) {
             memset(&result, 0, sizeof(result));
+            virp_exec_passthrough = (gate_eff_max == VIRP_TIER_BLACK);
             err = drv->execute(conn, command, &result);
+            virp_exec_passthrough = false;
             if (err != VIRP_OK) {
                 drop_connection(state, dev_idx);
                 pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -6208,13 +6239,16 @@ virp_error_t onode_set_uid_ceilings(onode_state_t *state,
     if (count > ONODE_MAX_ALLOWED_UIDS)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
     for (size_t i = 0; i < count; i++) {
-        /* A ceiling entry for a uid NOT on the allowlist can never take
-         * effect (the connection is refused at accept), and a BLACK
-         * "ceiling" would forbid everything — reject both as config
-         * errors rather than store a rule that misleads an auditor. */
+        /* GREEN/YELLOW/RED bound what the uid may execute. BLACK
+         * (2026-09-15) is NOT "forbid everything": it is the PASSTHROUGH
+         * ceiling — the uid's BLACK commands are dispatched, logged as
+         * decision=BLACK-PASSTHROUGH and chained like any other. The prod
+         * loader only produces it from the literal string "black" and
+         * logs loudly when it does. Anything else is a config error. */
         if (tiers[i] != VIRP_TIER_GREEN &&
             tiers[i] != VIRP_TIER_YELLOW &&
-            tiers[i] != VIRP_TIER_RED)
+            tiers[i] != VIRP_TIER_RED &&
+            tiers[i] != VIRP_TIER_BLACK)
             return VIRP_ERR_INVALID_TYPE;
         state->uid_ceiling_uids[i]  = uids[i];
         state->uid_ceiling_tiers[i] = tiers[i];

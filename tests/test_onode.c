@@ -2195,6 +2195,57 @@ static int ceil_capture(onode_state_t *tmp, const char *cmd, uid_t uid,
     return (err == VIRP_OK) ? 0 : -1;
 }
 
+/* PASSTHROUGH ceiling (2026-09-15). A per-uid ceiling of BLACK is the one
+ * and only way a BLACK command is dispatched: the gate logs
+ * decision=BLACK-PASSTHROUGH and hands the command to the driver with
+ * virp_exec_passthrough set. Every other ceiling — including RED — still
+ * refuses BLACK outright. Also pins the same-day rule change that an
+ * EXPLICIT per-uid entry is authoritative in both directions: a RED entry
+ * on a YELLOW node now binds RED (threshold=RED), where before it was
+ * silently capped to the node-wide YELLOW. */
+TEST(test_per_uid_black_ceiling_is_passthrough_and_red_binds_above_node)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-CEIL", 0xE220000E), 0);
+    uid_t cu[2] = { CEIL_UID, CEIL_UID + 1 };
+    virp_trust_tier_t ct[2] = { VIRP_TIER_BLACK, VIRP_TIER_RED };
+    ASSERT_OK(onode_set_uid_ceilings(&tmp, cu, ct, 2));
+
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    char logbuf[4096];
+
+    /* BLACK ("selfdestruct" on the mock) from the PASSTHROUGH uid → dispatched. */
+    ceil_capture(&tmp, "selfdestruct", CEIL_UID, buf, sizeof(buf), &len,
+                 logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "decision=BLACK-PASSTHROUGH") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "[GATE] BLACK PASSTHROUGH: uid=") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "threshold=BLACK") != NULL);
+
+    /* The same BLACK from a RED-ceiling uid → refused, no passthrough line. */
+    ceil_capture(&tmp, "selfdestruct", CEIL_UID + 1, buf, sizeof(buf), &len,
+                 logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "decision=block") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "BLACK PASSTHROUGH") == NULL);
+
+    /* A RED command ("reload" is RED on the mock) from the RED uid on a
+     * YELLOW node: the explicit entry binds RED, so it is allowed. */
+    ceil_capture(&tmp, "reload", CEIL_UID + 1, buf, sizeof(buf), &len,
+                 logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=RED") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=allow") != NULL);
+
+    /* No entry → node-wide YELLOW still decides: "reload" blocked. */
+    ceil_capture(&tmp, "reload", CEIL_UID + 7, buf, sizeof(buf), &len,
+                 logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=YELLOW") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=block") != NULL);
+
+    /* The thread-local never leaks past a dispatch. */
+    ASSERT_EQ((int)virp_exec_passthrough, 0);
+    onode_destroy(&tmp);
+}
+
 TEST(test_per_uid_ceiling_caps_yellow_but_not_uncapped)
 {
     onode_state_t tmp;
@@ -8467,6 +8518,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_provable_no_dispatch_retry_retained);
     RUN_TEST(test_error_obs_gate_block_logs_as_error_not_change);
     RUN_TEST(test_per_uid_ceiling_caps_yellow_but_not_uncapped);
+    RUN_TEST(test_per_uid_black_ceiling_is_passthrough_and_red_binds_above_node);
 
     printf("\n--- Watchdog / execute serialization (finding N3) ---\n");
     RUN_TEST(test_watchdog_health_check_serialized_with_execute);

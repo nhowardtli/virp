@@ -43,7 +43,7 @@ the 2026-08 notes, marked unverified.
 | 984 | **`virp-shell-red`** — the shell's `enable red` seat (same verbs as 988/985, ceiling **RED**: IOS config lines apply without a proposal; BLACK still never; reached only via its own sudo PASSWD rule, password asked again) | *free — reserved for the same identity* | — | new 2026-09-15 |
 | 985 | **`virp-shell-admin`** — the shell's `enable` seat (same verbs as 988, ceiling **YELLOW**: YELLOW changes apply, RED still proposals; reached only via the sudo PASSWD rule in `deploy/sudoers-virp-shell`) | *free — reserved for the same identity* | — | new 2026-09-15 |
 | 987 | `virp-sean` — Sean's agent-VM requester (`chain_verify`, `chain_append`→`evidence_item`) | *free — reserved for the same identity* | — | .211 only |
-| 1000 | operator (nhoward) | operator | operator | full vocabulary incl. `shutdown` |
+| 1000 | operator (nhoward) — **ceiling `black` = PASSTHROUGH** (own login is the open seat; reload/erase apply, chained) | operator | operator | full vocabulary incl. `shutdown`; passthrough on virp-lab since 2026-09-15 (docs/notes/black-passthrough-2026-09-15.md) |
 | 1001 | — | `virp-laptop` — forward-only approver identity (laptop → 313 socket) | — | 313 only |
 
 ## Known drift (do not "fix" by renumbering without a ruling)

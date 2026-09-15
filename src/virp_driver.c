@@ -68,3 +68,8 @@ uint64_t virp_device_id_from_hostname(const char *hostname)
         id = (id << 8) | digest[i];
     return id;
 }
+
+/* BLACK passthrough (2026-09-15): set by the daemon for exactly one
+ * execute() on the calling thread, read by the CLI drivers' BLACK
+ * backstops. See the declaration in include/virp_driver.h. */
+_Thread_local bool virp_exec_passthrough = false;

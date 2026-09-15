@@ -1258,6 +1258,9 @@ class VirpShell(cmd.Cmd):
             ceilings = {str(k): v for k, v in (doc.get("socket_uid_tier_ceilings") or {}).items()}
             actions = {str(k): v for k, v in (doc.get("socket_uid_action_allow") or {}).items()}
             allowed = [str(x) for x in doc.get("socket_allowed_uids", [])]
+            if seat == "not a shell seat" and u in allowed:
+                # A named human's own login with a policy row: the open seat.
+                rows[2] = ("seat", "own login (open seat — your uid is the identity)")
             rows.append(("allowlisted", "yes" if u in allowed else "NO — the gate refuses this uid"))
             rows.append(("ceiling", ceilings.get(u, "node-wide (%s)" % doc.get("gate_max_tier", "?"))))
             rows.append(("verbs", " ".join(actions.get(u, [])) or "-"))
@@ -1282,6 +1285,10 @@ class VirpShell(cmd.Cmd):
         """What a command does from THIS seat, derived from its ceiling —
         never a fixed claim. BLACK is unreachable from every seat."""
         c = self.seat_ceiling()
+        if c == "black":
+            return ("This seat is PASSTHROUGH (ceiling BLACK): everything applies, "
+                    "reload/erase included, and every line is chained under your uid. "
+                    "Confirmation prompts are answered for you. Nothing asks permission.")
         if c == "red":
             return ("This seat's ceiling is RED: GREEN reads, YELLOW and RED changes all "
                     "apply; BLACK never runs.")
@@ -1406,7 +1413,7 @@ def main(argv=None):
         sys.stderr.write("%% refusing to run as root; use the %s wrapper "
                          "(uid %d)\n" % (SHELL_USER, SHELL_UID))
         return 2
-    if os.geteuid() not in (SHELL_UID, ADMIN_UID, RED_UID):
+    if os.geteuid() not in (SHELL_UID, ADMIN_UID, RED_UID) and "--own" not in argv:
         sys.stderr.write("%% note: running as uid %d, not %d (%s), %d (%s) or %d (%s); "
                          "the gate judges the PEER uid, so this session is not a "
                          "virp-shell seat\n" % (os.geteuid(), SHELL_UID, SHELL_USER,
@@ -1415,6 +1422,7 @@ def main(argv=None):
     once = None
     privileged = False
     red = False
+    own = False
     while argv:
         a = argv.pop(0)
         if a == "--socket" and argv:
@@ -1426,6 +1434,12 @@ def main(argv=None):
         elif a == "--red":
             privileged = True
             red = True
+        elif a == "--own":
+            # The OPEN seat: the wrapper found this uid's own policy row and
+            # ran us as that uid. Start privileged; the ceiling — up to
+            # "black" passthrough — is whatever the row says.
+            privileged = True
+            own = True
         else:
             sys.stderr.write("usage: virp-shell [--socket PATH] [--privileged [--red]] [-c 'command']\n")
             return 2
@@ -1440,6 +1454,9 @@ def main(argv=None):
                          "proposal. BLACK never runs. Everything is chained under this uid.\n"
                          % (RED_USER, RED_UID))
     sh = VirpShell(sock_path=sock_path, privileged=privileged)
+    if own:
+        sys.stderr.write("Open seat: uid %d (%s). %s\n"
+                         % (os.geteuid(), username(os.geteuid()), sh.ceiling_sentence()))
     if once is not None:
         sh.default(once)
         return 0
