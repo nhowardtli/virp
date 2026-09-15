@@ -129,6 +129,19 @@ class _PolicyChecks:
         self.assertEqual(inert, [], "action policy for non-allowed uid: %s"
                          % inert)
 
+    def test_every_chain_append_uid_has_a_type_policy(self):
+        # v0.2.1 daemon rule, mirrored: a uid that may chain_append MUST
+        # have a socket_uid_chain_append_types row or onode_start refuses.
+        # Pinned 2026-09-15 after the node2 template — written before
+        # v0.2.1 — refused startup on the first cutover attempt.
+        types = self.doc.get("socket_uid_chain_append_types") or {}
+        for uid, acts in self.policy.items():
+            if "chain_append" in acts:
+                with self.subTest(uid=uid):
+                    self.assertIn(uid, types,
+                                  "%s may chain_append but has no type row" % uid)
+                    self.assertTrue(types[uid], "%s: empty type list" % uid)
+
     def test_every_action_set_is_well_formed(self):
         for uid, actions in self.policy.items():
             with self.subTest(uid=uid):
