@@ -47,6 +47,8 @@ def signed_request(raw,signature,secret,now):
     return d
 
 def gate_event(event):
+    # Enable only the serializer's demo verb; peer credentials remain this process uid1502.
+    os.environ["VIRP_SHELL_DEMO_SESSION"] = "1"
     # Installed shell has no .py suffix.
     from importlib.machinery import SourceFileLoader
     m=SourceFileLoader('issuer_gate','/usr/local/lib/virp/virp-shell').load_module()
