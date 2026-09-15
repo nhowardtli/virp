@@ -1,0 +1,12 @@
+[Unit]
+Description=VM219 offline fake FRR ring
+Requires=docker.service
+After=docker.service network-online.target virp-demo-network.service
+Before=virp-onode.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/virp/demo/fleet-start.sh
+TimeoutStartSec=180
+[Install]
+WantedBy=multi-user.target

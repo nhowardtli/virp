@@ -1,0 +1,8 @@
+[Unit]
+Description=Reset isolated VIRP demo state
+Requires=virp-demo-fleet.service
+After=virp-demo-fleet.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/virp/demo/reset.py
+TimeoutStartSec=120

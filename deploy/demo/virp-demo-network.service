@@ -1,0 +1,11 @@
+[Unit]
+Description=VM219 network boundary and prohibited routes
+After=network-online.target
+Wants=network-online.target
+Before=virp-onode.service virp-demo-fleet.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /usr/local/lib/virp/demo/network.py --management-interface eth0 --container-bridge br-demo --dns 10.0.20.1 --ntp 10.0.20.1 --apply
+[Install]
+WantedBy=multi-user.target

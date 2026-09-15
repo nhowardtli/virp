@@ -1434,6 +1434,10 @@ def main(argv=None):
         else:
             sys.stderr.write("usage: virp-shell [--socket PATH] [--privileged] [-c 'command']\n")
             return 2
+    if (os.environ.get("VIRP_SHELL_DEMO_SESSION") == "1"
+            and os.path.exists("/run/virp-demo-resetting")):
+        sys.stderr.write("% demo reset in progress; reconnect shortly\n")
+        return 2
     if privileged and os.geteuid() != ADMIN_UID:
         # The flag only means something when the wrapper actually re-seated
         # us; a bare uid asking for it gets the mode, not the ceiling.
