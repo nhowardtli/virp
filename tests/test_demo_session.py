@@ -50,6 +50,40 @@ class DemoSession(unittest.TestCase):
             finally:
                 gate.close()
 
+    def test_chain_content_limit_rejects_8191_bytes(self):
+        with patch.dict(os.environ, {'VIRP_SHELL_DEMO_SESSION': '1'}):
+            sh = vs.VirpShell(stdout=io.StringIO())
+            for size in (8191, 8192):
+                with self.subTest(size=size), patch.object(vs.json, 'dumps', return_value='x' * size), patch.object(vs, 'gate') as call:
+                    with self.assertRaises(vs.GateError):
+                        sh._demo_record('request', {})
+                    call.assert_not_called()
+            with patch.object(vs.json, 'dumps', return_value='x' * 8190), patch.object(vs, 'gate', return_value=observation(1, '{}')) as call:
+                sh._demo_record('request', {})
+                call.assert_called_once()
+
+    def test_reply_record_refusal_preserves_signed_output_before_warning(self):
+        calls = []
+        def answer(req):
+            calls.append(req['action'])
+            if len(calls) == 3:
+                return error_frame(-50)
+            return self.answer(req)
+        with patch.dict(os.environ, {'VIRP_SHELL_DEMO_SESSION': '1'}):
+            gate = FakeGate(answer)
+            try:
+                out = io.StringIO()
+                sh = vs.VirpShell(sock_path=gate.path, stdout=out)
+                info = sh._reply({'action': 'execute', 'device': 'frr1', 'command': 'show ip route'})
+                sh._print_signed(info, [info['text']])
+                text = out.getvalue()
+                self.assertIn('O 192.0.2.0/24 via 192.0.2.1', text)
+                self.assertLess(text.index(vs.TRAILER), text.index('% WARNING:'))
+                self.assertIn('do not retry automatically', text)
+                self.assertEqual(calls, ['chain_append', 'execute', 'chain_append'])
+            finally:
+                gate.close()
+
     def test_production_does_not_gain_append(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(vs.VirpShell(stdout=io.StringIO()).demo_session)

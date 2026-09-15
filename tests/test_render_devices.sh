@@ -273,5 +273,22 @@ if [ ! -f "$T/out.json" ]; then pass=$((pass + 1)); printf "PASS\n"
 else printf "FAIL (a fatal render left a file behind)\n"; fi
 
 echo ""
+# Render the actual demo template through the real renderer, not a copy.
+cp "$(dirname "$SCRIPT")/devices.demo.template.json" "$T/tmpl.json"
+printf 'VIRP_UID=999\n' > "$T/env"
+check "demo password absent -> FATAL" 1 "VIRP_DEMO_FRR_PASSWORD not set"
+printf 'VIRP_UID=999\nVIRP_DEMO_FRR_PASSWORD=demo-test-only\n' > "$T/env"
+check "demo template renders with VM-local password" 0 "rendered"
+run=$((run + 1)); printf "  [%d] demo renders all six devices and four passwords ... " "$run"
+if python3 - "$T/out.json" <<'PYDEMO'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert len(d['devices']) == 6
+assert all(x['password'] == 'demo-test-only' for x in d['devices'][:4])
+assert d['socket_uid_tier_ceilings']['988'] == 'green'
+assert d['gate_max_tier'] == 'yellow'
+PYDEMO
+then pass=$((pass + 1)); echo PASS; else echo FAIL; fi
+
 echo "=== Results: $pass/$run passed ==="
 [ "$pass" = "$run" ]

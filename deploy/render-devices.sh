@@ -181,6 +181,8 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             # (0644) — unlike the throwaway "frrlab" lab passwords above
             # it, this is a real operator account on physical hardware.
             "SWITCH_PASS",
+            # VM219-only generated fake fleet credential.
+            "VIRP_DEMO_FRR_PASSWORD",
             # IronClaw colo fleet (pa-850, ASA-5525, srx-300, R1..R35):
             # ONE shared login password and ONE shared enable secret
             # across the fleet, so the template names two placeholders
