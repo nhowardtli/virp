@@ -9,3 +9,4 @@
 Defaults:%virp timestamp_timeout=0
 %virp ALL=(virp-shell)       NOPASSWD: /usr/bin/python3 /usr/local/lib/virp/virp-shell, /usr/bin/python3 /usr/local/lib/virp/virp-shell *
 %virp ALL=(virp-shell-admin) PASSWD:   /usr/bin/python3 /usr/local/lib/virp/virp-shell --privileged, /usr/bin/python3 /usr/local/lib/virp/virp-shell --privileged *
+%virp ALL=(virp-shell-red)   PASSWD:   /usr/bin/python3 /usr/local/lib/virp/virp-shell --privileged --red, /usr/bin/python3 /usr/local/lib/virp/virp-shell --privileged --red *

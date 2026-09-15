@@ -7,27 +7,35 @@
 #
 #   read seat   virp-shell        uid 988  GREEN ceiling   sudo NOPASSWD
 #   admin seat  virp-shell-admin  uid 985  YELLOW ceiling  sudo PASSWD (your password)
+#   RED seat    virp-shell-red    uid 984  RED ceiling     sudo PASSWD (asked again)
 #
 # `enable` inside the shell exits with 42: this loop re-runs the program as
 # virp-shell-admin through the PASSWD rule (sudo -k, so it asks every time,
-# IOS-style). `disable` exits with 43 and the loop comes back to the read
-# seat. A wrong password lands you back at the read seat. Everything else
-# is the shell's own exit status. Rules: deploy/sudoers-virp-shell.
+# IOS-style). `enable red` (or `enable 15`) exits with 44 and the loop
+# re-runs it as virp-shell-red — the password is asked again, even from the
+# admin seat, because RED is a seat you step into on purpose. `disable`
+# exits with 43 and the loop comes back to the read seat. A wrong password
+# lands you back at the read seat. Everything else is the shell's own exit
+# status. Rules: deploy/sudoers-virp-shell.
 # Installed by `make install-virp-shell` from deploy/virp-shell.wrapper.
 
 SHELL_PY=/usr/local/lib/virp/virp-shell
 seat=virp-shell
 while :; do
-    if [ "$seat" = virp-shell-admin ]; then
-        sudo -k -p 'Password: ' -u virp-shell-admin -- /usr/bin/python3 "$SHELL_PY" --privileged "$@"
-    else
-        sudo -u virp-shell -- /usr/bin/python3 "$SHELL_PY" "$@"
-    fi
+    case "$seat" in
+        virp-shell-admin)
+            sudo -k -p 'Password: ' -u virp-shell-admin -- /usr/bin/python3 "$SHELL_PY" --privileged "$@" ;;
+        virp-shell-red)
+            sudo -k -p 'Password (RED seat): ' -u virp-shell-red -- /usr/bin/python3 "$SHELL_PY" --privileged --red "$@" ;;
+        *)
+            sudo -u virp-shell -- /usr/bin/python3 "$SHELL_PY" "$@" ;;
+    esac
     rc=$?
     case "$rc" in
         42) seat=virp-shell-admin ;;
+        44) seat=virp-shell-red ;;
         43) seat=virp-shell ;;
-        *)  if [ "$seat" = virp-shell-admin ] && [ "$rc" -ne 0 ]; then
+        *)  if [ "$seat" != virp-shell ] && [ "$rc" -ne 0 ]; then
                 # sudo refused (bad password, no rule): stay usable at the read seat.
                 echo "% enable failed (sudo exit $rc); back at the read seat" >&2
                 seat=virp-shell

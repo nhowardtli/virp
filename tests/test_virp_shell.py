@@ -180,12 +180,29 @@ class TestShellMatchesAllowlist(unittest.TestCase):
             self.assertNotIn(verb, doc["socket_uid_action_allow"][admin])
         self.assertNotIn(admin, doc.get("socket_uid_chain_append_types", {}))
 
+    def test_red_seat_984_is_red_with_the_same_verbs_and_no_approval(self):
+        # `enable red` = a THIRD uid (984), ceiling RED, same vocabulary,
+        # still no approval verbs and no chain_append. Option B, 2026-09-15.
+        doc = self.doc
+        red = str(vs.RED_UID)
+        self.assertIn(red, [str(u) for u in doc["socket_allowed_uids"]])
+        self.assertEqual(doc["socket_uid_tier_ceilings"][red], "red")
+        self.assertEqual(set(doc["socket_uid_action_allow"][red]),
+                         set(doc["socket_uid_action_allow"][SHELL_UID]))
+        for verb in ("approval_submit", "approval_challenge", "chain_append", "shutdown"):
+            self.assertNotIn(verb, doc["socket_uid_action_allow"][red])
+        self.assertNotIn(red, doc.get("socket_uid_chain_append_types", {}))
+
     def test_wrapper_and_sudoers_agree_on_seats_and_exit_codes(self):
         wrapper = open(os.path.join(ROOT, "deploy", "virp-shell.wrapper")).read()
         sudoers = open(os.path.join(ROOT, "deploy", "sudoers-virp-shell")).read()
         self.assertIn("42) seat=virp-shell-admin", wrapper)
         self.assertIn("43) seat=virp-shell", wrapper)
-        self.assertEqual((vs.EXIT_ENABLE, vs.EXIT_DISABLE), (42, 43))
+        self.assertIn("44) seat=virp-shell-red", wrapper)
+        self.assertEqual((vs.EXIT_ENABLE, vs.EXIT_DISABLE, vs.EXIT_ENABLE_RED), (42, 43, 44))
+        self.assertIn("-u virp-shell-red -- /usr/bin/python3", wrapper)
+        self.assertIn("--privileged --red", wrapper)
+        self.assertRegex(sudoers, r"\(virp-shell-red\)\s+PASSWD:.*--privileged --red")
         self.assertIn("sudo -k", wrapper)                       # ask every time
         self.assertIn("-u virp-shell-admin -- /usr/bin/python3", wrapper)
         self.assertIn("--privileged", wrapper)
@@ -760,6 +777,32 @@ class TestCommands(unittest.TestCase):
             self.assertIn("% mode only: uid 1000 keeps its own ceiling", buf.getvalue())
             self.assertFalse(sh.default("disable"))
             self.assertEqual(sh.prompt, "h>")
+            # RED seat: `enable red` from the read seat AND from the admin seat
+            # hands back with EXIT_ENABLE_RED (password asked again); at the
+            # red seat it is a no-op; `disable` returns to the read seat.
+            for uid in (vs.SHELL_UID, vs.ADMIN_UID):
+                os.geteuid = lambda uid=uid: uid
+                buf = io.StringIO()
+                sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h",
+                                  privileged=(uid == vs.ADMIN_UID))
+                self.assertTrue(sh.default("enable red"))
+                self.assertEqual(sh.exit_code, vs.EXIT_ENABLE_RED)
+                self.assertIn("RED seat", buf.getvalue())
+            os.geteuid = lambda: vs.SHELL_UID
+            sh = vs.VirpShell(sock_path="/nonexistent", stdout=io.StringIO(), host="h")
+            self.assertTrue(sh.default("enable 15"))
+            self.assertEqual(sh.exit_code, vs.EXIT_ENABLE_RED)
+            os.geteuid = lambda: vs.RED_UID
+            buf = io.StringIO()
+            sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h", privileged=True)
+            self.assertFalse(sh.default("enable red"))
+            self.assertEqual(sh.exit_code, 0)
+            self.assertTrue(sh.default("disable"))
+            self.assertEqual(sh.exit_code, vs.EXIT_DISABLE)
+            buf = io.StringIO()
+            sh = vs.VirpShell(sock_path="/nonexistent", stdout=buf, host="h")
+            self.assertFalse(sh.default("enable bogus"))
+            self.assertIn("% Invalid input detected at 'bogus'", buf.getvalue())
             # scripted stdin never re-seats (no terminal for sudo to ask on)
             sys.stdin.isatty = lambda: False
             os.geteuid = lambda: vs.SHELL_UID

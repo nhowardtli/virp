@@ -79,6 +79,12 @@ ADMIN_UID = 985
 ADMIN_USER = "virp-shell-admin"
 EXIT_ENABLE = 42       # wrapper: re-run as virp-shell-admin (sudo asks a password)
 EXIT_DISABLE = 43      # wrapper: re-run as virp-shell
+# `enable red` (or `enable 15`) is a THIRD seat, not a wider admin seat: RED
+# applies only from an identity you deliberately stepped into, with the
+# password asked again, and the chain shows uid 984 on exactly those changes.
+RED_UID = 984
+RED_USER = "virp-shell-red"
+EXIT_ENABLE_RED = 44   # wrapper: re-run as virp-shell-red (sudo asks a password)
 ONODE_SOCKET = os.environ.get("VIRP_SHELL_SOCKET", "/run/virp/onode.sock")
 RENDERED_DEVICES = "/run/virp/devices.json"        # what the daemon loaded
 TEMPLATE_DEVICES = "/etc/virp/devices.template.json"
@@ -525,7 +531,7 @@ COMMAND_TREE = {
         "terminal": (None, 0, 0),
     },
     "device": (None, 1, 1),
-    "enable": (None, 0, 0),
+    "enable": (None, 0, 1),
     "disable": (None, 0, 0),
     "end": (None, 0, 0),
     "exit": (None, 0, 0),
@@ -550,7 +556,7 @@ COMMAND_HELP = {
     "verify chain": "chain_verify <session-id> [from] [to] via the gate",
     "configure terminal": "Enter config mode; then `device <name>` to pick the target",
     "device": "(config) Select the device the next lines are sent to, through the gate",
-    "enable": "Become the admin seat (uid 985, YELLOW ceiling) — your password is asked",
+    "enable": "Become the admin seat (uid 985, YELLOW); `enable red` = the RED seat (uid 984) — password asked",
     "disable": "Back to the read seat (uid 988, GREEN ceiling)",
     "end": "Return to privileged exec mode",
     "exit": "Leave the shell",
@@ -638,6 +644,7 @@ def resolve(tokens):
 ARG_HELP = {
     "show device": [("<name>", "Device hostname (see show devices)")],
     "device": [("<name>", "Device hostname (see show devices)")],
+    "enable": [("[red]", "RED seat (uid 984): config changes apply; BLACK still never. Also accepts 15")],
     "show uid": [("[uid]", "One uid, or all allowlisted uids")],
     "show log": [("[lines]", "Number of journal lines (default 20)")],
     "show chain": [("[sessions]", "Recent sessions to list and verify (default 10, max 200)")],
@@ -1192,28 +1199,46 @@ class VirpShell(cmd.Cmd):
 
     # -- modes / misc -----------------------------------------------------
     def cmd_enable(self, args):
-        if self.privileged:
+        want_red = bool(args) and args[0].lower() in ("red", "15")
+        if args and not want_red:
+            self.out("%% Invalid input detected at '%s' (enable | enable red | enable 15)" % args[0])
             return False
-        if os.geteuid() == SHELL_UID and sys.stdin.isatty():
-            # Real escalation: hand back to the wrapper, which re-runs this
-            # program as virp-shell-admin through a PASSWD sudo rule. The
-            # password prompt is sudo's; a wrong password lands you back
-            # here at '>'. Session-local state (show proposals) does not
-            # cross the seat boundary — the chain has it.
-            self.out("Escalating to the admin seat (%s, uid %d) — sudo will ask "
-                     "for your password." % (ADMIN_USER, ADMIN_UID))
-            self.exit_code = EXIT_ENABLE
-            return True
-        # Not the read seat (a bare uid running the file, tests, scripts):
+        euid = os.geteuid()
+        if want_red:
+            if euid == RED_UID:
+                return False
+            if euid in (SHELL_UID, ADMIN_UID) and sys.stdin.isatty():
+                # Third seat, stepped into on purpose: the password is asked
+                # again even from the admin seat, and every change made
+                # here is chained under uid 984.
+                self.out("Escalating to the RED seat (%s, uid %d) — sudo will ask "
+                         "for your password. Config changes APPLY here; BLACK "
+                         "still never runs." % (RED_USER, RED_UID))
+                self.exit_code = EXIT_ENABLE_RED
+                return True
+        else:
+            if self.privileged:
+                return False
+            if euid == SHELL_UID and sys.stdin.isatty():
+                # Real escalation: hand back to the wrapper, which re-runs this
+                # program as virp-shell-admin through a PASSWD sudo rule. The
+                # password prompt is sudo's; a wrong password lands you back
+                # here at '>'. Session-local state (show proposals) does not
+                # cross the seat boundary — the chain has it.
+                self.out("Escalating to the admin seat (%s, uid %d) — sudo will ask "
+                         "for your password." % (ADMIN_USER, ADMIN_UID))
+                self.exit_code = EXIT_ENABLE
+                return True
+        # Not a re-seatable case (a bare uid running the file, tests, scripts):
         # mode only, and say so — the gate still judges this uid's ceiling.
         self.privileged = True
         self._set_prompt()
-        if os.geteuid() not in (SHELL_UID, ADMIN_UID):
+        if euid not in (SHELL_UID, ADMIN_UID, RED_UID):
             self.out("%% mode only: uid %d keeps its own ceiling (see show whoami)"
-                     % os.geteuid())
+                     % euid)
 
     def cmd_disable(self, args):
-        if os.geteuid() == ADMIN_UID and sys.stdin.isatty():
+        if os.geteuid() in (ADMIN_UID, RED_UID) and sys.stdin.isatty():
             self.out("Back to the read seat (%s, uid %d)." % (SHELL_USER, SHELL_UID))
             self.exit_code = EXIT_DISABLE
             return True
@@ -1223,7 +1248,8 @@ class VirpShell(cmd.Cmd):
 
     def cmd_show_whoami(self, args):
         uid = os.geteuid()
-        seat = {SHELL_UID: "read seat", ADMIN_UID: "admin seat"}.get(uid, "not a shell seat")
+        seat = {SHELL_UID: "read seat", ADMIN_UID: "admin seat",
+                RED_UID: "RED seat"}.get(uid, "not a shell seat")
         rows = [("uid", uid), ("user", username(uid)), ("seat", seat),
                 ("mode", "privileged" if self.privileged else "exec")]
         try:
@@ -1355,14 +1381,15 @@ def main(argv=None):
         sys.stderr.write("%% refusing to run as root; use the %s wrapper "
                          "(uid %d)\n" % (SHELL_USER, SHELL_UID))
         return 2
-    if os.geteuid() not in (SHELL_UID, ADMIN_UID):
-        sys.stderr.write("%% note: running as uid %d, not %d (%s) or %d (%s); the "
-                         "gate judges the PEER uid, so this session is not a "
+    if os.geteuid() not in (SHELL_UID, ADMIN_UID, RED_UID):
+        sys.stderr.write("%% note: running as uid %d, not %d (%s), %d (%s) or %d (%s); "
+                         "the gate judges the PEER uid, so this session is not a "
                          "virp-shell seat\n" % (os.geteuid(), SHELL_UID, SHELL_USER,
-                                                ADMIN_UID, ADMIN_USER))
+                                                ADMIN_UID, ADMIN_USER, RED_UID, RED_USER))
     sock_path = None
     once = None
     privileged = False
+    red = False
     while argv:
         a = argv.pop(0)
         if a == "--socket" and argv:
@@ -1371,14 +1398,22 @@ def main(argv=None):
             once = argv.pop(0)
         elif a == "--privileged":
             privileged = True
+        elif a == "--red":
+            privileged = True
+            red = True
         else:
-            sys.stderr.write("usage: virp-shell [--socket PATH] [--privileged] [-c 'command']\n")
+            sys.stderr.write("usage: virp-shell [--socket PATH] [--privileged [--red]] [-c 'command']\n")
             return 2
-    if privileged and os.geteuid() != ADMIN_UID:
+    if privileged and os.geteuid() not in (ADMIN_UID, RED_UID):
         # The flag only means something when the wrapper actually re-seated
         # us; a bare uid asking for it gets the mode, not the ceiling.
-        sys.stderr.write("%% note: --privileged as uid %d, not %d (%s); the gate "
-                         "judges the PEER uid\n" % (os.geteuid(), ADMIN_UID, ADMIN_USER))
+        sys.stderr.write("%% note: --privileged as uid %d, not %d (%s) or %d (%s); the gate "
+                         "judges the PEER uid\n" % (os.geteuid(), ADMIN_UID, ADMIN_USER,
+                                                    RED_UID, RED_USER))
+    if red and os.geteuid() == RED_UID:
+        sys.stderr.write("RED seat (%s, uid %d): config changes on IOS apply without a "
+                         "proposal. BLACK never runs. Everything is chained under this uid.\n"
+                         % (RED_USER, RED_UID))
     sh = VirpShell(sock_path=sock_path, privileged=privileged)
     if once is not None:
         sh.default(once)

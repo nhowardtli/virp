@@ -56,7 +56,15 @@ judges the new uid with its own ceiling:
 | read (`>`) | 988 `virp-shell` | GREEN | reads execute; YELLOW/RED → proposal |
 | admin (`#`) | 985 `virp-shell-admin` | YELLOW | reads execute; **YELLOW applies** (on IOS today that is `interface <name> description …` — see docs/notes/cisco-description-yellow-2026-09-15.md); RED → proposal |
 
-BLACK never runs from either seat, and neither seat can approve anything:
+| RED (`#`, via `enable red` / `enable 15`) | 984 `virp-shell-red` | RED | reads execute; **YELLOW and RED apply**; BLACK never |
+
+`enable red` is a third seat, not a wider admin seat: the password is asked
+again (even from `#`), the daemon judges uid 984, and every change made
+there is chained under that uid — so a RED change is always attributable
+to a deliberate escalation, never to routine work. `disable` returns to
+the read seat from either.
+
+BLACK never runs from any seat, and no seat can approve anything:
 proposer and approver stay two people. Every `[GATE]` line and chain entry
 carries the uid, so `show chain` / the daemon log show which seat did what.
 `show whoami` prints the live seat, ceiling and verbs. A wrong password

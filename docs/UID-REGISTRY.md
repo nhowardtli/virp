@@ -40,6 +40,7 @@ the 2026-08 notes, marked unverified.
 | 990 | fwupd-refresh | fwupd-refresh | — | distro |
 | 989 | polkitd | polkitd | — | distro |
 | 988 | **`virp-shell`** — operator REPL seat (`list_fleet list_sessions health heartbeat chain_verify execute`, GREEN — config mode proposes, never applies; `list_sessions` only once the daemon on `feat/onode-list-sessions` is deployed) | *free — reserved for the same identity* | — | new 2026-09-14; the older "reserved for Spark" note in the colo template was wrong (Spark is 997 on 313) and is corrected there |
+| 984 | **`virp-shell-red`** — the shell's `enable red` seat (same verbs as 988/985, ceiling **RED**: IOS config lines apply without a proposal; BLACK still never; reached only via its own sudo PASSWD rule, password asked again) | *free — reserved for the same identity* | — | new 2026-09-15 |
 | 985 | **`virp-shell-admin`** — the shell's `enable` seat (same verbs as 988, ceiling **YELLOW**: YELLOW changes apply, RED still proposals; reached only via the sudo PASSWD rule in `deploy/sudoers-virp-shell`) | *free — reserved for the same identity* | — | new 2026-09-15 |
 | 987 | `virp-sean` — Sean's agent-VM requester (`chain_verify`, `chain_append`→`evidence_item`) | *free — reserved for the same identity* | — | .211 only |
 | 1000 | operator (nhoward) | operator | operator | full vocabulary incl. `shutdown` |
