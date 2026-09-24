@@ -38,7 +38,7 @@ jobs:
         # test-virp-report needs reportlab, test-chainsign-vectors uses pynacl or
         # cryptography; gen-test-attestation.sh needs pyyaml. Without this step
         # the battery has never been green here.
-        run: python3 -m pip install --quiet pynacl fastapi httpx pytest pyyaml reportlab
+        run: python3 -m pip install --quiet pynacl fastapi httpx pytest pyyaml reportlab paramiko
       # CFLAGS already carry -Wall -Wextra -Werror -pedantic -std=c11, so a
       # warning is a build failure without any extra flag here.
       - name: Build (warnings are errors)
@@ -193,7 +193,7 @@ jobs:
       # path), so generate a throwaway key there; virp_key_load_file
       # refuses keys that are not 0600 and owner-readable only.
       - name: Install Python suite dependencies
-        run: python3 -m pip install --quiet pytest httpx pyyaml reportlab
+        run: python3 -m pip install --quiet pytest httpx pyyaml reportlab paramiko
       - name: Generate throwaway bridge key
         run: |
           sudo mkdir -p /opt/virp/keys

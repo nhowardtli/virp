@@ -2243,7 +2243,7 @@ TEST(test_per_uid_black_ceiling_is_passthrough_and_red_binds_above_node)
 
     /* The thread-local never leaks past a dispatch. */
     ASSERT_EQ((int)virp_exec_passthrough, 0);
-    onode_destroy(&tmp);
+    errobs_teardown(&tmp);
 }
 
 TEST(test_per_uid_ceiling_caps_yellow_but_not_uncapped)
@@ -4369,8 +4369,8 @@ TEST(test_execution_record_commits_to_digest_not_response_body)
  * An executed action that ERRORED still lands in the chain. A gap here
  * would be the worst kind: the actions most worth auditing are the ones
  * that went wrong, and a driver error is no proof the command never
- * reached the device — so the record says executed=true and flags that
- * the driver could not report what happened.
+ * reached the device — so gate_execution/2 records executed=null and flags
+ * that the driver could not report what happened.
  */
 TEST(test_errored_execution_still_chains_no_gap)
 {
@@ -4400,8 +4400,9 @@ TEST(test_errored_execution_still_chains_no_gap)
     ASSERT_TRUE(rows[0].have_body);
 
     ASSERT_TRUE(strstr(rows[0].body, "\"success\":false") != NULL);
-    /* No proof of non-dispatch: the record must not claim nothing ran. */
-    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":true") != NULL);
+    /* No proof either way: preserve uncertainty rather than asserting execution. */
+    ASSERT_TRUE(strstr(rows[0].body, "\"schema\":\"gate_execution/2\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":null") != NULL);
     ASSERT_TRUE(strstr(rows[0].body,
                        "\"executed_reported\":false") != NULL);
     ASSERT_TRUE(strstr(rows[0].body, "driver execute failed") != NULL);

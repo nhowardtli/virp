@@ -27,15 +27,17 @@ Copyright (c) 2026 Third Level IT LLC. All rights reserved.
 """
 
 import json
+from pathlib import Path
 import socket
 import subprocess
 import sys
 import time
 
-sys.path.insert(0, "/opt/virp/autopilot")
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "autopilot"))
 from virp_autopilot import parse_observation, TIER_NAMES  # noqa: E402
 
-BROKER = "/opt/virp/broker/virp_broker.py"
+BROKER = str(ROOT / "broker" / "virp_broker.py")
 TEST_PORT = 7421
 PROD_PORT = 7420
 GREEN_DEVICE = "clab-frr-ospf-frr1"
