@@ -584,6 +584,24 @@ static void test_altered_payload_rejected(void)
     PASS();
 }
 
+static void test_client_artifact_cannot_preempt_outcome(void)
+{
+    TEST("client-planted outcome id cannot consume a proposal");
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1], aid[64];
+    ASSERT(propose_via_block(&g, "R-APP", "reload", pid) == 0, "propose");
+    snprintf(aid, sizeof(aid), "outcome:%s", pid);
+    virp_chain_entry_t entry;
+    ASSERT(virp_chain_append(&g.chain, "client", "observation", aid,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &entry) == VIRP_OK, "plant wrong-type artifact with matching id");
+    virp_approval_challenge_t ch;
+    ASSERT(virp_approval_challenge(DIR, &g.chain, pid, 0, &ch) == VIRP_OK,
+           "wrong artifact type must not block challenge");
+    virp_approval_rec_t apr;
+    ASSERT(do_approve(pid, &apr) == VIRP_OK, "wrong type must not block submit");
+    PASS();
+}
+
 static void test_challenge_and_submit_consumed_refused(void)
 {
     TEST("L1: challenge + submit for a consumed proposal -> -42");
@@ -1866,6 +1884,7 @@ int main(void)
     test_unenrolled_key_rejected();
     test_disabled_key_rejected();
     test_altered_payload_rejected();
+    test_client_artifact_cannot_preempt_outcome();
     test_challenge_and_submit_consumed_refused();
     test_wrong_algorithm_rejected();
     test_no_approval_plain_block();

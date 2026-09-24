@@ -107,6 +107,19 @@ def test_live_signed_chain():
         check("live chain: all 6 entries signed+verified",
               s.get("entries_signed") == 6, str(s.get("entries_signed")))
 
+        # Signed entries alone do not authenticate the session length.
+        for trim in (False, True):
+            stripped = {sid: dict(h) for sid, h in heads.items()}
+            stripped["fixture-sess"]["head_sig"] = ""
+            stripped["fixture-sess"]["head_sig_key_id"] = ""
+            selected = entries[:-1] if trim else entries
+            if trim:
+                stripped["fixture-sess"]["last_sequence"] = selected[-1]["sequence"]
+                stripped["fixture-sess"]["last_entry_hash"] = selected[-1]["chain_entry_hash"]
+            got = verify.verify_chain_signatures(selected, stripped, pub)
+            check("stripped head, trim=%s -> FAIL" % trim,
+                  got["fixture-sess"]["verdict"] == verify.FAIL)
+
         # Tamper one stored signature -> FAIL.
         db2 = os.path.join(td, "chain2.db")
         shutil.copy(db, db2)

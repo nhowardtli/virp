@@ -41,7 +41,8 @@ StateDirectoryMode=0750
 # Device config is RENDERED at start: credentials live only in
 # /etc/virp/autopilot.env (0600 root) and are substituted into the
 # no-secrets template /etc/virp/devices.template.json, landing on the
-# /run tmpfs as 0640 root:virp. The `+` prefix runs the render as root
+# /run tmpfs as 0600 virp:virp. Shell seats read only the credential-free
+# devices.policy.json projection (0640), never devices.json. The `+` prefix runs the render as root
 # outside the sandbox; the daemon itself only reads the result. The
 # render script never echoes credential values.
 ExecStartPre=+/usr/local/lib/virp/render-devices.sh

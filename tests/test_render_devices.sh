@@ -89,6 +89,21 @@ assert by["zammad-ro"]["api_token"] != by["zammad-rw"]["api_token"], \
 PY
 then pass=$((pass + 1)); printf "PASS\n"; else printf "FAIL\n"; fi
 
+# The public projection is an allowlist; device secrets never reach seats.
+run=$((run + 1)); printf "  [%d] credential custody and policy projection ... " "$run"
+if python3 - "$T/out.json" "$T/out.policy.json" <<'PYTEST'
+import json, os, stat, sys
+secret, policy = sys.argv[1:]
+assert stat.S_IMODE(os.stat(secret).st_mode) == 0o600
+assert stat.S_IMODE(os.stat(policy).st_mode) == 0o640
+p = json.load(open(policy))
+assert set(p) <= {"socket_allowed_uids", "socket_uid_tier_ceilings",
+                  "socket_uid_action_allow", "socket_uid_chain_append_types"}
+assert "devices" not in p
+assert "sandbox-value" not in open(policy).read()
+PYTEST
+then pass=$((pass + 1)); printf "PASS\n"; else printf "FAIL\n"; fi
+
 # ── IronClaw colo fleet: ${LAB_PASSWORD} / ${LAB_ENABLE} ──────────────
 #
 # Same contract as the Zammad tokens, asserted separately because these

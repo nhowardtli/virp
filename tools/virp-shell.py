@@ -86,7 +86,7 @@ RED_UID = 984
 RED_USER = "virp-shell-red"
 EXIT_ENABLE_RED = 44   # wrapper: re-run as virp-shell-red (sudo asks a password)
 ONODE_SOCKET = os.environ.get("VIRP_SHELL_SOCKET", "/run/virp/onode.sock")
-RENDERED_DEVICES = "/run/virp/devices.json"        # what the daemon loaded
+RENDERED_DEVICES = "/run/virp/devices.policy.json"  # credential-free projection
 TEMPLATE_DEVICES = "/etc/virp/devices.template.json"
 INSTALL_DIR = "/usr/local/lib/virp"
 DAEMON_BIN = os.path.join(INSTALL_DIR, "virp-onode-prod")
@@ -710,16 +710,16 @@ def journal_denied(rc, err):
 
 def load_uid_policy():
     """The daemon's loaded per-uid policy. Prefer the RENDERED file the
-    daemon actually read; fall back to the template (placeholders shown
-    as-is). Returns (doc, source_path)."""
-    for path in (RENDERED_DEVICES, TEMPLATE_DEVICES):
+    renderer published; never read device credentials or a stale template.
+    Returns (doc, source_path)."""
+    for path in (RENDERED_DEVICES,):
         try:
             with open(path) as f:
                 return json.load(f), path
         except (OSError, ValueError):
             continue
-    raise GateError("template not readable at this uid (%s, %s)"
-                    % (RENDERED_DEVICES, TEMPLATE_DEVICES))
+    raise GateError("rendered policy not readable at this uid (%s)"
+                    % RENDERED_DEVICES)
 
 
 def username(uid):

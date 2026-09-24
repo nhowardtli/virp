@@ -227,6 +227,31 @@ static void item12_append(void)
              != VIRP_OK,
          "a backslashed artifact_id reached the canonical object");
 
+    const char *bad_hashes[] = { "", "abc", "x\"y", "a\\b",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg" };
+    for (size_t i = 0; i < sizeof(bad_hashes)/sizeof(bad_hashes[0]); i++) {
+        TEST("12: commitment-only append rejects a malformed digest");
+        WANT(virp_chain_append(&st, "sess", "observation", "bad",
+                              bad_hashes[i], &e) == VIRP_ERR_INVALID_LENGTH,
+             "non-hex hash reached the canonical object");
+    }
+    TEST("12: ingress refuses a short artifact_hash");
+    WANT(!parse("{\"action\":\"chain_append\",\"artifact_hash\":\"abc\"}"),
+         "short hash accepted at ingress");
+    TEST("12: ingress refuses an overlong artifact_hash");
+    WANT(!parse("{\"action\":\"chain_append\",\"artifact_hash\":\"" S63 "aa\"}"),
+         "overlong hash truncated into valid hash");
+
+    TEST("12: oversized artifact body cannot become commitment-only");
+    char oversized[10000];
+    const char *prefix = "{\"action\":\"chain_append\",\"artifact_content\":\"";
+    size_t prefix_len = strlen(prefix);
+    memcpy(oversized, prefix, prefix_len);
+    memset(oversized + prefix_len, 'x', 9000);
+    strcpy(oversized + prefix_len + 9000, "\"}");
+    WANT(!parse(oversized), "oversized body was silently dropped");
+
     TEST("12: a conformant append still succeeds");
     WANT(virp_chain_append(&st, "sess", "observation", "a-0", H, &e)
              == VIRP_OK,

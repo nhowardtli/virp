@@ -136,6 +136,48 @@ class TestVIRPVerify(unittest.TestCase):
             37809: cls.obs_incomplete,
         }
 
+    def test_signed_non_device_subtypes_are_not_claim_evidence(self):
+        from virp_verify import verify_evidence
+        for subtype in (0x08, 0x09, 0x0F):
+            with self.subTest(subtype=subtype):
+                entry = dict(self.obs_bgp)
+                raw = bytearray.fromhex(entry["raw_message"])
+                raw[VIRP_HEADER_SIZE] = subtype
+                ts = struct.unpack_from("!Q", raw, 16)[0]
+                raw = resign_with_timestamp(raw, ts)
+                self.assertTrue(self.bridge.verify_observation(raw))
+                entry["raw_message"] = raw.hex()
+                evidence = {"obs_id": 37807, "node_id": "R1",
+                            "extracted_path": "bgp.neighbor[10.0.0.2].state",
+                            "extracted_value": "Established"}
+                verdict, details = verify_evidence(
+                    evidence, {37807: entry}, self.bridge, freshness_window=300, now=time.time())
+                self.assertEqual(verdict, Verdict.UNVERIFIABLE)
+                self.assertIn("not DEVICE_OUTPUT", details["reason"])
+
+    def test_report_rejects_signed_non_device_subtypes(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "report"))
+        import verify as report_verify
+        with open(KEY_PATH, "rb") as f:
+            key = f.read()
+        for subtype in (0x07, 0x08, 0x09, 0x0F):
+            with self.subTest(subtype=subtype):
+                raw = bytearray.fromhex(self.obs_bgp["raw_message"])
+                raw[VIRP_HEADER_SIZE] = subtype
+                raw = resign_with_timestamp(raw, struct.unpack_from("!Q", raw, 16)[0])
+                import base64
+                entry = {"session_id": "test", "sequence": 0,
+                         "artifact_type": "observation", "artifact_id": "obs:R1:1",
+                         "artifact_hash": hashlib.sha256(raw).hexdigest(),
+                         "artifact_hash_alg": "sha256", "artifact_schema_version": "1",
+                         "chain_entry_hash": "b" * 64, "previous_entry_hash": "0" * 64,
+                         "timestamp_ns": 1, "monotonic_ns": 1,
+                         "signer_node_id": 1, "signer_org_id": "test", "chain_hmac": "c" * 64}
+                checked = report_verify.verify_entry(
+                    entry, "base64:" + base64.b64encode(raw).decode(), key, None, None)
+                self.assertEqual(checked.obs_hmac,
+                                 report_verify.PASS if subtype in (0x07, 0x0F) else report_verify.FAIL)
+
     # ── Case A: VERIFIED ──────────────────────────────────────────
 
     def test_case_a_verified(self):

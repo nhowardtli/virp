@@ -39,5 +39,13 @@ int main(void)
     e = fg_execute((virp_conn_t *)&conn, "get system status", &r);
     RC_ASSERT_REFUSAL(e, r, "FortiGate not-connected");
 
+    for (size_t i = 0; i < sizeof(FG_BLACK_COMMANDS) / sizeof(FG_BLACK_COMMANDS[0]); i++) {
+        if (fg_route_command(FG_BLACK_COMMANDS[i]) != VIRP_TIER_BLACK) {
+            fprintf(stderr, "FAIL: deny-listed command not BLACK at gate: %s\n",
+                    FG_BLACK_COMMANDS[i]);
+            return 1;
+        }
+    }
+
     RC_REPORT("test_fortigate_refusals_obey_contract");
 }

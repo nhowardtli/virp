@@ -34,6 +34,15 @@ session key_id       =    head_sig_key_id      if head_signed
                           first entry's chain_sig_key_id otherwise
 ```
 
+**2026-09-24 clarification (C and Python):** signed entries require a
+signed head. Removing `head_sig` while retaining entry signatures is a
+FAIL, even if the remaining entries individually verify. This check
+precedes unavailable-key grading. A fully unsigned history is still
+classified as an unsigned era; detecting deletion of all signature
+metadata or an entire session requires an independent checkpoint.
+The C/Python `SIGNED_FROM_N` migration behavior and its Rust counterpart
+still need a shared verdict corpus; this change does not claim parity.
+
 - An UNSIGNED session is graded `unsigned`. The asymmetric tier does not
   apply to it. This is never a failure and is never a pass of a check
   that did not run: `sig_checked` is false and the entries are counted

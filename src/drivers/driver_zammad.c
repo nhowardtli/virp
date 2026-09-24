@@ -1353,7 +1353,11 @@ static virp_error_t zammad_execute(virp_conn_t *base_conn,
                            "%s>%s [HTTP %ld]\n%s",
                            conn->device.hostname, path,
                            http_code, api_response);
-    result->output_len = (written > 0) ? (size_t)written : 0;
+    if (written < 0) return VIRP_ERR_INVALID_LENGTH;
+    result->output_len = (size_t)written < sizeof(result->output)
+        ? (size_t)written : sizeof(result->output) - 1;
+    if ((size_t)written >= sizeof(result->output))
+        result->output_truncated = true;
 
     if (http_code == 401 || http_code == 403) {
         result->success = false;

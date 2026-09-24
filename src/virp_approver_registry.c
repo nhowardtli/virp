@@ -14,6 +14,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include <sodium.h>
 #include <openssl/evp.h>
@@ -259,13 +262,25 @@ virp_error_t virp_approver_registry_load(virp_approver_registry_t *reg,
         return VIRP_ERR_NULL_PTR;
     memset(reg, 0, sizeof(*reg));
 
-    FILE *f = fopen(path, "rb");
-    if (!f)
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0)
         return VIRP_ERR_CHAIN_DB;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) ||
+        (st.st_uid != 0 && st.st_uid != geteuid())) {
+        close(fd);
+        return VIRP_ERR_CHAIN_DB;
+    }
+    FILE *f = fdopen(fd, "rb");
+    if (!f) { close(fd); return VIRP_ERR_CHAIN_DB; }
     char buf[64 * 1024];
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     int overflow = !feof(f);
+    int read_error = ferror(f);
     fclose(f);
+    if (read_error)
+        return VIRP_ERR_CHAIN_DB;
     if (overflow)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
     buf[n] = '\0';

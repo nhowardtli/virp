@@ -665,7 +665,7 @@ static bool approval_has_outcome(virp_chain_state_t *chain,
     char aid[64];
     snprintf(aid, sizeof(aid), "outcome:%s", proposal_id);
     bool exists = false;
-    if (virp_chain_artifact_exists(chain, aid, &exists) != VIRP_OK)
+    if (virp_chain_artifact_type_exists(chain, aid, "outcome", &exists) != VIRP_OK)
         return true;
     return exists;
 }

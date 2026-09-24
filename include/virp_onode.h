@@ -292,17 +292,13 @@ typedef struct {
     size_t              socket_allowed_uids_count;
 
     /*
-     * Per-uid tier ceiling (optional). A socket client connecting as one
-     * of these uids has its effective gate ceiling lowered to the paired
-     * tier: the gate blocks anything ABOVE min(gate_max_tier, this). It
-     * can only ever TIGHTEN, never raise, the global gate_max_tier.
-     * Parsed from the config's `socket_uid_tier_ceilings` object (uid →
-     * "green"/"yellow"/"red") via json-c. A uid absent here keeps the
-     * global gate_max_tier. Used to hold a remote requester (e.g. the
-     * netclaw tunnel identity) to GREEN reads while local operators keep
-     * the node-wide YELLOW ceiling. The connecting uid is carried
-     * explicitly into onode_execute_obs_ex() — never inferred from a
-     * thread-local — because the batch path fans out onto child threads.
+     * Per-uid gate policy (optional). An explicit row overrides the
+     * node-wide gate_max_tier and may raise or lower it. BLACK selects
+     * passthrough, including driver backstops; it is not a denial tier.
+     * Without a row, callers use the node-wide default. The production
+     * config loader requires every allowed UID to have a row when this
+     * map is present. This policy authenticates a Unix UID, not human
+     * presence. The caller UID is passed explicitly through batch workers.
      */
     uid_t               uid_ceiling_uids[ONODE_MAX_ALLOWED_UIDS];
     virp_trust_tier_t   uid_ceiling_tiers[ONODE_MAX_ALLOWED_UIDS];
@@ -740,9 +736,9 @@ virp_error_t onode_set_allowed_uids(onode_state_t *state,
 
 /*
  * Set per-uid tier ceilings. `uids[i]` is capped at `tiers[i]`
- * (GREEN/YELLOW/RED only; BLACK or UNCLASSIFIED is rejected with
- * VIRP_ERR_INVALID_TYPE). A ceiling can only tighten, never raise, the
- * node-wide gate_max_tier. Replaces any existing entries. Returns
+ * (GREEN/YELLOW/RED/BLACK; UNCLASSIFIED is rejected). Explicit rows
+ * override the node-wide gate_max_tier; BLACK enables passthrough.
+ * Replaces any existing entries. Returns
  * VIRP_ERR_MESSAGE_TOO_LARGE if `count` exceeds ONODE_MAX_ALLOWED_UIDS.
  */
 virp_error_t onode_set_uid_ceilings(onode_state_t *state,

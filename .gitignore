@@ -33,3 +33,7 @@ build-fuzz/
 
 # Release bundles (make release-bundle / release.yml build outputs)
 dist/
+
+# Isolated security regression and device-output fuzz builds
+build-sanitize/
+build-fuzz-device/

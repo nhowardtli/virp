@@ -444,7 +444,10 @@ static virp_error_t mock_execute(virp_conn_t *conn,
         result->success = true;
         result->exit_code = 0;
     } else {
-        /* Unknown command — simulate IOS error */
+        /* Unknown command: the simulated device processed it and
+         * returned a known failure, unlike the undeclared-refusal hook. */
+        result->disposition = VIRP_DISPOSITION_EXECUTED_FAILED;
+        result->exit_code_trusted = true;
         int n = snprintf(result->output, sizeof(result->output),
                          "%s#%s\n%% Invalid input detected at '^' marker.\n",
                          conn->device.hostname, command);

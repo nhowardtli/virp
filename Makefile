@@ -1351,7 +1351,7 @@ test-obskey: $(TEST_OBSKEY)
 # signatures with the public key only). Optional Ed25519 backend: SKIPS
 # loudly (exit 0) when neither pynacl nor cryptography is importable.
 .PHONY: test-chainsign-vectors
-test-chainsign-vectors: $(TEST_CHAIN_SIGNING)
+test-chainsign-vectors: $(BUILD_DIR)/test_chain_signing
 	python3 tests/test_chainsign_vectors.py
 
 # D-1 chain signing at the CHAIN level (schema, append/head signing,
@@ -2292,7 +2292,8 @@ asan-test:
 	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined"
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO) $(TEST_FG_SCRUB) $(TEST_CHAIN) \
-	        $(TEST_OBSKEY) $(TEST_OBS_ED25519) $(TEST_OBS_FORGE) $(TEST_OBS_NEG)
+	        $(TEST_OBSKEY) $(TEST_OBS_ED25519) $(TEST_OBS_FORGE) $(TEST_OBS_NEG) \
+	        $(BUILD_DIR)/test_security_bounds $(BUILD_DIR)/test_security_handlers $(BUILD_DIR)/test_onode_security
 	@echo "=== Running tests under ASan+UBSan ==="
 	./$(TEST_BIN) 2>&1
 	./$(TEST_ONODE) 2>&1
@@ -2303,6 +2304,9 @@ asan-test:
 	./$(TEST_OBS_ED25519) 2>&1
 	./$(TEST_OBS_FORGE) 2>&1
 	./$(TEST_OBS_NEG) 2>&1
+	./$(BUILD_DIR)/test_security_bounds 2>&1
+	./$(BUILD_DIR)/test_security_handlers 2>&1
+	./$(BUILD_DIR)/test_onode_security 2>&1
 	@echo "=== ASan+UBSan test run complete ==="
 	# Leave no instrumented residue in the shared build/ tree. asan-test
 	# already clean-builds at the start, so the tree is disposable; a
@@ -2510,3 +2514,31 @@ check-test-deps:
 	@scripts/check-test-deps.sh --selftest >/dev/null || \
 	    { echo "FAIL: check-test-deps.sh selftest failed — the guard is broken"; exit 1; }
 	@scripts/check-test-deps.sh fastapi httpx reportlab
+
+# Security-review regressions: v1 wire bounds and hostile driver lengths.
+$(BUILD_DIR)/test_security_bounds: tests/test_security_bounds.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+.PHONY: test-security-bounds
+test-security-bounds: $(BUILD_DIR)/test_security_bounds
+	./$(BUILD_DIR)/test_security_bounds
+all-tests: test-security-bounds
+
+$(BUILD_DIR)/test_security_handlers: tests/test_security_handlers.c src/virp_onode.c $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB)
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB) $(LDFLAGS) -ljson-c -o $@
+.PHONY: test-security-handlers
+test-security-handlers: $(BUILD_DIR)/test_security_handlers
+	./$(BUILD_DIR)/test_security_handlers
+all-tests: test-security-handlers
+
+# Instrument the library as well as the harness; use a separate object tree.
+.PHONY: fuzz-device-output
+fuzz-device-output:
+	$(MAKE) BUILD_DIR=build-fuzz-device CC=clang CFLAGS_EXTRA="$(CFLAGS_EXTRA) -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer" build-fuzz-device/libvirp.a
+	clang $(CFLAGS) -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer tests/fuzz_device_output.c build-fuzz-device/libvirp.a $(LDFLAGS) -o build-fuzz-device/fuzz_device_output
+
+$(BUILD_DIR)/test_onode_security: tests/test_onode_security.c tests/test_onode.c $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB)
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB) $(LDFLAGS) -ljson-c -o $@
+.PHONY: test-onode-security
+test-onode-security: $(BUILD_DIR)/test_onode_security
+	./$(BUILD_DIR)/test_onode_security
+all-tests: test-onode-security

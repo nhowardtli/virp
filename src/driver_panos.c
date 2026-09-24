@@ -886,6 +886,20 @@ static int pa_timeout_for_command(const char *command)
  * Driver: execute
  * ========================================================================= */
 
+static virp_error_t pa_store_output(virp_exec_result_t *result,
+                                   const char *hostname, const char *command,
+                                   const char *body)
+{
+    int written = snprintf(result->output, sizeof(result->output),
+                           "%s>%s\n%s", hostname, command, body);
+    if (written < 0) return VIRP_ERR_INVALID_LENGTH;
+    result->output_len = (size_t)written < sizeof(result->output)
+        ? (size_t)written : sizeof(result->output) - 1;
+    if ((size_t)written >= sizeof(result->output))
+        result->output_truncated = true;
+    return VIRP_OK;
+}
+
 static virp_error_t pa_execute(virp_conn_t *conn,
                                 const char *command,
                                 virp_exec_result_t *result)
@@ -1026,10 +1040,12 @@ static virp_error_t pa_execute(virp_conn_t *conn,
     }
 
     /* Format: hostname>command\noutput */
-    int written = snprintf(result->output, sizeof(result->output),
-                           "%s>%s\n%s",
-                           conn->device.hostname, command, output_start);
-    result->output_len = (written > 0) ? (size_t)written : 0;
+    virp_error_t store_err = pa_store_output(result, conn->device.hostname,
+                                                   command, output_start);
+    if (store_err != VIRP_OK) {
+        pthread_mutex_unlock(&conn->session_mutex);
+        return store_err;
+    }
     result->success = true;
     result->exit_code = 0;
 

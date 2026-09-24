@@ -51,6 +51,16 @@ Two further defences are worth stating explicitly:
 
 ## Current State — Status Index (introduced 2026-08-27)
 
+> **Source reconciliation — 2026-09-24.** The review branch contains the
+> fixes and remaining work listed in [the remediation ledger](docs/SECURITY-REMEDIATION-2026-09-24.md).
+> These are source changes, not deployment claims. Historical running-build
+> statements below have not been reverified against a live host. Since
+> `13994c5`, explicit per-UID ceilings override the global ceiling and may
+> raise it; BLACK enables passthrough, including driver backstops. The
+> older unconditional-BLACK and tighten-only claims below are superseded.
+> UID authentication does not prove a human is operating the seat.
+
+
 Every tracked security item carries exactly one of four statuses. The
 narrative sections below (audits, reviews, corrections) are the record
 of how each item was found and argued; THIS index is the current state,
@@ -719,33 +729,12 @@ grades `obs_hmac = UNVERIFIABLE`, never PASS, so an attacker who
 registers a hash gets an unverifiable row rather than a forged
 observation, the same grade a legitimate oversized LibreNMS entry gets.
 
-**The report roll-up does NOT currently carry that through, and this
-rationale must not be read as claiming it does.**
-`EntryVerification.ok` is `FAIL not in (...)`, and UNVERIFIABLE is not
-FAIL, so a commitment-only entry reports `ok = True`, is omitted from
-`summarize()`'s `failed_entries`, and is rendered as the literal string
-**PASS** by `report/virp_report.py` — for an observation whose
-signature was never checked. Verified on 2026-08-09 against a real
-production entry (`obs:librenms-lab:1786029902471700439`), not only a
-synthetic one.
-
-That is the PASS/UNCHECKED tri-state item from the 2026-08-07 review.
-It is deliberately NOT fixed here: changing `ok()` re-grades
-operator-facing verdicts on tens of thousands of existing entries and
-does not belong in a deploy payload assembled for something else. Until
-it is fixed, "the reader grades it UNVERIFIABLE" is true of the field
-and false of the PDF, and an operator reading a report cannot
-distinguish a verified observation from a commitment-only one.
-
-*[tested — `tests/test_onode.c`
-`test_chain_append_commitment_only_observation_accepted` and
-`..._empty_body_accepted` drive both no-body shapes through the real
-handler. `tests/test_commitment_only_grading.py` pins the FIELD at
-UNVERIFIABLE for a legitimate and an invented commitment alike, and
-pins the ROLL-UP GAP as an `expectedFailure`
-(`test_KNOWN_GAP_bodyless_entry_still_rolls_up_as_ok`) so that fixing
-`ok()` turns it into an unexpected success and fails the suite —
-forcing this wording to be revisited rather than left stale]*
+**Corrected 2026-09-24:** the earlier PASS/UNCHECKED roll-up gap was
+already fixed before this review branch (`0165984`). Commitment-only
+observations remain UNVERIFIABLE, do not roll up as `ok`, and render with
+a tri-state verdict. `tests/test_commitment_only_grading.py` and
+`tests/test_virp_report.py` cover this behavior. This correction does not
+claim that a body-less observation has been authenticated.
 
 The residue is real and stated: a caller can still write an arbitrary
 hash under `artifact_type: observation`. Closing that needs a

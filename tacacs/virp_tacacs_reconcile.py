@@ -199,7 +199,7 @@ def read_chain(db_path):
             receipts.append({"session_id": session_id, "sequence": seq,
                              "artifact_id": aid, "timestamp_ns": ts,
                              "body": body})
-        elif schema == "gate_execution/1":
+        elif atype == "gate_execution" and schema in ("gate_execution/1", "gate_execution/2"):
             gates.append({"session_id": session_id, "sequence": seq,
                           "artifact_id": aid, "timestamp_ns": ts,
                           "body": body})

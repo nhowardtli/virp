@@ -702,9 +702,45 @@ static void test_a_broken_hash_across_the_transition_is_broken(void)
     PASS();
 }
 
+static void test_signed_entries_require_signed_head(void)
+{
+    TEST("public-key verifier rejects stripped head, including a deleted tail");
+    for (int trim = 0; trim <= 1; trim++) {
+        build_migrated_db();
+        sqlite3 *db = NULL;
+        ASSERT(sqlite3_open(DB, &db) == SQLITE_OK, "open mutation db");
+        ASSERT(sqlite3_exec(db,
+            "UPDATE chain_heads SET head_sig='',head_sig_key_id='' "
+            "WHERE session_id='s-after'", NULL, NULL, NULL) == SQLITE_OK,
+            "strip head signature");
+        if (trim) {
+            ASSERT(sqlite3_exec(db,
+                "DELETE FROM chain_entries WHERE session_id='s-after' AND sequence=2;"
+                "UPDATE chain_heads SET last_sequence=1,last_entry_hash="
+                "(SELECT chain_entry_hash FROM chain_entries "
+                "WHERE session_id='s-after' AND sequence=1) "
+                "WHERE session_id='s-after'", NULL, NULL, NULL) == SQLITE_OK,
+                "remove tail and rewrite unsigned length commitment");
+        }
+        sqlite3_close(db);
+        virp_chain_state_t v;
+        ASSERT(virp_chain_open_verifier_ex(&v, DB, NULL, PK, 1, "local") == VIRP_OK,
+               "open PUBLIC KEY ONLY verifier");
+        virp_chain_verify_result_t r;
+        ASSERT(virp_chain_verify_session(&v, "s-after", &r) == VIRP_OK,
+               "verification completed");
+        ASSERT(!r.valid && !r.valid_signed, "stripped head must fail");
+        ASSERT(strstr(r.error_detail, "head") != NULL, "diagnostic names head");
+        virp_chain_destroy(&v);
+        cleanup();
+    }
+    PASS();
+}
+
 int main(void)
 {
     printf("\n=== VIRP chain-signing MIGRATION tests (HAM item 7) ===\n");
+    test_signed_entries_require_signed_head();
     test_from_n_unsigned_prefix_then_signed();
     test_from_1_is_the_degenerate_from_n();
     test_signed_then_unsigned_is_broken();

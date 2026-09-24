@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sodium.h>
 
 static int tests_passed = 0;
@@ -263,6 +264,28 @@ static void test_registry_skips_bad_entry(void)
     PASS();
 }
 
+static void test_registry_custody(void)
+{
+    TEST("registry refuses writable files and symlinks");
+    const char *path = "/tmp/virp-approvers-custody.json";
+    const char *link = "/tmp/virp-approvers-custody.link";
+    unlink(path); unlink(link);
+    FILE *f = fopen(path, "w");
+    ASSERT(f != NULL, "create registry");
+    fputs("[]", f); fclose(f);
+    virp_approver_registry_t reg;
+    ASSERT(chmod(path, 0644) == 0, "secure permissions");
+    ASSERT(virp_approver_registry_load(&reg, path) == VIRP_OK, "public-readable is fine");
+    ASSERT(chmod(path, 0664) == 0, "group writable");
+    ASSERT(virp_approver_registry_load(&reg, path) != VIRP_OK, "refuse group writable");
+    ASSERT(chmod(path, 0602) == 0, "world writable");
+    ASSERT(virp_approver_registry_load(&reg, path) != VIRP_OK, "refuse world writable");
+    ASSERT(chmod(path, 0600) == 0 && symlink(path, link) == 0, "create symlink");
+    ASSERT(virp_approver_registry_load(&reg, link) != VIRP_OK, "refuse symlink");
+    unlink(link); unlink(path);
+    PASS();
+}
+
 int main(void)
 {
     printf("\n=== VIRP Approver Registry Tests ===\n");
@@ -277,6 +300,7 @@ int main(void)
     test_algorithm_mismatch_rejected();
     test_registry_load_and_lookup();
     test_registry_skips_bad_entry();
+    test_registry_custody();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);

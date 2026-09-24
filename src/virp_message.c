@@ -347,7 +347,7 @@ static virp_error_t build_and_sign(uint8_t *buf, size_t buf_len,
 {
     size_t total = VIRP_HEADER_SIZE + payload_len;
 
-    if (total > VIRP_MAX_MESSAGE_SIZE)
+    if (total > VIRP_MAX_MESSAGE_SIZE || total > UINT16_MAX)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
     if (buf_len < total)
         return VIRP_ERR_BUFFER_TOO_SMALL;
@@ -398,10 +398,13 @@ virp_error_t virp_build_observation_tiered(uint8_t *buf, size_t buf_len,
     if (!buf || !out_len || !sk)
         return VIRP_ERR_NULL_PTR;
 
-    /* Build observation payload — cap data to max payload capacity */
+    /* Refuse overflow of the v1 uint16 frame length. Never silently sign
+     * a prefix: the caller must account for any capture truncation. */
     uint8_t payload[4 + VIRP_MAX_PAYLOAD_SIZE];
-    if (data_len > VIRP_MAX_PAYLOAD_SIZE - 4)
-        data_len = (uint16_t)(VIRP_MAX_PAYLOAD_SIZE - 4);
+    if (data_len > VIRP_OBS_V1_MAX_DATA)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+    if (data_len && !data)
+        return VIRP_ERR_NULL_PTR;
     payload[0] = obs_type;
     payload[1] = obs_scope;
     uint16_t dl_n = htons(data_len);

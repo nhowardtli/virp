@@ -138,6 +138,11 @@ jobs:
         run: make fuzz
       - name: Short bounded run
         run: timeout 120 ./build/fuzz_virp || test $? -eq 124
+      - name: Hostile device output under libFuzzer and sanitizers
+        run: |
+          sudo apt-get install -y --no-install-recommends clang
+          make fuzz-device-output
+          ./build-fuzz-device/fuzz_device_output -max_total_time=60 -max_len=65535
 
   static-analysis:
     name: clang-tidy
