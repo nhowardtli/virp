@@ -294,6 +294,13 @@ def verify_evidence(evidence: dict, corpus: dict, bridge: VIRPBridge,
             "signature": "VALID",
         }
 
+    if signed.get("obs_type") != 0x07:
+        return Verdict.UNVERIFIABLE, {
+            "obs_id": obs_id,
+            "reason": "Signed observation is not DEVICE_OUTPUT",
+            "signature": "VALID",
+        }
+
     try:
         verified_output = signed["payload"].decode("utf-8")
     except UnicodeDecodeError:

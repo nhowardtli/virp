@@ -22,6 +22,12 @@ When it claims a config change succeeded, where is the evidence?
 
 ---
 
+> **Current reference scope:** default v1 observations authenticate their
+> bytes but do not bind device/command/session as v2 does. Explicit UID
+> ceiling rows may raise the global ceiling; BLACK selects passthrough.
+> See the [2026-09-24 remediation ledger](docs/SECURITY-REMEDIATION-2026-09-24.md)
+> for source fixes, verification limits, and remaining audit work.
+
 ## What VIRP Does
 
 VIRP is an open protocol that authenticates every device observation at the point of collection, before the AI ever sees it.

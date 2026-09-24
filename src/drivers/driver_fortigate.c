@@ -815,6 +815,8 @@ const char *fg_route_table_entry(size_t i, virp_trust_tier_t *tier)
     return FG_ROUTE_TABLE[i].command_pattern;
 }
 
+bool fg_is_black_tier(const char *command);
+
 virp_trust_tier_t fg_route_command(const char *command)
 {
     if (!command) return VIRP_TIER_RED;              /* fail closed */
@@ -829,6 +831,7 @@ virp_trust_tier_t fg_route_command(const char *command)
 
     /* Skip leading whitespace so " show system admin" still classifies. */
     while (*command == ' ' || *command == '\t') command++;
+    if (fg_is_black_tier(command)) return VIRP_TIER_BLACK;
 
     const fg_command_route_t *best = NULL;
     size_t best_len = 0;

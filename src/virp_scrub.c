@@ -629,6 +629,11 @@ static void fail_closed(char *buf, size_t buf_size, size_t *len_io)
 void virp_scrub_exec_result(virp_exec_result_t *result)
 {
     if (!result) return;
+    if (result->output_len > sizeof(result->output)) {
+        fail_closed(result->output, sizeof(result->output), &result->output_len);
+        result->output_truncated = true;
+        result->success = false;
+    }
 
     /* ── the observation body ─────────────────────────────────────── */
     if (result->output_len > 0) {

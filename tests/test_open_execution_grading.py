@@ -21,6 +21,7 @@ Entries are built with real canonical hashes (verify.canonical_json,
 verify.genesis_hash) so the per-entry checks PASS on their own merits and
 the "not a broken chain" claim is exercised, not assumed. Pure stdlib.
 """
+import base64
 import hashlib
 import json
 import os
@@ -31,6 +32,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "report"))
 
 import verify  # noqa: E402
+from test_virp_report import sign_observation
 
 GATE_SESSION = "gate-enforce:PVE-LAB"
 APPROVAL_SESSION = "approval:PVE-LAB"
@@ -58,7 +60,8 @@ class ChainBuilder:
             "sequence": seq,
             "artifact_type": atype,
             "artifact_id": artifact_id,
-            "artifact_hash": _sha(body),
+            "artifact_hash": (hashlib.sha256(body).hexdigest()
+                              if isinstance(body, bytes) else _sha(body)),
             "artifact_hash_alg": "sha256",
             "artifact_schema_version": "1",
             "previous_entry_hash": (verify.genesis_hash(session)
@@ -72,7 +75,9 @@ class ChainBuilder:
         }
         e["chain_entry_hash"] = _sha(verify.canonical_json(e))
         self.entries.append(e)
-        self.artifacts[(artifact_id, e["artifact_hash"])] = body
+        self.artifacts[(artifact_id, e["artifact_hash"])] = (
+            "base64:" + base64.b64encode(body).decode()
+            if isinstance(body, bytes) else body)
         self._last[session] = e
         return e
 
@@ -339,7 +344,7 @@ class TestOpenExecutionGrading(unittest.TestCase):
         b.execution(None)          # intent_entry_hash: null
         b.execution(None)
         b.append(GATE_SESSION, "observation", "obs:leg",
-                 '{"schema":"observation/1"}')
+                 sign_observation(b'k' * 32, b'legacy device output'))
         verifications, summary = b.verify()
         self._assert_chain_clean(verifications, summary)
         self.assertEqual(summary["open_executions"], [])

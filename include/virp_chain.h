@@ -651,6 +651,9 @@ bool virp_chain_from_n_temporally_ok(uint64_t first_signed_ns,
  */
 bool virp_chain_canonical_string_ok(const char *s);
 
+/* Artifact commitments are exactly 32 bytes encoded as lowercase hex. */
+bool virp_chain_artifact_hash_ok(const char *s);
+
 virp_error_t virp_chain_verify_session(virp_chain_state_t *state,
                                        const char *session_id,
                                        virp_chain_verify_result_t *result);
@@ -691,6 +694,11 @@ virp_error_t virp_chain_get_last(virp_chain_state_t *state,
  * "outcome:<proposal_id>") — the L1 enforcement point. Returns VIRP_OK
  * on a successful query (whether or not it matched), an error otherwise.
  */
+virp_error_t virp_chain_artifact_type_exists(virp_chain_state_t *state,
+                                             const char *artifact_id,
+                                             const char *artifact_type,
+                                             bool *exists);
+
 virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
                                         const char *artifact_id,
                                         bool *exists);

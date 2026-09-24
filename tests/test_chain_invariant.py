@@ -58,6 +58,7 @@ def check(name, ok, detail=""):
         passed += 1
     else:
         failed += 1
+        raise AssertionError("%s: %s" % (name, detail))
     return ok
 
 
@@ -72,7 +73,9 @@ def sha256_file(path):
 # ---------------------------------------------------------------------------
 # 1. evidence files match the seal
 # ---------------------------------------------------------------------------
-def test_evidence_files(seal):
+def test_evidence_files(seal=None):
+    if seal is None:
+        seal = json.load(open(SEAL_JSON, encoding="utf-8"))
     ev = seal["evidence_files"]
     check("fixtures-appendix-a.json sha256 == seal evidence_files",
           sha256_file(FIXTURES) == ev["fixtures_appendix_a_sha256"])
@@ -97,7 +100,9 @@ def test_seal_verify_fixtures():
 # ---------------------------------------------------------------------------
 # 3. report/verify.py rebuilds Appendix A
 # ---------------------------------------------------------------------------
-def test_verifypy_against_fixtures(fx):
+def test_verifypy_against_fixtures(fx=None):
+    if fx is None:
+        fx = json.load(open(FIXTURES, encoding="utf-8"))
     for fid, e in sorted(fx["entries"].items()):
         fields = json.loads(e["canonical_utf8"])
         canon = verify.canonical_json(fields)
@@ -156,7 +161,11 @@ def merkle_root(sessions):
     return level[0].hex()
 
 
-def test_seal_merkle(seal, headset):
+def test_seal_merkle(seal=None, headset=None):
+    if seal is None:
+        seal = json.load(open(SEAL_JSON, encoding="utf-8"))
+    if headset is None:
+        headset = json.load(open(HEADSET, encoding="utf-8"))
     sessions = seal["sessions"]
     check("seal sessions[] sorted ascending by UTF-8 session_id",
           [s["session_id"].encode("utf-8") for s in sessions]
@@ -177,7 +186,10 @@ def test_seal_merkle(seal, headset):
 # ---------------------------------------------------------------------------
 # 5. live append path (C binary) re-verified by verify.py
 # ---------------------------------------------------------------------------
-def test_e2e_db(c_binary):
+def test_e2e_db(c_binary=None):
+    if c_binary is None:
+        subprocess.run(["make", "build/test_chain_invariant"], cwd=ROOT, check=True)
+        c_binary = os.path.join(ROOT, "build", "test_chain_invariant")
     with tempfile.TemporaryDirectory(prefix="virp-inv-") as td:
         db = os.path.join(td, "e2e.db")
         env = dict(os.environ, VIRP_INVARIANT_DB=db, VIRP_FIXTURES=FIXTURES)

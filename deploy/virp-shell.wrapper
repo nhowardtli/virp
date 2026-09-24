@@ -11,13 +11,13 @@
 #   RED seat    virp-shell-red    uid 984  RED        sudo PASSWD (asked again)
 #
 # OPEN SEAT (2026-09-15): if the invoking uid has its own row in the rendered
-# policy (/run/virp/devices.json socket_uid_tier_ceilings), the shell runs AS
+# policy (/run/virp/devices.policy.json socket_uid_tier_ceilings), the shell runs AS
 # THAT UID — no sudo, no enable — and everything typed is judged under that
 # row's ceiling and chained under that identity. A row of "black" is the
 # passthrough super-admin (reload, write erase … apply, on the record). This
 # is ISE/TACACS accounting with a hash chain behind it: for a named human
 # with a row, nothing asks permission and everything is attributable.
-# Group virp is what makes /run/virp/devices.json readable here.
+# Group virp can read only the credential-free policy projection.
 #
 # Shared seats: `enable` exits 42 → virp-shell-admin (sudo -k, asks every
 # time); `enable red` exits 44 → virp-shell-red (asked again); `disable`
@@ -26,7 +26,7 @@
 # Installed by `make install-virp-shell` from deploy/virp-shell.wrapper.
 
 SHELL_PY=/usr/local/lib/virp/virp-shell
-POLICY=/run/virp/devices.json
+POLICY=/run/virp/devices.policy.json
 
 me=$(id -u)
 if [ "$me" -ne 0 ] && [ -r "$POLICY" ] && \

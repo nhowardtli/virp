@@ -271,6 +271,12 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
         char sess_kid[VIRP_CHAINSIGN_KEYID_HEX] = {0};
         chain_session_sig_state_locked(state, session_id, &sess_signed,
                                        sess_kid, sizeof(sess_kid));
+        if (state->verify_sig_enabled && sess_signed && !head_is_signed) {
+            result->valid = false;
+            snprintf(result->error_detail, sizeof(result->error_detail),
+                     "Signed entries require a signed head: session length is unauthenticated");
+            return VIRP_OK;
+        }
         if (state->verify_sig_enabled && sess_signed &&
             strcmp(sess_kid, state->verify_key_id_hex) != 0) {
             state->sig_key_unavailable_session = true;
@@ -363,6 +369,12 @@ static virp_error_t chain_verify_session_locked(virp_chain_state_t *state,
          * before 2026-08-23 17:48:11Z or inside the 2m21s window on
          * 2026-08-23 when the daemon restarted without signing. */
         result->sig_era = VIRP_CHAIN_SIG_ERA_UNSIGNED;
+    } else if (result->entries_signed > 0 && !head_is_signed) {
+        result->valid = false;
+        result->sig_era = VIRP_CHAIN_SIG_ERA_NOT_GRADED;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "Signed entries require a signed head: session length "
+                 "is unauthenticated (missing head signature)");
     } else if (result->entries_unsigned == 0) {
         result->sig_era = VIRP_CHAIN_SIG_ERA_SIGNED;
     } else if (result->sig_transition_seq > 0 && head_is_signed) {
@@ -588,8 +600,9 @@ virp_error_t virp_chain_get_last(virp_chain_state_t *state,
     return rc;
 }
 
-virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
+virp_error_t virp_chain_artifact_type_exists(virp_chain_state_t *state,
                                         const char *artifact_id,
+                                        const char *artifact_type,
                                         bool *exists)
 {
     if (!state || !artifact_id || !exists) return VIRP_ERR_NULL_PTR;
@@ -601,11 +614,16 @@ virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
     sqlite3_stmt *st = NULL;
     virp_error_t rc = VIRP_OK;
     if (sqlite3_prepare_v2(state->db,
-            "SELECT 1 FROM chain_entries WHERE artifact_id = ? LIMIT 1",
+            "SELECT 1 FROM chain_entries WHERE artifact_id = ? "
+            "AND (? IS NULL OR artifact_type = ?) LIMIT 1",
             -1, &st, NULL) != SQLITE_OK) {
         rc = VIRP_ERR_CHAIN_DB;
     } else {
         sqlite3_bind_text(st, 1, artifact_id, -1, SQLITE_TRANSIENT);
+        if (artifact_type) {
+            sqlite3_bind_text(st, 2, artifact_type, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 3, artifact_type, -1, SQLITE_TRANSIENT);
+        }
         int step = sqlite3_step(st);
         if (step == SQLITE_ROW)
             *exists = true;
@@ -615,6 +633,13 @@ virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
     if (st) sqlite3_finalize(st);
     pthread_mutex_unlock(&state->lock);
     return rc;
+}
+
+virp_error_t virp_chain_artifact_exists(virp_chain_state_t *state,
+                                        const char *artifact_id,
+                                        bool *exists)
+{
+    return virp_chain_artifact_type_exists(state, artifact_id, NULL, exists);
 }
 
 virp_error_t virp_chain_artifact_body_exists(virp_chain_state_t *state,
@@ -1453,6 +1478,15 @@ static void compute_genesis_hash(const char *session_id, char out[65])
  * string ends at one, and the ingress refuses an encoded \\u0000
  * outright (json_has_nul_escape in src/virp_onode.c).
  */
+bool virp_chain_artifact_hash_ok(const char *s)
+{
+    if (!s || strlen(s) != 64) return false;
+    for (size_t i = 0; i < 64; i++)
+        if (!((s[i] >= '0' && s[i] <= '9') ||
+              (s[i] >= 'a' && s[i] <= 'f'))) return false;
+    return true;
+}
+
 bool virp_chain_canonical_string_ok(const char *s)
 {
     if (!s) return false;
@@ -2277,6 +2311,9 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
         !artifact_id || !artifact_hash || !entry)
         return VIRP_ERR_NULL_PTR;
 
+    if (state->read_only)
+        return VIRP_ERR_CHAIN_READONLY;
+
     /* CANONICAL-STRING CONFORMANCE (HAM item 12). Every one of these
      * reaches the canonical object that is hashed and HMAC'd, and the
      * canonicalizer does not escape. Checked here, at the one place
@@ -2287,14 +2324,12 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
      * input. */
     if (!virp_chain_canonical_string_ok(session_id) ||
         !virp_chain_canonical_string_ok(artifact_type) ||
-        !virp_chain_canonical_string_ok(artifact_id))
+        !virp_chain_canonical_string_ok(artifact_id) ||
+        !virp_chain_artifact_hash_ok(artifact_hash))
         return VIRP_ERR_INVALID_LENGTH;
 
     if (!state->db)
         return VIRP_ERR_CHAIN_DB;
-
-    if (state->read_only)
-        return VIRP_ERR_CHAIN_READONLY;
 
     /* Any append invalidates the verify-scoped maps: they are a snapshot
      * of the closers and intents as they were, and the daemon's
@@ -3122,7 +3157,8 @@ static virp_error_t chain_verify_locked(virp_chain_state_t *state,
 
     int64_t expected_seq = from_sequence;
 
-    while (sqlite3_step(state->stmt_get_range) == SQLITE_ROW) {
+    int walk_step;
+    while ((walk_step = sqlite3_step(state->stmt_get_range)) == SQLITE_ROW) {
         virp_chain_entry_t e;
         read_entry_from_stmt(state->stmt_get_range, &e);
 
@@ -3361,6 +3397,15 @@ sig_done: ;
         result->entries_checked++;
     }
 
+    if (walk_step != SQLITE_DONE && result->valid) {
+        result->valid = false;
+        result->verifier_error = true;
+        snprintf(result->error_detail, sizeof(result->error_detail),
+                 "VERIFIER_ERROR: database range walk failed (%d)", walk_step);
+        sqlite3_reset(state->stmt_get_range);
+        chain_maps_free(state);
+        return VIRP_ERR_CHAIN_DB;
+    }
     sqlite3_reset(state->stmt_get_range);
     /* The verify-scoped maps live only as long as this walk. Freeing here
      * (rather than caching across calls) keeps them consistent with the

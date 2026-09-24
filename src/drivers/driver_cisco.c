@@ -821,6 +821,7 @@ virp_trust_tier_t cisco_gate_tier(const char *command)
         return VIRP_TIER_RED;
 
     while (*command == ' ' || *command == '\t') command++;
+    if (cisco_is_black_tier(command)) return VIRP_TIER_BLACK;
 
     /* Typed config op (C-04 Option A): a port description is YELLOW. The
      * driver executes it as a fixed transaction, never as this literal. */

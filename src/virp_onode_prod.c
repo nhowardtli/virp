@@ -31,6 +31,7 @@
 #include <signal.h>
 #include <getopt.h>
 #include <json-c/json.h>
+#include <errno.h>
 
 /*
  * Everything between here and the end of main() is the daemon's process
@@ -205,37 +206,42 @@ static bool json_get_bool(struct json_object *obj, const char *key, bool *out)
  * install it on the O-Node state. Absent array → state is left untouched
  * and onode_start() will self-seed with geteuid().
  */
-static void load_socket_allowed_uids(onode_state_t *state,
-                                     struct json_object *root)
+static bool parse_uid(const char *text, uid_t *uid)
+{
+    if (!text || !*text) return false;
+    for (const char *p = text; *p; p++)
+        if (*p < '0' || *p > '9') return false;
+    errno = 0;
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno == ERANGE || !end || *end ||
+        value != (unsigned long)(uid_t)value || (uid_t)value == (uid_t)-1)
+        return false;
+    *uid = (uid_t)value;
+    return true;
+}
+
+static int load_socket_allowed_uids(onode_state_t *state,
+                                    struct json_object *root)
 {
     struct json_object *arr;
-    if (!json_object_object_get_ex(root, "socket_allowed_uids", &arr) ||
-        !json_object_is_type(arr, json_type_array)) {
-        return;  /* optional */
-    }
-
-    int n = (int)json_object_array_length(arr);
-    if (n <= 0) return;
-    if (n > ONODE_MAX_ALLOWED_UIDS) {
-        fprintf(stderr, "[O-Node] socket_allowed_uids has %d entries, "
-                        "truncating to %d\n", n, ONODE_MAX_ALLOWED_UIDS);
-        n = ONODE_MAX_ALLOWED_UIDS;
-    }
-
+    if (!json_object_object_get_ex(root, "socket_allowed_uids", &arr))
+        return 0; /* absent uses the daemon's self-only default */
+    if (!json_object_is_type(arr, json_type_array)) return -1;
+    size_t n = json_object_array_length(arr);
+    if (!n || n > ONODE_MAX_ALLOWED_UIDS) return -1;
     uid_t uids[ONODE_MAX_ALLOWED_UIDS];
-    int parsed = 0;
-    for (int i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
         struct json_object *el = json_object_array_get_idx(arr, i);
-        if (!el) continue;
-        if (json_object_is_type(el, json_type_int)) {
-            uids[parsed++] = (uid_t)json_object_get_int(el);
-        } else if (json_object_is_type(el, json_type_string)) {
-            uids[parsed++] = (uid_t)strtoul(json_object_get_string(el),
-                                            NULL, 10);
-        }
+        if ((!json_object_is_type(el, json_type_int) &&
+             !json_object_is_type(el, json_type_string)) ||
+            !parse_uid(json_object_get_string(el), &uids[i]))
+            return -1;
+        if (json_object_is_type(el, json_type_string) &&
+            strlen(json_object_get_string(el)) != (size_t)json_object_get_string_len(el))
+            return -1; /* embedded NUL must not change identity */
     }
-    if (parsed > 0)
-        onode_set_allowed_uids(state, uids, (size_t)parsed);
+    return onode_set_allowed_uids(state, uids, n) == VIRP_OK ? 0 : -1;
 }
 
 /*
@@ -245,20 +251,18 @@ static void load_socket_allowed_uids(onode_state_t *state,
  *   "socket_uid_tier_ceilings": { "993": "green", "1002": "yellow" }
  *
  * Keys are uid strings (matching how socket_allowed_uids may be given as
- * strings); values are "green"/"yellow"/"red". Absent object → no
- * ceilings, every allowed uid keeps the node-wide gate_max_tier. A
- * ceiling for a uid NOT on the allowlist is warned about and skipped —
- * it could never take effect (the connection is refused at accept), so
- * silently keeping it would mislead an auditor reading the config.
+ * strings); values are "green"/"yellow"/"red"/"black". Absent object
+ * preserves the node-wide default. A present map must cover every allowed
+ * uid; malformed or incomplete policy refuses startup. Rows outside the
+ * allowlist are retained with a warning and do not grant socket access.
  */
-static void load_uid_tier_ceilings(onode_state_t *state,
+static int load_uid_tier_ceilings(onode_state_t *state,
                                    struct json_object *root)
 {
     struct json_object *obj;
-    if (!json_object_object_get_ex(root, "socket_uid_tier_ceilings", &obj) ||
-        !json_object_is_type(obj, json_type_object)) {
-        return;  /* optional */
-    }
+    if (!json_object_object_get_ex(root, "socket_uid_tier_ceilings", &obj))
+        return 0;  /* optional only when absent */
+    if (!json_object_is_type(obj, json_type_object)) return -1;
 
     uid_t uids[ONODE_MAX_ALLOWED_UIDS];
     virp_trust_tier_t tiers[ONODE_MAX_ALLOWED_UIDS];
@@ -267,20 +271,25 @@ static void load_uid_tier_ceilings(onode_state_t *state,
     json_object_object_foreach(obj, key, val) {
         if (count >= ONODE_MAX_ALLOWED_UIDS) {
             fprintf(stderr, "[O-Node] socket_uid_tier_ceilings: too many "
-                            "entries, ignoring '%s' and beyond\n", key);
-            break;
+                            "entries, refusing '%s' and beyond\n", key);
+            return -1;
         }
         if (!json_object_is_type(val, json_type_string)) {
             fprintf(stderr, "[O-Node] socket_uid_tier_ceilings['%s']: value "
-                            "is not a tier string — skipping\n", key);
-            continue;
+                            "is not a tier string — refusing\n", key);
+            return -1;
         }
         char *end = NULL;
+        errno = 0;
         unsigned long uidv = strtoul(key, &end, 10);
-        if (!end || *end != '\0') {
+        bool decimal = key[0] != '\0';
+        for (const char *p = key; *p; p++)
+            if (*p < '0' || *p > '9') decimal = false;
+        if (!decimal || errno == ERANGE || !end || *end != '\0' ||
+            uidv != (unsigned long)(uid_t)uidv || (uid_t)uidv == (uid_t)-1) {
             fprintf(stderr, "[O-Node] socket_uid_tier_ceilings key '%s' is "
-                            "not a numeric uid — skipping\n", key);
-            continue;
+                            "not a numeric uid — refusing\n", key);
+            return -1;
         }
         const char *s = json_object_get_string(val);
         virp_trust_tier_t tier;
@@ -299,8 +308,8 @@ static void load_uid_tier_ceilings(onode_state_t *state,
         else {
             fprintf(stderr, "[O-Node] socket_uid_tier_ceilings['%s'] = '%s' "
                             "unrecognized (want green/yellow/red/black) — "
-                            "skipping\n", key, s);
-            continue;
+                            "refusing\n", key, s);
+            return -1;
         }
 
         /* Warn if this uid is not on the allowlist — the ceiling is inert. */
@@ -312,6 +321,8 @@ static void load_uid_tier_ceilings(onode_state_t *state,
                             "not in socket_allowed_uids — ceiling has no "
                             "effect (connection would be refused)\n", uidv);
 
+        for (size_t i = 0; i < count; i++)
+            if (uids[i] == (uid_t)uidv) return -1;
         uids[count]  = (uid_t)uidv;
         tiers[count] = tier;
         count++;
@@ -319,10 +330,19 @@ static void load_uid_tier_ceilings(onode_state_t *state,
 
     if (count > 0) {
         virp_error_t err = onode_set_uid_ceilings(state, uids, tiers, count);
-        if (err != VIRP_OK)
-            fprintf(stderr, "[O-Node] onode_set_uid_ceilings failed: %d\n",
-                    (int)err);
+        if (err != VIRP_OK) return -1;
     }
+    for (size_t i = 0; i < state->socket_allowed_uids_count; i++) {
+        bool covered = false;
+        for (size_t j = 0; j < count; j++)
+            if (uids[j] == state->socket_allowed_uids[i]) covered = true;
+        if (!covered) {
+            fprintf(stderr, "[O-Node] FATAL: configured ceilings omit allowed uid %u\n",
+                    (unsigned)state->socket_allowed_uids[i]);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /*
@@ -680,12 +700,20 @@ int load_devices(onode_state_t *state, const char *path)
     }
 
     /* Socket access gate: install allowlist before onode_start(). */
-    load_socket_allowed_uids(state, root);
+    if (load_socket_allowed_uids(state, root) != 0) {
+        fprintf(stderr, "[O-Node] FATAL: invalid socket_allowed_uids\n");
+        json_object_put(root);
+        return -1;
+    }
 
     /* Per-uid tier ceilings (optional). Installed before onode_start(),
      * after the allowlist so it can warn about a ceiling for a uid that
      * is not allowed to connect. */
-    load_uid_tier_ceilings(state, root);
+    if (load_uid_tier_ceilings(state, root) != 0) {
+        fprintf(stderr, "[O-Node] FATAL: invalid or incomplete socket_uid_tier_ceilings\n");
+        json_object_put(root);
+        return -1;
+    }
     load_uid_action_allow(state, root);
     load_uid_chain_append_types(state, root);
 

@@ -1128,7 +1128,7 @@ static void test_append_with_artifact_rolls_back_together(void)
     virp_chain_entry_t e;
     err = virp_chain_append_with_artifact(&state, "session-rollback",
                                           "outcome", "outcome:rb-0",
-                                          "aa11", "seed body", &e);
+                                          "f0d6adbebf32aa7c0ee548a05136b4792d444ce4766774f923bcefe3030c15d8", "seed body", &e);
     ASSERT(err == VIRP_OK, "seed append failed");
 
     /* Force the body store to fail: drop the artifacts table out from
@@ -1139,7 +1139,7 @@ static void test_append_with_artifact_rolls_back_together(void)
 
     err = virp_chain_append_with_artifact(&state, "session-rollback",
                                           "outcome", "outcome:rb-1",
-                                          "bb22", "doomed body", &e);
+                                          "302a451febb890c500eeffa465f07920dda753369393571edbf55e08bba72fcf", "doomed body", &e);
     ASSERT(err == VIRP_ERR_CHAIN_DB, "append must fail typed");
 
     virp_chain_entry_t last;

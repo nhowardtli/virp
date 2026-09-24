@@ -13,6 +13,7 @@
  */
 #include "../src/driver_panos.c"
 #include "refusal_contract.h"
+#include "virp_scrub.h"
 
 int main(void)
 {
@@ -37,6 +38,20 @@ int main(void)
     memset(&r, 0, sizeof(r));
     e = pa_execute(&conn, "commit force", &r);
     RC_ASSERT_REFUSAL(e, r, "PAN-OS BLACK refusal (commit)");
+
+    /* Complete reply fits raw capture but not hostname + command + reply.
+     * The returned length must remain safe through the real scrub path. */
+    static char large[VIRP_OUTPUT_MAX];
+    memset(large, 'x', sizeof(large)-1);
+    large[sizeof(large)-1] = 0;
+    memset(&r, 0, sizeof(r));
+    if (pa_store_output(&r, "long-hostname-for-boundary", "show version", large) != VIRP_OK ||
+        r.output_len != sizeof(r.output)-1 || !r.output_truncated) {
+        fprintf(stderr, "FAIL: oversized formatted reply was not bounded\n");
+        return 1;
+    }
+    virp_scrub_exec_result(&r); /* ASan detects any downstream over-read. */
+    if (r.output_len >= sizeof(r.output)) return 1;
 
     RC_REPORT("test_panos_black_refusal_obeys_contract");
 }

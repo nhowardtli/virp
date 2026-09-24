@@ -2243,7 +2243,7 @@ TEST(test_per_uid_black_ceiling_is_passthrough_and_red_binds_above_node)
 
     /* The thread-local never leaks past a dispatch. */
     ASSERT_EQ((int)virp_exec_passthrough, 0);
-    onode_destroy(&tmp);
+    errobs_teardown(&tmp);
 }
 
 TEST(test_per_uid_ceiling_caps_yellow_but_not_uncapped)
@@ -3868,7 +3868,7 @@ TEST(test_green_execution_chains_signed_observation)
 
     ASSERT_TRUE(strncmp(rows[1].id, "gateexec-", 9) == 0);
     ASSERT_TRUE(strstr(rows[1].body,
-                       "\"schema\":\"gate_execution/1\"") != NULL);
+                       "\"schema\":\"gate_execution/2\"") != NULL);
     ASSERT_TRUE(strstr(rows[1].body, "\"device\":\"PVE-LAB\"") != NULL);
     ASSERT_TRUE(strstr(rows[1].body, "\"driver\":\"mock\"") != NULL);
     ASSERT_TRUE(strstr(rows[1].body,
@@ -4369,8 +4369,8 @@ TEST(test_execution_record_commits_to_digest_not_response_body)
  * An executed action that ERRORED still lands in the chain. A gap here
  * would be the worst kind: the actions most worth auditing are the ones
  * that went wrong, and a driver error is no proof the command never
- * reached the device — so the record says executed=true and flags that
- * the driver could not report what happened.
+ * reached the device — so gate_execution/2 records executed=null and flags
+ * that the driver could not report what happened.
  */
 TEST(test_errored_execution_still_chains_no_gap)
 {
@@ -4400,8 +4400,9 @@ TEST(test_errored_execution_still_chains_no_gap)
     ASSERT_TRUE(rows[0].have_body);
 
     ASSERT_TRUE(strstr(rows[0].body, "\"success\":false") != NULL);
-    /* No proof of non-dispatch: the record must not claim nothing ran. */
-    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":true") != NULL);
+    /* No proof either way: preserve uncertainty rather than asserting execution. */
+    ASSERT_TRUE(strstr(rows[0].body, "\"schema\":\"gate_execution/2\"") != NULL);
+    ASSERT_TRUE(strstr(rows[0].body, "\"executed\":null") != NULL);
     ASSERT_TRUE(strstr(rows[0].body,
                        "\"executed_reported\":false") != NULL);
     ASSERT_TRUE(strstr(rows[0].body, "driver execute failed") != NULL);
@@ -8323,6 +8324,40 @@ TEST(test_onode_start_refuses_allowlisted_uid_without_action_map)
  * Main
  * ========================================================================= */
 
+TEST(test_large_intent_fetch_refuses_before_signing)
+{
+    virp_intent_entry_t ie;
+    memset(&ie, 0, sizeof(ie));
+    snprintf(ie.intent_id, sizeof(ie.intent_id), "large-intent-regression");
+    memset(ie.intent_hash, 'a', 64);
+    /* A valid JSON string that exceeds the response stack buffer. */
+    memset(ie.intent_json, 'x', 7000);
+    ie.intent_json[0] = '"'; ie.intent_json[6999] = '"';
+    snprintf(ie.proposed_actions, sizeof(ie.proposed_actions), "[]");
+    snprintf(ie.constraints, sizeof(ie.constraints), "{}");
+    ASSERT_OK(virp_chain_intent_store(&ca_state.chain, &ie));
+    uint8_t response[VIRP_MAX_MESSAGE_SIZE];
+    ssize_t n = ca_request(
+        "{\"action\":\"intent_get\",\"intent_id\":\"large-intent-regression\"}",
+        response, sizeof(response));
+    ASSERT_EQ(n, 4);  /* typed error, never an observation of stack bytes */
+    uint32_t code; memcpy(&code, response, 4);
+    ASSERT_EQ((int32_t)ntohl(code), VIRP_ERR_BUFFER_TOO_SMALL);
+}
+
+TEST(test_batch_refuses_overlength_instead_of_executing_prefix)
+{
+    char command[1024 + 1];
+    memset(command, 'x', sizeof(command) - 1); command[sizeof(command)-1] = 0;
+    char request[1024 + 256];
+    snprintf(request, sizeof(request),
+             "{\"action\":\"batch_execute\",\"commands\":["
+             "{\"device\":\"R1\",\"command\":\"show version\"},"
+             "{\"device\":\"R1\",\"command\":\"%s\"}]}", command);
+    uint8_t response[VIRP_MAX_MESSAGE_SIZE];
+    ASSERT_EQ(client_request(request, response, sizeof(response)), 4);
+}
+
 int main(int argc, char **argv)
 {
     /* Re-executed self as the crash-test child (see ev_crash_child). */
@@ -8399,16 +8434,9 @@ int main(int argc, char **argv)
 
     printf("\n[GREEN auto-execution records (chain covers what was allowed)]\n");
     RUN_TEST(test_declared_refusal_with_body_routes_to_error);
-    /* PENDING until the /2 three-valued work. Steps 1-2 fixed the five
-     * production drivers, which now DECLARE non-dispatch; these two drive
-     * a mock that deliberately reproduces the pre-step-2 shape (refusal
-     * with a body, no declaration) to hold the O-Node itself to account.
-     * It still records that shape as executed. No shipping driver emits
-     * it — driver twelve will. */
-    PENDING_TEST(test_refusal_with_body_is_not_an_execution,
-                 "gate_execution/2 three-valued executed (EXECUTED / REFUSED / UNKNOWN): an undeclared !success result must resolve to UNKNOWN, never EXECUTED, and must not be signed as DEVICE_OUTPUT");
-    PENDING_TEST(test_refusal_with_body_is_not_recorded_executed,
-                 "gate_execution/2 three-valued executed (EXECUTED / REFUSED / UNKNOWN): an undeclared !success result must resolve to UNKNOWN, never EXECUTED, and must not be signed as DEVICE_OUTPUT");
+    /* An undeclared failure with a body is UNKNOWN, never executed:true. */
+    RUN_TEST(test_refusal_with_body_is_not_an_execution);
+    RUN_TEST(test_refusal_with_body_is_not_recorded_executed);
     RUN_TEST(test_green_execution_chains_signed_observation);
     RUN_TEST(test_evidence_append_failure_refuses_and_executes_nothing);
     RUN_TEST(test_evidence_not_required_runs_and_warns);
@@ -8587,6 +8615,7 @@ int main(int argc, char **argv)
         RUN_TEST(test_uid_action_map_foreign_uid_keeps_shutdown);
         RUN_TEST(test_onode_start_refuses_chain_append_uid_without_type_policy);
         RUN_TEST(test_onode_start_refuses_allowlisted_uid_without_action_map);
+        RUN_TEST(test_large_intent_fetch_refuses_before_signing);
         ca_stop();
         ca_cleanup_files();
     } else {
@@ -8595,6 +8624,7 @@ int main(int argc, char **argv)
     }
 
     printf("\n  -- Audit §4.1: sign_intent/sign_outcome signing oracle --\n");
+    RUN_TEST(test_batch_refuses_overlength_instead_of_executing_prefix);
     RUN_TEST(test_sign_intent_predicate);
     RUN_TEST(test_sign_intent_rejects_oversized);
     RUN_TEST(test_sign_intent_rejects_non_hex);

@@ -400,6 +400,13 @@ static const char *onode_action_name(onode_action_t action)
     return "unknown";
 }
 
+/* All daemon session access observes expiry while holding the same lock. */
+static void onode_session_lock(onode_state_t *state)
+{
+    pthread_mutex_lock(&state->session_mutex);
+    if (state->ctx) (void)virp_session_check_timeouts(state->ctx);
+}
+
 static bool parse_request(const char *json, onode_request_t *req)
 {
     if (!json || !req) return false;
@@ -561,9 +568,18 @@ static bool parse_request(const char *json, onode_request_t *req)
         cJSON_Delete(root);
         return false;
     }
-    EXTRACT_STR("artifact_hash", req->artifact_hash, sizeof(req->artifact_hash));
-    EXTRACT_STR("artifact_content", req->artifact_content,
-                sizeof(req->artifact_content));
+    if (cJSON_GetObjectItemCaseSensitive(root, "artifact_hash") &&
+        (!EXTRACT_STR("artifact_hash", req->artifact_hash, sizeof(req->artifact_hash)) ||
+         !virp_chain_artifact_hash_ok(req->artifact_hash))) {
+        cJSON_Delete(root);
+        return false;
+    }
+    if (cJSON_GetObjectItemCaseSensitive(root, "artifact_content") &&
+        !EXTRACT_STR("artifact_content", req->artifact_content,
+                     sizeof(req->artifact_content))) {
+        cJSON_Delete(root);
+        return false;
+    }
 
     /*
      * Chain sequence numbers: negative values are meaningless and would
@@ -1104,12 +1120,9 @@ static virp_error_t approval_emit_outcome(onode_state_t *state,
  * persisting the content. The raw body still goes back to the caller in
  * the signed observation, unchanged.
  *
- * The digest is over the FULL response the driver captured
- * (result->output_len bytes), which is not always what the caller
- * receives: the observation payload is clamped to 65530 bytes, and
- * output_truncated says whether the DRIVER already cut the device's
- * output short. Both lengths are recorded so a reader can tell which
- * bytes the digest covers instead of guessing.
+ * The digest covers the scrubbed bytes retained for the observation.
+ * Wire-size clamping happens before this receipt is recorded, and
+ * output_truncated marks either driver truncation or that wire-size cap.
  *
  * result == NULL means the driver never returned one (execute() itself
  * errored). That still gets an entry — an executed-but-errored action
@@ -1185,7 +1198,7 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
     char *body = NULL;
     cJSON *o = cJSON_CreateObject();
     if (o) {
-        cJSON_AddStringToObject(o, "schema", "gate_execution/1");
+        cJSON_AddStringToObject(o, "schema", "gate_execution/2");
         cJSON_AddStringToObject(o, "device", device_name);
         cJSON_AddStringToObject(o, "driver", drv->name);
         cJSON_AddStringToObject(o, "command", command);
@@ -1270,16 +1283,17 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
             cJSON_AddNullToObject(o, "intent_artifact_id");
         }
 
-        /* "executed" uses the codebase's own proof standard: assume the
-         * command reached the device UNLESS the driver proved it did not
-         * (no_dispatch) — the same test the retry logic turns on, and for
-         * the same reason (absence of a response is not absence of a side
-         * effect). A driver that errored outright proved nothing, so it
-         * counts as executed and executed_reported=false says the driver
-         * could not tell us what happened. */
-        cJSON_AddBoolToObject(o, "executed",
-                              !(result && result->no_dispatch));
-        cJSON_AddBoolToObject(o, "executed_reported", result != NULL);
+        /* Three-valued evidence: lack of non-dispatch proof is not proof
+         * of execution. UNKNOWN is JSON null, never a success assertion. */
+        bool unknown = !result ||
+            result->disposition == VIRP_DISPOSITION_EXECUTED_UNKNOWN ||
+            (result->disposition == VIRP_DISPOSITION_UNSET &&
+             !result->success && !result->no_dispatch);
+        if (unknown)
+            cJSON_AddNullToObject(o, "executed");
+        else
+            cJSON_AddBoolToObject(o, "executed", !result->no_dispatch);
+        cJSON_AddBoolToObject(o, "executed_reported", !unknown);
         cJSON_AddBoolToObject(o, "success", result ? result->success : false);
         if (result) {
             cJSON_AddNumberToObject(o, "exit_code", (double)result->exit_code);
@@ -1387,7 +1401,7 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
 static void gate_session_hex(onode_state_t *state, char out[33])
 {
     out[0] = '\0';
-    pthread_mutex_lock(&state->session_mutex);
+    onode_session_lock(state);
     if (state->ctx &&
         virp_session_require_active(state->ctx) == VIRP_OK) {
         for (int i = 0; i < 16; i++)
@@ -1883,7 +1897,7 @@ static void approval_proposer_id(onode_state_t *state, int obs_version,
                                  char *out, size_t out_len)
 {
     if (obs_version == 2) {
-        pthread_mutex_lock(&state->session_mutex);
+        onode_session_lock(state);
         if (state->ctx &&
             virp_session_require_active(state->ctx) == VIRP_OK) {
             int off = snprintf(out, out_len, "session:");
@@ -2406,7 +2420,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * could never be delivered in the requested form.
      */
     if (obs_version == 2) {
-        pthread_mutex_lock(&state->session_mutex);
+        onode_session_lock(state);
         bool ok = state->ctx &&
                   virp_session_require_active(state->ctx) == VIRP_OK &&
                   state->ctx->session.session_key_valid;
@@ -2926,6 +2940,10 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     virp_exec_passthrough = (gate_eff_max == VIRP_TIER_BLACK);
     virp_error_t err = drv->execute(conn, command, &result);
     virp_exec_passthrough = false;
+    /* No driver may supply a length outside the storage it returned.
+     * Refuse before body filtering, scrubbing, hashing or signing. */
+    if (result.output_len >= sizeof(result.output))
+        err = VIRP_ERR_INVALID_LENGTH;
     VIRP_FI("post_exec");
     if (err != VIRP_OK) {
         drop_connection(state, dev_idx);
@@ -2986,6 +3004,8 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             virp_exec_passthrough = (gate_eff_max == VIRP_TIER_BLACK);
             err = drv->execute(conn, command, &result);
             virp_exec_passthrough = false;
+            if (result.output_len >= sizeof(result.output))
+                err = VIRP_ERR_INVALID_LENGTH;
             if (err != VIRP_OK) {
                 drop_connection(state, dev_idx);
                 pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -3098,7 +3118,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     virp_scrub_exec_result(&result);
 
     /*
-     * Failure with no output and NO proof of non-dispatch: the command
+     * Failure without a declared termination and NO proof of non-dispatch: the command
      * may have reached and executed on the device (SSH write completed
      * but the response was lost; REST request timed out after send;
      * output exceeded the evidence limit). Re-executing here is the
@@ -3109,22 +3129,18 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
      * "try again"); expressing UNKNOWN in the outcome artifact itself
      * is EXECUTION_INTENT territory, deferred with Part B.
      */
-    /* A driver that classifies its termination (linux) states UNKNOWN
-     * directly. The output_len test in the second clause is the LEGACY path
-     * for drivers not yet converted to the classifier — it is deliberately
-     * NOT part of the new decision, and must never be reintroduced into it:
-     * for the linux driver it was always false, which is precisely how this
-     * branch came to be dead code. Converting the remaining drivers retires
-     * that clause. */
+    /* Output text is not proof of execution. Legacy failures without a
+     * declared disposition stay UNKNOWN even when they include a body. */
     if (result.disposition == VIRP_DISPOSITION_EXECUTED_UNKNOWN ||
         (result.disposition == VIRP_DISPOSITION_UNSET &&
-         !result.success && result.output_len == 0 && !result.no_dispatch)) {
+         !result.success && !result.no_dispatch)) {
+        result.disposition = VIRP_DISPOSITION_EXECUTED_UNKNOWN;
         pthread_mutex_lock(&state->exec_mutex[dev_idx]);
         drop_connection(state, dev_idx);
         pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
         char err_msg[sizeof(result.error_msg) + 160];
         snprintf(err_msg, sizeof(err_msg),
-                 "ERROR: outcome UNKNOWN on '%s': %s — no response after "
+                 "ERROR: outcome UNKNOWN on '%s': %s — uncertain result after "
                  "possible dispatch; not retried (command may have "
                  "executed)",
                  device_name,
@@ -3247,6 +3263,15 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                                       &state->okey);
     }
 
+    /* Account for the wire limit BEFORE recording the execution receipt. */
+    size_t capture_limit = obs_version == 2
+        ? VIRP_MAX_MESSAGE_SIZE - VIRP_OBS_V2_HEADER_SIZE - VIRP_OBS_V2_SIG_SIZE
+        : VIRP_OBS_V1_MAX_DATA;
+    if (result.output_len > capture_limit) {
+        result.output_len = capture_limit;
+        result.output_truncated = true;
+    }
+
     /* What the device's termination actually told us, recorded before the
      * observation is built so the log and the signed artifact cannot drift. */
     fprintf(stderr, "[EXEC] device=%s disposition=%s success=%s exit=%d "
@@ -3286,8 +3311,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     }
 
     const uint8_t *obs_data = (const uint8_t *)result.output;
-    uint16_t data_len = (result.output_len > 65530) ?
-                         65530 : (uint16_t)result.output_len;
+    uint16_t data_len = (uint16_t)result.output_len;
 
     /* Phase C truth-fix: stamp the observation with the command's real
      * gate-classified tier (clamped to a transmittable tier) instead of a
@@ -3301,7 +3325,7 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
          * session died while the command ran, fail — never downgrade
          * to master-key signing on a v2 request.
          */
-        pthread_mutex_lock(&state->session_mutex);
+        onode_session_lock(state);
         if (!state->ctx ||
             virp_session_require_active(state->ctx) != VIRP_OK ||
             !state->ctx->session.session_key_valid) {
@@ -3621,8 +3645,10 @@ static int parse_batch_commands(const char *json,
     int count = 0;
     cJSON *item = NULL;
     cJSON_ArrayForEach(item, commands) {
-        if (count >= max_cmds) break;
-        if (!cJSON_IsObject(item)) continue;
+        if (count >= max_cmds || !cJSON_IsObject(item)) {
+            cJSON_Delete(root);
+            return 0;
+        }
 
         /* Approval applies are single-command by design. Refuse the
          * whole batch rather than silently dropping the field (the
@@ -3632,17 +3658,15 @@ static int parse_batch_commands(const char *json,
             return 0;
         }
 
-        cJSON *dev = cJSON_GetObjectItemCaseSensitive(item, "device");
-        cJSON *cmd = cJSON_GetObjectItemCaseSensitive(item, "command");
-
-        if (cJSON_IsString(dev) && dev->valuestring &&
-            cJSON_IsString(cmd) && cmd->valuestring) {
-            snprintf(args[count].device, sizeof(args[count].device),
-                     "%s", dev->valuestring);
-            snprintf(args[count].command, sizeof(args[count].command),
-                     "%s", cmd->valuestring);
-            count++;
+        if (!json_extract_string_cjson(item, "device", args[count].device,
+                                       sizeof(args[count].device)) ||
+            !json_extract_string_cjson(item, "command", args[count].command,
+                                       sizeof(args[count].command)) ||
+            !args[count].device[0] || !args[count].command[0]) {
+            cJSON_Delete(root);
+            return 0;
         }
+        count++;
     }
 
     cJSON_Delete(root);
@@ -4133,6 +4157,44 @@ static fed_cite_kind_t fed_outcome_citation(const char *body,
  * attacker-writable region inside the message must either sign it or
  * move the commitment to the canonical span.
  */
+/* A truncated JSON response is refused, never signed over a would-be length. */
+static int intent_format_json(const virp_intent_entry_t *ie, char *json_buf,
+                      size_t cap)
+{
+    int jlen = snprintf(json_buf, cap,
+        "{\"commands_executed\":%d,"
+        "\"confidence\":\"%s\","
+        "\"constraints\":%s,"
+        "\"created_at_ns\":%lld,"
+        "\"expires_at_ns\":%lld,"
+        "\"intent_hash\":\"%s\","
+        "\"intent_id\":\"%s\","
+        "\"intent_json\":%s,"
+        "\"max_commands\":%d,"
+        "\"proposed_actions\":%s,"
+        "\"signature_hmac\":\"%s\","
+        "\"signature_seq\":%lld,"
+        "\"signature_timestamp_ns\":%lld}",
+        ie->commands_executed,
+        ie->confidence,
+        ie->constraints,
+        (long long)ie->created_at_ns,
+        (long long)ie->expires_at_ns,
+        ie->intent_hash,
+        ie->intent_id,
+        ie->intent_json,
+        ie->max_commands,
+        ie->proposed_actions,
+        ie->signature_hmac,
+        (long long)ie->signature_seq,
+        (long long)ie->signature_timestamp_ns);
+    if (jlen < 0 || (size_t)jlen >= cap) {
+        if (cap) json_buf[0] = '\0';
+        return -1;
+    }
+    return jlen;
+}
+
 static virp_error_t chain_append_verify_observation(
     onode_state_t *state, const char *artifact_content, const char **why)
 {
@@ -4195,23 +4257,38 @@ static virp_error_t chain_append_verify_observation(
             *why = "v1 message is not an OBSERVATION";
             return VIRP_ERR_INVALID_TYPE;
         }
+        virp_observation_t observation;
+        const uint8_t *body;
+        uint16_t body_len;
+        err = virp_parse_observation(raw + VIRP_HEADER_SIZE,
+                    raw_len - VIRP_HEADER_SIZE, &observation, &body, &body_len);
+        if (err != VIRP_OK) { *why = "invalid observation payload"; return err; }
+        if (observation.obs_type != VIRP_OBS_DEVICE_OUTPUT &&
+            observation.obs_type != VIRP_OBS_ERROR) {
+            *why = "only device output or device error may be registered as observation";
+            return VIRP_ERR_INVALID_TYPE;
+        }
         return VIRP_OK;
     }
     case VIRP_VERSION_2: {
         virp_obs_header_v2_t vh;
+        onode_session_lock(state);
         if (!state->ctx || virp_session_state(state->ctx) != VIRP_SESSION_ACTIVE
             || !state->ctx->session.session_key_valid) {
             *why = "v2 body but no active session key to verify it under";
+            pthread_mutex_unlock(&state->session_mutex);
             return VIRP_ERR_SESSION_INVALID;
         }
         /* The message must belong to the session we actually hold. */
         if (raw_len >= VIRP_OBS_V2_HEADER_SIZE &&
             !virp_consttime_eq(raw + 28, state->ctx->session.session_id, 16)) {
             *why = "v2 body belongs to a different session";
+            pthread_mutex_unlock(&state->session_mutex);
             return VIRP_ERR_SESSION_INVALID;
         }
         err = virp_verify_observation_v2_signature(
                   state->ctx->session.session_key, raw, raw_len, &vh);
+        pthread_mutex_unlock(&state->session_mutex);
         if (err != VIRP_OK) { *why = "v2 session-HMAC invalid"; return err; }
         return VIRP_OK;
     }
@@ -4879,6 +4956,10 @@ static void handle_client(onode_state_t *state, int client_fd,
                 chain_entry.session_id,
                 chain_entry.signer_node_id,
                 chain_entry.signer_org_id);
+            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+                send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+                break;
+            }
             err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
                                           state->node_id, onode_next_seq(state),
                                           VIRP_OBS_CHAIN_ENTRY, VIRP_SCOPE_LOCAL,
@@ -4925,6 +5006,10 @@ static void handle_client(onode_state_t *state, int client_fd,
                 (long long)vresult.from_sequence,
                 (long long)vresult.to_sequence,
                 vresult.valid ? "true" : "false");
+            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+                send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+                break;
+            }
             err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
                                           state->node_id, onode_next_seq(state),
                                           VIRP_OBS_CHAIN_VERIFY, VIRP_SCOPE_LOCAL,
@@ -5016,6 +5101,10 @@ static void handle_client(onode_state_t *state, int client_fd,
                 (long long)vresult.from_sequence,
                 (long long)vresult.to_sequence,
                 vresult.valid ? "true" : "false");
+            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+                send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+                break;
+            }
             err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
                                           state->node_id, onode_next_seq(state),
                                           VIRP_OBS_CHAIN_VERIFY, VIRP_SCOPE_LOCAL,
@@ -5086,6 +5175,10 @@ static void handle_client(onode_state_t *state, int client_fd,
                 ie.signature_hmac,
                 (long long)ie.signature_seq,
                 (long long)ie.signature_timestamp_ns);
+            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+                send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+                break;
+            }
             err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
                                           state->node_id, seq,
                                           VIRP_OBS_INTENT_STORED, VIRP_SCOPE_LOCAL,
@@ -5119,35 +5212,11 @@ static void handle_client(onode_state_t *state, int client_fd,
 
             /* Return full intent data as JSON */
             char json_buf[6144];
-            int jlen = snprintf(json_buf, sizeof(json_buf),
-                "{\"commands_executed\":%d,"
-                "\"confidence\":\"%s\","
-                "\"constraints\":%s,"
-                "\"created_at_ns\":%lld,"
-                "\"expires_at_ns\":%lld,"
-                "\"intent_hash\":\"%s\","
-                "\"intent_id\":\"%s\","
-                "\"intent_json\":%s,"
-                "\"max_commands\":%d,"
-                "\"proposed_actions\":%s,"
-                "\"signature_hmac\":\"%s\","
-                "\"signature_seq\":%lld,"
-                "\"signature_timestamp_ns\":%lld}",
-                ie.commands_executed,
-                ie.confidence,
-                ie.constraints,
-                (long long)ie.created_at_ns,
-                (long long)ie.expires_at_ns,
-                ie.intent_hash,
-                ie.intent_id,
-                ie.intent_json,
-                ie.max_commands,
-                ie.proposed_actions,
-                ie.signature_hmac,
-                (long long)ie.signature_seq,
-                (long long)ie.signature_timestamp_ns);
-            /* Clamp payload to uint16 max */
-            if (jlen > 65535) jlen = 65535;
+            int jlen = intent_format_json(&ie, json_buf, sizeof(json_buf));
+            if (jlen < 0) {
+                send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+                break;
+            }
             err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
                                           state->node_id, onode_next_seq(state),
                                           VIRP_OBS_INTENT_FETCHED, VIRP_SCOPE_LOCAL,
@@ -5187,6 +5256,10 @@ static void handle_client(onode_state_t *state, int client_fd,
                 ie.commands_executed,
                 ie.intent_id,
                 ie.max_commands);
+            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+                send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+                break;
+            }
             err = virp_build_observation(resp_buf, sizeof(resp_buf), &resp_len,
                                           state->node_id, onode_next_seq(state),
                                           VIRP_OBS_INTENT_EXECUTED, VIRP_SCOPE_LOCAL,
@@ -5510,7 +5583,7 @@ static void handle_client(onode_state_t *state, int client_fd,
         /* Process handshake — serialized: only one handshake may drive
          * the shared ctx at a time. */
         virp_session_hello_ack_t ack;
-        pthread_mutex_lock(&state->session_mutex);
+        onode_session_lock(state);
         err = virp_handle_hello(state->ctx, &hello, &ack);
         pthread_mutex_unlock(&state->session_mutex);
         if (err != VIRP_OK) {
@@ -5580,7 +5653,7 @@ static void handle_client(onode_state_t *state, int client_fd,
         /* BIND + derive_key must happen atomically against ctx so a
          * concurrent HELLO on another worker can't observe a half-
          * bound session. */
-        pthread_mutex_lock(&state->session_mutex);
+        onode_session_lock(state);
         err = virp_handle_session_bind(state->ctx, &bind_msg);
         if (err == VIRP_OK) {
             err = virp_session_derive_key(state->ctx, state->okey.key.key);
@@ -5599,7 +5672,7 @@ static void handle_client(onode_state_t *state, int client_fd,
     }
 
     case ONODE_ACTION_SESSION_CLOSE:
-        pthread_mutex_lock(&state->session_mutex);
+        onode_session_lock(state);
         virp_handle_session_close(state->ctx);
         pthread_mutex_unlock(&state->session_mutex);
         fprintf(stderr, "[O-Node] Session closed by client\n");

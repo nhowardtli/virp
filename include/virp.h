@@ -24,6 +24,7 @@
 #define VIRP_KEY_SIZE           32          /* 256-bit signing keys */
 #define VIRP_MAX_MESSAGE_SIZE   65536       /* 64KB max message */
 #define VIRP_MAX_PAYLOAD_SIZE   (VIRP_MAX_MESSAGE_SIZE - VIRP_HEADER_SIZE)
+#define VIRP_OBS_V1_MAX_DATA    (UINT16_MAX - VIRP_HEADER_SIZE - 4)
 /* Socket framing version — inside the length-prefixed frame, NOT before it.
  * Enables version negotiation on a bad length without losing recovery. */
 #define VIRP_FRAME_VERSION      0x02        /* v2 framed protocol */

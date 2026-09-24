@@ -394,6 +394,20 @@ class TestReconcile(unittest.TestCase):
         r, g = rc.read_chain(self.db)
         return rc.reconcile(r, g, list(windows), window_ms), r, g
 
+    def test_execution_v2_is_retained_with_unknown_execution(self):
+        body = gate_body("R1", "show version")
+        body.update(schema="gate_execution/2", executed=None, executed_reported=False)
+        build_db(self.db, [], [("gate", "gate_execution", body, 100)])
+        _, gates = rc.read_chain(self.db)
+        self.assertEqual(len(gates), 1)
+        self.assertIsNone(gates[0]["body"]["executed"])
+
+    def test_client_artifact_cannot_impersonate_execution_schema(self):
+        build_db(self.db, [], [("client", "evidence_item",
+                               gate_body("R1", "show version"), 100)])
+        _, gates = rc.read_chain(self.db)
+        self.assertEqual(gates, [])
+
     def test_gated_command_matches(self):
         t = 1_757_000_000_000_000_000
         receipts = [

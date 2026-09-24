@@ -38,7 +38,7 @@ jobs:
         # test-virp-report needs reportlab, test-chainsign-vectors uses pynacl or
         # cryptography; gen-test-attestation.sh needs pyyaml. Without this step
         # the battery has never been green here.
-        run: python3 -m pip install --quiet pynacl fastapi httpx pytest pyyaml reportlab
+        run: python3 -m pip install --quiet pynacl fastapi httpx pytest pyyaml reportlab paramiko
       # CFLAGS already carry -Wall -Wextra -Werror -pedantic -std=c11, so a
       # warning is a build failure without any extra flag here.
       - name: Build (warnings are errors)
@@ -138,6 +138,11 @@ jobs:
         run: make fuzz
       - name: Short bounded run
         run: timeout 120 ./build/fuzz_virp || test $? -eq 124
+      - name: Hostile device output under libFuzzer and sanitizers
+        run: |
+          sudo apt-get install -y --no-install-recommends clang
+          make fuzz-device-output
+          ./build-fuzz-device/fuzz_device_output -max_total_time=60 -max_len=65535
 
   static-analysis:
     name: clang-tidy
@@ -188,7 +193,7 @@ jobs:
       # path), so generate a throwaway key there; virp_key_load_file
       # refuses keys that are not 0600 and owner-readable only.
       - name: Install Python suite dependencies
-        run: python3 -m pip install --quiet pytest httpx pyyaml reportlab
+        run: python3 -m pip install --quiet pytest httpx pyyaml reportlab paramiko
       - name: Generate throwaway bridge key
         run: |
           sudo mkdir -p /opt/virp/keys

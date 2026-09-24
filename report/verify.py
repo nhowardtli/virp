@@ -633,6 +633,13 @@ def verify_chain_signatures(entries, heads, pub, selection_complete=False):
         head_signed = bool(head and head.get("head_sig"))
         any_entry_signed = any(r.get("chain_sig") for r in rows)
 
+        if any_entry_signed and not head_signed:
+            out[sid] = {"sig_era": "NOT_GRADED", "verdict": FAIL,
+                        "detail": "signed entries require a signed head: "
+                                  "session length is unauthenticated",
+                        "entries_signed": 0, "entries_total": len(rows)}
+            continue
+
         if not head_signed and not any_entry_signed:
             # HAM item 7, reworked 2026-09-07. Named UNSIGNED_ERA, matching
             # the C verifier, so the two cannot describe the same session
@@ -1244,6 +1251,10 @@ def verify_entry(entry, artifact_content, okey, chain_key, expected_prev,
             v.header = parse_message_header(raw)
             v.payload = parse_observation_payload(raw)
             v.obs_hmac, v.obs_hmac_detail = verify_observation_hmac(raw, okey)
+            if (not v.header or v.header.get("type") != 0x01 or
+                    not v.payload or v.payload.get("obs_type") not in (0x07, 0x0F)):
+                v.obs_hmac = FAIL
+                v.obs_hmac_detail = "observation artifact is not device output or device error"
 
     return v
 

@@ -10,6 +10,7 @@
  */
 #include "../src/drivers/driver_juniper.c"
 #include "refusal_contract.h"
+#include "virp_scrub.h"
 
 int main(void)
 {
@@ -36,6 +37,20 @@ int main(void)
     memset(&r, 0, sizeof(r));
     e = junos_execute(&conn, "show version\nrequest system reboot", &r);
     RC_ASSERT_REFUSAL(e, r, "JunOS separator refusal");
+
+    /* Complete reply fits raw capture but not hostname + command + reply.
+     * The returned length must remain safe through the real scrub path. */
+    static char large[VIRP_OUTPUT_MAX];
+    memset(large, 'x', sizeof(large)-1);
+    large[sizeof(large)-1] = 0;
+    memset(&r, 0, sizeof(r));
+    if (junos_store_output(&r, "long-hostname-for-boundary", "show version", large) != VIRP_OK ||
+        r.output_len != sizeof(r.output)-1 || !r.output_truncated) {
+        fprintf(stderr, "FAIL: oversized formatted reply was not bounded\n");
+        return 1;
+    }
+    virp_scrub_exec_result(&r); /* ASan detects any downstream over-read. */
+    if (r.output_len >= sizeof(r.output)) return 1;
 
     RC_REPORT("test_juniper_refusals_obey_contract");
 }

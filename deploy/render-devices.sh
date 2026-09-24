@@ -10,7 +10,7 @@
 # the shell environment of any other process:
 #   - no `set -x`, no echo of values
 #   - substitution happens inside python via os.environ
-#   - output is 0640 root:virp on the /run tmpfs (gone at shutdown)
+#   - output is 0600 virp:virp on the /run tmpfs (gone at shutdown)
 #
 # Copyright (c) 2026 Third Level IT LLC. All rights reserved.
 
@@ -25,7 +25,7 @@ ENV_FILE="${VIRP_RENDER_ENV_FILE:-/etc/virp/autopilot.env}"
 TEMPLATE="${VIRP_RENDER_TEMPLATE:-/etc/virp/devices.template.json}"
 OUT="${VIRP_RENDER_OUT:-/run/virp/devices.json}"
 
-umask 027
+umask 077
 
 if [ ! -r "$ENV_FILE" ]; then
     echo "[render-devices] FATAL: $ENV_FILE missing or unreadable" >&2
@@ -42,7 +42,8 @@ set -a
 set +a
 
 python3 - "$TEMPLATE" "$OUT" <<'PYEOF'
-import json, os, re, sys
+import json, os, re, sys, tempfile, pwd
+from pathlib import Path
 
 template_path, out_path = sys.argv[1], sys.argv[2]
 with open(template_path) as f:
@@ -260,13 +261,34 @@ if leftover:
           % ", ".join(sorted(leftover)), file=sys.stderr)
     sys.exit(1)
 
-with open(out_path, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
+# Seats need authorization metadata, never the device credentials. Publish
+# only these policy fields; new credential/config fields cannot leak by default.
+policy_keys = ("socket_allowed_uids", "socket_uid_tier_ceilings",
+               "socket_uid_action_allow", "socket_uid_chain_append_types")
+policy = {k: data[k] for k in policy_keys if k in data}
+
+def publish(path, document, mode, owner=None):
+    # Never truncate an old group-readable credential file in place. The
+    # replacement has its final owner/mode before it becomes visible.
+    fd, tmp = tempfile.mkstemp(prefix=".virp-render-", dir=str(Path(path).parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(document, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+            if owner is not None:
+                os.fchown(f.fileno(), owner.pw_uid, owner.pw_gid)
+            os.fchmod(f.fileno(), mode)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+owner = None if os.environ.get("VIRP_RENDER_OUT") else pwd.getpwnam("virp")
+publish(out_path, data, 0o600, owner)
+publish(str(Path(out_path).with_suffix(".policy.json")), policy, 0o640,
+        owner)
 PYEOF
 
-if [ -z "${VIRP_RENDER_OUT:-}" ]; then
-    chown root:virp "$OUT"
-    chmod 0640 "$OUT"
-fi
 echo "[render-devices] rendered $OUT from $TEMPLATE (secrets from $ENV_FILE, values not logged)"

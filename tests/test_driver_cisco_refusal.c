@@ -26,5 +26,13 @@ int main(void)
     virp_error_t e = cisco_execute(&conn, "reload", &r);
     RC_ASSERT_REFUSAL(e, r, "IOS BLACK refusal");
 
+    for (size_t i = 0; i < sizeof(CISCO_BLACK_COMMANDS) / sizeof(CISCO_BLACK_COMMANDS[0]); i++) {
+        if (cisco_gate_tier(CISCO_BLACK_COMMANDS[i]) != VIRP_TIER_BLACK) {
+            fprintf(stderr, "FAIL: deny-listed command not BLACK at gate: %s\n",
+                    CISCO_BLACK_COMMANDS[i]);
+            return 1;
+        }
+    }
+
     RC_REPORT("test_cisco_black_refusal_obeys_contract");
 }
