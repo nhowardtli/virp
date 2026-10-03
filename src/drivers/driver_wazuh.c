@@ -39,6 +39,8 @@
 #include <strings.h>
 #include <stdbool.h>
 #include <time.h>
+#include <ctype.h>
+#include <arpa/inet.h>
 #include <curl/curl.h>
 #include <openssl/crypto.h>
 
@@ -575,6 +577,7 @@ bool wz_is_black_endpoint(const char *command)
 
 struct virp_conn {
     virp_device_t       device;
+    struct curl_slist  *resolve;            /* fixed address for TLS name */
     CURL               *curl;               /* Reusable CURL handle         */
     char                base_url[512];       /* https://host:port            */
     char                jwt_token[WZ_TOKEN_MAX]; /* Current Bearer token     */
@@ -591,8 +594,12 @@ struct virp_conn {
  * Custom CA bundle: set VIRP_CA_BUNDLE to path.
  * ========================================================================= */
 
-static void wz_configure_tls(CURL *curl)
+static void wz_configure_tls(struct virp_conn *conn)
 {
+    CURL *curl = conn->curl;
+    curl_easy_setopt(curl, CURLOPT_RESOLVE, conn->resolve);
+    /* Direct manager access: a proxy must not replace the configured address. */
+    curl_easy_setopt(curl, CURLOPT_PROXY, "");
     const char *insecure = getenv("VIRP_WAZUH_INSECURE");
     if (insecure && strcmp(insecure, "1") == 0) {
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -682,7 +689,7 @@ static virp_error_t wz_authenticate(struct virp_conn *conn)
     curl_easy_setopt(conn->curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(conn->curl, CURLOPT_CONNECTTIMEOUT, (long)WZ_CONNECT_TIMEOUT_SEC);
     curl_easy_setopt(conn->curl, CURLOPT_TIMEOUT, (long)WZ_API_TIMEOUT_SEC);
-    wz_configure_tls(conn->curl);
+    wz_configure_tls(conn);
 
     CURLcode rc = curl_easy_perform(conn->curl);
     if (rc != CURLE_OK) {
@@ -775,20 +782,39 @@ static virp_conn_t *wazuh_connect(const virp_device_t *device)
     struct virp_conn *conn = calloc(1, sizeof(struct virp_conn));
     if (!conn) return NULL;
 
-    memcpy(&conn->device, device, sizeof(*device));
     conn->connected = false;
     conn->authenticated = false;
 
     /* Build base URL — Wazuh API default port is 55000 */
     uint16_t port = device->api_port ? device->api_port :
                     (device->port ? device->port : 55000);
+    const char *tls_name = device->tls_servername[0] ? device->tls_servername : device->host;
+    if (device->tls_servername[0]) {
+        /* A named certificate still connects only to the configured IP.
+         * Reject URL/resolve metacharacters before constructing either. */
+        unsigned char addr[16];
+        if (inet_pton(AF_INET, device->host, addr) != 1 &&
+            inet_pton(AF_INET6, device->host, addr) != 1) { free(conn); return NULL; }
+        for (const unsigned char *p = (const unsigned char *)tls_name; *p; p++)
+            if (!isalnum(*p) && *p != '.' && *p != '-') { free(conn); return NULL; }
+        char entry[640];
+        if (strchr(device->host, ':'))
+            snprintf(entry, sizeof(entry), "%s:%u:[%s]", tls_name, port, device->host);
+        else snprintf(entry, sizeof(entry), "%s:%u:%s", tls_name, port, device->host);
+        conn->resolve = curl_slist_append(NULL, entry);
+        if (!conn->resolve) { free(conn); return NULL; }
+    }
     snprintf(conn->base_url, sizeof(conn->base_url),
-             "https://%s:%u", device->host, port);
+             "https://%s:%u", tls_name, port);
+
+    memcpy(&conn->device, device, sizeof(*device));
 
     /* Initialize CURL */
     conn->curl = curl_easy_init();
     if (!conn->curl) {
         fprintf(stderr, "[Wazuh] curl_easy_init() failed\n");
+        curl_slist_free_all(conn->resolve);
+        OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
         free(conn);
         return NULL;
     }
@@ -810,6 +836,8 @@ static virp_conn_t *wazuh_connect(const virp_device_t *device)
     if (err != VIRP_OK) {
         fprintf(stderr, "[Wazuh] Authentication failed: %d\n", err);
         curl_easy_cleanup(conn->curl);
+        curl_slist_free_all(conn->resolve);
+        OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
         free(conn);
         return NULL;
     }
@@ -960,7 +988,7 @@ static virp_error_t wazuh_execute(virp_conn_t *base_conn,
     curl_easy_setopt(conn->curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(conn->curl, CURLOPT_CONNECTTIMEOUT, (long)WZ_CONNECT_TIMEOUT_SEC);
     curl_easy_setopt(conn->curl, CURLOPT_TIMEOUT, (long)WZ_API_TIMEOUT_SEC);
-    wz_configure_tls(conn->curl);
+    wz_configure_tls(conn);
 
     CURLcode rc = curl_easy_perform(conn->curl);
 
@@ -1057,6 +1085,7 @@ static void wazuh_disconnect(virp_conn_t *base_conn)
 
     fprintf(stderr, "[Wazuh] Disconnected: %s\n", conn->device.hostname);
 
+    curl_slist_free_all(conn->resolve);
     OPENSSL_cleanse(conn->device.password, sizeof(conn->device.password));
     free(conn);
 }
