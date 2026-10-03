@@ -34,6 +34,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
@@ -5243,6 +5244,7 @@ static int write_test_registry(void)
 {
     FILE *f = fopen(AP_REGISTRY, "w");
     if (!f) return -1;
+    if (fchmod(fileno(f), 0600) != 0) { fclose(f); return -1; }
     fprintf(f,
         "[{\"key_id\":\"e6d67937b0a11c446e166ddc8f157ba9\","
         "\"algorithm\":\"ecdsa-p256\","

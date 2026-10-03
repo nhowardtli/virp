@@ -288,5 +288,18 @@ if [ ! -f "$T/out.json" ]; then pass=$((pass + 1)); printf "PASS\n"
 else printf "FAIL (a fatal render left a file behind)\n"; fi
 
 echo ""
+cat > "$T/tmpl.json" <<'EOF'
+{"devices":[{"hostname":"node1","password":"${VIRP_DEVICE_NODE1_PASSWORD}"}]}
+EOF
+printf 'UNRELATED=x\n' > "$T/env"
+check "per-device missing credential fails" 1 "VIRP_DEVICE_NODE1_PASSWORD not set"
+printf 'VIRP_DEVICE_NODE1_PASSWORD=testvalue\n' > "$T/env"
+check "per-device credential renders without renderer edits" 0 "rendered"
+cat > "$T/tmpl.json" <<'EOF'
+{"devices":[{"hostname":"node1","password":"${VIRP_DEVICE_NODE1_UID}"}]}
+EOF
+printf 'VIRP_DEVICE_NODE1_UID=0\n' > "$T/env"
+check "reserved namespace does not accept arbitrary UID values" 1 "unsubstituted placeholders"
+
 echo "=== Results: $pass/$run passed ==="
 [ "$pass" = "$run" ]

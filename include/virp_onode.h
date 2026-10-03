@@ -29,6 +29,8 @@
 #include <pthread.h>
 #include <semaphore.h>   /* sem_t for worker pool cap */
 #include <stdint.h>
+#include <stdatomic.h>
+_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "shutdown flag must be signal-safe");
 #include <sys/types.h>   /* uid_t for socket_allowed_uids */
 
 /* =========================================================================
@@ -36,6 +38,9 @@
  * ========================================================================= */
 
 #define ONODE_MAX_DEVICES       64
+
+/* NULL means the class has no qualified generic health read. */
+const char *onode_health_command(virp_vendor_t vendor);
 #define ONODE_MAX_BATCH         16
 #define ONODE_SOCKET_PATH       "/run/virp/onode.sock"
 #define ONODE_HEARTBEAT_SEC     30
@@ -147,6 +152,8 @@ typedef struct {
     int         backoff_sec;        /* Current backoff interval (5→10→30→60) */
     int         consecutive_fails;  /* Consecutive reconnect failures */
     bool        reconnecting;       /* True while a reconnect is in progress */
+    uint64_t    read_generation;     /* Serializes freshness against later reads */
+    time_t      last_read_success;   /* Successful signed GREEN read; not login */
 } onode_reconnect_t;
 
 /* =========================================================================
@@ -455,7 +462,7 @@ typedef struct {
 
     /* Watchdog thread (auto-reconnect) */
     pthread_t           watchdog_thread;
-    bool                watchdog_running;
+    atomic_bool         watchdog_running;
 
     /*
      * Worker pool. Each accepted connection is handled on a detached

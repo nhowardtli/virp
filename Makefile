@@ -2542,3 +2542,19 @@ $(BUILD_DIR)/test_onode_security: tests/test_onode_security.c tests/test_onode.c
 test-onode-security: $(BUILD_DIR)/test_onode_security
 	./$(BUILD_DIR)/test_onode_security
 all-tests: test-onode-security
+
+.PHONY: test-operability
+test-operability: $(BUILD_DIR)/test_operability
+	./$(BUILD_DIR)/test_operability
+$(BUILD_DIR)/test_operability: tests/test_operability.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+all-tests: test-operability
+
+.PHONY: test-wazuh-tls
+test-wazuh-tls:
+	$(MAKE) BUILD_DIR=build-wazuh-tls WAZUH=1 build-wazuh-tls/wazuh-tls-probe
+	python3 tests/test_wazuh_tls.py build-wazuh-tls/wazuh-tls-probe
+
+$(BUILD_DIR)/wazuh-tls-probe: tests/wazuh_tls_probe.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@

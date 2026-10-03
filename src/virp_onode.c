@@ -720,6 +720,8 @@ static void drop_connection(onode_state_t *state, int dev_idx)
     pthread_mutex_lock(&state->conn_mutex);
     virp_conn_t *conn = state->connections[dev_idx];
     state->connections[dev_idx] = NULL;
+    state->reconnect[dev_idx].last_read_success = 0;
+    state->reconnect[dev_idx].read_generation++;
 
     /* Arm reconnect backoff — watchdog will pick this up */
     onode_reconnect_t *ri = &state->reconnect[dev_idx];
@@ -2932,6 +2934,13 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                 command);
     }
 
+    uint64_t read_generation = 0;
+    if (gate_tier == VIRP_TIER_GREEN) {
+        pthread_mutex_lock(&state->conn_mutex);
+        read_generation = ++state->reconnect[dev_idx].read_generation;
+        state->reconnect[dev_idx].last_read_success = 0;
+        pthread_mutex_unlock(&state->conn_mutex);
+    }
     virp_exec_result_t result;
     memset(&result, 0, sizeof(result));   /* no_dispatch=false unless the
                                              driver proves otherwise */
@@ -3000,6 +3009,11 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         drop_connection(state, dev_idx);
         conn = get_connection(state, dev_idx);
         if (conn) {
+            if (read_generation) {
+                pthread_mutex_lock(&state->conn_mutex);
+                read_generation = ++state->reconnect[dev_idx].read_generation;
+                pthread_mutex_unlock(&state->conn_mutex);
+            }
             memset(&result, 0, sizeof(result));
             virp_exec_passthrough = (gate_eff_max == VIRP_TIER_BLACK);
             err = drv->execute(conn, command, &result);
@@ -3398,6 +3412,13 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         pthread_mutex_lock(&state->state_mutex);
         state->observations_sent++;
         pthread_mutex_unlock(&state->state_mutex);
+        if (result.success && read_generation) {
+            pthread_mutex_lock(&state->conn_mutex);
+            if (state->connections[dev_idx] &&
+                state->reconnect[dev_idx].read_generation == read_generation)
+                state->reconnect[dev_idx].last_read_success = time(NULL);
+            pthread_mutex_unlock(&state->conn_mutex);
+        }
     }
 
     return err;
@@ -3520,6 +3541,25 @@ static virp_error_t onode_list_devices(onode_state_t *state,
  * tell WHAT each device is without learning where it lives. Still pinned by
  * test to never quietly widen beyond name+class+status.
  */
+/* A health action is a fixed, driver-appropriate read through the normal gate.
+ * Unsupported classes never inherit a guessed CLI command. */
+const char *onode_health_command(virp_vendor_t vendor)
+{
+    switch (vendor) {
+    case VIRP_VENDOR_CISCO_IOS: case VIRP_VENDOR_CISCO_IOSXE:
+    case VIRP_VENDOR_CISCO_ASA: case VIRP_VENDOR_JUNIPER:
+    case VIRP_VENDOR_MOCK: return "show version";
+    case VIRP_VENDOR_FORTINET: return "get system status";
+    case VIRP_VENDOR_PALOALTO: return "show system info";
+    case VIRP_VENDOR_LINUX: case VIRP_VENDOR_PROXMOX: return "uptime";
+    case VIRP_VENDOR_WAZUH: return "GET /manager/status";
+    case VIRP_VENDOR_LIBRENMS: return "GET /api/v0/devices";
+    case VIRP_VENDOR_PBS: return "pbs op=backup.version.read";
+    case VIRP_VENDOR_ZAMMAD: return "GET /api/v1/ticket_states";
+    default: return NULL;
+    }
+}
+
 static virp_error_t onode_list_fleet(onode_state_t *state,
                                      uint8_t *out_buf, size_t out_buf_len,
                                      size_t *out_len)
@@ -3542,7 +3582,17 @@ static virp_error_t onode_list_fleet(onode_state_t *state,
             status = "disabled";
         } else {
             pthread_mutex_lock(&state->conn_mutex);
-            status = state->connections[i] ? "connected" : "unconnected";
+            const onode_reconnect_t *ri = &state->reconnect[i];
+            if (!virp_driver_lookup(state->devices[i].vendor) ||
+                !onode_health_command(state->devices[i].vendor))
+                status = "unsupported";
+            else if (state->connections[i]) {
+                time_t age = time(NULL) - ri->last_read_success;
+                status = !ri->last_read_success ? "connected_unverified" :
+                         (age < 0 || age > 300) ? "needs_health_check" : "read_verified";
+            } else if (ri->reconnecting) status = "connecting";
+            else if (ri->consecutive_fails) status = "connection_failed";
+            else status = "not_checked";
             pthread_mutex_unlock(&state->conn_mutex);
         }
 
@@ -4524,7 +4574,14 @@ static void handle_client(onode_state_t *state, int client_fd,
          * seat saw "(tier=RED max=YELLOW)" come back from its own socket.
          * Pass client_uid explicitly, exactly as the execute paths do.
          */
-        err = onode_execute_obs_ex(state, req.device, "show version",
+        int health_idx = find_device(state, req.device);
+        const char *health_command = health_idx < 0 ? "show version" :
+            onode_health_command(state->devices[health_idx].vendor);
+        if (!health_command) {
+            send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
+            break;
+        }
+        err = onode_execute_obs_ex(state, req.device, health_command,
                                    req.obs_version, NULL, client_uid,
                                    resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
@@ -5821,12 +5878,18 @@ static void *watchdog_thread_fn(void *arg)
 
     /* ---- Steady-state loop: health checks + reconnects ---- */
     while (state->watchdog_running) {
-        sleep(ONODE_WATCHDOG_INTERVAL_SEC);
+        /* Interruptible without locks/condition operations in the signal handler. */
+        for (int tick = 0; tick < ONODE_WATCHDOG_INTERVAL_SEC * 10 &&
+                           state->watchdog_running; tick++) {
+            struct timespec pause = { .tv_sec = 0, .tv_nsec = 100000000 };
+            nanosleep(&pause, NULL);
+        }
         if (!state->watchdog_running) break;
 
         time_t now = time(NULL);
 
         for (int i = 0; i < state->device_count; i++) {
+            if (!state->watchdog_running) goto done;
             if (!state->devices[i].enabled)
                 continue;
 
@@ -5869,7 +5932,8 @@ static void *watchdog_thread_fn(void *arg)
                  * execute-path drop_connection while we waited. */
                 pthread_mutex_lock(&state->conn_mutex);
                 conn = state->connections[i];
-                bool probe_skip = (conn == NULL) || ri->reconnecting;
+                bool probe_skip = !state->watchdog_running ||
+                                  (conn == NULL) || ri->reconnecting;
                 pthread_mutex_unlock(&state->conn_mutex);
                 if (probe_skip) {
                     pthread_mutex_unlock(&state->exec_mutex[i]);
@@ -5887,6 +5951,8 @@ static void *watchdog_thread_fn(void *arg)
                     pthread_mutex_lock(&state->conn_mutex);
                     virp_conn_t *stale = state->connections[i];
                     state->connections[i] = NULL;
+                    ri->last_read_success = 0;
+                    ri->read_generation++;
                     ri->reconnecting = true;
                     ri->last_attempt = now;
                     if (ri->backoff_sec == 0)
@@ -6035,6 +6101,7 @@ virp_error_t onode_init(onode_state_t *state,
         return VIRP_ERR_NULL_PTR;
 
     memset(state, 0, sizeof(*state));
+    atomic_init(&state->watchdog_running, false);
     state->node_id = node_id;
     state->seq_num = 0;
     state->listen_fd = -1;
