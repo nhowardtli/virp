@@ -2403,3 +2403,8 @@ check-test-deps:
 	@scripts/check-test-deps.sh --selftest >/dev/null || \
 	    { echo "FAIL: check-test-deps.sh selftest failed — the guard is broken"; exit 1; }
 	@scripts/check-test-deps.sh fastapi httpx reportlab
+
+.PHONY: test-watchdog-shutdown
+test-watchdog-shutdown: $(LIB)
+	$(CC) $(CFLAGS) tests/test_watchdog_shutdown.c $(LIB) $(LDFLAGS) -o $(BUILD_DIR)/test_watchdog_shutdown
+	./$(BUILD_DIR)/test_watchdog_shutdown

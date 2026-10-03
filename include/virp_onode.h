@@ -27,6 +27,8 @@
 #include "virp_approver_registry.h"
 #include "virp_obskey.h"
 #include <pthread.h>
+#include <stdatomic.h>
+_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "shutdown flag must be signal-safe");
 #include <semaphore.h>   /* sem_t for worker pool cap */
 #include <stdint.h>
 #include <sys/types.h>   /* uid_t for socket_allowed_uids */
@@ -458,7 +460,7 @@ typedef struct {
 
     /* Watchdog thread (auto-reconnect) */
     pthread_t           watchdog_thread;
-    bool                watchdog_running;
+    atomic_bool         watchdog_running;
 
     /*
      * Worker pool. Each accepted connection is handled on a detached

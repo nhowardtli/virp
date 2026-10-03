@@ -5645,12 +5645,17 @@ static void *watchdog_thread_fn(void *arg)
 
     /* ---- Steady-state loop: health checks + reconnects ---- */
     while (state->watchdog_running) {
-        sleep(ONODE_WATCHDOG_INTERVAL_SEC);
+        for (int tick = 0; tick < ONODE_WATCHDOG_INTERVAL_SEC * 10 &&
+                           state->watchdog_running; tick++) {
+            struct timespec pause = { .tv_sec = 0, .tv_nsec = 100000000 };
+            nanosleep(&pause, NULL);
+        }
         if (!state->watchdog_running) break;
 
         time_t now = time(NULL);
 
         for (int i = 0; i < state->device_count; i++) {
+            if (!state->watchdog_running) goto done;
             if (!state->devices[i].enabled)
                 continue;
 
@@ -5693,7 +5698,8 @@ static void *watchdog_thread_fn(void *arg)
                  * execute-path drop_connection while we waited. */
                 pthread_mutex_lock(&state->conn_mutex);
                 conn = state->connections[i];
-                bool probe_skip = (conn == NULL) || ri->reconnecting;
+                bool probe_skip = !state->watchdog_running ||
+                                  (conn == NULL) || ri->reconnecting;
                 pthread_mutex_unlock(&state->conn_mutex);
                 if (probe_skip) {
                     pthread_mutex_unlock(&state->exec_mutex[i]);
@@ -5859,6 +5865,7 @@ virp_error_t onode_init(onode_state_t *state,
         return VIRP_ERR_NULL_PTR;
 
     memset(state, 0, sizeof(*state));
+    atomic_init(&state->watchdog_running, false);
     state->node_id = node_id;
     state->seq_num = 0;
     state->listen_fd = -1;
