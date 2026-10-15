@@ -44,3 +44,8 @@ Task3's prerequisite (Tasks1/2 complete with time remaining) was not met. No .21
 3. Define replay linkage for consumed-intent/no-outcome cases alongside the normal original-outcome case.
 
 Stop is intentional under the owner's instruction. No claim of v3 readiness, verified bundle, successful canary or deployment.
+
+October 15 continuation: superseded for the canary by the owner's clarified
+chain-format ruling, authority to make implementation decisions, and fresh
+VM100 creation. See EXECUTE-V3.md and CANARY-V3-RESULTS.md. The current .211
+consumer contract gap is documented separately in DEPLOY-211-DRAFT.md.

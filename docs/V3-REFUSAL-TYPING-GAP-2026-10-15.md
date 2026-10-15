@@ -31,3 +31,8 @@ The code gap was identified before clone creation. No VM was created or changed;
 Define the authenticated v3 payload discriminator for execute responses (DEVICE_OUTPUT versus ERROR), including how existing readers distinguish legacy untyped v3 payloads. A bounded option is a versioned typed payload envelope with explicit subtype and exact body length inside the existing signed v3 payload, without changing the chain format or the outer v3 header. This is a proposal, not an implemented encoding. The chosen format must be understood by the intended consumer and verifier; no claim is made that released virp-verify0.1.3 already interprets it.
 
 After that ruling: implement/refusal tests, full batteries, clone and sanitize the stopped canary, snapshot it before guest changes, deploy only there, run FRR qualification with test approver, and record sessions. Task3 remains conditional on Tasks1/2 completion; no exact .211 deployment commands or AWS enrollment line have been invented.
+
+October 15 continuation: superseded for the canary by the owner's clarified
+chain-format ruling, authority to make implementation decisions, and fresh
+VM100 creation. See EXECUTE-V3.md and CANARY-V3-RESULTS.md. The current .211
+consumer contract gap is documented separately in DEPLOY-211-DRAFT.md.

@@ -28,6 +28,7 @@ Clients must persist it through the existing observation append operation to
 include its exact bytes in an export. Existing artifact-size limits still apply.
 The canary qualification must verify both emitted frames and stored artifacts.
 
-Validation in progress: test_execute_v3, approval-consumption regression,
-Python typed-payload and historical v3 vector tests. No production deployment
-or clean-machine VERIFIED acceptance is claimed by this document.
+Canary acceptance completed October 15, 2026 on VM100 virp-canary, commit
+ecb2051. All 71 all-tests prerequisites passed; see CANARY-V3-RESULTS.md.
+Production remains
+blocked by the concrete helper contract in DEPLOY-211-DRAFT.md.
