@@ -50,5 +50,22 @@ class RefusalTypeContract(unittest.TestCase):
         bad = bytearray(raw);bad[88] ^= 1
         self.assertEqual(verify.classify_observation_v3(bytes(bad), pub)[0], verify.FAIL)
 
+    def test_typed_error_preserves_refusal(self):
+        body = b"ERROR: approval_reused"
+        raw, pub = self.frame(b"VIRP-XO1" + struct.pack("!BBH", 15, 1, len(body)) + body)
+        self.assertEqual(verify.classify_observation_v3(raw, pub)[0], verify.PASS)
+        self.assertEqual(verify.parse_execute_v3_payload(raw)["obs_type"], 15)
+
+    def test_device_error_text_remains_device_output(self):
+        body = b"ERROR: approval_reused"
+        raw, _ = self.frame(b"VIRP-XO1" + struct.pack("!BBH", 7, 1, len(body)) + body)
+        self.assertEqual(verify.parse_execute_v3_payload(raw)["obs_type"], 7)
+
+    def test_malformed_typed_envelopes_refuse(self):
+        for body in [b"VIRP-XO1", b"VIRP-XO1" + struct.pack("!BBH", 8, 1, 0),
+                     b"VIRP-XO1" + struct.pack("!BBH", 15, 1, 10)]:
+            raw, _ = self.frame(body)
+            self.assertIsNone(verify.parse_execute_v3_payload(raw))
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

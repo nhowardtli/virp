@@ -853,6 +853,28 @@ def parse_observation_v2_payload(raw):
     }
 
 
+def parse_execute_v3_payload(raw):
+    """XO1 is opt-in within the signed payload; legacy v3 stays untyped.
+
+    Do not infer type from CLI text. Truncated/unknown XO1 subtypes fail closed.
+    """
+    parsed = parse_observation_v2_payload(raw)
+    if parsed is None:
+        return None
+    hdr = parse_observation_v3_header(raw)
+    body = raw[OBS_V2_HEADER_SIZE:OBS_V2_HEADER_SIZE + hdr["payload_len"]]
+    if not body.startswith(b"VIRP-XO1"):
+        return parsed
+    if len(body) < 12:
+        return None
+    subtype, scope, length = struct.unpack_from("!BBH", body, 8)
+    if subtype not in (0x07, 0x0f) or scope != 1 or length != len(body) - 12:
+        return None
+    text = body[12:].decode("utf-8", errors="replace")
+    return dict(parsed, obs_type=subtype, obs_scope=scope, obs_length=length,
+                text=text, output=text, payload_profile="VIRP-XO1")
+
+
 def classify_observation_v2(raw):
     """Structural verdict for a frame whose version byte claims v2.
 
@@ -1244,9 +1266,11 @@ def verify_entry(entry, artifact_content, okey, chain_key, expected_prev,
             # v3 frame: Ed25519-signed, and unlike v2 it IS verifiable at
             # rest from the public key alone (HAM item 8).
             v.header = parse_observation_v3_header(raw)
-            v.payload = parse_observation_v2_payload(raw)
+            v.payload = parse_execute_v3_payload(raw)
             v.obs_hmac, v.obs_hmac_detail = verify_observation_hmac(
                 raw, okey, obs_pub)
+            if v.payload is None:
+                v.obs_hmac, v.obs_hmac_detail = FAIL, "invalid typed v3 execute payload"
         else:
             v.header = parse_message_header(raw)
             v.payload = parse_observation_payload(raw)

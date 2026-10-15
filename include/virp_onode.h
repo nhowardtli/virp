@@ -191,6 +191,7 @@ typedef struct {
      */
     virp_obskey_t       obskey;
     bool                obskey_loaded;
+    bool                execute_v3; /* opt-in -3; requires -S, same key */
 
     /*
      * PREVIOUS O-Key — VERIFY-ONLY, TIME-BOUNDED. Optional.

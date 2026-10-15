@@ -273,6 +273,22 @@ int main(void)
     CHECK(virp_driver_mock_exec_attempts_reset() == 0,
           "[6b] and nothing reached the device");
 
+    /* Task 2 regression: replay is evidence, not just a returned error. */
+    sqlite3_stmt *replay_st = NULL;
+    int replay_found = 0;
+    if (sqlite3_prepare_v2(g.chain.db,
+        "SELECT artifact_content FROM artifacts WHERE artifact_type='gate_rejection'",
+        -1, &replay_st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(replay_st) == SQLITE_ROW) {
+            const char *body = (const char *)sqlite3_column_text(replay_st, 0);
+            if (body && strstr(body, "approval_reused") &&
+                strstr(body, pid1) && strstr(body, want_id)) replay_found++;
+        }
+    }
+    sqlite3_finalize(replay_st);
+    CHECK(replay_found == 1,
+          "[6c] replay refusal is chained with approval and original outcome IDs");
+
     /* ═══ PHASE 3 — THE DEVICE-LEVEL REJECTION QUESTION ═══════════════
      * The command REACHED the device and the device rejected it. Per
      * the brief's lean: a real execution attempt that reached the device
