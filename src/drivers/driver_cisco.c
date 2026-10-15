@@ -1824,9 +1824,7 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
     result->exit_code = 0;
 
     /* Check for IOS error markers */
-    if (strstr(output_start, "% Invalid input") ||
-        strstr(output_start, "% Incomplete command") ||
-        strstr(output_start, "% Ambiguous command")) {
+    if (cisco_ios_rejected(output_start)) {
         result->success = false;
         result->exit_code = 1;
         snprintf(result->error_msg, sizeof(result->error_msg),
