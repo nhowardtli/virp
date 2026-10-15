@@ -1,5 +1,7 @@
 # v3 execute-path unattended block: stopped at contract preflight
 
+**Historical:** the owner subsequently resolved the chain-format and canary-creation blockers. See `V3-REFUSAL-TYPING-GAP-2026-10-15.md` for the current, narrower code-level gap.
+
 ## Scope and status
 Owner authorized Task 1 (C v3 execute path and VM212 canary), Task 2 (signed replay refusal), and Task 3 only after the first two finish. Hard constraints: no install-prod on .211, no SW-3850 commands, no FortiGate/PVE firewall changes, no AWS changes; snapshot before VM changes; stop at contract gaps instead of guessing.
 
