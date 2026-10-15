@@ -185,10 +185,27 @@ static void test_classifier_agrees_with_parser(void)
     PASS();
 }
 
+static void test_aaa_denials(void)
+{
+    TEST("TACACS command denials cannot report a successful transaction");
+    assert(cisco_ios_rejected("% Authorization failed.\r\n"));
+    assert(cisco_ios_rejected("Command authorization failed.\r\n"));
+    assert(cisco_ios_rejected("% Command authorization failed.\r\n"));
+    assert(cisco_ios_rejected("% Access denied\r\n"));
+    assert(cisco_ios_rejected("% Permission denied\r\n"));
+    assert(!cisco_ios_rejected("description Authorization failed. lab fixture\r\n"));
+    assert(!cisco_ios_rejected("\r\n3850-Stack(config-if)#"));
+    PASS();
+}
+
 int main(void)
 {
     printf("VIRP Cisco typed config op — interface description (C-04 Option A)\n");
     printf("================================================================\n");
+    assert(cisco_driver.route_reason != NULL && cisco_iosxe_driver.route_reason != NULL);
+    assert(strstr(cisco_gate_reason("interface Gi1/0/22 description test"), "exact device") != NULL);
+    assert(cisco_gate_reason("show interfaces GigabitEthernet1/0/22") == NULL);
+    test_aaa_denials();
     test_parser();
     test_classifier_agrees_with_parser();
     test_executor_refuses_before_transport();

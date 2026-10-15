@@ -2558,3 +2558,10 @@ test-wazuh-tls:
 
 $(BUILD_DIR)/wazuh-tls-probe: tests/wazuh_tls_probe.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+all-tests: test-onode-security
+
+$(BUILD_DIR)/test_driver_cisco_auth: tests/test_driver_cisco_auth.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+.PHONY: test-cisco-auth
+test-cisco-auth: $(BUILD_DIR)/test_driver_cisco_auth
+	./$(BUILD_DIR)/test_driver_cisco_auth
