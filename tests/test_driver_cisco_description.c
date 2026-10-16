@@ -193,6 +193,9 @@ static void test_aaa_denials(void)
     assert(cisco_ios_rejected("% Command authorization failed.\r\n"));
     assert(cisco_ios_rejected("% Access denied\r\n"));
     assert(cisco_ios_rejected("% Permission denied\r\n"));
+    assert(cisco_ios_rejected("% Unknown command: show interfaces absent\r\n"));
+    assert(cisco_ios_rejected("  % Unknown command: bogus\r\n"));
+    assert(!cisco_ios_rejected("description Unknown command: lab fixture\r\n"));
     assert(!cisco_ios_rejected("description Authorization failed. lab fixture\r\n"));
     assert(!cisco_ios_rejected("\r\n3850-Stack(config-if)#"));
     PASS();

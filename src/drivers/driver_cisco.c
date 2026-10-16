@@ -1408,7 +1408,7 @@ static bool cisco_ios_rejected(const char *out)
     static const char *const errors[] = {
         "Invalid input", "Incomplete", "Ambiguous", "Unrecognized", "Bad ",
         "Authorization failed", "Command authorization failed",
-        "Access denied", "Permission denied"
+        "Access denied", "Permission denied", "Unknown command:"
     };
     for (const char *line = out; *line;) {
         const char *end = strchr(line, '\n');
