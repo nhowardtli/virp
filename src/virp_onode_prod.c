@@ -108,6 +108,11 @@ extern void virp_driver_zammad_init(void);
 #endif
 #endif
 
+#ifdef VIRP_DRIVER_GNS3
+extern void virp_driver_gns3_init(void);
+#include <curl/curl.h>
+#endif
+
 static void signal_handler(int sig)
 {
     (void)sig;
@@ -154,6 +159,7 @@ static virp_vendor_t vendor_from_string(const char *s)
     if (strcmp(s, "wazuh") == 0)     return VIRP_VENDOR_WAZUH;
     if (strcmp(s, "librenms") == 0)  return VIRP_VENDOR_LIBRENMS;
     if (strcmp(s, "pbs") == 0)       return VIRP_VENDOR_PBS;
+    if (strcmp(s, "gns3") == 0) return VIRP_VENDOR_GNS3;
     if (strcmp(s, "zammad") == 0)    return VIRP_VENDOR_ZAMMAD;
     if (strcmp(s, "mock") == 0)      return VIRP_VENDOR_MOCK;
     return VIRP_VENDOR_UNKNOWN;
@@ -1397,7 +1403,7 @@ int main(int argc, char **argv)
  * that; relying on it is still a race the daemon does not need to run.
  */
 #if defined(VIRP_DRIVER_WAZUH) || defined(VIRP_DRIVER_LIBRENMS) || \
-    defined(VIRP_DRIVER_PBS)   || defined(VIRP_DRIVER_ZAMMAD)
+    defined(VIRP_DRIVER_PBS)   || defined(VIRP_DRIVER_ZAMMAD) || defined(VIRP_DRIVER_GNS3)
     curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
 
@@ -1432,6 +1438,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef VIRP_DRIVER_ZAMMAD
     virp_driver_zammad_init();
+#endif
+#ifdef VIRP_DRIVER_GNS3
+    virp_driver_gns3_init();
 #endif
     fprintf(stderr, "[O-Node] Registered %d driver(s)\n", virp_driver_count());
 

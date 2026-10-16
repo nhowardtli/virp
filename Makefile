@@ -47,6 +47,12 @@ LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_build_id.o \
              $(BUILD_DIR)/cJSON.o
 
+ifdef GNS3
+  CFLAGS += -DVIRP_DRIVER_GNS3 $(shell pkg-config --cflags libcurl)
+  LDFLAGS += $(shell pkg-config --libs libcurl)
+  LIB_OBJS += $(BUILD_DIR)/driver_gns3.o
+endif
+
 # Optional Cisco driver (requires libssh2)
 ifdef CISCO
   CFLAGS  += -DVIRP_DRIVER_CISCO
@@ -2572,3 +2578,13 @@ test-wazuh-tls:
 
 $(BUILD_DIR)/wazuh-tls-probe: tests/wazuh_tls_probe.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/driver_gns3.o: src/drivers/driver_gns3.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+.PHONY: test-gns3
+test-gns3:
+	$(MAKE) BUILD_DIR=build-gns3 GNS3=1 build-gns3/libvirp.a
+	$(CC) $(CFLAGS) tests/test_driver_gns3.c build-gns3/libvirp.a $(LDFLAGS) -lcurl -o build-gns3/test_driver_gns3
+	./build-gns3/test_driver_gns3
+all-tests: test-gns3
