@@ -211,3 +211,11 @@ def execute_observed(transport, request, *, public_key, node_id, device_id,
         finally:
             os.close(fd)
     return raw, result
+
+
+def public_error(error):
+    """Expose only fixed recovery reasons, never arbitrary exception detail."""
+    allowed = {'unresolved_attempt_requires_reconciliation', 'attempt_already_exists'}
+    if isinstance(error, ValueError) and str(error) in allowed:
+        return str(error)
+    return type(error).__name__
