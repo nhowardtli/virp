@@ -194,7 +194,14 @@ def execute_observed(transport, request, *, public_key, node_id, device_id,
                     raise
                 if hasattr(error, 'add_note'):
                     error.add_note('session_close also failed: '+type(close_error).__name__)
-    if pending is not None:
+    # Signature validity is not execution certainty. Only these native,
+    # authenticated pre-dispatch refusal families are known safe to release.
+    # Unknown/new error vocabulary remains pending until reconciliation.
+    refusal_prefixes = ('ERROR: tier gate blocked ', 'ERROR: apply rejected ',
+                        'ERROR: multi-command / illegal separator rejected ')
+    result['recovery_required'] = (result['subtype'] == 15 and
+                                  not result['output'].startswith(refusal_prefixes))
+    if pending is not None and not result['recovery_required']:
         pending.unlink()
         fd = os.open(str(pending.parent), os.O_RDONLY | os.O_DIRECTORY)
         try:

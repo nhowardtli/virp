@@ -65,3 +65,19 @@ class Attempts(unittest.TestCase):
  def test_close_failure_does_not_replace_original_error(self):
   t=Transport('close')
   with patch('helper.decode',side_effect=ValueError('bad signature')),self.assertRaisesRegex(ValueError,'bad signature'):self.call(t)
+
+class SignedFailures(unittest.TestCase):
+ setUp=Attempts.setUp
+ call=Attempts.call
+ def test_signed_unknown_blocks_scope(self):
+  with patch('helper.decode',return_value={'version':3,'subtype':15,'output':"ERROR: outcome UNKNOWN on 'test': reply lost"}):
+   _,result=self.call(Transport(),recovery_dir=self.root/'recovery')
+  self.assertTrue(result['recovery_required']);self.assertTrue((self.root/'recovery/pending.json').exists())
+ def test_unknown_error_vocabulary_blocks_scope(self):
+  with patch('helper.decode',return_value={'version':3,'subtype':15,'output':'new error vocabulary'}):
+   _,result=self.call(Transport(),recovery_dir=self.root/'recovery')
+  self.assertTrue(result['recovery_required']);self.assertTrue((self.root/'recovery/pending.json').exists())
+ def test_gate_refusal_releases_scope(self):
+  with patch('helper.decode',return_value={'version':3,'subtype':15,'output':'ERROR: tier gate blocked command'}):
+   _,result=self.call(Transport(),recovery_dir=self.root/'recovery')
+  self.assertFalse(result['recovery_required']);self.assertFalse((self.root/'recovery/pending.json').exists())
