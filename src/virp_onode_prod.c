@@ -770,6 +770,8 @@ int load_devices(onode_state_t *state, const char *path)
                         sizeof(device.username));
         json_get_string(dev_obj, "password", device.password,
                         sizeof(device.password));
+        json_get_string(dev_obj, "ssh_private_key", device.ssh_private_key,
+                        sizeof(device.ssh_private_key));
         json_get_string(dev_obj, "enable",   device.enable_password,
                         sizeof(device.enable_password));
 
@@ -834,6 +836,8 @@ int load_devices(onode_state_t *state, const char *path)
         /* cisco_asa only: the operator declares that login already lands
          * in enable mode (aaa authorization exec ... auto-enable), so the
          * no-enable-credential refusal below does not apply (#14). */
+        if (json_get_bool(dev_obj, "asa_local_login", &bool_val))
+            device.asa_local_login = bool_val;
         if (json_get_bool(dev_obj, "asa_auto_enable", &bool_val))
             device.asa_auto_enable = bool_val;
 
@@ -1020,7 +1024,9 @@ int load_devices(onode_state_t *state, const char *path)
          */
         if (device.vendor == VIRP_VENDOR_CISCO_ASA &&
             device.enable_password[0] == '\0') {
-            if (device.asa_auto_enable) {
+            if (device.asa_local_login && device.ssh_private_key[0] == '/' && device.password[0]) {
+                fprintf(stderr, "[O-Node] %s uses explicit local read-only login\n", device.hostname);
+            } else if (device.asa_auto_enable) {
                 fprintf(stderr, "[O-Node] WARNING: asa_auto_enable=true for %s "
                                 "— no \"enable\" credential; the login must "
                                 "already land in enable mode (#14)\n",

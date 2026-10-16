@@ -87,6 +87,8 @@ typedef struct {
     char            username[64];
     char            password[128];      /* TODO: move to vault/keyring */
     char            enable_password[128];
+    char            ssh_private_key[256]; /* Optional absolute local private-key file */
+    bool            asa_local_login; /* Key login followed by bounded local read-only login */
     virp_vendor_t   vendor;
     uint32_t        node_id;            /* VIRP node ID for this device */
     /*
