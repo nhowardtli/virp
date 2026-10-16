@@ -136,21 +136,69 @@ def bind(transport, client_id):
 
 
 def execute_observed(transport, request, *, public_key, node_id, device_id,
-                     path, chain_session, artifact_id):
-    """One attempt, one fresh bound session, exact observation durably chained.
+                     path, chain_session, artifact_id, recovery_dir=None):
+    """One durable attempt, fresh binding and exact observation; never retry.
 
-    Caller must hold the dedicated helper lease lock, pin policy/target/binary,
-    record a unique request intent, and supply the fixed canonical command.
-    No retries, no automatic takeover of an existing session.
+    Caller holds its lease lock and pins policy/target/binary. A reused path
+    is refused BEFORE dispatch, including after a crash. With recovery_dir,
+    any unresolved attempt blocks the entire scope until trusted reconciliation.
+    A successful exchange is not proof that a write reached its desired state:
+    the caller must still obtain and compare a fresh verification observation.
     """
-    sid = bind(transport, 'cage-v3-helper')
+    from pathlib import Path
+    path = Path(path)
+    intent_path = Path(str(path)+'.intent.json')
+    if path.exists() or intent_path.exists():
+        raise ValueError('attempt_already_exists')
+    intent = json.dumps(dict(artifact_id=artifact_id, chain_session=chain_session,
+                            request_sha256=hashlib.sha256(json.dumps(request,
+                                sort_keys=True,separators=(',', ':')).encode()).hexdigest(),
+                            time_ns=time.time_ns()),sort_keys=True).encode()
+    pending = None
+    if recovery_dir is not None:
+        recovery_dir = Path(recovery_dir)
+        recovery_dir.mkdir(mode=0o700, exist_ok=True)
+        pending = recovery_dir/'pending.json'
+        try:
+            durable_write(pending, intent)
+        except FileExistsError as e:
+            raise ValueError('unresolved_attempt_requires_reconciliation') from e
+    # O_EXCL plus fsync reserves this request across processes/restarts. A
+    # failure here also retains the scope marker; never guess it is safe.
+    durable_write(intent_path, intent)
+    bound = False
+    error = None
     try:
+        sid = bind(transport, 'cage-v3-helper')
+        bound = True
         raw = transport.raw(dict(request, obs_version=3))
-        result = decode(raw, public_key=public_key, session_id=sid,
-                        node_id=node_id, device_id=device_id,
-                        command=request['command'], after_sequence=-1)
+        try:
+            result = decode(raw, public_key=public_key, session_id=sid,
+                            node_id=node_id, device_id=device_id,
+                            command=request['command'], after_sequence=-1)
+        except Exception:
+            # Forensics only: never chain or label this frame verified.
+            durable_write(Path(str(path)+'.unverified.frame'), raw)
+            raise
         result['chain_entry'] = store(raw, path, chain_session, artifact_id,
                                       transport.management)
-        return raw, result
+    except BaseException as e:
+        error = e
+        raise
     finally:
-        transport.management(dict(action='session_close'))
+        if bound:
+            try:
+                transport.management(dict(action='session_close'))
+            except Exception as close_error:
+                if error is None:
+                    raise
+                if hasattr(error, 'add_note'):
+                    error.add_note('session_close also failed: '+type(close_error).__name__)
+    if pending is not None:
+        pending.unlink()
+        fd = os.open(str(pending.parent), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return raw, result
