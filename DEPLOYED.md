@@ -1,3 +1,31 @@
+## 2026-10-16 — CML canary signed UNKNOWN recovery (phase12)
+
+VM105 only; production .211/SW3850 untouched. C binary remains90558ec,
+SHA2569742dc340a6bccf1049bd499dc76b031f17b2e9ae3115daa87f0bea9bffe77c2.
+Helper/recovery source98e0cc8 plus6b11bdc. Root-only recovery verifies the
+original UNKNOWN, fresh fixed read and signed chain membership before archiving
+pending. UID980 remains observation-only; root adds evidence_item append.
+No original operation replay or new device write; approvals remain consumed.
+
+First state comparison failed on IOS trailing header whitespace. Regression fix
+preserves that read and requires explicit signed review before a fresh read.
+Recovery entry6102c7dd1c2548b200b5ed1cdd50d3a0811b0d50dcb1aa1357324f4df141a814
+in kestrel-v3-cml-recovery12-20261016, sequence3. A signed separate resume permitted
+one model-driven GREEN read through VM227; STOP restored afterward. Phase10
+STOP/pending unchanged. All122 historical rows unchanged, current pending archived
+byte-for-byte. Native9 chains valid, zero open executions. VM103 remains stopped.
+
+Offline virp-verify0.1.3 with independently fetched external pin:
+CRYPTOGRAPHICALLY-VERIFIED,135 entries/9 chains/42 v3 frames; no witness submission.
+Recovery/review/resume are helper attestations stored as signed evidence_item
+entries, not native execution outcomes. Full driver-enabled battery passed
+(640 unittest,87 pytest); final Python follow-up cage suite55/55. No Rust changes.
+
+Snapshots105 before-phase12-recovery-20261016 and227
+before-phase12-resume-20261016. Root recovery backup /root/phase12-recovery.
+Never roll the chain backward. Audit phase12-recovery/REPORT.md; production
+keyboard procedure docs/DEPLOY-211-RECOVERY-RUNBOOK.md is prepared, not executed.
+
 ## 2026-10-16 — CML Cisco canary typed UNKNOWN (phase11)
 
 Canary only: colo pve1 VM105 `cml-kestrel`, CML internal IOS XE IOL-L2
