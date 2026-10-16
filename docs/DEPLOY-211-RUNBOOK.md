@@ -1,21 +1,18 @@
 # Operator keyboard runbook: Kestrel execute-v3 on .211
 
-**STOP — deployment is not released.** The earlier cage proof passed, but the
-final integrated rerun was blocked by a concurrent canary SSH change to
-`AllowUsers lab-bridge`. Both owner SSH and `virp-cage-test` are now rejected.
-Do not override that restriction or run the deployment steps below until an
-exclusive qualification window/access contract is established and the final
-integrated cage proof passes.
+**Qualification prerequisites cleared on October 16.** Dedicated VM103
+`virp-qualify` now replaces the conflicted public-lab VM100 for this work.
+Code `b7496fb` passed the full regression battery and a model-driven cage GREEN
+read/RED refusal with exact v3 storage and independent public-key verification.
+Production baseline `140f6f9` is reconciled in `d46802d`, with follow-up test-build
+fixes `7f74291` and `b7496fb`. See [the phase-one record](TLI-ROLLOUT-PHASE1.md).
 
-A second baseline check is outstanding: this branch preserves Cisco-specific
-candidate fixes, but does not yet include `140f6f9` device-health/readiness and
-watchdog changes inherited by the production candidate. Reconcile and test
-that delta before a production release. The commands below are the staged
-operator procedure, **not permission to skip these prerequisites**.
+This releases the procedure for the owner to run at the keyboard, as requested.
+It does not claim .211 is deployed or production RW is newly qualified.
 
 This runbook is **not executed**. .211 was not accessed during helper qualification.
 Target only `virp-kestrel-candidate`; the main `virp-onode` service stays separate.
-Use branch `feat/v3-execute-path`, code commit `a935cfd` or its documented successor.
+Use branch `feat/v3-execute-path`, qualified code commit `b7496fb` plus the documentation-only release commit.
 The canary helper uses the same `execute_observed` consumer as the staged production
 helper. The production grant adapter is checked offline; this is not a claim of a
 new production RW qualification. The existing Duo approver/coordinator stays in place.
@@ -59,10 +56,11 @@ umask 077
 git clone --branch feat/v3-execute-path --single-branch git@github.com:nhowardtli/virp.git "$HOME/virp-kestrel-v3-deploy"
 cd "$HOME/virp-kestrel-v3-deploy"
 test -z "$(git status --porcelain)"
-git merge-base --is-ancestor a935cfd HEAD
+git merge-base --is-ancestor b7496fb HEAD
 git log -1 --oneline
-# Release marker is intentionally absent while the above gaps remain.
 test -f docs/CAGE-V3-RELEASED
+# Stop if code has changed beyond the qualified build; documentation may advance.
+git diff --exit-code b7496fb HEAD -- . ':!docs' ':!DEPLOYED.md'
 python3 -c 'import cryptography'
 make test-cage-v3
 make prod

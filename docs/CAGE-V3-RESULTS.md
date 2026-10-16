@@ -1,5 +1,8 @@
 # Cage execute-v3 helper qualification — October 15–16, 2026
 
+Historical stop below was resolved by the dedicated VM103 qualification.
+See [TLI rollout phase one](TLI-ROLLOUT-PHASE1.md) for current status.
+
 ## Outcome and stop condition
 
 An initial model-driven VM227 → canary → FRR GREEN read and RED refusal passed.
