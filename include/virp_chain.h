@@ -331,6 +331,8 @@ typedef struct {
     /* Writer side: set by virp_chain_enable_signing(). When true, every
      * append also Ed25519-signs the canonical bytes and the head canonical
      * and stores the signatures + key_id in the sig columns. */
+    /* Opt-in native audit-session namespace; set once before workers start. */
+    char                   native_epoch[17];
     bool                   sign_enabled;
     virp_chainsign_key_t   sign_key;
     /* Insert / head-upsert variants that also bind the sig columns. Prepared
@@ -534,6 +536,12 @@ virp_error_t virp_chain_open_verifier_ex(virp_chain_state_t *state,
  *
  * On success, populates *entry with the committed chain entry.
  */
+/* Start fresh native approval/gate/config sessions without rewriting history.
+ * Requires signing, 1..16 ASCII letters/digits/hyphens; immutable per process.
+ * Caller-selected observation sessions and every read path remain unchanged. */
+virp_error_t virp_chain_set_native_epoch(virp_chain_state_t *state,
+                                        const char *epoch);
+
 virp_error_t virp_chain_append(virp_chain_state_t *state,
                                const char *session_id,
                                const char *artifact_type,

@@ -1608,6 +1608,8 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
             }
             cJSON_AddItemToObject(o, "uid_ceilings", ceils);
         }
+        if (state->chain.native_epoch[0])
+            cJSON_AddStringToObject(o, "native_audit_epoch", state->chain.native_epoch);
         cJSON_AddNumberToObject(o, "emitted_ns", (double)now_ns);
         body = cJSON_PrintUnformatted(o);
         cJSON_Delete(o);

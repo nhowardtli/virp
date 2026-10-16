@@ -737,9 +737,66 @@ static void test_signed_entries_require_signed_head(void)
     PASS();
 }
 
+
+static void test_native_epoch_preserves_legacy_and_starts_signed(void)
+{
+    TEST("native epoch isolates legacy without rewriting its bytes");
+    cleanup(); make_chain_key(); make_sign_key();
+    virp_chain_state_t c; virp_chain_entry_t old, fresh, check;
+    ASSERT(virp_chain_init(&c, DB, CK, 1, "test") == VIRP_OK, "init");
+    ASSERT(virp_chain_append(&c,"approval:SW","proposal","old",H1,&old)==VIRP_OK,"old append");
+    ASSERT(virp_chain_enable_signing(&c,SK)==VIRP_OK,"signing");
+    ASSERT(virp_chain_set_native_epoch(&c,"v3-20261016")==VIRP_OK,"epoch");
+    ASSERT(virp_chain_append(&c,"approval:SW","proposal","new",H1,&fresh)==VIRP_OK,"new append");
+    ASSERT(!strcmp(fresh.session_id,"approval:SW@v3-20261016") && fresh.sequence==0,"fresh session identity");
+    ASSERT(virp_chain_get_last(&c,"approval:SW",&check)==VIRP_OK,"old remains");
+    ASSERT(!strcmp(old.chain_entry_hash,check.chain_entry_hash) && check.sequence==0,"legacy unchanged");
+    ASSERT(virp_chain_append(&c,"cage-observations","observation","obs",H1,&fresh)==VIRP_OK,"ordinary append");
+    ASSERT(!strcmp(fresh.session_id,"cage-observations"),"caller session unchanged");
+    virp_chain_destroy(&c);
+    virp_chain_state_t v;
+    ASSERT(virp_chain_open_verifier_ex(&v,DB,NULL,PK,1,"test")==VIRP_OK,"public verifier");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify_session(&v,"approval:SW@v3-20261016",&r)==VIRP_OK && r.valid_signed,"public signed session");
+    virp_chain_destroy(&v); cleanup(); PASS();
+}
+
+static void test_native_epoch_rejects_invalid_and_unsigned(void)
+{
+    TEST("native epoch requires signing and bounded safe immutable name");
+    cleanup(); make_chain_key(); make_sign_key();virp_chain_state_t c;
+    ASSERT(virp_chain_init(&c,DB,CK,1,"test")==VIRP_OK,"init");
+    ASSERT(virp_chain_set_native_epoch(&c,"v3")!=VIRP_OK,"unsigned rejected");
+    ASSERT(virp_chain_enable_signing(&c,SK)==VIRP_OK,"signing");
+    ASSERT(virp_chain_set_native_epoch(&c,"")!=VIRP_OK,"empty rejected");
+    ASSERT(virp_chain_set_native_epoch(&c,"../bad")!=VIRP_OK,"unsafe rejected");
+    ASSERT(virp_chain_set_native_epoch(&c,"12345678901234567")!=VIRP_OK,"long rejected");
+    ASSERT(virp_chain_set_native_epoch(&c,"v3")==VIRP_OK,"valid");
+    ASSERT(virp_chain_set_native_epoch(&c,"v4")!=VIRP_OK,"runtime switch rejected");
+    virp_chain_destroy(&c);cleanup();PASS();
+}
+
+static void test_native_epoch_collision_and_length_fail_closed(void)
+{
+    TEST("native epoch rejects preexisting unsigned destination and truncation");
+    cleanup();make_chain_key();make_sign_key();virp_chain_state_t c;virp_chain_entry_t e;
+    ASSERT(virp_chain_init(&c,DB,CK,1,"test")==VIRP_OK,"init");
+    ASSERT(virp_chain_append(&c,"approval:SW@v3","proposal","old",H1,&e)==VIRP_OK,"old collision");
+    ASSERT(virp_chain_enable_signing(&c,SK)==VIRP_OK,"signing");
+    ASSERT(virp_chain_set_native_epoch(&c,"v3")==VIRP_OK,"epoch");
+    ASSERT(virp_chain_append(&c,"approval:SW","proposal","new",H1,&e)!=VIRP_OK,"collision refused");
+    char long_name[100];memset(long_name,'A',sizeof(long_name));memcpy(long_name,"approval:",9);long_name[90]=0;
+    ASSERT(virp_chain_append(&c,long_name,"proposal","long",H1,&e)!=VIRP_OK,"overflow refused");
+    ASSERT(virp_chain_get_last(&c,"approval:SW@v3",&e)==VIRP_OK && e.sequence==0,"old head unchanged");
+    virp_chain_destroy(&c);cleanup();PASS();
+}
+
 int main(void)
 {
     printf("\n=== VIRP chain-signing MIGRATION tests (HAM item 7) ===\n");
+    test_native_epoch_preserves_legacy_and_starts_signed();
+    test_native_epoch_rejects_invalid_and_unsigned();
+    test_native_epoch_collision_and_length_fail_closed();
     test_signed_entries_require_signed_head();
     test_from_n_unsigned_prefix_then_signed();
     test_from_1_is_the_degenerate_from_n();

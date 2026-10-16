@@ -88,6 +88,46 @@ static virp_error_t chain_artifact_store_locked(virp_chain_state_t *state,
                                                 const char *artifact_hash,
                                                 const char *session_id);
 
+virp_error_t virp_chain_set_native_epoch(virp_chain_state_t *state,
+                                        const char *epoch)
+{
+    if (!state || !epoch) return VIRP_ERR_NULL_PTR;
+    size_t n = strlen(epoch);
+    if (!n || n > 16) return VIRP_ERR_INVALID_LENGTH;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)epoch[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-'))
+            return VIRP_ERR_INVALID_LENGTH;
+    }
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = VIRP_ERR_INVALID_LENGTH;
+    if (state->sign_enabled && !state->native_epoch[0]) {
+        memcpy(state->native_epoch, epoch, n + 1);
+        rc = VIRP_OK;
+    }
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+/* Called under the chain lock, inside the write transaction. A namespace
+ * collision may never silently create another unsigned->signed transition. */
+static virp_error_t native_epoch_destination_locked(virp_chain_state_t *state,
+                                                     const char *session)
+{
+    sqlite3_stmt *st = NULL;
+    const char *sql = "SELECT 1 FROM chain_entries WHERE session_id=? AND "
+        "(chain_sig IS NULL OR chain_sig='' OR chain_sig_key_id IS NULL "
+        "OR chain_sig_key_id<>?) LIMIT 1";
+    if (sqlite3_prepare_v2(state->db, sql, -1, &st, NULL) != SQLITE_OK)
+        return VIRP_ERR_CHAIN_DB;
+    sqlite3_bind_text(st, 1, session, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, state->sign_key.key_id_hex, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? VIRP_OK : VIRP_ERR_CHAIN_DB;
+}
+
 virp_error_t virp_chain_append(virp_chain_state_t *state,
                                const char *session_id,
                                const char *artifact_type,
@@ -2314,6 +2354,21 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
     if (state->read_only)
         return VIRP_ERR_CHAIN_READONLY;
 
+    char epoch_session[sizeof(entry->session_id)];
+    bool use_epoch = state->native_epoch[0] &&
+        (!strncmp(session_id, "approval:", 9) ||
+         !strncmp(session_id, "gate-enforce:", 13) ||
+         !strncmp(session_id, "node-config:", 12));
+    if (use_epoch) {
+        if (!state->sign_enabled || strchr(session_id, '@'))
+            return VIRP_ERR_INVALID_LENGTH;
+        int n = snprintf(epoch_session, sizeof(epoch_session), "%s@%s",
+                         session_id, state->native_epoch);
+        if (n < 0 || (size_t)n >= sizeof(epoch_session))
+            return VIRP_ERR_INVALID_LENGTH;
+        session_id = epoch_session;
+    }
+
     /* CANONICAL-STRING CONFORMANCE (HAM item 12). Every one of these
      * reaches the canonical object that is hashed and HMAC'd, and the
      * canonicalizer does not escape. Checked here, at the one place
@@ -2342,6 +2397,11 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
     int rc = sqlite3_exec(state->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
     if (rc != SQLITE_OK)
         return VIRP_ERR_CHAIN_DB;
+
+    if (use_epoch && native_epoch_destination_locked(state, session_id) != VIRP_OK) {
+        sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+        return VIRP_ERR_CHAIN_DB;
+    }
 
     /* GATE 5 — federation retry idempotency (enforcement; F4, external
      * review 2026-08-17). A federation artifact_id embeds the bridge's

@@ -1291,6 +1291,7 @@ static void usage(const char *prog)
     printf("              with: virp-tool keygen chainsign <prefix>\n");
     printf("  -3          Sign execute observations as v3 Ed25519 using -S.\n");
     printf("              Requires an active bound session; no v1 fallback.\n");
+    printf("  -E <epoch>  Fresh native audit sessions (1..16 alnum/hyphen, requires -S).\n");
     printf("  -a <path>   Approval store dir (default: /var/lib/virp/approvals)\n");
     printf("  -A <path>   Approver registry (default: /etc/virp/approvers.json)\n");
     printf("  -h          Show this help\n");
@@ -1307,6 +1308,7 @@ int main(int argc, char **argv)
     const char *chain_db_path = NULL;
     const char *chain_key_path = NULL;
     bool execute_v3 = false;
+    const char *native_epoch = NULL;
     const char *chain_sign_key_path = NULL;   /* D-1: -S, opt-in */
     const char *approval_dir = "/var/lib/virp/approvals";
     const char *approvers_path = "/etc/virp/approvers.json";
@@ -1328,7 +1330,7 @@ int main(int argc, char **argv)
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "3k:K:W:s:d:n:c:C:S:a:A:h")) != -1) {
+    while ((opt = getopt(argc, argv, "3k:K:W:s:d:n:c:C:S:E:a:A:h")) != -1) {
         switch (opt) {
         case '3': execute_v3 = true; break;
         case 'k':
@@ -1354,6 +1356,9 @@ int main(int argc, char **argv)
             break;
         case 'C':
             chain_key_path = optarg;
+            break;
+        case 'E':
+            native_epoch = optarg;
             break;
         case 'S':
             chain_sign_key_path = optarg;
@@ -1520,6 +1525,12 @@ int main(int argc, char **argv)
             virp_context_destroy(ctx);
             return 1;
         }
+    }
+
+    if (native_epoch && (!g_state.chain_enabled ||
+            virp_chain_set_native_epoch(&g_state.chain, native_epoch) != VIRP_OK)) {
+        fprintf(stderr, "[O-Node] -E requires -S and a safe 1..16 character epoch\n");
+        onode_destroy(&g_state); virp_context_destroy(ctx); return 1;
     }
 
     if (execute_v3) {

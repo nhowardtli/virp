@@ -2572,3 +2572,8 @@ test-wazuh-tls:
 
 $(BUILD_DIR)/wazuh-tls-probe: tests/wazuh_tls_probe.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-witness-publisher
+test-witness-publisher:
+	python3 -m unittest discover -s tools/witness -v
+all-tests: test-witness-publisher
