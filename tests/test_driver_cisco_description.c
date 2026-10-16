@@ -201,6 +201,21 @@ static void test_aaa_denials(void)
     PASS();
 }
 
+static void test_health_probe_selection(void)
+{
+    TEST("health probe is explicit, bounded and mode-aware");
+    virp_conn_t c; memset(&c, 0, sizeof(c));
+    c.current_mode = CISCO_MODE_EXEC;
+    assert(strcmp(cisco_health_probe(&c), "show clock") == 0);
+    c.device.cisco_health_version = true;
+    assert(strcmp(cisco_health_probe(&c), "show version") == 0);
+    c.current_mode = CISCO_MODE_CONFIG_SUB;
+    assert(strcmp(cisco_health_probe(&c), "do show version") == 0);
+    c.device.cisco_health_version = false;
+    assert(strcmp(cisco_health_probe(&c), "do show clock") == 0);
+    PASS();
+}
+
 int main(void)
 {
     printf("VIRP Cisco typed config op — interface description (C-04 Option A)\n");
@@ -208,6 +223,7 @@ int main(void)
     assert(cisco_driver.route_reason != NULL && cisco_iosxe_driver.route_reason != NULL);
     assert(strstr(cisco_gate_reason("interface Gi1/0/22 description test"), "exact device") != NULL);
     assert(cisco_gate_reason("show interfaces GigabitEthernet1/0/22") == NULL);
+    test_health_probe_selection();
     test_aaa_denials();
     test_parser();
     test_classifier_agrees_with_parser();

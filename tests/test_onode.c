@@ -2765,6 +2765,23 @@ TEST(test_load_devices_skips_missing_required_fields)
     unlink(WRONG_TYPE_CFG);
 }
 
+TEST(test_load_devices_cisco_health_probe)
+{
+    const char *values[] = { "\"clock\"", "\"version\"", "null", "true", "\"show version\"", "\"version;reload\"", "\"version\\u0000extra\"" };
+    for (size_t i = 0; i < sizeof(values)/sizeof(values[0]) + 1; i++) {
+        bool wrong_vendor = i == sizeof(values)/sizeof(values[0]);
+        FILE *f = fopen(WRONG_TYPE_CFG, "w"); ASSERT_TRUE(f != NULL);
+        fprintf(f, "{\"devices\":[{\"hostname\":\"FRR-LAB\",\"host\":\"127.0.0.1\",\"vendor\":\"%s\",\"node_id\":7,\"cisco_health_probe\":%s}]}", wrong_vendor ? "mock" : "cisco_ios", wrong_vendor ? values[1] : values[i]);
+        fclose(f);
+        onode_state_t tmp; ASSERT_OK(onode_init(&tmp, 7, NULL, "/tmp/virp-health-probe.sock"));
+        tmp.ctx = virp_context_new(); ASSERT_TRUE(tmp.ctx != NULL);
+        int loaded = load_devices(&tmp, WRONG_TYPE_CFG);
+        if (i < 2) { ASSERT_EQ(loaded, 1); ASSERT_EQ(tmp.devices[0].cisco_health_version, i == 1); }
+        else { ASSERT_EQ(loaded, -1); ASSERT_EQ(tmp.device_count, 0); }
+        onode_destroy(&tmp); virp_context_destroy(tmp.ctx); unlink(WRONG_TYPE_CFG);
+    }
+}
+
 /*
  * Issue #14: a cisco_asa entry with no "enable" credential is refused
  * at load, not loaded to churn. The ASA driver's health check needs
@@ -8418,6 +8435,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_load_devices_wrong_type_does_not_crash);
     RUN_TEST(test_load_devices_refuses_absent_node_id);
     RUN_TEST(test_load_devices_skips_missing_required_fields);
+    RUN_TEST(test_load_devices_cisco_health_probe);
     RUN_TEST(test_load_devices_refuses_asa_without_enable);
     RUN_TEST(test_add_device_rejects_duplicate_identities);
     RUN_TEST(test_load_devices_duplicate_identities_fatal);

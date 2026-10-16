@@ -781,6 +781,23 @@ int load_devices(onode_state_t *state, const char *path)
         if (json_get_string(dev_obj, "vendor", vendor_str, sizeof(vendor_str)))
             device.vendor = vendor_from_string(vendor_str);
 
+        /* Fixed root-configured read probe for IOS-compatible lab targets.
+         * No arbitrary command or fallback, and no silent wrong-type default. */
+        struct json_object *probe = NULL;
+        if (json_object_object_get_ex(dev_obj, "cisco_health_probe", &probe)) {
+            const char *value = json_object_is_type(probe, json_type_string)
+                              ? json_object_get_string(probe) : NULL;
+            if ((device.vendor != VIRP_VENDOR_CISCO_IOS &&
+                 device.vendor != VIRP_VENDOR_CISCO_IOSXE) || !value ||
+                (size_t)json_object_get_string_len(probe) != strlen(value) ||
+                (strcmp(value, "clock") != 0 && strcmp(value, "version") != 0)) {
+                fprintf(stderr, "[O-Node] invalid cisco_health_probe; refusing config\n");
+                json_object_put(root);
+                return -1;
+            }
+            device.cisco_health_version = strcmp(value, "version") == 0;
+        }
+
         /*
          * node_id accepts either a hex string ("0A0000FD") or a JSON int,
          * matching virp_onode_main.c's dev parser. Other JSON types are

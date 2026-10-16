@@ -1902,6 +1902,15 @@ static bool cisco_detect(virp_conn_t *conn)
  * Driver: health_check
  * ========================================================================= */
 
+static const char *cisco_health_probe(const virp_conn_t *conn)
+{
+    bool config = conn->current_mode == CISCO_MODE_CONFIG ||
+                  conn->current_mode == CISCO_MODE_CONFIG_SUB;
+    if (conn->device.cisco_health_version)
+        return config ? "do show version" : "show version";
+    return config ? "do show clock" : "show clock";
+}
+
 static virp_error_t cisco_health_check(virp_conn_t *conn)
 {
     if (!conn) return VIRP_ERR_NULL_PTR;
@@ -1915,14 +1924,10 @@ static virp_error_t cisco_health_check(virp_conn_t *conn)
      * read that as unhealthy and drop the session mid-sequence
      * (probe cadence ONODE_WATCHDOG_INTERVAL_SEC is shorter than a
      * gate approval roundtrip). "do show clock" is the config-mode
-     * spelling of the same liveness probe. */
-    bool in_config = (conn->current_mode == CISCO_MODE_CONFIG ||
-                      conn->current_mode == CISCO_MODE_CONFIG_SUB);
+     * spelling of the same liveness probe. An explicit root-configured
+     * version probe uses the corresponding show/do show version forms. */
     virp_exec_result_t result;
-    virp_error_t err = cisco_execute(conn,
-                                     in_config ? "do show clock"
-                                               : "show clock",
-                                     &result);
+    virp_error_t err = cisco_execute(conn, cisco_health_probe(conn), &result);
     if (err != VIRP_OK) return err;
 
     return result.success ? VIRP_OK : VIRP_ERR_KEY_NOT_LOADED;

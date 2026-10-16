@@ -1608,6 +1608,18 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
             }
             cJSON_AddItemToObject(o, "uid_ceilings", ceils);
         }
+        cJSON *probes = cJSON_CreateArray();
+        if (probes) {
+            for (int i = 0; i < state->device_count; i++) {
+                if (!state->devices[i].cisco_health_version) continue;
+                cJSON *probe = cJSON_CreateObject();
+                if (!probe) continue;
+                cJSON_AddStringToObject(probe, "device", state->devices[i].hostname);
+                cJSON_AddStringToObject(probe, "probe", "version");
+                cJSON_AddItemToArray(probes, probe);
+            }
+            cJSON_AddItemToObject(o, "cisco_health_probes", probes);
+        }
         if (state->chain.native_epoch[0])
             cJSON_AddStringToObject(o, "native_audit_epoch", state->chain.native_epoch);
         cJSON_AddNumberToObject(o, "emitted_ns", (double)now_ns);
