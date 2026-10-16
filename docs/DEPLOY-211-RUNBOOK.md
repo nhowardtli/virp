@@ -74,8 +74,9 @@ the diagnostic and reconcile it; do not bypass the staging checks.
 ## 2. Install into the isolated candidate directory and stage helper/config
 
 `install-prod` below does not replace the main daemon binary or restart a service.
-The repository's install helper captures deployment recovery material and writes
-`DEPLOYED.md`. Keep any host deployment records outside commits.
+The repository's install helper captures deployment recovery material and prints
+a deployment record. Capture that output explicitly below; `deploy-record` does not
+write `DEPLOYED.md` by itself. Keep host deployment records outside commits.
 
 ```bash
 sudo -n make install-prod VIRP_INSTALL_DIR=/usr/local/lib/virp-kestrel-v3
@@ -134,8 +135,7 @@ per-session maxima script:
 
 ```bash
 sudo -n python3 /usr/local/lib/virp-kestrel-v3/cage/verify_local_chain.py --db /var/lib/virp-kestrel/chain.db --socket /run/virp-kestrel/onode.sock --requester virp-kreq | sudo -n tee /root/kestrel-v3-deploy/chain-verify.json
-sudo -n make deploy-record VIRP_INSTALL_DIR=/usr/local/lib/virp-kestrel-v3
-sudo -n cp DEPLOYED.md /root/kestrel-v3-deploy/DEPLOYED.md
+sudo -n make deploy-record VIRP_INSTALL_DIR=/usr/local/lib/virp-kestrel-v3 | sudo -n tee /root/kestrel-v3-deploy/DEPLOYED.md
 sudo -n systemctl show virp-kestrel-candidate -p MainPID -p ExecStart -p User -p Group | sudo -n tee /root/kestrel-v3-deploy/live-service.txt
 sudo -n sha256sum /usr/local/lib/virp-kestrel-v3/virp-onode-prod /usr/local/lib/virp-kestrel-v3/cage/helper.py /usr/local/sbin/virp-cage227-read | sudo -n tee /root/kestrel-v3-deploy/live-hashes.txt
 sudo -n sh -c 'cat /root/kestrel-v3-deploy/live-service.txt /root/kestrel-v3-deploy/live-hashes.txt /root/kestrel-v3-deploy/metadata.json /root/kestrel-v3-deploy/chain-verify.json >> /root/kestrel-v3-deploy/DEPLOYED.md'
