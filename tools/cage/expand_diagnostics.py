@@ -8,7 +8,7 @@ BASE_ENDPOINT='98e9baf151dd752f0b7d29a7ea23ea929baf1469234e54e3e2de4bc682bc7d59'
 READS={
  'sw_port_switchport':('SW-3850','10.0.10.2','show interfaces GigabitEthernet1/0/22 switchport'),
  'sw_port_errors':('SW-3850','10.0.10.2','show interfaces GigabitEthernet1/0/22 counters errors'),
- 'sw_interface_status':('SW-3850','10.0.10.2','show interfaces status'),
+ 'sw_port_status':('SW-3850','10.0.10.2','show interfaces GigabitEthernet1/0/22 status'),
  'sw_trunks':('SW-3850','10.0.10.2','show interfaces trunk'),
 }
 def operations(source):
