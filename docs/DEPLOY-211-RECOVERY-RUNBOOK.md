@@ -86,11 +86,14 @@ with (r/'lock').open('a') as lock:
  assert P('/proc/sys/kernel/random/boot_id').read_text()==lease['boot_id']
  assert not any((r/n).exists() for n in ['STOP','v3-recovery/pending.json','description-grant.json'])
  cfg=json.loads(cfgpath.read_text());actions=cfg['socket_uid_action_allow'];types=cfg['socket_uid_chain_append_types']
- assert actions['0']==[],'Root baseline differs; inspect instead of expanding it'
+ assert cfg['socket_allowed_uids']==[980] and '0' not in actions and '0' not in types
+ assert '0' not in cfg['socket_uid_tier_ceilings']
  assert types['980']==['observation']
  assert cfg['gate_default_mode']=='enforce' and cfg['evidence_required'] is True
  assert cfg['socket_uid_tier_ceilings']['980']=='green'
+ cfg['socket_allowed_uids'].append(0)
  actions['0']=['chain_append'];types['0']=['evidence_item']
+ cfg['socket_uid_tier_ceilings']['0']='green'
  newsha=sha(src/'build/virp-onode-prod');old=endpoint.read_text()
  needle="CANDIDATE_BINARY='18b87ac7c381b1ae2569a9c76230d05cba1cd596f004f2403bc8f0f229f7d2d2'"
  assert old.count(needle)==1
@@ -127,8 +130,10 @@ with (r/'lock').open('a') as lock:
 PY
 ```
 
-The root action baseline assertion is deliberately strict: current .211 policy
-was not read during canary work. A mismatch is a contract gap to inspect, not a
+Phase13 fresh preflight found root absent from both socket admission and policy
+maps. The corrected transition admits root with chain_append/evidence_item only;
+requester980 stays unchanged. The transition is regression-tested in
+tools/cage/test_recovery_policy.py. A mismatch is a contract gap to inspect, not a
 reason to remove the assertion or grant root general access. This deployment
 script has been syntax-checked, not executed or qualified on production.
 
