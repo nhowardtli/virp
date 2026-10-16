@@ -1750,19 +1750,21 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
     }
 
     if (rerr == VIRP_ERR_NO_PROMPT) {
-        /*
-         * Incomplete read. Returning a hard error (rather than VIRP_OK
-         * with a short body) is what makes the O-Node emit a typed
-         * ERROR observation instead of signing a truncated body as
-         * device output.
-         */
+        /* The command was sent; a missing prompt cannot prove its outcome.
+         * Return the typed result through the O-Node's UNKNOWN path, not
+         * its generic driver-error return. Never publish partial output
+         * or allow this connection/command to be retried. */
         conn->connected = false;
         result->success = false;
+        result->no_dispatch = false;
+        result->disposition = VIRP_DISPOSITION_EXECUTED_UNKNOWN;
+        result->exit_code_trusted = false;
         result->output_len = 0;
+        result->output[0] = '\0';
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Incomplete read on %s: no prompt after %zu bytes",
                  conn->device.hostname, n);
-        return VIRP_ERR_NO_PROMPT;
+        return VIRP_OK;
     }
     if (rerr != VIRP_OK) {
         conn->connected = false;
