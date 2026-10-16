@@ -1,3 +1,33 @@
+## 2026-10-16 — CML Cisco canary typed UNKNOWN (phase11)
+
+Canary only: colo pve1 VM105 `cml-kestrel`, CML internal IOS XE IOL-L2
+`kestrel-ios`192.168.255.10. Installed `90558ec`,
+`v0.2.0-242-g90558ec`, binary SHA256
+`9742dc340a6bccf1049bd499dc76b031f17b2e9ae3115daa87f0bea9bffe77c2`.
+Existing shared cage helper unchanged. Production .211/SW3850 untouched;
+VM103 retained stopped. Same cage/helper/C path with fresh bounded test scope.
+
+Test-first missing/partial prompt regression7/7; full C/Python all-tests pass
+(625 unittest,87 pytest). Model-driven four reads, RED refusal, test-approved
+description set/restore once, replay(-37), native v3 UNKNOWN on deliberately
+dropped IOS read response, and pending refusal passed. Original interface
+read restored byte-for-byte. Temporary fault rules removed. Both phase10 and
+phase11 STOP/pending retained; no unattended recovery claimed.
+
+Node-config session `node-config:00000104@cml-v3-20261016`, sequence2,
+entry `e0cbb25f9afffd2b8e0f46abf7802a36003308b3fdacb976a410886c5ebe9e97`.
+Cage session `kestrel-v3-cml-phase11-20261016`. Offline clean virp-verify0.1.3
+with external public pin: CRYPTOGRAPHICALLY-VERIFIED,122 entries/7 chains/39v3
+frames;69 historical entries unchanged. No witness submission, no Duo/TACACS
+or physical-switch equivalence claim. Empty counters/trunk bodies establish
+syntax/transport coverage only.
+
+Recovery: VM105 snapshot `before-phase11-unknown-20261016`, VM227
+`before-phase11-cage-20261016`; old binary/endpoint and consistent chain backup
+under VM105 `/root/phase11-recovery`. Restore binary/endpoint only, preserve
+chain history and STOP/pending. Full phase report and exact rollback in local
+audits/tli-ai-rollout-20261016/phase11-cisco-unknown/REPORT.md and ROLLBACK.txt.
+
 # VIRP Deployment Record — virp-lab
 
 ## Dedicated Kestrel production instance — 2026-10-16
