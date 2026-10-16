@@ -7,6 +7,14 @@ static void envstr(char *dest, size_t n, const char *name) {
     const char *s=getenv(name); snprintf(dest,n,"%s",s?s:"");
 }
 int main(void) {
+    const char *opt_in = getenv("VIRP_LIVE_WAZUH_TLS_FIXTURE");
+    if (!opt_in || strcmp(opt_in, "1") != 0) {
+        puts("SKIP: set VIRP_LIVE_WAZUH_TLS_FIXTURE=1 for the local TLS fixture");
+        return 0;
+    }
+    if (!getenv("TEST_HOST") || strcmp(getenv("TEST_HOST"), "127.0.0.1") != 0 ||
+        !getenv("TEST_PORT")) return 4;
+
     virp_driver_wazuh_init();
     virp_device_t d={.vendor=VIRP_VENDOR_WAZUH,.enabled=true};
     snprintf(d.hostname,sizeof(d.hostname),"tls-test");

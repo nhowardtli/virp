@@ -15,7 +15,7 @@ with tempfile.TemporaryDirectory() as td:
     ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain(p/'trusted.crt',p/'trusted.key')
     server.socket=ctx.wrap_socket(server.socket,server_side=True)
     t=threading.Thread(target=server.serve_forever,daemon=True);t.start()
-    env=dict(os.environ,TEST_HOST='127.0.0.1',TEST_TLS_NAME='localhost',TEST_PORT=str(server.server_port),TEST_USER='fixture',TEST_PASSWORD='fixture',VIRP_WAZUH_INSECURE='0',VIRP_CA_BUNDLE=str(p/'trusted.crt'))
+    env=dict(os.environ,VIRP_LIVE_WAZUH_TLS_FIXTURE='1',TEST_HOST='127.0.0.1',TEST_TLS_NAME='localhost',TEST_PORT=str(server.server_port),TEST_USER='fixture',TEST_PASSWORD='fixture',VIRP_WAZUH_INSECURE='0',VIRP_CA_BUNDLE=str(p/'trusted.crt'))
     def run(extra, expected, count):
         before=len(requests)
         r=subprocess.run([sys.argv[1]],env=dict(env,**extra),capture_output=True,text=True,timeout=10)
