@@ -2547,3 +2547,12 @@ all-tests: test-onode-security
 test-execute-v3: build/libvirp.a
 	$(CC) $(CFLAGS) tests/test_execute_v3.c build/libvirp.a $(LDFLAGS) -o build/test_execute_v3
 	umask 077; ./build/test_execute_v3
+
+$(BUILD_DIR)/test_driver_cisco_auth: tests/test_driver_cisco_auth.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+.PHONY: test-cisco-auth test-cage-v3
+test-cisco-auth: $(BUILD_DIR)/test_driver_cisco_auth
+	./$(BUILD_DIR)/test_driver_cisco_auth
+test-cage-v3:
+	python3 -m unittest discover -s tools/cage -v
+all-tests: test-cage-v3 test-cisco-auth

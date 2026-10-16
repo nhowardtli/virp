@@ -227,9 +227,24 @@ TEST(test_config_mode_is_not_silently_reconnected)
     DONE();
 }
 
+TEST(test_tacacs_denial_is_failure_without_retry)
+{
+    virp_conn_t conn; fake_chan_t f;
+    setup(&conn, &f, "show clock\r\nCommand authorization failed.\r\nSW-3850#");
+    virp_exec_result_t r;
+    virp_error_t rc = cisco_execute(&conn, "show clock", &r);
+    CHECK(rc == VIRP_OK && !r.success && r.exit_code == 1,
+          "completed AAA denial must be a failed command, not a successful read");
+    CHECK(stub_reconnects == 0, "AAA denial must not reconnect or retry");
+    CHECK(strstr(r.output, "Command authorization failed") != NULL,
+          "preserve the observed denial as evidence");
+    DONE();
+}
+
 int main(void)
 {
     printf("\n=== Cisco stale-session reconnect (defect C) ===\n\n");
+    RUN(test_tacacs_denial_is_failure_without_retry);
     RUN(test_closed_peer_reconnects_once_and_completes);
     RUN(test_reconnect_failure_returns_error_and_does_not_loop);
     RUN(test_non_close_transport_error_does_not_reconnect);

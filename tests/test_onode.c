@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -5243,6 +5244,8 @@ static int write_test_registry(void)
 {
     FILE *f = fopen(AP_REGISTRY, "w");
     if (!f) return -1;
+    /* Registry loader refuses group-writable files, including under umask 0002. */
+    if (fchmod(fileno(f), 0600) != 0) { fclose(f); return -1; }
     fprintf(f,
         "[{\"key_id\":\"e6d67937b0a11c446e166ddc8f157ba9\","
         "\"algorithm\":\"ecdsa-p256\","

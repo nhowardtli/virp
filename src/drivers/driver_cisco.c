@@ -128,26 +128,31 @@ static ssize_t cisco_io_write(void *ctx, const char *buf, size_t len)
     return (ssize_t)written;
 }
 
-/* =========================================================================
- * Keyboard-interactive auth callback for libssh2
- *
- * IOS 7200 (and many other IOS versions) only advertise
- * keyboard-interactive — not password. This callback supplies
- * the password for every prompt the server sends.
- *
- * Prompt cap: A legitimate IOS device sends 1–2 prompts (password,
- * sometimes OTP). A hostile or broken server could request thousands.
- * We cap at 4 to bound memory allocation.
- *
- * Ownership: libssh2 takes ownership of each responses[i].text and
- * calls free() on it after the callback returns. We strdup() the
- * password into each response. Because libssh2 frees the buffer
- * internally (not us), we cannot OPENSSL_cleanse the copy — the
- * password material persists in freed heap until overwritten. The
- * authoritative copy on conn->device.password is wiped at disconnect.
- * ========================================================================= */
+/* Password-only authentication is deliberately NOT an OTP implementation.
+ * Unknown, repeated, echoed or multiple challenges fail closed. In particular
+ * never disclose the password to a prompt asking for an OTP/recovery code.
+ * A rejected interactive exchange must not downgrade to password auth. */
+typedef struct {
+    const char *password;
+    bool sent;
+    bool rejected;
+} cisco_password_auth_t;
 
-#define KBD_MAX_PROMPTS 4
+static bool cisco_password_prompt(const LIBSSH2_USERAUTH_KBDINT_PROMPT *p)
+{
+    static const char expected[] = "password:";
+    if (!p || p->echo || !p->text || p->length > 64) return false;
+    size_t lo = 0, hi = p->length;
+    while (lo < hi && (p->text[lo] == ' ' || p->text[lo] == '\t')) lo++;
+    while (hi > lo && (p->text[hi-1] == ' ' || p->text[hi-1] == '\t')) hi--;
+    if (hi - lo != sizeof(expected) - 1) return false;
+    for (size_t i = 0; i < sizeof(expected) - 1; i++) {
+        unsigned char ch = (unsigned char)p->text[lo+i];
+        if (ch >= 'A' && ch <= 'Z') ch = (unsigned char)(ch + ('a'-'A'));
+        if (ch != (unsigned char)expected[i]) return false;
+    }
+    return true;
+}
 
 static void kbd_interactive_callback(const char *name, int name_len,
                                       const char *instruction, int instruction_len,
@@ -158,25 +163,24 @@ static void kbd_interactive_callback(const char *name, int name_len,
 {
     (void)name; (void)name_len;
     (void)instruction; (void)instruction_len;
-    (void)prompts;
-
-    if (num_prompts > KBD_MAX_PROMPTS) {
-        fprintf(stderr, "[Cisco] keyboard-interactive: server sent %d prompts "
-                "(max %d) — rejecting\n", num_prompts, KBD_MAX_PROMPTS);
-        /* Zero all responses so libssh2 sees empty answers */
-        for (int i = 0; i < num_prompts; i++) {
-            responses[i].text   = NULL;
-            responses[i].length = 0;
-        }
+    cisco_password_auth_t *ctx = abstract ? *abstract : NULL;
+    for (int i = 0; i < num_prompts; i++) {
+        responses[i].text = NULL;
+        responses[i].length = 0;
+    }
+    if (!ctx) return;
+    if (ctx->rejected || ctx->sent || num_prompts != 1 ||
+        !cisco_password_prompt(prompts) || !ctx->password || !ctx->password[0]) {
+        ctx->rejected = true;
         return;
     }
-
-    const char *password = (const char *)*abstract;
-
-    for (int i = 0; i < num_prompts; i++) {
-        responses[i].text   = strdup(password);
-        responses[i].length = (unsigned int)strlen(password);
+    responses[0].text = strdup(ctx->password);
+    if (!responses[0].text) {
+        ctx->rejected = true;
+        return;
     }
+    responses[0].length = (unsigned int)strlen(ctx->password);
+    ctx->sent = true;
 }
 
 /* =========================================================================
@@ -380,14 +384,17 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
      * IOS 7200 devices typically only advertise keyboard-interactive,
      * while IOS-XE 16.x supports both password and keyboard-interactive. */
     bool authenticated = false;
+    bool interactive_attempted = false;
+    cisco_password_auth_t auth_ctx = { .password = device->password };
 
     char *auth_list = libssh2_userauth_list(conn->session,
                                              device->username,
                                              (unsigned int)strlen(device->username));
 
     if (!auth_list && libssh2_userauth_authenticated(conn->session)) {
-        /* "none" auth succeeded (unlikely on IOS, but handle it) */
-        authenticated = true;
+        /* This configured credential must actually be authenticated.
+         * Anonymous server acceptance does not satisfy that policy. */
+        fprintf(stderr, "[Cisco] Refusing unauthenticated SSH session\n");
     }
 
     if (auth_list) {
@@ -397,11 +404,13 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
 
     /* Try keyboard-interactive first (IOS 7200, IOS 15.x AAA) */
     if (!authenticated && auth_list && strstr(auth_list, "keyboard-interactive")) {
-        *libssh2_session_abstract(conn->session) = (void *)device->password;
+        interactive_attempted = true;
+        *libssh2_session_abstract(conn->session) = &auth_ctx;
 
         if (libssh2_userauth_keyboard_interactive(conn->session,
                                                    device->username,
-                                                   kbd_interactive_callback) == 0) {
+                                                   kbd_interactive_callback) == 0 &&
+            auth_ctx.sent && !auth_ctx.rejected) {
             authenticated = true;
             fprintf(stderr, "[Cisco] Auth OK (keyboard-interactive): %s@%s\n",
                     device->username, device->host);
@@ -409,7 +418,8 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
     }
 
     /* Fallback to password auth (IOS-XE, some ISR platforms) */
-    if (!authenticated && auth_list && strstr(auth_list, "password")) {
+    if (!authenticated && !interactive_attempted && auth_list &&
+        strstr(auth_list, "password")) {
         if (libssh2_userauth_password(conn->session,
                                        device->username,
                                        device->password) == 0) {
@@ -419,6 +429,7 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
         }
     }
 
+    *libssh2_session_abstract(conn->session) = NULL;
     if (!authenticated) {
         char *errmsg;
         libssh2_session_last_error(conn->session, &errmsg, NULL, 0);
@@ -1391,9 +1402,31 @@ static virp_error_t cisco_send_settle(virp_conn_t *conn, const char *line,
 
 static bool cisco_ios_rejected(const char *out)
 {
-    return strstr(out, "% Invalid input") || strstr(out, "% Incomplete") ||
-           strstr(out, "% Ambiguous") || strstr(out, "% Unrecognized") ||
-           strstr(out, "% Bad ");
+    /* Match device diagnostic lines, not description text containing these
+     * words. AAA denial can leave the prompt unchanged: prompt completion
+     * alone is never proof that the requested change succeeded. */
+    static const char *const errors[] = {
+        "Invalid input", "Incomplete", "Ambiguous", "Unrecognized", "Bad ",
+        "Authorization failed", "Command authorization failed",
+        "Access denied", "Permission denied"
+    };
+    for (const char *line = out; *line;) {
+        const char *end = strchr(line, '\n');
+        if (!end) end = line + strlen(line);
+        const char *p = line;
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
+        if (p < end && *p == '%') {
+            p++;
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+        }
+        for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); i++) {
+            size_t n = strlen(errors[i]);
+            if ((size_t)(end - p) >= n && strncmp(p, errors[i], n) == 0)
+                return true;
+        }
+        line = *end ? end + 1 : end;
+    }
+    return false;
 }
 
 /*
@@ -1796,9 +1829,7 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
     result->exit_code = 0;
 
     /* Check for IOS error markers */
-    if (strstr(output_start, "% Invalid input") ||
-        strstr(output_start, "% Incomplete command") ||
-        strstr(output_start, "% Ambiguous command")) {
+    if (cisco_ios_rejected(output_start)) {
         result->success = false;
         result->exit_code = 1;
         snprintf(result->error_msg, sizeof(result->error_msg),
@@ -1901,6 +1932,17 @@ static virp_error_t cisco_health_check(virp_conn_t *conn)
  * Driver Registration
  * ========================================================================= */
 
+static const char *cisco_gate_reason(const char *command)
+{
+    if (cisco_parse_interface_description(command, NULL, 0, NULL, 0, NULL))
+        return "This operation changes an interface description. A requester "
+               "limited to reads needs approval for this exact device and change.";
+    if (cisco_gate_tier(command) == VIRP_TIER_RED)
+        return "This command can change device state or is not a recognized "
+               "read. It requires approval within the requester's scope.";
+    return NULL;
+}
+
 static virp_driver_t cisco_driver = {
     .name       = "cisco_ios",
     .vendor     = VIRP_VENDOR_CISCO_IOS,
@@ -1910,6 +1952,7 @@ static virp_driver_t cisco_driver = {
     .detect     = cisco_detect,
     .health_check = cisco_health_check,
     .route_command = cisco_gate_tier,
+    .route_reason = cisco_gate_reason,
 };
 
 /* IOS-XE: identical driver functions + the SAME shared gate core
@@ -1925,6 +1968,7 @@ static virp_driver_t cisco_iosxe_driver = {
     .detect     = cisco_detect,
     .health_check = cisco_health_check,
     .route_command = cisco_gate_tier,
+    .route_reason = cisco_gate_reason,
 };
 
 void virp_driver_cisco_init(void)
