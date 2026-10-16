@@ -2556,3 +2556,19 @@ test-cisco-auth: $(BUILD_DIR)/test_driver_cisco_auth
 test-cage-v3:
 	python3 -m unittest discover -s tools/cage -v
 all-tests: test-cage-v3 test-cisco-auth
+
+.PHONY: test-operability
+test-operability: $(BUILD_DIR)/test_operability
+	./$(BUILD_DIR)/test_operability
+$(BUILD_DIR)/test_operability: tests/test_operability.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+all-tests: test-operability
+
+.PHONY: test-wazuh-tls
+test-wazuh-tls:
+	$(MAKE) BUILD_DIR=build-wazuh-tls WAZUH=1 build-wazuh-tls/wazuh-tls-probe
+	python3 tests/test_wazuh_tls.py build-wazuh-tls/wazuh-tls-probe
+
+$(BUILD_DIR)/wazuh-tls-probe: tests/wazuh_tls_probe.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@

@@ -154,7 +154,7 @@ if "VIRP_BROKER_UID" in used and "VIRP_BROKER_UID" not in os.environ:
     import pwd
     os.environ["VIRP_BROKER_UID"] = str(pwd.getpwnam("virp-broker").pw_uid)
 
-for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
+credential_vars = ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             "VIRP_NETCLAW_UID", "VIRP_BROKER_UID",
             "WAZUH_USER", "WAZUH_PASS",
             "LIBRENMS_TOKEN", "PEER_USER", "PEER_PASS",
@@ -238,7 +238,12 @@ for var in ("VIRP_UID", "VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
             # new one. Adding a credential to autopilot.env is therefore
             # necessary but NOT sufficient; the name must be added here
             # too, in the same change.
-            "VIRP_FORTIGATE_COLO_PASSWORD"):
+            "VIRP_FORTIGATE_COLO_PASSWORD")
+# Per-device credentials have a reserved namespace, so enrollment never
+# requires changing this program. Unknown policy/UID placeholders still fail.
+credential_vars += tuple(sorted(v for v in used if re.fullmatch(
+    r"VIRP_DEVICE_[A-Z0-9_]+_(?:PASSWORD|API_TOKEN|ENABLE)", v)))
+for var in credential_vars:
     if var not in used:
         continue
     val = os.environ.get(var)
