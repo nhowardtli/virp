@@ -56,6 +56,10 @@
 extern int linux_gate_set_protected_vmids(const char *csv);
 #endif
 
+#ifdef VIRP_DRIVER_WAZUH
+extern int wazuh_gate_set_protected_agents(const char *csv);
+#endif
+
 #ifndef VIRP_ONODE_PROD_NO_MAIN
 
 static onode_state_t g_state;
@@ -70,9 +74,6 @@ extern void virp_driver_fortinet_init(void);
 #endif
 #ifdef VIRP_DRIVER_LINUX
 extern void virp_driver_linux_init(void);
-#endif
-#ifdef VIRP_DRIVER_WAZUH
-extern int wazuh_gate_set_protected_agents(const char *csv);
 #endif
 #ifdef VIRP_DRIVER_PALOALTO
 extern void virp_driver_paloalto_init(void);
