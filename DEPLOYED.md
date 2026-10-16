@@ -1,5 +1,29 @@
 # VIRP Deployment Record — virp-lab
 
+## Dedicated Kestrel production instance — 2026-10-16
+
+This record applies only to `.211`'s `virp-kestrel-candidate` service, not the
+main `virp-onode` reference instance described below.
+
+- Native source `4f210af`, snapshot `before-phase8-storage-20261016`.
+- Binary `/usr/local/lib/virp-kestrel-v3/virp-onode-prod`, SHA256
+  `18b87ac7c381b1ae2569a9c76230d05cba1cd596f004f2403bc8f0f229f7d2d2`.
+- Matching helper SHA256 `fff8bc6baec3edb5e5c4c5981043e876b2e934ac1069692614813c912afc83ee`.
+- Endpoint SHA256 `79a043fe73f14881c94a034fad263a46f8de90d78b8edc0b713dcff2661d0007`;
+  candidate pin updated, reply cap65536, operation catalogue unchanged.
+- Main binary retained SHA256
+  `8a11330b2a398ebc934c2b05717b889e5211b69ea8e2a6629460bf8d061ec38c`.
+- Four model-driven read diagnostics succeeded through VM227→.211→SW3850.
+  No new switch write or RW qualification run. Native136 entries/9 sessions
+  verified, zero open executions. Existing keys/lease/policy retained.
+- Packet73 entries, four chains,14 v3 frames (four new). Three new heads
+  witnessed, repeat submitted0. Clean offline virp-verify0.1.3 verdict
+  CRYPTOGRAPHICALLY-VERIFIED using external producer/witness pins.
+- Private report and exact recovery commands:
+  `/home/nhoward/audits/tli-ai-rollout-20261016/phase8-production-storage/REPORT.md`.
+  Root backups `/root/phase8-storage-20261016`; never roll the chain DB backward.
+
+
 - **Role**: production reference instance
 
 ## Current live state (verified 2026-09-15 16:40 UTC)
