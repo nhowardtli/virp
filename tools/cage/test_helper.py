@@ -36,6 +36,12 @@ class Contract(unittest.TestCase):
    out=store(b,p,'session','id',lambda r:calls.append(r) or {'session_id':'session','chain_entry_hash':'a'*64,'sequence':0})
    self.assertEqual(p.read_bytes(),b);self.assertEqual(base64.b64decode(calls[0]['artifact_content'][7:]),b)
    self.assertEqual(calls[0]['artifact_hash'],hashlib.sha256(b).hexdigest())
+ def test_maximum_signed_frame_decode(self):
+  frame=self.frame(body=b'x'*(65536-196))
+  self.assertEqual(len(frame),65536)
+  self.assertEqual(len(self.check(frame)['output']),65536-196)
+  with self.assertRaisesRegex(ValueError,'oversized_v3_frame'):
+   self.check(self.frame(body=b'x'*(65537-196)))
  def test_large_store_exact_and_bounded(self):
   for size in (9659, 65536):
    with tempfile.TemporaryDirectory() as td:

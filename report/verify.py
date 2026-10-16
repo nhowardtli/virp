@@ -210,11 +210,10 @@ NOT_APPLICABLE = "N/A"
 # defects in a particular chain. Each one makes some check impossible, and
 # each is discovered by inspection of the producer, not guessed:
 #
-# 1. virp_onode.c declares `char artifact_content[8192]`, so any artifact body
-#    is stored truncated to 8191 bytes while the chain entry's artifact_hash
-#    commits to the FULL message. Bodies at exactly the limit cannot be bound
-#    to their entry, and their O-Key signature cannot be recomputed, because
-#    the bytes that were signed are not all present.
+# 1. Historical writers truncated inline artifact bodies to 8191 bytes while
+#    committing to the full message. A mismatching body exactly at that old
+#    limit remains UNVERIFIABLE; complete matching bodies bind, and larger
+#    mismatches fail. Current observation storage is bounded separately.
 ARTIFACT_CONTENT_MAX = 8191
 
 # 2. The autopilot's comparator verdicts and chainwalk summaries register

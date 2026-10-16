@@ -4223,8 +4223,8 @@ static bool peer_uid_allowed(onode_state_t *state, int client_fd,
  *
  * WHAT THIS GATE DOES NOT CLOSE: a commitment-only append (no body)
  * cannot be signature-checked, because there are no bytes to check.
- * Those stay legal — they are 3.8% of the live chain, the deliberate
- * path for observations past the 8192-byte artifact field — and they
+ * Those stay legal for compatibility with producers using the historical
+ * 8192-byte artifact field; larger full observations now fit, and absent bodies
  * are honestly graded: every reader reports an entry with no stored
  * body as UNVERIFIABLE, never as a passing signature. A caller can
  * still register an arbitrary hash; what it cannot do is obtain an

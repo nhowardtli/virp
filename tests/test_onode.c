@@ -6231,16 +6231,18 @@ TEST(test_chain_append_large_v3_observation)
 {
     virp_obskey_t kp; ASSERT_OK(virp_obskey_generate(&kp));
     ca_state.obskey = kp; ca_state.obskey_loaded = true;
-    uint8_t obs[VIRP_MAX_MESSAGE_SIZE], resp[VIRP_MAX_MESSAGE_SIZE];
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE + 1], resp[VIRP_MAX_MESSAGE_SIZE];
     char body[90000], json[100000], h[65];
     const size_t sizes[] = {9659, VIRP_MAX_MESSAGE_SIZE};
     for (size_t i=0; i<2; i++) {
         size_t n=ca_mint_large_v3_obs(obs, sizeof(obs), &kp, 9400+i, sizes[i]);
         ASSERT_EQ(n, sizes[i]);
-        for (int bad=0; bad<4; bad++) {
+        for (int bad=0; bad<5; bad++) {
             if (bad==1) obs[n-1]^=1;
             if (bad==2) obs[n-1]^=1;
-            ca_sha256_hex_bin(obs,n,h); ca_b64_body(obs,n,body,sizeof(body));
+            size_t wire = bad==4 ? VIRP_MAX_MESSAGE_SIZE+1 : n;
+            if (bad==4) memset(obs, 'x', sizeof(obs));
+            ca_sha256_hex_bin(obs,wire,h); ca_b64_body(obs,wire,body,sizeof(body));
             if (bad==2) h[0]=h[0]=='a'?'b':'a';
             snprintf(json,sizeof(json),"{\"action\":\"chain_append\",\"session_id\":\"large-v3-%zu\",\"artifact_type\":\"%s\",\"artifact_id\":\"large-v3-%zu-%d\",\"artifact_hash\":\"%s\",\"artifact_content\":\"%s\"}",i,bad==3?"evidence_item":"observation",i,bad,h,body);
             ssize_t got=ca_request(json,resp,sizeof(resp));
