@@ -103,3 +103,37 @@ class AuthorityTests(unittest.TestCase):
   from types import SimpleNamespace
   with patch.object(recovery.pwd,'getpwnam',return_value=SimpleNamespace(pw_uid=981)),patch.object(recovery.subprocess,'check_output') as child,self.assertRaises(ValueError):recovery.RequesterSocket('/sock','virp-kreq',980)
   child.assert_not_called()
+
+class StateFormattingTests(unittest.TestCase):
+ def test_ios_trailing_space_is_not_state_drift(self):
+  p={'interface':'Ethernet0/1','expected_admin_down':True,'expected_description':''}
+  recovery.check_state({'subtype':7,'output':'Ethernet0/1 is administratively down, line protocol is down (disabled) \r\n'},p)
+ def test_duplicate_or_changed_header_refused(self):
+  p={'interface':'Ethernet0/1','expected_admin_down':True,'expected_description':''}
+  for text in ['Ethernet0/1 is up, line protocol is up\n', 'Ethernet0/1 is administratively down, line protocol is down (disabled)\n'*2]:
+   with self.assertRaises(ValueError):recovery.check_state({'subtype':7,'output':text},p)
+
+class ReviewedRetryTests(unittest.TestCase):
+ setUp=RecoveryTests.setUp
+ chain=RecoveryTests.chain
+ append=RecoveryTests.append
+ read=RecoveryTests.read
+ run_recovery=RecoveryTests.run_recovery
+ mocks=RecoveryTests.mocks
+ def test_review_never_retries_uncertain_read(self):
+  with self.mocks(),patch.object(recovery,'execute_observed',side_effect=TimeoutError),self.assertRaises(TimeoutError):self.run_recovery()
+  with self.assertRaises((ValueError,FileNotFoundError)):recovery.review_failed_read(self.profile,verify_entry=self.chain,append_record=self.append,reason='Inspect the failed read before another reconciliation.')
+  self.assertTrue(self.pending.exists())
+ def test_review_never_retries_ambiguous_append(self):
+  with self.mocks(),patch.object(self,'append',side_effect=TimeoutError),self.assertRaises(TimeoutError):self.run_recovery()
+  with self.assertRaises(ValueError):recovery.review_failed_read(self.profile,verify_entry=self.chain,append_record=self.append,reason='Inspect the failed append before another reconciliation.')
+  self.assertTrue(self.pending.exists())
+ def test_review_archives_failed_attempt_before_new_read(self):
+  self.profile['expected_description']='DIFFERENT'
+  with self.mocks(),self.assertRaises(ValueError):self.run_recovery()
+  before=len(self.calls)
+  with patch.object(recovery,'decode',return_value={'subtype':7}):
+   # The fake raw frame must reach the bounded envelope length gate.
+   journal=self.scope/'v3-recovery/reconciliations'/self.profile['pending_sha256'];(journal/'read.frame').write_bytes(b'0'*196)
+   r=recovery.review_failed_read(self.profile,verify_entry=self.chain,append_record=self.append,reason='The state checker rejected harmless IOS header spacing; preserve this attempt and capture fresh evidence.')
+  self.assertTrue(self.pending.exists());self.assertTrue(pathlib.Path(r['archived_attempt']).exists());self.assertEqual(sum(c[0]=='read' for c in self.calls[before:]),0)

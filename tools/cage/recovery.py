@@ -50,7 +50,7 @@ def check_state(result, profile):
     text = result['output']
     headers = re.findall(r'^' + re.escape(profile['interface']) + r' is ([^\r\n]+)', text, re.M)
     expected = 'administratively down, line protocol is down (disabled)' if profile['expected_admin_down'] else 'up, line protocol is up'
-    if headers != [expected]:
+    if [h.rstrip(' \t') for h in headers] != [expected]:
         raise ValueError('reconciliation_state_mismatch')
     descriptions = re.findall(r'^  Description: ([^\r\n]*)', text, re.M)
     want = [] if profile['expected_description'] == '' else [profile['expected_description']]
@@ -95,6 +95,12 @@ def reconcile(profile, transport, *, verify_entry, append_record):
         journal.mkdir(mode=0o700)  # exclusive: never retry an ambiguous recovery
         durable_write(journal/'intent.json', canonical({'pending_sha256':digest(original), 'profile_sha256':digest(canonical(profile)), 'started_ns':time.time_ns()}))
         read_id = 'reconcile:' + digest(original)[:32]
+        if journal.with_name(journal.name+'.reviewed').exists():
+            review=(journal.with_name(journal.name+'.reviewed')/'review.json').read_bytes()
+            if json.loads(review)['pending_sha256']!=digest(original):
+                raise ValueError('review_pending_mismatch')
+            verify_entry(review,profile['chain_session'],'recovery-review:'+digest(original)[:32])
+            read_id += ':reviewed'
         raw, result = execute_observed(transport,
             {'action':'execute', 'device':profile['request']['device'], 'command':profile['read_command']},
             public_key=bytes.fromhex(profile['public_key']), node_id=profile['node_id'],
@@ -125,6 +131,52 @@ def reconcile(profile, transport, *, verify_entry, append_record):
             finally: os.close(fd)
         return {'resolved':True, 'original_outcome':'UNKNOWN', 'archived_pending':str(archive),
                 'recovery_entry':receipt, 'stop_and_lease_unchanged':True}
+
+
+def review_failed_read(profile, *, verify_entry, append_record, reason):
+    """Explicit trusted review permits a NEW reconciliation, never an operation retry.
+
+    Only a completed, signed read with no attempted recovery append qualifies.
+    Missing/uncertain reads or lost append replies require separate investigation.
+    """
+    if not isinstance(reason,str) or not 20 <= len(reason) <= 1000:
+        raise ValueError('recovery_review_reason_required')
+    scope=Path(profile['scope'])
+    with open(scope/'lock','a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)
+        pending=(scope/'v3-recovery/pending.json').read_bytes()
+        if digest(pending)!=profile['pending_sha256']:
+            raise ValueError('pending_changed')
+        journal=scope/'v3-recovery/reconciliations'/digest(pending)
+        intent=(journal/'intent.json').read_bytes()
+        if json.loads(intent)['profile_sha256']!=digest(canonical(profile)):
+            raise ValueError('review_profile_changed')
+        if any((journal/n).exists() for n in ('recovery.json','review.json')) or (journal/'read-recovery/pending.json').exists():
+            raise ValueError('ambiguous_recovery_cannot_retry')
+        reviewed=journal.with_name(journal.name+'.reviewed')
+        if reviewed.exists():raise ValueError('recovery_review_already_used')
+        raw=(journal/'read.frame').read_bytes()
+        if len(raw)<196:raise ValueError('invalid_review_frame')
+        result=decode(raw,public_key=bytes.fromhex(profile['public_key']),
+            session_id=raw[28:44],node_id=profile['node_id'],device_id=profile['device_id'],
+            command=profile['read_command'],after_sequence=-1,
+            now_ns=struct.unpack_from('!Q',raw,12)[0])
+        if result['subtype']!=7:raise ValueError('review_read_not_successful')
+        entry=verify_entry(raw,profile['chain_session'],'reconcile:'+digest(pending)[:32])
+        body=canonical({'schema':'cage_recovery_review/1','authority':'trusted_local_helper',
+            'pending_sha256':digest(pending),'failed_attempt_sha256':digest(intent),
+            'read':entry,'read_frame_sha256':digest(raw),'reason':reason,
+            'permits':'one_new_reconciliation_read','original_operation_retried':False,
+            'recorded_ns':time.time_ns()})
+        durable_write(journal/'review.json',body)
+        receipt=append_record(body,profile['chain_session'],'recovery-review:'+digest(pending)[:32])
+        durable_write(journal/'review-receipt.json',canonical(receipt))
+        if (scope/'v3-recovery/pending.json').read_bytes()!=pending:raise ValueError('pending_changed')
+        os.rename(journal,reviewed)
+        fd=os.open(str(reviewed.parent),os.O_RDONLY | os.O_DIRECTORY)
+        try:os.fsync(fd)
+        finally:os.close(fd)
+        return {'reviewed':True,'archived_attempt':str(reviewed),'review_entry':receipt,'pending_preserved':True}
 
 
 def verify_entry_signature(entry, public_key):
@@ -204,6 +256,7 @@ class RequesterSocket(Socket):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--profile',required=True)
+    parser.add_argument('--review-failed-read',metavar='REASON')
     args=parser.parse_args()
     if os.geteuid()!=0: raise ValueError('recovery_requires_trusted_root')
     path=Path(args.profile).resolve()
@@ -218,6 +271,10 @@ def main():
         transport=RequesterSocket(profile['socket'],profile['requester'],profile['requester_uid'])
     ledger=Ledger(profile['db'],transport,bytes.fromhex(profile['public_key']),Socket(profile['socket']))
     os.umask(0o077)
-    print(json.dumps(reconcile(profile,transport,verify_entry=ledger.verify,append_record=ledger.append),indent=2))
+    if args.review_failed_read:
+        result=review_failed_read(profile,verify_entry=ledger.verify,append_record=ledger.append,reason=args.review_failed_read)
+    else:
+        result=reconcile(profile,transport,verify_entry=ledger.verify,append_record=ledger.append)
+    print(json.dumps(result,indent=2))
 
 if __name__=='__main__': main()

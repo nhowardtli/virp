@@ -58,3 +58,36 @@ read or duplicate append. Do not delete the journal to retry.
 `helper.public_error` exposes the fixed pending/duplicate reasons without
 leaking arbitrary exception details. Deployed endpoints must call it explicitly;
 upgrading the library alone does not update an old endpoint's error envelope.
+
+### Explicit review of a failed state comparison
+
+`--review-failed-read REASON` is a separate root-only action. It permits one new
+reconciliation read only when the earlier read has a valid signed success frame,
+exact chain membership, an unchanged profile and pending marker, no read-side
+pending marker, and no attempted recovery append. It records a signed
+`cage_recovery_review/1` evidence item before archiving that attempt as `.reviewed`.
+A second review, an UNKNOWN read, an absent frame or an ambiguous append is
+refused. Never delete an attempt journal to retry. The original operation is
+never retried, and its UNKNOWN remains UNKNOWN.
+
+The state parser accepts IOS trailing horizontal whitespace on the exact
+interface header. Duplicate headers, changed state and description drift remain
+fail-closed. Live phase12 qualification encountered that whitespace, retained
+the failed read, recorded the explicit review, then captured a new signed read.
+
+### Phase12 qualification, 2026-10-16
+
+VM105 only, through the VM227 cage and existing C binary90558ec. Recovery,
+review and resume attestations are stored as signed evidence_item chain entries;
+all three new execute frames are v3 observations. The retained phase11 pending
+bytes were archived only after recovery verification. An independently recorded
+bounded resume permitted one model-driven GREEN read; STOP was then restored.
+Ethernet0/1 remained administratively down with no description. No device writes
+were issued. The original122 entries remained unchanged. Offline virp-verify0.1.3
+with an external public pin verified135 entries across9 chains and42 v3 frames.
+No witness submission or production deployment was performed.
+
+A STOP archive must stay on the same filesystem for atomic rename. The live
+resume harness initially tried a cross-filesystem rename; it failed closed with
+STOP intact. The signed resume and updated lease were retained, checked again,
+and only then was STOP archived inside its original scope directory.
