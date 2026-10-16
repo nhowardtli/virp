@@ -1215,7 +1215,7 @@ def verify_entry(entry, artifact_content, okey, chain_key, expected_prev,
     v.artifact_raw = raw
     atype = entry["artifact_type"]
     truncated = (artifact_content is not None
-                 and len(artifact_content) >= ARTIFACT_CONTENT_MAX)
+                 and len(artifact_content) == ARTIFACT_CONTENT_MAX)
 
     if artifact_content is None:
         v.artifact_bind = UNVERIFIABLE

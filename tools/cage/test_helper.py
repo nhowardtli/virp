@@ -36,6 +36,17 @@ class Contract(unittest.TestCase):
    out=store(b,p,'session','id',lambda r:calls.append(r) or {'session_id':'session','chain_entry_hash':'a'*64,'sequence':0})
    self.assertEqual(p.read_bytes(),b);self.assertEqual(base64.b64decode(calls[0]['artifact_content'][7:]),b)
    self.assertEqual(calls[0]['artifact_hash'],hashlib.sha256(b).hexdigest())
+ def test_large_store_exact_and_bounded(self):
+  for size in (9659, 65536):
+   with tempfile.TemporaryDirectory() as td:
+    b=b'x'*size;calls=[];p=pathlib.Path(td)/'obs'
+    store(b,p,'session','id',lambda r:calls.append(r) or {'session_id':'session','chain_entry_hash':'a'*64,'sequence':0})
+    self.assertEqual(base64.b64decode(calls[0]['artifact_content'][7:]),b)
+    self.assertEqual(p.read_bytes(),b)
+  with tempfile.TemporaryDirectory() as td:
+   p=pathlib.Path(td)/'obs';b=b'x'*65537
+   with self.assertRaises(ValueError):store(b,p,'s','i',lambda r:self.fail('oversize append'))
+   self.assertEqual(p.read_bytes(),b)
  def test_store_failure_preserves_frame_no_retry(self):
   with tempfile.TemporaryDirectory() as td:
    p=pathlib.Path(td)/'obs';b=self.frame();calls=[]

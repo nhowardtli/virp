@@ -13,6 +13,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 def decode(raw, *, public_key, session_id, node_id, device_id, command,
            after_sequence, now_ns=None):
+    if len(raw) > 65536:
+        raise ValueError('oversized_v3_frame')
     if len(raw) < 196:
         raise ValueError('short_v3_frame')
     v, channel, tier, reserved, node, timestamp, seq, sid, device, digest, size = struct.unpack('!BBBBQQQ16sQ32sI', raw[:88])
@@ -65,7 +67,7 @@ def store(raw, path, chain_session, artifact_id, append):
     # Preserve original bytes even if the subsequent chain append fails.
     durable_write(path, raw)
     encoded = 'base64:' + base64.b64encode(raw).decode('ascii')
-    if len(encoded) > 8191:
+    if len(raw) > 65536:
         raise ValueError('observation_exceeds_chain_storage_limit')
     result = append(dict(action='chain_append', session_id=chain_session,
                         artifact_type='observation', artifact_id=artifact_id,
@@ -99,7 +101,7 @@ class Socket:
                     chunks += part
                 return chunks
             size = struct.unpack('!I', read(4))[0]
-            if not 0 < size <= 65535:
+            if not 0 < size <= 65536:
                 raise ValueError('socket_reply_limit')
             raw = read(size)
             if len(raw) == 4:

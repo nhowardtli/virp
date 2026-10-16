@@ -6195,6 +6195,65 @@ static size_t ca_mint_v3_obs(uint8_t *buf, size_t cap,
     return total;
 }
 
+static size_t ca_mint_large_v3_obs(uint8_t *buf, size_t cap,
+                             const virp_obskey_t *kp, uint64_t seq, size_t total_size)
+{
+    char PAY[VIRP_MAX_MESSAGE_SIZE]; memset(PAY, 'x', sizeof(PAY));
+    size_t P = total_size - 184;
+    size_t total = VIRP_OBS_V2_HEADER_SIZE + P + VIRP_OBS_V2_SIG_SIZE +
+                   VIRP_OBS_ED25519_SIG_SIZE;
+    if (cap < total) return 0;
+
+    virp_obs_header_v2_t h;
+    memset(&h, 0, sizeof(h));
+    h.version = VIRP_VERSION_3;
+    h.channel = VIRP_CHANNEL_OBS;
+    h.tier    = VIRP_TIER_GREEN;
+    h.node_id = 0x00000042u;
+    h.device_id = 0x1122334455667788ULL;
+    h.seq_num = seq;
+    h.timestamp_ns = 1754582400ULL * 1000000000ULL;
+    memset(h.session_id, 0x21, 16);
+    memset(h.command_hash, 0x37, 32);
+    h.payload_len = (uint32_t)P;
+    if (virp_obs_header_v2_serialize(&h, buf, cap) != VIRP_OK) return 0;
+
+    memcpy(buf + VIRP_OBS_V2_HEADER_SIZE, PAY, P);
+    size_t hmac_span = VIRP_OBS_V2_HEADER_SIZE + P;
+    memset(buf + hmac_span, 0x5A, VIRP_OBS_V2_SIG_SIZE);   /* not read */
+    size_t sig_span = hmac_span + VIRP_OBS_V2_SIG_SIZE;
+    if (crypto_sign_detached(buf + sig_span, NULL, buf, sig_span,
+                             kp->secret_key) != 0) return 0;
+    return total;
+}
+
+TEST(test_chain_append_large_v3_observation)
+{
+    virp_obskey_t kp; ASSERT_OK(virp_obskey_generate(&kp));
+    ca_state.obskey = kp; ca_state.obskey_loaded = true;
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE], resp[VIRP_MAX_MESSAGE_SIZE];
+    char body[90000], json[100000], h[65];
+    const size_t sizes[] = {9659, VIRP_MAX_MESSAGE_SIZE};
+    for (size_t i=0; i<2; i++) {
+        size_t n=ca_mint_large_v3_obs(obs, sizeof(obs), &kp, 9400+i, sizes[i]);
+        ASSERT_EQ(n, sizes[i]);
+        for (int bad=0; bad<4; bad++) {
+            if (bad==1) obs[n-1]^=1;
+            if (bad==2) obs[n-1]^=1;
+            ca_sha256_hex_bin(obs,n,h); ca_b64_body(obs,n,body,sizeof(body));
+            if (bad==2) h[0]=h[0]=='a'?'b':'a';
+            snprintf(json,sizeof(json),"{\"action\":\"chain_append\",\"session_id\":\"large-v3-%zu\",\"artifact_type\":\"%s\",\"artifact_id\":\"large-v3-%zu-%d\",\"artifact_hash\":\"%s\",\"artifact_content\":\"%s\"}",i,bad==3?"evidence_item":"observation",i,bad,h,body);
+            ssize_t got=ca_request(json,resp,sizeof(resp));
+            if (bad) ASSERT_EQ(got,4); else ASSERT_TRUE(got>4);
+        }
+        char sid[64];snprintf(sid,sizeof(sid),"large-v3-%zu",i);
+        virp_chain_verify_result_t result;
+        ASSERT_OK(virp_chain_verify(&ca_state.chain,sid,0,0,&result));
+        ASSERT_TRUE(result.valid);ASSERT_EQ(result.artifacts_bound,1);
+    }
+    ca_state.obskey_loaded=false;
+}
+
 /* GATE 3, v3 POSITIVE: with the observation-signing key loaded, a
  * genuinely Ed25519-signed observation registers. Without this the v3
  * arm would only ever be proved to say no. */
@@ -8589,6 +8648,7 @@ int main(int argc, char **argv)
         RUN_TEST(test_chain_append_rejects_unknown_obs_version);
         RUN_TEST(test_chain_append_rejects_v3_without_obskey);
         RUN_TEST(test_chain_append_accepts_signed_v3_observation);
+        RUN_TEST(test_chain_append_large_v3_observation);
         RUN_TEST(test_chain_append_rejects_v2_without_active_session);
         RUN_TEST(test_chain_append_commitment_only_observation_accepted);
         RUN_TEST(test_chain_append_commitment_only_empty_body_accepted);

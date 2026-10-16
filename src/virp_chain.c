@@ -2668,8 +2668,6 @@ static int chain_verify_binding_locked(virp_chain_state_t *state,
 
         if (!body || blen == 0) {
             verdict = 0;                       /* nothing retained to bind */
-        } else if (blen >= VIRP_CHAIN_ARTIFACT_CONTENT_MAX) {
-            verdict = 0;                       /* stored truncated: a prefix */
         } else if (virp_chain_type_is_indirect(e->artifact_type)) {
             /* Body required and present, but artifact_hash commits to a
              * signed observation the chain does not retain — honest
@@ -2678,9 +2676,11 @@ static int chain_verify_binding_locked(virp_chain_state_t *state,
         } else {
             char digest[65];
             if (virp_chain_artifact_digest(body, digest) != VIRP_OK)
-                verdict = -1;                  /* undecodable body */
+                verdict = blen == VIRP_CHAIN_ARTIFACT_CONTENT_MAX ? 0 : -1;
+            else if (hexdigest_eq(digest, e->artifact_hash))
+                verdict = 1;
             else
-                verdict = hexdigest_eq(digest, e->artifact_hash) ? 1 : -1;
+                verdict = blen == VIRP_CHAIN_ARTIFACT_CONTENT_MAX ? 0 : -1;
         }
     }
     sqlite3_finalize(st);

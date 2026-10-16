@@ -26,10 +26,11 @@
 
 #define VIRP_CHAIN_MILESTONE_INTERVAL  100
 
-/* The daemon's request field is char artifact_content[8192], so a body at
- * or past this length reached the chain truncated: a prefix, which cannot
- * hash to the whole. Mirrors ARTIFACT_CONTENT_MAX in report/verify.py. */
+/* Historical inline truncation boundary. Only a mismatching body exactly at
+ * this size may be a legacy prefix; larger complete bodies must bind. */
 #define VIRP_CHAIN_ARTIFACT_CONTENT_MAX 8191
+/* Full maximum-size wire observation, base64 prefix plus encoded bytes. */
+#define VIRP_CHAIN_OBSERVATION_CONTENT_MAX (7 + 4 * ((VIRP_MAX_MESSAGE_SIZE + 2) / 3))
 #define VIRP_CHAIN_GENESIS_PREFIX      "VIRP_CHAIN_GENESIS:"
 
 /* =========================================================================

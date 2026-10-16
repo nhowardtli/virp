@@ -373,6 +373,19 @@ class TestCollidingArtifactIds(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def test_large_binding_and_legacy_prefix(self):
+        body = 'x' * 10000
+        b = ChainBuilder(self.db)
+        b.append('large', 'evidence_item', 'large', hashlib.sha256(body.encode()).hexdigest(), artifact_content=body)
+        b.close()
+        self.assertEqual(analyse(self.db)[1]['artifact_bind'][verify.PASS], 1)
+        with sqlite3.connect(self.db) as db:
+            db.execute("UPDATE artifacts SET artifact_content = 'y' || substr(artifact_content,2)")
+        self.assertEqual(analyse(self.db)[1]['artifact_bind'][verify.FAIL], 1)
+        with sqlite3.connect(self.db) as db:
+            db.execute('UPDATE artifacts SET artifact_content = substr(artifact_content,1,8191)')
+        self.assertEqual(analyse(self.db)[1]['artifact_bind'][verify.UNVERIFIABLE], 1)
+
     def test_each_entry_binds_against_its_own_body(self):
         b = ChainBuilder(self.db)
         b.add_json("fed:test", "fed_request", "ncfed-req-collide",

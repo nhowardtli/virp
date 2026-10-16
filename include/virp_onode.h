@@ -46,7 +46,7 @@ const char *onode_health_command(virp_vendor_t vendor);
 #define ONODE_HEARTBEAT_SEC     30
 #define ONODE_MAX_CLIENTS       8
 #define ONODE_RECV_TIMEOUT_SEC  5
-#define ONODE_MAX_REQUEST_SIZE  24576
+#define ONODE_MAX_REQUEST_SIZE  131072
 #define ONODE_MAX_ALLOWED_UIDS  16
 #define ONODE_MAX_UID_CAPP_TYPES 16 /* max chain_append types per uid (v0.2.1) */
 #define ONODE_CHAIN_TYPE_MAX     16 /* artifact_type field width incl NUL   */

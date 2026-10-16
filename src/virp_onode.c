@@ -77,7 +77,7 @@ typedef struct {
     char            artifact_type[16];
     char            artifact_id[128];
     char            artifact_hash[65];
-    char            artifact_content[8192]; /* Raw payload for artifact store */
+    char            artifact_content[VIRP_CHAIN_OBSERVATION_CONTENT_MAX + 1]; /* Raw payload for artifact store */
     int64_t         from_sequence;
     int64_t         to_sequence;
     int64_t         limit;                  /* list_sessions: rows wanted (0 = default) */
@@ -580,6 +580,15 @@ static bool parse_request(const char *json, onode_request_t *req)
     if (cJSON_GetObjectItemCaseSensitive(root, "artifact_content") &&
         !EXTRACT_STR("artifact_content", req->artifact_content,
                      sizeof(req->artifact_content))) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    /* Only signed-observation types get the larger body budget. Their hash
+     * and cryptographic gates still run before any append. */
+    if (strlen(req->artifact_content) > VIRP_CHAIN_ARTIFACT_CONTENT_MAX &&
+        strcmp(req->artifact_type, "observation") != 0 &&
+        strcmp(req->artifact_type, "fed_observation") != 0) {
         cJSON_Delete(root);
         return false;
     }
