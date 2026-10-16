@@ -10,9 +10,9 @@ fixes `7f74291` and `b7496fb`. See [the phase-one record](TLI-ROLLOUT-PHASE1.md)
 This releases the procedure for the owner to run at the keyboard, as requested.
 It does not claim .211 is deployed or production RW is newly qualified.
 
-This runbook is **not executed**. .211 was not accessed during helper qualification.
+The initial paired deployment and the subsequent epoch update were executed on October16 under later owner authorization. This remains the reproducible initial-install procedure; do not rerun its baseline-pinned staging against an already migrated host. .211 was not accessed during the earlier helper qualification.
 Target only `virp-kestrel-candidate`; the main `virp-onode` service stays separate.
-Use branch `feat/v3-execute-path`, qualified code commit `b7496fb` plus the documentation-only release commit.
+Use branch `feat/v3-execute-path`, qualified code commit `043e152` or its documentation-only follow-up. The epoch fix is required when native sessions contain legacy unsigned entries; see [native audit epochs](NATIVE-AUDIT-EPOCH.md).
 The canary helper uses the same `execute_observed` consumer as the staged production
 helper. The production grant adapter is checked offline; this is not a claim of a
 new production RW qualification. The existing Duo approver/coordinator stays in place.
@@ -31,7 +31,7 @@ Before starting, the owner provisions:
   the private key. Only this public file is consumed by the helper.
 - Keep parent `/etc/virp-kestrel` root-owned, group `virp-kexec`, mode 0750.
 
-The daemon uses `-3 -S /etc/virp-kestrel/chain-sign.key`. No key material is
+The daemon uses `-3 -S /etc/virp-kestrel/chain-sign.key -E v3-20261016`. No key material is
 created, printed, enrolled, committed or copied into a checkout by this procedure.
 Keep production private keys on .211. Existing HMAC keys remain necessary for
 legacy chain compatibility; they are not used by the new execute-v3 consumer.
@@ -56,11 +56,11 @@ umask 077
 git clone --branch feat/v3-execute-path --single-branch git@github.com:nhowardtli/virp.git "$HOME/virp-kestrel-v3-deploy"
 cd "$HOME/virp-kestrel-v3-deploy"
 test -z "$(git status --porcelain)"
-git merge-base --is-ancestor b7496fb HEAD
+git merge-base --is-ancestor 043e152 HEAD
 git log -1 --oneline
 test -f docs/CAGE-V3-RELEASED
 # Stop if code has changed beyond the qualified build; documentation may advance.
-git diff --exit-code b7496fb HEAD -- . ':!docs' ':!DEPLOYED.md'
+git diff --exit-code 043e152 HEAD -- . ':!docs' ':!DEPLOYED.md'
 python3 -c 'import cryptography'
 make test-cage-v3
 make prod
@@ -83,6 +83,16 @@ sudo -n make install-prod VIRP_INSTALL_DIR=/usr/local/lib/virp-kestrel-v3
 sudo -n install -d -m 0755 /usr/local/lib/virp-kestrel-v3/cage
 sudo -n install -m 0644 tools/cage/helper.py tools/cage/verify_local_chain.py /usr/local/lib/virp-kestrel-v3/cage/
 sudo -n python3 tools/cage/stage_production.py --stage /root/kestrel-v3-deploy
+# Choose a unique audit epoch; this example is the qualified October16 rollout.
+sudo -n python3 - <<'PY_EPOCH'
+from pathlib import Path
+p = Path('/root/kestrel-v3-deploy/after/virp-kestrel-candidate.service')
+text = p.read_text()
+assert ' -E ' not in text
+lines = text.splitlines()
+assert sum(x.startswith('ExecStart=') for x in lines) == 1
+p.write_text('\n'.join(x + ' -E v3-20261016' if x.startswith('ExecStart=') else x for x in lines) + '\n')
+PY_EPOCH
 sudo -n python3 -m py_compile /root/kestrel-v3-deploy/after/virp-cage227-read
 sudo -n systemd-analyze verify /root/kestrel-v3-deploy/after/virp-kestrel-candidate.service
 ```
@@ -184,3 +194,11 @@ leave cage stopped and service stopped; investigate using retained evidence and
 PVE console recovery. Do not erase chains or revert VM snapshot over unexported
 new evidence. Record the rollback command, time, live hash and verification
 result in `/root/kestrel-v3-deploy/DEPLOYED.md`.
+
+## October16 continuation outcome
+
+`043e152` passed the full all-driver battery (604 Python unittest cases,87 API pytest cases, C core61/ONode169 and25 signing-migration cases, plus the other C/security suites). An isolated canary exercised13 helper-v3 observations for baseline, refusal, test-key approval, apply, verification, replay -37 and restore; the original outcome stayed unchanged and the complete running config was restored. Four new-epoch sessions/44 entries verified with virp-verify0.1.3 and an isolated test witness in a clean network-disabled container. The test witness is not the production AWS witness.
+
+Production `.211` now runs `043e152` with the paired helper pin and `-E v3-20261016`. Existing history, signing key and consumed approvals remain in place. New native sessions have the epoch suffix; export those explicitly with the matching cage observation session. Older mixed-era sessions still receive their honest legacy verification result; do not include them in a claimed all-signed packet or backfill signatures.
+
+The production witness transport is restricted and its publisher remains disabled until the designated complete RW session is ready. No production first-head submission is claimed. Protected applies still require the actual owner authentication event.
