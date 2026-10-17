@@ -2577,3 +2577,12 @@ $(BUILD_DIR)/wazuh-tls-probe: tests/wazuh_tls_probe.c $(LIB)
 test-witness-publisher:
 	python3 -m unittest discover -s tools/witness -v
 all-tests: test-witness-publisher
+
+# Exact typed Cisco access-port execution (approval-gated).
+$(BUILD_DIR)/test_driver_cisco_port_ops: tests/test_driver_cisco_port_ops.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+.PHONY: test-cisco-port-ops
+test-cisco-port-ops: $(BUILD_DIR)/test_driver_cisco_port_ops
+	./$(BUILD_DIR)/test_driver_cisco_port_ops
+
+all-tests: test-cisco-port-ops

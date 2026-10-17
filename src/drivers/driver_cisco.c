@@ -821,6 +821,71 @@ bool cisco_parse_interface_description(const char *command,
     return true;
 }
 
+/* Exact one-line port grammar. This is execution capability, not authority:
+ * classification remains RED without authenticated topology/port context.
+ * No ranges, logical interfaces, abbreviations, sticky MACs or mode trunk. */
+static bool cisco_port_decimal(const char *s, unsigned max)
+{
+    if (!s || *s < '1' || *s > '9') return false;
+    unsigned n = 0;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') return false;
+        unsigned d = (unsigned)(*s - '0');
+        if (n > (max - d) / 10) return false;
+        n = n * 10 + d;
+    }
+    return n <= max;
+}
+
+bool cisco_parse_port_operation(const char *command, char *ifname,
+                               size_t ifname_len, char *line, size_t line_len)
+{
+    if (!command || strncmp(command, "interface ", 10)) return false;
+    const char *name = command + 10;
+    const char *end = strchr(name, ' ');
+    if (!end || end == name || (size_t)(end-name) >= 64) return false;
+    const char *number = NULL;
+    const char *prefixes[] = {"GigabitEthernet", "Ethernet"};
+    for (size_t i=0; i<sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+        size_t n = strlen(prefixes[i]);
+        if (!strncmp(name, prefixes[i], n)) { number = name+n; break; }
+    }
+    if (!number || number >= end) return false;
+    unsigned slashes=0;
+    bool digit=false;
+    for (const char *p=number; p<end; p++) {
+        if (*p>='0' && *p<='9') digit=true;
+        else if (*p=='/' && digit) { slashes++; digit=false; }
+        else return false;
+    }
+    if (!digit || slashes < 1 || slashes > 2) return false;
+    const char *op=end+1;
+    const char *fixed[]={
+        "switchport mode access", "switchport mode dynamic auto",
+        "no switchport access vlan", "spanning-tree portfast",
+        "no spanning-tree portfast", "switchport port-security",
+        "no switchport port-security", "no switchport port-security maximum",
+        "switchport port-security violation restrict",
+        "switchport port-security violation shutdown",
+        "no switchport port-security violation"
+    };
+    bool valid=false;
+    for (size_t i=0;i<sizeof(fixed)/sizeof(fixed[0]);i++)
+        if (!strcmp(op,fixed[i])) valid=true;
+    const char *vlan="switchport access vlan ";
+    const char *maximum="switchport port-security maximum ";
+    if (!strncmp(op,vlan,strlen(vlan)))
+        valid=cisco_port_decimal(op+strlen(vlan),4094);
+    if (!strncmp(op,maximum,strlen(maximum)))
+        valid=cisco_port_decimal(op+strlen(maximum),1024);
+    if (!valid) return false;
+    size_t n=(size_t)(end-name), len=strlen(op);
+    if ((ifname && ifname_len<=n) || (line && line_len<=len)) return false;
+    if (ifname) { memcpy(ifname,name,n); ifname[n]='\0'; }
+    if (line) memcpy(line,op,len+1);
+    return true;
+}
+
 virp_trust_tier_t cisco_gate_tier(const char *command)
 {
     if (!command) return VIRP_TIER_RED;              /* fail closed */
@@ -1430,12 +1495,12 @@ static bool cisco_ios_rejected(const char *out)
 }
 
 /*
- * interface <name> description <text>  — the four-step transaction.
+ * Typed interface operation — the four-step transaction.
  *
  *   precondition  privileged EXEC (refused before any byte otherwise)
  *   1  configure terminal   -> (config)#
  *   2  interface <name>     -> (config-if)#   (any config sub-mode)
- *   3  description <text> | no description  -> prompt unchanged, no "% "
+ *   3  parser-rendered single line         -> prompt unchanged, no "% "
  *   4  end                  -> #             (ALWAYS attempted after 1)
  *
  * A step that fails stops the transaction; "end" still runs so the
@@ -1445,11 +1510,10 @@ static bool cisco_ios_rejected(const char *out)
  * signed body is the whole transcript, prefixed with the classified
  * command exactly as every other Cisco observation is.
  */
-static virp_error_t cisco_exec_interface_description(virp_conn_t *conn,
+static virp_error_t cisco_exec_interface_line(virp_conn_t *conn,
                                                      const char *command,
                                                      const char *ifname,
-                                                     const char *desc,
-                                                     bool negate,
+                                                     const char *line_desc,
                                                      virp_exec_result_t *result)
 {
     if (conn->current_mode != CISCO_MODE_EXEC || !conn->in_enable) {
@@ -1465,12 +1529,8 @@ static virp_error_t cisco_exec_interface_description(virp_conn_t *conn,
         return VIRP_OK;
     }
 
-    char line_if[128], line_desc[300];   /* "description " + desc[256] */
+    char line_if[128];
     snprintf(line_if, sizeof(line_if), "interface %s", ifname);
-    if (negate)
-        snprintf(line_desc, sizeof(line_desc), "no description");
-    else
-        snprintf(line_desc, sizeof(line_desc), "description %s", desc);
 
     const char *steps[4] = { "configure terminal", line_if, line_desc, "end" };
     const bool  moves[4] = { true, true, false, true };
@@ -1607,12 +1667,17 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
     /* Typed config op: executed as a fixed transaction, never as the
      * literal (IOS would reject "interface X description Y" in EXEC). */
     {
-        char ifn[64], dsc[256];
+        char ifn[64], dsc[256], line[300];
         bool neg = false;
         if (cisco_parse_interface_description(command, ifn, sizeof(ifn),
-                                              dsc, sizeof(dsc), &neg))
-            return cisco_exec_interface_description(conn, command, ifn, dsc,
-                                                    neg, result);
+                                              dsc, sizeof(dsc), &neg)) {
+            if (neg) snprintf(line, sizeof(line), "no description");
+            else snprintf(line, sizeof(line), "description %s", dsc);
+            return cisco_exec_interface_line(conn, command, ifn, line, result);
+        }
+        if (cisco_parse_port_operation(command, ifn, sizeof(ifn),
+                                      line, sizeof(line)))
+            return cisco_exec_interface_line(conn, command, ifn, line, result);
     }
 
     /* Commands that may legitimately move the prompt (config mode). */
