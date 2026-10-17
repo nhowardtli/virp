@@ -1,11 +1,14 @@
 # Keyboard runbook: dedicated Kestrel UNKNOWN recovery update
 
-Prepared October16; **not executed on .211**. Canary phase12 passed. This updates
+Prepared October16; phase13 subsequently executed the corrected procedure on .211.
+This baseline-pinned procedure is historical: do not rerun it on the upgraded host.
+Canary phase12 passed. Actual production deployment and RW evidence are recorded
+in DEPLOYED.md and audits/tli-ai-rollout-20261016/phase13-production-preflight/. This updates
 only `virp-kestrel-candidate`, its helper and endpoint. It supersedes the initial
 installation runbook for this upgrade. Do not run bare `make install-prod`: that
 target installs the main instance, outside this change's scope.
 
-Qualified source: `6b11bdc2a767adab2310cb2f034f5a3b89d6b67c` on
+Qualified source: `5a87465a946690cb2e67481261c55cb6801156c3` on
 `feat/v3-execute-path`, including C UNKNOWN fix90558ec and recovery98e0cc8.
 The installed canary C binary is90558ec; subsequent changes are Python/docs only.
 Build from the pinned source and record the resulting binary hash; a rebuild's
@@ -28,7 +31,7 @@ chains or test approver keys. On .211:
 
 ```sh
 cd /home/nhoward/virp-phase12-source
- test "$(git rev-parse HEAD)" = 6b11bdc2a767adab2310cb2f034f5a3b89d6b67c
+ test "$(git rev-parse HEAD)" = 5a87465a946690cb2e67481261c55cb6801156c3
  test -z "$(git status --porcelain)"
 make CISCO=1 FORTIGATE=1 PANOS=1 ASA=1 LINUX=1 WAZUH=1 JUNIPER=1 LIBRENMS=1 PBS=1 ZAMMAD=1 all-tests
 sha256sum build/virp-onode-prod tools/cage/helper.py tools/cage/recovery.py
@@ -70,7 +73,7 @@ helper=binary.parent/'cage/helper.py';recovery=binary.parent/'cage/recovery.py'
 endpoint=P('/usr/local/sbin/virp-cage227-read');cfgpath=P('/etc/virp-kestrel/devices.json')
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 assert P('/etc/machine-id').read_text().strip()=='294b84478a324262bc7daea9bc314553'
-assert subprocess.check_output(['git','-C',str(src),'rev-parse','HEAD'],text=True).strip()=='6b11bdc2a767adab2310cb2f034f5a3b89d6b67c'
+assert subprocess.check_output(['git','-C',str(src),'rev-parse','HEAD'],text=True).strip()=='5a87465a946690cb2e67481261c55cb6801156c3'
 assert not subprocess.check_output(['git','-C',str(src),'status','--porcelain'])
 assert pwd.getpwnam('virp-kreq').pw_uid==980
 assert sha(binary)=='18b87ac7c381b1ae2569a9c76230d05cba1cd596f004f2403bc8f0f229f7d2d2'
@@ -125,7 +128,7 @@ with (r/'lock').open('a') as lock:
  cfgpath.write_text(json.dumps(cfg));fd=os.open(str(cfgpath),os.O_RDONLY);os.fsync(fd);os.close(fd)
  subprocess.run(['systemctl','start','virp-kestrel-candidate'],check=True)
  assert sha(main)==mainsha and (r/'policy.json').read_bytes()==policy
- (b/'installed.json').write_text(json.dumps({'source':'6b11bdc','binary':sha(binary),'helper':sha(helper),'recovery':sha(recovery),'endpoint':sha(endpoint),'STOP_retained':True},indent=2))
+ (b/'installed.json').write_text(json.dumps({'source':'5a87465','binary':sha(binary),'helper':sha(helper),'recovery':sha(recovery),'endpoint':sha(endpoint),'STOP_retained':True},indent=2))
  print('Installed; STOP retained. Run chain verification next.')
 PY
 ```

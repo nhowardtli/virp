@@ -1,3 +1,38 @@
+## 2026-10-16 — production Kestrel recovery update and fresh Duo RW (phase13)
+
+Dedicated .211 virp-kestrel-candidate source5a87465, binary SHA256
+93d10333199b7e371d610205e0a1fd576a5f05d8ac3ec444327b6d2467c23ed6.
+Helper289d3e9bdbea284aa186b13af75b26e0034a5b5370ef53e0ef10db1db2bd869f;
+recovery23f8d92fd48e72de0058b15369ff742f8ab3b8322b611651538748f677c5e35f;
+endpoint6215b31e7dbd88ea114f18ccad2b93820e6c4d2b40f37e99393be3985c9beeea.
+Main daemon unchanged. Root newly admitted only for chain_append/evidence_item,
+GREEN ceiling; live execute/approval and requester evidence_item denials pass.
+No cage recovery tool or credential exposure. Existing requester policy unchanged.
+
+Fresh nhoward-admin Duo planff9584d15b284d7692da8cafc9465c47 completed via
+VM227→.211→SW3850. Attempt roundtrip-1792195227; observation chain
+kestrel-v3-diagnostics-20261016. Gi1/0/22 description applied once, verified,
+restored empty, verified; consumed approval replay refused-37; reconciliation
+confirms original shutdown/no-description state. Forwardd6638423c4bd60882b080b7df30f0768,
+restoree518eb5451a71125ee972dc93bdccbb0. TACACS45 scoped rows show exactly one set
+and one removal. No reload/write memory. Active write grant archived after completion.
+
+Portable118 entries/5 chains/28 v3 observations (14 new) verified with external
+producer/witness pins in network-disabled unprivileged virp-verify0.1.3 container:
+CRYPTOGRAPHICALLY-VERIFIED. Both approval signatures independently checked;
+replay gate_rejection links consumed approval to original outcome. Five heads
+submitted_verified; repeat0. Publisher disabled again. TACACS/owner-plan exports
+are supplemental, not native signed entries. No helper-only execute frames.
+
+Native171/171 tests, cage57/57, append policy7/7, roundtrip adapter6/6 passed.
+Initial native rebuild lacked driver flags; corrected flags passed before deployment.
+A malformed denial probe hit parse rejection; corrected probe proved type denial.
+Snapshot before-phase13-deploy-20261016; root /root/phase13-recovery-deploy backups.
+Initial expired lease renewal explicitly authorized for10h, through Oct17 05:53EDT;
+snapshot before-phase13-lease-20261016 and root /root/phase13-lease-20261016.
+Lease/scope preserved during deployment/RW; STOP/pending/active grant absent at end.
+No production UNKNOWN fault injection; its recovery remains canary-qualified only.
+
 ## 2026-10-16 — CML canary signed UNKNOWN recovery (phase12)
 
 VM105 only; production .211/SW3850 untouched. C binary remains90558ec,
