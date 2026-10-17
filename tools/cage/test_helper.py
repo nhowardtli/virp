@@ -16,6 +16,12 @@ class Contract(unittest.TestCase):
   args=dict(public_key=self.pub,session_id=self.sid,node_id=256,device_id=55,command=self.command,after_sequence=0,now_ns=self.now);args.update(kw);return decode(b,**args)
  def test_output(self):self.assertEqual(self.check(self.frame())['output'],'FRRouting')
  def test_refusal(self):self.assertEqual(self.check(self.frame(typ=15,tier=3,body=b'refused'))['subtype'],15)
+ def test_unclassified_predispatch_refusal(self):
+  r=self.check(self.frame(typ=15,tier=0,body=b"ERROR: multi-command / illegal separator rejected for 'SW-3850': pipe"))
+  self.assertEqual(r['subtype'],15)
+ def test_unclassified_success_or_unknown_error_refused(self):
+  for typ,body in [(7,b'output'),(15,b'ERROR: unexpected'),(15,b'ERROR: outcome UNKNOWN failed')]:
+   with self.subTest(typ=typ,body=body),self.assertRaises(ValueError):self.check(self.frame(typ=typ,tier=0,body=body))
  def test_bound_fields(self):
   for changes in [dict(version=1),dict(channel=2),dict(reserved=1),dict(node=1),dict(device=1),dict(sid=b'2'*16),dict(command=b'3'*32),dict(seq=0),dict(timestamp=self.now-121_000_000_000),dict(timestamp=self.now+121_000_000_000),dict(typ=6),dict(scope=2),dict(body=b'\xff')]:
    with self.subTest(changes=changes),self.assertRaises(ValueError):self.check(self.frame(**changes))

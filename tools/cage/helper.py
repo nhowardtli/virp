@@ -18,7 +18,7 @@ def decode(raw, *, public_key, session_id, node_id, device_id, command,
     if len(raw) < 196:
         raise ValueError('short_v3_frame')
     v, channel, tier, reserved, node, timestamp, seq, sid, device, digest, size = struct.unpack('!BBBBQQQ16sQ32sI', raw[:88])
-    if (v, channel, reserved) != (3, 1, 0) or tier not in (1, 2, 3, 4):
+    if (v, channel, reserved) != (3, 1, 0) or tier not in (0, 1, 2, 3, 4):
         raise ValueError('invalid_v3_header')
     if len(raw) != 184 + size:
         raise ValueError('invalid_v3_length')
@@ -45,6 +45,8 @@ def decode(raw, *, public_key, session_id, node_id, device_id, command,
         output = payload[12:].decode('utf-8', errors='strict')
     except UnicodeDecodeError as e:
         raise ValueError('invalid_output_encoding') from e
+    if tier == 0 and (subtype != 15 or not output.startswith('ERROR: multi-command / illegal separator rejected ')):
+        raise ValueError('unsupported_unclassified_observation')
     return dict(version=3, subtype=subtype, output=output, sequence=seq,
                 session_id=sid.hex(), public_signature_verified=True,
                 frame_sha256=hashlib.sha256(raw).hexdigest())

@@ -91,3 +91,20 @@ A STOP archive must stay on the same filesystem for atomic rename. The live
 resume harness initially tried a cross-filesystem rename; it failed closed with
 STOP intact. The signed resume and updated lease were retained, checked again,
 and only then was STOP archived inside its original scope directory.
+
+### UNCLASSIFIED pre-dispatch refusal decoding
+
+The C separator boundary runs before classification and dispatch. Its v3 error
+frame therefore carries tier0 (UNCLASSIFIED). The helper now accepts this tier
+only for subtype15 with the exact native separator-refusal prefix; other tier0
+success/error observations remain rejected. Signature, identity, command digest,
+session, sequence and freshness checks still apply. This is not a classifier or
+separator-policy relaxation.
+
+Live read-only qualification encountered this on `show logging | include Gi1/0/22`.
+The initial helper retained the frame as unverified and held pending. A trusted
+one-off recovery verified original signature/intent/command, exact signed native
+`gate_rejection` with ingress-separator/executed:false, and native chain, then
+stored the original frame bytes and signed a recovery attestation before archiving
+pending. No command was replayed. This does not add generic recovery of invalid
+frames or UNKNOWN; the existing UNKNOWN recovery contract remains unchanged.
