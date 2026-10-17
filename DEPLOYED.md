@@ -1,3 +1,30 @@
+## 2026-10-16 — Kestrel Cisco read-only catalogue and refusal decoder
+
+Owner directed Cisco RO administration. VM227 runner now exposes16 fixed switch
+reads; .211 endpoint enforces read_only_operations before request creation/dispatch.
+Write/proposal/replay and other-device operations refused. NativeGREEN ceiling,
+C binaries, keys and10h lease deadlines unchanged. TACACS exact read forms added
+onCT224; existing write rules unchanged. No switch configuration writes.
+
+Helper fdcb562 fixes legitimate v3 tier0 UNCLASSIFIED separator-refusal decoding;
+only typedERROR with exact native pre-dispatch prefix accepted.59 cage tests pass.
+HelperSHA99e47b79f988ce9c75fc04b6a85f1fdfb39de93ff10583bc2c89e8b5a618fa2c.
+EndpointSHA901d40a54ece449e7b11669bb519ad3137a20cc1f96c55c8ca3b0e3f9c8a436d.
+Original filtered-log refusal retained, signature/native executed:false verified,
+raw bytes chained without replay, signed recovery then pending archive. Scope
+resumed for successful model read; no pending remains. Running-config stillYELLOW;
+pipe-containing log read still refused before classification. No policy relaxation.
+
+Evidence163entries/6chains/43v3frames(15new), four updated witnessheads;
+network-disabled external-pin virp-verify0.1.3 CRYPTOGRAPHICALLY-VERIFIED.
+Native227entries valid,181oldrows unchanged. ~/bin/kestrel owner CLI available;
+16operation status display filtered to readonly model catalogue.24attempts remain
+at close; no quota reset. Snapshot211/227 before-access-ro-20261016; root backups
+/root/kestrel-access-ro-20261016 on211/227/CT224. Preserve all chain evidence.
+Report audits/kestrel-access-port-20261016/ro-expansion/REPORT.md; source catalogue
+deploy/kestrel-cisco-readonly-operations.json. No full VLAN transaction qualification,
+accepted Phase2 diagnosis, production fault injection or canary mutation claimed.
+
 ## 2026-10-16 — production Kestrel recovery update and fresh Duo RW (phase13)
 
 Dedicated .211 virp-kestrel-candidate source5a87465, binary SHA256
