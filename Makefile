@@ -2586,3 +2586,8 @@ test-cisco-port-ops: $(BUILD_DIR)/test_driver_cisco_port_ops
 	./$(BUILD_DIR)/test_driver_cisco_port_ops
 
 all-tests: test-cisco-port-ops
+
+.PHONY: test-cage-port-plan
+test-cage-port-plan:
+	cd tools/cage && python3 -m unittest test_port_plan
+all-tests: test-cage-port-plan

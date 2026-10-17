@@ -2,7 +2,7 @@
 #include "../src/drivers/driver_cisco.c"
 #include <assert.h>
 int main(void) {
- const char *good[]={"switchport mode access","switchport mode dynamic auto","switchport access vlan 10","no switchport access vlan","spanning-tree portfast","no spanning-tree portfast","switchport port-security","no switchport port-security","switchport port-security maximum 2","no switchport port-security maximum","switchport port-security violation restrict","switchport port-security violation shutdown","no switchport port-security violation"};
+ const char *good[]={"switchport mode access","switchport mode dynamic auto","no switchport mode","switchport access vlan 10","no switchport access vlan","spanning-tree portfast","no spanning-tree portfast","switchport port-security","no switchport port-security","switchport port-security maximum 2","no switchport port-security maximum","switchport port-security violation restrict","switchport port-security violation shutdown","no switchport port-security violation"};
  char cmd[256],ifn[64],line[128]; unsigned count=0;
  for(size_t i=0;i<sizeof(good)/sizeof(good[0]);i++) {
   snprintf(cmd,sizeof cmd,"interface GigabitEthernet1/0/22 %s",good[i]);

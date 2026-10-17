@@ -861,7 +861,7 @@ bool cisco_parse_port_operation(const char *command, char *ifname,
     if (!digit || slashes < 1 || slashes > 2) return false;
     const char *op=end+1;
     const char *fixed[]={
-        "switchport mode access", "switchport mode dynamic auto",
+        "switchport mode access", "switchport mode dynamic auto", "no switchport mode",
         "no switchport access vlan", "spanning-tree portfast",
         "no spanning-tree portfast", "switchport port-security",
         "no switchport port-security", "no switchport port-security maximum",

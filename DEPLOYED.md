@@ -1,3 +1,29 @@
+## 2026-10-17 — CML canary port-write preflight
+
+VM105 only: deployed source **3be7f74**, binary SHA256
+`938027b7714a5ca930ad08bf5d56fe73386452beb3a28862e26a96d954e6c182`,
+service `virp-canary`. Snapshot `before-port-rollout-20261017` and private
+software/SQLite backups `/root/port-rollout-20261017` retained.
+Owner authorized STOP release; release is signed in
+`kestrel-v3-port-admin-20261017`, entry
+`bf10fd9567646efcd2f1a9ce5a2c8f7da2e7b6ca9c6fb4b5f0d82e4d419c57fb`.
+Previous135entries unchanged. Expired description grant remains unchanged;
+consumed approvals never reset. Pending absent.
+
+Exact canary config-read operation added to helper, still YELLOW and requiring
+native approval. Test key approved one read via VM227;7 new v3 frames all stored
+in `kestrel-v3-port-qualification-20261017`. Offline0.1.3 public-pin packet:
+114entries/5chains/7v3, CRYPTOGRAPHICALLY-VERIFIED. No witness submission.
+This is **preflight**, not successful port-write qualification.
+
+Canary baseline only shutdown, dynamic-auto; LLDP disabled and only VLAN1 active.
+Broader fixture preparation requested because previous scope excluded global
+changes. No port write. New no-switchport-mode restore form and local plan
+renderer are source changes pending canary installation, not part of this build.
+Production binary/helper unchanged. Production lease only renewed10h until
+2026-10-18T03:03:23Z; permissions/quota/approval consumption unchanged.
+Private report: audits/kestrel-port-rollout-20261017/REPORT.md.
+
 ## 2026-10-16 — Kestrel Cisco read-only catalogue and refusal decoder
 
 Owner directed Cisco RO administration. VM227 runner now exposes16 fixed switch

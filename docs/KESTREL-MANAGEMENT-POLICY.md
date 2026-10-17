@@ -28,7 +28,7 @@ The C driver now parses a finite set of interface operations and renders each th
 
 Supported grammar: canonical physical GigabitEthernet or Ethernet name plus one of:
 
-- switchport mode access or switchport mode dynamic auto
+- switchport mode access, switchport mode dynamic auto, or no switchport mode
 - switchport access vlan 1..4094 or no switchport access vlan
 - spanning-tree portfast or no spanning-tree portfast
 - switchport port-security or no switchport port-security
@@ -49,3 +49,14 @@ These are transport capabilities, not grants. Dynamic-auto and negations exist t
 ## Deployment status and blocking guard
 
 No production or canary deployment from this change. CML preflight found `/var/lib/virp-cml-phase11/STOP` present, pending absent, service active. Do not remove or route around that STOP by inventing another scope. Owner release is required before live qualification. Policy-aware helper, generalized owner coordinator and exact TACACS grants remain to be implemented and tested before activation.
+
+## October17 implementation update
+
+Owner subsequently authorized continuing and renewing the lease. CML105 STOP
+was archived after chain verification and snapshot; its signed release and
+3be7f74 deployment are recorded in DEPLOYED.md. No port writes yet. CML has LLDP
+disabled and only VLAN1 active; isolated fixture preparation is pending because
+original scope excluded global VLAN changes. `port_plan.py` is a pure staged
+renderer/verifier with active-VLAN and tamper checks, not a deployed approval
+coordinator or proof of protection against an attacker able to rewrite its hash.
+The trusted coordinator must pin the bundle digest in the approved record.
