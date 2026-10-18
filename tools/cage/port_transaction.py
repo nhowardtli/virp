@@ -111,10 +111,24 @@ class Transactions:
    try:self.key.verify(bytes.fromhex(row['signature']),DOMAIN+canonical(approval))
    except (InvalidSignature,ValueError):raise Refused('stored_approval_invalid') from None
   return row,body
+ def assert_target_available(self,target):
+  validate_target(target)
+  for previous in self.db.execute('SELECT id,body,hash,state FROM transactions').fetchall():
+   prior=json.loads(previous['body'])
+   if digest(prior)!=previous['hash']:raise Refused('prior_transaction_bundle_tampered')
+   if prior['target']==target:
+    if previous['state'] not in ('restored','expired-before-apply','preflight-refused'):raise Refused('target_transaction_open')
+    if self.db.execute('SELECT 1 FROM events WHERE transaction_id=? AND receipt IS NULL',(previous['id'],)).fetchone():raise Refused('prior_transaction_receipt_required')
+ def _inventory_ids(self,body):
+  i=body['native_proposals']
+  return {r['proposal_id'] for r in (i['forward'],i['restore'],i['preflight'],*i['verify'])}
  def create(self,body):
   validate_bundle(body)
   tid=uuid.uuid4().hex
   with self.atomic():
+   self.assert_target_available(body['target'])
+   for previous in self.db.execute('SELECT body FROM transactions').fetchall():
+    if self._inventory_ids(json.loads(previous['body']))&self._inventory_ids(body):raise Refused('native_inventory_previously_bound')
    self.db.execute('INSERT INTO transactions(id,body,hash,state,boot) VALUES(?,?,?,?,?)',(tid,canonical(body).decode(),digest(body),'prepared',self.boot_id))
    self._event(tid,'proposal',plan_sha256=digest(body),bundle=body)
   return tid

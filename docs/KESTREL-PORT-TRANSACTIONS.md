@@ -282,3 +282,22 @@ existing pending marker still requires separately qualified reconciliation.
 Owner closure consumes the signed close event. These integration tests use real
 Ed25519 signatures with synthetic device/chain transport and mocked Duo; they
 are not a live packet or standalone-verifier acceptance.
+
+## Preparation and exclusion
+
+`PortPreparation` collects all seven baseline reads through the public-key helper
+before rendering anything. The complete collection must be fresh, and MAC,
+neighbor, protected-port and supported-format checks precede native proposal
+filing. Forward, restore, preflight and bounded verification proposals are then
+filed and their authenticated references included in the immutable bundle.
+
+The initial interface-config read still requires an independently issued native
+YELLOW approval. The preparation API takes that already-approved proposal ID;
+it does not invent authority, weaken the classifier, or accept model evidence.
+Production provisioning of this initial read approval remains outstanding.
+
+Only one transaction may be open on a given target port. A closed transaction's
+outbox must reach the signed chain before another starts, and native proposal
+IDs cannot be reused in a later transaction. Prepared or ambiguous transactions
+remain blocking until explicitly resolved; there is no automatic deletion of
+state or consumed approvals.

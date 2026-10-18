@@ -36,6 +36,17 @@ class TransactionTests(unittest.TestCase):
   return {'proposal_id':pid,'device':'kestrel-ios','command':cmd,'device_node_id':260,'tier':'RED' if r['verb'] in ('apply','restore') else 'YELLOW','ttl_seconds':300,'canonical':struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,self.clock.wall,300).hex()}
  def native(self,r):
   challenge=self.challenge(r);pid=self.store.reserve_native(r,challenge);self.flush();self.store.native_signable(r,pid);self.flush();return pid
+ def test_second_transaction_on_same_port_refused(self):
+  other=copy.deepcopy(self.body);other['native_proposals']=proposal_inventory()
+  with self.assertRaisesRegex(Refused,'target_transaction_open'):self.store.create(other)
+  self.assertEqual(self.store.db.execute('select count(*) from transactions').fetchone()[0],1)
+ def test_closed_transaction_allows_fresh_inventory_only_after_receipts(self):
+  self.approve(1,preflight=False);self.clock.tick(2);self.store.status(self.tid)
+  other=copy.deepcopy(self.body);other['native_proposals']=proposal_inventory()
+  with self.assertRaisesRegex(Refused,'prior_transaction_receipt_required'):self.store.create(other)
+  self.flush()
+  with self.assertRaisesRegex(Refused,'native_inventory_previously_bound'):self.store.create(self.body)
+  self.assertNotEqual(self.store.create(other),self.tid)
  def test_missing_native_issuance_blocks_dispatch(self):
   self.approve();self.flush();r=self.store.begin(self.tid,'apply');self.flush()
   with self.assertRaisesRegex(Refused,'native_approval_issuance_required'):self.store.require_dispatch(r)
