@@ -16,6 +16,7 @@ from port_challenge import validate as validate_challenge
 from port_transaction import canonical,digest,validate_bundle,DOMAIN,Refused
 
 class OwnerRequests:
+ authorization_method='duo'
  def __init__(self,path,public_key,sign,*,owner,boot_id,max_lease_seconds,wall_ns=time.time_ns,boottime=None,producers=None):
   self.producers=producers or {}
   self.key=Ed25519PublicKey.from_public_bytes(public_key);self.sign=sign;self.owner=owner
@@ -91,7 +92,7 @@ class OwnerRequests:
    if self.clock()>=row['deadline'] or self.now()>=row['authorized_ns']+row['lease']*1000000000:raise Refused('owner_approval_expired')
    try:
     if set(a)!={'schema','approval_id','transaction_id','plan_sha256','owner','issued_ns','lease_seconds','boot_id','issued_boottime','authorization'}:raise ValueError()
-    if a['authorization']!={'method':'duo','reference':row['duo_txid'],'approved_ns':row['authorized_ns']}:raise ValueError()
+    if a['authorization']!={'method':self.authorization_method,'reference':row['duo_txid'],'approved_ns':row['authorized_ns']}:raise ValueError()
     if a['schema']!='kestrel-port-approval/1' or a['transaction_id']!=tid or a['plan_sha256']!=row['hash'] or a['owner']!=self.owner:raise ValueError()
     if a['boot_id']!=row['executor_boot'] or type(a['lease_seconds'])is not int or not 1<=a['lease_seconds']<=row['lease']:raise ValueError()
     if not re.fullmatch('[a-f0-9]{32}',a['approval_id']):raise ValueError()
@@ -102,14 +103,14 @@ class OwnerRequests:
     if remaining<=0:raise ValueError()
    except (TypeError,KeyError,ValueError):raise Refused('owner_envelope_binding_invalid') from None
    self.db.execute("UPDATE owner_requests SET state='signature_started',envelope=?,deadline=? WHERE id=?",(canonical(a).decode(),min(row['deadline'],self.clock()+remaining),tid))
-   self.event(tid,'signature_started',approval_id=a['approval_id'],duo_txid=row['duo_txid'],plan_sha256=row['hash'])
+   self.event(tid,'signature_started',approval_id=a['approval_id'],authorization_method=self.authorization_method,authorization_reference=row['duo_txid'],plan_sha256=row['hash'])
   signature=self.sign(DOMAIN+canonical(a))
   self.key.verify(signature,DOMAIN+canonical(a))
   with self.atomic():
    current,_=self.get(tid,'signature_started')
    if current['envelope']!=canonical(a).decode():raise Refused('signed_envelope_changed')
    self.db.execute("UPDATE owner_requests SET state='signed',signature=? WHERE id=?",(signature.hex(),tid))
-   self.event(tid,'signed',approval_id=a['approval_id'],duo_txid=row['duo_txid'],plan_sha256=row['hash'],signature=signature.hex())
+   self.event(tid,'signed',approval_id=a['approval_id'],authorization_method=self.authorization_method,authorization_reference=row['duo_txid'],plan_sha256=row['hash'],signature=signature.hex())
   return signature
 
  def sign_native(self,tid,event,entry,challenge):

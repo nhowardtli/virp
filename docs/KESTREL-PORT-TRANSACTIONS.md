@@ -308,3 +308,13 @@ a lost response. The signed executor envelope uses only the duration remaining
 from the owner's original authorization deadline. The owner independently checks
 that deadline again. Handoff failure latches STOP and preserves the attempt for
 reconciliation; it does not create an approval or silently retry with a new ID.
+
+## Explicit canary authority
+
+`CanaryOwnerRequests` is a separate lab-only adapter with fixed identity
+canary-test-approver and only the kestrel-ios target. It signs envelopes labeled
+`authorization.method=test` and never contacts Duo. The production owner
+entrypoint does not import or expose this adapter. Production transaction state
+requires `duo` and rejects a test envelope even if otherwise correctly signed.
+The lab entrypoint must additionally pin VM105 and its provisioned test key.
+No test signer or key has been installed by this source change.
