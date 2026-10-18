@@ -79,7 +79,7 @@ class NativeOwnerTests(unittest.TestCase):
   name={'rollback':'restore'}.get(phase,phase)
   refs=self.body['native_proposals']['verify'] if name=='verify' else [self.body['native_proposals'][name]]
   pid=refs[0]['proposal_id']
-  challenge={'proposal_id':pid,'device':'kestrel-ios','command':cmd,'device_node_id':260,'tier':'RED' if phase in ('forward','rollback') else 'YELLOW','ttl_seconds':300,'canonical':struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,self.now,300).hex()}
+  challenge={'proposal_id':pid,'device':'kestrel-ios','command':cmd,'device_node_id':260,'tier':'YELLOW' if phase in ('forward','rollback') else 'YELLOW','ttl_seconds':300,'canonical':struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,self.now,300).hex()}
   event={'schema':'kestrel-port-event/1','type':'native_approval_intent','transaction_id':self.tid,'event_id':uuid.uuid4().hex,'request_id':uuid.uuid4().hex,'approval_id':self.a['approval_id'],'command':cmd,'canonical':challenge['canonical'],'proposal_id':pid,'time_ns':self.now}
   e={'artifact_hash':digest(event),'artifact_hash_alg':'sha256','artifact_id':event['event_id'],'artifact_schema_version':1,'artifact_type':'evidence_item','monotonic_ns':1,'previous_entry_hash':'0'*64,'sequence':sequence,'session_id':'test-port','signer_node_id':260,'signer_org_id':'local','timestamp_ns':self.now}
   raw=canonical(e);e.update(chain_entry_hash=hashlib.sha256(raw).hexdigest(),chain_sig_key_id=hashlib.sha256(self.producer_pub).hexdigest()[:32],chain_sig=self.producer.sign(b'VIRP-CHAIN-ENTRY-SIG-v1\0'+raw).hex())

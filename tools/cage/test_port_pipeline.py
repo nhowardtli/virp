@@ -31,7 +31,7 @@ class Pipeline(unittest.TestCase):
   phase={'apply':'forward','restore':'restore','preflight':'preflight'}.get(verb,'verify')
   refs=self.body['native_proposals']['verify'] if phase=='verify' else [self.body['native_proposals'][phase]]
   pid=next(ref['proposal_id'] for ref in refs if not self.tx.db.execute('select 1 from native_issuances where proposal_id=?',(ref['proposal_id'],)).fetchone())
-  q={'proposal_id':pid,'device':'kestrel-ios','command':cmd,'device_node_id':260,'tier':'RED' if verb in ('apply','restore') else 'YELLOW','ttl_seconds':300,'canonical':struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,self.wall,300).hex()}
+  q={'proposal_id':pid,'device':'kestrel-ios','command':cmd,'device_node_id':260,'tier':'YELLOW' if verb in ('apply','restore') else 'YELLOW','ttl_seconds':300,'canonical':struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,self.wall,300).hex()}
   self.tx.reserve_native(r,q);self.flush();intent=self.tx.events(self.tid)[-1]
   raw=self.tx.native_signable(r,pid);sig=self.owner.sign_native(self.tid,intent,self.proof(intent),q)
   self.key.public_key().verify(sig,raw);self.flush();self.tx.require_dispatch(r);return r

@@ -2,6 +2,10 @@ import unittest
 from port_plan import plan, config_lines, verify
 BASE='x#show running-config interface Ethernet0/1\nBuilding configuration...\nCurrent configuration : 39 bytes\n!\ninterface Ethernet0/1\n shutdown\nend'
 class PortPlanTests(unittest.TestCase):
+ def test_routine_yellow_security_red(self):
+  for op in ('mode_access','vlan_10','portfast'):
+   self.assertEqual(plan(BASE,'Ethernet0/1',op,active_vlans={10})['tier'],'YELLOW')
+  self.assertEqual(plan(BASE.replace(' shutdown',' switchport mode access\n shutdown'),'Ethernet0/1','security_enable')['tier'],'RED')
  def test_absent_mode_restores_absence(self):
   p=plan(BASE,'Ethernet0/1','mode_access');self.assertEqual(p['rollback'],'interface Ethernet0/1 no switchport mode');self.assertIn(' switchport mode access',p['expected'])
  def test_explicit_vlan_restored(self):

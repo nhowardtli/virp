@@ -20,7 +20,7 @@ class FlowTests(unittest.TestCase):
   self.fail('unexpected owner action')
  def challenge(self,pid,cmd):
   raw=struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,self.p.wall,300)
-  return {'proposal_id':pid,'device':'kestrel-ios','device_node_id':260,'command':cmd,'tier':'RED' if cmd.startswith('interface ') else 'YELLOW','ttl_seconds':300,'canonical':raw.hex()}
+  return {'proposal_id':pid,'device':'kestrel-ios','device_node_id':260,'command':cmd,'tier':'YELLOW' if cmd.startswith('interface ') else 'YELLOW','ttl_seconds':300,'canonical':raw.hex()}
  def observe(self,cmd,proposal_id=None):
   self.calls.append((cmd,proposal_id))
   if self.failure=='transport':raise TimeoutError('synthetic lost response')

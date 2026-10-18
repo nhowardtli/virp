@@ -8,8 +8,8 @@ int main(void) {
   snprintf(cmd,sizeof cmd,"interface GigabitEthernet1/0/22 %s",good[i]);
   assert(cisco_parse_port_operation(cmd,ifn,sizeof ifn,line,sizeof line));
   assert(!strcmp(ifn,"GigabitEthernet1/0/22") && !strcmp(line,good[i]));
-  /* Without authenticated port context, forwarding/security stays RED. */
-  assert(cisco_gate_tier(cmd)==VIRP_TIER_RED);
+  /* Exact routine grammar is YELLOW; security changes remain RED. */
+  assert(cisco_gate_tier(cmd)==(strstr(good[i],"port-security") ? VIRP_TIER_RED : VIRP_TIER_YELLOW));
   virp_conn_t c; memset(&c,0,sizeof c);c.connected=true;c.current_mode=CISCO_MODE_USER;
   virp_exec_result_t r;memset(&r,0,sizeof r);
   assert(cisco_execute(&c,cmd,&r)==VIRP_OK && r.no_dispatch && !r.success);

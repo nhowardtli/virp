@@ -34,7 +34,7 @@ class NativePort:
   self.approvals=ApprovalLedger(ledger.db,transport,public_key,approval_session,node_id)
   self.proposals=ProposalLedger(ledger.db,transport,public_key,approval_session,node_id)
  def tier(self,command):
-  if 'plan' in self.body and command in (self.body['plan']['forward'],self.body['plan']['rollback']):return 'RED'
+  if 'plan' in self.body and command in (self.body['plan']['forward'],self.body['plan']['rollback']):return self.body['plan']['tier']
   if command==commands(self.target['port'])['config']:return 'YELLOW'
   raise Refused('native_approval_not_required_for_command')
  def observe(self,command,*,proposal_id=None):

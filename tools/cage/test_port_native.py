@@ -48,7 +48,7 @@ class NativeAdapter(unittest.TestCase):
  def native_challenge(self):
   cmd=self.body['plan']['forward'];pid=self.body['native_proposals']['forward']['proposal_id']
   raw=struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,1000,300)
-  return {'proposal_id':pid,'device':'kestrel-ios','device_node_id':260,'command':cmd,'tier':'RED','ttl_seconds':300,'canonical':raw.hex()}
+  return {'proposal_id':pid,'device':'kestrel-ios','device_node_id':260,'command':cmd,'tier':'YELLOW','ttl_seconds':300,'canonical':raw.hex()}
  def test_challenge_uses_separate_control_identity(self):
   q=self.native_challenge();calls=[]
   self.native.control=SimpleNamespace(management=lambda request:calls.append(request) or q)

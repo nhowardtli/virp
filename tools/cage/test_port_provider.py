@@ -18,6 +18,9 @@ class ProviderTests(unittest.TestCase):
   tool=body['tools'][0];self.assertTrue(tool['strict']);self.assertEqual(tool['parameters']['properties']['operation']['enum'],['port_preflight'])
   self.assertFalse(tool['parameters']['additionalProperties']);self.assertEqual(set(tool['parameters']['required']),{'operation','rationale'})
   self.assertNotIn(b'unit-test-key',request.data)
+ def test_astra_low_reasoning(self):
+  ResponsesProvider('gpt-6-astra','unit-test-key',open_request=self.open)([],('port_preflight',))
+  self.assertEqual(json.loads(self.requests[0][0].data)['reasoning'],{'effort':'low'})
  def test_unknown_operation_refuses_before_network(self):
   provider=ResponsesProvider('model','unit-test-key',open_request=self.open)
   with self.assertRaises(ProviderRefused):provider([],('reload',))

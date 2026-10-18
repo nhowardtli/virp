@@ -36,7 +36,7 @@ class CageServiceTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as directory:
    root=service.Path(directory);state=root/'state';state.mkdir()
    for name in ('journal','transport','transcripts'):(state/name).mkdir()
-   cfg=root/'api.json';cfg.write_text(json.dumps({'model':service.MODEL}))
+   cfg=root/'api.json';cfg.write_text(json.dumps({'model':service.SHARED_CONFIG_MODEL}))
    hosts=root/'known_hosts';hosts.write_text('synthetic public host pin')
    key=root/'api.key';key.write_text('unit-test-key')
    p=self.profile();p['api_config_sha256']=hashlib.sha256(cfg.read_bytes()).hexdigest();p['known_hosts_sha256']=hashlib.sha256(hosts.read_bytes()).hexdigest()

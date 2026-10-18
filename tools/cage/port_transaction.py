@@ -211,7 +211,7 @@ class Transactions:
   if q['verb']=='apply':self._fresh_preflight(row)
   if not row['approval'] or (q['verb'] in ('apply','preflight') and (row['expired'] or self.wall_ns()>=row['expires_ns'] or self.boottime()>=row['deadline'])):raise Refused('lease_expired')
   if q['verb'] in ('apply','restore'):
-   expected=body['plan']['forward' if q['verb']=='apply' else 'rollback'];tier='RED'
+   expected=body['plan']['forward' if q['verb']=='apply' else 'rollback'];tier=body['plan']['tier']
   else:
    expected='show running-config interface '+body['target']['port'];tier='YELLOW'
   if command!=expected:raise Refused('native_command_outside_approved_plan')

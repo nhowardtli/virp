@@ -10,6 +10,27 @@ from port_runner import CLOSED,NEXT,RESULTS,RunnerRefused,encode
 
 class ModelStopped(ValueError):pass
 
+def summarize_usage(responses):
+ """Provider-reported counters, not signed device evidence or billing totals.
+
+ Cached input and reasoning output are subsets, never added to total tokens.
+ Missing metadata is explicit; no prices or zero-cost assumptions are inferred.
+ """
+ result={'responses':len(responses),'models':sorted({r['model'] for r in responses if isinstance(r.get('model'),str)}),
+  'input_tokens':0,'output_tokens':0,'total_tokens':0,'cached_input_tokens':0,'reasoning_output_tokens':0,
+  'missing_or_invalid_responses':0,'complete':True,'details_complete':True,'source':'provider_reported'}
+ for r in responses:
+  u=r.get('usage')
+  if (not isinstance(u,dict) or any(type(u.get(k))is not int or u[k]<0 for k in ('input_tokens','output_tokens','total_tokens'))
+      or u['total_tokens']!=u['input_tokens']+u['output_tokens']):
+   result['missing_or_invalid_responses']+=1;result['complete']=False;result['details_complete']=False;continue
+  for k in ('input_tokens','output_tokens','total_tokens'):result[k]+=u[k]
+  for group,key,dest,limit in [('input_tokens_details','cached_tokens','cached_input_tokens','input_tokens'),('output_tokens_details','reasoning_tokens','reasoning_output_tokens','output_tokens')]:
+   detail=u.get(group);v=detail.get(key) if isinstance(detail,dict) else None
+   if type(v)is int and 0<=v<=u[limit]:result[dest]+=v
+   else:result['details_complete']=False
+ return result
+
 def last_state(runner):
  with runner.locked():state,_,_=runner.history();return state
 
@@ -39,7 +60,7 @@ def run(provider,runner,transport,*,operation,prompt,record,max_turns=12):
  if not isinstance(prompt,str) or not 1<=len(prompt)<=4000:raise ModelStopped('invalid_owner_prompt')
  if type(max_turns)is not int or not 7<=max_turns<=12:raise ModelStopped('invalid_model_turn_bound')
  selected='port_prepare_'+operation;allowed=frozenset({selected,*RESULTS})
- inputs=[{'role':'user','content':prompt}];call_ids=set();verified=False;transcript_ok=True
+ inputs=[{'role':'user','content':prompt}];call_ids=set();verified=False;transcript_ok=True;responses=[]
  def emit(event):
   nonlocal transcript_ok
   try:record(event)
@@ -54,6 +75,7 @@ def run(provider,runner,transport,*,operation,prompt,record,max_turns=12):
    emit({'type':'model_request','turn':turn,'allowed_operations':sorted(available)})
    response=provider(inputs,tuple(sorted(available)))
    if not isinstance(response,dict) or len(encode(response))>131072:raise ModelStopped('invalid_model_response')
+   responses.append(response)
    emit({'type':'model_response','turn':turn,'response':response,'authority':'untrusted_model_output'})
    if response.get('status','completed')!='completed':raise ModelStopped('model_response_incomplete')
    output=response.get('output')
@@ -78,7 +100,7 @@ def run(provider,runner,transport,*,operation,prompt,record,max_turns=12):
     completed=runner.completion()
     return {'ok':result['state']=='restored' and verified,'result':completed,
      'reason':'roundtrip_complete' if verified and result['state']=='restored' else 'forward_verification_not_passed',
-     'transcript_complete':transcript_ok,'evidence_verified_independently':False}
+     'usage':summarize_usage(responses),'transcript_complete':transcript_ok,'evidence_verified_independently':False}
   raise ModelStopped('model_turn_limit')
  except Exception as error:
   public_error=isinstance(error,(ModelStopped,RunnerRefused)) or (type(error).__module__=='port_provider' and type(error).__name__=='ProviderRefused')
@@ -86,4 +108,4 @@ def run(provider,runner,transport,*,operation,prompt,record,max_turns=12):
   recovery=restore_confirmed(runner,transport)
   try:emit({'type':'workflow_stopped','reason':reason,'recovery':recovery})
   except ModelStopped:pass
-  return {'ok':False,'error':reason,'recovery':recovery,'transcript_complete':transcript_ok,'evidence_verified_independently':False}
+  return {'ok':False,'error':reason,'recovery':recovery,'usage':summarize_usage(responses),'transcript_complete':transcript_ok,'evidence_verified_independently':False}

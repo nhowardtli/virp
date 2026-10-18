@@ -9,7 +9,8 @@ import argparse,fcntl,hashlib,json,os,re,stat,sys,uuid
 from pathlib import Path
 
 MACHINE='5f20c5fdcf174e398af109874389db81'
-MODEL='gpt-4.1-mini-2025-04-14'
+MODEL='gpt-6-astra'
+SHARED_CONFIG_MODEL='gpt-4.1-mini-2025-04-14'
 CONFIG='/etc/openai-cage/api.json'
 API_KEY='/etc/openai-cage/api.key'
 KNOWN_HOSTS='/etc/virp-cml-cage/known_hosts'
@@ -54,7 +55,7 @@ def main():
    if hashlib.sha256(protected(module_dir/name).read_bytes()).hexdigest()!=digest:raise CageRefused('cage_module_changed')
   for path,digest in ((CONFIG,CONFIG_SHA),(KNOWN_HOSTS,HOSTS_SHA)):
    if hashlib.sha256(protected(path,secret=True).read_bytes()).hexdigest()!=digest:raise CageRefused('cage_config_or_host_pin_changed')
-  if json.loads(protected(CONFIG,secret=True).read_bytes()).get('model')!=MODEL:raise CageRefused('cage_model_changed')
+  if json.loads(protected(CONFIG,secret=True).read_bytes()).get('model')!=SHARED_CONFIG_MODEL:raise CageRefused('cage_model_changed')
  guard();sys.path.insert(0,str(module_dir))
  from helper import durable_write
  from port_model import run

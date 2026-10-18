@@ -54,7 +54,7 @@ def plan(text, port, operation, *, active_vlans=None):
   if prefix=='switchport port-security maximum' and int(old[0].split()[-1])>1024:raise ValueError('unsupported_restore')
  if old==[forward]:raise ValueError('no_change')
  expected=sorted([x for x in before if not family(x,prefix)]+[' '+forward])
- body={'schema':'kestrel-port-plan/1','port':port,'operation':operation,'tier':'RED',
+ body={'schema':'kestrel-port-plan/1','port':port,'operation':operation,'tier':'RED' if operation.startswith('security_') else 'YELLOW',
        'before':before,'expected':expected,'pre_config_sha256':hashlib.sha256(text.encode()).hexdigest(),
        'forward':'interface '+port+' '+forward,'rollback':'interface '+port+' '+(old[0] if old else 'no '+prefix),
        'save':False}

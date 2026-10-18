@@ -33,7 +33,7 @@ class TransactionTests(unittest.TestCase):
   phase={'apply':'forward','restore':'restore','preflight':'preflight'}.get(r['verb'],'verify')
   refs=self.body['native_proposals']['verify'] if phase=='verify' else [self.body['native_proposals'][phase]]
   pid=next(ref['proposal_id'] for ref in refs if not self.store.db.execute('select 1 from native_issuances where proposal_id=?',(ref['proposal_id'],)).fetchone())
-  return {'proposal_id':pid,'device':'kestrel-ios','command':cmd,'device_node_id':260,'tier':'RED' if r['verb'] in ('apply','restore') else 'YELLOW','ttl_seconds':300,'canonical':struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,self.clock.wall,300).hex()}
+  return {'proposal_id':pid,'device':'kestrel-ios','command':cmd,'device_node_id':260,'tier':'YELLOW' if r['verb'] in ('apply','restore') else 'YELLOW','ttl_seconds':300,'canonical':struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,self.clock.wall,300).hex()}
  def native(self,r):
   challenge=self.challenge(r);pid=self.store.reserve_native(r,challenge);self.flush();self.store.native_signable(r,pid);self.flush();return pid
  def test_second_transaction_on_same_port_refused(self):

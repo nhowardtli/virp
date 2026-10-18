@@ -132,8 +132,8 @@ class OwnerRequests:
     raise Refused('native_intent_approval_binding_invalid')
    if type(event.get('time_ns'))is not int or not 0<=self.now()-event['time_ns']<=120000000000:raise Refused('native_intent_stale')
    command=event['command'];p=body['plan']
-   if command==p['forward']:phase='forward';tier='RED'
-   elif command==p['rollback']:phase='restore';tier='RED'
+   if command==p['forward']:phase='forward';tier=p['tier']
+   elif command==p['rollback']:phase='restore';tier=p['tier']
    elif command=='show running-config interface '+target['port']:
     phase='preflight' if challenge['proposal_id']==body['native_proposals']['preflight']['proposal_id'] else 'verify';tier='YELLOW'
    else:raise Refused('native_command_outside_owner_approval')

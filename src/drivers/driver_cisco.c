@@ -909,6 +909,19 @@ virp_trust_tier_t cisco_gate_tier(const char *command)
     if (cisco_parse_interface_description(command, NULL, 0, NULL, 0, NULL))
         return VIRP_TIER_YELLOW;
 
+    /* Exact routine port operations only. Context (protected ports, MACs,
+     * neighbors and approval scope) is enforced by the transaction helper.
+     * Security changes and unknown configuration remain RED. */
+    char port_line[256];
+    if (cisco_parse_port_operation(command, NULL, 0, port_line, sizeof(port_line)) &&
+        (strncmp(port_line, "switchport mode ", 16) == 0 ||
+         strcmp(port_line, "no switchport mode") == 0 ||
+         strncmp(port_line, "switchport access vlan ", 23) == 0 ||
+         strcmp(port_line, "no switchport access vlan") == 0 ||
+         strcmp(port_line, "spanning-tree portfast") == 0 ||
+         strcmp(port_line, "no spanning-tree portfast") == 0))
+        return VIRP_TIER_YELLOW;
+
     const cisco_route_t *best = NULL;
     size_t best_len = 0;
     for (size_t i = 0; i < CISCO_GATE_TABLE_SIZE; i++) {

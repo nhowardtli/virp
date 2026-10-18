@@ -1,6 +1,6 @@
 """Fixed Responses API adapter; credentials belong to the trusted root runner.
 
-No model migration, dynamic endpoint, redirect, ambient proxy or automatic retry.
+No dynamic endpoint, redirect, ambient proxy or automatic retry.
 Schema shape checked against official function-calling documentation2026-10-18.
 """
 import json,re,urllib.request,urllib.error
@@ -37,8 +37,10 @@ class ResponsesProvider:
   tool={'type':'function','name':'virp_port','description':'Request the next fixed port transaction step through the guarded C helper.',
    'strict':True,'parameters':{'type':'object','properties':{'operation':{'type':'string','enum':sorted(set(allowed))},
     'rationale':{'type':'string','description':'Explain this step in20 to1000 characters.'}},'required':['operation','rationale'],'additionalProperties':False}}
-  body=encode({'model':self.model,'store':False,'instructions':INSTRUCTIONS,'input':inputs,'tools':[tool],
-   'parallel_tool_calls':False,'max_output_tokens':1800})
+  payload={'model':self.model,'store':False,'instructions':INSTRUCTIONS,'input':inputs,'tools':[tool],
+   'parallel_tool_calls':False,'max_output_tokens':1800}
+  if self.model=='gpt-6-astra':payload['reasoning']={'effort':'low'}
+  body=encode(payload)
   if len(body)>524288:raise ProviderRefused('provider_input_too_large')
   request=urllib.request.Request(ENDPOINT,data=body,headers={'Authorization':'Bearer '+self.key,'Content-Type':'application/json'},method='POST')
   try:
