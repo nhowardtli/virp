@@ -3,6 +3,12 @@ import port_canary_router as router
 
 class RouterTests(unittest.TestCase):
  def raw(self,operation):return json.dumps({'operation':operation,'request_id':'a'*32,'rationale':'fixed canary qualification request'}).encode()
+ def test_open_mode_requires_explicit_router_opt_in(self):
+  q=json.loads(self.raw('open_execute'));q['command']='configure terminal';raw=json.dumps(q).encode()
+  with self.assertRaises(router.RouterRefused):router.select(raw)
+  self.assertEqual(router.select(raw,allow_open=True),router.OPEN_SERVICE)
+  q['device']='production'
+  with self.assertRaises(router.RouterRefused):router.select(json.dumps(q).encode(),allow_open=True)
  def test_routes_only_named_port_operations(self):
   for op in router.PORT_OPERATIONS:self.assertEqual(router.select(self.raw(op)),router.PORT_SERVICE)
  def test_known_legacy_operations_preserved(self):

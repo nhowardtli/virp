@@ -24,15 +24,22 @@ def unique(pairs):
   result[key]=value
  return result
 
-def select(raw):
+OPEN_SERVICE='/opt/virp-canary/cage/open_canary.py'
+
+def select(raw,allow_open=False):
  try:
   if not isinstance(raw,bytes) or len(raw)>4096:raise ValueError()
   q=json.loads(raw,object_pairs_hook=unique)
+  if allow_open and isinstance(q,dict) and q.get('operation')=='open_execute':
+   if set(q)!={'operation','request_id','rationale','command'}:raise ValueError()
+   if not isinstance(q['command'],str) or not 1<=len(q['command'])<=1024:raise ValueError()
+   q={k:v for k,v in q.items() if k!='command'}
   if not isinstance(q,dict) or set(q)!={'operation','request_id','rationale'}:raise ValueError()
   if not isinstance(q['request_id'],str) or not re.fullmatch('[a-f0-9]{32}',q['request_id']):raise ValueError()
   if not isinstance(q['rationale'],str) or not 20<=len(q['rationale'])<=1000:raise ValueError()
   op=q['operation']
   if not isinstance(op,str):raise ValueError()
+  if op=='open_execute' and allow_open:return OPEN_SERVICE
   if op in PORT_OPERATIONS:return PORT_SERVICE
   if op in LEGACY_OPERATIONS:return LEGACY_SERVICE
   raise RouterRefused('operation_denied')
@@ -67,10 +74,12 @@ def main():
  if len(sys.argv)!=1 or os.geteuid()!=0 or os.environ.get('SUDO_USER')!='virp-cage-test' or Path('/etc/machine-id').read_text().strip()!=MACHINE:raise RouterRefused('canary_router_identity_mismatch')
  os.umask(0o077);protected(__file__)
  p=json.loads(protected(PROFILE,secret=True).read_bytes(),object_pairs_hook=unique)
- if set(p)!={'schema','port_sha256','legacy_sha256'} or p['schema']!='kestrel-port-router/1':raise RouterRefused('invalid_router_profile')
- for path,key in ((PORT_SERVICE,'port_sha256'),(LEGACY_SERVICE,'legacy_sha256')):
+ if set(p) not in ({'schema','port_sha256','legacy_sha256'},{'schema','port_sha256','legacy_sha256','open_sha256'}) or p['schema']!='kestrel-port-router/1':raise RouterRefused('invalid_router_profile')
+ destinations=[(PORT_SERVICE,'port_sha256'),(LEGACY_SERVICE,'legacy_sha256')]
+ if 'open_sha256' in p:destinations.append((OPEN_SERVICE,'open_sha256'))
+ for path,key in destinations:
   if not isinstance(p[key],str) or not re.fullmatch('[a-f0-9]{64}',p[key]) or hashlib.sha256(protected(path).read_bytes()).hexdigest()!=p[key]:raise RouterRefused('router_destination_changed')
- raw=sys.stdin.buffer.read(4097);target=select(raw);handoff(target,raw)
+ raw=sys.stdin.buffer.read(4097);target=select(raw,allow_open='open_sha256' in p);handoff(target,raw)
 
 if __name__=='__main__':
  try:main()

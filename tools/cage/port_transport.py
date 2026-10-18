@@ -43,9 +43,10 @@ def unique(pairs):
  return result
 
 class CanaryTransport:
- def __init__(self,root,*,wait_seconds=60,protect=protected,identity=os.geteuid):
+ def __init__(self,root,*,wait_seconds=60,protect=protected,identity=os.geteuid,request_validator=validate):
   if identity()!=0:raise TransportRefused('trusted_runner_requires_root')
   if type(wait_seconds) not in (int,float) or not math.isfinite(wait_seconds) or not 0<wait_seconds<=60:raise TransportRefused('invalid_observation_wait')
+  self.validate=request_validator
   self.root=protect(root,secret=True,directory=True);self.protect=protect;self.wait=wait_seconds
   self.protect(KEY,secret=True);self.protect(KNOWN_HOSTS)
   self.command=argv();self.processes={}
@@ -54,7 +55,7 @@ class CanaryTransport:
   if not isinstance(rid,str) or not re.fullmatch('[a-f0-9]{32}',rid):raise TransportRefused('invalid_transport_request_id')
   return self.root/rid
  def call(self,q):
-  validate(q);rid=q['request_id'];directory=self.attempt(rid)
+  self.validate(q);rid=q['request_id'];directory=self.attempt(rid)
   self.protect(self.root,secret=True,directory=True)
   self.protect(KEY,secret=True);self.protect(KNOWN_HOSTS)
   try:directory.mkdir(mode=0o700)
