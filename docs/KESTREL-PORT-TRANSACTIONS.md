@@ -369,3 +369,23 @@ CRYPTOGRAPHICALLY-VERIFIED for all122 entries/four chains in a network-disabled,
 read-only container as UID65534 with only the external test public pin and
 bundle mounted. No witness receipt exists for this synthetic run; it does not
 establish a physical device or a real Duo approval.
+
+The real-C suite also exercises wall-clock expiry after apply, rejection of an
+unrelated read, restore under the original approval, ordered expiry/restore/close
+entries, expiry before apply without a write, and rejection of a tampered rollback
+bundle. The test deliberately restores its injected store bytes afterward solely
+for fixture cleanup, then performs the original authorized rollback. This is not
+an exposed repair API.
+
+A one-second real-clock test found that rounding remaining duration to integer
+seconds made short approvals unusable. The envelope now preserves the original
+owner decision timestamp and a conservative corresponding boot-clock instant.
+Both deadlines remain anchored to the original approval; no time is added.
+An owner timestamp ahead of the executor refuses explicitly. Production clock
+alignment and the remote owner transport still require live qualification.
+
+A separate local C fault test changes the simulated state but drops its response.
+The C daemon returns a signed v3 UNKNOWN, commits the native outcome, and consumes
+the approval. The helper records unknown and preserves STOP/pending. Both retry
+and restore through the ordinary helper are blocked. Root reconciliation of that
+pending state remains a separate, not-yet-wired port recovery path.

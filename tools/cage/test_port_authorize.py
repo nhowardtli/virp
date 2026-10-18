@@ -27,6 +27,16 @@ class AuthorizationTests(unittest.TestCase):
   self.assertEqual(self.calls,['prepare','authorize','sign_envelope'])
   row,_=self.tx._get(self.tid);self.assertEqual(row['expires_ns'],self.p.wall+10000000000)
   self.assertEqual(self.stops,[])
+ def test_one_second_lease_preserves_subsecond_remaining_time(self):
+  initial=self.p.wall;self.delay=.1
+  self.flow.authorize(1)
+  row,_=self.tx._get(self.tid)
+  self.assertEqual(row['expires_ns'],initial+1000000000)
+  self.assertAlmostEqual(row['deadline'],101.0)
+ def test_owner_clock_ahead_refuses_instead_of_extending(self):
+  self.delay=-.1
+  with self.assertRaisesRegex(Refused,'owner_clock_ahead'):self.flow.authorize(10)
+  self.assertEqual(self.calls,['prepare','authorize'])
  def test_delayed_duo_reply_cannot_restart_lease(self):
   initial=self.p.wall;self.delay=3.5;self.flow.authorize(10)
   row,_=self.tx._get(self.tid);self.assertLessEqual(row['expires_ns'],initial+10000000000)

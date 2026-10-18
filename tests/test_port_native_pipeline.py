@@ -4,7 +4,7 @@
 Run via make test-port-native-pipeline CISCO=1. No network target is contacted.
 Fresh test keys and all mutable state live in one private temporary directory.
 """
-import base64,hashlib,json,os,pathlib,sqlite3,subprocess,sys,tempfile,time,unittest,uuid
+import base64,hashlib,json,os,pathlib,sqlite3,subprocess,sys,tempfile,time,unittest,uuid,socket
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'tools/cage'))
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding,PublicFormat
@@ -52,7 +52,14 @@ class NativePipeline(unittest.TestCase):
   if hasattr(self,'transport'):
    try:self.transport.management({'action':'shutdown'})
    except ValueError:pass  # Native shutdown closes the socket without a reply.
-  if hasattr(self,'proc'):self.proc.wait(timeout=35)  # Native idle select has a 30-second heartbeat.
+  if hasattr(self,'proc'):
+   # Wake the native idle select after its shutdown flag was set. This sends
+   # no request/device command and is fixture cleanup, not restart qualification.
+   try:
+    with socket.socket(socket.AF_UNIX) as wake:wake.connect(str(self.root/'onode.sock'))
+   except OSError:pass
+   self.proc.wait(timeout=35)
+
   if hasattr(self,'log'):self.log.close()
   if os.environ.get('VIRP_KEEP_PORT_FIXTURE')=='1':
    # Only a test process invokes this; directory contains generated test keys.
@@ -63,6 +70,65 @@ class NativePipeline(unittest.TestCase):
  def call(self,q):
   if q['action']=='authorize':return {'ok':True,'transaction_id':q['transaction_id'],**self.owner.authorize(q['transaction_id'])}
   return dispatch(q,self.owner,lambda:None,{'kestrel-ios'})
+ def prepare_flow(self,seconds=60):
+  read=self.native({'target':self.target});cmd='show running-config interface Ethernet0/1'
+  reference=read.propose(cmd)['reference'];challenge=read.challenge(reference['proposal_id'],cmd)
+  read.submit(challenge,self.key.sign(bytes.fromhex(challenge['canonical'])))
+  tid=PortPreparation(self.tx,self.events,read,self.native,self.scope,protected_ports=set()).prepare('mode_access',config_proposal_id=reference['proposal_id'],verification_budget=4)
+  PortAuthorization(self.tx,self.events,self,self.scope,tid).authorize(seconds)
+  _,body=self.tx._get(tid)
+  return tid,PortFlow(self.tx,self.events,self.native(body),self,self.scope,tid,protected_ports=set())
+ def verify_all_chains(self):
+  with sqlite3.connect(self.root/'chain.db') as db:
+   sessions=list(db.execute('select session_id,max(sequence) from chain_entries group by session_id'))
+  for sid,high in sessions:
+   result=self.transport.management({'action':'chain_verify','session_id':sid,'from_sequence':0,'to_sequence':high})
+   self.assertTrue(result['valid']);self.assertEqual(result['entries_checked'],high+1);self.assertEqual(result['executions_open'],0)
+ def test_native_lease_expiry_and_tamper_cases(self):
+  with self.scope.locked():
+   tid,flow=self.prepare_flow(3);flow.step('preflight');flow.step('apply')
+   time.sleep(3.1)
+   with self.assertRaisesRegex(ValueError,'verb_not_allowed'):flow.step('unrelated_green_read')
+   flow.step('restore');self.assertEqual(flow.step('verify_restored')['state'],'restored')
+   kinds=[e['type'] for e in self.tx.events(tid)]
+   required=['approval','apply_outcome','lease_expired','restore_outcome','verify_restored_outcome','close']
+   self.assertEqual([k for k in kinds if k in required],required)
+   self.assertEqual(self.tx.events(tid)[-1]['reason'],'lease_expired')
+   self.assertEqual(json.loads((self.root/'device-state.json').read_text()),{'access':False,'writes':2})
+   # Expiry before apply closes without a device write.
+   early,flow=self.prepare_flow(1);time.sleep(1.1)
+   with self.assertRaises(ValueError):flow.step('preflight')
+   self.assertEqual(flow.close_owner()['state'],'expired-before-apply')
+   self.assertEqual(json.loads((self.root/'device-state.json').read_text())['writes'],2)
+   # Tamper root-held proposal bytes only in this isolated test fixture.
+   tampered,flow=self.prepare_flow(60);flow.step('preflight');flow.step('apply')
+   row,body=self.tx._get(tampered);original_store_bytes=row['body'];body['plan']['before'].append(' description tampered')
+   self.tx.db.execute('update transactions set body=? where id=?',(json.dumps(body),tampered))
+   before=json.loads((self.root/'device-state.json').read_text())
+   with self.assertRaisesRegex(ValueError,'approved_bundle_tampered'):flow.step('restore')
+   self.assertEqual(json.loads((self.root/'device-state.json').read_text()),before)
+   # Undo only our deliberate test injection, preserving the approved original
+   # bytes and every consumed approval/state field; this is not a recovery API.
+   self.tx.db.execute('update transactions set body=? where id=?',(original_store_bytes,tampered))
+   flow.step('restore');self.assertEqual(flow.step('verify_restored')['state'],'restored')
+   self.assertEqual(json.loads((self.root/'device-state.json').read_text()),{'access':False,'writes':4})
+   self.verify_all_chains()
+   print('LOCAL SYNTHETIC: expiry narrowed authority, original approval restored, pre-apply expiry wrote nothing, tampered rollback refused; native chains clean')
+ def test_native_unknown_response_stops_without_retry(self):
+  with self.scope.locked():
+   tid,flow=self.prepare_flow();flow.step('preflight')
+   (self.root/'drop-next-response').write_text('local test fault injection')
+   self.assertEqual(flow.step('apply')['state'],'unknown')
+   self.assertTrue((self.root/'STOP').exists());self.assertTrue((self.root/'v3-recovery/pending.json').exists())
+   self.assertEqual(json.loads((self.root/'device-state.json').read_text()),{'access':True,'writes':1})
+   with self.assertRaisesRegex(ValueError,'scope_stopped'):flow.step('apply')
+   with self.assertRaisesRegex(ValueError,'scope_stopped'):flow.step('restore')
+   self.assertEqual(json.loads((self.root/'device-state.json').read_text())['writes'],1)
+   _,body=self.tx._get(tid);pid=body['native_proposals']['forward']['proposal_id']
+   with sqlite3.connect(self.root/'chain.db') as db:
+    raw=db.execute('select artifact_content from artifacts where artifact_id=?',('outcome:'+pid,)).fetchone()[0]
+   self.assertIs(json.loads(raw)['success'],False);self.verify_all_chains()
+   print('LOCAL SYNTHETIC: dropped response produced native signed UNKNOWN, one simulated dispatch, STOP/pending preserved, no retry or restore bypass')
  def test_native_socket_roundtrip_and_replay(self):
   with self.scope.locked():
    read=self.native({'target':self.target});cmd='show running-config interface Ethernet0/1'
@@ -90,6 +156,7 @@ class NativePipeline(unittest.TestCase):
     row=dict(db.execute("select * from chain_entries where artifact_id like ?",('replay:'+pid+':%',)).fetchone())
     raw=db.execute('select artifact_content from artifacts where artifact_id=?',(row['artifact_id'],)).fetchone()[0].encode()
     self.assertEqual(dict(db.execute('select * from chain_entries where artifact_id=?',('outcome:'+pid,)).fetchone()),original)
+    self.assertEqual(db.execute('select artifact_content from artifacts where artifact_id=?',('outcome:'+pid,)).fetchone()[0].encode(),original_bytes)
     sessions=[(r[0],r[1]) for r in db.execute('select session_id,max(sequence) from chain_entries group by session_id')]
    result=verify_pair((row,raw),(original,original_bytes),public_key=self.producer,node_id=260,device='kestrel-ios',command=body['plan']['forward'],proposal_id=pid,gate_session='gate-enforce:kestrel-ios@port-test',approval_session=self.approval_session,prior_outcome_hash=original['artifact_hash'],not_before_ns=started)
    self.assertEqual(result['error_code'],-37)

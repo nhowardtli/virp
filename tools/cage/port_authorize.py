@@ -17,12 +17,17 @@ class PortAuthorization:
    self.call({'action':'prepare','body':body,'lease_seconds':seconds,'executor_boot_id':self.tx.boot_id})
    authorized=self.call({'action':'authorize'})
    if authorized.get('plan_sha256')!=digest(body) or type(authorized.get('expires_ns'))is not int:raise Refused('owner_authorization_binding_invalid')
-   a=self.tx.approval_request(self.tid,1,authorization=authorized['authorization'])
-   remaining=(authorized['expires_ns']-a['issued_ns'])//1000000000
-   if remaining<1:raise Refused('owner_lease_already_elapsed')
-   # Bind to the captured issue instant; the signer independently enforces its
-   # original Duo deadline. Delay cannot restart the approved duration.
-   a['lease_seconds']=min(seconds,remaining)
+   approved=authorized.get('approved_ns');duration=authorized.get('max_lease_seconds')
+   if (type(approved)is not int or type(duration)is not int or not 1<=duration<=seconds
+       or authorized['expires_ns']!=approved+duration*1000000000
+       or authorized['authorization'].get('approved_ns')!=approved):raise Refused('owner_authorization_binding_invalid')
+   # Preserve the original decision instant rather than rounding a subsecond
+   # remainder down to zero. Sampling boot time first makes this conservative.
+   boot=self.tx.boottime();now=self.tx.wall_ns()
+   if approved>now:raise Refused('owner_clock_ahead')
+   if now>=authorized['expires_ns']:raise Refused('owner_lease_already_elapsed')
+   a=self.tx.approval_request(self.tid,duration,authorization=authorized['authorization'])
+   a['issued_ns']=approved;a['issued_boottime']=boot-(now-approved)/1000000000
    signature=bytes.fromhex(self.call({'action':'sign_envelope','envelope':a})['signature'])
    self.scope.check();self.tx.approve(a,signature);self.tx.flush(self.events)
    return self.tx.status(self.tid)

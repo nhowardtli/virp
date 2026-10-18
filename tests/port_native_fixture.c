@@ -20,7 +20,7 @@ struct virp_conn { bool connected; };
 static onode_state_t node;
 static bool access_mode;
 static unsigned writes;
-static char state_path[256];
+static char state_path[256],drop_path[256];
 static virp_conn_t *fixture_connect(const virp_device_t *device)
 {
     (void)device;
@@ -62,6 +62,12 @@ static virp_error_t fixture_execute(virp_conn_t *c,const char *cmd,virp_exec_res
         r->no_dispatch=true;r->disposition=VIRP_DISPOSITION_NOT_SENT;
         snprintf(r->error_msg,sizeof(r->error_msg),"unsupported local fixture command");return VIRP_OK;
     }
+    if(!strncmp(cmd,"interface ",10)&&access(drop_path,F_OK)==0){
+        assert(unlink(drop_path)==0);
+        r->disposition=VIRP_DISPOSITION_EXECUTED_UNKNOWN;
+        snprintf(r->error_msg,sizeof(r->error_msg),"simulated response loss after dispatch");
+        return VIRP_OK;
+    }
     int n=snprintf(r->output,sizeof(r->output),"canary#%s\n%s",cmd,body);
     assert(n>0&&(size_t)n<sizeof(r->output));r->output_len=(size_t)n;
     r->success=true;r->disposition=VIRP_DISPOSITION_EXECUTED_CONFIRMED;return VIRP_OK;
@@ -76,7 +82,7 @@ int main(int argc,char **argv)
 #define PATH(dst,name) assert(snprintf(dst,sizeof(dst),"%s/" name,argv[1])<(int)sizeof(dst))
     PATH(sock,"onode.sock");PATH(db,"chain.db");PATH(chain_key,"chain.key");
     PATH(sign_key,"sign.key");PATH(pub,"sign.pub");PATH(registry,"approvers.json");
-    PATH(approvals,"approvals");PATH(state_path,"device-state.json");
+    PATH(approvals,"approvals");PATH(state_path,"device-state.json");PATH(drop_path,"drop-next-response");
 #undef PATH
     virp_driver_cisco_init();
     const virp_driver_t *cisco=virp_driver_lookup(VIRP_VENDOR_CISCO_IOS);assert(cisco);
