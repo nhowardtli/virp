@@ -1,3 +1,31 @@
+## 2026-10-18 — live CML port transaction candidate
+
+VM105 only: source **dd5fc4a**, v0.2.0-275-gdd5fc4a, binary SHA256
+`796689b64ec69bb3eb1eefb1d1f04422ab68309857d93177529559bdf256eb03`.
+VM227 separate canary runner installed; production runner and .211 unchanged.
+Snapshots `before-port-candidate-20261018` (105) and
+`before-port-runner-20261018` (227); root-only software/metadata recovery retained.
+Dedicated daemon-only credential group; cage/requester credential reads denied.
+
+Owner authorized five-hour canary renewal and LLDP/VLAN10 lab preparation.
+Lease expires 2026-10-18T16:00:20Z; request budget/consumed grants preserved.
+Fixed preparation ran through native C with test approvals, no direct device
+SSH bypass. VLAN10 active, LLDP enabled/zero neighbors. No write memory.
+
+Real model transaction `3764010b593a425c850360526c52595c`: mode_access,
+machine verify, exact baseline restore, replay -37; original outcome unchanged.
+Timing-harness transaction `1c98829aee5b4eb196b8f054dd29d445`: 30-second
+lease expired after apply, original-approval restore/verify passed. The normal
+canary transaction setting is restored to300seconds. Both transactions closed;
+STOP/pending absent;159 prior entries unchanged;54/96requestsused.
+
+Offline public-pin virp-verify0.1.3: **CRYPTOGRAPHICALLY-VERIFIED**,448entries,
+14chains,121v3frames (72new). No witness receipt. Native TTL remains300seconds;
+transaction expiry is helper/owner enforced. New-port UNKNOWN reconciliation,
+remaining live negative cases and remaining typed operations are not qualified.
+No production acceptance, real Duo or physical3850 result is claimed.
+Private evidence: audits/kestrel-canary-live-20261018/REPORT.md.
+
 ## 2026-10-17 — CML canary port-write preflight
 
 VM105 only: deployed source **3be7f74**, binary SHA256
