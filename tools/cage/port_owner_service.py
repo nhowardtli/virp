@@ -59,7 +59,7 @@ def main():
  os.umask(0o077)
  protected(__file__)
  module_dir=Path(__file__).resolve().parent
- for name in ('port_owner.py','port_duo.py','port_transaction.py','port_plan.py','port_challenge.py','recovery.py','helper.py'):
+ for name in ('port_owner.py','port_duo.py','port_transaction.py','port_plan.py','port_challenge.py','port_evidence.py','recovery.py','helper.py'):
   protected(module_dir/name)
  sys.path.insert(0,str(Path(__file__).resolve().parent))
  from port_owner import OwnerRequests

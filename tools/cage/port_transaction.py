@@ -16,6 +16,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from port_plan import plan as render
 from port_challenge import validate as validate_challenge
+from port_evidence import commands as precondition_commands
 
 DOMAIN = b'VIRP-PORT-TRANSACTION-APPROVAL-v1\x00'
 TARGETS = {('kestrel-ios','192.168.255.10','Ethernet0/1'):{'device_node_id':260,'transport_port':22},
@@ -30,7 +31,7 @@ def validate_bundle(body):
  # Validate finite render grammar even though this is a trusted internal API.
  try:
   target=body['target'];p=body['plan'];port=target['port']
-  if set(body)!={'target','plan','verification','precondition_hashes'}:raise ValueError()
+  if set(body)!={'target','plan','verification','precondition_hashes','native_proposals'}:raise ValueError()
   if set(target)!={'device','host','port','device_node_id','transport_port'} or tuple(target[k] for k in ('device','host','port')) not in TARGETS:raise ValueError()
   pins=TARGETS[tuple(target[k] for k in ('device','host','port'))]
   if any(type(target[k])is not int or target[k]!=v for k,v in pins.items()):raise ValueError()
@@ -41,6 +42,12 @@ def validate_bundle(body):
   for k in ('forward','rollback','before','expected','tier','schema','operation'):
    if p[k]!=rebuilt[k]:raise ValueError()
   if body['verification']!=['show interfaces '+port+' switchport','show running-config interface '+port]:raise ValueError()
+  inventory=body['native_proposals']
+  if set(inventory)!={'forward','restore','preflight','verify'} or not isinstance(inventory['verify'],list) or not 2<=len(inventory['verify'])<=8:raise ValueError()
+  refs=[inventory['forward'],inventory['restore'],inventory['preflight'],*inventory['verify']]
+  for ref in refs:
+   if set(ref)!={'proposal_id','artifact_hash','chain_entry_hash'} or not re.fullmatch('[a-f0-9]{32}',ref['proposal_id']) or not hex64(ref['artifact_hash']) or not hex64(ref['chain_entry_hash']):raise ValueError()
+  if any(len({ref[k] for ref in refs})!=len(refs) for k in ('proposal_id','artifact_hash','chain_entry_hash')):raise ValueError()
   if not body['precondition_hashes'] or not all(hex64(x) for x in body['precondition_hashes']):raise ValueError()
  except (KeyError,TypeError,ValueError):raise Refused('invalid_transaction_bundle') from None
 
@@ -55,7 +62,7 @@ class Transactions:
   self.db.executescript('''
    CREATE TABLE IF NOT EXISTS transactions(id TEXT PRIMARY KEY,body TEXT NOT NULL,hash TEXT NOT NULL,
     state TEXT NOT NULL,boot TEXT NOT NULL,approval TEXT,signature TEXT,expires_ns INTEGER,
-    deadline REAL,expired INTEGER NOT NULL DEFAULT 0,close_reason TEXT);
+    deadline REAL,preflight_wall_ns INTEGER,preflight_boot REAL,expired INTEGER NOT NULL DEFAULT 0,close_reason TEXT);
    CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,transaction_id TEXT UNIQUE NOT NULL);
    CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,transaction_id TEXT NOT NULL,verb TEXT NOT NULL,
     dispatched INTEGER NOT NULL DEFAULT 0,finished INTEGER NOT NULL DEFAULT 0);
@@ -130,11 +137,11 @@ class Transactions:
  def _refresh(self,tid):
   with self.atomic():
    row,_=self._get(tid)
-   if row['state'] not in ('restored','expired-before-apply') and row['approval'] and not row['expired'] and (self.wall_ns()>=row['expires_ns'] or self.boottime()>=row['deadline']):
+   if row['state'] not in ('restored','expired-before-apply','preflight-refused') and row['approval'] and not row['expired'] and (self.wall_ns()>=row['expires_ns'] or self.boottime()>=row['deadline']):
     self.db.execute('UPDATE transactions SET expired=1 WHERE id=?',(tid,))
     self._event(tid,'lease_expired',approval_id=json.loads(row['approval'])['approval_id'],transaction_state=row['state'])
     req=self.db.execute("SELECT dispatched FROM requests WHERE transaction_id=? AND verb='apply' ORDER BY rowid DESC LIMIT 1",(tid,)).fetchone()
-    if row['state']=='approved' or (row['state']=='applying' and req and not req['dispatched']):
+    if row['state'] in ('approved','preflight_verified','preflighting') or (row['state']=='applying' and req and not req['dispatched']):
      self.db.execute("UPDATE transactions SET state='expired-before-apply',close_reason='lease_expired' WHERE id=?",(tid,))
      self._event(tid,'close',reason='expired-before-apply')
  def status(self,tid):
@@ -144,14 +151,15 @@ class Transactions:
   self._refresh(tid)
   with self.atomic():
    row,body=self._get(tid)
-   allowed={'apply':('approved',),'verify':('applied','verified'),'restore':('applied','verified','verify_failed'),
+   allowed={'preflight':('approved',),'apply':('preflight_verified',),'verify':('applied','verified'),'restore':('applied','verified','verify_failed'),
             'verify_restored':('restore_applied',),'reconcile':('unknown',)}
    if verb not in allowed or row['state'] not in allowed[verb]:raise Refused('verb_not_allowed_in_transaction_state')
-   if not row['approval'] or (row['expired'] and verb=='apply'):raise Refused('lease_expired')
+   if verb=='apply':self._fresh_preflight(row)
+   if not row['approval'] or (row['expired'] and verb in ('apply','preflight')):raise Refused('lease_expired')
    if self.db.execute('SELECT 1 FROM events WHERE transaction_id=? AND receipt IS NULL',(tid,)).fetchone():raise Refused('chain_receipt_required')
    rid=uuid.uuid4().hex
    self.db.execute('INSERT INTO requests(id,transaction_id,verb) VALUES(?,?,?)',(rid,tid,verb))
-   state={'apply':'applying','verify':'verifying','restore':'restoring','verify_restored':'verifying_restore','reconcile':'reconciling'}[verb]
+   state={'preflight':'preflighting','apply':'applying','verify':'verifying','restore':'restoring','verify_restored':'verifying_restore','reconcile':'reconciling'}[verb]
    self.db.execute('UPDATE transactions SET state=? WHERE id=?',(state,tid))
    self._event(tid,verb+'_intent',request_id=rid,approval_id=json.loads(row['approval'])['approval_id'],plan_sha256=row['hash'])
    return {'transaction_id':tid,'request_id':rid,'verb':verb}
@@ -160,20 +168,29 @@ class Transactions:
   q=self.db.execute('SELECT * FROM requests WHERE id=?',(r['request_id'],)).fetchone()
   if q is None or q['transaction_id']!=r['transaction_id'] or q['verb']!=r['verb'] or q['finished']:raise Refused('request_reused_or_mismatched')
   row,body=self._get(r['transaction_id']);return q,row,body
+ def _fresh_preflight(self,row):
+  if row['preflight_wall_ns'] is None or row['preflight_boot'] is None or not 0<=self.wall_ns()-row['preflight_wall_ns']<=30000000000 or not 0<=self.boottime()-row['preflight_boot']<=30:raise Refused('preflight_stale')
  def _native_command(self,q,row,body,command):
   if q['dispatched']:raise Refused('dispatch_already_consumed')
-  if not row['approval'] or (q['verb']=='apply' and (row['expired'] or self.wall_ns()>=row['expires_ns'] or self.boottime()>=row['deadline'])):raise Refused('lease_expired')
+  if q['verb']=='apply':self._fresh_preflight(row)
+  if not row['approval'] or (q['verb'] in ('apply','preflight') and (row['expired'] or self.wall_ns()>=row['expires_ns'] or self.boottime()>=row['deadline'])):raise Refused('lease_expired')
   if q['verb'] in ('apply','restore'):
    expected=body['plan']['forward' if q['verb']=='apply' else 'rollback'];tier='RED'
   else:
    expected='show running-config interface '+body['target']['port'];tier='YELLOW'
   if command!=expected:raise Refused('native_command_outside_approved_plan')
   return tier
+ def _native_ids(self,q,body):
+  inventory=body['native_proposals']
+  phase={'apply':'forward','restore':'restore','preflight':'preflight'}.get(q['verb'],'verify')
+  refs=inventory['verify'] if phase=='verify' else [inventory[phase]]
+  return {ref['proposal_id'] for ref in refs}
  def reserve_native(self,r,challenge):
   self._refresh(r['transaction_id'])
   with self.atomic():
    q,row,body=self._request(r)
    command=challenge.get('command');tier=self._native_command(q,row,body,command)
+   if challenge.get('proposal_id') not in self._native_ids(q,body):raise Refused('native_proposal_not_in_approved_inventory')
    validate_challenge(challenge,device=body['target']['device'],command=command,
     node_id=body['target']['device_node_id'],now_ns=self.wall_ns(),tier=tier)
    if self.db.execute('SELECT 1 FROM events WHERE transaction_id=? AND receipt IS NULL',(row['id'],)).fetchone():raise Refused('chain_receipt_required')
@@ -189,6 +206,7 @@ class Transactions:
    q,row,body=self._request(r)
    n=self.db.execute('SELECT * FROM native_issuances WHERE proposal_id=? AND request_id=?',(proposal_id,r['request_id'])).fetchone()
    if n is None or n['issued']:raise Refused('native_approval_unknown_or_reused')
+   if proposal_id not in self._native_ids(q,body):raise Refused('native_proposal_not_in_approved_inventory')
    tier=self._native_command(q,row,body,n['command'])
    if json.loads(n['challenge'])['proposal_id']!=proposal_id:raise Refused('native_proposal_binding_changed')
    raw=validate_challenge(json.loads(n['challenge']),device=body['target']['device'],command=n['command'],node_id=body['target']['device_node_id'],now_ns=self.wall_ns(),tier=tier)
@@ -201,7 +219,8 @@ class Transactions:
   with self.atomic():
    q,row,body=self._request(r)
    if q['dispatched']:raise Refused('dispatch_already_consumed')
-   if row['state']=='expired-before-apply' or (q['verb']=='apply' and (row['expired'] or self.wall_ns()>=row['expires_ns'] or self.boottime()>=row['deadline'])):raise Refused('lease_expired')
+   if q['verb']=='apply':self._fresh_preflight(row)
+   if row['state']=='expired-before-apply' or (q['verb'] in ('apply','preflight') and (row['expired'] or self.wall_ns()>=row['expires_ns'] or self.boottime()>=row['deadline'])):raise Refused('lease_expired')
    if self.db.execute('SELECT 1 FROM events WHERE transaction_id=? AND receipt IS NULL',(row['id'],)).fetchone():raise Refused('chain_receipt_required')
    needed=body['plan']['forward' if q['verb']=='apply' else 'rollback'] if q['verb'] in ('apply','restore') else 'show running-config interface '+body['target']['port']
    n=self.db.execute('SELECT issued FROM native_issuances WHERE request_id=? AND command=?',(r['request_id'],needed)).fetchone()
@@ -209,7 +228,7 @@ class Transactions:
    self.db.execute('UPDATE requests SET dispatched=1 WHERE id=?',(r['request_id'],))
    # Durable reservation before device dispatch. A crash here requires reconciliation.
    if q['verb'] in ('apply','restore'):return body['plan']['forward' if q['verb']=='apply' else 'rollback']
-   return list(body['verification'])
+   return list(precondition_commands(body['target']['port']).values()) if q['verb']=='preflight' else list(body['verification'])
  def record_interruption(self,r,reason):
   # Root adapter only, after establishing the request worker is no longer
   # active. This is a helper event, never fabricated native UNKNOWN evidence.
@@ -217,11 +236,12 @@ class Transactions:
   self._refresh(r['transaction_id'])
   with self.atomic():
    q,row,_=self._request(r)
-   if row['state'] in ('restored','expired-before-apply'):raise Refused('transaction_already_closed')
+   if row['state'] in ('restored','expired-before-apply','preflight-refused'):raise Refused('transaction_already_closed')
    self.db.execute('UPDATE requests SET finished=1 WHERE id=?',(r['request_id'],))
-   self.db.execute("UPDATE transactions SET state='unknown' WHERE id=?",(row['id'],))
+   self.db.execute('UPDATE transactions SET state=?,close_reason=? WHERE id=?',('preflight-refused' if q['verb']=='preflight' else 'unknown','preflight-unproven' if q['verb']=='preflight' else None,row['id']))
    self._event(row['id'],'helper_interruption',request_id=r['request_id'],reason=reason,
     dispatch_reserved=bool(q['dispatched']),native_result_available=False)
+   if q['verb']=='preflight':self._event(row['id'],'close',reason='preflight-unproven')
  def finish(self,r,outcome,*,observation_hash):
   if not hex64(observation_hash):raise Refused('missing_observation')
   self._refresh(r['transaction_id'])
@@ -229,7 +249,17 @@ class Transactions:
    q,row,_=self._request(r)
    if not q['dispatched']:raise Refused('request_not_dispatched')
    verb=q['verb'];next_state=None;reason=None
-   if verb in ('apply','restore'):
+   if verb=='preflight' and row['state']=='expired-before-apply':
+    if outcome not in ('matches','mismatch','unknown'):raise Refused('invalid_outcome')
+    self.db.execute('UPDATE requests SET finished=1 WHERE id=?',(r['request_id'],))
+    self._event(row['id'],'preflight_outcome',request_id=r['request_id'],outcome=outcome,observation_hash=observation_hash,ignored_for_apply=True)
+    return
+   if verb=='preflight':
+    if outcome=='matches':
+     next_state='preflight_verified'
+     self.db.execute('UPDATE transactions SET preflight_wall_ns=?,preflight_boot=? WHERE id=?',(self.wall_ns(),self.boottime(),row['id']))
+    elif outcome in ('mismatch','unknown'):next_state='preflight-refused';reason='preflight-mismatch' if outcome=='mismatch' else 'preflight-unproven'
+   elif verb in ('apply','restore'):
     if outcome=='executed':next_state='applied' if verb=='apply' else 'restore_applied'
     elif outcome=='unknown':next_state='unknown'
    elif verb=='verify':

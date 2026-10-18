@@ -133,13 +133,16 @@ class OwnerRequests:
    command=event['command'];p=body['plan']
    if command==p['forward']:phase='forward';tier='RED'
    elif command==p['rollback']:phase='restore';tier='RED'
-   elif command=='show running-config interface '+target['port']:phase='verify';tier='YELLOW'
+   elif command=='show running-config interface '+target['port']:
+    phase='preflight' if challenge['proposal_id']==body['native_proposals']['preflight']['proposal_id'] else 'verify';tier='YELLOW'
    else:raise Refused('native_command_outside_owner_approval')
-   if phase=='forward':
+   inventory=body['native_proposals'];refs=inventory['verify'] if phase=='verify' else [inventory[phase]]
+   if challenge['proposal_id'] not in {ref['proposal_id'] for ref in refs}:raise Refused('native_proposal_not_in_owner_approved_inventory')
+   if phase in ('forward','preflight'):
     if self.clock()>=row['deadline'] or self.now()>=a['issued_ns']+a['lease_seconds']*1000000000:raise Refused('owner_approval_expired')
    elif not self.db.execute("SELECT 1 FROM native_signatures WHERE transaction_id=? AND phase='forward' AND state='signed'",(tid,)).fetchone():
     raise Refused('native_forward_not_issued')
-   if phase in ('forward','restore') and self.db.execute('SELECT 1 FROM native_signatures WHERE transaction_id=? AND phase=?',(tid,phase)).fetchone():raise Refused('native_phase_already_issued')
+   if phase in ('forward','restore','preflight') and self.db.execute('SELECT 1 FROM native_signatures WHERE transaction_id=? AND phase=?',(tid,phase)).fetchone():raise Refused('native_phase_already_issued')
    if phase=='verify' and self.db.execute("SELECT COUNT(*) FROM native_signatures WHERE transaction_id=? AND phase='verify'",(tid,)).fetchone()[0]>=8:raise Refused('native_verification_budget_exhausted')
    raw=validate_challenge(challenge,device=target['device'],command=command,node_id=target['device_node_id'],now_ns=self.now(),tier=tier)
    try:self.db.execute('INSERT INTO native_signatures(proposal_id,transaction_id,phase,event_id,request_id,state) VALUES(?,?,?,?,?,?)',(challenge['proposal_id'],tid,phase,event['event_id'],event['request_id'],'signing'))
@@ -161,7 +164,7 @@ class OwnerRequests:
        or entry['artifact_type']!='evidence_item' or entry['session_id']!=profile['chain_session']
        or entry['signer_node_id']!=profile['node_id'] or event.get('schema')!='kestrel-port-event/1'
        or event.get('transaction_id')!=tid or event.get('type')!='close'
-       or event.get('reason') not in ('roundtrip_complete','lease_expired','reconciled_to_baseline','expired-before-apply')):
+       or event.get('reason') not in ('roundtrip_complete','lease_expired','reconciled_to_baseline','expired-before-apply','preflight-mismatch','preflight-unproven')):
     raise Refused('owner_close_binding_invalid')
    self.db.execute("UPDATE owner_requests SET state='closed' WHERE id=?",(tid,))
    self.event(tid,'closed',reason=event['reason'],chain_entry_hash=entry['chain_entry_hash'])

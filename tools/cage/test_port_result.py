@@ -1,6 +1,6 @@
 import unittest
 from port_plan import plan
-from port_result import compare, capture_after
+from port_result import compare, capture_after, compare_preflight
 from test_port_evidence import fixture
 class Comparisons(unittest.TestCase):
  def setUp(self):
@@ -18,6 +18,17 @@ class Comparisons(unittest.TestCase):
    d={**self.after,'switchport':self.after['switchport'].replace(old,new)};self.assertEqual(compare(self.p,d),'mismatch')
  def test_missing_extra_and_unparseable_reads_unknown(self):
   for d in [{'config':self.after['config']},{**self.after,'extra':'output'},{**self.after,'switchport':'% Invalid input'}]:self.assertEqual(compare(self.p,d),'unknown')
+class PreflightComparison(unittest.TestCase):
+ def setUp(self):
+  self.outputs=fixture();self.body={'target':{'port':'Ethernet0/1'},'plan':plan(self.outputs['config'],'Ethernet0/1','vlan_10',active_vlans={10})}
+ def test_complete_unchanged_preconditions(self):self.assertEqual(compare_preflight(self.body,self.outputs,protected_ports=set()),'matches')
+ def test_config_drift_before_apply(self):
+  self.outputs['config']=self.outputs['config'].replace(' shutdown',' description changed\n shutdown')
+  self.assertEqual(compare_preflight(self.body,self.outputs,protected_ports=set()),'mismatch')
+ def test_neighbor_or_missing_evidence_blocks(self):
+  self.outputs['lldp']='Total entries displayed: 1'
+  self.assertEqual(compare_preflight(self.body,self.outputs,protected_ports=set()),'unknown')
+  del self.outputs['lldp'];self.assertEqual(compare_preflight(self.body,self.outputs,protected_ports=set()),'unknown')
 class Ordering(unittest.TestCase):
  def setUp(self):
   from test_helper import Contract

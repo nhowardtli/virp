@@ -33,7 +33,9 @@ separate test approver, never the owner's private key.
    bundle, and append its proposal event to the native chain.
 2. Independently authorize and sign the exact transaction envelope. Store it and
    append the approval event. Lease time begins at its signed issuance time.
-3. Reserve one apply request. Flush its event through `EventLedger` before
+3. Recheck all prerequisites through the preallocated preflight read authority.
+   Only an unchanged, fully verified baseline advances to preflight_verified.
+   Reserve one apply request. Flush its event through `EventLedger` before
    reserving a native challenge for its exact command and pinned device.
 4. Flush the native approval intent. `native_signable` durably consumes issuance
    before returning exact VAP1 bytes to the trusted signer adapter. The independent
@@ -189,13 +191,19 @@ Before enabling the runtime, native forward/restore proposals must be filed and
 bound into the transaction *before* owner approval. The existing C daemon can
 issue a fresh challenge for an unconsumed, already-filed proposal; this permits a
 fresh short-lived restore signature without creating a new restore proposal at
-expiry. The current transaction bundle does not yet pin that proposal inventory.
-This must be implemented before live expiry acceptance, not worked around by
-silently creating a new proposal after expiry.
+expiry. The transaction bundle now pins an inventory of forward, restore, preflight
+and two to eight verification proposals, each with its native artifact and chain
+entry hashes. Both coordinator and helper refuse an unlisted proposal even if
+a valid producer signs a later intent for it. The runtime must verify each native
+proposal reference before preparing this bundle; lexical reference validation
+alone is not proof that a native proposal was filed.
 
 The runtime must also recheck the complete approved baseline before forward
-apply. Current parser/state libraries do not themselves dispatch or collect that
-second preflight. A trusted caller supplying a hash or `matches` is not sufficient
+apply. The state engine now requires preflight success and refuses apply when that
+check is more than 30 seconds old by either wall or boot time. Expiry during
+preflight closes before apply; a late read result cannot reopen the transaction.
+The runtime adapter must collect that second preflight using authenticated
+frames and the complete precondition set. A trusted caller supplying a hash or `matches` is not sufficient
 for an exposed cage endpoint. Live dispatch remains disabled until these adapters
 are wired and qualified.
 

@@ -6,8 +6,8 @@ This is the initial config/switchport comparator, not complete VLAN/log coverage
 """
 import re
 import struct
-from port_plan import verify
-from port_evidence import verified_capture,one_field
+from port_plan import verify,config_lines
+from port_evidence import verified_capture,one_field,preconditions
 
 def capture_after(*,not_before_ns,min_chain_sequence,**bindings):
  result=verified_capture(**bindings)
@@ -29,5 +29,15 @@ def compare(p,outputs,*,restore=False):
   target_mode='static access' if ' switchport mode access' in expected else 'dynamic auto'
   if not verify(p,outputs['config'],restore):return 'mismatch'
   if name not in (port,short) or enabled!='Enabled' or oper!='down' or mode!=target_mode or int(vlan.split()[0])!=target_vlan:return 'mismatch'
+  return 'matches'
+ except (ValueError,KeyError,TypeError):return 'unknown'
+
+
+def compare_preflight(body,outputs,*,protected_ports):
+ try:
+  p=body['plan'];port=body['target']['port']
+  if config_lines(outputs['config'],port)!=p['before']:return 'mismatch'
+  current=preconditions(outputs,port,p['operation'],protected_ports=protected_ports)
+  if any(current[k]!=p[k] for k in ('before','forward','rollback','expected','operation','tier')):return 'mismatch'
   return 'matches'
  except (ValueError,KeyError,TypeError):return 'unknown'
