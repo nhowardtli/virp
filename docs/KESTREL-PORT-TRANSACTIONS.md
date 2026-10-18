@@ -149,3 +149,27 @@ This entrypoint is **not installed**. A separate executor-authenticated transpor
 and restricted forced-command account must be provisioned before .211 can use
 it. The existing ThinkPad-to-PVE-to-CT224 administrative route does not establish
 that transport. No SSH key, sudoers entry, account or daemon was created here.
+
+## Target identity and transport findings, 2026-10-18
+
+The approved target carries device, host, physical port, transport_port and explicit device_node_id.
+The canary config pins device_node_id to 260 (hex 00000104); it is not derived
+from its IP address. The current canary SSH transport port is 22; the current
+production C config uses 10.0.10.2:2223 with device node 0A000A02. These are
+observed config pins, not instructions to alter either device. Producer node identity and the 64-bit observation device ID
+are separate bindings and must also be checked by the helper. The signed native
+challenge uses the configured device node ID.
+
+Read-only management checks found CT224's SSH active at 10.0.20.224, reachable
+from .211 without firewall changes. Its existing signing key and Duo config are
+root-owned 0600, and its approval state directory is root-owned 0700. The new
+wrapper and restricted kestrel-approve account are absent. Public SSH/approver
+pins were captured through the existing authenticated Proxmox management route;
+no private material was exported.
+
+`port_owner_remote` fixes the owner destination and command, disables inherited
+SSH config, agent use/forwarding, multiplexing, proxy commands, password auth and
+host-key updates, and requires a root-protected explicit known-hosts file. JSON
+travels only on stdin. Timeout or malformed response is indeterminate and never
+automatically retried. This client is source-only until restricted account,
+forced command, client key and pinned host file are provisioned.

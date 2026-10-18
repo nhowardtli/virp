@@ -13,7 +13,7 @@ class TransactionTests(unittest.TestCase):
   self.tmp=tempfile.TemporaryDirectory();self.clock=Clock();self.key=Ed25519PrivateKey.generate()
   pub=self.key.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
   self.dbpath=str(Path(self.tmp.name)/'state.db');self.public=pub;self.store=self.open()
-  self.body={'target':{'device':'kestrel-ios','host':'192.168.255.10','port':'Ethernet0/1'},'plan':plan(BASE,'Ethernet0/1','mode_access'),'verification':['show interfaces Ethernet0/1 switchport','show running-config interface Ethernet0/1'],'precondition_hashes':['a'*64]}
+  self.body={'target':{'device':'kestrel-ios','host':'192.168.255.10','port':'Ethernet0/1','device_node_id':260,'transport_port':22},'plan':plan(BASE,'Ethernet0/1','mode_access'),'verification':['show interfaces Ethernet0/1 switchport','show running-config interface Ethernet0/1'],'precondition_hashes':['a'*64]}
   self.tid=self.store.create(self.body)
  def open(self):return Transactions(self.dbpath,self.public,owner='test-approver',wall_ns=lambda:self.clock.wall,boottime=lambda:self.clock.boot,boot_id='boot1',max_lease_seconds=300,required_approval_method='test')
  def tearDown(self):self.store.close();self.tmp.cleanup()
@@ -27,7 +27,7 @@ class TransactionTests(unittest.TestCase):
  def challenge(self,r):
   cmd=self.body['plan']['forward' if r['verb']=='apply' else 'rollback'] if r['verb'] in ('apply','restore') else 'show running-config interface Ethernet0/1'
   pid=uuid.uuid4().hex
-  return {'proposal_id':pid,'device':'kestrel-ios','command':cmd,'device_node_id':0xc0a8ff0a,'tier':'RED' if r['verb'] in ('apply','restore') else 'YELLOW','ttl_seconds':300,'canonical':struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),0xc0a8ff0a,self.clock.wall,300).hex()}
+  return {'proposal_id':pid,'device':'kestrel-ios','command':cmd,'device_node_id':260,'tier':'RED' if r['verb'] in ('apply','restore') else 'YELLOW','ttl_seconds':300,'canonical':struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,self.clock.wall,300).hex()}
  def native(self,r):
   challenge=self.challenge(r);pid=self.store.reserve_native(r,challenge);self.flush();self.store.native_signable(r,pid);self.flush();return pid
  def test_missing_native_issuance_blocks_dispatch(self):
@@ -140,6 +140,9 @@ class TransactionTests(unittest.TestCase):
   b=copy.deepcopy(self.body);b['plan']['forward']='interface Ethernet0/2 shutdown'
   from port_transaction import digest
   b['plan']['bundle_sha256']=digest({k:v for k,v in b['plan'].items() if k!='bundle_sha256'})
+  with self.assertRaises(Refused):self.store.create(b)
+ def test_wrong_device_node_pin_rejected(self):
+  b=copy.deepcopy(self.body);b['target']['device_node_id']=0xc0a8ff0a
   with self.assertRaises(Refused):self.store.create(b)
  def test_unauthorized_verification_command_rejected(self):
   b=copy.deepcopy(self.body);b['verification'].append('show running-config')

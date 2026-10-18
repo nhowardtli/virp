@@ -6,7 +6,6 @@ loading code. Production must fix owner=nhoward-admin; tests use a distinct key.
 """
 from contextlib import contextmanager
 import json
-import ipaddress
 import math
 import re
 import sqlite3
@@ -65,7 +64,7 @@ class OwnerRequests:
    self.event(tid,'push_started',plan_sha256=row['hash'])
   pre=duo.preauth(self.owner)
   if pre.get('result')!='auth':raise Refused('explicit_duo_factor_required')
-  context={'Plan':tid,'SHA256':row['hash'],'Target':body['target']['host'],
+  context={'Plan':tid,'SHA256':row['hash'],'Target':body['target']['host']+':'+str(body['target']['transport_port']),
    'Interface':body['target']['port'],'Forward':body['plan']['forward'],
    'Restore':body['plan']['rollback'],'Lease seconds':str(row['lease']),
    'Scope':'Apply once, verify, restore baseline, verify; no save'}
@@ -142,7 +141,7 @@ class OwnerRequests:
     raise Refused('native_forward_not_issued')
    if phase in ('forward','restore') and self.db.execute('SELECT 1 FROM native_signatures WHERE transaction_id=? AND phase=?',(tid,phase)).fetchone():raise Refused('native_phase_already_issued')
    if phase=='verify' and self.db.execute("SELECT COUNT(*) FROM native_signatures WHERE transaction_id=? AND phase='verify'",(tid,)).fetchone()[0]>=8:raise Refused('native_verification_budget_exhausted')
-   raw=validate_challenge(challenge,device=target['device'],command=command,node_id=int(ipaddress.IPv4Address(target['host'])),now_ns=self.now(),tier=tier)
+   raw=validate_challenge(challenge,device=target['device'],command=command,node_id=target['device_node_id'],now_ns=self.now(),tier=tier)
    try:self.db.execute('INSERT INTO native_signatures(proposal_id,transaction_id,phase,event_id,request_id,state) VALUES(?,?,?,?,?,?)',(challenge['proposal_id'],tid,phase,event['event_id'],event['request_id'],'signing'))
    except sqlite3.IntegrityError:raise Refused('native_signature_reused') from None
    self.event(tid,'native_signing',phase=phase,proposal_id=challenge['proposal_id'],intent_chain_entry=entry['chain_entry_hash'],approval_id=a['approval_id'])

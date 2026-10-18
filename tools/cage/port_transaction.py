@@ -6,7 +6,6 @@ model receives verb names only. Native command approvals remain mandatory.
 """
 from contextlib import contextmanager
 import hashlib
-import ipaddress
 import json
 import math
 import re
@@ -19,8 +18,8 @@ from port_plan import plan as render
 from port_challenge import validate as validate_challenge
 
 DOMAIN = b'VIRP-PORT-TRANSACTION-APPROVAL-v1\x00'
-TARGETS = {('kestrel-ios','192.168.255.10','Ethernet0/1'),
-           ('SW-3850','10.0.10.2','GigabitEthernet1/0/22')}
+TARGETS = {('kestrel-ios','192.168.255.10','Ethernet0/1'):{'device_node_id':260,'transport_port':22},
+           ('SW-3850','10.0.10.2','GigabitEthernet1/0/22'):{'device_node_id':0x0a000a02,'transport_port':2223}}
 class Refused(ValueError):pass
 
 def canonical(obj):return json.dumps(obj,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()
@@ -32,7 +31,9 @@ def validate_bundle(body):
  try:
   target=body['target'];p=body['plan'];port=target['port']
   if set(body)!={'target','plan','verification','precondition_hashes'}:raise ValueError()
-  if set(target)!={'device','host','port'} or tuple(target[k] for k in ('device','host','port')) not in TARGETS:raise ValueError()
+  if set(target)!={'device','host','port','device_node_id','transport_port'} or tuple(target[k] for k in ('device','host','port')) not in TARGETS:raise ValueError()
+  pins=TARGETS[tuple(target[k] for k in ('device','host','port'))]
+  if any(type(target[k])is not int or target[k]!=v for k,v in pins.items()):raise ValueError()
   if p['port']!=port or p['save'] is not False:raise ValueError()
   if digest({k:v for k,v in p.items() if k!='bundle_sha256'})!=p['bundle_sha256']:raise ValueError()
   baseline='interface '+port+'\n'+'\n'.join(p['before'])+'\nend'
@@ -174,7 +175,7 @@ class Transactions:
    q,row,body=self._request(r)
    command=challenge.get('command');tier=self._native_command(q,row,body,command)
    validate_challenge(challenge,device=body['target']['device'],command=command,
-    node_id=int(ipaddress.IPv4Address(body['target']['host'])),now_ns=self.wall_ns(),tier=tier)
+    node_id=body['target']['device_node_id'],now_ns=self.wall_ns(),tier=tier)
    if self.db.execute('SELECT 1 FROM events WHERE transaction_id=? AND receipt IS NULL',(row['id'],)).fetchone():raise Refused('chain_receipt_required')
    try:self.db.execute('INSERT INTO native_issuances(proposal_id,request_id,command,challenge) VALUES(?,?,?,?)',(challenge['proposal_id'],r['request_id'],command,canonical(challenge).decode()))
    except sqlite3.IntegrityError:raise Refused('native_approval_already_reserved') from None
@@ -190,7 +191,7 @@ class Transactions:
    if n is None or n['issued']:raise Refused('native_approval_unknown_or_reused')
    tier=self._native_command(q,row,body,n['command'])
    if json.loads(n['challenge'])['proposal_id']!=proposal_id:raise Refused('native_proposal_binding_changed')
-   raw=validate_challenge(json.loads(n['challenge']),device=body['target']['device'],command=n['command'],node_id=int(ipaddress.IPv4Address(body['target']['host'])),now_ns=self.wall_ns(),tier=tier)
+   raw=validate_challenge(json.loads(n['challenge']),device=body['target']['device'],command=n['command'],node_id=body['target']['device_node_id'],now_ns=self.wall_ns(),tier=tier)
    if self.db.execute('SELECT 1 FROM events WHERE transaction_id=? AND receipt IS NULL',(row['id'],)).fetchone():raise Refused('chain_receipt_required')
    self.db.execute('UPDATE native_issuances SET issued=1 WHERE proposal_id=?',(proposal_id,))
    self._event(row['id'],'native_signature_issuance',request_id=r['request_id'],proposal_id=proposal_id)
