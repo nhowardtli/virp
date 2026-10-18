@@ -2591,3 +2591,20 @@ all-tests: test-cisco-port-ops
 test-cage-port-plan:
 	cd tools/cage && python3 -m unittest test_port_plan
 all-tests: test-cage-port-plan
+
+# Actual local C socket/approval/chain pipeline with simulated device callbacks.
+# Requires CISCO=1 for the real classifier; never contacts a network device.
+$(BUILD_DIR)/port_native_fixture: tests/port_native_fixture.c $(LIB)
+	@test "$(CISCO)" = "1" || { echo "CISCO=1 is required for the native port fixture"; exit 1; }
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+.PHONY: test-port-native-pipeline
+test-port-native-pipeline: $(BUILD_DIR)/port_native_fixture
+	umask 077; VIRP_PORT_FIXTURE="$(abspath $(BUILD_DIR)/port_native_fixture)" python3 tests/test_port_native_pipeline.py
+
+.PHONY: test-bundle-encoding
+test-bundle-encoding:
+	python3 tools/bundle/test_export_encoding.py
+all-tests: test-bundle-encoding
+ifeq ($(CISCO),1)
+all-tests: test-port-native-pipeline
+endif

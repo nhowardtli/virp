@@ -342,3 +342,30 @@ It accepts existing native database and exported signature representations.
 A read-only compatibility check passed against the already accepted October16
 production description packet using its external producer pin. That is historical
 format compatibility, not a new write, witness head or acceptance packet.
+
+## Local native integration and export regression
+
+`make CISCO=1 test-port-native-pipeline` starts a real local C O-Node with an
+in-memory test device. The production Cisco classifier, Unix socket protocol,
+approval store, v3 signing and native chain implementation are exercised. Its
+callbacks perform no network I/O. This is a test binary, excluded from production
+installation. The pipeline uses generated test keys and explicit test authority.
+
+The first successful round trip produced 29 v3 frames and 122 native entries in
+four chains. Forward and restore each reached the simulated device once; replay
+returned -37, the prior outcome row remained byte-for-byte unchanged, and every
+native chain verified with zero open executions. These are local integration
+results, not VM227, VM105 or physical Cisco acceptance.
+
+The independent offline verifier found an exporter defect: SQLite TEXT records
+using the `base64:` transport wrapper were copied as wrapper text instead of
+original frame bytes. `virp_export_bundle.py` now strictly decodes that storage
+representation. Literal UTF-8 and BLOB bytes remain exact; malformed encoded
+storage refuses before bundle output. No chain, frame, signature or verifier
+format changed. The failed export is retained in the private session audit.
+
+With the corrected export, the unchanged virp-verify 0.1.3 returned
+CRYPTOGRAPHICALLY-VERIFIED for all122 entries/four chains in a network-disabled,
+read-only container as UID65534 with only the external test public pin and
+bundle mounted. No witness receipt exists for this synthetic run; it does not
+establish a physical device or a real Duo approval.
