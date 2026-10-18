@@ -122,3 +122,30 @@ delta or operational port-security acceptance reads.
 The synthetic pipeline test joins the coordinator, transaction state and signed
 ledger for expiry/restore/closure. It uses generated test keys, mock Duo and
 mock device outcomes. It is not live qualification evidence.
+
+## Root owner entrypoint (source-only)
+
+`port_owner_service.py` is a one-request stdin/stdout entrypoint, not a listener.
+It requires root, a root-owned profile and all local modules, a pinned machine
+ID, a private state directory, and a matching Ed25519 PEM private key/public pin.
+Production identity is fixed to nhoward-admin. Duo secrets stay in the existing
+root-protected Auth Proxy configuration. They are not command arguments or output.
+The source `port_duo` adapter preserves the already-qualified description
+coordinator's no-redirect/no-proxy/no-retry behavior. Verified-push requirements
+are not downgraded: without an owner number-display interface, that flow refuses.
+
+Allowed JSON actions are prepare, authorize, sign_envelope, sign_native, close
+and status, each with exact fields. No arbitrary command, file path, owner or
+signing key can be supplied through the JSON request. Device provisioning comes
+from the protected profile. The profile has schema `kestrel-port-owner/1` and
+fields machine_id, database, private_key, public_key_hex, duo_config, duo_section,
+max_lease_seconds and producers. Each producer is keyed by a provisioned device
+name and contains public_key_hex, node_id and chain_session. Private files and
+the state directory must disallow group/other permissions. Public modules/pins
+must disallow group/other writes. Maximum supported lease is ten hours; the
+protected profile and per-proposal owner decision may set a shorter duration.
+
+This entrypoint is **not installed**. A separate executor-authenticated transport
+and restricted forced-command account must be provisioned before .211 can use
+it. The existing ThinkPad-to-PVE-to-CT224 administrative route does not establish
+that transport. No SSH key, sudoers entry, account or daemon was created here.
