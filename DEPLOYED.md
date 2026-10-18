@@ -3232,3 +3232,37 @@ interlocks retained. Native deadline binding, UNKNOWN reconciliation, full live
 negative matrix and comprehensive BLACK alias/indirect-effect coverage remain open.
 No generic automatic rollback claimed. New CLI route is whole-canary, not port-only.
 Report: /home/nhoward/audits/kestrel-open-canary-20261018/REPORT.md.
+
+## 2026-10-18 — Production standing two-port Kestrel qualification
+
+Sources bc90a0d,382ad3f. Existing .211 dedicated C binary unchanged:
+93d10333199b7e371d610205e0a1fd576a5f05d8ac3ec444327b6d2467c23ed6.
+Snapshots211/227/CT224 before-kestrel-twoport-20261018. New UID979 RED ceiling,
+exact two-port helper/renderer, shared legacy lock; no BLACK passthrough or approval
+API. Root-owned devices.json with daemon981-only read ACL; requesters denied.
+New explicit standing scope /var/lib/virp-kestrel-twoport; no timed expiry;512request
+ceiling,52used. STOP/recovery/runtime pins retained. Old lease/history untouched.
+CT224 exact svc-kestrel command extension, parser passed; credentials unchanged.
+VM227 /usr/local/sbin/virp-twoport-test and virp-twoport-control; local kestrel CLI
+ask/status/stop connected. GPT-6 Astra, existing root-held keys, shared API config
+unchanged. State ready, no STOP/pending, publisher disabled after submission.
+
+Kestrel18typed ops/34reads/106v3native exchanges. Gi1/0/22 accessVLAN50, PortFast,
+BPDU Guard, port security max2/restrict; Gi1/0/23 trunk allowed50,80, DTPoff.
+Both distinct descriptions, auto speed/duplex, enabled/notconnect; no MAC/neighbor.
+Exact config comparisons pass. Leave running-config for owner; no save/reload,
+VLAN creation or other interface change. Old227entries/artifact bytes unchanged.
+
+364Python tests pass, native3chains valid/no open executions. Portable packet
+488entries/3chains,106v3frames,0helper-onlyexecute frames. Offline0.1.3 c38c4f8
+CRYPTOGRAPHICALLY-VERIFIED, all3witness receipts verified/pinned; supplement verifies
+frame signatures/bindings/commands and12accounting chunks.259accounting records
+cover all issued commands. Session kestrel-twoport-20261018 seq170; witnessleaf26190,
+tree26191 stamped2026-10-18T14:42:22.474Z.57modelresponses/637144tokens,564817cached
+input. No Duo/cryptographic owner approval: explicit chat standing delegation.
+
+Native deadline binding, UNKNOWN reconciliation, full live negative matrix,
+continuous native precondition enforcement, traffic forwarding and compliance
+certification NOT proven. Root installed baseline is helper policy, not a native
+transaction. Recovery instructions and private backups retained; never rewind chain.
+Report/packet: /home/nhoward/audits/kestrel-3850-two-port-20261018/REPORT.md.
