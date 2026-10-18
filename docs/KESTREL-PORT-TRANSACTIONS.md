@@ -259,3 +259,26 @@ that binding and retain its evidence.
 an unapproved proposal invokes it before returning a refusal. The actual endpoint
 must wire this to the locked scope's durable STOP marker. The guards and adapter
 are tested locally; no new runtime endpoint is installed yet.
+
+## Transaction workflow adapter
+
+`PortFlow` now joins the state engine, independent owner signing, native approval
+submission, fixed helper commands and machine comparisons. Every step requires
+the outer scope guard. Verification reads are rechecked against public pins,
+command/session/device identity, action time and chain ordering. Preflight's
+entire read collection must finish within 30 seconds. A signed command response
+advances only to applied; fresh read comparisons are still needed for verified.
+
+Each machine comparison is a signed `evidence_item` referencing all observation
+hashes/receipts, the native approval artifact, exact transaction and bundle hash.
+The transaction outcome links that comparison and its last observation. The
+proposal event carries the complete immutable bundle, including its prefiled
+native proposal inventory, for portable inspection.
+
+A transport exception leaves the request outstanding and latches STOP. A signed
+UNKNOWN is preserved as native evidence and leaves the transaction unknown.
+Neither path automatically retries a write or fabricates a device result. The
+existing pending marker still requires separately qualified reconciliation.
+Owner closure consumes the signed close event. These integration tests use real
+Ed25519 signatures with synthetic device/chain transport and mocked Duo; they
+are not a live packet or standalone-verifier acceptance.

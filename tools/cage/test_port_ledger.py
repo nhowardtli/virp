@@ -19,12 +19,20 @@ class LedgerTests(unittest.TestCase):
   if q['action']=='chain_verify':return {'valid':not self.broken,'entries_checked':q['to_sequence']+1,'executions_open':0}
   self.calls+=1
   seq=self.db.execute('select count(*) from chain_entries').fetchone()[0]
-  e=dict(artifact_hash=q['artifact_hash'],artifact_hash_alg='sha256',artifact_id=q['artifact_id'],artifact_schema_version=1,artifact_type='evidence_item',monotonic_ns=1,previous_entry_hash='0'*64,sequence=seq,session_id=q['session_id'],signer_node_id=260,signer_org_id='test',timestamp_ns=1)
+  e=dict(artifact_hash=q['artifact_hash'],artifact_hash_alg='sha256',artifact_id=q['artifact_id'],artifact_schema_version=1,artifact_type=q.get('artifact_type','evidence_item'),monotonic_ns=1,previous_entry_hash='0'*64,sequence=seq,session_id=q['session_id'],signer_node_id=260,signer_org_id='test',timestamp_ns=1)
   raw=canonical(e);e.update(chain_entry_hash=hashlib.sha256(raw).hexdigest(),chain_sig_key_id=hashlib.sha256(self.pub).hexdigest()[:32],chain_sig=self.key.sign(b'VIRP-CHAIN-ENTRY-SIG-v1\0'+raw).hex())
   self.db.execute('INSERT INTO chain_entries VALUES('+','.join('?' for _ in e)+')',tuple(e.values()))
   self.db.execute('INSERT INTO artifacts VALUES(?,?,?)',(q['artifact_id'],q['artifact_hash'],q['artifact_content']));self.db.commit()
   if self.lose_reply:raise TimeoutError('append reply lost')
   return {'ok':True}
+ def test_proof_requires_existing_verified_entry(self):
+  with self.assertRaises(ValueError):self.ledger.proof(self.event)
+  self.assertEqual(self.calls,0)
+  receipt=self.ledger(self.event);proof=self.ledger.proof(self.event)
+  self.assertEqual(proof['chain_entry_hash'],receipt['chain_entry_hash'])
+  self.assertTrue(proof['chain_sig'])
+  self.broken=True
+  with self.assertRaises(ValueError):self.ledger.proof(self.event)
  def test_append_and_retry_returns_same_verified_receipt(self):
   first=self.ledger(self.event);self.assertEqual(first,self.ledger(self.event));self.assertEqual(self.calls,1)
  def test_lost_reply_retry_does_not_append_twice(self):

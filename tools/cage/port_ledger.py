@@ -7,7 +7,7 @@ configuration, never cage input. No chain signature format is introduced here.
 import re
 import sqlite3
 from pathlib import Path
-from recovery import Ledger
+from recovery import Ledger,verify_entry_signature
 from port_transaction import canonical
 
 class EventLedger:
@@ -32,3 +32,15 @@ class EventLedger:
    return self.native.verify(raw,self.session,aid)
   if artifacts:raise ValueError('transaction_orphan_artifact_requires_reconciliation')
   return self.native.append(raw,self.session,aid)
+
+ def proof(self,event):
+  """Read an existing verified entry for the independent owner; never append."""
+  raw=canonical(event);aid=event['event_id']
+  receipt=self.native.verify(raw,self.session,aid)
+  with sqlite3.connect('file:'+str(Path(self.native.db).resolve())+'?mode=ro',uri=True) as db:
+   db.row_factory=sqlite3.Row
+   rows=db.execute('SELECT * FROM chain_entries WHERE session_id=? AND artifact_id=?',(self.session,aid)).fetchall()
+  if len(rows)!=1:raise ValueError('transaction_event_not_unique')
+  entry=dict(rows[0]);verify_entry_signature(entry,self.native.public_key)
+  if entry['chain_entry_hash']!=receipt['chain_entry_hash']:raise ValueError('transaction_entry_changed')
+  return entry

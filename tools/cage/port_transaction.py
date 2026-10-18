@@ -116,7 +116,7 @@ class Transactions:
   tid=uuid.uuid4().hex
   with self.atomic():
    self.db.execute('INSERT INTO transactions(id,body,hash,state,boot) VALUES(?,?,?,?,?)',(tid,canonical(body).decode(),digest(body),'prepared',self.boot_id))
-   self._event(tid,'proposal',plan_sha256=digest(body))
+   self._event(tid,'proposal',plan_sha256=digest(body),bundle=body)
   return tid
  def approval_request(self,tid,seconds,*,authorization):
   row,_=self._get(tid)
@@ -254,8 +254,9 @@ class Transactions:
    self._event(row['id'],'helper_interruption',request_id=r['request_id'],reason=reason,
     dispatch_reserved=bool(q['dispatched']),native_result_available=False)
    if q['verb']=='preflight':self._event(row['id'],'close',reason='preflight-unproven')
- def finish(self,r,outcome,*,observation_hash):
+ def finish(self,r,outcome,*,observation_hash,evidence=None):
   if not hex64(observation_hash):raise Refused('missing_observation')
+  if evidence is not None and (not isinstance(evidence,dict) or set(evidence)!={'artifact_id','artifact_hash','chain_entry_hash'} or not re.fullmatch('[a-f0-9]{32}',str(evidence['artifact_id'])) or not hex64(evidence['artifact_hash']) or not hex64(evidence['chain_entry_hash'])):raise Refused('invalid_comparison_evidence')
   self._refresh(r['transaction_id'])
   with self.atomic():
    q,row,_=self._request(r)
@@ -264,7 +265,7 @@ class Transactions:
    if verb=='preflight' and row['state']=='expired-before-apply':
     if outcome not in ('matches','mismatch','unknown'):raise Refused('invalid_outcome')
     self.db.execute('UPDATE requests SET finished=1 WHERE id=?',(r['request_id'],))
-    self._event(row['id'],'preflight_outcome',request_id=r['request_id'],outcome=outcome,observation_hash=observation_hash,ignored_for_apply=True)
+    self._event(row['id'],'preflight_outcome',request_id=r['request_id'],outcome=outcome,observation_hash=observation_hash,comparison_evidence=evidence,ignored_for_apply=True)
     return
    if verb=='preflight':
     if outcome=='matches':
@@ -288,7 +289,7 @@ class Transactions:
    if next_state is None:raise Refused('invalid_outcome')
    self.db.execute('UPDATE requests SET finished=1 WHERE id=?',(r['request_id'],))
    self.db.execute('UPDATE transactions SET state=?,close_reason=? WHERE id=?',(next_state,reason,row['id']))
-   self._event(row['id'],verb+'_outcome',request_id=r['request_id'],outcome=outcome,observation_hash=observation_hash)
+   self._event(row['id'],verb+'_outcome',request_id=r['request_id'],outcome=outcome,observation_hash=observation_hash,comparison_evidence=evidence)
    if reason:self._event(row['id'],'close',reason=reason)
  def events(self,tid):return [json.loads(x[0]) for x in self.db.execute('SELECT body FROM events WHERE transaction_id=? ORDER BY seq',(tid,))]
  def flush(self,append_verified):
