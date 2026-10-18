@@ -514,3 +514,25 @@ larger than8KiB, and disables child core dumps. Exceeding the file cap fails the
 transport and preserves unresolved intent. This is not a native signed E_SIZE
 or UNKNOWN frame. The adapter is still not installed or SSH-qualified on VM227;
 the protected VM227 entrypoint/model-loop integration remains outstanding.
+
+`port_model.py` implements the provider-independent loop for one owner-selected
+operation. The model sees only that operation's preparation verb and the bounded
+transaction steps. It cannot choose another operation, provide CLI/approval/lease
+fields, dispatch parallel calls, or use prose as an execution result. The loop
+permits up to12 turns and stops after one closed transaction. A restored baseline
+without a passed forward verification is explicitly not qualification success.
+
+If the model or provider stops after a confirmed apply, the trusted controller
+requests only the original transaction's approved restore and verify-restored
+steps. It cannot issue another approval or retry the forward write. Unknown or
+unresolved runner state blocks this fallback and requires reconciliation. Server
+lease/STOP/pending and approval controls still govern every fallback request.
+Transcript failure is reported and does not erase the separately durable runner
+journal or native evidence. These local transcripts are not signed observations.
+
+Nine model-loop tests use scripted providers, not a real LLM. The real local C
+suite now has four cases and proves the early-model-stop fallback applies once,
+restores once under its one original transaction approval, and leaves clean
+native chains. The positive case traverses the scripted model loop, runner,
+dispatcher and real C daemon. No VM227 API call or live Cisco qualification is
+implied; protected host/API-provider assembly remains to be installed and tested.

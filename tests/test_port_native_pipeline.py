@@ -23,6 +23,7 @@ from port_owner_service import dispatch
 from port_replay import verify_pair
 from port_services import PortServices
 from port_runner import PortRunner
+from port_model import run as model_run
 from port_endpoint import dispatch as cage_dispatch
 
 class NativePipeline(unittest.TestCase):
@@ -73,6 +74,25 @@ class NativePipeline(unittest.TestCase):
   return NativePort(body=body,transport=self.transport,ledger=self.ledger,records=self.root/'records',recovery_dir=self.root/'v3-recovery',public_key=self.producer,node_id=260,chain_session=self.chain,approval_session=self.approval_session,approver_public_key=self.pub,operator='canary-test-approver',guard=self.scope.check,stop=self.scope.stop)
  def call(self,q):
   return CanaryClient(self.owner).call(q)
+ def services(self):
+  def bootstrap(read):
+   cmd='show running-config interface Ethernet0/1'
+   reference=read.propose(cmd)['reference'];challenge=read.challenge(reference['proposal_id'],cmd)
+   read.submit(challenge,self.key.sign(bytes.fromhex(challenge['canonical'])))
+   return reference['proposal_id']
+  return PortServices(self.tx,self.events,self,self.scope,self.target,self.native,bootstrap,protected_ports=set())
+ def model_fixture(self,steps):
+  services=self.services();runner_root=self.root/'runner';runner_root.mkdir(mode=0o700)
+  runner=PortRunner(runner_root,protect=lambda p,**kw:pathlib.Path(p));iterator=iter(enumerate(steps));transcript=[]
+  def provider(inputs,allowed):
+   try:index,operation=next(iterator)
+   except StopIteration:return {'output':[]}
+   self.assertIn(operation,allowed)
+   return {'output':[{'type':'function_call','name':'virp_port','call_id':'local-test-'+str(index),
+    'arguments':json.dumps({'operation':operation,'rationale':'local synthetic model-loop qualification'})}]}
+  result=model_run(provider,runner,lambda q:cage_dispatch(q,services,self.scope,lease_seconds=60),
+   operation='mode_access',prompt='Qualify the isolated simulated mode-access transaction.',record=transcript.append)
+  return result,runner,transcript
  def prepare_flow(self,seconds=60):
   read=self.native({'target':self.target});cmd='show running-config interface Ethernet0/1'
   reference=read.propose(cmd)['reference'];challenge=read.challenge(reference['proposal_id'],cmd)
@@ -134,21 +154,8 @@ class NativePipeline(unittest.TestCase):
    print('LOCAL SYNTHETIC: dropped response produced native signed UNKNOWN, one simulated dispatch, STOP/pending preserved, no retry or restore bypass')
  def test_native_socket_roundtrip_and_replay(self):
   with self.scope.locked():
-   def bootstrap(read):
-    cmd='show running-config interface Ethernet0/1'
-    reference=read.propose(cmd)['reference'];challenge=read.challenge(reference['proposal_id'],cmd)
-    read.submit(challenge,self.key.sign(bytes.fromhex(challenge['canonical'])))
-    return reference['proposal_id']
-   services=PortServices(self.tx,self.events,self,self.scope,self.target,self.native,bootstrap,protected_ports=set())
-   runner_root=self.root/'runner';runner_root.mkdir(mode=0o700)
-   runner=PortRunner(runner_root,protect=lambda p,**kw:pathlib.Path(p))
-   def ask(operation):
-    return runner.request(operation,'local synthetic cage dispatcher qualification',
-     lambda q:cage_dispatch(q,services,self.scope,lease_seconds=60))
-   tid=ask('port_prepare_mode_access')['transaction_id']
-   self.assertEqual(ask('port_authorize')['state'],'approved')
-   for verb,state in [('preflight','preflight_verified'),('apply','applied'),('verify','verified'),('restore','restore_applied'),('verify_restored','restored')]:
-    self.assertEqual(ask('port_'+verb)['state'],state)
+   result,runner,transcript=self.model_fixture(['port_prepare_mode_access','port_authorize','port_preflight','port_apply','port_verify','port_restore','port_verify_restored'])
+   self.assertTrue(result['ok']);tid=result['result']['transaction_id']
    self.assertEqual(len(list((self.root/'records').glob('*.request.json'))),7)
    self.assertEqual(runner.completion()['state'],'restored')
    _,body=self.tx._get(tid);native=self.native(body)
@@ -175,4 +182,16 @@ class NativePipeline(unittest.TestCase):
     self.assertTrue(verified['valid']);self.assertEqual(verified['entries_checked'],high+1);self.assertEqual(verified['executions_open'],0)
    frames=list((self.root/'records').glob('*.v3.frame'));self.assertTrue(frames);self.assertTrue(all(p.read_bytes()[0]==3 for p in frames))
    print('LOCAL SYNTHETIC:',len(frames),'v3 frames,',len(sessions),'native chains, apply/restore once, replay -37, state restored')
+ def test_native_model_early_stop_restores_original_baseline(self):
+  with self.scope.locked():
+   result,runner,transcript=self.model_fixture(['port_prepare_mode_access','port_authorize','port_preflight','port_apply'])
+   self.assertFalse(result['ok']);self.assertEqual(result['error'],'model_ended_before_transaction_closed')
+   self.assertEqual(result['recovery']['state'],'restored');self.assertEqual(runner.completion()['state'],'restored')
+   self.assertEqual(json.loads((self.root/'device-state.json').read_text()),{'access':False,'writes':2})
+   tid=result['recovery']['transaction_id'];events=self.tx.events(tid)
+   self.assertEqual(len([e for e in events if e['type']=='approval']),1)
+   self.assertEqual(len([e for e in events if e['type']=='apply_outcome']),1)
+   self.assertEqual(len([e for e in events if e['type']=='restore_outcome']),1)
+   self.verify_all_chains()
+   print('LOCAL SYNTHETIC: scripted model stopped after apply; trusted controller restored once under original approval; native chains clean')
 if __name__=='__main__':unittest.main()
