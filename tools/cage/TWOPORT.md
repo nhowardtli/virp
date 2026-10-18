@@ -36,3 +36,7 @@ Qualification grammar permits access/trunk mode, selected active VLANs,
 descriptions, edge protections, bounded port-security settings, auto speed/duplex
 and administrative enable/disable. It does not establish end-to-end forwarding
 when no device is attached, nor establish production-wide autonomous management.
+
+The endpoint also holds the legacy production helper lock for the whole request,
+so future use of the legacy read route cannot interleave a config-mode sequence.
+This is process serialization, not a claim of native transaction isolation.

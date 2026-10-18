@@ -1,6 +1,6 @@
 #!/usr/bin/python3 -I
 """Production two-port standing delegation. Root trusted adapter, no model creds."""
-import hashlib,json,os,sys,time
+import fcntl,hashlib,json,os,sys,time
 from pathlib import Path
 MACHINE='294b84478a324262bc7daea9bc314553'
 PROFILE='/etc/virp-kestrel/twoport.json'
@@ -44,7 +44,8 @@ def main():
   return d
  q=validate(json.loads(raw,object_pairs_hook=unique));commands=plan(q['command'])
  scope=StandingScope(ROOT,check_runtime=guard,limit=512,binding={'device':DEVICE,'ports':list(PORTS),'authorization_sha256':p['authorization_sha256']})
- with scope.locked():
+ with open('/var/lib/virp-cage227/lock','a') as legacy_lock,scope.locked():
+  fcntl.flock(legacy_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
   scope.check()
   # Deployment starts read-only. Engineer must retain chained baselines and
   # install the exact reviewed active VLAN set before any configuration.
