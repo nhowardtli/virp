@@ -27,9 +27,26 @@ def canonical(obj):return json.dumps(obj,sort_keys=True,separators=(',',':'),ens
 def digest(obj):return hashlib.sha256(canonical(obj)).hexdigest()
 def hex64(value):return isinstance(value,str) and re.fullmatch('[0-9a-f]{64}',value)
 
+def validate_bundle(body):
+ # Validate finite render grammar even though this is a trusted internal API.
+ try:
+  target=body['target'];p=body['plan'];port=target['port']
+  if set(body)!={'target','plan','verification','precondition_hashes'}:raise ValueError()
+  if set(target)!={'device','host','port'} or tuple(target[k] for k in ('device','host','port')) not in TARGETS:raise ValueError()
+  if p['port']!=port or p['save'] is not False:raise ValueError()
+  if digest({k:v for k,v in p.items() if k!='bundle_sha256'})!=p['bundle_sha256']:raise ValueError()
+  baseline='interface '+port+'\n'+'\n'.join(p['before'])+'\nend'
+  rebuilt=render(baseline,port,p['operation'],active_vlans={10})
+  for k in ('forward','rollback','before','expected','tier','schema','operation'):
+   if p[k]!=rebuilt[k]:raise ValueError()
+  if body['verification']!=['show interfaces '+port+' switchport','show running-config interface '+port]:raise ValueError()
+  if not body['precondition_hashes'] or not all(hex64(x) for x in body['precondition_hashes']):raise ValueError()
+ except (KeyError,TypeError,ValueError):raise Refused('invalid_transaction_bundle') from None
+
 class Transactions:
- def __init__(self,path,public_key,*,owner,wall_ns=time.time_ns,boottime=None,boot_id,max_lease_seconds):
+ def __init__(self,path,public_key,*,owner,wall_ns=time.time_ns,boottime=None,boot_id,max_lease_seconds,required_approval_method="duo"):
   self.key=Ed25519PublicKey.from_public_bytes(public_key)
+  self.required_approval_method=required_approval_method
   self.owner=owner;self.wall_ns=wall_ns;self.boottime=boottime or (lambda:time.clock_gettime(time.CLOCK_BOOTTIME));self.boot_id=boot_id;self.max_lease_seconds=max_lease_seconds
   self.db=sqlite3.connect(path,isolation_level=None,timeout=10)
   self.db.row_factory=sqlite3.Row
@@ -69,45 +86,35 @@ class Transactions:
   if row['approval']:
    approval=json.loads(row['approval'])
    if approval['plan_sha256']!=row['hash'] or approval['transaction_id']!=tid:raise Refused('approval_binding_changed')
-   if approval['owner']!=self.owner or approval['boot_id']!=self.boot_id:raise Refused('stored_approval_context_changed')
+   if approval['owner']!=self.owner or approval['boot_id']!=self.boot_id or approval['authorization']['method']!=self.required_approval_method:raise Refused('stored_approval_context_changed')
    if row['expires_ns']!=approval['issued_ns']+approval['lease_seconds']*1000000000 or row['deadline']!=approval['issued_boottime']+approval['lease_seconds']:raise Refused('approved_deadline_tampered')
    try:self.key.verify(bytes.fromhex(row['signature']),DOMAIN+canonical(approval))
    except (InvalidSignature,ValueError):raise Refused('stored_approval_invalid') from None
   return row,body
  def create(self,body):
-  # Validate finite render grammar even though this is a trusted internal API.
-  try:
-   target=body['target'];p=body['plan'];port=target['port']
-   if set(body)!={'target','plan','verification','precondition_hashes'}:raise ValueError()
-   if set(target)!={'device','host','port'} or tuple(target[k] for k in ('device','host','port')) not in TARGETS:raise ValueError()
-   if p['port']!=port or p['save'] is not False:raise ValueError()
-   if digest({k:v for k,v in p.items() if k!='bundle_sha256'})!=p['bundle_sha256']:raise ValueError()
-   baseline='interface '+port+'\n'+'\n'.join(p['before'])+'\nend'
-   rebuilt=render(baseline,port,p['operation'],active_vlans={10})
-   for k in ('forward','rollback','before','expected','tier','schema','operation'):
-    if p[k]!=rebuilt[k]:raise ValueError()
-   if body['verification']!=['show interfaces '+port+' switchport','show running-config interface '+port]:raise ValueError()
-   if not body['precondition_hashes'] or not all(hex64(x) for x in body['precondition_hashes']):raise ValueError()
-  except (KeyError,TypeError,ValueError):raise Refused('invalid_transaction_bundle') from None
+  validate_bundle(body)
   tid=uuid.uuid4().hex
   with self.atomic():
    self.db.execute('INSERT INTO transactions(id,body,hash,state,boot) VALUES(?,?,?,?,?)',(tid,canonical(body).decode(),digest(body),'prepared',self.boot_id))
    self._event(tid,'proposal',plan_sha256=digest(body))
   return tid
- def approval_request(self,tid,seconds):
+ def approval_request(self,tid,seconds,*,authorization):
   row,_=self._get(tid)
   if row['state']!='prepared':raise Refused('approval_already_processed')
   if type(seconds)is not int or not 1<=seconds<=self.max_lease_seconds:raise Refused('invalid_lease')
   return {'schema':'kestrel-port-approval/1','approval_id':uuid.uuid4().hex,'transaction_id':tid,
-          'plan_sha256':row['hash'],'owner':self.owner,'issued_ns':self.wall_ns(),'lease_seconds':seconds,'boot_id':self.boot_id,'issued_boottime':self.boottime()}
+          'plan_sha256':row['hash'],'owner':self.owner,'issued_ns':self.wall_ns(),'lease_seconds':seconds,'boot_id':self.boot_id,'issued_boottime':self.boottime(),'authorization':authorization}
  def approve(self,a,signature):
   try:
-   if set(a)!={'schema','approval_id','transaction_id','plan_sha256','owner','issued_ns','lease_seconds','boot_id','issued_boottime'}:raise ValueError()
+   if set(a)!={'schema','approval_id','transaction_id','plan_sha256','owner','issued_ns','lease_seconds','boot_id','issued_boottime','authorization'}:raise ValueError()
    if a['schema']!='kestrel-port-approval/1' or a['owner']!=self.owner or a['boot_id']!=self.boot_id:raise ValueError()
    if not re.fullmatch('[a-f0-9]{32}',a['approval_id']):raise ValueError()
    if type(a['issued_ns'])is not int or not 0<=self.wall_ns()-a['issued_ns']<=120000000000:raise ValueError()
    if type(a['lease_seconds'])is not int or not 1<=a['lease_seconds']<=self.max_lease_seconds:raise ValueError()
    if type(a['issued_boottime']) not in (int,float) or not math.isfinite(a['issued_boottime']) or not 0<=self.boottime()-a['issued_boottime']<=120:raise ValueError()
+   auth=a['authorization']
+   if set(auth)!={'method','reference','approved_ns'} or auth['method']!=self.required_approval_method or auth['method'] not in ('duo','test'):raise ValueError()
+   if not re.fullmatch('[A-Za-z0-9-]{16,128}',auth['reference']) or type(auth['approved_ns'])is not int or not auth['approved_ns']<=a['issued_ns']:raise ValueError()
    self.key.verify(signature,DOMAIN+canonical(a))
   except (ValueError,KeyError,TypeError,InvalidSignature):raise Refused('invalid_approval') from None
   expiry=a['issued_ns']+a['lease_seconds']*1000000000
@@ -154,7 +161,7 @@ class Transactions:
   row,body=self._get(r['transaction_id']);return q,row,body
  def _native_command(self,q,row,body,command):
   if q['dispatched']:raise Refused('dispatch_already_consumed')
-  if not row['approval'] or (q['verb']=='apply' and row['expired']):raise Refused('lease_expired')
+  if not row['approval'] or (q['verb']=='apply' and (row['expired'] or self.wall_ns()>=row['expires_ns'] or self.boottime()>=row['deadline'])):raise Refused('lease_expired')
   if q['verb'] in ('apply','restore'):
    expected=body['plan']['forward' if q['verb']=='apply' else 'rollback'];tier='RED'
   else:
@@ -193,7 +200,7 @@ class Transactions:
   with self.atomic():
    q,row,body=self._request(r)
    if q['dispatched']:raise Refused('dispatch_already_consumed')
-   if row['state']=='expired-before-apply' or (q['verb']=='apply' and row['expired']):raise Refused('lease_expired')
+   if row['state']=='expired-before-apply' or (q['verb']=='apply' and (row['expired'] or self.wall_ns()>=row['expires_ns'] or self.boottime()>=row['deadline'])):raise Refused('lease_expired')
    if self.db.execute('SELECT 1 FROM events WHERE transaction_id=? AND receipt IS NULL',(row['id'],)).fetchone():raise Refused('chain_receipt_required')
    needed=body['plan']['forward' if q['verb']=='apply' else 'rollback'] if q['verb'] in ('apply','restore') else 'show running-config interface '+body['target']['port']
    n=self.db.execute('SELECT issued FROM native_issuances WHERE request_id=? AND command=?',(r['request_id'],needed)).fetchone()
@@ -202,6 +209,18 @@ class Transactions:
    # Durable reservation before device dispatch. A crash here requires reconciliation.
    if q['verb'] in ('apply','restore'):return body['plan']['forward' if q['verb']=='apply' else 'rollback']
    return list(body['verification'])
+ def record_interruption(self,r,reason):
+  # Root adapter only, after establishing the request worker is no longer
+  # active. This is a helper event, never fabricated native UNKNOWN evidence.
+  if reason not in ('transport_lost','worker_lost','signer_indeterminate'):raise Refused('invalid_interruption_reason')
+  self._refresh(r['transaction_id'])
+  with self.atomic():
+   q,row,_=self._request(r)
+   if row['state'] in ('restored','expired-before-apply'):raise Refused('transaction_already_closed')
+   self.db.execute('UPDATE requests SET finished=1 WHERE id=?',(r['request_id'],))
+   self.db.execute("UPDATE transactions SET state='unknown' WHERE id=?",(row['id'],))
+   self._event(row['id'],'helper_interruption',request_id=r['request_id'],reason=reason,
+    dispatch_reserved=bool(q['dispatched']),native_result_available=False)
  def finish(self,r,outcome,*,observation_hash):
   if not hex64(observation_hash):raise Refused('missing_observation')
   self._refresh(r['transaction_id'])

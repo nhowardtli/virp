@@ -15,10 +15,11 @@ class TransactionTests(unittest.TestCase):
   self.dbpath=str(Path(self.tmp.name)/'state.db');self.public=pub;self.store=self.open()
   self.body={'target':{'device':'kestrel-ios','host':'192.168.255.10','port':'Ethernet0/1'},'plan':plan(BASE,'Ethernet0/1','mode_access'),'verification':['show interfaces Ethernet0/1 switchport','show running-config interface Ethernet0/1'],'precondition_hashes':['a'*64]}
   self.tid=self.store.create(self.body)
- def open(self):return Transactions(self.dbpath,self.public,owner='test-approver',wall_ns=lambda:self.clock.wall,boottime=lambda:self.clock.boot,boot_id='boot1',max_lease_seconds=300)
+ def open(self):return Transactions(self.dbpath,self.public,owner='test-approver',wall_ns=lambda:self.clock.wall,boottime=lambda:self.clock.boot,boot_id='boot1',max_lease_seconds=300,required_approval_method='test')
  def tearDown(self):self.store.close();self.tmp.cleanup()
+ def auth(self):return {'method':'test','reference':'test-'+uuid.uuid4().hex,'approved_ns':self.clock.wall}
  def approve(self,seconds=10):
-  a=self.store.approval_request(self.tid,seconds);signature=self.key.sign(DOMAIN+canonical(a));self.store.approve(a,signature);return a,signature
+  a=self.store.approval_request(self.tid,seconds,authorization=self.auth());signature=self.key.sign(DOMAIN+canonical(a));self.store.approve(a,signature);return a,signature
  def flush(self):
   self.store.flush(lambda event:{'chain_entry_hash':'b'*64,'artifact_id':event['event_id']})
  def begin(self,verb):
@@ -77,7 +78,7 @@ class TransactionTests(unittest.TestCase):
   db=sqlite3.connect(self.dbpath);b=copy.deepcopy(self.body);b['plan']['rollback']='interface Ethernet0/2 shutdown';db.execute('update transactions set body=? where id=?',(canonical(b).decode(),self.tid));db.commit();db.close()
   with self.assertRaises(Refused):self.begin('restore')
  def test_wrong_signature_or_owner_refused(self):
-  a=self.store.approval_request(self.tid,10)
+  a=self.store.approval_request(self.tid,10,authorization=self.auth())
   with self.assertRaises(Refused):self.store.approve(a,b'0'*64)
   a['owner']='someone-else'
   with self.assertRaises(Refused):self.store.approve(a,self.key.sign(DOMAIN+canonical(a)))
@@ -88,6 +89,19 @@ class TransactionTests(unittest.TestCase):
   self.approve();self.begin('apply');self.store.close();self.store=self.open()
   with self.assertRaises(Refused):self.begin('apply')
   with self.assertRaises(Refused):self.begin('restore')
+ def test_interrupted_dispatch_requires_reconciliation(self):
+  self.approve();r=self.begin('apply');self.store.record_interruption(r,'transport_lost')
+  self.assertEqual(self.store.status(self.tid)['state'],'unknown')
+  with self.assertRaises(Refused):self.begin('restore')
+  with self.assertRaises(Refused):self.store.finish(r,'executed',observation_hash='c'*64)
+  check=self.begin('reconcile');self.store.finish(check,'matches_before',observation_hash='d'*64)
+  self.assertEqual(self.store.status(self.tid)['state'],'restored')
+ def test_interruption_cannot_reopen_completed_request(self):
+  self.approve();r=self.begin('apply');self.store.finish(r,'executed',observation_hash='c'*64)
+  with self.assertRaises(Refused):self.store.record_interruption(r,'worker_lost')
+ def test_interruption_reason_is_fixed(self):
+  self.approve();r=self.begin('apply')
+  with self.assertRaises(Refused):self.store.record_interruption(r,'model says retry')
  def test_chain_failure_prevents_dispatch(self):
   self.approve();self.flush();r=self.store.begin(self.tid,'apply')
   with self.assertRaises(Refused):self.store.require_dispatch(r)
@@ -121,7 +135,7 @@ class TransactionTests(unittest.TestCase):
   with self.assertRaises(Refused):self.begin('apply')
  def test_lease_outside_maximum_refused(self):
   for n in [0,301,True,1.5]:
-   with self.assertRaises(Refused):self.store.approval_request(self.tid,n)
+   with self.assertRaises(Refused):self.store.approval_request(self.tid,n,authorization=self.auth())
  def test_forged_render_rejected_even_with_rehashed_body(self):
   b=copy.deepcopy(self.body);b['plan']['forward']='interface Ethernet0/2 shutdown'
   from port_transaction import digest
