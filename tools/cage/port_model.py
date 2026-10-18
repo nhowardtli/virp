@@ -81,7 +81,8 @@ def run(provider,runner,transport,*,operation,prompt,record,max_turns=12):
      'transcript_complete':transcript_ok,'evidence_verified_independently':False}
   raise ModelStopped('model_turn_limit')
  except Exception as error:
-  reason=str(error) if isinstance(error,ModelStopped) else 'runner_or_provider_failed'
+  public_error=isinstance(error,(ModelStopped,RunnerRefused)) or (type(error).__module__=='port_provider' and type(error).__name__=='ProviderRefused')
+  reason=str(error) if public_error else 'runner_or_provider_failed'
   recovery=restore_confirmed(runner,transport)
   try:emit({'type':'workflow_stopped','reason':reason,'recovery':recovery})
   except ModelStopped:pass

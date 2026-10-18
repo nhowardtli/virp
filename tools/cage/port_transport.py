@@ -59,6 +59,9 @@ class CanaryTransport:
   self.protect(KEY,secret=True);self.protect(KNOWN_HOSTS)
   try:directory.mkdir(mode=0o700)
   except FileExistsError:raise TransportRefused('attempt_already_exists') from None
+  parent_fd=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY)
+  try:os.fsync(parent_fd)
+  finally:os.close(parent_fd)
   durable_write(directory/'request.json',encode(q)+b'\n')
   durable_write(directory/'launch-intent.json',encode({'request_id':rid,'boot_id':self.boot,'argv_sha256':hashlib.sha256(encode(self.command)).hexdigest(),'time_ns':time.time_ns()}))
   # Regular files survive the runner's exit and avoid a parent pipe closure

@@ -536,3 +536,36 @@ restores once under its one original transaction approval, and leaves clean
 native chains. The positive case traverses the scripted model loop, runner,
 dispatcher and real C daemon. No VM227 API call or live Cisco qualification is
 implied; protected host/API-provider assembly remains to be installed and tested.
+
+## VM227 assembly (source only; no API call made)
+
+`port_cage_service.py` is the root-only client entrypoint, hard-pinned to VM227's
+observed machine identity. It preserves the existing configured model
+`gpt-4.1-mini-2025-04-14`; this work does not migrate models. Root-only profile
+`/etc/virp-cml-cage/port-runner.json` binds source module hashes, the API config
+hash and the existing SSH known-hosts pin. Paths for API/SSH credentials and
+canary transport are fixed. No key goes into the profile, repo or model context.
+
+The operator selects one finite `--operation`; the model receives only its
+allowed steps. Persistent client state belongs under root-only
+`/var/lib/virp-cml-cage/port/{journal,transport,transcripts}`. A model-run lock
+prevents concurrent loops. `--inspect REQUEST_ID` reads retained transport
+process evidence even while that lock is held; it cannot dispatch, retry or
+release recovery state. API-key loading is lazy, so an already unresolved
+request stops without loading it or contacting the model.
+
+`port_provider.py` preserves the existing Responses API route with strict
+function schema, additionalProperties:false, required operation/rationale,
+parallel_tool_calls:false and store:false. Returned output items are retained
+with matching call_id tool results. These details were checked against
+[official OpenAI function-calling documentation](https://developers.openai.com/api/docs/guides/function-calling)
+on2026-10-18. Prompt instructions are not an authorization boundary; the runner,
+helper, independent approval and C gate enforce the available operations.
+
+The provider has a fixed HTTPS endpoint, default certificate verification,
+no redirects/ambient proxies/retries, bounded request/response size and sanitized
+errors. Credential headers never enter model inputs or transcripts. Eight host
+assembly tests and six provider tests use simulated host custody and fake
+provider/transport responses. They prove wiring, refusals and lazy credential
+loading, not installed-host, model-behavior or live SSH acceptance. No API key
+file was read during this engineering session, and no live model request was sent.
