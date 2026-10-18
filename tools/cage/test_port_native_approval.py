@@ -34,7 +34,7 @@ class ArtifactTests(unittest.TestCase):
   raw=canonical(e);e.update(chain_entry_hash=hashlib.sha256(raw).hexdigest(),chain_sig_key_id=hashlib.sha256(self.fixture.pub).hexdigest()[:32],chain_sig=self.fixture.key.sign(b'VIRP-CHAIN-ENTRY-SIG-v1\0'+raw).hex());self.entry=e
   self.fixture.db.execute('insert into chain_entries values('+','.join('?' for _ in e)+')',tuple(e.values()))
   self.fixture.db.execute('insert into artifacts values(?,?,?)',(self.aid,e['artifact_hash'],self.raw_body.decode()));self.fixture.db.commit()
-  self.ledger=ApprovalLedger(self.fixture.path,self.fixture,self.fixture.pub,'approval:kestrel-ios@cml-v3-20261016')
+  self.ledger=ApprovalLedger(self.fixture.path,self.fixture,self.fixture.pub,'approval:kestrel-ios@cml-v3-20261016',260)
  def tearDown(self):self.fixture.tearDown()
  def check(self,**extra):
   args=dict(expected_chain_hash=self.entry['chain_entry_hash'],public_key=self.pub,proposal_id=self.pid,device='kestrel-ios',device_node_id=260,command=self.command,operator='test-approver',now_ns=self.now);args.update(extra);return self.ledger.verify(**args)
@@ -52,4 +52,17 @@ class ArtifactTests(unittest.TestCase):
   with self.assertRaises(ValueError):self.check()
  def test_wrong_approver_pin_refused_even_with_valid_producer(self):
   with self.assertRaises(ValueError):self.check(public_key=b'z'*32)
+class ProposalSemantics(unittest.TestCase):
+ def setUp(self):
+  self.body={'proposal_id':'a'*32,'device':'kestrel-ios','device_node_id':260,'command':'show running-config interface Ethernet0/1','command_hash':hashlib.sha256(b'show running-config interface Ethernet0/1').hexdigest(),'tier':'YELLOW','timestamp_ns':'1000'}
+ def check(self,body=None):
+  from port_native_approval import verify_proposal
+  return verify_proposal(body or self.body,proposal_id='a'*32,device='kestrel-ios',device_node_id=260,command='show running-config interface Ethernet0/1',tier='YELLOW',not_before_ns=900,now_ns=1100)
+ def test_exact_proposal(self):self.check()
+ def test_other_command_node_or_tier_refused(self):
+  for key,value in [('command','show version'),('device_node_id',1),('tier','RED'),('proposal_id','b'*32)]:
+   with self.assertRaises(ValueError):self.check({**self.body,key:value})
+ def test_old_or_future_proposal_refused(self):
+  for timestamp in ['899','1101',True,1000.0]:
+   with self.assertRaises(ValueError):self.check({**self.body,'timestamp_ns':timestamp})
 if __name__=='__main__':unittest.main()

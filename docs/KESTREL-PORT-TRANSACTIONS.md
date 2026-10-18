@@ -212,3 +212,28 @@ verdict authenticates chain signatures and carried artifact hashes; it does not
 by itself implement this transaction state machine or check the native VAP1
 approval semantics. Keep the existing verifier and report supplementary public-
 pin approval/v3 checks separately. No Rust version or verifier code was changed.
+
+## Native helper adapter
+
+`port_native.NativePort` uses the existing `execute_observed` helper and constrained
+requester transport. It exposes only the fixed prerequisite reads and the exact
+validated forward/rollback commands. Baseline collection can start with a pinned
+target and read-only command set; it does not need fake proposal placeholders.
+The caller's target/plan is copied so later dictionary mutation cannot retarget
+an initialized adapter.
+
+The actual canary UID policy was inspected: UID 980 has execute, session binding,
+observation append and chain verification; approval challenge/submit remain on
+the existing root control identity. The adapter therefore separates the execute
+transport from the approval control transport. No UID permission was widened.
+Approval submit must be fresh, attributed to the pinned approver/operator, and
+backed by an independently verified native approval artifact before returning.
+
+The new native ledger readers also passed a read-only check against the canary's
+actual SQLite database and `chain_verify` endpoint. That check used the historical
+cc7dc593c61c1d349727746e81dff01a record at its historical issuance time. It sent
+zero device commands, did not install code, and grants no current authority.
+
+The enclosing endpoint must supply the protected host/config/binary/scope guard,
+hold the scope lock, and latch STOP on an unexpected preapproval success. That
+runtime composition is still under construction; these modules are not deployed.

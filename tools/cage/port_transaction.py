@@ -27,20 +27,32 @@ def canonical(obj):return json.dumps(obj,sort_keys=True,separators=(',',':'),ens
 def digest(obj):return hashlib.sha256(canonical(obj)).hexdigest()
 def hex64(value):return isinstance(value,str) and re.fullmatch('[0-9a-f]{64}',value)
 
-def validate_bundle(body):
- # Validate finite render grammar even though this is a trusted internal API.
+def validate_target(target):
  try:
-  target=body['target'];p=body['plan'];port=target['port']
-  if set(body)!={'target','plan','verification','precondition_hashes','native_proposals'}:raise ValueError()
   if set(target)!={'device','host','port','device_node_id','transport_port'} or tuple(target[k] for k in ('device','host','port')) not in TARGETS:raise ValueError()
   pins=TARGETS[tuple(target[k] for k in ('device','host','port'))]
   if any(type(target[k])is not int or target[k]!=v for k,v in pins.items()):raise ValueError()
+ except (KeyError,TypeError,ValueError):raise Refused('invalid_pinned_target') from None
+
+def validate_target_plan(target,p):
+ try:
+  validate_target(target)
+  port=target['port']
   if p['port']!=port or p['save'] is not False:raise ValueError()
   if digest({k:v for k,v in p.items() if k!='bundle_sha256'})!=p['bundle_sha256']:raise ValueError()
   baseline='interface '+port+'\n'+'\n'.join(p['before'])+'\nend'
   rebuilt=render(baseline,port,p['operation'],active_vlans={10})
   for k in ('forward','rollback','before','expected','tier','schema','operation'):
    if p[k]!=rebuilt[k]:raise ValueError()
+  if not hex64(p['pre_config_sha256']):raise ValueError()
+ except (KeyError,TypeError,ValueError):raise Refused('invalid_target_or_rendered_plan') from None
+
+def validate_bundle(body):
+ # Caller verifies source frames and native proposal references independently.
+ try:
+  target=body['target'];p=body['plan'];port=target['port']
+  if set(body)!={'target','plan','verification','precondition_hashes','native_proposals'}:raise ValueError()
+  validate_target_plan(target,p)
   if body['verification']!=['show interfaces '+port+' switchport','show running-config interface '+port]:raise ValueError()
   inventory=body['native_proposals']
   if set(inventory)!={'forward','restore','preflight','verify'} or not isinstance(inventory['verify'],list) or not 2<=len(inventory['verify'])<=8:raise ValueError()

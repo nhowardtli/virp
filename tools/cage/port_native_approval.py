@@ -32,25 +32,52 @@ def verify_approval(body,*,public_key,proposal_id,device,device_node_id,command,
   raise ValueError('native_approval_artifact_invalid') from None
  return canonical
 
-class ApprovalLedger:
- def __init__(self,db,transport,producer_public_key,approval_session):
-  self.db=db;self.transport=transport;self.pin=producer_public_key;self.session=approval_session
- def verify(self,*,expected_chain_hash,**expected):
-  sid=self.session;prefix='approval:'+expected['device'];aid='approval:'+expected['proposal_id']
+def verify_proposal(body,*,proposal_id,device,device_node_id,command,tier,not_before_ns,now_ns):
+ try:
+  if body['proposal_id']!=proposal_id or body['device']!=device or body['command']!=command or body['tier']!=tier:raise ValueError()
+  if type(body['device_node_id'])is not int or body['device_node_id']!=device_node_id:raise ValueError()
+  if body['command_hash']!=hashlib.sha256(command.encode('ascii')).hexdigest():raise ValueError()
+  timestamp=body['timestamp_ns']
+  if type(timestamp)is int:issued=timestamp
+  elif isinstance(timestamp,str) and re.fullmatch('[1-9][0-9]{0,19}',timestamp):issued=int(timestamp)
+  else:raise ValueError()
+  if not not_before_ns<=issued<=now_ns:raise ValueError()
+  if not re.fullmatch('[a-f0-9]{32}',proposal_id):raise ValueError()
+ except (KeyError,TypeError,ValueError,UnicodeError):raise ValueError('native_proposal_artifact_invalid') from None
+
+class NativeArtifactLedger:
+ def __init__(self,db,transport,producer_public_key,approval_session,producer_node_id):
+  self.db=db;self.transport=transport;self.pin=producer_public_key;self.session=approval_session;self.node=producer_node_id
+ def load(self,kind,device,proposal_id,expected_chain_hash=None):
+  sid=self.session;prefix='approval:'+device;aid=kind+':'+proposal_id
   if not isinstance(sid,str) or not (sid==prefix or sid.startswith(prefix+'@')):raise ValueError('native_approval_session_pin_invalid')
   with sqlite3.connect('file:'+str(Path(self.db).resolve())+'?mode=ro',uri=True) as db:
    db.row_factory=sqlite3.Row
    rows=db.execute('SELECT * FROM chain_entries WHERE session_id=? AND artifact_id=?',(sid,aid)).fetchall()
-   if len(rows)!=1:raise ValueError('native_approval_not_unique_in_chain')
+   if len(rows)!=1:raise ValueError('native_artifact_not_unique_in_chain')
    entry=dict(rows[0]);verify_entry_signature(entry,self.pin)
-   if entry['artifact_type']!='approval' or entry['chain_entry_hash']!=expected_chain_hash:raise ValueError('native_approval_chain_binding_invalid')
+   if (entry['artifact_type']!=kind or entry['signer_node_id']!=self.node or entry['artifact_hash_alg']!='sha256'
+       or (expected_chain_hash is not None and entry['chain_entry_hash']!=expected_chain_hash)):raise ValueError('native_artifact_chain_binding_invalid')
    artifacts=db.execute('SELECT artifact_content FROM artifacts WHERE artifact_id=? AND artifact_hash=?',(aid,entry['artifact_hash'])).fetchall()
-   if len(artifacts)!=1:raise ValueError('native_approval_artifact_missing_or_duplicate')
+   if len(artifacts)!=1:raise ValueError('native_artifact_missing_or_duplicate')
    raw=artifacts[0][0]
    if isinstance(raw,str):raw=raw.encode()
-   if hashlib.sha256(raw).hexdigest()!=entry['artifact_hash']:raise ValueError('native_approval_artifact_hash_invalid')
-   body=json.loads(raw);verify_approval(body,**expected)
+   if hashlib.sha256(raw).hexdigest()!=entry['artifact_hash']:raise ValueError('native_artifact_hash_invalid')
+   body=json.loads(raw)
    high=db.execute('SELECT MAX(sequence) FROM chain_entries WHERE session_id=?',(sid,)).fetchone()[0]
   result=self.transport.management({'action':'chain_verify','session_id':sid,'from_sequence':0,'to_sequence':high})
-  if result.get('valid')is not True or result.get('entries_checked')!=high+1 or result.get('executions_open')!=0:raise ValueError('native_approval_chain_invalid')
+  if result.get('valid')is not True or result.get('entries_checked')!=high+1 or result.get('executions_open')!=0:raise ValueError('native_artifact_chain_invalid')
   return {'entry':entry,'artifact':body,'artifact_bytes':raw}
+
+class ApprovalLedger(NativeArtifactLedger):
+ def verify(self,*,expected_chain_hash,**expected):
+  result=self.load('approval',expected['device'],expected['proposal_id'],expected_chain_hash)
+  verify_approval(result['artifact'],**expected)
+  return result
+
+class ProposalLedger(NativeArtifactLedger):
+ def verify(self,*,expected_chain_hash=None,**expected):
+  result=self.load('proposal',expected['device'],expected['proposal_id'],expected_chain_hash)
+  verify_proposal(result['artifact'],**expected)
+  result['reference']={'proposal_id':expected['proposal_id'],'artifact_hash':result['entry']['artifact_hash'],'chain_entry_hash':result['entry']['chain_entry_hash']}
+  return result
