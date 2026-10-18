@@ -333,3 +333,12 @@ snapshot: root ownership, daemon group read access for files the daemon must rea
 and protected parent directories. Preserve every config byte and hash; retain
 original ownership/modes for rollback. No such change was made by the read-only
 inspection. Do not weaken the profile guard to make the current layout pass.
+
+`port_replay.verify_pair` supplements full chain verification with semantic
+checks for the native -37 gate_rejection and its original successful outcome.
+It verifies both producer signatures and artifact bytes, the exact device,
+command and approval ID, executed:false, the prior outcome hash, and ordering.
+It accepts existing native database and exported signature representations.
+A read-only compatibility check passed against the already accepted October16
+production description packet using its external producer pin. That is historical
+format compatibility, not a new write, witness head or acceptance packet.
