@@ -237,3 +237,25 @@ zero device commands, did not install code, and grants no current authority.
 The enclosing endpoint must supply the protected host/config/binary/scope guard,
 hold the scope lock, and latch STOP on an unexpected preapproval success. That
 runtime composition is still under construction; these modules are not deployed.
+
+## Outer scope and runtime guards
+
+`ScopeGuard` holds the existing scope lock across one helper operation, preserves
+STOP/pending markers and the 96-request ceiling, and records each request once.
+It requires the existing wall/boot work lease on every check. A policy edit while
+an operation is running refuses continuation. It cannot renew leases or resolve
+pending outcomes. Transaction-lease recovery does not bypass this outer scope.
+
+`RuntimePins` requires protected file hashes, exact machine/caller/requester
+identity, producer public pin, enforced gate and GREEN requester ceiling. It
+checks the configured target's hostname, host, device node and transport port.
+It also checks the active service's running executable hash and full startup
+arguments, not just the binary currently on disk. Pins must come from a reviewed
+root-owned deployment profile. Checking these files does not independently prove
+which configuration bytes a process loaded at startup; deployment must establish
+that binding and retain its evidence.
+
+`NativePort` now requires a STOP-latch callback. Unexpected success while filing
+an unapproved proposal invokes it before returning a refusal. The actual endpoint
+must wire this to the locked scope's durable STOP marker. The guards and adapter
+are tested locally; no new runtime endpoint is installed yet.

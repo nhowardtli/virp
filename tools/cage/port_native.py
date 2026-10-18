@@ -19,7 +19,7 @@ from port_transaction import Refused,canonical,validate_target_plan,validate_tar
 
 class NativePort:
  def __init__(self,*,body,transport,ledger,records,recovery_dir,public_key,node_id,
-              chain_session,approval_session,approver_public_key,operator,guard,
+              chain_session,approval_session,approver_public_key,operator,guard,stop,
               control_transport=None,observer=execute_observed,wall_ns=time.time_ns):
   if 'plan' in body:validate_target_plan(body['target'],body['plan'])
   else:validate_target(body['target'])
@@ -27,7 +27,7 @@ class NativePort:
   self.control=control_transport or transport
   self.records=Path(records);self.recovery_dir=Path(recovery_dir);self.public_key=public_key
   self.node_id=node_id;self.chain_session=chain_session;self.approver_public_key=approver_public_key
-  self.operator=operator;self.guard=guard;self.observer=observer;self.now=wall_ns
+  self.operator=operator;self.guard=guard;self.stop=stop;self.observer=observer;self.now=wall_ns
   self.device_id=int.from_bytes(hashlib.sha256(self.target['device'].encode()).digest()[:8],'big')
   self.allowed=set(commands(self.target['port']).values())
   if 'plan' in self.body:self.allowed|={self.body['plan']['forward'],self.body['plan']['rollback']}
@@ -57,7 +57,7 @@ class NativePort:
   tier=self.tier(command)
   observed=self.observe(command);r=observed['result']
   if r['subtype']!=15 or not r['output'].startswith('ERROR: tier gate blocked '):
-   # The enclosing root endpoint must latch its STOP marker on this result.
+   self.stop('unexpected_preapproval_result')
    raise Refused('unexpected_preapproval_result_stop_required')
   ids=re.findall(r'\bproposal_id=([a-f0-9]{32})\b',r['output'])
   if len(ids)!=1:raise Refused('native_proposal_id_not_unique')

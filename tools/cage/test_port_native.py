@@ -7,10 +7,10 @@ from port_transaction import Refused
 from test_port_fixtures import proposal_inventory
 class NativeAdapter(unittest.TestCase):
  def setUp(self):
-  self.tmp=tempfile.TemporaryDirectory();self.calls=[];self.guards=0
+  self.tmp=tempfile.TemporaryDirectory();self.calls=[];self.guards=0;self.stops=[]
   self.body={'target':{'device':'kestrel-ios','host':'192.168.255.10','port':'Ethernet0/1','device_node_id':260,'transport_port':22},'plan':plan('interface Ethernet0/1\n shutdown\nend','Ethernet0/1','mode_access'),'verification':['show interfaces Ethernet0/1 switchport','show running-config interface Ethernet0/1'],'precondition_hashes':['a'*64],'native_proposals':proposal_inventory()}
   self.ledger=SimpleNamespace(db='/unused',verify=lambda raw,sid,aid:{'session_id':sid,'artifact_id':aid,'chain_entry_hash':'b'*64,'sequence':1})
-  self.native=NativePort(body=self.body,transport=SimpleNamespace(management=self.management),ledger=self.ledger,records=self.tmp.name,recovery_dir=self.tmp.name,public_key=b'x'*32,node_id=260,chain_session='test',approval_session='approval:kestrel-ios@test',approver_public_key=b'y'*32,operator='test',guard=self.guard,observer=self.observe,wall_ns=lambda:1000)
+  self.native=NativePort(body=self.body,transport=SimpleNamespace(management=self.management),ledger=self.ledger,records=self.tmp.name,recovery_dir=self.tmp.name,public_key=b'x'*32,node_id=260,chain_session='test',approval_session='approval:kestrel-ios@test',approver_public_key=b'y'*32,operator='test',guard=self.guard,stop=self.stops.append,observer=self.observe,wall_ns=lambda:1000)
  def tearDown(self):self.tmp.cleanup()
  def guard(self):self.guards+=1
  def management(self,q):self.fail('unexpected management request')
@@ -27,7 +27,7 @@ class NativeAdapter(unittest.TestCase):
   self.native.observe('show interfaces Ethernet0/1 switchport')
   self.assertEqual(self.calls[0][0]['device'],'kestrel-ios')
  def test_baseline_collection_needs_no_placeholder_plan(self):
-  read=NativePort(body={'target':self.body['target']},transport=self.native.transport,ledger=self.ledger,records=self.tmp.name,recovery_dir=self.tmp.name,public_key=b'x'*32,node_id=260,chain_session='test',approval_session='approval:kestrel-ios@test',approver_public_key=b'y'*32,operator='test',guard=self.guard,observer=self.observe,wall_ns=lambda:1000)
+  read=NativePort(body={'target':self.body['target']},transport=self.native.transport,ledger=self.ledger,records=self.tmp.name,recovery_dir=self.tmp.name,public_key=b'x'*32,node_id=260,chain_session='test',approval_session='approval:kestrel-ios@test',approver_public_key=b'y'*32,operator='test',guard=self.guard,stop=self.stops.append,observer=self.observe,wall_ns=lambda:1000)
   with self.assertRaises(Refused):read.observe(self.body['plan']['forward'])
   read.observe('show interfaces Ethernet0/1 switchport');self.assertEqual(len(self.calls),1)
  def test_other_command_or_port_never_dispatched(self):
@@ -44,6 +44,7 @@ class NativeAdapter(unittest.TestCase):
   self.assertEqual(self.calls,[])
  def test_preapproval_success_requires_stop(self):
   with self.assertRaisesRegex(Refused,'stop_required'):self.native.propose(self.body['plan']['forward'])
+  self.assertEqual(self.stops,['unexpected_preapproval_result'])
  def native_challenge(self):
   cmd=self.body['plan']['forward'];pid=self.body['native_proposals']['forward']['proposal_id']
   raw=struct.pack('!4s16s32sQQI',b'VAP1',bytes.fromhex(pid),hashlib.sha256(cmd.encode()).digest(),260,1000,300)

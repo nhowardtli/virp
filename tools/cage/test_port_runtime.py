@@ -1,0 +1,49 @@
+import hashlib,json,tempfile,unittest
+from pathlib import Path
+from port_runtime import RuntimePins
+from port_transaction import Refused
+
+class RuntimeTests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
+  self.target={'device':'kestrel-ios','host':'192.168.255.10','port':'Ethernet0/1','device_node_id':260,'transport_port':22}
+  self.cfg={'gate_default_mode':'enforce','evidence_required':True,'socket_uid_tier_ceilings':{'980':'green'},'devices':[{'hostname':'kestrel-ios','host':'192.168.255.10','node_id':'00000104','port':22}]}
+  self.files={'binary':b'binary','config':json.dumps(self.cfg).encode(),'public_key':b'p'*32,'module':b'module'}
+  self.pins={}
+  for name,raw in self.files.items():
+   p=self.root/name;p.write_bytes(raw);self.pins[str(p)]=hashlib.sha256(raw).hexdigest()
+  self.profile={'machine_id':'host','sudo_user':'cage-user','requester':'virp-kreq','requester_uid':980,'service':'virp-canary','binary':str(self.root/'binary'),'config':str(self.root/'config'),'public_key':str(self.root/'public_key'),'public_key_hex':(b'p'*32).hex(),'files':self.pins,'target':self.target}
+  self.profile['argv']=[self.profile['binary'],'-d',self.profile['config']]
+  self.process={'active':True,'executable':self.profile['binary'],'binary_sha256':self.pins[self.profile['binary']],'argv':[self.profile['binary'],'-d',self.profile['config']]}
+  self.guard=RuntimePins(self.profile,protect=lambda p,**kw:Path(p),identity=lambda:(0,'cage-user','host',980),process_probe=lambda s:self.process)
+ def tearDown(self):self.tmp.cleanup()
+ def test_exact_pins_pass(self):self.guard()
+ def test_file_change_refuses(self):
+  for name in self.files:
+   p=self.root/name;p.write_bytes(b'changed')
+   with self.assertRaisesRegex(Refused,'runtime_file_changed'):self.guard()
+   p.write_bytes(self.files[name])
+ def test_identity_mismatch_refuses(self):
+  for identity in [(1,'cage-user','host',980),(0,'other','host',980),(0,'cage-user','other',980),(0,'cage-user','host',981)]:
+   self.guard.identity=lambda:identity
+   with self.assertRaisesRegex(Refused,'runtime_identity_mismatch'):self.guard()
+ def test_running_binary_and_config_must_match(self):
+  for change in ({'active':False},{'executable':'/other'},{'binary_sha256':'0'*64},{'argv':[self.profile['binary'],'-d','/other']}):
+   saved=dict(self.process);self.process.update(change)
+   with self.assertRaises(Refused):self.guard()
+   self.process=saved
+ def test_profile_cannot_mutate_after_constructor(self):
+  self.profile['files'][self.profile['binary']]='0'*64
+  self.guard()
+ def test_policy_semantics_checked_even_if_hash_provisioned(self):
+  for change in ({'gate_default_mode':'observe'},{'evidence_required':False},{'socket_uid_tier_ceilings':{'980':'red'}}):
+   config={**self.cfg,**change};raw=json.dumps(config).encode();(self.root/'config').write_bytes(raw)
+   self.guard.profile['files'][str(self.root/'config')]=hashlib.sha256(raw).hexdigest()
+   with self.assertRaisesRegex(Refused,'runtime_gate_policy_changed'):self.guard()
+ def test_target_port_and_node_checked_even_if_hash_provisioned(self):
+  for key,value in [('host','192.0.2.1'),('node_id','00000105'),('port',2022)]:
+   config=json.loads(json.dumps(self.cfg));config['devices'][0][key]=value
+   raw=json.dumps(config).encode();(self.root/'config').write_bytes(raw)
+   self.guard.profile['files'][str(self.root/'config')]=hashlib.sha256(raw).hexdigest()
+   with self.assertRaisesRegex(Refused,'runtime_target_changed'):self.guard()
+if __name__=='__main__':unittest.main()
