@@ -406,3 +406,49 @@ services. It rejects supplied CLI, target, transaction ID, approval status and
 lease fields. STOP/pending/expiry and duplicate requests fail before dispatch.
 Reconciliation and replay qualification are not exposed as ordinary cage verbs.
 Request/response files remain explicitly helper records, not native observations.
+
+## Canary host entrypoint (source only)
+
+`port_canary_service.py` is a separate, canary-only entrypoint. It hard-pins VM105's
+machine identity, virp-cage-test caller, virp-kreq UID980 execute path, daemon UID995,
+the existing service argv, producer public key, and canary test approver public
+key. It accepts no command-line paths. All local modules are root-protected and
+hash-pinned before import, then rechecked during each scope check. A test checks
+the complete transitive local import manifest, including deferred imports.
+
+Its fixed root profile is `/etc/virp-canary/port-helper.json`; private test-key
+loading is restricted to `/root/canary-test-approver.key`, mode0600, raw64 bytes
+`seed || public`. Both the stored public half and derived Ed25519 public key must
+match the independently pinned canary test public key. No private bytes are in
+the repository. Wrong host/caller, changed runtime, expired work scope, STOP or
+pending outcome refuse before private-key loading or transaction-store opening.
+
+The lab bootstrap may approve only `show running-config interface Ethernet0/1`
+on the fixed canary. Its native proposal/approval are chained and signed by the
+test approver, explicitly not Duo. Production has no such automatic bootstrap
+authority. Execute remains UID980; root control is restricted by the adapter to
+native approval submission and signed evidence appends. The model never receives
+either socket or a signing function.
+
+This entrypoint has not been installed or executed on VM105. Its caller/host
+refusal, key parsing and profile checks are local tests. The real local C fixture
+uses the same CanaryClient owner adapter, but does not qualify host deployment,
+SSH forced-command routing, VM227 model behavior, real Cisco timing or recovery.
+The existing expired scope and unapproved lab prerequisites remain unchanged.
+
+### Lease enforcement boundary
+
+The transaction lease is enforced by the trusted helper and independent owner
+coordinator. Native VAP1 command approvals retain the existing300-second TTL;
+the C daemon does not parse the new transaction envelope. Scope and transaction
+state are checked before dispatch. An already-dispatched operation can finish
+after lease expiry; this is not cancellation or a claim of device-side deadline
+enforcement. A command signature can also remain cryptographically valid longer
+than a short transaction lease, although the ordinary fixed helper refuses its
+use outside the approved transaction state. No arbitrary approval-ID or raw
+socket path is exposed to the cage.
+
+If acceptance requires the C gate itself to bind every native approval to the
+transaction's shorter deadline, that is an additional contract/implementation
+gap. Do not claim the local expiry tests prove that stronger property, change
+approval TTL semantics silently, or expose the raw command executor to compensate.

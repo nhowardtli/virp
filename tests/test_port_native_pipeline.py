@@ -18,6 +18,7 @@ from port_flow import PortFlow
 from port_scope import ScopeGuard
 from port_transaction import Transactions
 from port_canary_owner import CanaryOwnerRequests
+from port_canary_service import CanaryClient
 from port_owner_service import dispatch
 from port_replay import verify_pair
 from port_services import PortServices
@@ -70,8 +71,7 @@ class NativePipeline(unittest.TestCase):
  def native(self,body):
   return NativePort(body=body,transport=self.transport,ledger=self.ledger,records=self.root/'records',recovery_dir=self.root/'v3-recovery',public_key=self.producer,node_id=260,chain_session=self.chain,approval_session=self.approval_session,approver_public_key=self.pub,operator='canary-test-approver',guard=self.scope.check,stop=self.scope.stop)
  def call(self,q):
-  if q['action']=='authorize':return {'ok':True,'transaction_id':q['transaction_id'],**self.owner.authorize(q['transaction_id'])}
-  return dispatch(q,self.owner,lambda:None,{'kestrel-ios'})
+  return CanaryClient(self.owner).call(q)
  def prepare_flow(self,seconds=60):
   read=self.native({'target':self.target});cmd='show running-config interface Ethernet0/1'
   reference=read.propose(cmd)['reference'];challenge=read.challenge(reference['proposal_id'],cmd)
