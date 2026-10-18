@@ -2,6 +2,16 @@ import unittest
 from open_canary import validate
 class OpenTests(unittest.TestCase):
  def request(self):return {'operation':'port_open_execute','request_id':'a'*32,'rationale':'Inspect the isolated canary for qualification.','command':'show version'}
+ def test_scope_journal_accepts_open_operation(self):
+  import tempfile
+  from pathlib import Path
+  from port_scope import ScopeGuard
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);(root/'records').mkdir()
+   scope=ScopeGuard(root,check_runtime=lambda:None,protect=lambda p,**kw:Path(p))
+   scope.check=lambda:{'authorization_sha256':'a'*64}
+   q=self.request();scope.reserve({k:q[k] for k in ('operation','request_id','rationale')})
+   self.assertTrue((root/'records'/(q['request_id']+'.request.json')).exists())
  def test_green_yellow_red_are_not_helper_filtered(self):
   for cmd in ('show version','show running-config','configure terminal','interface Ethernet0/1 switchport port-security','reload'):
    q=self.request();q['command']=cmd;self.assertEqual(validate(q),q)
