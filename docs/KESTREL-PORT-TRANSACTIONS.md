@@ -452,3 +452,23 @@ If acceptance requires the C gate itself to bind every native approval to the
 transaction's shorter deadline, that is an additional contract/implementation
 gap. Do not claim the local expiry tests prove that stronger property, change
 approval TTL semantics silently, or expose the raw command executor to compensate.
+
+### Forced-command router (source only)
+
+`port_canary_router.py` stages routing for the existing authenticated canary
+forced command. It pins two root-owned destination files in a root-only
+`/etc/virp-canary/port-router.json` profile. Thirteen port operations go to the
+new service; existing diagnostic reads/status/stop go to a preserved legacy
+endpoint. The old description apply/restore/replay verbs are deliberately not
+exposed during this port qualification: two independent write workflows must
+not operate on the same port between transaction steps. The old endpoint remains
+recovery material, not a second agent-accessible executor.
+
+Only operation/request_id/rationale are accepted. Duplicate JSON keys, extra
+fields and unlisted operations refuse. Handoff uses exec with an anonymous
+request file and an allowlisted environment, so the router introduces no child
+timeout that could kill a running transaction. A subprocess test checks exact
+request bytes, same PID and exclusion of inherited environment secrets. Both
+destinations retain their own identity, work-scope, lock and runtime checks.
+The VM227 transport timeout and model turn limit still need qualification;
+this router alone does not solve those limits or prove end-to-end deployment.
