@@ -3174,3 +3174,32 @@ and since the home node defines none of the colo placeholders,
 `render-devices.sh` would FATAL and the daemon would refuse to start
 across every governed device. The target now refuses to run off
 `virp-lab` unless the source is named explicitly.
+
+## 2026-10-18 — Astra canary model and routine port tiers
+
+Source d9a9df5 on feat/v3-execute-path; VM105 canary binary SHA256
+`13612b4de39ffdfb78c44d0d15a4d0fc160ad80c385754bc1a3608f81a3d3329`.
+VM227 isolated canary runner uses `gpt-6-astra`, reasoning low, per-run token totals.
+Production .211/3850 and shared production API configuration unchanged.
+Snapshots VM105/227 `before-astra-mode-20261018`; software/profile backups
+`/root/kestrel-astra-mode-20261018` on each VM. Recovery restores matching
+software/profile versions only, never chain/approval/journal state.
+
+Exact routine access-mode/access-VLAN/PortFast operations are YELLOW; security
+operations remain RED and destructive/unknown protections remain. Native GREEN
+ceiling and independent transaction/test approval still enforced. Old signed RED
+plans and all448prior chain entries preserved.
+
+Live GPT-6 Astra transaction `e368621a3c514d32af4bacc6251a073b`:
+mode_access, apply, verify, exact restore and verify-restored passed through
+VM227 -> VM105 C -> isolated Cisco Ethernet0/1. Seven model calls:5092input,
+385output,5477total tokens;11reasoning included,0cached. Provider accounting,
+not billing or signed device evidence. Scope lease unchanged;61/96requests used.
+
+Validation:223classifier cases,38parser cases plus boundary checks,
+347Python helper tests,4native C integration tests. Offline virp-verify0.1.3
+CRYPTOGRAPHICALLY-VERIFIED:568entries/14chains/149v3frames,120newentries/28newv3.
+All chains valid, no open execution, STOP/pending absent. No witness receipt.
+Native deadline binding, port UNKNOWN reconciliation and full live negative
+matrix remain open. No broad autonomous production qualification claimed.
+Private report and packet: `/home/nhoward/audits/kestrel-astra-mode-20261018/`.
