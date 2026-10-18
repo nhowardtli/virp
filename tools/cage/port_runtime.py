@@ -26,9 +26,11 @@ def probe_service(service):
  exe=os.readlink(proc/'exe')
  digest=hashlib.sha256((proc/'exe').read_bytes()).hexdigest()
  argv=[x.decode() for x in (proc/'cmdline').read_bytes().split(b'\0') if x]
+ uid_line=next(line for line in (proc/'status').read_text().splitlines() if line.startswith('Uid:'))
+ effective_uid=int(uid_line.split()[2])
  after=(proc/'stat').read_bytes().rsplit(b')',1)[1].split()[19]
  if start!=after:raise Refused('runtime_process_changed')
- return {'active':True,'executable':exe,'binary_sha256':digest,'argv':argv}
+ return {'active':True,'executable':exe,'binary_sha256':digest,'argv':argv,'effective_uid':effective_uid}
 
 class RuntimePins:
  def __init__(self,profile,*,protect=protected,identity=None,process_probe=probe_service):
@@ -37,6 +39,7 @@ class RuntimePins:
   self.identity=identity or self.local_identity
   p=self.profile
   if p['requester_uid']!=980:raise Refused('invalid_requester_pin')
+  if type(p['daemon_uid'])is not int or p['daemon_uid']<=0:raise Refused('invalid_daemon_uid_pin')
   if any(path not in p['files'] for path in (p['binary'],p['config'],p['public_key'])):raise Refused('missing_runtime_file_pin')
   if any(not re.fullmatch('[a-f0-9]{64}',v) for v in p['files'].values()):raise Refused('invalid_runtime_file_pin')
   if (not isinstance(p['argv'],list) or not p['argv'] or p['argv'][0]!=p['binary'] or
@@ -49,7 +52,9 @@ class RuntimePins:
   if self.identity()!=(0,p['sudo_user'],p['machine_id'],p['requester_uid']):raise Refused('runtime_identity_mismatch')
   data={}
   for path,digest in p['files'].items():
-   raw=self.protect(path,secret=path==p['config']).read_bytes()
+   protected_path=self.protect(path)
+   if path==p['config'] and protected_path.stat().st_mode&0o007:raise Refused('runtime_config_permissions')
+   raw=protected_path.read_bytes()
    if hashlib.sha256(raw).hexdigest()!=digest:raise Refused('runtime_file_changed')
    data[path]=raw
   if data[p['public_key']]!=bytes.fromhex(p['public_key_hex']):raise Refused('runtime_producer_pin_mismatch')
@@ -62,4 +67,4 @@ class RuntimePins:
   except (ValueError,KeyError,TypeError):raise Refused('runtime_target_changed') from None
   if d.get('host')!=target['host'] or node!=target['device_node_id'] or d.get('port',22)!=target['transport_port']:raise Refused('runtime_target_changed')
   live=self.probe(p['service'])
-  if live.get('active') is not True or live.get('executable')!=p['binary'] or live.get('binary_sha256')!=p['files'][p['binary']] or live.get('argv')!=p['argv']:raise Refused('runtime_process_pin_mismatch')
+  if live.get('effective_uid')!=p['daemon_uid'] or live.get('active') is not True or live.get('executable')!=p['binary'] or live.get('binary_sha256')!=p['files'][p['binary']] or live.get('argv')!=p['argv']:raise Refused('runtime_process_pin_mismatch')

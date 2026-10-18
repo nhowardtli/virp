@@ -318,3 +318,18 @@ entrypoint does not import or expose this adapter. Production transaction state
 requires `duo` and rejects a test envelope even if otherwise correctly signed.
 The lab entrypoint must additionally pin VM105 and its provisioned test key.
 No test signer or key has been installed by this source change.
+
+## Canary custody finding (read-only, 2026-10-18)
+
+The running canary binary still matches 938027b7...e6c182. Its device config,
+producer public file and approver registry currently belong to service UID995,
+GID987, mode0600. The binary and helper modules are root-owned. The new runtime
+guard intentionally requires root-controlled configuration inputs and also pins
+the running daemon's effective UID. It accepts a root-owned device config with
+read-only daemon-group access (0640), but rejects world-readable credentials.
+
+Deployment therefore needs an explicit metadata-only custody adjustment after a
+snapshot: root ownership, daemon group read access for files the daemon must read,
+and protected parent directories. Preserve every config byte and hash; retain
+original ownership/modes for rollback. No such change was made by the read-only
+inspection. Do not weaken the profile guard to make the current layout pass.

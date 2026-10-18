@@ -1,6 +1,7 @@
-import hashlib,json,tempfile,unittest
+import hashlib,json,tempfile,unittest,os
+from unittest.mock import patch
 from pathlib import Path
-from port_runtime import RuntimePins
+from port_runtime import RuntimePins,probe_service
 from port_transaction import Refused
 
 class RuntimeTests(unittest.TestCase):
@@ -11,24 +12,32 @@ class RuntimeTests(unittest.TestCase):
   self.files={'binary':b'binary','config':json.dumps(self.cfg).encode(),'public_key':b'p'*32,'module':b'module'}
   self.pins={}
   for name,raw in self.files.items():
-   p=self.root/name;p.write_bytes(raw);self.pins[str(p)]=hashlib.sha256(raw).hexdigest()
-  self.profile={'machine_id':'host','sudo_user':'cage-user','requester':'virp-kreq','requester_uid':980,'service':'virp-canary','binary':str(self.root/'binary'),'config':str(self.root/'config'),'public_key':str(self.root/'public_key'),'public_key_hex':(b'p'*32).hex(),'files':self.pins,'target':self.target}
+   p=self.root/name;p.write_bytes(raw);p.chmod(0o640 if name=='config' else 0o644);self.pins[str(p)]=hashlib.sha256(raw).hexdigest()
+  self.profile={'machine_id':'host','sudo_user':'cage-user','requester':'virp-kreq','requester_uid':980,'service':'virp-canary','daemon_uid':995,'binary':str(self.root/'binary'),'config':str(self.root/'config'),'public_key':str(self.root/'public_key'),'public_key_hex':(b'p'*32).hex(),'files':self.pins,'target':self.target}
   self.profile['argv']=[self.profile['binary'],'-d',self.profile['config']]
-  self.process={'active':True,'executable':self.profile['binary'],'binary_sha256':self.pins[self.profile['binary']],'argv':[self.profile['binary'],'-d',self.profile['config']]}
+  self.process={'effective_uid':995,'active':True,'executable':self.profile['binary'],'binary_sha256':self.pins[self.profile['binary']],'argv':[self.profile['binary'],'-d',self.profile['config']]}
   self.guard=RuntimePins(self.profile,protect=lambda p,**kw:Path(p),identity=lambda:(0,'cage-user','host',980),process_probe=lambda s:self.process)
  def tearDown(self):self.tmp.cleanup()
+ def test_process_probe_reads_real_proc_fields(self):
+  with patch('port_runtime.subprocess.check_output',return_value='MainPID='+str(os.getpid())+'\nActiveState=active\n'):
+   found=probe_service('virp-canary')
+  self.assertEqual(found['effective_uid'],os.geteuid());self.assertEqual(found['executable'],os.readlink('/proc/self/exe'))
+  self.assertTrue(found['argv']);self.assertEqual(len(found['binary_sha256']),64)
  def test_exact_pins_pass(self):self.guard()
  def test_file_change_refuses(self):
   for name in self.files:
    p=self.root/name;p.write_bytes(b'changed')
    with self.assertRaisesRegex(Refused,'runtime_file_changed'):self.guard()
    p.write_bytes(self.files[name])
+ def test_device_credentials_cannot_be_world_readable(self):
+  (self.root/'config').chmod(0o644)
+  with self.assertRaisesRegex(Refused,'runtime_config_permissions'):self.guard()
  def test_identity_mismatch_refuses(self):
   for identity in [(1,'cage-user','host',980),(0,'other','host',980),(0,'cage-user','other',980),(0,'cage-user','host',981)]:
    self.guard.identity=lambda:identity
    with self.assertRaisesRegex(Refused,'runtime_identity_mismatch'):self.guard()
  def test_running_binary_and_config_must_match(self):
-  for change in ({'active':False},{'executable':'/other'},{'binary_sha256':'0'*64},{'argv':[self.profile['binary'],'-d','/other']}):
+  for change in ({'effective_uid':0},{'active':False},{'executable':'/other'},{'binary_sha256':'0'*64},{'argv':[self.profile['binary'],'-d','/other']}):
    saved=dict(self.process);self.process.update(change)
    with self.assertRaises(Refused):self.guard()
    self.process=saved
