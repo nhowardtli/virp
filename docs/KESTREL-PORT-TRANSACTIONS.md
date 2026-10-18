@@ -173,3 +173,34 @@ host-key updates, and requires a root-protected explicit known-hosts file. JSON
 travels only on stdin. Timeout or malformed response is indeterminate and never
 automatically retried. This client is source-only until restricted account,
 forced command, client key and pinned host file are provisioned.
+
+## Native approval verification and remaining integration contracts
+
+`port_native_approval` reconstructs the existing 72-byte VAP1 payload from the
+native approval artifact and checks the approver's external public pin, operator,
+proposal, command, configured device node and TTL. `ApprovalLedger` additionally
+checks exact artifact bytes, producer signature, unique membership, the explicitly
+pinned epoch session and native chain verification. The real canary approval
+session is `approval:kestrel-ios@cml-v3-20261016`. A compatibility check against the
+previously captured cc7dc593c61c1d349727746e81dff01a approval passed using public
+pins and its historical issuance time; it confers no present execution authority.
+
+Before enabling the runtime, native forward/restore proposals must be filed and
+bound into the transaction *before* owner approval. The existing C daemon can
+issue a fresh challenge for an unconsumed, already-filed proposal; this permits a
+fresh short-lived restore signature without creating a new restore proposal at
+expiry. The current transaction bundle does not yet pin that proposal inventory.
+This must be implemented before live expiry acceptance, not worked around by
+silently creating a new proposal after expiry.
+
+The runtime must also recheck the complete approved baseline before forward
+apply. Current parser/state libraries do not themselves dispatch or collect that
+second preflight. A trusted caller supplying a hash or `matches` is not sufficient
+for an exposed cage endpoint. Live dispatch remains disabled until these adapters
+are wired and qualified.
+
+The checked virp-verify 0.1.3 build is c38c4f8 (clean release). Its standalone
+verdict authenticates chain signatures and carried artifact hashes; it does not
+by itself implement this transaction state machine or check the native VAP1
+approval semantics. Keep the existing verifier and report supplementary public-
+pin approval/v3 checks separately. No Rust version or verifier code was changed.
