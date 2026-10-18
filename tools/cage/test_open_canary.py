@@ -1,7 +1,7 @@
 import unittest
 from open_canary import validate
 class OpenTests(unittest.TestCase):
- def request(self):return {'operation':'open_execute','request_id':'a'*32,'rationale':'Inspect the isolated canary for qualification.','command':'show version'}
+ def request(self):return {'operation':'port_open_execute','request_id':'a'*32,'rationale':'Inspect the isolated canary for qualification.','command':'show version'}
  def test_green_yellow_red_are_not_helper_filtered(self):
   for cmd in ('show version','show running-config','configure terminal','interface Ethernet0/1 switchport port-security','reload'):
    q=self.request();q['command']=cmd;self.assertEqual(validate(q),q)

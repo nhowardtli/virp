@@ -34,7 +34,7 @@ def main():
    index+=1;durable_write(directory/(str(index).zfill(4)+'.json'),json.dumps(event).encode())
   def call(q):guard();return transport.call(q)
   if a.command:
-   q=validate({'operation':'open_execute','request_id':uuid.uuid4().hex,'command':a.command,'rationale':'Owner-directed canary qualification of non-BLACK delegated execution.'});record({'type':'helper_request','request':q});result=call(q)
+   q=validate({'operation':'port_open_execute','request_id':uuid.uuid4().hex,'command':a.command,'rationale':'Owner-directed canary qualification of non-BLACK delegated execution.'});record({'type':'helper_request','request':q});result=call(q)
   else:
    key=protected('/etc/openai-cage/api.key',secret=True).read_text().strip()
    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())

@@ -30,7 +30,7 @@ def select(raw,allow_open=False):
  try:
   if not isinstance(raw,bytes) or len(raw)>4096:raise ValueError()
   q=json.loads(raw,object_pairs_hook=unique)
-  if allow_open and isinstance(q,dict) and q.get('operation')=='open_execute':
+  if allow_open and isinstance(q,dict) and q.get('operation')=='port_open_execute':
    if set(q)!={'operation','request_id','rationale','command'}:raise ValueError()
    if not isinstance(q['command'],str) or not 1<=len(q['command'])<=1024:raise ValueError()
    q={k:v for k,v in q.items() if k!='command'}
@@ -39,7 +39,7 @@ def select(raw,allow_open=False):
   if not isinstance(q['rationale'],str) or not 20<=len(q['rationale'])<=1000:raise ValueError()
   op=q['operation']
   if not isinstance(op,str):raise ValueError()
-  if op=='open_execute' and allow_open:return OPEN_SERVICE
+  if op=='port_open_execute' and allow_open:return OPEN_SERVICE
   if op in PORT_OPERATIONS:return PORT_SERVICE
   if op in LEGACY_OPERATIONS:return LEGACY_SERVICE
   raise RouterRefused('operation_denied')

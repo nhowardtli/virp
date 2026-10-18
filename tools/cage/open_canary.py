@@ -16,7 +16,7 @@ class OpenRefused(ValueError):pass
 
 def validate(q):
  if not isinstance(q,dict) or set(q)!={'operation','request_id','rationale','command'}:raise OpenRefused('invalid_open_request')
- if q['operation']!='open_execute' or not isinstance(q['request_id'],str) or not re.fullmatch('[a-f0-9]{32}',q['request_id']):raise OpenRefused('invalid_open_request')
+ if q['operation']!='port_open_execute' or not isinstance(q['request_id'],str) or not re.fullmatch('[a-f0-9]{32}',q['request_id']):raise OpenRefused('invalid_open_request')
  if not isinstance(q['rationale'],str) or not 20<=len(q['rationale'])<=1000:raise OpenRefused('invalid_open_rationale')
  if not isinstance(q['command'],str) or not 1<=len(q['command'])<=1024 or any(ord(c)<32 or ord(c)>126 for c in q['command']):raise OpenRefused('invalid_open_command')
  return q

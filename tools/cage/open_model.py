@@ -20,7 +20,7 @@ def run(provider,transport,prompt,record,max_turns=16):
   if c.get('name')!='virp_execute' or not isinstance(c.get('call_id'),str) or c['call_id'] in calls_seen:raise ValueError('invalid_model_call')
   calls_seen.add(c['call_id']);a=json.loads(c['arguments'])
   if not isinstance(a,dict) or set(a)!={'command','rationale'}:raise ValueError('invalid_model_arguments')
-  q=validate({'operation':'open_execute','request_id':uuid.uuid4().hex,**a});record({'type':'helper_request','request':q})
+  q=validate({'operation':'port_open_execute','request_id':uuid.uuid4().hex,**a});record({'type':'helper_request','request':q})
   result=transport(q);record({'type':'helper_result','result':result});results.append(result)
   if result.get('request_id')!=q['request_id'] or result.get('command')!=q['command'] or result.get('result',{}).get('recovery_required'):
    return {'ok':False,'reason':'unresolved_helper_result','device_results':results,'usage':summarize_usage(responses)}
