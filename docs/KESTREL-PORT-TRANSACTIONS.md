@@ -493,3 +493,24 @@ This integration exposed an actual wire-type mismatch: SQLite expiry flags
 were exported as integers. The endpoint now emits a validated JSON boolean.
 The VM227 model loop and process-aware SSH timeout adapter are still separate
 deployment work; injecting a test transport here does not qualify them.
+
+`port_transport.py` now stages the fixed VM227-to-VM105 SSH adapter. Its target,
+port1122, forced command, root credential paths and SSH isolation options are
+fixed; neither model arguments nor ambient SSH-agent/proxy configuration choose
+them. It records intent before launch and PID/start-time/boot identity afterward.
+Input/output use private files, and the child starts in its own session. A wait
+timeout leaves the original process running and does not resend or cancel it.
+Inspection distinguishes running, exited, missing, rebooted and reused-PID
+states; process exit alone is never reported as remote execution success.
+
+The runner's unresolved-request latch remains in force even if a delayed reply
+later arrives. Reconciliation of that attempt is separate; no automatic retry
+or journal repair is exposed. Local subprocess tests prove this behavior across
+adapter/runner recreation, with no network I/O. They also cover malformed and
+duplicate-key replies, failed launches and secret-environment exclusion.
+
+The transport caps each retained stdout/stderr file at64KiB, rejects replies
+larger than8KiB, and disables child core dumps. Exceeding the file cap fails the
+transport and preserves unresolved intent. This is not a native signed E_SIZE
+or UNKNOWN frame. The adapter is still not installed or SSH-qualified on VM227;
+the protected VM227 entrypoint/model-loop integration remains outstanding.
