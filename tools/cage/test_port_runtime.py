@@ -13,10 +13,10 @@ class RuntimeTests(unittest.TestCase):
   self.pins={}
   for name,raw in self.files.items():
    p=self.root/name;p.write_bytes(raw);p.chmod(0o640 if name=='config' else 0o644);self.pins[str(p)]=hashlib.sha256(raw).hexdigest()
-  self.profile={'machine_id':'host','sudo_user':'cage-user','requester':'virp-kreq','requester_uid':980,'service':'virp-canary','daemon_uid':995,'binary':str(self.root/'binary'),'config':str(self.root/'config'),'public_key':str(self.root/'public_key'),'public_key_hex':(b'p'*32).hex(),'files':self.pins,'target':self.target}
+  self.profile={'machine_id':'host','sudo_user':'cage-user','requester':'virp-kreq','requester_uid':980,'service':'virp-canary','daemon_uid':995,'credential_gid':os.getgid(),'binary':str(self.root/'binary'),'config':str(self.root/'config'),'public_key':str(self.root/'public_key'),'public_key_hex':(b'p'*32).hex(),'files':self.pins,'target':self.target}
   self.profile['argv']=[self.profile['binary'],'-d',self.profile['config']]
-  self.process={'effective_uid':995,'active':True,'executable':self.profile['binary'],'binary_sha256':self.pins[self.profile['binary']],'argv':[self.profile['binary'],'-d',self.profile['config']]}
-  self.guard=RuntimePins(self.profile,protect=lambda p,**kw:Path(p),identity=lambda:(0,'cage-user','host',980),process_probe=lambda s:self.process)
+  self.process={'groups':[os.getgid()],'effective_uid':995,'active':True,'executable':self.profile['binary'],'binary_sha256':self.pins[self.profile['binary']],'argv':[self.profile['binary'],'-d',self.profile['config']]}
+  self.guard=RuntimePins(self.profile,protect=lambda p,**kw:Path(p),identity=lambda:(0,'cage-user','host',980),process_probe=lambda s:self.process,group_members=lambda gid:{995})
  def tearDown(self):self.tmp.cleanup()
  def test_process_probe_reads_real_proc_fields(self):
   with patch('port_runtime.subprocess.check_output',return_value='MainPID='+str(os.getpid())+'\nActiveState=active\n'):
@@ -29,6 +29,15 @@ class RuntimeTests(unittest.TestCase):
    p=self.root/name;p.write_bytes(b'changed')
    with self.assertRaisesRegex(Refused,'runtime_file_changed'):self.guard()
    p.write_bytes(self.files[name])
+ def test_shared_socket_group_cannot_read_credentials(self):
+  self.guard.group_members=lambda gid:{995,980}
+  with self.assertRaisesRegex(Refused,'credential_group_not_daemon_only'):self.guard()
+ def test_daemon_must_actually_have_private_read_group(self):
+  self.process['groups']=[]
+  with self.assertRaisesRegex(Refused,'runtime_process_pin_mismatch'):self.guard()
+ def test_root_config_must_have_expected_private_group(self):
+  self.guard.profile['credential_gid']=os.getgid()+10000
+  with self.assertRaisesRegex(Refused,'runtime_config_permissions'):self.guard()
  def test_device_credentials_cannot_be_world_readable(self):
   (self.root/'config').chmod(0o644)
   with self.assertRaisesRegex(Refused,'runtime_config_permissions'):self.guard()

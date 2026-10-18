@@ -389,3 +389,20 @@ The C daemon returns a signed v3 UNKNOWN, commits the native outcome, and consum
 the approval. The helper records unknown and preserves STOP/pending. Both retry
 and restore through the ordinary helper are blocked. Root reconciliation of that
 pending state remains a separate, not-yet-wired port recovery path.
+
+A follow-up membership check corrected the proposed custody layout before any
+deployment: virp-kreq UID980 is a member of the existing virp-canary socket group
+987. That shared group must **not** receive credential read access. The guard now
+requires a separate pinned credential group with exactly daemon UID995 as its
+member, devices.json root-owned0640 under that group, and the running daemon
+actually holding that group. The existing995:987 mode0600 config under a0700
+service-owned directory is not claimed to leak credentials today. No ownership
+or group change was executed. The private audit contains the deployment decision
+and original metadata for recovery.
+
+`port_endpoint` accepts only operation/request_id/rationale, maps thirteen fixed
+operations, and takes transaction selection and lease duration from trusted
+services. It rejects supplied CLI, target, transaction ID, approval status and
+lease fields. STOP/pending/expiry and duplicate requests fail before dispatch.
+Reconciliation and replay qualification are not exposed as ordinary cage verbs.
+Request/response files remain explicitly helper records, not native observations.

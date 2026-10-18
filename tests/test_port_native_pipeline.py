@@ -20,6 +20,8 @@ from port_transaction import Transactions
 from port_canary_owner import CanaryOwnerRequests
 from port_owner_service import dispatch
 from port_replay import verify_pair
+from port_services import PortServices
+from port_endpoint import dispatch as cage_dispatch
 
 class NativePipeline(unittest.TestCase):
  def setUp(self):
@@ -131,18 +133,21 @@ class NativePipeline(unittest.TestCase):
    print('LOCAL SYNTHETIC: dropped response produced native signed UNKNOWN, one simulated dispatch, STOP/pending preserved, no retry or restore bypass')
  def test_native_socket_roundtrip_and_replay(self):
   with self.scope.locked():
-   read=self.native({'target':self.target});cmd='show running-config interface Ethernet0/1'
-   # Explicit local test-key bootstrap; no production/Duo claim.
-   reference=read.propose(cmd)['reference'];challenge=read.challenge(reference['proposal_id'],cmd)
-   read.submit(challenge,self.key.sign(bytes.fromhex(challenge['canonical'])))
-   prep=PortPreparation(self.tx,self.events,read,self.native,self.scope,protected_ports=set())
-   tid=prep.prepare('mode_access',config_proposal_id=reference['proposal_id'],verification_budget=4)
-   approved=PortAuthorization(self.tx,self.events,self,self.scope,tid).authorize(60)
-   self.assertEqual(approved['state'],'approved')
-   _,body=self.tx._get(tid);native=self.native(body)
-   flow=PortFlow(self.tx,self.events,native,self,self.scope,tid,protected_ports=set())
+   def bootstrap(read):
+    cmd='show running-config interface Ethernet0/1'
+    reference=read.propose(cmd)['reference'];challenge=read.challenge(reference['proposal_id'],cmd)
+    read.submit(challenge,self.key.sign(bytes.fromhex(challenge['canonical'])))
+    return reference['proposal_id']
+   services=PortServices(self.tx,self.events,self,self.scope,self.target,self.native,bootstrap,protected_ports=set())
+   def ask(operation):
+    q={'operation':operation,'request_id':uuid.uuid4().hex,'rationale':'local synthetic cage dispatcher qualification'}
+    return cage_dispatch(q,services,self.scope,lease_seconds=60)
+   tid=ask('port_prepare_mode_access')['transaction_id']
+   self.assertEqual(ask('port_authorize')['state'],'approved')
    for verb,state in [('preflight','preflight_verified'),('apply','applied'),('verify','verified'),('restore','restore_applied'),('verify_restored','restored')]:
-    self.assertEqual(flow.step(verb)['state'],state)
+    self.assertEqual(ask('port_'+verb)['state'],state)
+   self.assertEqual(len(list((self.root/'records').glob('*.request.json'))),7)
+   _,body=self.tx._get(tid);native=self.native(body)
    state=json.loads((self.root/'device-state.json').read_text());self.assertEqual(state,{'access':False,'writes':2})
    pid=body['native_proposals']['forward']['proposal_id']
    with sqlite3.connect(self.root/'chain.db') as db:
