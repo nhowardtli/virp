@@ -301,3 +301,10 @@ outbox must reach the signed chain before another starts, and native proposal
 IDs cannot be reused in a later transaction. Prepared or ambiguous transactions
 remain blocking until explicitly resolved; there is no automatic deletion of
 state or consumed approvals.
+
+`PortAuthorization` durably reserves one owner handoff before contacting the
+owner service. It cannot automatically repeat a push or signature request after
+a lost response. The signed executor envelope uses only the duration remaining
+from the owner's original authorization deadline. The owner independently checks
+that deadline again. Handoff failure latches STOP and preserves the attempt for
+reconciliation; it does not create an approval or silently retry with a new ID.

@@ -76,6 +76,7 @@ class Transactions:
     state TEXT NOT NULL,boot TEXT NOT NULL,approval TEXT,signature TEXT,expires_ns INTEGER,
     deadline REAL,preflight_wall_ns INTEGER,preflight_boot REAL,expired INTEGER NOT NULL DEFAULT 0,close_reason TEXT);
    CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,transaction_id TEXT UNIQUE NOT NULL);
+   CREATE TABLE IF NOT EXISTS owner_attempts(transaction_id TEXT PRIMARY KEY,lease_seconds INTEGER NOT NULL,started_ns INTEGER NOT NULL);
    CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,transaction_id TEXT NOT NULL,verb TEXT NOT NULL,
     dispatched INTEGER NOT NULL DEFAULT 0,finished INTEGER NOT NULL DEFAULT 0);
    CREATE TABLE IF NOT EXISTS native_issuances(proposal_id TEXT PRIMARY KEY,request_id TEXT NOT NULL,
@@ -132,6 +133,15 @@ class Transactions:
    self.db.execute('INSERT INTO transactions(id,body,hash,state,boot) VALUES(?,?,?,?,?)',(tid,canonical(body).decode(),digest(body),'prepared',self.boot_id))
    self._event(tid,'proposal',plan_sha256=digest(body),bundle=body)
   return tid
+ def begin_authorization(self,tid,seconds):
+  if type(seconds)is not int or not 1<=seconds<=self.max_lease_seconds:raise Refused('invalid_lease')
+  with self.atomic():
+   row,_=self._get(tid)
+   if row['state']!='prepared':raise Refused('approval_already_processed')
+   if self.db.execute('SELECT 1 FROM events WHERE transaction_id=? AND receipt IS NULL',(tid,)).fetchone():raise Refused('chain_receipt_required')
+   try:self.db.execute('INSERT INTO owner_attempts VALUES(?,?,?)',(tid,seconds,self.wall_ns()))
+   except sqlite3.IntegrityError:raise Refused('owner_authorization_already_started') from None
+   self._event(tid,'owner_authorization_intent',lease_seconds=seconds,plan_sha256=row['hash'])
  def approval_request(self,tid,seconds,*,authorization):
   row,_=self._get(tid)
   if row['state']!='prepared':raise Refused('approval_already_processed')
