@@ -37,6 +37,9 @@ def dispatch(q,services,scope,*,lease_seconds):
  if state.get('id',tid)!=tid:raise Refused('backend_transaction_changed')
  result={'ok':True,'operation':operation,'request_id':q['request_id'],'transaction_id':tid,
          **{k:state[k] for k in ('state','expired','close_reason') if k in state}}
+ if 'expired' in result:
+  if type(result['expired']) not in (int,bool) or result['expired'] not in (0,1):raise Refused('invalid_backend_expiry_flag')
+  result['expired']=bool(result['expired'])
  if record is not None:
   durable_write(record.with_name(q['request_id']+'.result.json'),canonical(result))
  return result

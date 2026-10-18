@@ -22,6 +22,7 @@ from port_canary_service import CanaryClient
 from port_owner_service import dispatch
 from port_replay import verify_pair
 from port_services import PortServices
+from port_runner import PortRunner
 from port_endpoint import dispatch as cage_dispatch
 
 class NativePipeline(unittest.TestCase):
@@ -139,14 +140,17 @@ class NativePipeline(unittest.TestCase):
     read.submit(challenge,self.key.sign(bytes.fromhex(challenge['canonical'])))
     return reference['proposal_id']
    services=PortServices(self.tx,self.events,self,self.scope,self.target,self.native,bootstrap,protected_ports=set())
+   runner_root=self.root/'runner';runner_root.mkdir(mode=0o700)
+   runner=PortRunner(runner_root,protect=lambda p,**kw:pathlib.Path(p))
    def ask(operation):
-    q={'operation':operation,'request_id':uuid.uuid4().hex,'rationale':'local synthetic cage dispatcher qualification'}
-    return cage_dispatch(q,services,self.scope,lease_seconds=60)
+    return runner.request(operation,'local synthetic cage dispatcher qualification',
+     lambda q:cage_dispatch(q,services,self.scope,lease_seconds=60))
    tid=ask('port_prepare_mode_access')['transaction_id']
    self.assertEqual(ask('port_authorize')['state'],'approved')
    for verb,state in [('preflight','preflight_verified'),('apply','applied'),('verify','verified'),('restore','restore_applied'),('verify_restored','restored')]:
     self.assertEqual(ask('port_'+verb)['state'],state)
    self.assertEqual(len(list((self.root/'records').glob('*.request.json'))),7)
+   self.assertEqual(runner.completion()['state'],'restored')
    _,body=self.tx._get(tid);native=self.native(body)
    state=json.loads((self.root/'device-state.json').read_text());self.assertEqual(state,{'access':False,'writes':2})
    pid=body['native_proposals']['forward']['proposal_id']

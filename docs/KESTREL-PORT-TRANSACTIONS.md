@@ -472,3 +472,24 @@ request bytes, same PID and exclusion of inherited environment secrets. Both
 destinations retain their own identity, work-scope, lock and runtime checks.
 The VM227 transport timeout and model turn limit still need qualification;
 this router alone does not solve those limits or prove end-to-end deployment.
+
+### Trusted runner protocol (source only)
+
+`port_runner.py` supplies the client-side transaction sequence and durable
+request journal for the future VM227 integration. It accepts named operations
+and rationale, generates its own request IDs, and persists intent before calling
+the fixed transport adapter. A timeout, refusal or reply-binding mismatch leaves
+that request unresolved on disk. A new runner instance refuses another dispatch;
+there is no retry, journal-clearing or recovery shortcut. Actual UNKNOWN also
+blocks further ordinary requests. A verification mismatch permits only restore.
+
+The runner checks exact operation/request/transaction binding and refuses a
+completion claim until the helper reports a closed transaction. It does not
+claim independent evidence verification. Its private journal is not a native
+chain. The real local C positive fixture now traverses this runner protocol,
+the finite dispatcher, native helper and C daemon for all seven steps.
+
+This integration exposed an actual wire-type mismatch: SQLite expiry flags
+were exported as integers. The endpoint now emits a validated JSON boolean.
+The VM227 model loop and process-aware SSH timeout adapter are still separate
+deployment work; injecting a test transport here does not qualify them.

@@ -42,6 +42,9 @@ class EndpointTests(unittest.TestCase):
  def test_status_does_not_consume_attempt_budget(self):
   r=self.run_request(self.request('port_status'));self.assertEqual(r['state'],'prepared')
   self.assertEqual(list((self.root/'records').iterdir()),[])
+ def test_sqlite_expired_flag_is_a_json_boolean(self):
+  self.services.status=lambda tid:{'id':tid,'state':'prepared','expired':0,'close_reason':None}
+  self.assertIs(self.run_request(self.request('port_status'))['expired'],False)
  def test_catalogue_contains_no_free_cli_or_qualification_bypass(self):
   self.assertNotIn('port_reconcile',OPERATIONS);self.assertNotIn('port_replay',OPERATIONS)
   self.assertEqual(set(OPERATIONS),{'port_prepare_mode_access','port_prepare_vlan_10','port_prepare_portfast','port_prepare_security_enable','port_prepare_security_maximum_2','port_prepare_security_violation_restrict','port_authorize','port_preflight','port_apply','port_verify','port_restore','port_verify_restored','port_status'})
