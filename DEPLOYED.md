@@ -3203,3 +3203,32 @@ All chains valid, no open execution, STOP/pending absent. No witness receipt.
 Native deadline binding, port UNKNOWN reconciliation and full live negative
 matrix remain open. No broad autonomous production qualification claimed.
 Private report and packet: `/home/nhoward/audits/kestrel-astra-mode-20261018/`.
+
+## 2026-10-18 — Owner-delegated non-BLACK canary test mode
+
+Source2c1fcba/92e83e9/379d629; C binary remains d9a9df5
+SHA25613612b4de39ffdfb78c44d0d15a4d0fc160ad80c385754bc1a3608f81a3d3329.
+VM105 dedicated no-login UID979 RED ceiling, socket admission and execution/session/
+observation-only append/verify actions. No BLACK passthrough. UID980 stays GREEN.
+Root opt-in forced router exposes open_canary.py only on fixed isolated Cisco target.
+VM227 isolated /usr/local/sbin/virp-cml-open-test --prompt '<task>' uses GPT-6 Astra.
+No proposal/approval/Duo/test-approver hop on new path. Existing bounded path retained;
+production .211/3850, shared API config, firewall/AWS unchanged.
+
+Snapshots105/227 before-open-canary-20261018; VM105 recovery material
+/root/kestrel-open-canary-20261018/before. Private rollback script
+/home/nhoward/audits/kestrel-open-canary-20261018/transfer/disable-open.py restores
+original native grant/router/profile without rewinding evidence.
+
+354Python tests passed. Live GREEN show version and RED configure terminal/end
+execute; BLACK reload returns signed refusal. Model8commands set/verify/restore
+canary description, original/final config output byte-identical,0newapprovals.
+Offline0.1.3 CRYPTOGRAPHICALLY-VERIFIED:618entries/15chains/161v3;50newentries/12v3,
+568priorentries unchanged. No witness. Model27499tokens incl21249cached input.
+
+Temporary helper work expiry remains2026-10-18T16:00:20.335895Z;74requests used,
+open route ceiling256, original bounded route96. STOP/pending/evidence and lease
+interlocks retained. Native deadline binding, UNKNOWN reconciliation, full live
+negative matrix and comprehensive BLACK alias/indirect-effect coverage remain open.
+No generic automatic rollback claimed. New CLI route is whole-canary, not port-only.
+Report: /home/nhoward/audits/kestrel-open-canary-20261018/REPORT.md.
