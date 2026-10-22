@@ -35,6 +35,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -67,6 +68,7 @@ struct virp_conn {
     bool                ssh_connected;
     bool                vdom_enabled;
     bool                vdom_probed;
+    time_t              next_health_probe; /* monotonic; no shell on every watchdog tick */
 };
 
 
@@ -887,6 +889,19 @@ static virp_error_t fg_health_check(virp_conn_t *base_conn)
     if (!conn->ssh_connected)
         return FG_ERR_NOT_CONNECTED;
 
+    /* A fresh shell channel generates a FortiOS administrator login event.
+     * Check transport closure each tick, but perform application-level health
+     * only every five minutes. Explicit device reads are never throttled.
+     * This is connection liveness, not a new signed health observation. */
+    char byte;
+    ssize_t n = recv(conn->ssh_socket, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+        return FG_ERR_TRANSPORT;
+    struct timespec now;
+    bool clock_ok = (clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+    if (clock_ok && conn->next_health_probe > now.tv_sec)
+        return VIRP_OK;
+
     virp_exec_result_t result;
     memset(&result, 0, sizeof(result));
 
@@ -894,6 +909,7 @@ static virp_error_t fg_health_check(virp_conn_t *base_conn)
     if (err != VIRP_OK || !result.success)
         return err ? err : FG_ERR_TRANSPORT;
 
+    if (clock_ok) conn->next_health_probe = now.tv_sec + 300;
     return VIRP_OK;
 }
 
