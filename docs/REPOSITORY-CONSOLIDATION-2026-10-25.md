@@ -74,3 +74,4 @@ Separate repositories such as virp-rust, virp-witnessd and virp-audit are unchan
 | `archive/2026-10-25/rescue/feat/v3-observation-wiring-2026-08-31` | `9a44a00f55ad707763aa89c2f0f4887a4cce26ba` |
 | `archive/2026-10-25/rescue/netclaw-cc841caa` | `cc841caa38ca539f37fa7b6edf5eefef56878bc3` |
 | `archive/2026-10-25/stage/consolidate-2026-09-08` | `723f11e5092df522be085804fb8ab036f814e6fd` |
+| `archive/2026-10-25/recovered-camera-notes` | `f95f513cb7fdbdb32234bdbfa22680cb852e033f` |
