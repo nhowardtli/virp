@@ -2623,3 +2623,14 @@ test-gns3:
 	$(CC) $(CFLAGS) tests/test_driver_gns3.c build-gns3/libvirp.a $(LDFLAGS) -lcurl -o build-gns3/test_driver_gns3
 	./build-gns3/test_driver_gns3
 all-tests: test-gns3
+
+# Health regressions retained from both home and colo development branches.
+.PHONY: test-watchdog-shutdown test-forti-health-cadence
+test-watchdog-shutdown: $(LIB)
+	$(CC) $(CFLAGS) tests/test_watchdog_shutdown.c $(LIB) $(LDFLAGS) -o $(BUILD_DIR)/test_watchdog_shutdown
+	./$(BUILD_DIR)/test_watchdog_shutdown
+
+test-forti-health-cadence: $(LIB)
+	$(CC) $(CFLAGS) -DVIRP_DRIVER_FORTINET tests/test_forti_health_cadence.c $(LIB) $(LDFLAGS) -lssh2 -o $(BUILD_DIR)/test_forti_health_cadence
+	./$(BUILD_DIR)/test_forti_health_cadence
+all-tests: test-watchdog-shutdown test-forti-health-cadence
