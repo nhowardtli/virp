@@ -41,3 +41,7 @@ build-fuzz-device/
 # Isolated operability and local TLS test builds
 build-candidate/
 build-wazuh-tls/
+
+# GNS3 and local native-pipeline regression build products
+build-gns3/
+build-native/
