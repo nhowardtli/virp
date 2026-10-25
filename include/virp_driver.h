@@ -54,6 +54,7 @@ typedef enum {
     VIRP_VENDOR_LIBRENMS    = 11,  /* LibreNMS REST API (token auth) */
     VIRP_VENDOR_PBS         = 12,  /* Proxmox Backup Server (typed ops, pinned TLS) */
     VIRP_VENDOR_ZAMMAD      = 13,  /* Zammad REST API (personal access token) */
+    VIRP_VENDOR_GNS3        = 14,  /* Isolated fixed lab lifecycle controller */
     VIRP_VENDOR_MOCK        = 99,   /* Testing only */
 } virp_vendor_t;
 
@@ -87,6 +88,8 @@ typedef struct {
     char            username[64];
     char            password[128];      /* TODO: move to vault/keyring */
     char            enable_password[128];
+    char            ssh_private_key[256]; /* Optional absolute local private-key file */
+    bool            asa_local_login; /* Key login followed by bounded local read-only login */
     virp_vendor_t   vendor;
     uint32_t        node_id;            /* VIRP node ID for this device */
     /*

@@ -3617,6 +3617,7 @@ static const char *onode_vendor_name(virp_vendor_t vendor)
     case VIRP_VENDOR_LIBRENMS:    return "librenms";
     case VIRP_VENDOR_PBS:         return "pbs";
     case VIRP_VENDOR_ZAMMAD:      return "zammad";
+    case VIRP_VENDOR_GNS3:        return "gns3";
     case VIRP_VENDOR_MOCK:        return "mock";
     default:                      return "unknown";
     }

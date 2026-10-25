@@ -563,10 +563,12 @@ static virp_conn_t *asa_connect(const virp_device_t *device)
         return NULL;
     }
 
-    /* Password authentication */
-    if (libssh2_userauth_password(conn->session,
-                                   device->username,
-                                   device->password) != 0) {
+    /* Explicit key configuration fails closed, never falls back to a password. */
+    int auth_rc = device->ssh_private_key[0] == '/'
+        ? libssh2_userauth_publickey_fromfile(conn->session, device->username,
+                                             NULL, device->ssh_private_key, NULL)
+        : libssh2_userauth_password(conn->session, device->username, device->password);
+    if (auth_rc != 0) {
         char *errmsg;
         libssh2_session_last_error(conn->session, &errmsg, NULL, 0);
         fprintf(stderr, "[ASA] Auth failed for %s@%s: %s\n",
@@ -616,6 +618,30 @@ static virp_conn_t *asa_connect(const virp_device_t *device)
     char scratch[4096];
     size_t setup_bytes =
         virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 5000);
+
+    /* Some read-only ASA accounts authenticate SSH with a key then use
+     * local login to obtain their assigned privilege. Never enter enable
+     * or change AAA. Each challenge must be observed before sending data. */
+    if (device->asa_local_login) {
+        if (device->ssh_private_key[0] != '/' || !device->password[0] ||
+            strchr(device->username, '\n') || strchr(device->username, '\r') ||
+            strchr(device->password, '\n') || strchr(device->password, '\r'))
+            goto learn_failed;
+        ssh_write(conn, "login\n");
+        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+        if (!strstr(scratch, "Username:")) goto learn_failed;
+        char credential[256];
+        snprintf(credential, sizeof(credential), "%s\n", device->username);
+        ssh_write(conn, credential);
+        virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+        if (!strstr(scratch, "Password:")) goto learn_failed;
+        snprintf(credential, sizeof(credential), "%s\n", device->password);
+        ssh_write(conn, credential);
+        OPENSSL_cleanse(credential, sizeof(credential));
+        setup_bytes = virp_ssh_read_quiescent(&conn->io, scratch, sizeof(scratch), 3000);
+        if (!setup_bytes || strstr(scratch, "failed") || strstr(scratch, "Invalid") ||
+            strstr(scratch, "Password:")) goto learn_failed;
+    }
 
     /* Learn the prompt before deciding anything from it. */
     virp_ssh_learn_opts_t lopts = { .channel_has_spoken = setup_bytes > 0 };
@@ -1215,7 +1241,7 @@ static virp_error_t asa_health_check(virp_conn_t *conn)
     if (!conn->connected) return VIRP_ERR_KEY_NOT_LOADED;
 
     virp_exec_result_t result;
-    virp_error_t err = asa_execute(conn, "show clock", &result);
+    virp_error_t err = asa_execute(conn, conn->device.asa_local_login ? "show version" : "show clock", &result);
     if (err != VIRP_OK) return err;
 
     return result.success ? VIRP_OK : VIRP_ERR_KEY_NOT_LOADED;
