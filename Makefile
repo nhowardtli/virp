@@ -2586,7 +2586,7 @@ all-tests: test-witness-publisher
 
 # Exact typed Cisco access-port execution (approval-gated).
 $(BUILD_DIR)/test_driver_cisco_port_ops: tests/test_driver_cisco_port_ops.c $(LIB)
-	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
 .PHONY: test-cisco-port-ops
 test-cisco-port-ops: $(BUILD_DIR)/test_driver_cisco_port_ops
 	./$(BUILD_DIR)/test_driver_cisco_port_ops
