@@ -28,6 +28,7 @@ Copyright 2026 Third Level IT LLC — Apache 2.0
 """
 
 import argparse
+import base64
 import datetime
 import hashlib
 import json
@@ -88,6 +89,21 @@ def safe_name(session_id):
 def has_column(conn, table, col):
     return any(r[1] == col for r in
                conn.execute("PRAGMA table_info(%s)" % table).fetchall())
+
+
+def artifact_bytes(content):
+    """Decode the database TEXT transport wrapper, preserving original bytes.
+
+    This is storage decoding, not verification: the independent verifier still
+    recomputes the claimed hash. BLOB values already carry literal bytes.
+    """
+    if isinstance(content, str):
+        if content.startswith("base64:"):
+            return base64.b64decode(content[7:], validate=True)
+        return content.encode("utf-8")
+    if isinstance(content, bytes):
+        return content
+    raise ValueError("unsupported artifact storage type")
 
 
 def export(db_path, out_dir, producer, retries=3):
@@ -178,7 +194,11 @@ def _export_once(db_path, out_dir, producer):
     for ah, content in conn.execute(
             "SELECT artifact_hash, artifact_content FROM artifacts").fetchall():
         if ah in referenced and ah not in bodies and content is not None:
-            bodies[ah] = content
+            try:
+                bodies[ah] = artifact_bytes(content)
+            except (ValueError, TypeError):
+                conn.close()
+                raise
     conn.close()
 
     os.makedirs(os.path.join(out_dir, "sessions"), exist_ok=True)
@@ -199,7 +219,7 @@ def _export_once(db_path, out_dir, producer):
     manifest_artifacts = []
     for ah, content in sorted(bodies.items()):
         rel = "artifacts/%s" % ah
-        raw = content.encode() if isinstance(content, str) else content
+        raw = content
         with open(os.path.join(out_dir, rel), "wb") as f:
             f.write(raw)
         manifest_artifacts.append({"artifact_hash": ah, "path": rel})

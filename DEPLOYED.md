@@ -1,4 +1,202 @@
+## 2026-10-18 — live CML port transaction candidate
+
+VM105 only: source **dd5fc4a**, v0.2.0-275-gdd5fc4a, binary SHA256
+`796689b64ec69bb3eb1eefb1d1f04422ab68309857d93177529559bdf256eb03`.
+VM227 separate canary runner installed; production runner and .211 unchanged.
+Snapshots `before-port-candidate-20261018` (105) and
+`before-port-runner-20261018` (227); root-only software/metadata recovery retained.
+Dedicated daemon-only credential group; cage/requester credential reads denied.
+
+Owner authorized five-hour canary renewal and LLDP/VLAN10 lab preparation.
+Lease expires 2026-10-18T16:00:20Z; request budget/consumed grants preserved.
+Fixed preparation ran through native C with test approvals, no direct device
+SSH bypass. VLAN10 active, LLDP enabled/zero neighbors. No write memory.
+
+Real model transaction `3764010b593a425c850360526c52595c`: mode_access,
+machine verify, exact baseline restore, replay -37; original outcome unchanged.
+Timing-harness transaction `1c98829aee5b4eb196b8f054dd29d445`: 30-second
+lease expired after apply, original-approval restore/verify passed. The normal
+canary transaction setting is restored to300seconds. Both transactions closed;
+STOP/pending absent;159 prior entries unchanged;54/96requestsused.
+
+Offline public-pin virp-verify0.1.3: **CRYPTOGRAPHICALLY-VERIFIED**,448entries,
+14chains,121v3frames (72new). No witness receipt. Native TTL remains300seconds;
+transaction expiry is helper/owner enforced. New-port UNKNOWN reconciliation,
+remaining live negative cases and remaining typed operations are not qualified.
+No production acceptance, real Duo or physical3850 result is claimed.
+Private evidence: audits/kestrel-canary-live-20261018/REPORT.md.
+
+## 2026-10-17 — CML canary port-write preflight
+
+VM105 only: deployed source **3be7f74**, binary SHA256
+`938027b7714a5ca930ad08bf5d56fe73386452beb3a28862e26a96d954e6c182`,
+service `virp-canary`. Snapshot `before-port-rollout-20261017` and private
+software/SQLite backups `/root/port-rollout-20261017` retained.
+Owner authorized STOP release; release is signed in
+`kestrel-v3-port-admin-20261017`, entry
+`bf10fd9567646efcd2f1a9ce5a2c8f7da2e7b6ca9c6fb4b5f0d82e4d419c57fb`.
+Previous135entries unchanged. Expired description grant remains unchanged;
+consumed approvals never reset. Pending absent.
+
+Exact canary config-read operation added to helper, still YELLOW and requiring
+native approval. Test key approved one read via VM227;7 new v3 frames all stored
+in `kestrel-v3-port-qualification-20261017`. Offline0.1.3 public-pin packet:
+114entries/5chains/7v3, CRYPTOGRAPHICALLY-VERIFIED. No witness submission.
+This is **preflight**, not successful port-write qualification.
+
+Canary baseline only shutdown, dynamic-auto; LLDP disabled and only VLAN1 active.
+Broader fixture preparation requested because previous scope excluded global
+changes. No port write. New no-switchport-mode restore form and local plan
+renderer are source changes pending canary installation, not part of this build.
+Production binary/helper unchanged. Production lease only renewed10h until
+2026-10-18T03:03:23Z; permissions/quota/approval consumption unchanged.
+Private report: audits/kestrel-port-rollout-20261017/REPORT.md.
+
+## 2026-10-16 — Kestrel Cisco read-only catalogue and refusal decoder
+
+Owner directed Cisco RO administration. VM227 runner now exposes16 fixed switch
+reads; .211 endpoint enforces read_only_operations before request creation/dispatch.
+Write/proposal/replay and other-device operations refused. NativeGREEN ceiling,
+C binaries, keys and10h lease deadlines unchanged. TACACS exact read forms added
+onCT224; existing write rules unchanged. No switch configuration writes.
+
+Helper fdcb562 fixes legitimate v3 tier0 UNCLASSIFIED separator-refusal decoding;
+only typedERROR with exact native pre-dispatch prefix accepted.59 cage tests pass.
+HelperSHA99e47b79f988ce9c75fc04b6a85f1fdfb39de93ff10583bc2c89e8b5a618fa2c.
+EndpointSHA901d40a54ece449e7b11669bb519ad3137a20cc1f96c55c8ca3b0e3f9c8a436d.
+Original filtered-log refusal retained, signature/native executed:false verified,
+raw bytes chained without replay, signed recovery then pending archive. Scope
+resumed for successful model read; no pending remains. Running-config stillYELLOW;
+pipe-containing log read still refused before classification. No policy relaxation.
+
+Evidence163entries/6chains/43v3frames(15new), four updated witnessheads;
+network-disabled external-pin virp-verify0.1.3 CRYPTOGRAPHICALLY-VERIFIED.
+Native227entries valid,181oldrows unchanged. ~/bin/kestrel owner CLI available;
+16operation status display filtered to readonly model catalogue.24attempts remain
+at close; no quota reset. Snapshot211/227 before-access-ro-20261016; root backups
+/root/kestrel-access-ro-20261016 on211/227/CT224. Preserve all chain evidence.
+Report audits/kestrel-access-port-20261016/ro-expansion/REPORT.md; source catalogue
+deploy/kestrel-cisco-readonly-operations.json. No full VLAN transaction qualification,
+accepted Phase2 diagnosis, production fault injection or canary mutation claimed.
+
+## 2026-10-16 — production Kestrel recovery update and fresh Duo RW (phase13)
+
+Dedicated .211 virp-kestrel-candidate source5a87465, binary SHA256
+93d10333199b7e371d610205e0a1fd576a5f05d8ac3ec444327b6d2467c23ed6.
+Helper289d3e9bdbea284aa186b13af75b26e0034a5b5370ef53e0ef10db1db2bd869f;
+recovery23f8d92fd48e72de0058b15369ff742f8ab3b8322b611651538748f677c5e35f;
+endpoint6215b31e7dbd88ea114f18ccad2b93820e6c4d2b40f37e99393be3985c9beeea.
+Main daemon unchanged. Root newly admitted only for chain_append/evidence_item,
+GREEN ceiling; live execute/approval and requester evidence_item denials pass.
+No cage recovery tool or credential exposure. Existing requester policy unchanged.
+
+Fresh nhoward-admin Duo planff9584d15b284d7692da8cafc9465c47 completed via
+VM227→.211→SW3850. Attempt roundtrip-1792195227; observation chain
+kestrel-v3-diagnostics-20261016. Gi1/0/22 description applied once, verified,
+restored empty, verified; consumed approval replay refused-37; reconciliation
+confirms original shutdown/no-description state. Forwardd6638423c4bd60882b080b7df30f0768,
+restoree518eb5451a71125ee972dc93bdccbb0. TACACS45 scoped rows show exactly one set
+and one removal. No reload/write memory. Active write grant archived after completion.
+
+Portable118 entries/5 chains/28 v3 observations (14 new) verified with external
+producer/witness pins in network-disabled unprivileged virp-verify0.1.3 container:
+CRYPTOGRAPHICALLY-VERIFIED. Both approval signatures independently checked;
+replay gate_rejection links consumed approval to original outcome. Five heads
+submitted_verified; repeat0. Publisher disabled again. TACACS/owner-plan exports
+are supplemental, not native signed entries. No helper-only execute frames.
+
+Native171/171 tests, cage57/57, append policy7/7, roundtrip adapter6/6 passed.
+Initial native rebuild lacked driver flags; corrected flags passed before deployment.
+A malformed denial probe hit parse rejection; corrected probe proved type denial.
+Snapshot before-phase13-deploy-20261016; root /root/phase13-recovery-deploy backups.
+Initial expired lease renewal explicitly authorized for10h, through Oct17 05:53EDT;
+snapshot before-phase13-lease-20261016 and root /root/phase13-lease-20261016.
+Lease/scope preserved during deployment/RW; STOP/pending/active grant absent at end.
+No production UNKNOWN fault injection; its recovery remains canary-qualified only.
+
+## 2026-10-16 — CML canary signed UNKNOWN recovery (phase12)
+
+VM105 only; production .211/SW3850 untouched. C binary remains90558ec,
+SHA2569742dc340a6bccf1049bd499dc76b031f17b2e9ae3115daa87f0bea9bffe77c2.
+Helper/recovery source98e0cc8 plus6b11bdc. Root-only recovery verifies the
+original UNKNOWN, fresh fixed read and signed chain membership before archiving
+pending. UID980 remains observation-only; root adds evidence_item append.
+No original operation replay or new device write; approvals remain consumed.
+
+First state comparison failed on IOS trailing header whitespace. Regression fix
+preserves that read and requires explicit signed review before a fresh read.
+Recovery entry6102c7dd1c2548b200b5ed1cdd50d3a0811b0d50dcb1aa1357324f4df141a814
+in kestrel-v3-cml-recovery12-20261016, sequence3. A signed separate resume permitted
+one model-driven GREEN read through VM227; STOP restored afterward. Phase10
+STOP/pending unchanged. All122 historical rows unchanged, current pending archived
+byte-for-byte. Native9 chains valid, zero open executions. VM103 remains stopped.
+
+Offline virp-verify0.1.3 with independently fetched external pin:
+CRYPTOGRAPHICALLY-VERIFIED,135 entries/9 chains/42 v3 frames; no witness submission.
+Recovery/review/resume are helper attestations stored as signed evidence_item
+entries, not native execution outcomes. Full driver-enabled battery passed
+(640 unittest,87 pytest); final Python follow-up cage suite55/55. No Rust changes.
+
+Snapshots105 before-phase12-recovery-20261016 and227
+before-phase12-resume-20261016. Root recovery backup /root/phase12-recovery.
+Never roll the chain backward. Audit phase12-recovery/REPORT.md; production
+keyboard procedure docs/DEPLOY-211-RECOVERY-RUNBOOK.md is prepared, not executed.
+
+## 2026-10-16 — CML Cisco canary typed UNKNOWN (phase11)
+
+Canary only: colo pve1 VM105 `cml-kestrel`, CML internal IOS XE IOL-L2
+`kestrel-ios`192.168.255.10. Installed `90558ec`,
+`v0.2.0-242-g90558ec`, binary SHA256
+`9742dc340a6bccf1049bd499dc76b031f17b2e9ae3115daa87f0bea9bffe77c2`.
+Existing shared cage helper unchanged. Production .211/SW3850 untouched;
+VM103 retained stopped. Same cage/helper/C path with fresh bounded test scope.
+
+Test-first missing/partial prompt regression7/7; full C/Python all-tests pass
+(625 unittest,87 pytest). Model-driven four reads, RED refusal, test-approved
+description set/restore once, replay(-37), native v3 UNKNOWN on deliberately
+dropped IOS read response, and pending refusal passed. Original interface
+read restored byte-for-byte. Temporary fault rules removed. Both phase10 and
+phase11 STOP/pending retained; no unattended recovery claimed.
+
+Node-config session `node-config:00000104@cml-v3-20261016`, sequence2,
+entry `e0cbb25f9afffd2b8e0f46abf7802a36003308b3fdacb976a410886c5ebe9e97`.
+Cage session `kestrel-v3-cml-phase11-20261016`. Offline clean virp-verify0.1.3
+with external public pin: CRYPTOGRAPHICALLY-VERIFIED,122 entries/7 chains/39v3
+frames;69 historical entries unchanged. No witness submission, no Duo/TACACS
+or physical-switch equivalence claim. Empty counters/trunk bodies establish
+syntax/transport coverage only.
+
+Recovery: VM105 snapshot `before-phase11-unknown-20261016`, VM227
+`before-phase11-cage-20261016`; old binary/endpoint and consistent chain backup
+under VM105 `/root/phase11-recovery`. Restore binary/endpoint only, preserve
+chain history and STOP/pending. Full phase report and exact rollback in local
+audits/tli-ai-rollout-20261016/phase11-cisco-unknown/REPORT.md and ROLLBACK.txt.
+
 # VIRP Deployment Record — virp-lab
+
+## Dedicated Kestrel production instance — 2026-10-16
+
+This record applies only to `.211`'s `virp-kestrel-candidate` service, not the
+main `virp-onode` reference instance described below.
+
+- Native source `4f210af`, snapshot `before-phase8-storage-20261016`.
+- Binary `/usr/local/lib/virp-kestrel-v3/virp-onode-prod`, SHA256
+  `18b87ac7c381b1ae2569a9c76230d05cba1cd596f004f2403bc8f0f229f7d2d2`.
+- Matching helper SHA256 `fff8bc6baec3edb5e5c4c5981043e876b2e934ac1069692614813c912afc83ee`.
+- Endpoint SHA256 `79a043fe73f14881c94a034fad263a46f8de90d78b8edc0b713dcff2661d0007`;
+  candidate pin updated, reply cap65536, operation catalogue unchanged.
+- Main binary retained SHA256
+  `8a11330b2a398ebc934c2b05717b889e5211b69ea8e2a6629460bf8d061ec38c`.
+- Four model-driven read diagnostics succeeded through VM227→.211→SW3850.
+  No new switch write or RW qualification run. Native136 entries/9 sessions
+  verified, zero open executions. Existing keys/lease/policy retained.
+- Packet73 entries, four chains,14 v3 frames (four new). Three new heads
+  witnessed, repeat submitted0. Clean offline virp-verify0.1.3 verdict
+  CRYPTOGRAPHICALLY-VERIFIED using external producer/witness pins.
+- Private report and exact recovery commands:
+  `/home/nhoward/audits/tli-ai-rollout-20261016/phase8-production-storage/REPORT.md`.
+  Root backups `/root/phase8-storage-20261016`; never roll the chain DB backward.
+
 
 - **Role**: production reference instance
 
@@ -2976,3 +3174,95 @@ and since the home node defines none of the colo placeholders,
 `render-devices.sh` would FATAL and the daemon would refuse to start
 across every governed device. The target now refuses to run off
 `virp-lab` unless the source is named explicitly.
+
+## 2026-10-18 — Astra canary model and routine port tiers
+
+Source d9a9df5 on feat/v3-execute-path; VM105 canary binary SHA256
+`13612b4de39ffdfb78c44d0d15a4d0fc160ad80c385754bc1a3608f81a3d3329`.
+VM227 isolated canary runner uses `gpt-6-astra`, reasoning low, per-run token totals.
+Production .211/3850 and shared production API configuration unchanged.
+Snapshots VM105/227 `before-astra-mode-20261018`; software/profile backups
+`/root/kestrel-astra-mode-20261018` on each VM. Recovery restores matching
+software/profile versions only, never chain/approval/journal state.
+
+Exact routine access-mode/access-VLAN/PortFast operations are YELLOW; security
+operations remain RED and destructive/unknown protections remain. Native GREEN
+ceiling and independent transaction/test approval still enforced. Old signed RED
+plans and all448prior chain entries preserved.
+
+Live GPT-6 Astra transaction `e368621a3c514d32af4bacc6251a073b`:
+mode_access, apply, verify, exact restore and verify-restored passed through
+VM227 -> VM105 C -> isolated Cisco Ethernet0/1. Seven model calls:5092input,
+385output,5477total tokens;11reasoning included,0cached. Provider accounting,
+not billing or signed device evidence. Scope lease unchanged;61/96requests used.
+
+Validation:223classifier cases,38parser cases plus boundary checks,
+347Python helper tests,4native C integration tests. Offline virp-verify0.1.3
+CRYPTOGRAPHICALLY-VERIFIED:568entries/14chains/149v3frames,120newentries/28newv3.
+All chains valid, no open execution, STOP/pending absent. No witness receipt.
+Native deadline binding, port UNKNOWN reconciliation and full live negative
+matrix remain open. No broad autonomous production qualification claimed.
+Private report and packet: `/home/nhoward/audits/kestrel-astra-mode-20261018/`.
+
+## 2026-10-18 — Owner-delegated non-BLACK canary test mode
+
+Source2c1fcba/92e83e9/379d629; C binary remains d9a9df5
+SHA25613612b4de39ffdfb78c44d0d15a4d0fc160ad80c385754bc1a3608f81a3d3329.
+VM105 dedicated no-login UID979 RED ceiling, socket admission and execution/session/
+observation-only append/verify actions. No BLACK passthrough. UID980 stays GREEN.
+Root opt-in forced router exposes open_canary.py only on fixed isolated Cisco target.
+VM227 isolated /usr/local/sbin/virp-cml-open-test --prompt '<task>' uses GPT-6 Astra.
+No proposal/approval/Duo/test-approver hop on new path. Existing bounded path retained;
+production .211/3850, shared API config, firewall/AWS unchanged.
+
+Snapshots105/227 before-open-canary-20261018; VM105 recovery material
+/root/kestrel-open-canary-20261018/before. Private rollback script
+/home/nhoward/audits/kestrel-open-canary-20261018/transfer/disable-open.py restores
+original native grant/router/profile without rewinding evidence.
+
+354Python tests passed. Live GREEN show version and RED configure terminal/end
+execute; BLACK reload returns signed refusal. Model8commands set/verify/restore
+canary description, original/final config output byte-identical,0newapprovals.
+Offline0.1.3 CRYPTOGRAPHICALLY-VERIFIED:618entries/15chains/161v3;50newentries/12v3,
+568priorentries unchanged. No witness. Model27499tokens incl21249cached input.
+
+Temporary helper work expiry remains2026-10-18T16:00:20.335895Z;74requests used,
+open route ceiling256, original bounded route96. STOP/pending/evidence and lease
+interlocks retained. Native deadline binding, UNKNOWN reconciliation, full live
+negative matrix and comprehensive BLACK alias/indirect-effect coverage remain open.
+No generic automatic rollback claimed. New CLI route is whole-canary, not port-only.
+Report: /home/nhoward/audits/kestrel-open-canary-20261018/REPORT.md.
+
+## 2026-10-18 — Production standing two-port Kestrel qualification
+
+Sources bc90a0d,382ad3f. Existing .211 dedicated C binary unchanged:
+93d10333199b7e371d610205e0a1fd576a5f05d8ac3ec444327b6d2467c23ed6.
+Snapshots211/227/CT224 before-kestrel-twoport-20261018. New UID979 RED ceiling,
+exact two-port helper/renderer, shared legacy lock; no BLACK passthrough or approval
+API. Root-owned devices.json with daemon981-only read ACL; requesters denied.
+New explicit standing scope /var/lib/virp-kestrel-twoport; no timed expiry;512request
+ceiling,52used. STOP/recovery/runtime pins retained. Old lease/history untouched.
+CT224 exact svc-kestrel command extension, parser passed; credentials unchanged.
+VM227 /usr/local/sbin/virp-twoport-test and virp-twoport-control; local kestrel CLI
+ask/status/stop connected. GPT-6 Astra, existing root-held keys, shared API config
+unchanged. State ready, no STOP/pending, publisher disabled after submission.
+
+Kestrel18typed ops/34reads/106v3native exchanges. Gi1/0/22 accessVLAN50, PortFast,
+BPDU Guard, port security max2/restrict; Gi1/0/23 trunk allowed50,80, DTPoff.
+Both distinct descriptions, auto speed/duplex, enabled/notconnect; no MAC/neighbor.
+Exact config comparisons pass. Leave running-config for owner; no save/reload,
+VLAN creation or other interface change. Old227entries/artifact bytes unchanged.
+
+364Python tests pass, native3chains valid/no open executions. Portable packet
+488entries/3chains,106v3frames,0helper-onlyexecute frames. Offline0.1.3 c38c4f8
+CRYPTOGRAPHICALLY-VERIFIED, all3witness receipts verified/pinned; supplement verifies
+frame signatures/bindings/commands and12accounting chunks.259accounting records
+cover all issued commands. Session kestrel-twoport-20261018 seq170; witnessleaf26190,
+tree26191 stamped2026-10-18T14:42:22.474Z.57modelresponses/637144tokens,564817cached
+input. No Duo/cryptographic owner approval: explicit chat standing delegation.
+
+Native deadline binding, UNKNOWN reconciliation, full live negative matrix,
+continuous native precondition enforcement, traffic forwarding and compliance
+certification NOT proven. Root installed baseline is helper policy, not a native
+transaction. Recovery instructions and private backups retained; never rewind chain.
+Report/packet: /home/nhoward/audits/kestrel-3850-two-port-20261018/REPORT.md.

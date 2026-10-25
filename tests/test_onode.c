@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -2764,6 +2765,23 @@ TEST(test_load_devices_skips_missing_required_fields)
     unlink(WRONG_TYPE_CFG);
 }
 
+TEST(test_load_devices_cisco_health_probe)
+{
+    const char *values[] = { "\"clock\"", "\"version\"", "null", "true", "\"show version\"", "\"version;reload\"", "\"version\\u0000extra\"" };
+    for (size_t i = 0; i < sizeof(values)/sizeof(values[0]) + 1; i++) {
+        bool wrong_vendor = i == sizeof(values)/sizeof(values[0]);
+        FILE *f = fopen(WRONG_TYPE_CFG, "w"); ASSERT_TRUE(f != NULL);
+        fprintf(f, "{\"devices\":[{\"hostname\":\"FRR-LAB\",\"host\":\"127.0.0.1\",\"vendor\":\"%s\",\"node_id\":7,\"cisco_health_probe\":%s}]}", wrong_vendor ? "mock" : "cisco_ios", wrong_vendor ? values[1] : values[i]);
+        fclose(f);
+        onode_state_t tmp; ASSERT_OK(onode_init(&tmp, 7, NULL, "/tmp/virp-health-probe.sock"));
+        tmp.ctx = virp_context_new(); ASSERT_TRUE(tmp.ctx != NULL);
+        int loaded = load_devices(&tmp, WRONG_TYPE_CFG);
+        if (i < 2) { ASSERT_EQ(loaded, 1); ASSERT_EQ(tmp.devices[0].cisco_health_version, i == 1); }
+        else { ASSERT_EQ(loaded, -1); ASSERT_EQ(tmp.device_count, 0); }
+        onode_destroy(&tmp); virp_context_destroy(tmp.ctx); unlink(WRONG_TYPE_CFG);
+    }
+}
+
 /*
  * Issue #14: a cisco_asa entry with no "enable" credential is refused
  * at load, not loaded to churn. The ASA driver's health check needs
@@ -5243,6 +5261,8 @@ static int write_test_registry(void)
 {
     FILE *f = fopen(AP_REGISTRY, "w");
     if (!f) return -1;
+    /* Registry loader refuses group-writable files, including under umask 0002. */
+    if (fchmod(fileno(f), 0600) != 0) { fclose(f); return -1; }
     fprintf(f,
         "[{\"key_id\":\"e6d67937b0a11c446e166ddc8f157ba9\","
         "\"algorithm\":\"ecdsa-p256\","
@@ -6173,6 +6193,67 @@ static size_t ca_mint_v3_obs(uint8_t *buf, size_t cap,
     if (crypto_sign_detached(buf + sig_span, NULL, buf, sig_span,
                              kp->secret_key) != 0) return 0;
     return total;
+}
+
+static size_t ca_mint_large_v3_obs(uint8_t *buf, size_t cap,
+                             const virp_obskey_t *kp, uint64_t seq, size_t total_size)
+{
+    char PAY[VIRP_MAX_MESSAGE_SIZE]; memset(PAY, 'x', sizeof(PAY));
+    size_t P = total_size - 184;
+    size_t total = VIRP_OBS_V2_HEADER_SIZE + P + VIRP_OBS_V2_SIG_SIZE +
+                   VIRP_OBS_ED25519_SIG_SIZE;
+    if (cap < total) return 0;
+
+    virp_obs_header_v2_t h;
+    memset(&h, 0, sizeof(h));
+    h.version = VIRP_VERSION_3;
+    h.channel = VIRP_CHANNEL_OBS;
+    h.tier    = VIRP_TIER_GREEN;
+    h.node_id = 0x00000042u;
+    h.device_id = 0x1122334455667788ULL;
+    h.seq_num = seq;
+    h.timestamp_ns = 1754582400ULL * 1000000000ULL;
+    memset(h.session_id, 0x21, 16);
+    memset(h.command_hash, 0x37, 32);
+    h.payload_len = (uint32_t)P;
+    if (virp_obs_header_v2_serialize(&h, buf, cap) != VIRP_OK) return 0;
+
+    memcpy(buf + VIRP_OBS_V2_HEADER_SIZE, PAY, P);
+    size_t hmac_span = VIRP_OBS_V2_HEADER_SIZE + P;
+    memset(buf + hmac_span, 0x5A, VIRP_OBS_V2_SIG_SIZE);   /* not read */
+    size_t sig_span = hmac_span + VIRP_OBS_V2_SIG_SIZE;
+    if (crypto_sign_detached(buf + sig_span, NULL, buf, sig_span,
+                             kp->secret_key) != 0) return 0;
+    return total;
+}
+
+TEST(test_chain_append_large_v3_observation)
+{
+    virp_obskey_t kp; ASSERT_OK(virp_obskey_generate(&kp));
+    ca_state.obskey = kp; ca_state.obskey_loaded = true;
+    uint8_t obs[VIRP_MAX_MESSAGE_SIZE + 1], resp[VIRP_MAX_MESSAGE_SIZE];
+    char body[90000], json[100000], h[65];
+    const size_t sizes[] = {9659, VIRP_MAX_MESSAGE_SIZE};
+    for (size_t i=0; i<2; i++) {
+        size_t n=ca_mint_large_v3_obs(obs, sizeof(obs), &kp, 9400+i, sizes[i]);
+        ASSERT_EQ(n, sizes[i]);
+        for (int bad=0; bad<5; bad++) {
+            if (bad==1) obs[n-1]^=1;
+            if (bad==2) obs[n-1]^=1;
+            size_t wire = bad==4 ? VIRP_MAX_MESSAGE_SIZE+1 : n;
+            if (bad==4) memset(obs, 'x', sizeof(obs));
+            ca_sha256_hex_bin(obs,wire,h); ca_b64_body(obs,wire,body,sizeof(body));
+            if (bad==2) h[0]=h[0]=='a'?'b':'a';
+            snprintf(json,sizeof(json),"{\"action\":\"chain_append\",\"session_id\":\"large-v3-%zu\",\"artifact_type\":\"%s\",\"artifact_id\":\"large-v3-%zu-%d\",\"artifact_hash\":\"%s\",\"artifact_content\":\"%s\"}",i,bad==3?"evidence_item":"observation",i,bad,h,body);
+            ssize_t got=ca_request(json,resp,sizeof(resp));
+            if (bad) ASSERT_EQ(got,4); else ASSERT_TRUE(got>4);
+        }
+        char sid[64];snprintf(sid,sizeof(sid),"large-v3-%zu",i);
+        virp_chain_verify_result_t result;
+        ASSERT_OK(virp_chain_verify(&ca_state.chain,sid,0,0,&result));
+        ASSERT_TRUE(result.valid);ASSERT_EQ(result.artifacts_bound,1);
+    }
+    ca_state.obskey_loaded=false;
 }
 
 /* GATE 3, v3 POSITIVE: with the observation-signing key loaded, a
@@ -8415,6 +8496,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_load_devices_wrong_type_does_not_crash);
     RUN_TEST(test_load_devices_refuses_absent_node_id);
     RUN_TEST(test_load_devices_skips_missing_required_fields);
+    RUN_TEST(test_load_devices_cisco_health_probe);
     RUN_TEST(test_load_devices_refuses_asa_without_enable);
     RUN_TEST(test_add_device_rejects_duplicate_identities);
     RUN_TEST(test_load_devices_duplicate_identities_fatal);
@@ -8568,6 +8650,7 @@ int main(int argc, char **argv)
         RUN_TEST(test_chain_append_rejects_unknown_obs_version);
         RUN_TEST(test_chain_append_rejects_v3_without_obskey);
         RUN_TEST(test_chain_append_accepts_signed_v3_observation);
+        RUN_TEST(test_chain_append_large_v3_observation);
         RUN_TEST(test_chain_append_rejects_v2_without_active_session);
         RUN_TEST(test_chain_append_commitment_only_observation_accepted);
         RUN_TEST(test_chain_append_commitment_only_empty_body_accepted);

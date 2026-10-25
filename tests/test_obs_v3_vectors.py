@@ -127,13 +127,12 @@ def main():
         v8, _d = verify.classify_observation_v3(raw[:-1], pub)
         check("frame %d truncated by one byte FAILS" % i, v8 == verify.FAIL)
 
-    # Item 8b: what the daemon emits by default. The execute path bounds
-    # obs_version at 2, so a client cannot ask for v3 at all. Pinned at
-    # the source, so raising that bound has to change this test and
-    # somebody has to think about it.
+    # Execute v3 is now supported explicitly and by the -3 deployment
+    # option. The default remains compatible; runtime signing and
+    # prerequisite enforcement are exercised by test_execute_v3.c.
     onode = open(os.path.join(ROOT, "src", "virp_onode.c")).read()
-    check("the execute path still bounds obs_version at 2",
-          'json_extract_u64_bounded(root, "obs_version", 2, &v)' in onode)
+    check("the execute path accepts obs_version through 3",
+          'json_extract_u64_bounded(root, "obs_version", 3, &v)' in onode)
     check("the default obs_version is still 1",
           "req->obs_version = 1;" in onode)
 

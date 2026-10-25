@@ -56,6 +56,10 @@
 extern int linux_gate_set_protected_vmids(const char *csv);
 #endif
 
+#ifdef VIRP_DRIVER_WAZUH
+extern int wazuh_gate_set_protected_agents(const char *csv);
+#endif
+
 #ifndef VIRP_ONODE_PROD_NO_MAIN
 
 static onode_state_t g_state;
@@ -70,9 +74,6 @@ extern void virp_driver_fortinet_init(void);
 #endif
 #ifdef VIRP_DRIVER_LINUX
 extern void virp_driver_linux_init(void);
-#endif
-#ifdef VIRP_DRIVER_WAZUH
-extern int wazuh_gate_set_protected_agents(const char *csv);
 #endif
 #ifdef VIRP_DRIVER_PALOALTO
 extern void virp_driver_paloalto_init(void);
@@ -780,6 +781,23 @@ int load_devices(onode_state_t *state, const char *path)
         if (json_get_string(dev_obj, "vendor", vendor_str, sizeof(vendor_str)))
             device.vendor = vendor_from_string(vendor_str);
 
+        /* Fixed root-configured read probe for IOS-compatible lab targets.
+         * No arbitrary command or fallback, and no silent wrong-type default. */
+        struct json_object *probe = NULL;
+        if (json_object_object_get_ex(dev_obj, "cisco_health_probe", &probe)) {
+            const char *value = json_object_is_type(probe, json_type_string)
+                              ? json_object_get_string(probe) : NULL;
+            if ((device.vendor != VIRP_VENDOR_CISCO_IOS &&
+                 device.vendor != VIRP_VENDOR_CISCO_IOSXE) || !value ||
+                (size_t)json_object_get_string_len(probe) != strlen(value) ||
+                (strcmp(value, "clock") != 0 && strcmp(value, "version") != 0)) {
+                fprintf(stderr, "[O-Node] invalid cisco_health_probe; refusing config\n");
+                json_object_put(root);
+                return -1;
+            }
+            device.cisco_health_version = strcmp(value, "version") == 0;
+        }
+
         /*
          * node_id accepts either a hex string ("0A0000FD") or a JSON int,
          * matching virp_onode_main.c's dev parser. Other JSON types are
@@ -1288,6 +1306,9 @@ static void usage(const char *prog)
     printf("              canonical bytes) so a third party can verify with\n");
     printf("              the public key alone. Requires -c/-C. Generate\n");
     printf("              with: virp-tool keygen chainsign <prefix>\n");
+    printf("  -3          Sign execute observations as v3 Ed25519 using -S.\n");
+    printf("              Requires an active bound session; no v1 fallback.\n");
+    printf("  -E <epoch>  Fresh native audit sessions (1..16 alnum/hyphen, requires -S).\n");
     printf("  -a <path>   Approval store dir (default: /var/lib/virp/approvals)\n");
     printf("  -A <path>   Approver registry (default: /etc/virp/approvers.json)\n");
     printf("  -h          Show this help\n");
@@ -1303,6 +1324,8 @@ int main(int argc, char **argv)
     const char *devices_path = NULL;
     const char *chain_db_path = NULL;
     const char *chain_key_path = NULL;
+    bool execute_v3 = false;
+    const char *native_epoch = NULL;
     const char *chain_sign_key_path = NULL;   /* D-1: -S, opt-in */
     const char *approval_dir = "/var/lib/virp/approvals";
     const char *approvers_path = "/etc/virp/approvers.json";
@@ -1324,8 +1347,9 @@ int main(int argc, char **argv)
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "k:K:W:s:d:n:c:C:S:a:A:h")) != -1) {
+    while ((opt = getopt(argc, argv, "3k:K:W:s:d:n:c:C:S:E:a:A:h")) != -1) {
         switch (opt) {
+        case '3': execute_v3 = true; break;
         case 'k':
             okey_path = optarg;
             break;
@@ -1349,6 +1373,9 @@ int main(int argc, char **argv)
             break;
         case 'C':
             chain_key_path = optarg;
+            break;
+        case 'E':
+            native_epoch = optarg;
             break;
         case 'S':
             chain_sign_key_path = optarg;
@@ -1515,6 +1542,22 @@ int main(int argc, char **argv)
             virp_context_destroy(ctx);
             return 1;
         }
+    }
+
+    if (native_epoch && (!g_state.chain_enabled ||
+            virp_chain_set_native_epoch(&g_state.chain, native_epoch) != VIRP_OK)) {
+        fprintf(stderr, "[O-Node] -E requires -S and a safe 1..16 character epoch\n");
+        onode_destroy(&g_state); virp_context_destroy(ctx); return 1;
+    }
+
+    if (execute_v3) {
+        if (!chain_sign_key_path ||
+            virp_obskey_load(&g_state.obskey, chain_sign_key_path) != VIRP_OK) {
+            fprintf(stderr, "[O-Node] -3 requires a valid -S signing key\n");
+            onode_destroy(&g_state); virp_context_destroy(ctx); return 1;
+        }
+        g_state.obskey_loaded = true;
+        g_state.execute_v3 = true;
     }
 
     /* Install signal handlers */

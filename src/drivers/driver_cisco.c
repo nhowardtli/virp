@@ -128,26 +128,31 @@ static ssize_t cisco_io_write(void *ctx, const char *buf, size_t len)
     return (ssize_t)written;
 }
 
-/* =========================================================================
- * Keyboard-interactive auth callback for libssh2
- *
- * IOS 7200 (and many other IOS versions) only advertise
- * keyboard-interactive — not password. This callback supplies
- * the password for every prompt the server sends.
- *
- * Prompt cap: A legitimate IOS device sends 1–2 prompts (password,
- * sometimes OTP). A hostile or broken server could request thousands.
- * We cap at 4 to bound memory allocation.
- *
- * Ownership: libssh2 takes ownership of each responses[i].text and
- * calls free() on it after the callback returns. We strdup() the
- * password into each response. Because libssh2 frees the buffer
- * internally (not us), we cannot OPENSSL_cleanse the copy — the
- * password material persists in freed heap until overwritten. The
- * authoritative copy on conn->device.password is wiped at disconnect.
- * ========================================================================= */
+/* Password-only authentication is deliberately NOT an OTP implementation.
+ * Unknown, repeated, echoed or multiple challenges fail closed. In particular
+ * never disclose the password to a prompt asking for an OTP/recovery code.
+ * A rejected interactive exchange must not downgrade to password auth. */
+typedef struct {
+    const char *password;
+    bool sent;
+    bool rejected;
+} cisco_password_auth_t;
 
-#define KBD_MAX_PROMPTS 4
+static bool cisco_password_prompt(const LIBSSH2_USERAUTH_KBDINT_PROMPT *p)
+{
+    static const char expected[] = "password:";
+    if (!p || p->echo || !p->text || p->length > 64) return false;
+    size_t lo = 0, hi = p->length;
+    while (lo < hi && (p->text[lo] == ' ' || p->text[lo] == '\t')) lo++;
+    while (hi > lo && (p->text[hi-1] == ' ' || p->text[hi-1] == '\t')) hi--;
+    if (hi - lo != sizeof(expected) - 1) return false;
+    for (size_t i = 0; i < sizeof(expected) - 1; i++) {
+        unsigned char ch = (unsigned char)p->text[lo+i];
+        if (ch >= 'A' && ch <= 'Z') ch = (unsigned char)(ch + ('a'-'A'));
+        if (ch != (unsigned char)expected[i]) return false;
+    }
+    return true;
+}
 
 static void kbd_interactive_callback(const char *name, int name_len,
                                       const char *instruction, int instruction_len,
@@ -158,25 +163,24 @@ static void kbd_interactive_callback(const char *name, int name_len,
 {
     (void)name; (void)name_len;
     (void)instruction; (void)instruction_len;
-    (void)prompts;
-
-    if (num_prompts > KBD_MAX_PROMPTS) {
-        fprintf(stderr, "[Cisco] keyboard-interactive: server sent %d prompts "
-                "(max %d) — rejecting\n", num_prompts, KBD_MAX_PROMPTS);
-        /* Zero all responses so libssh2 sees empty answers */
-        for (int i = 0; i < num_prompts; i++) {
-            responses[i].text   = NULL;
-            responses[i].length = 0;
-        }
+    cisco_password_auth_t *ctx = abstract ? *abstract : NULL;
+    for (int i = 0; i < num_prompts; i++) {
+        responses[i].text = NULL;
+        responses[i].length = 0;
+    }
+    if (!ctx) return;
+    if (ctx->rejected || ctx->sent || num_prompts != 1 ||
+        !cisco_password_prompt(prompts) || !ctx->password || !ctx->password[0]) {
+        ctx->rejected = true;
         return;
     }
-
-    const char *password = (const char *)*abstract;
-
-    for (int i = 0; i < num_prompts; i++) {
-        responses[i].text   = strdup(password);
-        responses[i].length = (unsigned int)strlen(password);
+    responses[0].text = strdup(ctx->password);
+    if (!responses[0].text) {
+        ctx->rejected = true;
+        return;
     }
+    responses[0].length = (unsigned int)strlen(ctx->password);
+    ctx->sent = true;
 }
 
 /* =========================================================================
@@ -193,6 +197,9 @@ static void kbd_interactive_callback(const char *name, int name_len,
  * the default list is unaffected when ssh_legacy is false.
  * ========================================================================= */
 
+/* Preserve strict-KEX signaling when overriding library defaults. Without
+ * this marker, patched libssh2 can reset sequence numbers while OpenSSH
+ * does not, producing a MAC failure immediately after NEWKEYS. */
 static const char CISCO_KEX_DEFAULT[] =
     "ecdh-sha2-nistp256,"
     "ecdh-sha2-nistp384,"
@@ -200,7 +207,8 @@ static const char CISCO_KEX_DEFAULT[] =
     "diffie-hellman-group14-sha256,"
     "diffie-hellman-group14-sha1,"
     "diffie-hellman-group-exchange-sha256,"
-    "diffie-hellman-group-exchange-sha1";
+    "diffie-hellman-group-exchange-sha1,"
+    "ext-info-c,kex-strict-c-v00@openssh.com";
 
 static const char CISCO_KEX_LEGACY[] =
     "ecdh-sha2-nistp256,"
@@ -210,7 +218,8 @@ static const char CISCO_KEX_LEGACY[] =
     "diffie-hellman-group14-sha1,"
     "diffie-hellman-group-exchange-sha256,"
     "diffie-hellman-group-exchange-sha1,"
-    "diffie-hellman-group1-sha1";
+    "diffie-hellman-group1-sha1,"
+    "ext-info-c,kex-strict-c-v00@openssh.com";
 
 const char *virp_cisco_kex_list(bool ssh_legacy)
 {
@@ -375,14 +384,17 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
      * IOS 7200 devices typically only advertise keyboard-interactive,
      * while IOS-XE 16.x supports both password and keyboard-interactive. */
     bool authenticated = false;
+    bool interactive_attempted = false;
+    cisco_password_auth_t auth_ctx = { .password = device->password };
 
     char *auth_list = libssh2_userauth_list(conn->session,
                                              device->username,
                                              (unsigned int)strlen(device->username));
 
     if (!auth_list && libssh2_userauth_authenticated(conn->session)) {
-        /* "none" auth succeeded (unlikely on IOS, but handle it) */
-        authenticated = true;
+        /* This configured credential must actually be authenticated.
+         * Anonymous server acceptance does not satisfy that policy. */
+        fprintf(stderr, "[Cisco] Refusing unauthenticated SSH session\n");
     }
 
     if (auth_list) {
@@ -392,11 +404,13 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
 
     /* Try keyboard-interactive first (IOS 7200, IOS 15.x AAA) */
     if (!authenticated && auth_list && strstr(auth_list, "keyboard-interactive")) {
-        *libssh2_session_abstract(conn->session) = (void *)device->password;
+        interactive_attempted = true;
+        *libssh2_session_abstract(conn->session) = &auth_ctx;
 
         if (libssh2_userauth_keyboard_interactive(conn->session,
                                                    device->username,
-                                                   kbd_interactive_callback) == 0) {
+                                                   kbd_interactive_callback) == 0 &&
+            auth_ctx.sent && !auth_ctx.rejected) {
             authenticated = true;
             fprintf(stderr, "[Cisco] Auth OK (keyboard-interactive): %s@%s\n",
                     device->username, device->host);
@@ -404,7 +418,8 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
     }
 
     /* Fallback to password auth (IOS-XE, some ISR platforms) */
-    if (!authenticated && auth_list && strstr(auth_list, "password")) {
+    if (!authenticated && !interactive_attempted && auth_list &&
+        strstr(auth_list, "password")) {
         if (libssh2_userauth_password(conn->session,
                                        device->username,
                                        device->password) == 0) {
@@ -414,6 +429,7 @@ static virp_conn_t *cisco_connect(const virp_device_t *device)
         }
     }
 
+    *libssh2_session_abstract(conn->session) = NULL;
     if (!authenticated) {
         char *errmsg;
         libssh2_session_last_error(conn->session, &errmsg, NULL, 0);
@@ -805,6 +821,71 @@ bool cisco_parse_interface_description(const char *command,
     return true;
 }
 
+/* Exact one-line port grammar. This is execution capability, not authority:
+ * classification remains RED without authenticated topology/port context.
+ * No ranges, logical interfaces, abbreviations, sticky MACs or mode trunk. */
+static bool cisco_port_decimal(const char *s, unsigned max)
+{
+    if (!s || *s < '1' || *s > '9') return false;
+    unsigned n = 0;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') return false;
+        unsigned d = (unsigned)(*s - '0');
+        if (n > (max - d) / 10) return false;
+        n = n * 10 + d;
+    }
+    return n <= max;
+}
+
+bool cisco_parse_port_operation(const char *command, char *ifname,
+                               size_t ifname_len, char *line, size_t line_len)
+{
+    if (!command || strncmp(command, "interface ", 10)) return false;
+    const char *name = command + 10;
+    const char *end = strchr(name, ' ');
+    if (!end || end == name || (size_t)(end-name) >= 64) return false;
+    const char *number = NULL;
+    const char *prefixes[] = {"GigabitEthernet", "Ethernet"};
+    for (size_t i=0; i<sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+        size_t n = strlen(prefixes[i]);
+        if (!strncmp(name, prefixes[i], n)) { number = name+n; break; }
+    }
+    if (!number || number >= end) return false;
+    unsigned slashes=0;
+    bool digit=false;
+    for (const char *p=number; p<end; p++) {
+        if (*p>='0' && *p<='9') digit=true;
+        else if (*p=='/' && digit) { slashes++; digit=false; }
+        else return false;
+    }
+    if (!digit || slashes < 1 || slashes > 2) return false;
+    const char *op=end+1;
+    const char *fixed[]={
+        "switchport mode access", "switchport mode dynamic auto", "no switchport mode",
+        "no switchport access vlan", "spanning-tree portfast",
+        "no spanning-tree portfast", "switchport port-security",
+        "no switchport port-security", "no switchport port-security maximum",
+        "switchport port-security violation restrict",
+        "switchport port-security violation shutdown",
+        "no switchport port-security violation"
+    };
+    bool valid=false;
+    for (size_t i=0;i<sizeof(fixed)/sizeof(fixed[0]);i++)
+        if (!strcmp(op,fixed[i])) valid=true;
+    const char *vlan="switchport access vlan ";
+    const char *maximum="switchport port-security maximum ";
+    if (!strncmp(op,vlan,strlen(vlan)))
+        valid=cisco_port_decimal(op+strlen(vlan),4094);
+    if (!strncmp(op,maximum,strlen(maximum)))
+        valid=cisco_port_decimal(op+strlen(maximum),1024);
+    if (!valid) return false;
+    size_t n=(size_t)(end-name), len=strlen(op);
+    if ((ifname && ifname_len<=n) || (line && line_len<=len)) return false;
+    if (ifname) { memcpy(ifname,name,n); ifname[n]='\0'; }
+    if (line) memcpy(line,op,len+1);
+    return true;
+}
+
 virp_trust_tier_t cisco_gate_tier(const char *command)
 {
     if (!command) return VIRP_TIER_RED;              /* fail closed */
@@ -826,6 +907,19 @@ virp_trust_tier_t cisco_gate_tier(const char *command)
     /* Typed config op (C-04 Option A): a port description is YELLOW. The
      * driver executes it as a fixed transaction, never as this literal. */
     if (cisco_parse_interface_description(command, NULL, 0, NULL, 0, NULL))
+        return VIRP_TIER_YELLOW;
+
+    /* Exact routine port operations only. Context (protected ports, MACs,
+     * neighbors and approval scope) is enforced by the transaction helper.
+     * Security changes and unknown configuration remain RED. */
+    char port_line[256];
+    if (cisco_parse_port_operation(command, NULL, 0, port_line, sizeof(port_line)) &&
+        (strncmp(port_line, "switchport mode ", 16) == 0 ||
+         strcmp(port_line, "no switchport mode") == 0 ||
+         strncmp(port_line, "switchport access vlan ", 23) == 0 ||
+         strcmp(port_line, "no switchport access vlan") == 0 ||
+         strcmp(port_line, "spanning-tree portfast") == 0 ||
+         strcmp(port_line, "no spanning-tree portfast") == 0))
         return VIRP_TIER_YELLOW;
 
     const cisco_route_t *best = NULL;
@@ -1386,18 +1480,40 @@ static virp_error_t cisco_send_settle(virp_conn_t *conn, const char *line,
 
 static bool cisco_ios_rejected(const char *out)
 {
-    return strstr(out, "% Invalid input") || strstr(out, "% Incomplete") ||
-           strstr(out, "% Ambiguous") || strstr(out, "% Unrecognized") ||
-           strstr(out, "% Bad ");
+    /* Match device diagnostic lines, not description text containing these
+     * words. AAA denial can leave the prompt unchanged: prompt completion
+     * alone is never proof that the requested change succeeded. */
+    static const char *const errors[] = {
+        "Invalid input", "Incomplete", "Ambiguous", "Unrecognized", "Bad ",
+        "Authorization failed", "Command authorization failed",
+        "Access denied", "Permission denied", "Unknown command:"
+    };
+    for (const char *line = out; *line;) {
+        const char *end = strchr(line, '\n');
+        if (!end) end = line + strlen(line);
+        const char *p = line;
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
+        if (p < end && *p == '%') {
+            p++;
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+        }
+        for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); i++) {
+            size_t n = strlen(errors[i]);
+            if ((size_t)(end - p) >= n && strncmp(p, errors[i], n) == 0)
+                return true;
+        }
+        line = *end ? end + 1 : end;
+    }
+    return false;
 }
 
 /*
- * interface <name> description <text>  — the four-step transaction.
+ * Typed interface operation — the four-step transaction.
  *
  *   precondition  privileged EXEC (refused before any byte otherwise)
  *   1  configure terminal   -> (config)#
  *   2  interface <name>     -> (config-if)#   (any config sub-mode)
- *   3  description <text> | no description  -> prompt unchanged, no "% "
+ *   3  parser-rendered single line         -> prompt unchanged, no "% "
  *   4  end                  -> #             (ALWAYS attempted after 1)
  *
  * A step that fails stops the transaction; "end" still runs so the
@@ -1407,11 +1523,10 @@ static bool cisco_ios_rejected(const char *out)
  * signed body is the whole transcript, prefixed with the classified
  * command exactly as every other Cisco observation is.
  */
-static virp_error_t cisco_exec_interface_description(virp_conn_t *conn,
+static virp_error_t cisco_exec_interface_line(virp_conn_t *conn,
                                                      const char *command,
                                                      const char *ifname,
-                                                     const char *desc,
-                                                     bool negate,
+                                                     const char *line_desc,
                                                      virp_exec_result_t *result)
 {
     if (conn->current_mode != CISCO_MODE_EXEC || !conn->in_enable) {
@@ -1427,12 +1542,8 @@ static virp_error_t cisco_exec_interface_description(virp_conn_t *conn,
         return VIRP_OK;
     }
 
-    char line_if[128], line_desc[300];   /* "description " + desc[256] */
+    char line_if[128];
     snprintf(line_if, sizeof(line_if), "interface %s", ifname);
-    if (negate)
-        snprintf(line_desc, sizeof(line_desc), "no description");
-    else
-        snprintf(line_desc, sizeof(line_desc), "description %s", desc);
 
     const char *steps[4] = { "configure terminal", line_if, line_desc, "end" };
     const bool  moves[4] = { true, true, false, true };
@@ -1569,12 +1680,17 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
     /* Typed config op: executed as a fixed transaction, never as the
      * literal (IOS would reject "interface X description Y" in EXEC). */
     {
-        char ifn[64], dsc[256];
+        char ifn[64], dsc[256], line[300];
         bool neg = false;
         if (cisco_parse_interface_description(command, ifn, sizeof(ifn),
-                                              dsc, sizeof(dsc), &neg))
-            return cisco_exec_interface_description(conn, command, ifn, dsc,
-                                                    neg, result);
+                                              dsc, sizeof(dsc), &neg)) {
+            if (neg) snprintf(line, sizeof(line), "no description");
+            else snprintf(line, sizeof(line), "description %s", dsc);
+            return cisco_exec_interface_line(conn, command, ifn, line, result);
+        }
+        if (cisco_parse_port_operation(command, ifn, sizeof(ifn),
+                                      line, sizeof(line)))
+            return cisco_exec_interface_line(conn, command, ifn, line, result);
     }
 
     /* Commands that may legitimately move the prompt (config mode). */
@@ -1712,19 +1828,21 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
     }
 
     if (rerr == VIRP_ERR_NO_PROMPT) {
-        /*
-         * Incomplete read. Returning a hard error (rather than VIRP_OK
-         * with a short body) is what makes the O-Node emit a typed
-         * ERROR observation instead of signing a truncated body as
-         * device output.
-         */
+        /* The command was sent; a missing prompt cannot prove its outcome.
+         * Return the typed result through the O-Node's UNKNOWN path, not
+         * its generic driver-error return. Never publish partial output
+         * or allow this connection/command to be retried. */
         conn->connected = false;
         result->success = false;
+        result->no_dispatch = false;
+        result->disposition = VIRP_DISPOSITION_EXECUTED_UNKNOWN;
+        result->exit_code_trusted = false;
         result->output_len = 0;
+        result->output[0] = '\0';
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Incomplete read on %s: no prompt after %zu bytes",
                  conn->device.hostname, n);
-        return VIRP_ERR_NO_PROMPT;
+        return VIRP_OK;
     }
     if (rerr != VIRP_OK) {
         conn->connected = false;
@@ -1791,9 +1909,7 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
     result->exit_code = 0;
 
     /* Check for IOS error markers */
-    if (strstr(output_start, "% Invalid input") ||
-        strstr(output_start, "% Incomplete command") ||
-        strstr(output_start, "% Ambiguous command")) {
+    if (cisco_ios_rejected(output_start)) {
         result->success = false;
         result->exit_code = 1;
         snprintf(result->error_msg, sizeof(result->error_msg),
@@ -1866,6 +1982,15 @@ static bool cisco_detect(virp_conn_t *conn)
  * Driver: health_check
  * ========================================================================= */
 
+static const char *cisco_health_probe(const virp_conn_t *conn)
+{
+    bool config = conn->current_mode == CISCO_MODE_CONFIG ||
+                  conn->current_mode == CISCO_MODE_CONFIG_SUB;
+    if (conn->device.cisco_health_version)
+        return config ? "do show version" : "show version";
+    return config ? "do show clock" : "show clock";
+}
+
 static virp_error_t cisco_health_check(virp_conn_t *conn)
 {
     if (!conn) return VIRP_ERR_NULL_PTR;
@@ -1879,14 +2004,10 @@ static virp_error_t cisco_health_check(virp_conn_t *conn)
      * read that as unhealthy and drop the session mid-sequence
      * (probe cadence ONODE_WATCHDOG_INTERVAL_SEC is shorter than a
      * gate approval roundtrip). "do show clock" is the config-mode
-     * spelling of the same liveness probe. */
-    bool in_config = (conn->current_mode == CISCO_MODE_CONFIG ||
-                      conn->current_mode == CISCO_MODE_CONFIG_SUB);
+     * spelling of the same liveness probe. An explicit root-configured
+     * version probe uses the corresponding show/do show version forms. */
     virp_exec_result_t result;
-    virp_error_t err = cisco_execute(conn,
-                                     in_config ? "do show clock"
-                                               : "show clock",
-                                     &result);
+    virp_error_t err = cisco_execute(conn, cisco_health_probe(conn), &result);
     if (err != VIRP_OK) return err;
 
     return result.success ? VIRP_OK : VIRP_ERR_KEY_NOT_LOADED;
@@ -1895,6 +2016,17 @@ static virp_error_t cisco_health_check(virp_conn_t *conn)
 /* =========================================================================
  * Driver Registration
  * ========================================================================= */
+
+static const char *cisco_gate_reason(const char *command)
+{
+    if (cisco_parse_interface_description(command, NULL, 0, NULL, 0, NULL))
+        return "This operation changes an interface description. A requester "
+               "limited to reads needs approval for this exact device and change.";
+    if (cisco_gate_tier(command) == VIRP_TIER_RED)
+        return "This command can change device state or is not a recognized "
+               "read. It requires approval within the requester's scope.";
+    return NULL;
+}
 
 static virp_driver_t cisco_driver = {
     .name       = "cisco_ios",
@@ -1905,6 +2037,7 @@ static virp_driver_t cisco_driver = {
     .detect     = cisco_detect,
     .health_check = cisco_health_check,
     .route_command = cisco_gate_tier,
+    .route_reason = cisco_gate_reason,
 };
 
 /* IOS-XE: identical driver functions + the SAME shared gate core
@@ -1920,6 +2053,7 @@ static virp_driver_t cisco_iosxe_driver = {
     .detect     = cisco_detect,
     .health_check = cisco_health_check,
     .route_command = cisco_gate_tier,
+    .route_reason = cisco_gate_reason,
 };
 
 void virp_driver_cisco_init(void)

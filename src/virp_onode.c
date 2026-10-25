@@ -44,6 +44,9 @@
 #include "virp_approval.h"
 #include "virp_body_filter.h"
 
+/* Legacy encoder stages v3 bodies locally; evidence retains v3 identity. */
+static _Thread_local bool execute_wrapping_v3;
+
 /* =========================================================================
  * JSON Request Parsing
  *
@@ -74,7 +77,7 @@ typedef struct {
     char            artifact_type[16];
     char            artifact_id[128];
     char            artifact_hash[65];
-    char            artifact_content[8192]; /* Raw payload for artifact store */
+    char            artifact_content[VIRP_CHAIN_OBSERVATION_CONTENT_MAX + 1]; /* Raw payload for artifact store */
     int64_t         from_sequence;
     int64_t         to_sequence;
     int64_t         limit;                  /* list_sessions: rows wanted (0 = default) */
@@ -516,7 +519,7 @@ static bool parse_request(const char *json, onode_request_t *req)
     req->obs_version = 1;
     {
         uint64_t v = 0;
-        if (json_extract_u64_bounded(root, "obs_version", 2, &v)) {
+        if (json_extract_u64_bounded(root, "obs_version", 3, &v)) {
             if (v < 1) { cJSON_Delete(root); return false; }
             req->obs_version = (int32_t)v;
         } else if (cJSON_GetObjectItemCaseSensitive(root, "obs_version")) {
@@ -577,6 +580,15 @@ static bool parse_request(const char *json, onode_request_t *req)
     if (cJSON_GetObjectItemCaseSensitive(root, "artifact_content") &&
         !EXTRACT_STR("artifact_content", req->artifact_content,
                      sizeof(req->artifact_content))) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    /* Only signed-observation types get the larger body budget. Their hash
+     * and cryptographic gates still run before any append. */
+    if (strlen(req->artifact_content) > VIRP_CHAIN_ARTIFACT_CONTENT_MAX &&
+        strcmp(req->artifact_type, "observation") != 0 &&
+        strcmp(req->artifact_type, "fed_observation") != 0) {
         cJSON_Delete(root);
         return false;
     }
@@ -720,6 +732,8 @@ static void drop_connection(onode_state_t *state, int dev_idx)
     pthread_mutex_lock(&state->conn_mutex);
     virp_conn_t *conn = state->connections[dev_idx];
     state->connections[dev_idx] = NULL;
+    state->reconnect[dev_idx].last_read_success = 0;
+    state->reconnect[dev_idx].read_generation++;
 
     /* Arm reconnect backoff — watchdog will pick this up */
     onode_reconnect_t *ri = &state->reconnect[dev_idx];
@@ -1257,7 +1271,7 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
          * closer's session to the intent's (1.2). Null for v1. */
         {
             char sess_hex[33] = "";
-            if (obs_version == 2)
+            if (obs_version == 2 || execute_wrapping_v3)
                 gate_session_hex(state, sess_hex);
             if (sess_hex[0])
                 cJSON_AddStringToObject(o, "session", sess_hex);
@@ -1445,7 +1459,7 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
              "gate-enforce:%s", device_name);
 
     char sess_hex[33] = "";
-    if (obs_version == 2)
+    if (obs_version == 2 || execute_wrapping_v3)
         gate_session_hex(state, sess_hex);
 
     struct timespec ts;
@@ -1509,7 +1523,7 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
             cJSON_AddNullToObject(o, "approval_entry_hash");
             cJSON_AddNullToObject(o, "proposal_entry_hash");
         }
-        cJSON_AddNumberToObject(o, "obs_version", (double)obs_version);
+        cJSON_AddNumberToObject(o, "obs_version", (double)(execute_wrapping_v3 ? 3 : obs_version));
         /* Wall clock at intent time, so two dispatches of the same command
          * by the same principal never share a body (and so an artifact_id). */
         cJSON_AddNumberToObject(o, "intent_ns", (double)intent_ns);
@@ -1603,6 +1617,20 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
             }
             cJSON_AddItemToObject(o, "uid_ceilings", ceils);
         }
+        cJSON *probes = cJSON_CreateArray();
+        if (probes) {
+            for (int i = 0; i < state->device_count; i++) {
+                if (!state->devices[i].cisco_health_version) continue;
+                cJSON *probe = cJSON_CreateObject();
+                if (!probe) continue;
+                cJSON_AddStringToObject(probe, "device", state->devices[i].hostname);
+                cJSON_AddStringToObject(probe, "probe", "version");
+                cJSON_AddItemToArray(probes, probe);
+            }
+            cJSON_AddItemToObject(o, "cisco_health_probes", probes);
+        }
+        if (state->chain.native_epoch[0])
+            cJSON_AddStringToObject(o, "native_audit_epoch", state->chain.native_epoch);
         cJSON_AddNumberToObject(o, "emitted_ns", (double)now_ns);
         body = cJSON_PrintUnformatted(o);
         cJSON_Delete(o);
@@ -1896,7 +1924,7 @@ static virp_error_t onode_approval_submit(onode_state_t *state,
 static void approval_proposer_id(onode_state_t *state, int obs_version,
                                  char *out, size_t out_len)
 {
-    if (obs_version == 2) {
+    if (obs_version == 2 || execute_wrapping_v3) {
         onode_session_lock(state);
         if (state->ctx &&
             virp_session_require_active(state->ctx) == VIRP_OK) {
@@ -2349,7 +2377,115 @@ virp_error_t onode_apply_obs(onode_state_t *state,
                                 out_buf, out_buf_len, out_len);
 }
 
+
+/* Execute-v3 payload profile XO1: 8-byte magic followed by the existing
+ * authenticated v1 observation subheader (type, scope, BE16 length) and body.
+ * No header/reserved-byte or canonical chain changes. Legacy output is local
+ * staging only; it is never returned when v3 was requested. */
+
+/* A consumed approval is an event even though no device I/O follows.
+ * The outcome ID is populated only if that outcome actually exists. A crash
+ * after intent leaves a null outcome, never an invented successful result. */
+static virp_error_t replay_refusal_record(onode_state_t *state,
+    const char *device, const char *proposal_id, const char *command)
+{
+    if (!state->chain_enabled) return VIRP_OK;
+    char outcome[64], session[96], artifact[96], hash[65];
+    snprintf(outcome, sizeof(outcome), "outcome:%s", proposal_id);
+    bool exists = false;
+    virp_error_t err = virp_chain_artifact_type_exists(&state->chain,
+        outcome, "outcome", &exists);
+    if (err != VIRP_OK) { onode_mark_evidence_degraded(state, device, "replay lookup"); return err; }
+    cJSON *o = cJSON_CreateObject(); if (!o) return VIRP_ERR_BUFFER_TOO_SMALL;
+    cJSON_AddStringToObject(o, "schema", "gate_rejection/1");
+    cJSON_AddStringToObject(o, "reason", "approval_reused");
+    cJSON_AddNumberToObject(o, "error_code", VIRP_ERR_APPROVAL_REUSED);
+    cJSON_AddStringToObject(o, "approval_id", proposal_id);
+    cJSON_AddStringToObject(o, "proposal_id", proposal_id);
+    cJSON_AddStringToObject(o, "device", device);
+    cJSON_AddStringToObject(o, "command", command);
+    cJSON_AddBoolToObject(o, "executed", false);
+    if (exists) cJSON_AddStringToObject(o, "original_outcome_id", outcome);
+    else { cJSON_AddNullToObject(o, "original_outcome_id");
+        cJSON_AddStringToObject(o, "outcome_status", "not_recorded"); }
+    char *body = cJSON_PrintUnformatted(o); cJSON_Delete(o);
+    if (!body) return VIRP_ERR_BUFFER_TOO_SMALL;
+    gate_sha256_hex(body, strlen(body), hash);
+    snprintf(session, sizeof(session), "gate-enforce:%s", device);
+    snprintf(artifact, sizeof(artifact), "replay:%s:%u", proposal_id, onode_next_seq(state));
+    virp_chain_entry_t ce;
+    err = virp_chain_append_with_artifact(&state->chain, session,
+        "gate_rejection", artifact, hash, body, &ce);
+    cJSON_free(body);
+    if (err != VIRP_OK) onode_mark_evidence_degraded(state, device, "replay rejection");
+    return err;
+}
+
+static virp_error_t onode_execute_legacy(onode_state_t *, const char *,
+    const char *, int, const char *, uid_t, uint8_t *, size_t, size_t *);
+
 virp_error_t onode_execute_obs_ex(onode_state_t *state,
+    const char *device_name, const char *command, int obs_version,
+    const char *proposal_id, uid_t client_uid,
+    uint8_t *out_buf, size_t out_buf_len, size_t *out_len)
+{
+    if (!state || !device_name || !command || !out_buf || !out_len)
+        return VIRP_ERR_NULL_PTR;
+    if (obs_version < 1 || obs_version > 3) return VIRP_ERR_VERSION_MISMATCH;
+    if (obs_version != 3 && !state->execute_v3)
+        return onode_execute_legacy(state, device_name, command, obs_version,
+            proposal_id, client_uid, out_buf, out_buf_len, out_len);
+    *out_len = 0;
+    if (!state->chain_enabled || !state->chain.sign_enabled ||
+        !state->obskey_loaded ||
+        memcmp(state->chain.sign_key.public_key, state->obskey.public_key, 32))
+        return VIRP_ERR_KEY_NOT_LOADED;
+    if (out_buf_len < VIRP_MAX_MESSAGE_SIZE) return VIRP_ERR_BUFFER_TOO_SMALL;
+    char canonical[512];
+    if (virp_canonicalize_command(command, canonical, sizeof(canonical)) < 0)
+        return VIRP_ERR_INVALID_LENGTH;
+    onode_session_lock(state);
+    uint64_t session_generation = state->ctx ? state->ctx->session.generation : 0;
+    uint8_t session_id[16] = {0};
+    if (state->ctx) memcpy(session_id, state->ctx->session.session_id, sizeof(session_id));
+    bool active = state->ctx &&
+        virp_session_require_active(state->ctx) == VIRP_OK &&
+        state->ctx->session.session_key_valid;
+    pthread_mutex_unlock(&state->session_mutex);
+    if (!active) return VIRP_ERR_SESSION_INVALID;
+    uint8_t legacy[VIRP_MAX_MESSAGE_SIZE]; size_t legacy_len = 0;
+    execute_wrapping_v3 = true;
+    virp_error_t err = onode_execute_legacy(state, device_name, command, 1,
+        proposal_id, client_uid, legacy, sizeof(legacy), &legacy_len);
+    execute_wrapping_v3 = false;
+    if (err != VIRP_OK) return err;
+    if (legacy_len < 60 || legacy[0] != 1 ||
+        (legacy[56] != VIRP_OBS_DEVICE_OUTPUT && legacy[56] != VIRP_OBS_ERROR))
+        return VIRP_ERR_INVALID_LENGTH;
+    uint8_t payload[VIRP_MAX_MESSAGE_SIZE];
+    size_t payload_len = 8 + legacy_len - 56;
+    if (payload_len > VIRP_MAX_MESSAGE_SIZE - VIRP_OBS_V3_MIN_SIZE)
+        return VIRP_ERR_MESSAGE_TOO_LARGE;
+    memcpy(payload, "VIRP-XO1", 8);
+    memcpy(payload + 8, legacy + 56, legacy_len - 56);
+    int idx = find_device(state, device_name);
+    uint64_t device_id = idx >= 0 ? state->devices[idx].device_id : 0;
+    onode_session_lock(state);
+    if (!state->ctx || virp_session_require_active(state->ctx) != VIRP_OK ||
+        !state->ctx->session.session_key_valid ||
+        state->ctx->session.generation != session_generation ||
+        memcmp(state->ctx->session.session_id, session_id, sizeof(session_id)))
+        err = VIRP_ERR_SESSION_INVALID;
+    else err = virp_build_observation_ed25519(state->ctx, &state->obskey,
+        state->node_id, device_id, legacy[9],
+        ++state->ctx->session.last_seq, command,
+        idx >= 0 ? onode_typed_profile(state, idx) : NULL,
+        payload, payload_len, out_buf, out_buf_len, out_len);
+    pthread_mutex_unlock(&state->session_mutex);
+    return err;
+}
+
+static virp_error_t onode_execute_legacy(onode_state_t *state,
                                   const char *device_name,
                                   const char *command,
                                   int obs_version,
@@ -2639,6 +2775,10 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                         (ent && ent->operator[0]) ? ent->operator : "(unknown)");
                 /* fall through: the approved command executes below */
             } else {
+                if (aerr == VIRP_ERR_APPROVAL_REUSED) {
+                    virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command);
+                    if (re != VIRP_OK) { pthread_mutex_unlock(&state->exec_mutex[dev_idx]); return re; }
+                }
                 pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
                 char err_msg[384];
                 snprintf(err_msg, sizeof(err_msg),
@@ -2863,6 +3003,10 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         virp_approval_consume_unlock();
 
         if (refuse_err != VIRP_OK) {
+            if (refuse_err == VIRP_ERR_APPROVAL_REUSED) {
+                virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command);
+                if (re != VIRP_OK) { pthread_mutex_unlock(&state->exec_mutex[dev_idx]); return re; }
+            }
             pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
             log_error_obs(device_name, gate_tier, refuse_msg);
             return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
@@ -2906,6 +3050,14 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
             virp_error_t ce = virp_approval_commit_consume(state->approval_dir,
                                                            proposal_id);
             if (ce != VIRP_OK) {
+                if (ce == VIRP_ERR_APPROVAL_REUSED) {
+                    virp_error_t re = replay_refusal_record(state, device_name,
+                                                           proposal_id, command);
+                    if (re != VIRP_OK) {
+                        pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+                        return re;
+                    }
+                }
                 pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
                 char err_msg[384];
                 snprintf(err_msg, sizeof(err_msg),
@@ -2932,6 +3084,13 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
                 command);
     }
 
+    uint64_t read_generation = 0;
+    if (gate_tier == VIRP_TIER_GREEN) {
+        pthread_mutex_lock(&state->conn_mutex);
+        read_generation = ++state->reconnect[dev_idx].read_generation;
+        state->reconnect[dev_idx].last_read_success = 0;
+        pthread_mutex_unlock(&state->conn_mutex);
+    }
     virp_exec_result_t result;
     memset(&result, 0, sizeof(result));   /* no_dispatch=false unless the
                                              driver proves otherwise */
@@ -3000,6 +3159,11 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         drop_connection(state, dev_idx);
         conn = get_connection(state, dev_idx);
         if (conn) {
+            if (read_generation) {
+                pthread_mutex_lock(&state->conn_mutex);
+                read_generation = ++state->reconnect[dev_idx].read_generation;
+                pthread_mutex_unlock(&state->conn_mutex);
+            }
             memset(&result, 0, sizeof(result));
             virp_exec_passthrough = (gate_eff_max == VIRP_TIER_BLACK);
             err = drv->execute(conn, command, &result);
@@ -3264,7 +3428,9 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
     }
 
     /* Account for the wire limit BEFORE recording the execution receipt. */
-    size_t capture_limit = obs_version == 2
+    size_t capture_limit = execute_wrapping_v3
+        ? VIRP_MAX_MESSAGE_SIZE - VIRP_OBS_V3_MIN_SIZE - 12
+        : obs_version == 2
         ? VIRP_MAX_MESSAGE_SIZE - VIRP_OBS_V2_HEADER_SIZE - VIRP_OBS_V2_SIG_SIZE
         : VIRP_OBS_V1_MAX_DATA;
     if (result.output_len > capture_limit) {
@@ -3398,6 +3564,13 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         pthread_mutex_lock(&state->state_mutex);
         state->observations_sent++;
         pthread_mutex_unlock(&state->state_mutex);
+        if (result.success && read_generation) {
+            pthread_mutex_lock(&state->conn_mutex);
+            if (state->connections[dev_idx] &&
+                state->reconnect[dev_idx].read_generation == read_generation)
+                state->reconnect[dev_idx].last_read_success = time(NULL);
+            pthread_mutex_unlock(&state->conn_mutex);
+        }
     }
 
     return err;
@@ -3520,6 +3693,25 @@ static virp_error_t onode_list_devices(onode_state_t *state,
  * tell WHAT each device is without learning where it lives. Still pinned by
  * test to never quietly widen beyond name+class+status.
  */
+/* A health action is a fixed, driver-appropriate read through the normal gate.
+ * Unsupported classes never inherit a guessed CLI command. */
+const char *onode_health_command(virp_vendor_t vendor)
+{
+    switch (vendor) {
+    case VIRP_VENDOR_CISCO_IOS: case VIRP_VENDOR_CISCO_IOSXE:
+    case VIRP_VENDOR_CISCO_ASA: case VIRP_VENDOR_JUNIPER:
+    case VIRP_VENDOR_MOCK: return "show version";
+    case VIRP_VENDOR_FORTINET: return "get system status";
+    case VIRP_VENDOR_PALOALTO: return "show system info";
+    case VIRP_VENDOR_LINUX: case VIRP_VENDOR_PROXMOX: return "uptime";
+    case VIRP_VENDOR_WAZUH: return "GET /manager/status";
+    case VIRP_VENDOR_LIBRENMS: return "GET /api/v0/devices";
+    case VIRP_VENDOR_PBS: return "pbs op=backup.version.read";
+    case VIRP_VENDOR_ZAMMAD: return "GET /api/v1/ticket_states";
+    default: return NULL;
+    }
+}
+
 static virp_error_t onode_list_fleet(onode_state_t *state,
                                      uint8_t *out_buf, size_t out_buf_len,
                                      size_t *out_len)
@@ -3542,7 +3734,17 @@ static virp_error_t onode_list_fleet(onode_state_t *state,
             status = "disabled";
         } else {
             pthread_mutex_lock(&state->conn_mutex);
-            status = state->connections[i] ? "connected" : "unconnected";
+            const onode_reconnect_t *ri = &state->reconnect[i];
+            if (!virp_driver_lookup(state->devices[i].vendor) ||
+                !onode_health_command(state->devices[i].vendor))
+                status = "unsupported";
+            else if (state->connections[i]) {
+                time_t age = time(NULL) - ri->last_read_success;
+                status = !ri->last_read_success ? "connected_unverified" :
+                         (age < 0 || age > 300) ? "needs_health_check" : "read_verified";
+            } else if (ri->reconnecting) status = "connecting";
+            else if (ri->consecutive_fails) status = "connection_failed";
+            else status = "not_checked";
             pthread_mutex_unlock(&state->conn_mutex);
         }
 
@@ -4021,8 +4223,8 @@ static bool peer_uid_allowed(onode_state_t *state, int client_fd,
  *
  * WHAT THIS GATE DOES NOT CLOSE: a commitment-only append (no body)
  * cannot be signature-checked, because there are no bytes to check.
- * Those stay legal — they are 3.8% of the live chain, the deliberate
- * path for observations past the 8192-byte artifact field — and they
+ * Those stay legal for compatibility with producers using the historical
+ * 8192-byte artifact field; larger full observations now fit, and absent bodies
  * are honestly graded: every reader reports an entry with no stored
  * body as UNVERIFIABLE, never as a passing signature. A caller can
  * still register an arbitrary hash; what it cannot do is obtain an
@@ -4524,7 +4726,14 @@ static void handle_client(onode_state_t *state, int client_fd,
          * seat saw "(tier=RED max=YELLOW)" come back from its own socket.
          * Pass client_uid explicitly, exactly as the execute paths do.
          */
-        err = onode_execute_obs_ex(state, req.device, "show version",
+        int health_idx = find_device(state, req.device);
+        const char *health_command = health_idx < 0 ? "show version" :
+            onode_health_command(state->devices[health_idx].vendor);
+        if (!health_command) {
+            send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
+            break;
+        }
+        err = onode_execute_obs_ex(state, req.device, health_command,
                                    req.obs_version, NULL, client_uid,
                                    resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
@@ -5821,12 +6030,18 @@ static void *watchdog_thread_fn(void *arg)
 
     /* ---- Steady-state loop: health checks + reconnects ---- */
     while (state->watchdog_running) {
-        sleep(ONODE_WATCHDOG_INTERVAL_SEC);
+        /* Interruptible without locks/condition operations in the signal handler. */
+        for (int tick = 0; tick < ONODE_WATCHDOG_INTERVAL_SEC * 10 &&
+                           state->watchdog_running; tick++) {
+            struct timespec pause = { .tv_sec = 0, .tv_nsec = 100000000 };
+            nanosleep(&pause, NULL);
+        }
         if (!state->watchdog_running) break;
 
         time_t now = time(NULL);
 
         for (int i = 0; i < state->device_count; i++) {
+            if (!state->watchdog_running) goto done;
             if (!state->devices[i].enabled)
                 continue;
 
@@ -5869,7 +6084,8 @@ static void *watchdog_thread_fn(void *arg)
                  * execute-path drop_connection while we waited. */
                 pthread_mutex_lock(&state->conn_mutex);
                 conn = state->connections[i];
-                bool probe_skip = (conn == NULL) || ri->reconnecting;
+                bool probe_skip = !state->watchdog_running ||
+                                  (conn == NULL) || ri->reconnecting;
                 pthread_mutex_unlock(&state->conn_mutex);
                 if (probe_skip) {
                     pthread_mutex_unlock(&state->exec_mutex[i]);
@@ -5887,6 +6103,8 @@ static void *watchdog_thread_fn(void *arg)
                     pthread_mutex_lock(&state->conn_mutex);
                     virp_conn_t *stale = state->connections[i];
                     state->connections[i] = NULL;
+                    ri->last_read_success = 0;
+                    ri->read_generation++;
                     ri->reconnecting = true;
                     ri->last_attempt = now;
                     if (ri->backoff_sec == 0)
@@ -6035,6 +6253,7 @@ virp_error_t onode_init(onode_state_t *state,
         return VIRP_ERR_NULL_PTR;
 
     memset(state, 0, sizeof(*state));
+    atomic_init(&state->watchdog_running, false);
     state->node_id = node_id;
     state->seq_num = 0;
     state->listen_fd = -1;

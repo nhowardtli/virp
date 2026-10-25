@@ -1,0 +1,82 @@
+{
+  "sw_description": [
+    "SW-3850",
+    "10.0.10.2",
+    "show interfaces GigabitEthernet1/0/22"
+  ],
+  "sw_port_switchport": [
+    "SW-3850",
+    "10.0.10.2",
+    "show interfaces GigabitEthernet1/0/22 switchport"
+  ],
+  "sw_port_errors": [
+    "SW-3850",
+    "10.0.10.2",
+    "show interfaces GigabitEthernet1/0/22 counters errors"
+  ],
+  "sw_port_status": [
+    "SW-3850",
+    "10.0.10.2",
+    "show interfaces GigabitEthernet1/0/22 status"
+  ],
+  "sw_trunks": [
+    "SW-3850",
+    "10.0.10.2",
+    "show interfaces trunk"
+  ],
+  "sw_inventory_status": [
+    "SW-3850",
+    "10.0.10.2",
+    "show interfaces status"
+  ],
+  "sw_vlan_brief": [
+    "SW-3850",
+    "10.0.10.2",
+    "show vlan brief"
+  ],
+  "sw_etherchannel": [
+    "SW-3850",
+    "10.0.10.2",
+    "show etherchannel summary"
+  ],
+  "sw_cdp_neighbors": [
+    "SW-3850",
+    "10.0.10.2",
+    "show cdp neighbors detail"
+  ],
+  "sw_lldp_neighbors": [
+    "SW-3850",
+    "10.0.10.2",
+    "show lldp neighbors detail"
+  ],
+  "sw_port_mac": [
+    "SW-3850",
+    "10.0.10.2",
+    "show mac address-table interface GigabitEthernet1/0/22"
+  ],
+  "sw_port_cdp": [
+    "SW-3850",
+    "10.0.10.2",
+    "show cdp neighbors GigabitEthernet1/0/22 detail"
+  ],
+  "sw_port_lldp": [
+    "SW-3850",
+    "10.0.10.2",
+    "show lldp neighbors GigabitEthernet1/0/22 detail"
+  ],
+  "sw_port_stp": [
+    "SW-3850",
+    "10.0.10.2",
+    "show spanning-tree interface GigabitEthernet1/0/22 detail"
+  ],
+  "sw_port_config": [
+    "SW-3850",
+    "10.0.10.2",
+    "show running-config interface GigabitEthernet1/0/22"
+  ],
+  "sw_port_logs": [
+    "SW-3850",
+    "10.0.10.2",
+    "show logging | include Gi1/0/22"
+  ]
+}

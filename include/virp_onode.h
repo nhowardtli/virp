@@ -29,6 +29,8 @@
 #include <pthread.h>
 #include <semaphore.h>   /* sem_t for worker pool cap */
 #include <stdint.h>
+#include <stdatomic.h>
+_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "shutdown flag must be signal-safe");
 #include <sys/types.h>   /* uid_t for socket_allowed_uids */
 
 /* =========================================================================
@@ -36,12 +38,15 @@
  * ========================================================================= */
 
 #define ONODE_MAX_DEVICES       64
+
+/* NULL means the class has no qualified generic health read. */
+const char *onode_health_command(virp_vendor_t vendor);
 #define ONODE_MAX_BATCH         16
 #define ONODE_SOCKET_PATH       "/run/virp/onode.sock"
 #define ONODE_HEARTBEAT_SEC     30
 #define ONODE_MAX_CLIENTS       8
 #define ONODE_RECV_TIMEOUT_SEC  5
-#define ONODE_MAX_REQUEST_SIZE  24576
+#define ONODE_MAX_REQUEST_SIZE  131072
 #define ONODE_MAX_ALLOWED_UIDS  16
 #define ONODE_MAX_UID_CAPP_TYPES 16 /* max chain_append types per uid (v0.2.1) */
 #define ONODE_CHAIN_TYPE_MAX     16 /* artifact_type field width incl NUL   */
@@ -147,6 +152,8 @@ typedef struct {
     int         backoff_sec;        /* Current backoff interval (5→10→30→60) */
     int         consecutive_fails;  /* Consecutive reconnect failures */
     bool        reconnecting;       /* True while a reconnect is in progress */
+    uint64_t    read_generation;     /* Serializes freshness against later reads */
+    time_t      last_read_success;   /* Successful signed GREEN read; not login */
 } onode_reconnect_t;
 
 /* =========================================================================
@@ -191,6 +198,7 @@ typedef struct {
      */
     virp_obskey_t       obskey;
     bool                obskey_loaded;
+    bool                execute_v3; /* opt-in -3; requires -S, same key */
 
     /*
      * PREVIOUS O-Key — VERIFY-ONLY, TIME-BOUNDED. Optional.
@@ -455,7 +463,7 @@ typedef struct {
 
     /* Watchdog thread (auto-reconnect) */
     pthread_t           watchdog_thread;
-    bool                watchdog_running;
+    atomic_bool         watchdog_running;
 
     /*
      * Worker pool. Each accepted connection is handled on a detached

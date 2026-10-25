@@ -799,6 +799,26 @@ static void sha256_hex_str(const char *s, char out[65])
     for (int i = 0; i < 32; i++) snprintf(out + i * 2, 3, "%02x", d[i]);
 }
 
+static void test_verify_large_artifact_binding(void)
+{
+    TEST("Large bodies bind; corrupt large bodies fail; legacy prefix stays unknown");
+    cleanup(); create_test_key();
+    virp_chain_state_t state;
+    ASSERT(virp_chain_init(&state, TEST_DB, TEST_KEY, 1, "local") == VIRP_OK, "init");
+    char body[10001]; memset(body, 'x', sizeof(body)-1); body[10000] = 0;
+    char hash[65]; sha256_hex_str(body, hash);
+    virp_chain_entry_t e;
+    ASSERT(virp_chain_append_with_artifact(&state, "large", "observation", "large", hash, body, &e) == VIRP_OK, "append");
+    virp_chain_verify_result_t r;
+    ASSERT(virp_chain_verify(&state, "large", 0, 0, &r) == VIRP_OK, "verify");
+    ASSERT(r.valid && r.artifacts_bound == 1, "complete large body must bind");
+    sqlite3_exec(state.db, "UPDATE artifacts SET artifact_content = 'y' || substr(artifact_content,2)", NULL, NULL, NULL);
+    ASSERT(virp_chain_verify(&state, "large", 0, 0, &r) == VIRP_OK && !r.valid, "large tamper must fail");
+    sqlite3_exec(state.db, "UPDATE artifacts SET artifact_content = substr(artifact_content,1,8191)", NULL, NULL, NULL);
+    ASSERT(virp_chain_verify(&state, "large", 0, 0, &r) == VIRP_OK && r.valid && r.artifacts_unverifiable == 1, "legacy prefix remains unverifiable");
+    virp_chain_destroy(&state); PASS();
+}
+
 static void test_verify_binds_stored_artifact(void)
 {
     TEST("Verify binds stored artifact bodies");
@@ -1649,6 +1669,7 @@ int main(void)
     test_verify_session_forged_head();
     test_restart_does_not_launder_truncation();
     test_dropped_heads_table_is_fatal();
+    test_verify_large_artifact_binding();
     test_verify_binds_stored_artifact();
     test_verify_binds_base64_body();
     test_verify_indirect_type_is_unverifiable();

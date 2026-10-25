@@ -2492,7 +2492,7 @@ test-release-tools:
 	@scripts/verify-release-bundle.sh --selftest
 	@scripts/check-release-tag.sh --selftest
 
-all-tests: check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-evidence-ham test-tacacs-authz test-tacacs-ham test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-verifier-error test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-json-hygiene test-obskey test-obs-ed25519 test-obs-v3-vectors test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chain-signing-migration test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api test-health-uid-passthrough test-virp-shell
+all-tests: test-execute-v3 check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-evidence-ham test-tacacs-authz test-tacacs-ham test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-verifier-error test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-json-hygiene test-obskey test-obs-ed25519 test-obs-v3-vectors test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chain-signing-migration test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api test-health-uid-passthrough test-virp-shell
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 
@@ -2542,3 +2542,69 @@ $(BUILD_DIR)/test_onode_security: tests/test_onode_security.c tests/test_onode.c
 test-onode-security: $(BUILD_DIR)/test_onode_security
 	./$(BUILD_DIR)/test_onode_security
 all-tests: test-onode-security
+
+.PHONY: test-execute-v3
+test-execute-v3: build/libvirp.a
+	$(CC) $(CFLAGS) tests/test_execute_v3.c build/libvirp.a $(LDFLAGS) -o build/test_execute_v3
+	umask 077; ./build/test_execute_v3
+
+$(BUILD_DIR)/test_driver_cisco_auth: tests/test_driver_cisco_auth.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lssh2 -o $@
+.PHONY: test-cisco-auth test-cage-v3
+test-cisco-auth: $(BUILD_DIR)/test_driver_cisco_auth
+	./$(BUILD_DIR)/test_driver_cisco_auth
+test-cage-v3:
+	python3 -m unittest discover -s tools/cage -v
+all-tests: test-cage-v3 test-cisco-auth
+
+.PHONY: test-operability
+test-operability: $(BUILD_DIR)/test_operability
+	./$(BUILD_DIR)/test_operability
+$(BUILD_DIR)/test_operability: tests/test_operability.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+all-tests: test-operability
+
+.PHONY: test-wazuh-tls
+test-wazuh-tls:
+	$(MAKE) BUILD_DIR=build-wazuh-tls WAZUH=1 build-wazuh-tls/wazuh-tls-probe
+	python3 tests/test_wazuh_tls.py build-wazuh-tls/wazuh-tls-probe
+
+$(BUILD_DIR)/wazuh-tls-probe: tests/wazuh_tls_probe.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+.PHONY: test-witness-publisher
+test-witness-publisher:
+	python3 -m unittest discover -s tools/witness -v
+all-tests: test-witness-publisher
+
+# Exact typed Cisco access-port execution (approval-gated).
+$(BUILD_DIR)/test_driver_cisco_port_ops: tests/test_driver_cisco_port_ops.c $(LIB)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+.PHONY: test-cisco-port-ops
+test-cisco-port-ops: $(BUILD_DIR)/test_driver_cisco_port_ops
+	./$(BUILD_DIR)/test_driver_cisco_port_ops
+
+all-tests: test-cisco-port-ops
+
+.PHONY: test-cage-port-plan
+test-cage-port-plan:
+	cd tools/cage && python3 -m unittest test_port_plan
+all-tests: test-cage-port-plan
+
+# Actual local C socket/approval/chain pipeline with simulated device callbacks.
+# Requires CISCO=1 for the real classifier; never contacts a network device.
+$(BUILD_DIR)/port_native_fixture: tests/port_native_fixture.c $(LIB)
+	@test "$(CISCO)" = "1" || { echo "CISCO=1 is required for the native port fixture"; exit 1; }
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+.PHONY: test-port-native-pipeline
+test-port-native-pipeline: $(BUILD_DIR)/port_native_fixture
+	umask 077; VIRP_PORT_FIXTURE="$(abspath $(BUILD_DIR)/port_native_fixture)" python3 tests/test_port_native_pipeline.py
+
+.PHONY: test-bundle-encoding
+test-bundle-encoding:
+	python3 tools/bundle/test_export_encoding.py
+all-tests: test-bundle-encoding
+ifeq ($(CISCO),1)
+all-tests: test-port-native-pipeline
+endif

@@ -467,10 +467,25 @@ static void test_read_spelling_coverage(void)
     TEST("router bgp still RED (write, not a show)"); assert(cisco_gate_tier("router bgp 65000") == VIRP_TIER_RED); PASS();
 }
 
+static void test_routine_port_tiers(void)
+{
+ const char *routine[]={"switchport mode access","switchport mode dynamic auto","no switchport mode","switchport access vlan 10","no switchport access vlan","spanning-tree portfast","no spanning-tree portfast"};
+ char command[256];
+ for (size_t i=0;i<sizeof(routine)/sizeof(routine[0]);i++) {
+  snprintf(command,sizeof(command),"interface GigabitEthernet1/0/22 %s",routine[i]);
+  TEST(command); assert(cisco_gate_tier(command)==VIRP_TIER_YELLOW); PASS();
+ }
+ const char *protected[]={"interface GigabitEthernet1/0/22 no shutdown","interface GigabitEthernet1/0/22 no switchport port-security","interface GigabitEthernet1/0/22 switchport mode trunk","interface Vlan10 switchport access vlan 10","interface Port-channel1 switchport access vlan 10","interface GigabitEthernet1/0/22 switchport access vlan 4095","interface GigabitEthernet1/0/22 spanning-tree portfast trunk","interface GigabitEthernet1/0/22 switchport mode access;reload"};
+ for (size_t i=0;i<sizeof(protected)/sizeof(protected[0]);i++) {
+  TEST(protected[i]); assert(cisco_gate_tier(protected[i])==VIRP_TIER_RED); PASS();
+ }
+}
+
 int main(void)
 {
     printf("VIRP Cisco IOS/IOS-XE Gate Classifier — Unit Tests\n");
     printf("==================================================\n");
+    test_routine_port_tiers();
     test_green();
     test_read_spelling_coverage();
     test_yellow();

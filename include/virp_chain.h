@@ -26,10 +26,11 @@
 
 #define VIRP_CHAIN_MILESTONE_INTERVAL  100
 
-/* The daemon's request field is char artifact_content[8192], so a body at
- * or past this length reached the chain truncated: a prefix, which cannot
- * hash to the whole. Mirrors ARTIFACT_CONTENT_MAX in report/verify.py. */
+/* Historical inline truncation boundary. Only a mismatching body exactly at
+ * this size may be a legacy prefix; larger complete bodies must bind. */
 #define VIRP_CHAIN_ARTIFACT_CONTENT_MAX 8191
+/* Full maximum-size wire observation, base64 prefix plus encoded bytes. */
+#define VIRP_CHAIN_OBSERVATION_CONTENT_MAX (7 + 4 * ((VIRP_MAX_MESSAGE_SIZE + 2) / 3))
 #define VIRP_CHAIN_GENESIS_PREFIX      "VIRP_CHAIN_GENESIS:"
 
 /* =========================================================================
@@ -331,6 +332,8 @@ typedef struct {
     /* Writer side: set by virp_chain_enable_signing(). When true, every
      * append also Ed25519-signs the canonical bytes and the head canonical
      * and stores the signatures + key_id in the sig columns. */
+    /* Opt-in native audit-session namespace; set once before workers start. */
+    char                   native_epoch[17];
     bool                   sign_enabled;
     virp_chainsign_key_t   sign_key;
     /* Insert / head-upsert variants that also bind the sig columns. Prepared
@@ -534,6 +537,12 @@ virp_error_t virp_chain_open_verifier_ex(virp_chain_state_t *state,
  *
  * On success, populates *entry with the committed chain entry.
  */
+/* Start fresh native approval/gate/config sessions without rewriting history.
+ * Requires signing, 1..16 ASCII letters/digits/hyphens; immutable per process.
+ * Caller-selected observation sessions and every read path remain unchanged. */
+virp_error_t virp_chain_set_native_epoch(virp_chain_state_t *state,
+                                        const char *epoch);
+
 virp_error_t virp_chain_append(virp_chain_state_t *state,
                                const char *session_id,
                                const char *artifact_type,

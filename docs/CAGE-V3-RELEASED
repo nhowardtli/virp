@@ -1,0 +1,10 @@
+Qualified code: b7496fb
+Qualification date: 2026-10-16
+Branch: feat/v3-execute-path
+Dedicated target: colo pve1 VM103 virp-qualify, node259
+Acceptance: model GREEN read + RED refusal through VM227 cage helper;
+exact v3 frames durably stored, full-range chain_verify clean, public-only
+entry/head/observation verification PASS; full C/Python batteries PASS.
+Production deployment: NOT EXECUTED; owner keyboard runbook only.
+Production approvals/RW and witness acceptance: separate subsequent milestones.
+Evidence: docs/TLI-ROLLOUT-PHASE1.md

@@ -227,9 +227,51 @@ TEST(test_config_mode_is_not_silently_reconnected)
     DONE();
 }
 
+TEST(test_tacacs_denial_is_failure_without_retry)
+{
+    virp_conn_t conn; fake_chan_t f;
+    setup(&conn, &f, "show clock\r\nCommand authorization failed.\r\nSW-3850#");
+    virp_exec_result_t r;
+    virp_error_t rc = cisco_execute(&conn, "show clock", &r);
+    CHECK(rc == VIRP_OK && !r.success && r.exit_code == 1,
+          "completed AAA denial must be a failed command, not a successful read");
+    CHECK(stub_reconnects == 0, "AAA denial must not reconnect or retry");
+    CHECK(strstr(r.output, "Command authorization failed") != NULL,
+          "preserve the observed denial as evidence");
+    DONE();
+}
+
+/* A command was sent, but no terminal prompt arrived. Both a dropped
+ * response and a truncated body must carry uncertainty, never retry. */
+TEST(test_missing_prompt_is_unknown_without_output_or_retry)
+{
+    const char *replies[] = {NULL, "show clock\r\nPARTIAL-DO-NOT-PUBLISH"};
+    for (size_t i = 0; i < sizeof(replies)/sizeof(replies[0]); i++) {
+        virp_conn_t conn; fake_chan_t f;
+        setup(&conn, &f, replies[i]);
+        virp_exec_result_t r;
+        virp_error_t rc = cisco_execute(&conn, "show clock", &r);
+        CHECK(rc == VIRP_OK, "uncertainty must reach the typed outcome path, got %d", rc);
+        CHECK(!r.success && !r.no_dispatch &&
+              r.disposition == VIRP_DISPOSITION_EXECUTED_UNKNOWN,
+              "missing prompt after dispatch must be EXECUTED_UNKNOWN");
+        CHECK(r.output_len == 0 && r.output[0] == '\0',
+              "partial device bytes must not escape as output");
+        CHECK(!r.exit_code_trusted && !conn.connected,
+              "no trusted exit status or reusable connection after lost response");
+        CHECK(f.writes == 1 && stub_reconnects == 0,
+              "unknown command must be sent once, never retried");
+        CHECK(strstr(r.error_msg, "no prompt") != NULL,
+              "missing prompt reason must survive");
+    }
+    DONE();
+}
+
 int main(void)
 {
     printf("\n=== Cisco stale-session reconnect (defect C) ===\n\n");
+    RUN(test_missing_prompt_is_unknown_without_output_or_retry);
+    RUN(test_tacacs_denial_is_failure_without_retry);
     RUN(test_closed_peer_reconnects_once_and_completes);
     RUN(test_reconnect_failure_returns_error_and_does_not_loop);
     RUN(test_non_close_transport_error_does_not_reconnect);

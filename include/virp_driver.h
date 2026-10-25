@@ -100,6 +100,7 @@ typedef struct {
      */
     uint64_t        device_id;
     bool            enabled;
+    bool            cisco_health_version; /* root config: fixed version probe; default clock */
     /* Vendor-optional (FortiGate) — zero-initialized for other vendors */
     char            api_token[256];     /* REST API Bearer token */
     uint16_t        api_port;           /* REST API port (default 443) */
