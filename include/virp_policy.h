@@ -24,6 +24,8 @@ virp_policy_t *virp_policy_load(const char *path, const char *journal_path);
 int virp_policy_secure_file(const char *path);
 int virp_policy_secure_runtime_file(const char *path);
 void virp_policy_close(virp_policy_t *policy);
+/* Explicit non-agent collector role; cannot overlap an execution principal. */
+bool virp_policy_can_append(virp_policy_t *, uid_t, const char *artifact_type);
 int virp_policy_check(virp_policy_t *, uid_t, const virp_device_t *,
                       const char *, virp_policy_action_t *, const char **reason);
 /* Durable reservation BEFORE dispatch; quotas survive restart and policy edits. */

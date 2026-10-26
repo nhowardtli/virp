@@ -41,7 +41,7 @@ inferred the attacker's intent.
 | BLACK-07 | Steal secrets or export private data | Closed read vocabulary; no arbitrary file read, command expansion, network upload, packet capture, or secret export primitive. Allowed output still requires appropriate recipient access. |
 | BLACK-08 | Install persistence or a backdoor | No scripts, scheduler, package install, account creation, or arbitrary shell primitive. |
 | BLACK-09 | Cross containment boundaries | Exact endpoint/resource matching and explicit VLAN range; no trunk, DTP, tunnel, or security-disable primitive. |
-| BLACK-10 | Forge evidence or erase the audit trail | Agent signing/chain-append/intent-execute paths disabled under policy; mandatory execution evidence and durable journal; journal failure refuses admission. Existing cryptographic verification limitations are not fixed by this change. |
+| BLACK-10 | Forge evidence or erase the audit trail | Agent signing/chain-append/intent-execute paths disabled under policy; separate trusted accounting collectors can append only evidence items; mandatory execution evidence and durable journal; journal failure refuses admission. Existing cryptographic verification limitations are not fixed by this change. |
 | BLACK-11 | Replace trusted software or policy | No software update, file write, firmware, or policy-edit primitive. Installed binaries and dependencies must remain outside agent custody. |
 | BLACK-12 | Exhaust resources or spend without bound | Persistent global call and disruptive-operation budgets; no cloud provisioning/spending primitive. No automatic budget reset. |
 | BLACK-13 | Escape assigned scope, time, target, or supported grammar | Closed parser, Unix peer identity, exact grants, expiry, clock rollback checks; unknown syntax fails closed. |
@@ -51,6 +51,16 @@ Protection applies only to paths enforced by this daemon. Agent root access,
 direct device credentials, access to the daemon UID, or another unrestricted
 executor bypass this boundary. Do not describe an installation as contained
 until those paths are removed and verified independently.
+
+A policy may additionally declare `"trusted_appenders": [{"uid": 995,
+"types": ["evidence_item"]}]` for an independently trusted, installed accounting
+collector. This role cannot overlap any execution principal and cannot submit
+observations, intents, approvals, or outcomes. Existing socket/action/type
+allowlists still apply. It has no command-execution or standalone-signing grant.
+These records attest what the collector submitted; they are not native device
+observations. Protect collector code, producer keys and identity from agents.
+The default is no trusted appenders. This preserves authenticated accounting
+without restoring an agent signing oracle.
 
 ## Initial operation catalog
 

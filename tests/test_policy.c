@@ -154,7 +154,21 @@ static void crash_journal_test(void) {
     virp_policy_action_t a;const char *why;assert(!virp_policy_check(p,1234,&d,"qm destroy 104",&a,&why));assert(virp_policy_reserve(p,&a,&why)<0);
     virp_policy_close(p);sqlite3_close(db);unlink(path);
 }
+static void collector_tests(void) {
+    sqlite3 *db=database();char *c=replace(config,"\"version\":1","\"trusted_appenders\":[{\"uid\":4321,\"types\":[\"evidence_item\"]}],\"version\":1");
+    virp_policy_t *p=virp_policy_parse(c,db);assert(p);
+    assert(virp_policy_can_append(p,4321,"evidence_item"));
+    assert(!virp_policy_can_append(p,1234,"evidence_item"));
+    assert(!virp_policy_can_append(p,4321,"observation"));
+    assert(!virp_policy_can_append(p,4322,"evidence_item"));
+    virp_device_t d={.vendor=VIRP_VENDOR_PROXMOX,.device_id=17,.port=22,.enabled=true};strcpy(d.host,"127.0.0.1");
+    virp_policy_action_t a;const char *why;assert(virp_policy_check(p,4321,&d,"uptime",&a,&why));
+    virp_policy_close(p);
+    char *bad=replace(c,"4321","1234");assert(!virp_policy_parse(bad,db));free(bad);
+    bad=replace(c,"evidence_item","observation");assert(!virp_policy_parse(bad,db));free(bad);
+    free(c);sqlite3_close(db);
+}
 int main(void) {
-    classify_tests();scope_tests();race_tests();malformed_tests();stop_clock_failure_tests();containment_tests();crash_journal_test();
+    classify_tests();scope_tests();race_tests();malformed_tests();stop_clock_failure_tests();containment_tests();crash_journal_test();collector_tests();
     puts("PASS policy: closed grammar, identity/target scope, profiles, protected resources, quotas, concurrency, restart, STOP, uncertainty and storage failure");return 0;
 }

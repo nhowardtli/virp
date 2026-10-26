@@ -4735,7 +4735,9 @@ static void handle_client(onode_state_t *state, int client_fd,
 
     if (state->policy && (req.action == ONODE_ACTION_SHUTDOWN ||
         req.action == ONODE_ACTION_SIGN_INTENT || req.action == ONODE_ACTION_SIGN_OUTCOME ||
-        req.action == ONODE_ACTION_CHAIN_APPEND || req.action == ONODE_ACTION_INTENT_STORE ||
+        (req.action == ONODE_ACTION_CHAIN_APPEND &&
+         !virp_policy_can_append(state->policy, client_uid, req.artifact_type)) ||
+        req.action == ONODE_ACTION_INTENT_STORE ||
         req.action == ONODE_ACTION_INTENT_EXECUTE)) {
         send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
         close(client_fd);

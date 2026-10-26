@@ -150,7 +150,7 @@ static bool valid_reason(const char *s) { return s&&strlen(s)==8&&!strncmp(s,"BL
 virp_policy_t *virp_policy_parse(const char *json,sqlite3 *db) {
     if(!json||!db||strlen(json)>1024*1024||strstr(json,"\\u0000"))return NULL;
     cJSON *r=cJSON_ParseWithOpts(json,NULL,1);
-    if(!fields(r,"|version||max_calls||max_disruptive||max_inflight||principals||protected|")||!integer(r,"version",1,1)||
+    if(!fields(r,"|version||max_calls||max_disruptive||max_inflight||principals||protected||trusted_appenders|")||!integer(r,"version",1,1)||
        !integer(r,"max_calls",1,1000000)||!integer(r,"max_disruptive",0,1000000)||!integer(r,"max_inflight",1,64))goto bad;
     cJSON *ps=get(r,"principals"),*protected=get(r,"protected");
     if(!cJSON_IsArray(ps)||cJSON_GetArraySize(ps)>64||!cJSON_IsArray(protected)||cJSON_GetArraySize(protected)>512)goto bad;
@@ -171,6 +171,18 @@ virp_policy_t *virp_policy_parse(const char *json,sqlite3 *db) {
             if(!strcmp(str(rule,"operation"),"port.vlan")) {
                 if(!integer(rule,"vlan_min",1,4094)||!integer(rule,"vlan_max",1,4094)||num(rule,"vlan_min")>num(rule,"vlan_max"))goto bad;
             } else if(get(rule,"vlan_min")||get(rule,"vlan_max"))goto bad;
+        }
+    }
+    cJSON *appenders=get(r,"trusted_appenders");
+    if(appenders) {
+        if(!cJSON_IsArray(appenders)||cJSON_GetArraySize(appenders)>16)goto bad;
+        cJSON_ArrayForEach(x,appenders) {
+            if(!fields(x,"|uid||types|")||!integer(x,"uid",1,UINT_MAX-1))goto bad;
+            cJSON *types=get(x,"types"),*type;
+            if(!cJSON_IsArray(types)||cJSON_GetArraySize(types)!=1)goto bad;
+            cJSON_ArrayForEach(type,types)if(!cJSON_IsString(type)||strcmp(type->valuestring,"evidence_item"))goto bad;
+            cJSON *principal;cJSON_ArrayForEach(principal,ps)if(num(principal,"uid")==num(x,"uid"))goto bad;
+            for(cJSON *y=x->next;y;y=y->next)if(cJSON_IsNumber(get(y,"uid"))&&num(y,"uid")==num(x,"uid"))goto bad;
         }
     }
     sqlite3_stmt *st=NULL;
@@ -229,6 +241,9 @@ virp_policy_t *virp_policy_load(const char *path,const char *journal) {
         cJSON *principal; cJSON_ArrayForEach(principal,get(p->root,"principals")) {
             if(num(principal,"uid")==geteuid()){virp_policy_close(p);return NULL;}
         }
+        cJSON_ArrayForEach(principal,get(p->root,"trusted_appenders")) {
+            if(num(principal,"uid")==geteuid()){virp_policy_close(p);return NULL;}
+        }
         /* Exclusive custody proves no other production dispatcher owns these
          * pending attempts. A prior process may have acted before crashing. */
         if(sqlite3_exec(db,"UPDATE policy_attempts SET state='unknown' WHERE state='pending'",NULL,NULL,NULL)!=SQLITE_OK){virp_policy_close(p);return NULL;}
@@ -236,6 +251,12 @@ virp_policy_t *virp_policy_load(const char *path,const char *journal) {
     return p;
 }
 void virp_policy_close(virp_policy_t *p) { if(!p)return;cJSON_Delete(p->root);if(p->owns_db)sqlite3_close(p->db);if(p->custody_fd>=0)close(p->custody_fd);pthread_mutex_destroy(&p->lock);free(p); }
+bool virp_policy_can_append(virp_policy_t *p,uid_t uid,const char *type) {
+    if(!p||!type||strcmp(type,"evidence_item"))return false;
+    cJSON *x;cJSON_ArrayForEach(x,get(p->root,"trusted_appenders"))
+        if(num(x,"uid")==uid)return true;
+    return false;
+}
 int virp_policy_check(virp_policy_t *p,uid_t uid,const virp_device_t *d,const char *command,virp_policy_action_t *a,const char **why) {
     *why="BLACK-13";
     if(!p||!d||!d->enabled||uid==(uid_t)-1||virp_policy_classify(d->vendor,command,a))return -1;
