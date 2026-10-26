@@ -1627,6 +1627,10 @@ static virp_error_t cisco_exec_interface_line(virp_conn_t *conn,
         return VIRP_OK;
     }
     result->exit_code = 0;
+    /* All four exchanges reached their expected prompts without an IOS
+     * rejection. This settles dispatch, not the requested postcondition;
+     * callers still require an independent verification read. */
+    result->disposition = VIRP_DISPOSITION_EXECUTED_CONFIRMED;
     fprintf(stderr, "[Cisco] %s: config transaction applied: %s\n",
             conn->device.hostname, command);
     return VIRP_OK;
@@ -1928,6 +1932,12 @@ static virp_error_t cisco_execute(virp_conn_t *conn,
                  conn->device.hostname);
     }
 
+    /* A complete, recognized prompt settles this exchange. Preserve CLI
+     * rejection as FAILED and do not invent a trustworthy process exit code.
+     * Transport/prompt failures return above and remain uncertain. */
+    result->disposition = result->success
+        ? VIRP_DISPOSITION_EXECUTED_CONFIRMED
+        : VIRP_DISPOSITION_EXECUTED_FAILED;
     free(scrubbed);
     return VIRP_OK;
 }

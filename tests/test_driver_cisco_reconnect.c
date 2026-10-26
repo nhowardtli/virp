@@ -44,6 +44,8 @@ static int tests_run, tests_failed;
 
 /* ── A scriptable stand-in for the channel ─────────────────────────── */
 typedef struct {
+    virp_conn_t *transaction_conn;
+    int transaction_fail_at;
     int   writes;
     int   fail_writes;      /* first N writes fail ... */
     ssize_t fail_code;      /* ... with this adapter code */
@@ -80,7 +82,15 @@ static ssize_t fake_write(void *ctx, const char *buf, size_t len)
         f->fail_writes--;
         return f->fail_code;
     }
-    if (f->reply) fake_queue(f, f->reply);
+    if (f->transaction_conn) {
+        if (f->transaction_fail_at == f->writes) return VIRP_SSH_IO_ERROR;
+        const char *prompt = f->writes == 1 ? "SW-3850(config)#" :
+                             f->writes < 4 ? "SW-3850(config-if)#" : "SW-3850#";
+        virp_conn_t *c = f->transaction_conn;
+        snprintf(c->prompt.prompt, sizeof(c->prompt.prompt), "%s", prompt);
+        c->prompt.prompt_len = strlen(prompt);
+        fake_queue(f, "\r\n"); fake_queue(f, prompt);
+    } else if (f->reply) fake_queue(f, f->reply);
     return (ssize_t)len;
 }
 
@@ -144,6 +154,8 @@ TEST(test_closed_peer_reconnects_once_and_completes)
     CHECK(stub_reconnects == 1,
           "expected exactly 1 reconnect, got %d", stub_reconnects);
     CHECK(r.success, "result must report success after the retry");
+    CHECK(r.disposition == VIRP_DISPOSITION_EXECUTED_CONFIRMED, "completed exchange must settle native journal");
+    CHECK(!r.exit_code_trusted, "CLI prompt is not a process exit status");
     CHECK(strstr(r.output, "12:00:00") != NULL,
           "the retried command's output must be returned, got '%s'",
           r.output);
@@ -196,6 +208,7 @@ TEST(test_command_error_does_not_reconnect)
     virp_error_t rc = cisco_execute(&conn, "bogus", &r);
 
     CHECK(rc == VIRP_OK, "a device-level rejection is a normal read");
+    CHECK(!r.success && r.disposition == VIRP_DISPOSITION_EXECUTED_FAILED, "complete IOS rejection settles as failed");
     CHECK(stub_reconnects == 0,
           "a command error must never trigger a reconnect; got %d",
           stub_reconnects);
@@ -235,6 +248,7 @@ TEST(test_tacacs_denial_is_failure_without_retry)
     virp_error_t rc = cisco_execute(&conn, "show clock", &r);
     CHECK(rc == VIRP_OK && !r.success && r.exit_code == 1,
           "completed AAA denial must be a failed command, not a successful read");
+    CHECK(r.disposition == VIRP_DISPOSITION_EXECUTED_FAILED, "AAA rejection must settle as failed");
     CHECK(stub_reconnects == 0, "AAA denial must not reconnect or retry");
     CHECK(strstr(r.output, "Command authorization failed") != NULL,
           "preserve the observed denial as evidence");
@@ -267,9 +281,32 @@ TEST(test_missing_prompt_is_unknown_without_output_or_retry)
     DONE();
 }
 
+
+TEST(test_typed_transaction_settles_only_after_complete_exchange)
+{
+    virp_conn_t conn; fake_chan_t f; virp_exec_result_t r;
+    setup(&conn, &f, NULL); conn.in_enable = true; f.transaction_conn = &conn;
+    virp_error_t rc = cisco_execute(&conn,
+        "interface GigabitEthernet1/0 description qualification", &r);
+    CHECK(rc == VIRP_OK && r.success && f.writes == 4,
+          "typed write must complete all four exchanges");
+    CHECK(r.disposition == VIRP_DISPOSITION_EXECUTED_CONFIRMED && !r.exit_code_trusted,
+          "settle completed exchange without inventing a process exit code");
+    CHECK(conn.current_mode == CISCO_MODE_EXEC, "transaction must return to EXEC");
+    setup(&conn, &f, NULL); conn.in_enable = true; f.transaction_conn = &conn;
+    f.transaction_fail_at = 3;
+    rc = cisco_execute(&conn,
+        "interface GigabitEthernet1/0 description qualification", &r);
+    CHECK(!r.success && r.disposition != VIRP_DISPOSITION_EXECUTED_CONFIRMED &&
+          r.disposition != VIRP_DISPOSITION_EXECUTED_FAILED && f.writes == 3,
+          "uncertain typed write must not settle or retry");
+    DONE();
+}
+
 int main(void)
 {
     printf("\n=== Cisco stale-session reconnect (defect C) ===\n\n");
+    RUN(test_typed_transaction_settles_only_after_complete_exchange);
     RUN(test_missing_prompt_is_unknown_without_output_or_retry);
     RUN(test_tacacs_denial_is_failure_without_retry);
     RUN(test_closed_peer_reconnects_once_and_completes);
