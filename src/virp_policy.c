@@ -298,10 +298,11 @@ int64_t virp_policy_reserve(virp_policy_t *p,const virp_policy_action_t *a,const
        (a->effect==2&&sqlite3_column_int64(st,2)>=num(p->root,"max_disruptive"))){*why="BLACK-12";goto done;}
     if(sqlite3_column_int64(st,4)>=num(p->root,"max_inflight")){*why="BLACK-06";goto done;}
     sqlite3_finalize(st);st=NULL;
-    /* Any ambiguous previous dispatch stops mutation, even when concurrency
-     * allowance is greater than one. Reads cannot clear the uncertainty. */
+    /* An ambiguous mutation stops further mutation even when concurrency
+     * allowance is greater than one. Unknown reads remain in the journal,
+     * but cannot represent an uncertain mutation in this closed catalog. */
     if(a->effect) {
-        if(sqlite3_prepare_v2(p->db,"SELECT COUNT(*) FROM policy_attempts WHERE state='unknown' OR (state='pending' AND device_id=? AND (resource=? COLLATE NOCASE OR resource='host' OR ?='host'))",-1,&st,NULL)!=SQLITE_OK)goto done;
+        if(sqlite3_prepare_v2(p->db,"SELECT COUNT(*) FROM policy_attempts WHERE (state='unknown' AND operation NOT IN ('system.read','vm.read')) OR (state='pending' AND device_id=? AND (resource=? COLLATE NOCASE OR resource='host' OR ?='host'))",-1,&st,NULL)!=SQLITE_OK)goto done;
         sqlite3_bind_int64(st,1,(sqlite3_int64)a->device_id);sqlite3_bind_text(st,2,a->resource,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,a->resource,-1,SQLITE_TRANSIENT);
         if(sqlite3_step(st)!=SQLITE_ROW||sqlite3_column_int64(st,0)){*why="BLACK-14";goto done;}
         sqlite3_finalize(st);st=NULL;

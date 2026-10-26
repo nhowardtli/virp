@@ -45,7 +45,7 @@ inferred the attacker's intent.
 | BLACK-11 | Replace trusted software or policy | No software update, file write, firmware, or policy-edit primitive. Installed binaries and dependencies must remain outside agent custody. |
 | BLACK-12 | Exhaust resources or spend without bound | Persistent global call and disruptive-operation budgets; no cloud provisioning/spending primitive. No automatic budget reset. |
 | BLACK-13 | Escape assigned scope, time, target, or supported grammar | Closed parser, Unix peer identity, exact grants, expiry, clock rollback checks; unknown syntax fails closed. |
-| BLACK-14 | Repeat an operation after an uncertain dispatch | Reserve durably before connection/dispatch; no policy-path automatic retry; UNKNOWN blocks subsequent mutations until owner reconciliation. |
+| BLACK-14 | Repeat an operation after an uncertain dispatch | Reserve durably before connection/dispatch; no policy-path automatic retry; UNKNOWN mutation blocks subsequent mutations until owner reconciliation. |
 
 Protection applies only to paths enforced by this daemon. Agent root access,
 direct device credentials, access to the daemon UID, or another unrestricted
@@ -144,7 +144,9 @@ host keys; hostname text equality alone does not pin DNS resolution.
 Budgets are global across principals and persist across policy edits/restarts.
 Reservations consume budget even if connection or execution later fails. There
 is no elapsed-time reset. `max_inflight` counts pending attempts; UNKNOWN does
-not prevent read-only diagnosis, but it blocks every new mutation. `done`
+not prevent read-only diagnosis. An UNKNOWN mutation blocks every new mutation;
+an UNKNOWN read remains recorded without blocking unrelated mutation authority.
+This distinction relies on the closed, side-effect-free read catalog. `done`
 means dispatch uncertainty was settled, not that the application objective or
 service recovery was verified. A completed reboot dispatch can precede actual
 recovery, so a concurrency limit alone cannot protect cluster availability.

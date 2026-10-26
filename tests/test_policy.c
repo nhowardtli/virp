@@ -168,7 +168,16 @@ static void collector_tests(void) {
     bad=replace(c,"evidence_item","observation");assert(!virp_policy_parse(bad,db));free(bad);
     free(c);sqlite3_close(db);
 }
+static void unknown_read_test(void) {
+    sqlite3 *db=database();virp_policy_t *p=virp_policy_parse(config,db);assert(p);
+    virp_device_t d={.vendor=VIRP_VENDOR_PROXMOX,.device_id=17,.port=22,.enabled=true};strcpy(d.host,"127.0.0.1");
+    virp_policy_action_t a;const char *why;
+    assert(!virp_policy_check(p,1234,&d,"uptime",&a,&why));int64_t id=virp_policy_reserve(p,&a,&why);assert(id>0);assert(!virp_policy_finish(p,id,false));
+    assert(!virp_policy_check(p,1234,&d,"qm destroy 104",&a,&why));id=virp_policy_reserve(p,&a,&why);assert(id>0);assert(!virp_policy_finish(p,id,false));
+    sqlite3_stmt *st=NULL;assert(sqlite3_prepare_v2(db,"SELECT COUNT(*) FROM policy_attempts WHERE state='unknown'",-1,&st,NULL)==SQLITE_OK);assert(sqlite3_step(st)==SQLITE_ROW&&sqlite3_column_int(st,0)==2);sqlite3_finalize(st);
+    virp_policy_close(p);sqlite3_close(db);
+}
 int main(void) {
-    classify_tests();scope_tests();race_tests();malformed_tests();stop_clock_failure_tests();containment_tests();crash_journal_test();collector_tests();
+    classify_tests();scope_tests();race_tests();malformed_tests();stop_clock_failure_tests();containment_tests();crash_journal_test();collector_tests();unknown_read_test();
     puts("PASS policy: closed grammar, identity/target scope, profiles, protected resources, quotas, concurrency, restart, STOP, uncertainty and storage failure");return 0;
 }
