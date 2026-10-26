@@ -837,11 +837,8 @@ static const char *gate_tier_name(virp_trust_tier_t t)
 static bool gate_tier_blocks(virp_trust_tier_t tier, virp_trust_tier_t max_tier)
 {
     if (tier == VIRP_TIER_UNCLASSIFIED) return true;
-    /* BLACK is inexpressible for every ceiling except the explicit
-     * PASSTHROUGH ceiling (2026-09-15): a uid whose per-uid ceiling is
-     * literally "black" applies BLACK on the record. Nothing else — not
-     * RED, not the node-wide ceiling, not SHADOW — reaches it. */
-    if (tier == VIRP_TIER_BLACK)        return max_tier != VIRP_TIER_BLACK;
+    /* BLACK cannot be authorized by a ceiling or an approval. */
+    if (tier == VIRP_TIER_BLACK)        return true;
     return tier > max_tier;
 }
 
@@ -868,7 +865,7 @@ static virp_trust_tier_t onode_effective_max_tier(const onode_state_t *state,
              * ceiling remains the default for every uid WITHOUT an entry,
              * and the template's per-uid rows are policy the operator
              * wrote on purpose: honour them, and say which one decided
-             * (onode_ceiling_source). "black" is the passthrough ceiling. */
+             * (onode_ceiling_source). BLACK is not a valid ceiling. */
             eff = state->uid_ceiling_tiers[i];
             break;
         }
@@ -892,8 +889,7 @@ static const char *onode_ceiling_source(const onode_state_t *state,
     for (size_t i = 0; i < state->uid_ceiling_count; i++) {
         if (state->uid_ceiling_uids[i] == client_uid) {
             /* Mirrors onode_effective_max_tier: an explicit entry decides. */
-            return (state->uid_ceiling_tiers[i] == VIRP_TIER_BLACK)
-                       ? "per-uid passthrough" : "per-uid";
+            return "per-uid";
         }
     }
     return "node-wide";
@@ -1800,7 +1796,9 @@ static virp_error_t onode_approval_challenge(onode_state_t *state,
 
         const virp_driver_t *drv =
             virp_driver_lookup(state->devices[didx].vendor);
-        if (gate_classify(drv, prop.command) == VIRP_TIER_BLACK) {
+        virp_policy_action_t action;
+        bool typed = state->policy && !virp_policy_classify(state->devices[didx].vendor, prop.command, &action);
+        if (!typed && gate_classify(drv, prop.command) == VIRP_TIER_BLACK) {
             fprintf(stderr, "[APPROVAL] challenge refused: proposal=%s "
                     "command is BLACK — not appliable at any tier\n",
                     proposal_id);
@@ -2424,7 +2422,69 @@ static virp_error_t replay_refusal_record(onode_state_t *state,
 static virp_error_t onode_execute_legacy(onode_state_t *, const char *,
     const char *, int, const char *, uid_t, uint8_t *, size_t, size_t *);
 
+static _Thread_local struct {
+    virp_policy_action_t action;
+    virp_policy_t *policy;
+    int64_t ticket;
+    bool known;
+} policy_call;
+
+static virp_error_t policy_driver_execute(const virp_driver_t *drv,
+    virp_conn_t *conn, const char *command, virp_exec_result_t *result)
+{
+    policy_call.known = false;
+    if (policy_call.policy) virp_policy_dispatch_enter(&policy_call.action);
+    virp_error_t err = drv->execute(conn, command, result);
+    virp_policy_dispatch_leave();
+    policy_call.known = err == VIRP_OK &&
+        (result->no_dispatch || result->disposition == VIRP_DISPOSITION_NOT_SENT ||
+         result->disposition == VIRP_DISPOSITION_EXECUTED_CONFIRMED ||
+         result->disposition == VIRP_DISPOSITION_EXECUTED_FAILED);
+    /* This closes dispatch uncertainty, NOT an application success assertion.
+     * Preserve exit_code_trusted and the original disposition in signed evidence. */
+    return err;
+}
+
+static virp_error_t onode_execute_policy_impl(onode_state_t *, const char *,
+    const char *, int, const char *, uid_t, uint8_t *, size_t, size_t *);
+
 virp_error_t onode_execute_obs_ex(onode_state_t *state,
+    const char *device_name, const char *command, int obs_version,
+    const char *proposal_id, uid_t client_uid,
+    uint8_t *out_buf, size_t out_buf_len, size_t *out_len)
+{
+    if (!state || !device_name || !command || !out_buf || !out_len)
+        return VIRP_ERR_NULL_PTR;
+    *out_len = 0;
+    if (policy_call.policy) return VIRP_ERR_ACTION_FORBIDDEN; /* no recursion */
+    memset(&policy_call, 0, sizeof(policy_call));
+    if (state->policy) {
+        int idx = find_device(state, device_name);
+        const char *why = "BLACK-13";
+        if (idx < 0 || virp_policy_check(state->policy, client_uid,
+                &state->devices[idx], command, &policy_call.action, &why)) {
+            fprintf(stderr, "[POLICY] %s uid=%lu: operation refused before dispatch\n",
+                    why, (unsigned long)client_uid);
+            return VIRP_ERR_ACTION_FORBIDDEN;
+        }
+        policy_call.policy = state->policy;
+        command = policy_call.action.command;
+    }
+    virp_error_t err = onode_execute_policy_impl(state, device_name, command,
+        obs_version, proposal_id, client_uid, out_buf, out_buf_len, out_len);
+    if (policy_call.ticket > 0) {
+        pthread_mutex_lock(&state->state_mutex);
+        bool degraded = state->evidence_degraded;
+        pthread_mutex_unlock(&state->state_mutex);
+        if (virp_policy_finish(policy_call.policy, policy_call.ticket,
+                policy_call.known && err == VIRP_OK && !degraded))
+            err = VIRP_ERR_ACTION_FORBIDDEN; /* durable pending remains */
+    }
+    memset(&policy_call, 0, sizeof(policy_call));
+    return err;
+}
+
+static virp_error_t onode_execute_policy_impl(onode_state_t *state,
     const char *device_name, const char *command, int obs_version,
     const char *proposal_id, uid_t client_uid,
     uint8_t *out_buf, size_t out_buf_len, size_t *out_len)
@@ -2614,7 +2674,10 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                                       (uint16_t)strlen(err_msg),
                                       &state->okey);
     }
-    virp_trust_tier_t gate_tier = gate_classify(drv, command);
+    virp_trust_tier_t gate_tier = policy_call.policy
+        ? (policy_call.action.effect == 0 ? VIRP_TIER_GREEN :
+           policy_call.action.effect == 1 ? VIRP_TIER_YELLOW : VIRP_TIER_RED)
+        : gate_classify(drv, command);
 
     /* Approval-apply state: set when a valid, consumed approval admits a
      * gate-blocked command; the post-execution paths then emit the
@@ -2653,14 +2716,14 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
      * function-scoped so the success observation below can be stamped
      * with it (Phase C truth-fix). */
     {
-        onode_gate_mode_t mode = gate_effective_mode(state, drv->name);
+        onode_gate_mode_t mode = policy_call.policy ? GATE_MODE_ENFORCE : gate_effective_mode(state, drv->name);
         /* Effective ceiling = node-wide gate_max_tier, tightened by any
          * per-uid ceiling for the connecting socket client. A remote
          * requester capped at GREEN thus has YELLOW/RED blocked (and
          * therefore proposal-only) while local operators keep the
          * node-wide ceiling. client_uid == (uid_t)-1 (internal callers)
          * leaves gate_max_tier unchanged. */
-        virp_trust_tier_t eff_max = onode_effective_max_tier(state, client_uid);
+        virp_trust_tier_t eff_max = policy_call.policy ? policy_call.action.ceiling : onode_effective_max_tier(state, client_uid);
         bool block = gate_tier_blocks(gate_tier, eff_max);
 
         gate_mode = mode;
@@ -2682,7 +2745,7 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                 gate_tier_name(eff_max),
                 (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
                 (gate_tier == VIRP_TIER_BLACK)
-                    ? (eff_max == VIRP_TIER_BLACK ? "BLACK-PASSTHROUGH" : "block")
+                    ? "block"
                 : mode == GATE_MODE_ENFORCE
                     ? (block ? "block" : "allow")
                     : (block ? "would-block" : "would-allow"),
@@ -2704,24 +2767,12 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
          * from an absence. Several drivers carry their own BLACK
          * backstop in execute(); this branch is what makes the
          * guarantee driver-independent (PAN-OS had no backstop). */
-        if (gate_tier == VIRP_TIER_BLACK && eff_max != VIRP_TIER_BLACK) {
+        if (gate_tier == VIRP_TIER_BLACK) {
             pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
             return gate_refuse_obs(state, device_name, dev_idx, drv,
                                    command, gate_tier, eff_max, mode,
                                    client_uid, obs_version,
                                    out_buf, out_buf_len, out_len);
-        }
-        if (gate_tier == VIRP_TIER_BLACK) {
-            /* PASSTHROUGH (2026-09-15): the ONLY way a BLACK command is
-             * ever dispatched — a uid whose per-uid ceiling is literally
-             * "black". Not mode-dependent, not approvable, never a
-             * proposal: it is a named human's own hand, on the record.
-             * The driver backstop reads virp_exec_passthrough (set just
-             * before dispatch below) and logs its own line. */
-            fprintf(stderr, "[GATE] BLACK PASSTHROUGH: uid=%ld device=%s "
-                    "command=\"%s\" — applying under the passthrough "
-                    "ceiling; recorded as tier=BLACK\n",
-                    (long)client_uid, device_name, command);
         }
 
         if (mode == GATE_MODE_ENFORCE && block &&
@@ -2817,6 +2868,18 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
      * (L1): the gate
      * decision above never touched the device, so a refused request cost
      * nothing on the wire. */
+    if (policy_call.policy) {
+        const char *why = NULL;
+        policy_call.ticket = virp_policy_reserve(policy_call.policy, &policy_call.action, &why);
+        if (policy_call.ticket <= 0) {
+            fprintf(stderr, "[POLICY] %s: pre-dispatch reservation refused\n", why);
+            pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
+            return gate_refuse_obs(state, device_name, dev_idx, drv, command,
+                VIRP_TIER_BLACK, gate_eff_max, GATE_MODE_ENFORCE, client_uid,
+                obs_version, out_buf, out_buf_len, out_len);
+        }
+        policy_call.known = true; /* no dispatch yet; connection failure is NOT_SENT */
+    }
     virp_conn_t *conn = get_connection(state, dev_idx);
     if (!conn) {
         pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -3095,9 +3158,10 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
     memset(&result, 0, sizeof(result));   /* no_dispatch=false unless the
                                              driver proves otherwise */
     VIRP_FI("pre_exec");
-    /* Passthrough is scoped to exactly this dispatch on this thread. */
-    virp_exec_passthrough = (gate_eff_max == VIRP_TIER_BLACK);
-    virp_error_t err = drv->execute(conn, command, &result);
+    /* The retired passthrough flag stays false; policy_driver_execute
+     * supplies only the exact typed reboot capability. */
+    virp_exec_passthrough = false;
+    virp_error_t err = policy_driver_execute(drv, conn, command, &result);
     virp_exec_passthrough = false;
     /* No driver may supply a length outside the storage it returned.
      * Refuse before body filtering, scrubbing, hashing or signing. */
@@ -3155,7 +3219,7 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
      * prefix before reading, so that test was always false and silently
      * disabled this branch for that driver (TRANSCRIPT-05). Buffer
      * contents say nothing about whether bytes were dispatched. */
-    if (!result.success && result.no_dispatch) {
+    if (!policy_call.policy && !result.success && result.no_dispatch) {
         drop_connection(state, dev_idx);
         conn = get_connection(state, dev_idx);
         if (conn) {
@@ -3165,8 +3229,8 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                 pthread_mutex_unlock(&state->conn_mutex);
             }
             memset(&result, 0, sizeof(result));
-            virp_exec_passthrough = (gate_eff_max == VIRP_TIER_BLACK);
-            err = drv->execute(conn, command, &result);
+            virp_exec_passthrough = false;
+            err = policy_driver_execute(drv, conn, command, &result);
             virp_exec_passthrough = false;
             if (result.output_len >= sizeof(result.output))
                 err = VIRP_ERR_INVALID_LENGTH;
@@ -4664,6 +4728,15 @@ static void handle_client(onode_state_t *state, int client_fd,
                 "socket_uid_action_allow set\n",
                 (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
                 onode_action_name(req.action));
+        send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+        close(client_fd);
+        return;
+    }
+
+    if (state->policy && (req.action == ONODE_ACTION_SHUTDOWN ||
+        req.action == ONODE_ACTION_SIGN_INTENT || req.action == ONODE_ACTION_SIGN_OUTCOME ||
+        req.action == ONODE_ACTION_CHAIN_APPEND || req.action == ONODE_ACTION_INTENT_STORE ||
+        req.action == ONODE_ACTION_INTENT_EXECUTE)) {
         send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
         close(client_fd);
         return;
@@ -6532,16 +6605,10 @@ virp_error_t onode_set_uid_ceilings(onode_state_t *state,
     if (count > ONODE_MAX_ALLOWED_UIDS)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
     for (size_t i = 0; i < count; i++) {
-        /* GREEN/YELLOW/RED bound what the uid may execute. BLACK
-         * (2026-09-15) is NOT "forbid everything": it is the PASSTHROUGH
-         * ceiling — the uid's BLACK commands are dispatched, logged as
-         * decision=BLACK-PASSTHROUGH and chained like any other. The prod
-         * loader only produces it from the literal string "black" and
-         * logs loudly when it does. Anything else is a config error. */
+        /* Legacy ceilings can never confer BLACK authority. */
         if (tiers[i] != VIRP_TIER_GREEN &&
             tiers[i] != VIRP_TIER_YELLOW &&
-            tiers[i] != VIRP_TIER_RED &&
-            tiers[i] != VIRP_TIER_BLACK)
+            tiers[i] != VIRP_TIER_RED)
             return VIRP_ERR_INVALID_TYPE;
         state->uid_ceiling_uids[i]  = uids[i];
         state->uid_ceiling_tiers[i] = tiers[i];
@@ -7092,6 +7159,9 @@ void onode_destroy(onode_state_t *state)
         }
         return;
     }
+
+    virp_policy_close(state->policy);
+    state->policy = NULL;
 
     /*
      * Close all device connections. The listen socket has already been

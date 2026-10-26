@@ -25,7 +25,8 @@ LDFLAGS = -lcrypto -lpthread -lsqlite3 -lsodium $(LDFLAGS_EXTRA)
 BUILD_DIR = build
 
 # Core library objects
-LIB_OBJS  = $(BUILD_DIR)/virp_crypto.o \
+LIB_OBJS  = $(BUILD_DIR)/virp_policy.o \
+             $(BUILD_DIR)/virp_crypto.o \
              $(BUILD_DIR)/virp_message.o \
              $(BUILD_DIR)/virp_driver.o \
              $(BUILD_DIR)/driver_mock.o \
@@ -2634,3 +2635,18 @@ test-forti-health-cadence: $(LIB)
 	$(CC) $(CFLAGS) -DVIRP_DRIVER_FORTINET tests/test_forti_health_cadence.c $(LIB) $(LDFLAGS) -lssh2 -o $(BUILD_DIR)/test_forti_health_cadence
 	./$(BUILD_DIR)/test_forti_health_cadence
 all-tests: test-watchdog-shutdown test-forti-health-cadence
+
+$(BUILD_DIR)/virp_policy.o: src/virp_policy.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+.PHONY: test-black-policy
+test-black-policy: $(LIB)
+	$(CC) $(CFLAGS) tests/test_policy.c $(LIB) $(LDFLAGS) -o $(BUILD_DIR)/test_policy
+	./$(BUILD_DIR)/test_policy
+all-tests: test-black-policy
+
+.PHONY: test-black-policy-daemon
+test-black-policy-daemon: $(LIB)
+	$(CC) $(CFLAGS) tests/test_policy_daemon.c $(LIB) $(LDFLAGS) -o $(BUILD_DIR)/test_policy_daemon
+	umask 077; ./$(BUILD_DIR)/test_policy_daemon
+all-tests: test-black-policy-daemon

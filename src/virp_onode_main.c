@@ -424,6 +424,11 @@ int main(int argc, char **argv)
     curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
 
+    if (!use_mock || devices_path) {
+        fprintf(stderr, "Demo daemon is mock-only; use virp-onode-prod with owner policy for real targets.\n");
+        return 1;
+    }
+
     /* Register drivers */
     virp_driver_mock_init();
 #ifdef VIRP_DRIVER_CISCO

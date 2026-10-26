@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "max_calls": 1000,
+  "max_disruptive": 0,
+  "max_inflight": 1,
+  "principals": [],
+  "protected": []
+}

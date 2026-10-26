@@ -32,6 +32,7 @@
 #include <getopt.h>
 #include <json-c/json.h>
 #include <errno.h>
+#include <unistd.h>
 
 /*
  * Everything between here and the end of main() is the daemon's process
@@ -303,14 +304,9 @@ static int load_uid_tier_ceilings(onode_state_t *state,
         if      (strcasecmp(s, "green")  == 0) tier = VIRP_TIER_GREEN;
         else if (strcasecmp(s, "yellow") == 0) tier = VIRP_TIER_YELLOW;
         else if (strcasecmp(s, "red")    == 0) tier = VIRP_TIER_RED;
-        else if (strcasecmp(s, "black")  == 0) {
-            /* PASSTHROUGH (2026-09-15): this uid applies everything, BLACK
-             * included, on the record. Loud on purpose. */
-            tier = VIRP_TIER_BLACK;
-            fprintf(stderr, "[O-Node] socket_uid_tier_ceilings['%s'] = black: "
-                            "PASSTHROUGH identity — BLACK commands (reload, "
-                            "erase, format) will be APPLIED for this uid and "
-                            "recorded as BLACK PASSTHROUGH\n", key);
+        else if (strcasecmp(s, "black") == 0) {
+            fprintf(stderr, "FATAL: BLACK passthrough retired; configure an autonomy profile instead\n");
+            return -1;
         }
         else {
             fprintf(stderr, "[O-Node] socket_uid_tier_ceilings['%s'] = '%s' "
@@ -1296,6 +1292,8 @@ static void usage(const char *prog)
     printf("Copyright (c) 2026 Third Level IT LLC\n\n");
     printf("Usage: %s [options]\n\n", prog);
     printf("Options:\n");
+    printf("  -P <path>   Required root-owned owner policy (docs/BLACK-POLICY.md)\n");
+    printf("  -J <path>   Required existing daemon-private persistent policy journal\n");
     printf("  -k <path>   O-Key file path (generates new key if file doesn't exist)\n");
     printf("  -K <path>   PREVIOUS O-Key, VERIFY-ONLY, for the rotation grace\n");
     printf("              window. Observations minted before a rotation and\n");
@@ -1329,6 +1327,8 @@ static void usage(const char *prog)
 
 int main(int argc, char **argv)
 {
+    const char *policy_path = NULL;
+    const char *policy_journal = NULL;
     const char *okey_path = NULL;
     const char *prev_okey_path = NULL;
     uint32_t    prev_okey_window = 900;   /* 15 min; > the 5-min cycle */
@@ -1359,8 +1359,10 @@ int main(int argc, char **argv)
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "3k:K:W:s:d:n:c:C:S:E:a:A:h")) != -1) {
+    while ((opt = getopt(argc, argv, "3k:K:W:s:d:n:c:C:S:E:a:A:P:J:h")) != -1) {
         switch (opt) {
+        case 'P': policy_path = optarg; break;
+        case 'J': policy_journal = optarg; break;
         case '3': execute_v3 = true; break;
         case 'k':
             okey_path = optarg;
@@ -1405,9 +1407,13 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!devices_path) {
-        fprintf(stderr, "[O-Node] Error: -d <devices.json> is required\n");
-        usage(argv[0]);
+    if (!policy_path || !policy_journal || !devices_path ||
+        virp_policy_secure_runtime_file(devices_path)) {
+        fprintf(stderr, "FATAL: production requires -P owner-policy.json -J existing-policy.db and daemon-custodied -d device config. See docs/BLACK-POLICY.md.\n");
+        return 1;
+    }
+    if (access(approvers_path, F_OK) == 0 && virp_policy_secure_file(approvers_path)) {
+        fprintf(stderr, "FATAL: approver registry must be in protected root custody\n");
         return 1;
     }
 
@@ -1511,6 +1517,14 @@ int main(int argc, char **argv)
     }
     g_state.ctx = ctx;
 
+    g_state.policy = virp_policy_load(policy_path, policy_journal);
+    if (!g_state.policy) {
+        fprintf(stderr, "FATAL: policy/journal invalid or not in protected owner/daemon custody\n");
+        onode_destroy(&g_state);
+        virp_context_destroy(ctx);
+        return 1;
+    }
+
     /* Load devices from JSON config */
     int loaded = load_devices(&g_state, devices_path);
     if (loaded <= 0) {
@@ -1519,6 +1533,8 @@ int main(int argc, char **argv)
         virp_context_destroy(ctx);
         return 1;
     }
+
+    g_state.evidence_required = true;
 
     /*
      * Trust chain (Primitive 6) + approval flow. Fatal if approval mode

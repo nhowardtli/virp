@@ -7,7 +7,7 @@
 //
 // Flags:
 //   -node-id     uint32  Node ID (default: 0x211)
-//   -okey        string  Path to O-Key file (default: generate new)
+//   -okey        string  Reserved compatibility flag; external keys are refused
 //   -socket      string  Unix socket path (default: /tmp/virp-onode.sock)
 //   -devices     string  Path to devices.json
 
@@ -26,12 +26,12 @@ import (
 
 func main() {
 	nodeID := flag.Uint("node-id", 0x211, "VIRP node ID")
-	okeyPath := flag.String("okey", "", "path to O-Key file (empty = generate)")
+	okeyPath := flag.String("okey", "", "demo only: must be empty; external keys are refused")
 	socketPath := flag.String("socket", virp.DefaultSocketPath, "Unix socket path")
 	devicesPath := flag.String("devices", "", "path to devices.json")
 	flag.Parse()
 
-	fmt.Fprintf(os.Stderr, "VIRP O-Node (Go) v%d\n", virp.Version)
+	fmt.Fprintf(os.Stderr, "VIRP DEMO O-Node (Go, not production) v%d\n", virp.Version)
 	fmt.Fprintf(os.Stderr, "Copyright (c) 2026 Third Level IT LLC\n\n")
 
 	on, err := virp.NewONode(uint32(*nodeID), *okeyPath, *socketPath)

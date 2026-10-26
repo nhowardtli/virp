@@ -45,6 +45,7 @@
 #include <openssl/crypto.h>
 
 #include "virp_driver.h"
+#include "virp_policy.h"
 #include "virp_driver_fortigate.h"
 #include "virp_ssh_hostkey.h"
 
@@ -923,9 +924,9 @@ static virp_error_t fg_execute(virp_conn_t *base_conn,
     memset(result, 0, sizeof(*result));
 
     /* ── BLACK tier safety: never execute destructive commands ── */
-    if (fg_is_black_tier(command) && virp_exec_passthrough) {
-        fprintf(stderr, "[FortiGate] BLACK PASSTHROUGH: '%s' on %s — backstop "
-                "yields to the passthrough ceiling\n", command, conn->device.hostname);
+    if (fg_is_black_tier(command) && virp_policy_reboot_permitted(command)) {
+        fprintf(stderr, "[FortiGate] POLICY REBOOT: '%s' on %s — backstop "
+                "yields to the scoped reboot capability\n", command, conn->device.hostname);
     } else if (fg_is_black_tier(command)) {
         result->success = false;
         result->exit_code = 1;

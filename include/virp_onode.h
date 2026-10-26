@@ -22,6 +22,7 @@
 #include "virp.h"
 #include "virp_crypto.h"
 #include "virp_driver.h"
+#include "virp_policy.h"
 #include "virp_chain.h"
 #include "virp_context.h"
 #include "virp_approver_registry.h"
@@ -385,6 +386,7 @@ typedef struct {
      * reported failed, modelling a chain that goes read-only in exactly
      * that window. Never set in production.
      */
+    virp_policy_t       *policy; /* owner-controlled production boundary */
     bool                evidence_degraded;
 
 #ifdef VIRP_FAULT_INJECT

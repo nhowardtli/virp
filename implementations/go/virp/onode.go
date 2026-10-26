@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Third Level IT LLC. All rights reserved.
 // VIRP -- Verified Infrastructure Response Protocol
-// O-Node Daemon -- the hardened observer process (Go implementation)
+// O-Node demonstration -- not a production security boundary
 //
 // The O-Node is the ONLY process that holds the O-Key.
 // It listens on a Unix domain socket and accepts JSON requests.
@@ -21,12 +21,12 @@ import (
 )
 
 const (
-	DefaultSocketPath  = "/tmp/virp-onode.sock"
-	MaxDevices         = 64
-	MaxClients         = 8
-	RecvTimeoutSec     = 5
-	MaxRequestSize     = 8192
-	HeartbeatInterval  = 30 * time.Second
+	DefaultSocketPath = "/tmp/virp-onode.sock"
+	MaxDevices        = 64
+	MaxClients        = 8
+	RecvTimeoutSec    = 5
+	MaxRequestSize    = 8192
+	HeartbeatInterval = 30 * time.Second
 )
 
 // ONodeRequest is the JSON request format over the Unix socket.
@@ -105,6 +105,9 @@ type ONode struct {
 // If okeyPath is empty, a new key is generated.
 // If socketPath is empty, DefaultSocketPath is used.
 func NewONode(nodeID uint32, okeyPath, socketPath string) (*ONode, error) {
+	if okeyPath != "" {
+		return nil, fmt.Errorf("Go O-Node is demo-only: externally supplied signing keys are forbidden")
+	}
 	if socketPath == "" {
 		socketPath = DefaultSocketPath
 	}
@@ -116,22 +119,13 @@ func NewONode(nodeID uint32, okeyPath, socketPath string) (*ONode, error) {
 		logger:      log.New(os.Stderr, "[O-Node] ", log.LstdFlags),
 	}
 
-	// Load or generate O-Key
-	if okeyPath != "" {
-		sk, err := KeyLoadFile(KeyTypeOKey, okeyPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load O-Key from %s: %w", okeyPath, err)
-		}
-		on.OKey = sk
-		on.logger.Printf("Loaded O-Key from %s", okeyPath)
-	} else {
-		sk, err := KeyGenerate(KeyTypeOKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate O-Key: %w", err)
-		}
-		on.OKey = sk
-		on.logger.Print("Generated new O-Key")
+	// Only ephemeral demonstration keys; never load a production O-Key.
+	sk, err := KeyGenerate(KeyTypeOKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate demo O-Key: %w", err)
 	}
+	on.OKey = sk
+	on.logger.Print("Generated ephemeral demo O-Key")
 
 	on.logger.Printf("Fingerprint: %x", on.OKey.Fingerprint)
 	return on, nil
@@ -166,7 +160,10 @@ func (on *ONode) Start() error {
 	on.listener = listener
 
 	// Allow non-root users to connect
-	os.Chmod(on.SocketPath, 0777)
+	if err := os.Chmod(on.SocketPath, 0600); err != nil {
+		listener.Close()
+		return err
+	}
 
 	on.logger.Printf("Listening on %s", on.SocketPath)
 	on.logger.Printf("Node ID: 0x%08x", on.NodeID)

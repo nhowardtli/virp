@@ -18,6 +18,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_driver.h"
+#include "virp_policy.h"
 #include "virp_ssh_io.h"
 #include "virp_driver_asa.h"
 #include <stdio.h>
@@ -1046,9 +1047,9 @@ static virp_error_t asa_execute(virp_conn_t *conn,
      * invariant. Consider moving this one before asa's connected check to
      * match. Left as-is for now to keep this change scoped to linux. */
     virp_trust_tier_t tier = asa_route_command(command);
-    if (tier == VIRP_TIER_BLACK && virp_exec_passthrough) {
-        fprintf(stderr, "[ASA] BLACK PASSTHROUGH: '%s' on %s — backstop yields "
-                "to the passthrough ceiling\n", command, conn->device.hostname);
+    if (tier == VIRP_TIER_BLACK && virp_policy_reboot_permitted(command)) {
+        fprintf(stderr, "[ASA] POLICY REBOOT: '%s' on %s — backstop yields "
+                "to the scoped reboot capability\n", command, conn->device.hostname);
     } else if (tier == VIRP_TIER_BLACK) {
         result->success = false;
         result->exit_code = 1;

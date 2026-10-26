@@ -1,9 +1,9 @@
 [Unit]
 Description=VIRP Observation Node Daemon
 After=network.target
-# The devices.json writer (api/server.py /api/devices/add) must share
-# group ownership of /var/lib/virp so the HTTP service can write what
-# this daemon reads. Provision both units under the same `virp` user.
+# The daemon UID is a trusted boundary. Never share it with an agent or
+# HTTP/broker process. See docs/BLACK-POLICY.md before upgrading.
+# Provision the separate owner policy and persistent journal before start.
 
 [Service]
 Type=simple
@@ -67,6 +67,8 @@ ExecStart=/usr/local/lib/virp/virp-onode-prod \
     -k /etc/virp/keys/onode.key \
     -s /run/virp/onode.sock \
     -d /run/virp/devices.json \
+    -P /etc/virp/owner-policy.json \
+    -J /var/lib/virp/policy.db \
     -c /var/lib/virp/chain.db \
     -C /etc/virp/keys/chain.key
 

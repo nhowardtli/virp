@@ -24,7 +24,11 @@ When it claims a config change succeeded, where is the evidence?
 
 > **Current reference scope:** default v1 observations authenticate their
 > bytes but do not bind device/command/session as v2 does. Explicit UID
-> ceiling rows may raise the global ceiling; BLACK selects passthrough.
+> ceilings no longer permit BLACK passthrough. Production now requires an
+> independent owner policy and persistent journal. The supported operation
+> catalog is intentionally limited; see [BLACK policy](docs/BLACK-POLICY.md)
+> for profiles, migration requirements, and enforcement limits. The Go O-Node
+> is demonstration-only and refuses externally supplied signing keys.
 > See the [2026-09-24 remediation ledger](docs/SECURITY-REMEDIATION-2026-09-24.md)
 > for source fixes, verification limits, and remaining audit work.
 

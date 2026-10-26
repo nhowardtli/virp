@@ -22,6 +22,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "virp_driver.h"
+#include "virp_policy.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -349,9 +350,9 @@ static virp_error_t linux_execute(virp_conn_t *conn,
      * than the ASA driver, which refuses BLACK only after the connected
      * check.)
      */
-    if (linux_gate_tier(command) == VIRP_TIER_BLACK && virp_exec_passthrough) {
-        fprintf(stderr, "[Linux] BLACK PASSTHROUGH: '%s' on %s — backstop yields "
-                "to the passthrough ceiling\n", command, conn->device.hostname);
+    if (linux_gate_tier(command) == VIRP_TIER_BLACK && virp_policy_reboot_permitted(command)) {
+        fprintf(stderr, "[Linux] POLICY REBOOT: '%s' on %s — backstop yields "
+                "to the scoped reboot capability\n", command, conn->device.hostname);
     } else if (linux_gate_tier(command) == VIRP_TIER_BLACK) {
         result->success = false;
         result->exit_code = 1;

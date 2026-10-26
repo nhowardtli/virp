@@ -831,27 +831,12 @@ func TestONodeSequenceIncrement(t *testing.T) {
 	}
 }
 
-func TestONodeKeyPersistence(t *testing.T) {
-	dir := t.TempDir()
-	keyPath := filepath.Join(dir, "onode.key")
-
-	// Create O-Node, save its key
-	on1, _ := NewONode(1, "", filepath.Join(dir, "a.sock"))
-	KeySaveFile(on1.OKey, keyPath)
-	fp1 := on1.OKey.Fingerprint
-	on1.Destroy()
-
-	// Create another O-Node loading the same key
-	on2, _ := NewONode(1, keyPath, filepath.Join(dir, "b.sock"))
-	fp2 := on2.OKey.Fingerprint
-	on2.Destroy()
-
-	if fp1 != fp2 {
-		t.Fatal("key persistence failed: fingerprints differ")
+func TestONodeRefusesExternalSigningKey(t *testing.T) {
+	if on, err := NewONode(1, filepath.Join(t.TempDir(), "production.key"), ""); err == nil || on != nil {
+		t.Fatal("demo O-Node must not load external signing keys")
 	}
 }
 
-// Ensure the O-Node socket file is cleaned up
 func TestONodeSocketCleanup(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "cleanup.sock")
 	on, _ := NewONode(1, "", socketPath)
