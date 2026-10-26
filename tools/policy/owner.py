@@ -90,6 +90,14 @@ def main():
         if not args.policy or args.uid is None or args.profile is None:
             parser.error('profile requires --policy --uid --profile')
         policy = secure(args.policy)
+        original = policy.stat()
+        try:
+            read_acl = os.getxattr(policy, 'system.posix_acl_access', follow_symlinks=False)
+        except OSError as error:
+            import errno
+            if error.errno not in (errno.ENODATA, errno.ENOTSUP):
+                raise
+            read_acl = None
         data = json.loads(policy.read_text(), object_pairs_hook=unique)
         matches = [p for p in data['principals'] if p['uid'] == args.uid]
         if len(matches) != 1:
@@ -103,7 +111,14 @@ def main():
                 f.write('\n')
                 f.flush()
                 os.fsync(f.fileno())
-                os.fchmod(f.fileno(), 0o400)
+                # Retain the existing root-controlled read boundary, including
+                # a daemon-only ACL. Replacing it with root-only 0400 makes the
+                # next non-root daemon restart fail after a profile change.
+                os.fchown(f.fileno(), 0, original.st_gid)
+                os.fchmod(f.fileno(), stat.S_IMODE(original.st_mode))
+                if read_acl is not None:
+                    os.setxattr(f.fileno(), 'system.posix_acl_access', read_acl)
+                os.fsync(f.fileno())
             # Record intention before replacing a policy. Restart applies it;
             # no agent-accessible live reload or privilege toggle exists.
             with db:
