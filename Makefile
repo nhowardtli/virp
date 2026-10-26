@@ -2650,3 +2650,9 @@ test-black-policy-daemon: $(LIB)
 	$(CC) $(CFLAGS) tests/test_policy_daemon.c $(LIB) $(LDFLAGS) -o $(BUILD_DIR)/test_policy_daemon
 	umask 077; ./$(BUILD_DIR)/test_policy_daemon
 all-tests: test-black-policy-daemon
+
+# Separate mock-only executable: production has no policy bypass switch.
+.PHONY: demo-daemon
+demo-daemon: $(BUILD_DIR)/virp-onode-demo
+$(BUILD_DIR)/virp-onode-demo: demo/onode_mock.c $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB)
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB) $(LDFLAGS) -ljson-c -o $@

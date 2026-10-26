@@ -35,7 +35,7 @@ from virp_verify import (
     evaluate_assertion, load_corpus,
 )
 
-KEY_PATH = "/opt/virp/keys/onode.key"
+KEY_PATH = os.environ.get("VIRP_TEST_KEY_PATH", "/opt/virp/keys/onode.key")
 
 
 def resign_with_timestamp(signed_msg: bytes, ts_ns: int) -> bytes:

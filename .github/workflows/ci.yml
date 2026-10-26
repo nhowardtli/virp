@@ -42,7 +42,7 @@ jobs:
       # CFLAGS already carry -Wall -Wextra -Werror -pedantic -std=c11, so a
       # warning is a build failure without any extra flag here.
       - name: Build (warnings are errors)
-        run: make all && make prod
+        run: make all && make prod && make demo-daemon
       - name: Static checks and lints
         run: |
           make check-deploy-unit
@@ -174,7 +174,7 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.DEPS }} python3
       - name: Build shared library
-        run: make shared && make all
+        run: make shared && make all && make CISCO=1 build/port_native_fixture
       # These two load build/libvirp.so directly and need nothing else.
       - name: C/Python parity and bridge verification
         run: |

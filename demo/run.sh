@@ -17,6 +17,7 @@
 # Copyright (c) 2026 Third Level IT LLC — Apache 2.0
 
 set -uo pipefail
+umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -107,8 +108,8 @@ trap cleanup EXIT
 
 # -------------------------------------------------------------------- build --
 if [[ $DO_BUILD -eq 1 ]]; then
-    echo "Building the reference implementation (make all, make prod)..."
-    if ! make -s all >/dev/null 2>&1 || ! make -s prod >/dev/null 2>&1; then
+    echo "Building the reference implementation (make all, make prod, make demo-daemon)..."
+    if ! make -s all >/dev/null 2>&1 || ! make -s prod >/dev/null 2>&1 || ! make -s demo-daemon >/dev/null 2>&1; then
         echo "Build failed. Install dependencies first:" >&2
         echo "  sudo apt install -y build-essential libssl-dev libsodium-dev \\" >&2
         echo "       libsqlite3-dev libssh2-1-dev libcurl4-openssl-dev libjson-c-dev" >&2
@@ -118,7 +119,7 @@ if [[ $DO_BUILD -eq 1 ]]; then
 fi
 
 TOOL="$REPO_ROOT/build/virp-tool"
-ONODE="$REPO_ROOT/build/virp-onode-prod"
+ONODE="$REPO_ROOT/build/virp-onode-demo"
 for bin in "$TOOL" "$ONODE"; do
     if [[ ! -x "$bin" ]]; then
         echo "Missing binary: $bin (run without --no-build, or 'make all prod')" >&2
