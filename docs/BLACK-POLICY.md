@@ -205,7 +205,8 @@ budgets, and automated recovery verification are future work.
 normalization, exact scope, profiles, protected resources and parent-host
 containment, VLAN limits, durable quotas, concurrent admissions, STOP, clock
 rollback, storage failure, unknown-result quarantine, Unix peer requests,
-batches, and refusal of signing/shutdown socket actions. The fixtures dispatch
+batches, genuine approval application/replay, durable reservations across a
+process crash, and refusal of signing/shutdown socket actions. The fixtures dispatch
 only to a synthetic driver, never a real device.
 
 The full C regression suite and Go tests are separate compatibility checks.

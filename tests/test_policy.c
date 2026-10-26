@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/wait.h>
 
 static char *readall(const char *file) {
     FILE *f=fopen(file,"rb");assert(f);assert(!fseek(f,0,SEEK_END));long n=ftell(f);rewind(f);
@@ -132,7 +133,28 @@ static void containment_tests(void) {
     assert(virp_policy_check(p,1234,&d,"interface GigabitEthernet1/0/2 switchport access vlan 81",&a,&why));
     virp_policy_close(p);sqlite3_close(db);
 }
+static void crash_journal_test(void) {
+    char path[]="/tmp/virp-policy-crash-XXXXXX";int fd=mkstemp(path);assert(fd>=0);close(fd);
+    pid_t child=fork();assert(child>=0);
+    if(!child) {
+        sqlite3 *db=NULL;assert(sqlite3_open(path,&db)==SQLITE_OK);
+        char *schema=readall("deploy/policy-schema.sql");assert(sqlite3_exec(db,schema,NULL,NULL,NULL)==SQLITE_OK);free(schema);
+        virp_policy_t *p=virp_policy_parse(config,db);assert(p);
+        virp_device_t d={.vendor=VIRP_VENDOR_PROXMOX,.device_id=17,.port=22,.enabled=true};strcpy(d.host,"127.0.0.1");
+        virp_policy_action_t a;const char *why;
+        assert(!virp_policy_check(p,1234,&d,"qm destroy 104",&a,&why));assert(virp_policy_reserve(p,&a,&why)>0);
+        _exit(0); /* crash boundary: no finish, sqlite_close, or policy cleanup */
+    }
+    int status;assert(waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0);
+    sqlite3 *db=NULL;assert(sqlite3_open(path,&db)==SQLITE_OK);
+    sqlite3_stmt *st=NULL;assert(sqlite3_prepare_v2(db,"SELECT calls,disruptive,(SELECT COUNT(*) FROM policy_attempts WHERE state='pending') FROM policy_control",-1,&st,NULL)==SQLITE_OK);
+    assert(sqlite3_step(st)==SQLITE_ROW);assert(sqlite3_column_int(st,0)==1&&sqlite3_column_int(st,1)==1&&sqlite3_column_int(st,2)==1);sqlite3_finalize(st);
+    virp_policy_t *p=virp_policy_parse(config,db);assert(p);
+    virp_device_t d={.vendor=VIRP_VENDOR_PROXMOX,.device_id=17,.port=22,.enabled=true};strcpy(d.host,"127.0.0.1");
+    virp_policy_action_t a;const char *why;assert(!virp_policy_check(p,1234,&d,"qm destroy 104",&a,&why));assert(virp_policy_reserve(p,&a,&why)<0);
+    virp_policy_close(p);sqlite3_close(db);unlink(path);
+}
 int main(void) {
-    classify_tests();scope_tests();race_tests();malformed_tests();stop_clock_failure_tests();containment_tests();
+    classify_tests();scope_tests();race_tests();malformed_tests();stop_clock_failure_tests();containment_tests();crash_journal_test();
     puts("PASS policy: closed grammar, identity/target scope, profiles, protected resources, quotas, concurrency, restart, STOP, uncertainty and storage failure");return 0;
 }
