@@ -91,6 +91,7 @@ type ONode struct {
 	seqNum  atomic.Uint32
 
 	listener net.Listener
+	stopped  bool // guarded by mu; Shutdown is terminal
 	running  atomic.Bool
 	mu       sync.Mutex
 
@@ -150,18 +151,23 @@ func (on *ONode) NextSeq() uint32 {
 
 // Start begins the O-Node event loop. Blocks until Shutdown is called.
 func (on *ONode) Start() error {
+	on.mu.Lock()
+	if on.stopped || on.listener != nil {
+		on.mu.Unlock()
+		return fmt.Errorf("demo O-Node already started or stopped")
+	}
 	// Remove stale socket
 	os.Remove(on.SocketPath)
 
 	listener, err := net.Listen("unix", on.SocketPath)
 	if err != nil {
+		on.mu.Unlock()
 		return fmt.Errorf("listen %s: %w", on.SocketPath, err)
 	}
-	on.listener = listener
-
-	// Allow non-root users to connect
+	// Restrict the demo socket to its owning identity
 	if err := os.Chmod(on.SocketPath, 0600); err != nil {
 		listener.Close()
+		on.mu.Unlock()
 		return err
 	}
 
@@ -170,7 +176,9 @@ func (on *ONode) Start() error {
 	on.logger.Printf("Devices: %d", len(on.devices))
 	on.logger.Print("Ready.")
 
+	on.listener = listener
 	on.running.Store(true)
+	on.mu.Unlock()
 
 	// Heartbeat goroutine
 	go on.heartbeatLoop()
@@ -192,6 +200,9 @@ func (on *ONode) Start() error {
 
 // Shutdown signals the O-Node to stop.
 func (on *ONode) Shutdown() {
+	on.mu.Lock()
+	defer on.mu.Unlock()
+	on.stopped = true
 	on.running.Store(false)
 	if on.listener != nil {
 		on.listener.Close()

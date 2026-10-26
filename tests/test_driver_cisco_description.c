@@ -121,46 +121,43 @@ static void test_executor_refuses_before_transport(void)
     PASS();
 }
 
-/* PASSTHROUGH (2026-09-15): with virp_exec_passthrough set by the daemon,
- * the driver's BLACK backstop yields — proven here without a device: a
- * disconnected conn falls PAST the BLACK branch to "Not connected". Without
- * the flag the same request is the BLACK refusal it always was. */
-static void test_black_backstop_yields_only_to_passthrough(void)
+/* The retired flag must never authorize BLACK. Only the exact typed reboot
+ * capability can pass its specific backstop; no actual device is contacted. */
+static void test_black_backstop_only_exact_reboot(void)
 {
     virp_conn_t conn;
     virp_exec_result_t r;
-
-    TEST("reload, no passthrough → BLACK refusal (no_dispatch, NOT_SENT)");
     memset(&conn, 0, sizeof conn);
-    conn.connected = false;
     snprintf(conn.device.hostname, sizeof conn.device.hostname, "R1");
+    TEST("retired passthrough flag cannot authorize config erasure");
     memset(&r, 0, sizeof r);
+    virp_exec_passthrough = true;
+    virp_error_t e = cisco_execute(&conn, "write erase", &r);
     virp_exec_passthrough = false;
-    virp_error_t e = cisco_execute(&conn, "reload", &r);
-    RC_ASSERT_REFUSAL(e, r, "BLACK without passthrough");
+    RC_ASSERT_REFUSAL(e, r, "BLACK even with retired flag");
     assert(strstr(r.error_msg, "BLACK tier") != NULL);
     PASS();
 
-    TEST("reload, passthrough → backstop yields (reaches 'Not connected', not the BLACK text)");
-    memset(&conn, 0, sizeof conn);
-    conn.connected = false;
-    snprintf(conn.device.hostname, sizeof conn.device.hostname, "R1");
-    memset(&r, 0, sizeof r);
-    virp_exec_passthrough = true;
-    e = cisco_execute(&conn, "write erase", &r);
-    virp_exec_passthrough = false;
-    assert(e == VIRP_OK && !r.success && r.no_dispatch);
-    assert(strstr(r.error_msg, "Not connected") != NULL);
-    assert(strstr(r.error_msg, "BLACK tier") == NULL);
-    PASS();
-
-    TEST("the flag is cleared after use (a later call is refused again)");
-    memset(&conn, 0, sizeof conn);
-    conn.connected = false;
-    snprintf(conn.device.hostname, sizeof conn.device.hostname, "R1");
+    TEST("exact reboot capability passes only its reboot backstop");
+    virp_policy_action_t a;
+    assert(!virp_policy_classify(VIRP_VENDOR_CISCO_IOS, "reload", &a));
+    virp_policy_dispatch_enter(&a);
     memset(&r, 0, sizeof r);
     e = cisco_execute(&conn, "reload", &r);
-    RC_ASSERT_REFUSAL(e, r, "BLACK after passthrough cleared");
+    assert(e == VIRP_OK && !r.success && r.no_dispatch);
+    assert(strstr(r.error_msg, "Not connected") != NULL);
+    memset(&r, 0, sizeof r);
+    e = cisco_execute(&conn, "write erase", &r);
+    RC_ASSERT_REFUSAL(e, r, "reboot capability does not allow erase");
+    assert(strstr(r.error_msg, "BLACK tier") != NULL);
+    virp_policy_dispatch_leave();
+    PASS();
+
+    TEST("reboot is blocked again when scoped capability ends");
+    memset(&r, 0, sizeof r);
+    e = cisco_execute(&conn, "reload", &r);
+    RC_ASSERT_REFUSAL(e, r, "BLACK after capability cleared");
+    assert(strstr(r.error_msg, "BLACK tier") != NULL);
     PASS();
 }
 
@@ -228,7 +225,7 @@ int main(void)
     test_parser();
     test_classifier_agrees_with_parser();
     test_executor_refuses_before_transport();
-    test_black_backstop_yields_only_to_passthrough();
+    test_black_backstop_only_exact_reboot();
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     RC_REPORT("test_driver_cisco_description");
     return tests_passed == tests_run ? 0 : 1;

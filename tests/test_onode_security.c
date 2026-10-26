@@ -6,7 +6,7 @@ int main(void)
 {
     virp_driver_mock_init();
     RUN_TEST(test_errored_execution_still_chains_no_gap);
-    RUN_TEST(test_per_uid_black_ceiling_is_passthrough_and_red_binds_above_node);
+    RUN_TEST(test_black_ceiling_rejected_and_red_remains_scoped);
     RUN_TEST(test_declared_refusal_with_body_routes_to_error);
     RUN_TEST(test_refusal_with_body_is_not_an_execution);
     RUN_TEST(test_refusal_with_body_is_not_recorded_executed);
