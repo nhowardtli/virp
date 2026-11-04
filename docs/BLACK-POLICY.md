@@ -73,6 +73,7 @@ syntax are refused; they are not stripped into an executable fallback.
 | Operation | Accepted forms | Resource | Effect |
 | --- | --- | --- | --- |
 | `system.read` | Network: exact `show version`, `show clock`, `show interfaces`, `show interfaces status`, `show ip route`; FortiGate also `get system status`. Linux/Proxmox: `uptime`, `hostname`, `uname -sr`. | `host` | Read |
+| `frr.read` | Linux only, byte-exact: `vtysh -c "show running-config"`, `vtysh -c "show logging"`, `vtysh -c "show zebra"`, `vtysh -c "show daemons"` (the four forms the evidence and config-backup collectors send; the two double quotes are part of the fixed form). No other `show`, abbreviation, second `-c`, environment prefix, redirection or quoting is admitted, and a `system.read` grant does not cover it. Added 2026-11-04 (feat/autopilot-nondaemon-uid). | `host` | Read |
 | `host.reboot` | Cisco `reload`; ASA `reload noconfirm`; JunOS `request system reboot`; FortiGate `execute reboot`; Linux/Proxmox `reboot` or `systemctl reboot`. | `host` | Disruptive |
 | `vm.read` | `qm status ID`, `pct status ID` | `vm:ID`, `ct:ID` | Read |
 | `vm.reboot` | `qm reboot ID`, `pct reboot ID` | `vm:ID`, `ct:ID` | Disruptive |

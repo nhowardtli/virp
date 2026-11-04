@@ -66,9 +66,44 @@ static bool physical(const char *s) {
 static int op(virp_policy_action_t *a,const char *name,unsigned effect) {
     snprintf(a->operation,sizeof(a->operation),"%s",name);a->effect=effect;return 0;
 }
+/* FRR read catalog (2026-11-04, feat/autopilot-nondaemon-uid). The owner
+ * policy's grammar refuses quotes, so the vtysh forms the evidence and
+ * config-backup collectors send were refused BLACK-13 before dispatch.
+ * This admits EXACTLY those four byte strings for the Linux vendor and
+ * nothing else: no other `show`, no abbreviation, no second -c, no
+ * environment prefix, no redirection, no other quoting. Whitespace is
+ * canonicalized the same way normalize() does; every other byte must
+ * match the table. The effect is a read (0), the resource is `host`,
+ * and the operation is its own name so a `system.read` grant does not
+ * silently widen into configuration dumps. */
+static const char *frr_show[]={
+    "vtysh -c \"show running-config\"",
+    "vtysh -c \"show logging\"",
+    "vtysh -c \"show zebra\"",
+    "vtysh -c \"show daemons\""};
+static int frr_read(const char *in,virp_policy_action_t *a) {
+    char out[512];size_t n=0;bool space=false;
+    if(!in||strlen(in)>=512)return -1;
+    for(const unsigned char *s=(const unsigned char *)in;*s;s++) {
+        if(*s==' '||*s=='\t'){if(n)space=true;continue;}
+        if(*s<33||*s>126)return -1;
+        if(space)out[n++]=' ';
+        space=false;out[n++]=(char)*s;
+    }
+    out[n]=0;
+    for(size_t i=0;i<sizeof(frr_show)/sizeof(frr_show[0]);i++) {
+        if(strcmp(out,frr_show[i]))continue;
+        snprintf(a->command,sizeof(a->command),"%s",frr_show[i]);
+        snprintf(a->resource,sizeof(a->resource),"host");
+        return op(a,"frr.read",0);
+    }
+    return -1;
+}
 int virp_policy_classify(virp_vendor_t v,const char *cmd,virp_policy_action_t *a) {
     if(!a)return -1;
-    memset(a,0,sizeof(*a)); if(normalize(cmd,a->command))return -1;
+    memset(a,0,sizeof(*a));
+    if(v==VIRP_VENDOR_LINUX && !frr_read(cmd,a))return 0;
+    if(normalize(cmd,a->command))return -1;
     snprintf(a->resource,sizeof(a->resource),"host");
     bool cisco=v==VIRP_VENDOR_CISCO_IOS||v==VIRP_VENDOR_CISCO_IOSXE;
     bool cli=cisco||v==VIRP_VENDOR_CISCO_ASA||v==VIRP_VENDOR_JUNIPER||v==VIRP_VENDOR_FORTINET;
@@ -144,7 +179,7 @@ static bool device_id(const char *s) {
     for(int i=0;i<16;i++)if(!isdigit((unsigned char)s[i])&&(s[i]<'a'||s[i]>'f'))return false;
     return strcmp(s,"0000000000000000")!=0;
 }
-static const char *operations[]={"system.read","host.reboot","vm.read","vm.reboot","vm.delete","vm.start","port.description","port.vlan","port.access"};
+static const char *operations[]={"system.read","frr.read","host.reboot","vm.read","vm.reboot","vm.delete","vm.start","port.description","port.vlan","port.access"};
 static bool valid_op(const char *s) { if(!s)return false;for(size_t i=0;i<sizeof(operations)/sizeof(operations[0]);i++)if(!strcmp(s,operations[i]))return true;return false; }
 static bool valid_reason(const char *s) { return s&&strlen(s)==8&&!strncmp(s,"BLACK-",6)&&s[6]>='0'&&s[6]<='1'&&s[7]>='0'&&s[7]<='9'&&atoi(s+6)>=1&&atoi(s+6)<=14; }
 virp_policy_t *virp_policy_parse(const char *json,sqlite3 *db) {
@@ -302,7 +337,7 @@ int64_t virp_policy_reserve(virp_policy_t *p,const virp_policy_action_t *a,const
      * allowance is greater than one. Unknown reads remain in the journal,
      * but cannot represent an uncertain mutation in this closed catalog. */
     if(a->effect) {
-        if(sqlite3_prepare_v2(p->db,"SELECT COUNT(*) FROM policy_attempts WHERE (state='unknown' AND operation NOT IN ('system.read','vm.read')) OR (state='pending' AND device_id=? AND (resource=? COLLATE NOCASE OR resource='host' OR ?='host'))",-1,&st,NULL)!=SQLITE_OK)goto done;
+        if(sqlite3_prepare_v2(p->db,"SELECT COUNT(*) FROM policy_attempts WHERE (state='unknown' AND operation NOT IN ('system.read','vm.read','frr.read')) OR (state='pending' AND device_id=? AND (resource=? COLLATE NOCASE OR resource='host' OR ?='host'))",-1,&st,NULL)!=SQLITE_OK)goto done;
         sqlite3_bind_int64(st,1,(sqlite3_int64)a->device_id);sqlite3_bind_text(st,2,a->resource,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,a->resource,-1,SQLITE_TRANSIENT);
         if(sqlite3_step(st)!=SQLITE_ROW||sqlite3_column_int64(st,0)){*why="BLACK-14";goto done;}
         sqlite3_finalize(st);st=NULL;

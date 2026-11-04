@@ -177,7 +177,57 @@ static void unknown_read_test(void) {
     sqlite3_stmt *st=NULL;assert(sqlite3_prepare_v2(db,"SELECT COUNT(*) FROM policy_attempts WHERE state='unknown'",-1,&st,NULL)==SQLITE_OK);assert(sqlite3_step(st)==SQLITE_ROW&&sqlite3_column_int(st,0)==2);sqlite3_finalize(st);
     virp_policy_close(p);sqlite3_close(db);
 }
+static void frr_tests(void) {
+    /* feat/autopilot-nondaemon-uid: the four collector forms, byte-exact,
+     * Linux vendor only; everything adjacent to them stays refused. */
+    virp_policy_action_t a;
+    const char *ok[]={"vtysh -c \"show running-config\"","vtysh -c \"show logging\"","vtysh -c \"show zebra\"","vtysh -c \"show daemons\""};
+    for(size_t i=0;i<4;i++){assert(!virp_policy_classify(VIRP_VENDOR_LINUX,ok[i],&a));assert(a.effect==0&&!strcmp(a.operation,"frr.read")&&!strcmp(a.resource,"host")&&!strcmp(a.command,ok[i]));}
+    assert(!virp_policy_classify(VIRP_VENDOR_LINUX,"  vtysh \t -c  \"show   logging\"  ",&a));assert(!strcmp(a.command,"vtysh -c \"show logging\""));
+    const char *bad[]={"vtysh -c \"show ip ospf neighbor\"","vtysh -c \"show ip route ospf\"","vtysh -c \"show running-config\" -c \"configure terminal\"","vtysh -c \"show daemons\" -c \"show logging\"",
+        "FRR_PAGER=cat vtysh -c \"show running-config\"","env vtysh -c \"show running-config\"","sudo vtysh -c \"show running-config\"","vtysh -d zebra -c \"show running-config\"",
+        "vtysh -c 'show running-config'","vtysh -c show running-config","vtysh -c \"show running-config","vtysh -c \"\"show running-config\"\"","vtysh -c \"show running-config\"x",
+        "vtysh -c \"show running-config\";reboot","vtysh -c \"show running-config\"; rm -rf /etc/frr","vtysh -c \"show running-config\" | tee /tmp/x","vtysh -c \"show running-config\" > /tmp/x",
+        "vtysh -c \"show running-config\" && reboot","vtysh -c \"show running-config\"\n","vtysh -c \"show logging\"\x01","vtysh -c \"sh run\"","vtysh -c \"show run\"","vtysh -c \"show running-config all\"",
+        "VTYSH -c \"show running-config\"","vtysh -c \"Show running-config\"","vtysh -C \"show running-config\"","vtysh -c \"configure terminal\"","vtysh -c \"clear ip ospf process\"","cat /etc/frr/frr.conf","vtysh"};
+    for(size_t i=0;i<sizeof(bad)/sizeof(bad[0]);i++)assert(virp_policy_classify(VIRP_VENDOR_LINUX,bad[i],&a));
+    virp_vendor_t others[]={VIRP_VENDOR_PROXMOX,VIRP_VENDOR_CISCO_IOS,VIRP_VENDOR_CISCO_IOSXE,VIRP_VENDOR_CISCO_ASA,VIRP_VENDOR_JUNIPER,VIRP_VENDOR_FORTINET,VIRP_VENDOR_MOCK};
+    for(size_t j=0;j<sizeof(others)/sizeof(others[0]);j++)for(size_t i=0;i<4;i++)assert(virp_policy_classify(others[j],ok[i],&a));
+    /* the pre-existing Linux rows are untouched by the new table */
+    assert(!virp_policy_classify(VIRP_VENDOR_LINUX,"uptime",&a));assert(!strcmp(a.operation,"system.read"));
+    assert(!virp_policy_classify(VIRP_VENDOR_LINUX,"reboot",&a));assert(a.effect==2);
+    assert(virp_policy_classify(VIRP_VENDOR_LINUX,"uname -a",&a));
+    /* a grant is per operation: system.read does not cover frr.read, frr.read does not cover system.read */
+    sqlite3 *db=database();const char *why=NULL;
+    const char *frr="{\"version\":1,\"max_calls\":10,\"max_disruptive\":1,\"max_inflight\":1,\"protected\":[],\"principals\":[{\"uid\":1234,\"profile\":\"observe\",\"expires\":4102444800,\"rules\":[{\"device_id\":\"0000000000000011\",\"host\":\"172.20.20.5\",\"port\":2222,\"vendor\":3,\"operation\":\"frr.read\",\"resource\":\"host\"}]}]}";
+    virp_policy_t *p=virp_policy_parse(frr,db);assert(p);
+    virp_device_t d={.vendor=VIRP_VENDOR_LINUX,.device_id=17,.port=2222,.enabled=true};strcpy(d.host,"172.20.20.5");
+    assert(!virp_policy_check(p,1234,&d,"vtysh -c \"show running-config\"",&a,&why));assert(a.ceiling==VIRP_TIER_GREEN&&a.effect==0&&!strcmp(a.operation,"frr.read"));
+    assert(virp_policy_check(p,1234,&d,"uptime",&a,&why));assert(!strcmp(why,"BLACK-13"));
+    assert(virp_policy_check(p,1234,&d,"vtysh -c \"show ip ospf neighbor\"",&a,&why));assert(!strcmp(why,"BLACK-13"));
+    assert(virp_policy_check(p,1235,&d,"vtysh -c \"show running-config\"",&a,&why));
+    d.port=22;assert(virp_policy_check(p,1234,&d,"vtysh -c \"show running-config\"",&a,&why));d.port=2222;
+    d.vendor=VIRP_VENDOR_PROXMOX;assert(virp_policy_check(p,1234,&d,"vtysh -c \"show running-config\"",&a,&why));d.vendor=VIRP_VENDOR_LINUX;
+    virp_policy_close(p);
+    char *sysread=replace(frr,"frr.read","system.read");p=virp_policy_parse(sysread,db);assert(p);free(sysread);
+    assert(virp_policy_check(p,1234,&d,"vtysh -c \"show running-config\"",&a,&why));assert(!strcmp(why,"BLACK-13"));
+    assert(!virp_policy_check(p,1234,&d,"uptime",&a,&why));
+    virp_policy_close(p);
+    /* the operation vocabulary admits exactly the new name */
+    char *badop=replace(frr,"frr.read","frr.show");assert(!virp_policy_parse(badop,db));free(badop);
+    badop=replace(frr,"frr.read","frr.READ");assert(!virp_policy_parse(badop,db));free(badop);
+    sqlite3_close(db);
+    /* an UNKNOWN frr.read is a read: it stays in the journal without quarantining mutation */
+    db=database();
+    const char *mixed="{\"version\":1,\"max_calls\":10,\"max_disruptive\":2,\"max_inflight\":1,\"protected\":[],\"principals\":[{\"uid\":1234,\"profile\":\"autonomous\",\"expires\":4102444800,\"rules\":["
+        "{\"device_id\":\"0000000000000011\",\"host\":\"172.20.20.5\",\"port\":2222,\"vendor\":3,\"operation\":\"frr.read\",\"resource\":\"host\"},"
+        "{\"device_id\":\"0000000000000011\",\"host\":\"172.20.20.5\",\"port\":2222,\"vendor\":3,\"operation\":\"host.reboot\",\"resource\":\"host\"}]}]}";
+    p=virp_policy_parse(mixed,db);assert(p);
+    assert(!virp_policy_check(p,1234,&d,"vtysh -c \"show daemons\"",&a,&why));int64_t id=virp_policy_reserve(p,&a,&why);assert(id>0);assert(!virp_policy_finish(p,id,false));
+    assert(!virp_policy_check(p,1234,&d,"reboot",&a,&why));id=virp_policy_reserve(p,&a,&why);assert(id>0);assert(!virp_policy_finish(p,id,true));
+    virp_policy_close(p);sqlite3_close(db);
+}
 int main(void) {
-    classify_tests();scope_tests();race_tests();malformed_tests();stop_clock_failure_tests();containment_tests();crash_journal_test();collector_tests();unknown_read_test();
-    puts("PASS policy: closed grammar, identity/target scope, profiles, protected resources, quotas, concurrency, restart, STOP, uncertainty and storage failure");return 0;
+    classify_tests();scope_tests();race_tests();malformed_tests();stop_clock_failure_tests();containment_tests();crash_journal_test();collector_tests();unknown_read_test();frr_tests();
+    puts("PASS policy: closed grammar, identity/target scope, profiles, protected resources, quotas, concurrency, restart, STOP, uncertainty, storage failure and the exact FRR read forms");return 0;
 }
