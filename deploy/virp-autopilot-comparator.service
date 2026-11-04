@@ -5,20 +5,16 @@ Requires=virp-onode.service
 
 [Service]
 Type=oneshot
-# NOT root: the daemon's socket_allowed_uids deliberately excludes uid 0
-# (see DEPLOYED.md, "socket allowlist policy"). Runs as `virp`, the
-# daemon's own service account: nologin, no sudo, and no read access to
-# /etc/virp/autopilot.env, so it holds no device credentials.
-#
-# Why not a separate, even-less-privileged uid? Verifying an observation
-# requires the O-Key — VIRP signs with symmetric HMAC — and
-# virp_key_load_file refuses a key with group read ("insecure mode
-# 0640"). A second account could therefore only verify by weakening key
-# hygiene or by keeping a duplicate of the signing key on disk. Running
-# as the key's owner avoids both. Verifier and signer become separable
-# only when the daemon exposes a verify action.
-User=virp
-Group=virp
+# NOT root, and NOT the daemon's uid (2026-11-04, feat/autopilot-nondaemon-uid):
+# the owner policy refuses to load when the daemon's own uid is a
+# principal, so a client sharing uid 999 is refused BLACK-13 on every
+# execute. Runs as `virp-autopilot` (uid 971), a nologin account in no
+# group but its own, which verifies v3 execute observations with the
+# daemon's PUBLIC chain-signing key and holds no secret. Full reasoning
+# and the ACL grant path: deploy/virp-autopilot.service and
+# deploy/autopilot-access.sh.
+User=virp-autopilot
+Group=virp-autopilot
 ExecStart=/usr/bin/python3 /usr/local/lib/virp/autopilot/virp_autopilot.py comparator
 NoNewPrivileges=yes
 PrivateTmp=yes

@@ -137,6 +137,7 @@ deploy/virp-onode-runbook.dropin.conf /etc/systemd/system/virp-onode.service.d/5
 deploy/virp-onode-evidence.dropin.conf /etc/systemd/system/virp-onode.service.d/51-evidence.conf
 deploy/virp-onode-netclaw.dropin.conf /etc/systemd/system/virp-onode.service.d/52-netclaw.conf
 deploy/virp-onode-sean.dropin.conf /etc/systemd/system/virp-onode.service.d/53-sean.conf
+deploy/virp-onode-autopilot.dropin.conf /etc/systemd/system/virp-onode.service.d/54-autopilot.conf
 # Lab-only, opt-in, installed by `make install-wazuh-lab-dropin` and by
 # nothing else. Listed so that IF it is installed it is still compared
 # against its tracked source — being deliberate is not the same as being

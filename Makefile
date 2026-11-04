@@ -1596,7 +1596,8 @@ VIRP_INSTALL_SCRIPTS = deploy/render-devices.sh \
                        deploy/config-backup-access.sh \
                        deploy/evidence-access.sh \
                        deploy/netclaw-access.sh \
-                       deploy/sean-access.sh
+                       deploy/sean-access.sh \
+                       deploy/autopilot-access.sh
 
 # The timer-driven automations (autopilot cycle/comparator/chainwalk/
 # corpus, config-backup, evidence) run these Python modules. They had the

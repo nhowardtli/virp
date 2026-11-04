@@ -49,14 +49,18 @@ import os
 import socket
 import sqlite3
 import struct
-import subprocess
 import sys
 import time
 
 # ── Paths / wire constants ─────────────────────────────────────────────
 
 ONODE_SOCKET = "/run/virp/onode.sock"
-OKEY_PATH    = "/etc/virp/keys/onode.key"
+# The observation-signing PUBLIC key: the daemon's chain-signing key
+# (-S) is also its v3 observation key (virp_obskey_load(sign_key) in
+# virp_onode_prod.c). 32 raw bytes or 64 hex chars, root 0644. This
+# client holds NO secret: it never opens onode.key, which is why it can
+# run as its own uid (virp-autopilot, 971) instead of the daemon's.
+OBS_PUB_PATH = "/etc/virp/keys/chain-sign.pub"
 # Installed path, NOT the build tree. This used to be
 # /opt/virp/build/virp-tool — a build artifact inside the source
 # checkout — so a `make clean` during a deploy deleted it and took
@@ -76,6 +80,29 @@ ALERTS_FILE  = os.path.join(STATE_DIR, "alerts.jsonl")
 HEADER_FMT = "!BBHIBBHIQ"        # 24 bytes, then 32-byte HMAC
 HEADER_LEN = 24
 HMAC_LEN   = 32
+
+# v3 execute observation (include/virp.h, docs/EXECUTE-V3.md): the 88-byte
+# v2 header layout with version byte 3, then payload, then the 32-byte
+# session HMAC, then a 64-byte detached Ed25519 signature over
+# header || payload || HMAC. The execute payload is profile XO1: 8-byte
+# magic, then the v1 subheader (type, scope, length) and the body.
+OBS_V2_HEADER_FMT = "!BBBBQQQ16sQ32sI"
+OBS_V2_HEADER_LEN = 88
+OBS_V2_HMAC_LEN   = 32
+OBS_V3_SIG_LEN    = 64
+XO1_MAGIC         = b"VIRP-XO1"
+
+# Session the client opens before a cycle so the daemon will mint v3
+# frames (execute v3 refuses without a bound session). The handshake
+# itself negotiates protocol 2/1; v3 is selected per request.
+CLIENT_ID = "virp-autopilot"
+
+# Transport attestation for frames that have no public-key form
+# (sign_outcome, chain_verify_session are HMAC-only v1): the uid on the
+# other end of the unix socket, captured with SO_PEERCRED at connect,
+# and the uid that owns the socket file (the daemon created it).
+LAST_PEER_UID = None
+DAEMON_UID = None
 
 TIER_NAMES = {0x00: "UNCLASSIFIED", 0x01: "GREEN", 0x02: "YELLOW",
               0x03: "RED"}
@@ -392,10 +419,17 @@ CORPUS = [
 
 def onode_send(request, sock_path=ONODE_SOCKET, timeout=60):
     """v2 framing: send [4B len][0x02][JSON], receive [4B len][payload]."""
+    global LAST_PEER_UID, DAEMON_UID
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
         s.connect(sock_path)
+        try:
+            _pid, LAST_PEER_UID, _gid = struct.unpack(
+                "3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            DAEMON_UID = os.stat(sock_path).st_uid
+        except (OSError, struct.error):
+            LAST_PEER_UID = DAEMON_UID = None
         payload = json.dumps(request).encode()
         s.sendall(struct.pack(">I", 1 + len(payload)) + b"\x02" + payload)
         hdr = b""
@@ -416,12 +450,49 @@ def onode_send(request, sock_path=ONODE_SOCKET, timeout=60):
         s.close()
 
 
+def parse_observation_v3(raw):
+    """Structure of a v3 frame (version byte 3). Field names mirror the
+    v1 parser so callers need no per-version branches. Signature
+    verification is verify_observation()'s job."""
+    if len(raw) < OBS_V2_HEADER_LEN + OBS_V2_HMAC_LEN + OBS_V3_SIG_LEN:
+        return {"parse_error": "v3 frame too short (%d bytes)" % len(raw)}
+    (version, channel, tier, reserved, node_id, ts_ns, seq, session_id,
+     device_id, command_hash, payload_len) = struct.unpack_from(
+        OBS_V2_HEADER_FMT, raw, 0)
+    expected = (OBS_V2_HEADER_LEN + payload_len + OBS_V2_HMAC_LEN
+                + OBS_V3_SIG_LEN)
+    if expected != len(raw):
+        return {"parse_error": "v3 payload_len %d does not match frame "
+                               "size (%d expected, %d stored)"
+                               % (payload_len, expected, len(raw))}
+    if reserved != 0:
+        return {"parse_error": "v3 reserved byte is 0x%02x" % reserved}
+    payload = raw[OBS_V2_HEADER_LEN:OBS_V2_HEADER_LEN + payload_len]
+    obs_type = obs_scope = None
+    data = payload
+    if payload[:8] == XO1_MAGIC and len(payload) >= 12:
+        obs_type, obs_scope, data_len = struct.unpack("!BBH", payload[8:12])
+        data = payload[12:12 + data_len]
+    return {
+        "version": version, "type": None, "length": expected,
+        "node_id": node_id, "channel": channel, "tier": tier,
+        "tier_name": TIER_NAMES.get(tier, "0x%02x" % tier),
+        "seq": seq, "timestamp_ns": ts_ns,
+        "session_id": session_id.hex(), "device_id": device_id,
+        "command_hash": command_hash.hex(),
+        "obs_type": obs_type, "obs_scope": obs_scope,
+        "payload": data.decode("utf-8", errors="replace"),
+    }
+
+
 def parse_observation(raw):
     """Parse header + observation payload. Structure only — signature
-    verification is virp-tool inspect's job (the canonical C code)."""
+    verification is verify_observation()'s job."""
     if len(raw) == 4:
         code = struct.unpack(">i", raw)[0]
         return {"error_code": code}
+    if raw[:1] == b"\x03":
+        return parse_observation_v3(raw)
     if len(raw) < HEADER_LEN + HMAC_LEN + 4:
         return {"parse_error": "message too short (%d bytes)" % len(raw)}
     (version, mtype, length, node_id, channel, tier, _reserved,
@@ -439,21 +510,117 @@ def parse_observation(raw):
     }
 
 
-def verify_observation(raw, workdir="/tmp"):
-    """HMAC verification via the canonical C implementation. Returns
-    True iff `virp-tool inspect` prints a VALID signature."""
-    path = os.path.join(workdir, "autopilot-verify-%d.bin" % os.getpid())
+def load_obs_pub(path=OBS_PUB_PATH):
+    """The 32-byte Ed25519 observation-signing public key, raw or hex.
+    Refuses anything that is not exactly a public key: a 64-byte file is
+    a secret and this client must never hold one."""
+    with open(path, "rb") as f:
+        b = f.read(129)
+    if len(b) == 32:
+        return b
     try:
-        with open(path, "wb") as f:
-            f.write(raw)
-        out = subprocess.run([VIRP_TOOL, "inspect", path, OKEY_PATH, "okey"],
-                             capture_output=True, text=True, timeout=30)
-        return "✓ VALID" in out.stdout
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        h = bytes.fromhex(b.decode("ascii").strip())
+    except (UnicodeDecodeError, ValueError):
+        h = b""
+    if len(h) == 32:
+        return h
+    raise ValueError("%s is not a 32-byte Ed25519 public key" % path)
+
+
+def _ed25519_verify(pub, msg, sig):
+    """Pure verification, no secret. `cryptography` is the only backend
+    the daemon hosts carry (41.x on virp-lab); without it the answer is
+    False, never True."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey)
+        from cryptography.exceptions import InvalidSignature
+    except ImportError:
+        return False
+    try:
+        Ed25519PublicKey.from_public_bytes(pub).verify(sig, msg)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def verify_observation(raw, pub=None):
+    """Public-key verification of a v3 observation: the detached Ed25519
+    signature over header || payload || HMAC, checked with the daemon's
+    PUBLIC key only (mirrors virp_verify_observation_ed25519 and
+    report/verify.py classify_observation_v3). Returns True only for a
+    well-framed v3 frame whose signature verifies. A v1/v2 frame is
+    HMAC-only and has no public-key form, so this returns False for it;
+    callers that consume HMAC-only control frames use
+    attest_control_frame() and say so."""
+    if not raw or raw[0] != 3:
+        return False
+    obs = parse_observation_v3(raw)
+    if "parse_error" in obs:
+        return False
+    if obs["tier"] not in TIER_NAMES or obs["tier"] == 0xFF:
+        return False
+    span = len(raw) - OBS_V3_SIG_LEN
+    try:
+        key = pub if pub is not None else load_obs_pub()
+    except (OSError, ValueError):
+        return False
+    return _ed25519_verify(key, raw[:span], raw[span:])
+
+
+def attest_control_frame(raw):
+    """Transport attestation for HMAC-only control frames (sign_outcome,
+    chain_verify_session): the frame parses and the socket peer that sent
+    it is the uid that owns the daemon socket. This is unix-IPC
+    authenticity, NOT a signature check: this client holds no O-Key and
+    there is no public-key form of these frames yet (a daemon `verify`
+    action would close that). Anything this attests and then appends to
+    the chain is re-verified by the daemon's GATE 3 under its own key."""
+    if not raw or len(raw) == 4:
+        return False
+    obs = parse_observation(raw)
+    if "parse_error" in obs or "error_code" in obs:
+        return False
+    return (LAST_PEER_UID is not None and DAEMON_UID is not None
+            and LAST_PEER_UID == DAEMON_UID)
+
+
+def execute_request(device, command):
+    """The execute request this client sends: v3 is selected per request
+    so the reply carries a detached Ed25519 signature this uid can check
+    with the public key."""
+    return {"action": "execute", "device": device, "command": command,
+            "obs_version": 3}
+
+
+def open_session(client_id=CLIENT_ID):
+    """HELLO + BIND on the daemon's shared session context. Required for
+    execute v3 (onode_execute_policy_impl refuses without an active bound
+    session). The daemon derives the session key from the O-Key on its
+    side; nothing secret crosses this socket."""
+    nonce = os.urandom(8).hex()
+    ack = onode_send({"action": "session_hello", "client_id": client_id,
+                      "versions": "2,1", "algorithms": "1",
+                      "supported_channels": 3, "client_nonce": nonce})
+    if len(ack) == 4:
+        raise IOError("session_hello refused: %d"
+                      % struct.unpack(">i", ack)[0])
+    a = json.loads(ack.decode())
+    bound = onode_send({"action": "session_bind", "client_id": client_id,
+                        "session_id": a["session_id"],
+                        "client_nonce": a["client_nonce"],
+                        "server_nonce": a["server_nonce"]})
+    if len(bound) == 4:
+        raise IOError("session_bind refused: %d"
+                      % struct.unpack(">i", bound)[0])
+    return a["session_id"]
+
+
+def close_session():
+    try:
+        onode_send({"action": "session_close"})
+    except (OSError, IOError):
+        pass
 
 
 def chain_append(session_id, device, raw_obs):
@@ -716,8 +883,7 @@ def evaluate_baselines(results, baselines=None):
 # ── Modes ──────────────────────────────────────────────────────────────
 
 def execute(device, command):
-    raw = onode_send({"action": "execute", "device": device,
-                      "command": command})
+    raw = onode_send(execute_request(device, command))
     return raw, parse_observation(raw)
 
 
@@ -833,7 +999,12 @@ def chain_head(db_path=CHAIN_DB):
     writes). Shape matches eval_peer_chain_head() so local and peer
     heads are directly comparable."""
     try:
-        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+        # immutable=1: this uid owns no WAL/-shm write access (and must
+        # not), so a plain read-only open of the daemon's WAL database
+        # would fail. The read is a best-effort glance for the summary;
+        # the chainwalk's verdicts come from the daemon, not from here.
+        con = sqlite3.connect("file:%s?mode=ro&immutable=1" % db_path,
+                              uri=True)
     except sqlite3.Error:
         return None
     try:
@@ -903,7 +1074,8 @@ def chain_sessions(db_path=CHAIN_DB):
     """Read-only enumeration of sessions + max sequence. The daemon owns
     all chain WRITES; a read-only sqlite open for enumeration keeps the
     single-writer invariant intact."""
-    con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    con = sqlite3.connect("file:%s?mode=ro&immutable=1" % db_path,
+                          uri=True)  # see chain_head(): no -shm write
     try:
         rows = con.execute("SELECT session_id, MAX(sequence) "
                            "FROM chain_entries GROUP BY session_id").fetchall()
@@ -949,7 +1121,9 @@ def run_chainwalk():
             alerts += 1
             failures += 1
             continue
-        verified = verify_observation(raw)
+        # chain_verify_session replies are HMAC-only v1 frames: no
+        # public-key form exists, so attest the transport and say so.
+        verified = attest_control_frame(raw)
         try:
             vr = json.loads(obs["payload"])
         except ValueError:
@@ -966,10 +1140,10 @@ def run_chainwalk():
             vr["local_note"] = ("head commits to %s but %s entries "
                                 "visible locally" % (head_to, max_seq))
         total_entries += int(vr.get("entries_checked", 0))
-        print("  [%s] session=%s entries=%s first_broken=%s verified=%s%s"
+        print("  [%s] session=%s entries=%s first_broken=%s attested=%s%s"
               % ("OK" if valid else "ALERT", sid,
                  vr.get("entries_checked"), vr.get("first_broken"),
-                 "VALID" if verified else "FAILED",
+                 "PEERCRED" if verified else "UNATTESTED",
                  (" detail=%r" % vr["error_detail"])
                  if vr.get("error_detail") else ""))
         if not valid:
@@ -991,7 +1165,7 @@ def run_chainwalk():
     signed = onode_send({"action": "sign_outcome", "command": digest})
     sobs = parse_observation(signed)
     if "error_code" in sobs or sobs.get("obs_type") != OBS_OUTCOME_SIGNED \
-            or not verify_observation(signed):
+            or not attest_control_frame(signed):
         emit_alert("chainwalk_summary_signing", {"obs": sobs})
         alerts += 1
     else:
@@ -1187,7 +1361,7 @@ def run_comparator():
     signed = onode_send({"action": "sign_outcome", "command": digest})
     sobs = parse_observation(signed)
     if "error_code" in sobs or sobs.get("obs_type") != OBS_OUTCOME_SIGNED \
-            or not verify_observation(signed):
+            or not attest_control_frame(signed):
         emit_alert("comparator_verdict_signing", {"obs": sobs})
         alerts += 1
     else:
@@ -1213,9 +1387,17 @@ def main():
                                      "comparator"])
     args = ap.parse_args()
     os.makedirs(STATE_DIR, exist_ok=True)
-    alerts = {"cycle": run_cycle, "corpus": run_corpus,
-              "chainwalk": run_chainwalk,
-              "comparator": run_comparator}[args.mode]()
+    # execute v3 needs a bound session; the control-frame modes do not.
+    needs_session = args.mode in ("cycle", "corpus", "comparator")
+    if needs_session:
+        open_session()
+    try:
+        alerts = {"cycle": run_cycle, "corpus": run_corpus,
+                  "chainwalk": run_chainwalk,
+                  "comparator": run_comparator}[args.mode]()
+    finally:
+        if needs_session:
+            close_session()
     return 1 if alerts else 0
 
 

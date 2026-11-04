@@ -46,6 +46,9 @@ UIDS = {
     "VIRP_BROKER_UID": "994",
 }
 OPERATOR_UID = "1000"
+# Literal in the template (render-devices.sh knows no placeholder for it):
+# the autopilot identity from feat/autopilot-nondaemon-uid.
+AUTOPILOT_UID = "971"
 SERVICE_IDENTITIES = ("VIRP_BACKUP_UID", "VIRP_EVIDENCE_UID",
                       "VIRP_NETCLAW_UID", "VIRP_BROKER_UID")
 
@@ -245,6 +248,39 @@ class CanonicalTemplateTests(_PolicyChecks, unittest.TestCase):
         self.assertTrue(m, "broker ALLOWED_ACTIONS not found")
         relay = set(re.findall(r'"([a-z_]+)"', m.group(1)))
         self.assertEqual(set(self.policy[UIDS["VIRP_BROKER_UID"]]), relay)
+
+    def autopilot_source_send_set(self):
+        """Every {"action": "<verb>"} the autopilot client builds, parsed
+        from the source so the template row cannot drift from the code."""
+        src = open(os.path.join(ROOT, "autopilot", "virp_autopilot.py")).read()
+        verbs = set(re.findall(r'"action":\s*"([a-z_]+)"', src))
+        self.assertTrue(verbs, "no actions found in virp_autopilot.py")
+        return verbs
+
+    def test_autopilot_uid_is_allowed_green_and_sends_exactly_its_verbs(self):
+        # feat/autopilot-nondaemon-uid (2026-11-04): the autopilot no
+        # longer runs as the daemon's uid. Its row is the verb set the
+        # source actually sends, nothing more, GREEN, and append-limited
+        # to the three artifact types it writes.
+        self.assertIn(AUTOPILOT_UID, self.allowed)
+        self.assertEqual(set(self.policy[AUTOPILOT_UID]),
+                         self.autopilot_source_send_set())
+        self.assertEqual(set(self.policy[AUTOPILOT_UID]),
+                         {"execute", "chain_append", "chain_verify_session",
+                          "sign_outcome", "session_hello", "session_bind",
+                          "session_close"})
+        self.assertNotIn("shutdown", self.policy[AUTOPILOT_UID])
+        self.assertEqual(self.doc["socket_uid_tier_ceilings"][AUTOPILOT_UID],
+                         "green")
+        self.assertEqual(set(self.doc["socket_uid_chain_append_types"][AUTOPILOT_UID]),
+                         {"observation", "comparator_verd", "chainwalk_summa"})
+
+    def test_autopilot_uid_is_not_the_daemon_uid(self):
+        # The owner policy refuses to load if the daemon's own uid is a
+        # principal (src/virp_policy.c, virp_policy_load), which is the
+        # whole reason the autopilot has its own identity.
+        self.assertNotEqual(AUTOPILOT_UID, UIDS["VIRP_UID"])
+        self.assertNotIn(AUTOPILOT_UID, UIDS.values())
 
     def test_backup_and_evidence_carry_a_green_tier_ceiling(self):
         # both collectors are read-only by classification, and the

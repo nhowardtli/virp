@@ -11,6 +11,7 @@ Run: make test-autopilot   (or python3 tests/test_autopilot.py)
 import json
 import os
 import re
+import struct
 import sys
 import unittest
 
@@ -803,24 +804,31 @@ class TestTemplateExclusions(unittest.TestCase):
             self.assertIn("_socket_allowlist_policy", cfg,
                           "%s: the policy must be documented in place" % name)
 
-    def test_autopilot_units_do_not_run_as_root(self):
-        """The units must name a User. Running as the daemon's own account
-        is deliberate: verification needs the O-Key, VIRP signs with
-        symmetric HMAC, and virp_key_load_file refuses a group-readable key
-        — so a separate uid could only verify by weakening key hygiene or
-        duplicating the signing key. Documented in the units themselves."""
+    def test_autopilot_units_run_as_their_own_identity(self):
+        """The units must name a User, and since feat/autopilot-nondaemon-uid
+        (2026-11-04) it is virp-autopilot (uid 971), NOT the daemon's own
+        account: the owner policy refuses to load when the daemon's uid is
+        a principal, so a client sharing uid 999 is refused BLACK-13 on
+        every execute. The old reason for sharing the uid (verification
+        needed the O-Key) is gone — the client verifies v3 frames with the
+        PUBLIC chain-signing key. Each unit must say why."""
         deploy = os.path.join(REPO_ROOT, "deploy")
         units = [u for u in os.listdir(deploy)
                  if u.startswith("virp-autopilot") and u.endswith(".service")]
-        self.assertTrue(units, "no autopilot units found")
+        self.assertEqual(len(units), 4, units)
         for u in units:
             with open(os.path.join(deploy, u)) as f:
                 text = f.read()
-            self.assertIn("User=virp\n", text,
-                          "%s must run as virp, not root" % u)
+            self.assertIn("User=virp-autopilot\n", text,
+                          "%s must run as virp-autopilot" % u)
+            self.assertIn("Group=virp-autopilot\n", text, u)
+            self.assertNotIn("User=virp\n", text,
+                             "%s must not run as the daemon's uid" % u)
             self.assertNotIn("User=root", text, "%s must not run as root" % u)
-            self.assertIn("insecure mode", text,
-                          "%s must record WHY a separate uid was rejected" % u)
+            self.assertIn("BLACK-13", text,
+                          "%s must record WHY it left the daemon's uid" % u)
+            self.assertIn("PUBLIC", text,
+                          "%s must record how it verifies without a secret" % u)
 
     def test_scan_boundary_semantics(self):
         self.assertTrue(self.blocked_hit('"host": "10.0.10.1"', "10.0.10.1"))
@@ -828,6 +836,133 @@ class TestTemplateExclusions(unittest.TestCase):
         self.assertFalse(self.blocked_hit('"host": "10.0.10.12"', "10.0.10.1"))
         self.assertFalse(self.blocked_hit('"host": "10.0.10.100"', "10.0.10.10"))
 
+
+
+class TestNonDaemonUidVerification(unittest.TestCase):
+    """feat/autopilot-nondaemon-uid: the client holds no O-Key, requests
+    v3 frames, verifies them with the PUBLIC key only, and attests
+    HMAC-only control frames by socket peer credential, labelled so."""
+
+    def setUp(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey)
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat)
+        self.key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+        self.pub = self.key.public_key().public_bytes(Encoding.Raw,
+                                                      PublicFormat.Raw)
+        other = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33)))
+        self.other_pub = other.public_key().public_bytes(Encoding.Raw,
+                                                         PublicFormat.Raw)
+
+    def v3_frame(self, body, obs_type=ap.OBS_DEVICE_OUTPUT, tier=0x01,
+                 version=3, reserved=0, key=None, xo1=True):
+        import hashlib
+        import hmac
+        payload = body
+        if xo1:
+            payload = (ap.XO1_MAGIC + struct.pack("!BBH", obs_type, 1, len(body))
+                       + body)
+        header = struct.pack(ap.OBS_V2_HEADER_FMT, version, 1, tier, reserved,
+                             17, 1, 1, bytes(16), 23,
+                             hashlib.sha256(b"uptime").digest(), len(payload))
+        span = header + payload
+        span += hmac.new(bytes(32), span, hashlib.sha256).digest()
+        return span + (key or self.key).sign(span)
+
+    def test_module_holds_no_okey_path_and_never_calls_inspect(self):
+        self.assertFalse(hasattr(ap, "OKEY_PATH"))
+        src = open(ap.__file__).read()
+        self.assertNotIn('"okey"', src)
+        self.assertNotIn("/etc/virp/keys/onode.key", src)
+        self.assertNotIn("/etc/virp/keys/chain.key", src)
+        self.assertTrue(ap.OBS_PUB_PATH.endswith("chain-sign.pub"))
+
+    def test_execute_request_selects_v3(self):
+        self.assertEqual(ap.execute_request("R1", "show clock"),
+                         {"action": "execute", "device": "R1",
+                          "command": "show clock", "obs_version": 3})
+
+    def test_v3_frame_parses_like_v1(self):
+        raw = self.v3_frame(b"18:02:39 UTC")
+        obs = ap.parse_observation(raw)
+        self.assertEqual(obs["version"], 3)
+        self.assertEqual(obs["tier"], 0x01)
+        self.assertEqual(obs["tier_name"], "GREEN")
+        self.assertEqual(obs["obs_type"], ap.OBS_DEVICE_OUTPUT)
+        self.assertEqual(obs["payload"], "18:02:39 UTC")
+        self.assertEqual(obs["seq"], 1)
+        err = ap.parse_observation(self.v3_frame(b"ERROR: tier gate blocked",
+                                                 obs_type=ap.OBS_ERROR))
+        self.assertEqual(err["obs_type"], ap.OBS_ERROR)
+
+    def test_v3_verifies_with_the_public_key_only(self):
+        raw = self.v3_frame(b"up 5 days")
+        self.assertTrue(ap.verify_observation(raw, pub=self.pub))
+        self.assertFalse(ap.verify_observation(raw, pub=self.other_pub))
+        bad = bytearray(raw)
+        bad[ap.OBS_V2_HEADER_LEN + 12] ^= 1           # one body byte
+        self.assertFalse(ap.verify_observation(bytes(bad), pub=self.pub))
+        bad = bytearray(raw)
+        bad[-1] ^= 1                                  # one signature byte
+        self.assertFalse(ap.verify_observation(bytes(bad), pub=self.pub))
+        bad = bytearray(raw)
+        bad[ap.OBS_V2_HEADER_LEN + len(raw) - ap.OBS_V2_HEADER_LEN
+            - ap.OBS_V3_SIG_LEN - 1] ^= 1              # one HMAC byte: inside the span
+        self.assertFalse(ap.verify_observation(bytes(bad), pub=self.pub))
+        self.assertFalse(ap.verify_observation(raw + b"x", pub=self.pub))
+        self.assertFalse(ap.verify_observation(
+            self.v3_frame(b"x", reserved=1), pub=self.pub))
+        self.assertFalse(ap.verify_observation(
+            self.v3_frame(b"x", tier=0xFF), pub=self.pub))
+
+    def test_v1_frames_have_no_public_key_form(self):
+        v1 = struct.pack(ap.HEADER_FMT, 1, 1, 60, 17, 1, 1, 0, 1, 0) \
+            + bytes(32) + struct.pack("!BBH", ap.OBS_DEVICE_OUTPUT, 1, 0)
+        self.assertFalse(ap.verify_observation(v1, pub=self.pub))
+        self.assertEqual(ap.parse_observation(v1)["version"], 1)
+
+    def test_load_obs_pub_refuses_a_secret(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(bytes(64))
+        try:
+            with self.assertRaises(ValueError):
+                ap.load_obs_pub(f.name)
+        finally:
+            os.unlink(f.name)
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(self.pub.hex().encode() + b"\n")
+        try:
+            self.assertEqual(ap.load_obs_pub(f.name), self.pub)
+        finally:
+            os.unlink(f.name)
+
+    def test_control_frame_attestation_is_peer_credential_not_signature(self):
+        v1 = struct.pack(ap.HEADER_FMT, 1, 1, 60, 17, 1, 1, 0, 1, 0) \
+            + bytes(32) + struct.pack("!BBH", ap.OBS_OUTCOME_SIGNED, 1, 0)
+        saved = (ap.LAST_PEER_UID, ap.DAEMON_UID)
+        try:
+            ap.LAST_PEER_UID, ap.DAEMON_UID = 999, 999
+            self.assertTrue(ap.attest_control_frame(v1))
+            ap.LAST_PEER_UID, ap.DAEMON_UID = 1000, 999
+            self.assertFalse(ap.attest_control_frame(v1))
+            ap.LAST_PEER_UID, ap.DAEMON_UID = None, None
+            self.assertFalse(ap.attest_control_frame(v1))
+            ap.LAST_PEER_UID, ap.DAEMON_UID = 999, 999
+            self.assertFalse(ap.attest_control_frame(struct.pack(">i", -50)))
+        finally:
+            ap.LAST_PEER_UID, ap.DAEMON_UID = saved
+
+    def test_execute_paths_never_fall_back_to_attestation(self):
+        # Reads the source: every execute result goes through
+        # verify_observation (public key); attest_control_frame is used
+        # only on sign_outcome / chain_verify_session replies.
+        src = open(ap.__file__).read()
+        for fn in ("run_cycle", "run_corpus"):
+            body = src.split("def %s(" % fn, 1)[1].split("\ndef ", 1)[0]
+            self.assertNotIn("attest_control_frame", body, fn)
+            self.assertIn("verify_observation(raw)", body, fn)
 
 if __name__ == "__main__":
     r = unittest.main(exit=False, verbosity=1)
