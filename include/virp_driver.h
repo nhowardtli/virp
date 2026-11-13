@@ -93,6 +93,17 @@ typedef struct {
      */
     uint64_t        device_id;
     bool            enabled;
+    /*
+     * Per-device tier cap ("max_tier" in devices.json). 0
+     * (VIRP_TIER_UNCLASSIFIED) means NO cap — the zero-initialized
+     * default, so every existing device behaves as before. Otherwise one
+     * of VIRP_TIER_GREEN/YELLOW/RED: the highest tier that may execute on
+     * THIS device without a signed approval, for every caller. It only
+     * TIGHTENS the ceiling the node-wide / per-uid / policy logic arrived
+     * at; it never raises one. BLACK is not a ceiling and is refused at
+     * onode_add_device().
+     */
+    virp_trust_tier_t max_tier;
     bool            cisco_health_version; /* root config: fixed version probe; default clock */
     /* Vendor-optional (FortiGate) — zero-initialized for other vendors */
     char            api_token[256];     /* REST API Bearer token */

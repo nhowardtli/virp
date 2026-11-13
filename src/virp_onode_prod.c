@@ -137,7 +137,8 @@ static void signal_handler(int sig)
  *       "username": "virp-agent",
  *       "password": "secret",
  *       "enable": "secret",
- *       "node_id": "01010101"
+ *       "node_id": "01010101",
+ *       "max_tier": "green"      (optional per-device tier cap)
  *     }
  *   ]
  * }
@@ -851,6 +852,41 @@ int load_devices(onode_state_t *state, const char *path)
 
         if (json_get_bool(dev_obj, "ssh_legacy", &bool_val))
             device.ssh_legacy = bool_val;
+
+        /*
+         * max_tier: per-device tier cap. Exactly "green", "yellow" or
+         * "red" (lowercase, like every tier string the template already
+         * carries). The highest tier that may execute on this device
+         * without a signed approval, for every caller; it only tightens
+         * (see onode_apply_device_cap in virp_onode.c). Absent = no cap.
+         *
+         * Present but not one of those three strings refuses the WHOLE
+         * config. This key exists to protect a device, so the one outcome
+         * that must be impossible is a typo ("gren", "black", true) that
+         * loads the device with no cap and looks configured.
+         */
+        struct json_object *cap_val = NULL;
+        if (json_object_object_get_ex(dev_obj, "max_tier", &cap_val)) {
+            const char *cv = json_object_is_type(cap_val, json_type_string)
+                           ? json_object_get_string(cap_val) : NULL;
+            virp_trust_tier_t cap = VIRP_TIER_UNCLASSIFIED;
+            if (cv && (size_t)json_object_get_string_len(cap_val) == strlen(cv)) {
+                if      (strcmp(cv, "green")  == 0) cap = VIRP_TIER_GREEN;
+                else if (strcmp(cv, "yellow") == 0) cap = VIRP_TIER_YELLOW;
+                else if (strcmp(cv, "red")    == 0) cap = VIRP_TIER_RED;
+            }
+            if (cap == VIRP_TIER_UNCLASSIFIED) {
+                fprintf(stderr, "[O-Node] FATAL: device '%s': max_tier must "
+                        "be \"green\", \"yellow\" or \"red\" — refusing "
+                        "the config rather than loading the device "
+                        "uncapped\n", device.hostname);
+                json_object_put(root);
+                return -1;
+            }
+            device.max_tier = cap;
+            fprintf(stderr, "[O-Node] %s: per-device tier cap max_tier=%s\n",
+                    device.hostname, cv);
+        }
 
         /* cisco_asa only: the operator declares that login already lands
          * in enable mode (aaa authorization exec ... auto-enable), so the

@@ -874,17 +874,74 @@ static virp_trust_tier_t onode_effective_max_tier(const onode_state_t *state,
 }
 
 /*
- * Where the effective ceiling that onode_effective_max_tier() returned came
- * from, for the audit record. "per-uid" only when this uid has a per-uid
- * entry AND that entry is at least as tight as the node-wide ceiling — a
- * LOOSER per-uid entry never binds, because the effective-ceiling helper
- * only tightens, so the node-wide ceiling is what actually decided. Mirrors
- * that helper's logic exactly so the recorded source can never disagree with
- * the recorded effective ceiling.
+ * Per-device tier cap. A device entry may carry "max_tier"
+ * (virp_device_t.max_tier): the highest tier that may execute on THAT
+ * device without a signed approval, whoever is asking. Before this the
+ * only ceilings were node-wide and per-uid, so protecting one device meant
+ * capping identities across the whole fleet (the 2026-09-05 SW-3850 note
+ * in deploy/devices.template.json records the cost of doing it that way).
+ *
+ * A device cap only ever TIGHTENS. It is applied after the node-wide /
+ * per-uid / policy ceiling has been decided, and it binds an explicit RED
+ * per-uid seat too: that seat's entry is authoritative against the NODE's
+ * default, not against a protection written on the device itself. An
+ * over-cap command is refused exactly like any other over-ceiling command
+ * and becomes a proposal; a signed approval admits it, because the cap is
+ * a ceiling on UNAPPROVED execution, the same as every other ceiling here.
+ * 0 (VIRP_TIER_UNCLASSIFIED) means no cap. BLACK is never a valid cap and
+ * onode_add_device() refuses it, so only GREEN/YELLOW/RED can reach here;
+ * anything else is treated as no cap rather than compared numerically
+ * (BLACK is 0xFF and would otherwise read as "looser than everything").
+ */
+static bool onode_device_cap_valid(virp_trust_tier_t cap)
+{
+    return cap == VIRP_TIER_GREEN || cap == VIRP_TIER_YELLOW ||
+           cap == VIRP_TIER_RED;
+}
+
+static virp_trust_tier_t onode_apply_device_cap(virp_trust_tier_t eff,
+                                                virp_trust_tier_t cap)
+{
+    if (onode_device_cap_valid(cap) && cap < eff)
+        return cap;
+    return eff;
+}
+
+/* The cap configured on a device, by hostname; 0 when the device is
+ * unknown or uncapped. Read-only twin of find_device() for the audit
+ * helpers, which hold a const state. */
+static virp_trust_tier_t onode_device_cap_by_name(const onode_state_t *state,
+                                                  const char *device_name)
+{
+    if (!device_name) return VIRP_TIER_UNCLASSIFIED;
+    for (int i = 0; i < state->device_count; i++) {
+        if (strcmp(state->devices[i].hostname, device_name) == 0)
+            return state->devices[i].max_tier;
+    }
+    return VIRP_TIER_UNCLASSIFIED;
+}
+
+/*
+ * Where the effective ceiling came from, for the audit record.
+ *
+ * "per-device" when the device's cap is what actually bound: the recorded
+ * effective ceiling equals the cap AND the cap is strictly tighter than
+ * the ceiling this caller would have had without it. A cap that is equal
+ * to or looser than the caller's own ceiling changed nothing and is not
+ * named. Otherwise "per-uid" when this uid has an explicit entry (which is
+ * authoritative in both directions, see onode_effective_max_tier), else
+ * "node-wide". eff_max is the ceiling the gate actually used, passed in so
+ * the recorded source can never disagree with the recorded ceiling.
  */
 static const char *onode_ceiling_source(const onode_state_t *state,
-                                        uid_t client_uid)
+                                        uid_t client_uid,
+                                        const char *device_name,
+                                        virp_trust_tier_t eff_max)
 {
+    virp_trust_tier_t cap = onode_device_cap_by_name(state, device_name);
+    if (onode_device_cap_valid(cap) && eff_max == cap &&
+        cap < onode_effective_max_tier(state, client_uid))
+        return "per-device";
     if (client_uid == (uid_t)-1) return "node-wide";
     for (size_t i = 0; i < state->uid_ceiling_count; i++) {
         if (state->uid_ceiling_uids[i] == client_uid) {
@@ -1222,7 +1279,8 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
         cJSON_AddStringToObject(o, "effective_max_tier",
                                 gate_tier_name(eff_max));
         cJSON_AddStringToObject(o, "ceiling_source",
-                                onode_ceiling_source(state, client_uid));
+                                onode_ceiling_source(state, client_uid,
+                                    device_name, eff_max));
         cJSON_AddStringToObject(o, "gate_mode",
                                 mode == GATE_MODE_ENFORCE ? "ENFORCE"
                                                           : "SHADOW");
@@ -1478,7 +1536,8 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
         cJSON_AddStringToObject(o, "effective_max_tier",
                                 gate_tier_name(eff_max));
         cJSON_AddStringToObject(o, "ceiling_source",
-                                onode_ceiling_source(state, client_uid));
+                                onode_ceiling_source(state, client_uid,
+                                    device_name, eff_max));
         cJSON_AddStringToObject(o, "gate_mode",
                                 mode == GATE_MODE_ENFORCE ? "ENFORCE"
                                                           : "SHADOW");
@@ -1565,7 +1624,8 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
  *
  * Written once at startup (and available for a config reload) so the chain
  * itself records the posture the node ran under: evidence_required, the
- * default gate mode, the node-wide tier ceiling and any per-uid ceilings,
+ * default gate mode, the node-wide tier ceiling, any per-uid ceilings and
+ * any per-device caps,
  * and the daemon build id. Purpose: a reader of the chain alone can tell
  * the WINDOW in which unrecorded execution was permitted (evidence_required
  * false, or a build predating this work), and Docket can answer the tier-
@@ -1612,6 +1672,23 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
                 cJSON_AddItemToArray(ceils, c);
             }
             cJSON_AddItemToObject(o, "uid_ceilings", ceils);
+        }
+        /* Per-device caps, capped devices only (an uncapped device has no
+         * entry, so an empty array reads as "no device was capped"). */
+        cJSON *dcaps = cJSON_CreateArray();
+        if (dcaps) {
+            for (int i = 0; i < state->device_count; i++) {
+                if (!onode_device_cap_valid(state->devices[i].max_tier))
+                    continue;
+                cJSON *c = cJSON_CreateObject();
+                if (!c) continue;
+                cJSON_AddStringToObject(c, "device",
+                                        state->devices[i].hostname);
+                cJSON_AddStringToObject(c, "ceiling",
+                        gate_tier_name(state->devices[i].max_tier));
+                cJSON_AddItemToArray(dcaps, c);
+            }
+            cJSON_AddItemToObject(o, "device_ceilings", dcaps);
         }
         cJSON *probes = cJSON_CreateArray();
         if (probes) {
@@ -2206,7 +2283,8 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
             cJSON_AddStringToObject(o, "effective_max_tier",
                                     gate_tier_name(eff_max));
             cJSON_AddStringToObject(o, "ceiling_source",
-                                    onode_ceiling_source(state, client_uid));
+                                    onode_ceiling_source(state, client_uid,
+                                    device_name, eff_max));
             /* Which mode refused. ENFORCE entries read exactly as
              * before plus this field; a SHADOW entry can only be a
              * BLACK refusal — the one verdict SHADOW does not
@@ -2724,6 +2802,10 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
          * node-wide ceiling. client_uid == (uid_t)-1 (internal callers)
          * leaves gate_max_tier unchanged. */
         virp_trust_tier_t eff_max = policy_call.policy ? policy_call.action.ceiling : onode_effective_max_tier(state, client_uid);
+        /* Per-device cap: tightens whatever was decided above, on this
+         * device only, for every caller and on the policy path too. */
+        eff_max = onode_apply_device_cap(eff_max,
+                                         state->devices[dev_idx].max_tier);
         bool block = gate_tier_blocks(gate_tier, eff_max);
 
         gate_mode = mode;
@@ -6435,6 +6517,19 @@ virp_error_t onode_add_device(onode_state_t *state,
 
     if (state->device_count >= ONODE_MAX_DEVICES)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
+
+    /* Per-device tier cap: absent (0) or exactly GREEN/YELLOW/RED. Checked
+     * here, at the one choke point every loader goes through, so a cap
+     * that cannot be honoured refuses the device instead of loading it
+     * uncapped. BLACK is not a ceiling. */
+    if (device->max_tier != VIRP_TIER_UNCLASSIFIED &&
+        !onode_device_cap_valid(device->max_tier)) {
+        fprintf(stderr, "[O-Node] FATAL: device '%s' carries an invalid "
+                "max_tier (0x%02x). A device cap is green, yellow or red; "
+                "refusing the device rather than loading it uncapped.\n",
+                device->hostname, (unsigned)device->max_tier);
+        return VIRP_ERR_INVALID_TYPE;
+    }
 
     memcpy(&state->devices[state->device_count], device, sizeof(*device));
 

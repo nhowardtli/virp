@@ -2290,6 +2290,177 @@ TEST(test_per_uid_ceiling_caps_yellow_but_not_uncapped)
     errobs_teardown(&tmp);
 }
 
+/* =========================================================================
+ * Per-device tier cap ("max_tier" on a device entry)
+ *
+ * Until this existed the only ceilings were node-wide gate_max_tier and
+ * the per-uid map, so protecting ONE device (the switch that carries the
+ * colo) meant capping identities fleet-wide. A device cap TIGHTENS the
+ * ceiling for every caller on that device and for no other device; it can
+ * never raise a ceiling, and an explicit RED per-uid seat does not get
+ * past it.
+ * ========================================================================= */
+static int devcap_capture(onode_state_t *tmp, const char *device,
+                          const char *cmd, uid_t uid,
+                          uint8_t *buf, size_t bufsz, size_t *len,
+                          char *logbuf, size_t logsz)
+{
+    const char *log_path = "/tmp/virp-onode-devcap.log";
+    fflush(stderr);
+    int saved_fd = dup(fileno(stderr));
+    if (saved_fd < 0) return -1;
+    int log_fd = open(log_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (log_fd < 0) { close(saved_fd); return -1; }
+    dup2(log_fd, fileno(stderr));
+    close(log_fd);
+
+    virp_error_t err = onode_execute_obs_ex(tmp, device, cmd, 1, NULL,
+                                            uid, buf, bufsz, len);
+
+    fflush(stderr);
+    dup2(saved_fd, fileno(stderr));
+    close(saved_fd);
+
+    FILE *lf = fopen(log_path, "r");
+    if (!lf) return -1;
+    size_t got = fread(logbuf, 1, logsz - 1, lf);
+    fclose(lf);
+    unlink(log_path);
+    logbuf[got] = '\0';
+    return (err == VIRP_OK) ? 0 : -1;
+}
+
+static int devcap_add(onode_state_t *tmp, const char *hostname,
+                      uint32_t node_id, virp_trust_tier_t cap)
+{
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "%s", hostname);
+    snprintf(dev.host, sizeof(dev.host), "10.255.0.2");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = node_id;
+    dev.enabled = true;
+    dev.max_tier = cap;
+    return (onode_add_device(tmp, &dev) == VIRP_OK) ? 0 : -1;
+}
+
+/* A GREEN-capped device refuses YELLOW and RED from EVERY identity — the
+ * uncapped internal caller and a seat holding an explicit RED ceiling —
+ * while reads still pass, and the sibling device with no cap is untouched. */
+TEST(test_device_cap_binds_every_identity_on_that_device_only)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-OPEN", 0xE2200031), 0);   /* no cap */
+    ASSERT_EQ(devcap_add(&tmp, "SW-CORE", 0x0E220032, VIRP_TIER_GREEN), 0);
+
+    const uid_t red_seat = 4984;
+    uid_t cu[1] = { red_seat };
+    virp_trust_tier_t ct[1] = { VIRP_TIER_RED };
+    ASSERT_OK(onode_set_uid_ceilings(&tmp, cu, ct, 1));
+
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    char logbuf[4096];
+
+    /* 1. YELLOW from the uncapped internal caller: node-wide YELLOW would
+     *    allow it; the device cap refuses it and says GREEN decided. */
+    devcap_capture(&tmp, "SW-CORE", "clear counters", (uid_t)-1,
+                   buf, sizeof(buf), &len, logbuf, sizeof(logbuf));
+    {
+        virp_observation_t obs; const uint8_t *data; uint16_t dl;
+        ASSERT_OK(virp_parse_observation(buf + VIRP_HEADER_SIZE,
+                                         len - VIRP_HEADER_SIZE, &obs, &data, &dl));
+        ASSERT_EQ(obs.obs_type, VIRP_OBS_ERROR);
+        ASSERT_TRUE(strstr((const char *)data, "tier gate blocked") != NULL);
+        ASSERT_TRUE(strstr((const char *)data, "max=GREEN") != NULL);
+    }
+    ASSERT_TRUE(strstr(logbuf, "threshold=GREEN") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=block") != NULL);
+
+    /* 2. RED from the explicit RED seat: that seat's ceiling is
+     *    authoritative against the NODE, not against a device cap. */
+    devcap_capture(&tmp, "SW-CORE", "reload", red_seat,
+                   buf, sizeof(buf), &len, logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=GREEN") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=block") != NULL);
+
+    /* 3. YELLOW from the RED seat: also refused. */
+    devcap_capture(&tmp, "SW-CORE", "clear counters", red_seat,
+                   buf, sizeof(buf), &len, logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=GREEN") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=block") != NULL);
+
+    /* 4. A read on the capped device still passes. */
+    devcap_capture(&tmp, "SW-CORE", "show version", (uid_t)-1,
+                   buf, sizeof(buf), &len, logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=GREEN") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=allow") != NULL);
+
+    /* 5. The SIBLING device is not capped: same callers, same commands,
+     *    the ceilings they had before. */
+    devcap_capture(&tmp, "R-OPEN", "clear counters", (uid_t)-1,
+                   buf, sizeof(buf), &len, logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=YELLOW") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=allow") != NULL);
+    devcap_capture(&tmp, "R-OPEN", "reload", red_seat,
+                   buf, sizeof(buf), &len, logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=RED") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=allow") != NULL);
+
+    /* 6. BLACK stays refused on the capped device. */
+    devcap_capture(&tmp, "SW-CORE", "selfdestruct", red_seat,
+                   buf, sizeof(buf), &len, logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "decision=block") != NULL);
+
+    errobs_teardown(&tmp);
+}
+
+/* A device cap only ever TIGHTENS. A RED cap on a YELLOW node raises
+ * nothing, and it does not lift a GREEN per-uid ceiling. */
+TEST(test_device_cap_never_raises_a_ceiling)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-OPEN", 0xE2200033), 0);
+    ASSERT_EQ(devcap_add(&tmp, "SW-LOOSE", 0x0E220034, VIRP_TIER_RED), 0);
+
+    const uid_t green_seat = 4993;
+    uid_t cu[1] = { green_seat };
+    virp_trust_tier_t ct[1] = { VIRP_TIER_GREEN };
+    ASSERT_OK(onode_set_uid_ceilings(&tmp, cu, ct, 1));
+
+    uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    char logbuf[4096];
+
+    /* node-wide YELLOW still decides for the uncapped caller. */
+    devcap_capture(&tmp, "SW-LOOSE", "reload", (uid_t)-1,
+                   buf, sizeof(buf), &len, logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=YELLOW") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=block") != NULL);
+
+    /* the GREEN seat stays GREEN. */
+    devcap_capture(&tmp, "SW-LOOSE", "clear counters", green_seat,
+                   buf, sizeof(buf), &len, logbuf, sizeof(logbuf));
+    ASSERT_TRUE(strstr(logbuf, "threshold=GREEN") != NULL);
+    ASSERT_TRUE(strstr(logbuf, "decision=block") != NULL);
+
+    errobs_teardown(&tmp);
+}
+
+/* onode_add_device is the choke point for device config: a cap that is
+ * not GREEN/YELLOW/RED (or absent) is refused there, whichever loader
+ * supplied it. BLACK is not a ceiling. */
+TEST(test_device_cap_invalid_value_refused_at_add)
+{
+    onode_state_t tmp;
+    ASSERT_EQ(errobs_setup(&tmp, "R-OPEN", 0xE2200035), 0);
+    ASSERT_EQ(devcap_add(&tmp, "SW-BLACK", 0x0E220036, VIRP_TIER_BLACK), -1);
+    ASSERT_EQ(devcap_add(&tmp, "SW-JUNK", 0x0E220037, (virp_trust_tier_t)7), -1);
+    ASSERT_EQ(tmp.device_count, 1);
+    errobs_teardown(&tmp);
+}
+
 /* (a) Connection failure to an unreachable device, GREEN read: the error
  * observation must be VIRP_OBS_ERROR at tier GREEN (the read's true
  * tier) — not a DEVICE_OUTPUT observation the consumer logs as a change. */
@@ -2777,6 +2948,50 @@ TEST(test_load_devices_cisco_health_probe)
     }
 }
 
+/* The loader: "max_tier" accepts exactly green/yellow/red. Anything else
+ * refuses the WHOLE config — a protective cap that did not parse must not
+ * load as "no cap". */
+TEST(test_load_devices_max_tier)
+{
+    const char *values[] = { "\"green\"", "\"yellow\"", "\"red\"",
+                             "\"black\"", "\"purple\"", "\"\"", "null",
+                             "true", "1", "[\"green\"]",
+                             "\"green\\u0000x\"", "\"GREEN \"" };
+    const virp_trust_tier_t want[] = { VIRP_TIER_GREEN, VIRP_TIER_YELLOW,
+                                       VIRP_TIER_RED };
+    for (size_t i = 0; i < sizeof(values)/sizeof(values[0]); i++) {
+        FILE *f = fopen(WRONG_TYPE_CFG, "w"); ASSERT_TRUE(f != NULL);
+        fprintf(f, "{\"devices\":[{\"hostname\":\"SW-CAP\",\"host\":\"127.0.0.1\","
+                   "\"vendor\":\"mock\",\"node_id\":9,\"max_tier\":%s}]}",
+                values[i]);
+        fclose(f);
+        onode_state_t tmp;
+        ASSERT_OK(onode_init(&tmp, 9, NULL, "/tmp/virp-devcap-load.sock"));
+        tmp.ctx = virp_context_new(); ASSERT_TRUE(tmp.ctx != NULL);
+        int loaded = load_devices(&tmp, WRONG_TYPE_CFG);
+        if (i < 3) {
+            ASSERT_EQ(loaded, 1);
+            ASSERT_EQ(tmp.devices[0].max_tier, want[i]);
+        } else {
+            ASSERT_EQ(loaded, -1);
+            ASSERT_EQ(tmp.device_count, 0);
+        }
+        onode_destroy(&tmp); virp_context_destroy(tmp.ctx); unlink(WRONG_TYPE_CFG);
+    }
+
+    /* Absent key: no cap, device loads as before. */
+    FILE *f = fopen(WRONG_TYPE_CFG, "w"); ASSERT_TRUE(f != NULL);
+    fprintf(f, "{\"devices\":[{\"hostname\":\"SW-NOCAP\",\"host\":\"127.0.0.1\","
+               "\"vendor\":\"mock\",\"node_id\":9}]}");
+    fclose(f);
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 9, NULL, "/tmp/virp-devcap-load.sock"));
+    tmp.ctx = virp_context_new(); ASSERT_TRUE(tmp.ctx != NULL);
+    ASSERT_EQ(load_devices(&tmp, WRONG_TYPE_CFG), 1);
+    ASSERT_EQ(tmp.devices[0].max_tier, VIRP_TIER_UNCLASSIFIED);
+    onode_destroy(&tmp); virp_context_destroy(tmp.ctx); unlink(WRONG_TYPE_CFG);
+}
+
 /*
  * Issue #14: a cisco_asa entry with no "enable" credential is refused
  * at load, not loaded to churn. The ASA driver's health check needs
@@ -3097,6 +3312,77 @@ TEST(test_node_config_best_effort_when_not_required)
     ASSERT_EQ(pthread_timedjoin_np(th, NULL, &dl), 0);
     onode_destroy(&nc_state);
     virp_context_destroy(nc_state.ctx);
+    nc_cleanup();
+}
+
+/* The posture record names every capped device, so a reader of the chain
+ * alone can tell which devices were protected in a given boot window —
+ * the same reason uid_ceilings is recorded. Uncapped devices are absent. */
+TEST(test_node_config_records_device_ceilings)
+{
+    nc_cleanup();
+    virp_signing_key_t ck;
+    ASSERT_OK(virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN));
+    ASSERT_OK(virp_key_save_file(&ck, NC_CHAIN_KEY));
+    virp_key_destroy(&ck);
+    ASSERT_OK(onode_init(&nc_state, 0xDEAD00C1, NULL, NC_SOCKET));
+    nc_state.ctx = virp_context_new();
+    ASSERT_TRUE(nc_state.ctx != NULL);
+    nc_state.evidence_required = true;
+    ASSERT_OK(virp_chain_init(&nc_state.chain, NC_CHAIN_DB, NC_CHAIN_KEY,
+                              0xDEAD00C1, "local"));
+    nc_state.chain_enabled = true;
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    dev.port = 22; dev.vendor = VIRP_VENDOR_MOCK; dev.enabled = true;
+    snprintf(dev.hostname, sizeof(dev.hostname), "SW-CAPPED");
+    snprintf(dev.host, sizeof(dev.host), "10.255.0.3");
+    dev.node_id = 0x0E2200C1; dev.max_tier = VIRP_TIER_GREEN;
+    ASSERT_OK(onode_add_device(&nc_state, &dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "R-UNCAPPED");
+    snprintf(dev.host, sizeof(dev.host), "10.255.0.4");
+    dev.node_id = 0x0E2200C2; dev.max_tier = VIRP_TIER_UNCLASSIFIED;
+    ASSERT_OK(onode_add_device(&nc_state, &dev));
+
+    pthread_t th;
+    ASSERT_EQ(pthread_create(&th, NULL, nc_start_thread, NULL), 0);
+    int bound = 0;
+    for (int i = 0; i < 100; i++) {
+        if (access(NC_SOCKET, F_OK) == 0) { bound = 1; break; }
+        usleep(20000);
+    }
+    ASSERT_TRUE(bound);
+    onode_shutdown(&nc_state);
+    int poke = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (poke >= 0) {
+        struct sockaddr_un a; memset(&a, 0, sizeof(a));
+        a.sun_family = AF_UNIX;
+        snprintf(a.sun_path, sizeof(a.sun_path), "%s", NC_SOCKET);
+        (void)connect(poke, (struct sockaddr *)&a, sizeof(a));
+        close(poke);
+    }
+    struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 15;
+    ASSERT_EQ(pthread_timedjoin_np(th, NULL, &dl), 0);
+    onode_destroy(&nc_state);
+    virp_context_destroy(nc_state.ctx);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(NC_CHAIN_DB, &db), SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT a.artifact_content FROM chain_entries e "
+        "LEFT JOIN artifacts a ON a.artifact_id = e.artifact_id "
+        "WHERE e.artifact_type = 'node_config' "
+        "ORDER BY e.id DESC LIMIT 1", -1, &st, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    const char *body = (const char *)sqlite3_column_text(st, 0);
+    ASSERT_TRUE(body != NULL);
+    ASSERT_TRUE(strstr(body, "\"device_ceilings\":[{\"device\":\"SW-CAPPED\","
+                             "\"ceiling\":\"GREEN\"}]") != NULL);
+    ASSERT_TRUE(strstr(body, "R-UNCAPPED") == NULL);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
     nc_cleanup();
 }
 
@@ -3464,6 +3750,73 @@ TEST(test_gate_rejection_records_per_uid_effective_ceiling)
     ASSERT_TRUE(strstr(body, "\"gate_max_tier\":\"YELLOW\"") != NULL);
     ASSERT_TRUE(strstr(body, "\"effective_max_tier\":\"GREEN\"") != NULL);
     ASSERT_TRUE(strstr(body, "\"ceiling_source\":\"per-uid\"") != NULL);
+
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    gr_cleanup();
+}
+
+/* The device-cap refusal explains itself in the chain: a YELLOW command,
+ * a YELLOW node, a caller with NO per-uid entry — only the device cap
+ * accounts for the refusal, and the record must name it. */
+TEST(test_gate_rejection_records_per_device_ceiling)
+{
+    gr_cleanup();
+
+    virp_signing_key_t ck;
+    ASSERT_OK(virp_key_generate(&ck, VIRP_KEY_TYPE_CHAIN));
+    ASSERT_OK(virp_key_save_file(&ck, GR_CHAIN_KEY));
+    virp_key_destroy(&ck);
+
+    onode_state_t tmp;
+    ASSERT_OK(onode_init(&tmp, 0xDEAD0009, NULL, "/tmp/virp-onode-grdevcap.sock"));
+    tmp.ctx = virp_context_new();
+    ASSERT_TRUE(tmp.ctx != NULL);
+    tmp.gate_default_mode = GATE_MODE_ENFORCE;
+    tmp.gate_max_tier = VIRP_TIER_YELLOW;
+
+    ASSERT_OK(onode_setup_chain_and_approvals(&tmp, 0xDEAD0009,
+                                              GR_CHAIN_DB, GR_CHAIN_KEY,
+                                              "/tmp/virp-onode-test-grdevcapappr",
+                                              "/tmp/virp-onode-test-no-registry"));
+    ASSERT_EQ((int)tmp.chain_enabled, 1);
+
+    virp_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    snprintf(dev.hostname, sizeof(dev.hostname), "SW-CAP-REC");
+    snprintf(dev.host, sizeof(dev.host), "10.0.0.97");
+    dev.port = 22;
+    dev.vendor = VIRP_VENDOR_MOCK;
+    dev.node_id = 0x0BADCEE2;
+    dev.enabled = true;
+    dev.max_tier = VIRP_TIER_GREEN;
+    ASSERT_OK(onode_add_device(&tmp, &dev));
+
+    uint8_t obs_buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t obs_len = 0;
+    ASSERT_OK(onode_execute_obs_ex(&tmp, "SW-CAP-REC", "clear counters",
+                                   1, NULL, (uid_t)4000,
+                                   obs_buf, sizeof(obs_buf), &obs_len));
+
+    onode_destroy(&tmp);
+    virp_context_destroy(tmp.ctx);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(GR_CHAIN_DB, &db), SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "SELECT a.artifact_content FROM chain_entries e "
+        "LEFT JOIN artifacts a ON a.artifact_id = e.artifact_id "
+        "WHERE e.artifact_type = 'gate_rejection' "
+        "ORDER BY e.id DESC LIMIT 1", -1, &st, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    const char *body = (const char *)sqlite3_column_text(st, 0);
+    ASSERT_TRUE(body != NULL && body[0] != '\0');
+
+    ASSERT_TRUE(strstr(body, "\"classified_tier\":\"YELLOW\"") != NULL);
+    ASSERT_TRUE(strstr(body, "\"gate_max_tier\":\"YELLOW\"") != NULL);
+    ASSERT_TRUE(strstr(body, "\"effective_max_tier\":\"GREEN\"") != NULL);
+    ASSERT_TRUE(strstr(body, "\"ceiling_source\":\"per-device\"") != NULL);
 
     sqlite3_finalize(st);
     sqlite3_close(db);
@@ -8492,6 +8845,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_load_devices_refuses_absent_node_id);
     RUN_TEST(test_load_devices_skips_missing_required_fields);
     RUN_TEST(test_load_devices_cisco_health_probe);
+    RUN_TEST(test_load_devices_max_tier);
     RUN_TEST(test_load_devices_refuses_asa_without_enable);
     RUN_TEST(test_add_device_rejects_duplicate_identities);
     RUN_TEST(test_load_devices_duplicate_identities_fatal);
@@ -8500,6 +8854,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_blocked_address_text_scan);
     RUN_TEST(test_node_config_fatal_when_evidence_required);
     RUN_TEST(test_node_config_best_effort_when_not_required);
+    RUN_TEST(test_node_config_records_device_ceilings);
     RUN_TEST(test_load_devices_refuses_nonboolean_evidence_required);
     RUN_TEST(test_load_devices_accepts_boolean_evidence_required);
     RUN_TEST(test_load_devices_allows_former_blocked_addresses);
@@ -8508,6 +8863,7 @@ int main(int argc, char **argv)
     printf("\n[Gate-reason retention (chain body recoverable)]\n");
     RUN_TEST(test_gate_rejection_reason_body_is_retained_and_matches_commitment);
     RUN_TEST(test_gate_rejection_records_per_uid_effective_ceiling);
+    RUN_TEST(test_gate_rejection_records_per_device_ceiling);
 
     printf("\n[GREEN auto-execution records (chain covers what was allowed)]\n");
     RUN_TEST(test_declared_refusal_with_body_routes_to_error);
@@ -8623,6 +8979,9 @@ int main(int argc, char **argv)
     RUN_TEST(test_provable_no_dispatch_retry_retained);
     RUN_TEST(test_error_obs_gate_block_logs_as_error_not_change);
     RUN_TEST(test_per_uid_ceiling_caps_yellow_but_not_uncapped);
+    RUN_TEST(test_device_cap_binds_every_identity_on_that_device_only);
+    RUN_TEST(test_device_cap_never_raises_a_ceiling);
+    RUN_TEST(test_device_cap_invalid_value_refused_at_add);
     RUN_TEST(test_black_ceiling_rejected_and_red_remains_scoped);
 
     printf("\n--- Watchdog / execute serialization (finding N3) ---\n");

@@ -476,6 +476,37 @@ follow-up hardening.
 > runs today. The TODO text is retained unedited as the record;
 > corrected here in the house style rather than silently rewritten.
 
+> **Added 2026-11-13: a per-device cap.** Until this date the only
+> ceilings were node-wide (`gate_max_tier`) and per-uid, so protecting
+> ONE device meant capping identities across the whole fleet (the
+> 2026-09-05 SW-3850 note in `deploy/devices.template.json` records
+> doing exactly that). A device entry may now carry
+> `"max_tier": "green" | "yellow" | "red"`: the highest tier that may
+> execute on that device without a signed approval, for every caller.
+> What it does and does not do:
+>
+> - It only TIGHTENS. It is applied after the node-wide, per-uid or
+>   policy ceiling is decided and can never raise one. It binds an
+>   explicit RED per-uid seat too.
+> - It is a ceiling on UNAPPROVED execution, the same as the others. An
+>   over-cap command is refused, files a proposal, and a signed approval
+>   admits it once. It is not a hard wall, and BLACK is unaffected.
+> - A value that is present but is not one of the three strings refuses
+>   the whole config at load. A typo must not load the device uncapped.
+> - The chain explains it: a refusal decided by the cap records
+>   `ceiling_source: "per-device"`, and `node_config` lists capped
+>   devices under `device_ceilings`.
+> - It is keyed on the device's HOSTNAME as configured on this node. It
+>   says nothing about the same device reached through another node.
+>
+> Tests: `test_device_cap_*`, `test_load_devices_max_tier`,
+> `test_gate_rejection_records_per_device_ceiling`,
+> `test_node_config_records_device_ceilings` (make test-onode) and
+> `make test-device-cap-approval`. NOT yet deployed on any node, and no
+> device in the tracked template carries a cap: adding one, and
+> loosening the fleet-wide uid pins it would replace, is an operator
+> decision made per node.
+
 ## Ed25519 Observation Signing (added 2026-08-07)
 
 **The scheme.** Observations can now additionally be emitted as wire
