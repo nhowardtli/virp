@@ -1592,6 +1592,13 @@ VIRP_INSTALL_BIN  = $(VIRP_INSTALL_DIR)/virp-onode-prod
 # Scripts the unit executes. These are as load-bearing as the binary —
 # an edit to render-devices.sh in a worktree would change daemon
 # behaviour on the next restart just as surely as a rebuilt binary.
+#
+# This variable is the ONE list of them. deploy-capture and the rollback
+# target each used to carry their own hand-typed copy, and both copies
+# stopped at four names when sean-access.sh became the fifth: an install
+# replaced five scripts, the pre-install capture saved four, and a
+# rollback restored four, leaving sean-access.sh at the version being
+# rolled back FROM. Both now derive from this list.
 VIRP_INSTALL_SCRIPTS = deploy/render-devices.sh \
                        deploy/config-backup-access.sh \
                        deploy/evidence-access.sh \
@@ -1742,10 +1749,7 @@ deploy-capture:
 	 echo "=== capturing current install -> $$dst ==="; \
 	 for f in $(VIRP_INSTALL_BIN) \
 	          $(VIRP_INSTALL_TOOL) \
-	          $(VIRP_INSTALL_DIR)/render-devices.sh \
-	          $(VIRP_INSTALL_DIR)/config-backup-access.sh \
-	          $(VIRP_INSTALL_DIR)/evidence-access.sh \
-	          $(VIRP_INSTALL_DIR)/netclaw-access.sh; do \
+	          $(addprefix $(VIRP_INSTALL_DIR)/,$(notdir $(VIRP_INSTALL_SCRIPTS))); do \
 	     if [ -f "$$f" ]; then cp -a "$$f" $$dst/; echo "  captured $$f"; \
 	     else echo "  ABSENT   $$f"; fi; \
 	 done; \
@@ -2063,6 +2067,22 @@ install-wazuh-lab-dropin:
 # Verifies the capture's own manifest first, so a corrupted or partial
 # capture is refused rather than half-restored. Does NOT restart.
 # -------------------------------------------------------------------------
+# Every script install-prod replaces must also be captured before the
+# install and restored by a rollback. Asserted against the recipes make
+# would actually run (`make -n`), not against the variable, so a recipe
+# that goes back to a hand-typed list fails here.
+.PHONY: test-install-script-lists
+test-install-script-lists:
+	@fail=0; \
+	 cap=$$($(MAKE) -n --no-print-directory deploy-capture 2>/dev/null); \
+	 rb=$$($(MAKE) -n --no-print-directory rollback-prod ROLLBACK_FROM=/nonexistent 2>/dev/null); \
+	 for b in $(notdir $(VIRP_INSTALL_SCRIPTS)); do \
+	     printf '%s' "$$cap" | grep -q "/$$b" || { echo "FAIL: deploy-capture does not capture $$b"; fail=1; }; \
+	     printf '%s' "$$rb"  | grep -qw "$$b" || { echo "FAIL: rollback-prod does not restore $$b"; fail=1; }; \
+	 done; \
+	 [ $$fail -eq 0 ] && echo "  PASS: capture and rollback cover all $(words $(VIRP_INSTALL_SCRIPTS)) installed scripts"; \
+	 exit $$fail
+
 .PHONY: rollback-prod
 rollback-prod:
 	@test -n "$(ROLLBACK_FROM)" || \
@@ -2082,7 +2102,7 @@ rollback-prod:
 	     install -m 0755 "$(ROLLBACK_FROM)/virp-tool" $(VIRP_INSTALL_TOOL); \
 	     ln -f $(VIRP_INSTALL_TOOL) $(VIRP_INSTALL_TOOL_ALIAS); \
 	     echo "  restored $(VIRP_INSTALL_TOOL)"; fi
-	@for b in render-devices.sh config-backup-access.sh evidence-access.sh netclaw-access.sh; do \
+	@for b in $(notdir $(VIRP_INSTALL_SCRIPTS)); do \
 	     if [ -f "$(ROLLBACK_FROM)/$$b" ]; then \
 	         install -m 0755 "$(ROLLBACK_FROM)/$$b" $(VIRP_INSTALL_DIR)/$$b; \
 	         echo "  restored $(VIRP_INSTALL_DIR)/$$b"; fi; \
@@ -2499,7 +2519,7 @@ test-release-tools:
 	@scripts/verify-release-bundle.sh --selftest
 	@scripts/check-release-tag.sh --selftest
 
-all-tests: test-execute-v3 check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-tacacs test-tacacs-evidence-ham test-tacacs-authz test-tacacs-ham test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-verifier-error test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-json-hygiene test-obskey test-obs-ed25519 test-obs-v3-vectors test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chain-signing-migration test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api test-health-uid-passthrough test-virp-shell
+all-tests: test-execute-v3 check-deploy-unit check-pbs-pin check-live-fence check-socket-path check-shared-readpath check-obs-build-ordering test test-onode test-scrub test-ssh-io test-fg-scrub test-body-filter test-cisco-scrub test-asa-scrub test-linux-scrub test-linux-connect test-drivers test-refusal-contract test-autopilot test-config-backup test-render-devices test-deploy-dirty-guard test-deploy-record-facts test-install-script-lists test-tacacs test-tacacs-evidence-ham test-tacacs-authz test-tacacs-ham test-tacacs-identities test-template-uid-policy test-evidence test-virp-report test-verifier-error test-chain test-evidence-binding test-consume-ordering test-apply-daemon test-evidence-fi test-approved-outcome-fi test-chain-invariant test-federation test-interop test-session test-session-key test-obs-v2 test-json-hygiene test-obskey test-obs-ed25519 test-obs-v3-vectors test-obs-ed25519-forge test-obs-ed25519-neg test-chainsign test-chain-signing test-chain-signing-migration test-chainsign-vectors test-validator test-approval test-approvers test-pkcs11 test-build-id test-commitment-grading test-chain-append-policy test-open-execution-grading test-fed-outcome-observation test-release-tools test-api test-health-uid-passthrough test-virp-shell
 	@echo "=== all suites ran; verifying none of them SILENTLY SKIPPED ==="
 	@$(MAKE) --no-print-directory check-test-deps
 

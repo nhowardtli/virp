@@ -1,0 +1,16 @@
+# unit-exec-exempt.txt — paths a tracked unit executes that are NOT
+# compared byte-for-byte through deploy/unit-manifest.txt.
+#
+# scripts/check-unit-drift.sh fails when a unit executes a path under
+# /usr/local/lib/virp or /opt/virp that is in neither file. An entry here
+# is a statement that something ELSE establishes what that file is, and
+# it must say what. "It is fine" is not a reason. Every line is one more
+# executed file nobody diffs.
+#
+# Format: <installed-path> <the check that covers it instead>
+
+# A build artifact: there is no tracked file to compare it with. Its
+# identity is established by the build id the binary reports against the
+# deploy tree's commit (scripts/check-deploy-build-id.sh, part of
+# `make check-deploy-unit`).
+/usr/local/lib/virp/virp-onode-prod check-deploy-build-id

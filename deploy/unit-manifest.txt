@@ -142,3 +142,45 @@ deploy/virp-onode-sean.dropin.conf /etc/systemd/system/virp-onode.service.d/53-s
 # against its tracked source — being deliberate is not the same as being
 # unmanaged.
 deploy/virp-onode-wazuh-lab.dropin.conf /etc/systemd/system/virp-onode.service.d/60-wazuh-lab.conf
+
+# ── scripts and modules the units EXECUTE (added 2026-11-13) ──────────
+#
+# Everything above compares a unit file. A unit file is a pointer, and
+# until this section nothing compared what the pointers point at. On
+# 2026-08-10 the repo copy of render-devices.sh gained two names in its
+# render tuple, the daemon went on running the installed copy without
+# them, and the restart crash-looped with every unit check green.
+# scripts/check-unit-drift.sh now FAILS when a tracked unit executes a
+# path under the install root or the deploy tree that is neither listed
+# here nor named in deploy/unit-exec-exempt.txt, so this list cannot
+# fall behind the units silently.
+#
+# Same rules as every pair above: absent on a node is skipped, present
+# must be byte-identical, root:root, not group/world writable.
+deploy/render-devices.sh /usr/local/lib/virp/render-devices.sh
+deploy/config-backup-access.sh /usr/local/lib/virp/config-backup-access.sh
+deploy/evidence-access.sh /usr/local/lib/virp/evidence-access.sh
+deploy/netclaw-access.sh /usr/local/lib/virp/netclaw-access.sh
+deploy/sean-access.sh /usr/local/lib/virp/sean-access.sh
+autopilot/virp_autopilot.py /usr/local/lib/virp/autopilot/virp_autopilot.py
+autopilot/virp_config_backup.py /usr/local/lib/virp/autopilot/virp_config_backup.py
+autopilot/virp_evidence.py /usr/local/lib/virp/autopilot/virp_evidence.py
+#
+# deployed-state.sh: virp-deployed-state.service executes it from the
+# install root, and NO make target installs it there (it is not in
+# VIRP_INSTALL_SCRIPTS). The unit is installed on no node today, so
+# nothing is broken yet; the first node to enable the timer would run a
+# hand-placed script. Listed so that copy is compared the day it exists.
+tools/state/deployed-state.sh /usr/local/lib/virp/deployed-state.sh
+#
+# These three run OUT OF THE DEPLOY TREE (/opt/virp), which
+# check-deploy-unit-source forbids for deploy/*.service: a restart runs
+# whatever the checkout holds. That check globs deploy/ only, so
+# broker/ and integrations/ were never scanned by it. Recorded here, not
+# fixed: moving them to the install root changes two units and their
+# install path, which is a deploy, not a checker change. On a node whose
+# deploy tree IS /opt/virp these pairs compare a file with itself and
+# always match; they only bite when the check runs from another clone.
+broker/broker-access.sh /opt/virp/broker/broker-access.sh
+broker/virp_broker.py /opt/virp/broker/virp_broker.py
+integrations/prometheus/virp_prometheus_exporter.py /opt/virp/prometheus/virp_prometheus_exporter.py
