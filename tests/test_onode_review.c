@@ -2678,6 +2678,108 @@ static void t_M14_accept_loop_enforces_per_uid_cap(void)
 }
 
 /* =========================================================================
+ * M18 — shutdown is prompt, signal-safe, and acknowledged
+ * ========================================================================= */
+
+static double m18_join_seconds(pthread_t t)
+{
+    int64_t t0 = m14_now_ms();
+    pthread_join(t, NULL);
+    return (double)(m14_now_ms() - t0) / 1000.0;
+}
+
+static void m18_sig_handler(int sig)
+{
+    (void)sig;
+    onode_shutdown(&g_fx.st);       /* exactly what both mains' handlers do */
+}
+
+static void t_M18_shutdown_wakes_the_accept_loop(void)
+{
+    printf("\n  M18: onode_shutdown() wakes the accept loop at once\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m18-wake")) { CHECK(false, "fixture"); return; }
+    pthread_t srv;
+    if (!fx_server_start(fx, &srv)) { CHECK(false, "server start"); return; }
+
+    /* No connection, no signal: nothing else can wake select(), whose
+     * timeout is the 30 s heartbeat. */
+    onode_shutdown(&fx->st);
+    double took = m18_join_seconds(srv);
+    CHECK(took < 3.0, "onode_start() returned promptly, not at the next heartbeat tick");
+    printf("      (loop exited %.2f s after onode_shutdown)\n", took);
+    CHECK(!atomic_load(&fx->st.running) &&
+          atomic_load(&fx->st.shutdown_requested),
+          "running is cleared and the request is latched");
+    fx_destroy(fx);
+}
+
+static void t_M18_shutdown_from_signal_handler(void)
+{
+    printf("\n  M18: a handler that only calls onode_shutdown() stops the daemon\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m18-signal")) { CHECK(false, "fixture"); return; }
+    pthread_t srv;
+    if (!fx_server_start(fx, &srv)) { CHECK(false, "server start"); return; }
+
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = m18_sig_handler;
+    sigemptyset(&sa.sa_mask);
+    CHECK(sigaction(SIGUSR1, &sa, &old) == 0, "handler installed");
+    errno = EXDEV;
+    raise(SIGUSR1);                 /* delivered on THIS thread, not the loop's */
+    CHECK(errno == EXDEV, "onode_shutdown() preserved errno across the handler");
+    double took = m18_join_seconds(srv);
+    CHECK(took < 3.0, "the accept loop on another thread woke and returned");
+    sigaction(SIGUSR1, &old, NULL);
+    fx_destroy(fx);
+}
+
+static void t_M18_shutdown_before_start_is_not_lost(void)
+{
+    printf("\n  M18: a shutdown requested during startup is honoured\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m18-early")) { CHECK(false, "fixture"); return; }
+    onode_shutdown(&fx->st);        /* e.g. SIGTERM before the loop exists */
+    pthread_t srv;
+    CHECK(pthread_create(&srv, NULL, fx_server_thread, &fx->st) == 0,
+          "onode_start() called after the request");
+    double took = m18_join_seconds(srv);
+    CHECK(took < 3.0, "onode_start() returned without serving");
+    fx_destroy(fx);
+}
+
+static void t_M18_shutdown_action_is_acknowledged(void)
+{
+    printf("\n  M18: the shutdown action is acknowledged and takes effect at once\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m18-action")) { CHECK(false, "fixture"); return; }
+    pthread_t srv;
+    if (!fx_server_start(fx, &srv)) { CHECK(false, "server start"); return; }
+
+    int fd = fx_connect(&fx->st);
+    const char *req = "{\"action\":\"shutdown\"}";
+    uint32_t n = htonl((uint32_t)strlen(req) + 1);
+    uint8_t ver = VIRP_FRAME_VERSION;
+    CHECK(fd >= 0 && send(fd, &n, 4, 0) == 4 && send(fd, &ver, 1, 0) == 1 &&
+          send(fd, req, strlen(req), 0) == (ssize_t)strlen(req),
+          "shutdown requested over the socket");
+    char ack[128] = "";
+    uint32_t alen = 0;
+    bool got = recv(fd, &alen, 4, MSG_WAITALL) == 4;
+    alen = ntohl(alen);
+    got = got && alen > 0 && alen < sizeof(ack) &&
+          recv(fd, ack, alen, MSG_WAITALL) == (ssize_t)alen;
+    CHECK(got && strcmp(ack, "{\"status\":\"shutting_down\"}") == 0,
+          "the caller receives a framed acknowledgement, not a bare EOF");
+    if (fd >= 0) close(fd);
+    double took = m18_join_seconds(srv);
+    CHECK(took < 3.0, "and the daemon stops without waiting for a heartbeat tick");
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -2724,6 +2826,11 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M16_proposals_are_rate_limited_per_uid",
                                               t_M16_proposals_are_rate_limited_per_uid },
     { "t_M17_batch_thread_create_failure",    t_M17_batch_thread_create_failure },
+    { "t_M18_shutdown_wakes_the_accept_loop", t_M18_shutdown_wakes_the_accept_loop },
+    { "t_M18_shutdown_from_signal_handler",   t_M18_shutdown_from_signal_handler },
+    { "t_M18_shutdown_before_start_is_not_lost",
+                                              t_M18_shutdown_before_start_is_not_lost },
+    { "t_M18_shutdown_action_is_acknowledged", t_M18_shutdown_action_is_acknowledged },
     { "t_M14_request_deadline_is_absolute",   t_M14_request_deadline_is_absolute },
     { "t_M14_send_timeout_abandons_a_stalled_reader",
                                               t_M14_send_timeout_abandons_a_stalled_reader },

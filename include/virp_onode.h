@@ -653,8 +653,33 @@ typedef struct {
         uint32_t    filed;
     }                   proposal_uid[ONODE_MAX_WORKERS];
 
-    /* Runtime */
-    bool                running;
+    /*
+     * Shutdown request (security review M18).
+     *
+     * `running` is ATOMIC: it is cleared by onode_shutdown(), which runs
+     * in a signal handler (SIGINT/SIGTERM in both mains) and on a worker
+     * thread (ONODE_ACTION_SHUTDOWN), and read by the accept loop on the
+     * main thread. A plain bool written from a handler is a data race
+     * and, for a signal handler, undefined behaviour.
+     *
+     * `wake_fd` is an eventfd the accept loop's select() watches.
+     * Clearing a flag does not interrupt a select() that is already
+     * blocked: a signal did so only when it happened to be delivered to
+     * the main thread, and a shutdown REQUEST over the socket never did
+     * — the loop noticed at its next heartbeat timeout, up to
+     * ONODE_HEARTBEAT_SEC later. onode_shutdown() writes to the eventfd
+     * (write(2) is async-signal-safe) and the loop returns at once.
+     * Created in onode_init(), closed in onode_destroy(); `wake_ready`
+     * guards a state that never went through onode_init().
+     */
+    atomic_bool         running;
+    /* Latched by onode_shutdown() and never cleared: a request that
+     * arrives BEFORE onode_start() has entered its loop (a signal during
+     * startup) must not be lost when onode_start() then sets `running`.
+     * onode_start() honours it and returns without serving. */
+    atomic_bool         shutdown_requested;
+    int                 wake_fd;
+    bool                wake_ready;
     uint32_t            uptime_start;   /* time(NULL) at startup */
     uint32_t            observations_sent;
     uint32_t            errors;
@@ -801,7 +826,12 @@ void onode_verify_leave(onode_state_t *state, uid_t uid, int64_t elapsed_ms);
 
 /*
  * Signal the O-Node to shut down gracefully.
- * Can be called from a signal handler.
+ *
+ * ASYNC-SIGNAL-SAFE, and that is a contract, not an accident (M18): it
+ * does two lock-free atomic stores and one write(2) to an eventfd, and
+ * preserves errno. No stdio, no locks, no allocation. Both mains call it
+ * straight from their SIGINT/SIGTERM handlers, and the handler does
+ * nothing else. Also safe from any thread. Idempotent.
  */
 void onode_shutdown(onode_state_t *state);
 

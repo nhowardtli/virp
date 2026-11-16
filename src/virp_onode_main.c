@@ -117,10 +117,18 @@ extern void virp_driver_zammad_init(void);
 extern void virp_driver_juniper_init(void);
 #endif
 
+/*
+ * SIGINT / SIGTERM. Nothing but onode_shutdown(), which is
+ * async-signal-safe by contract (two atomic stores and an eventfd
+ * write). This used to fprintf() first — stdio is not async-signal-safe,
+ * and a signal landing while another thread held the stderr lock could
+ * deadlock the handler inside the very path meant to stop the daemon
+ * (security review M18). The "shutting down" line is printed by
+ * onode_start() once its loop has actually exited.
+ */
 static void signal_handler(int sig)
 {
     (void)sig;
-    fprintf(stderr, "\n[O-Node] Signal received, shutting down...\n");
     onode_shutdown(&g_state);
 }
 

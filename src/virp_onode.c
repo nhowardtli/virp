@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/select.h>
+#include <sys/eventfd.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
@@ -7420,7 +7421,21 @@ static void handle_client(onode_state_t *state, int client_fd,
         break;
 
     case ONODE_ACTION_SHUTDOWN:
-        fprintf(stderr, "[O-Node] Shutdown requested\n");
+        fprintf(stderr, "[O-Node] Shutdown requested by uid %ld\n",
+                (client_uid == (uid_t)-1) ? -1L : (long)client_uid);
+        /* Acknowledge FIRST, then ask (M18). The caller used to get a
+         * bare EOF, indistinguishable from the daemon dying or the
+         * request being dropped. And the order matters: once shutdown
+         * is requested the drain shuts down every worker's client
+         * socket, this one included, so an acknowledgement sent
+         * afterwards may never leave. The send is bounded by
+         * SO_SNDTIMEO, so a caller that does not read cannot delay the
+         * shutdown it asked for. onode_shutdown() wakes the accept loop
+         * through the same eventfd a signal uses. */
+        {
+            const char *ack = "{\"status\":\"shutting_down\"}";
+            (void)send_framed(client_fd, ack, strlen(ack));
+        }
         onode_shutdown(state);
         break;
     }
@@ -7906,7 +7921,20 @@ virp_error_t onode_init(onode_state_t *state,
     state->node_id = node_id;
     state->seq_num = 0;
     state->listen_fd = -1;
-    state->running = false;
+    atomic_init(&state->running, false);
+    atomic_init(&state->shutdown_requested, false);
+
+    /* Shutdown wake (M18). Non-blocking so the write in onode_shutdown()
+     * can never stall a signal handler, and so the accept loop can drain
+     * it; close-on-exec so it is not inherited by anything the daemon
+     * might ever exec. If it cannot be created the daemon still works —
+     * shutdown then waits for the loop's next timeout, as it always
+     * used to — and says so. */
+    state->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    state->wake_ready = state->wake_fd >= 0;
+    if (!state->wake_ready)
+        perror("[O-Node] eventfd (shutdown wake unavailable; shutdown "
+               "will wait for the next heartbeat tick)");
 
     /* Tier-enforcement gate default posture: ENFORCE — hard-reject
      * over-tier and UNCLASSIFIED commands. This is the intended v1
@@ -8601,22 +8629,37 @@ virp_error_t onode_start(onode_state_t *state)
     fprintf(stderr, "[O-Node] Devices: %d\n", state->device_count);
     fprintf(stderr, "[O-Node] Ready.\n\n");
 
-    state->running = true;
+    /* A shutdown requested while we were still starting (a signal before
+     * this line) must win: it is latched, so do not overwrite it by
+     * declaring the daemon running. The loop below is then skipped and
+     * the normal drain and teardown follow. */
+    atomic_store(&state->running,
+                 !atomic_load(&state->shutdown_requested));
 
-    /* Start auto-reconnect watchdog thread */
-    if (onode_watchdog_start(state) != VIRP_OK)
+    /* Start auto-reconnect watchdog thread — unless shutdown is already
+     * pending, in which case there is nothing for it to keep connected. */
+    if (atomic_load(&state->running) &&
+        onode_watchdog_start(state) != VIRP_OK)
         perror("[O-Node] Failed to start watchdog thread");
 
-    /* Event loop */
-    while (state->running) {
+    /* Event loop. Watches the listen socket AND the shutdown eventfd
+     * (M18): onode_shutdown() writes to it from a signal handler or a
+     * worker thread, select() returns, and the loop condition sees the
+     * cleared flag — no waiting out the heartbeat timeout. */
+    while (atomic_load(&state->running)) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(state->listen_fd, &readfds);
+        int nfds = state->listen_fd + 1;
+        if (state->wake_ready && state->wake_fd < FD_SETSIZE) {
+            FD_SET(state->wake_fd, &readfds);
+            if (state->wake_fd >= nfds) nfds = state->wake_fd + 1;
+        }
 
         /* Timeout for periodic heartbeat */
         struct timeval tv = { .tv_sec = ONODE_HEARTBEAT_SEC, .tv_usec = 0 };
 
-        int ready = select(state->listen_fd + 1, &readfds, NULL, NULL, &tv);
+        int ready = select(nfds, &readfds, NULL, NULL, &tv);
 
         if (ready < 0) {
             if (errno == EINTR) continue;  /* Signal interrupted */
@@ -8641,6 +8684,18 @@ virp_error_t onode_start(onode_state_t *state)
                         uptime, state->observations_sent, state->seq_num,
                         conn_up, conn_total, state->reconnects);
             }
+            continue;
+        }
+
+        if (state->wake_ready && state->wake_fd < FD_SETSIZE &&
+            FD_ISSET(state->wake_fd, &readfds)) {
+            /* Shutdown was requested. Drain the counter (non-blocking)
+             * and let the loop condition decide; a connection that
+             * raced in is left in the backlog and closed with the
+             * listen socket. */
+            uint64_t n;
+            ssize_t r = read(state->wake_fd, &n, sizeof(n));
+            (void)r;
             continue;
         }
 
@@ -8818,11 +8873,23 @@ virp_error_t onode_start(onode_state_t *state)
     return VIRP_OK;
 }
 
+/* ASYNC-SIGNAL-SAFE — see the header. Keep it that way: no stdio, no
+ * locks, no allocation, errno preserved. */
 void onode_shutdown(onode_state_t *state)
 {
     if (!state) return;
-    state->running = false;
-    state->watchdog_running = false;
+    int saved_errno = errno;
+    atomic_store(&state->shutdown_requested, true);
+    atomic_store(&state->running, false);
+    atomic_store(&state->watchdog_running, false);
+    if (state->wake_ready) {
+        /* An eventfd write only fails with EAGAIN when the counter is
+         * about to overflow — i.e. the wake is already pending. */
+        const uint64_t one = 1;
+        ssize_t w = write(state->wake_fd, &one, sizeof(one));
+        (void)w;
+    }
+    errno = saved_errno;
 }
 
 void onode_destroy(onode_state_t *state)
@@ -8887,6 +8954,16 @@ void onode_destroy(onode_state_t *state)
     if (state->listen_fd >= 0) {
         close(state->listen_fd);
         unlink(state->socket_path);
+    }
+
+    /* The shutdown wake. No signal handler can be mid-write on it here
+     * that matters: wake_ready is cleared first, and a handler that
+     * already read it true writes to an fd this thread closes only
+     * afterwards — at worst EBADF, which onode_shutdown ignores. */
+    if (state->wake_ready) {
+        state->wake_ready = false;
+        close(state->wake_fd);
+        state->wake_fd = -1;
     }
 
     /* Destroy trust chain */
