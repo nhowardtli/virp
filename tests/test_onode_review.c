@@ -2859,6 +2859,123 @@ static void t_M19_v3_session_is_owned_by_binding_uid(void)
 }
 
 /* =========================================================================
+ * M20 — one daemon per socket, and a v1 sequence that never restarts
+ * ========================================================================= */
+
+static void t_M20_second_instance_refuses_to_start(void)
+{
+    printf("\n  M20: a second daemon on the same socket refuses to start\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m20-lock")) { CHECK(false, "fixture"); return; }
+    pthread_t srv;
+    if (!fx_server_start(fx, &srv)) { CHECK(false, "server start"); return; }
+
+    static onode_state_t second;
+    CHECK(onode_init(&second, 0x5EC00002, NULL, fx->st.socket_path) == VIRP_OK,
+          "a second daemon state for the SAME socket path");
+    int64_t t0 = m14_now_ms();
+    virp_error_t e = onode_start(&second);   /* pre-fix: steals the socket and serves */
+    CHECK(e != VIRP_OK && m14_now_ms() - t0 < 2000,
+          "its onode_start() refuses, immediately");
+    onode_destroy(&second);
+
+    /* The first daemon's socket was not unlinked, and it still answers. */
+    CHECK(access(fx->st.socket_path, F_OK) == 0,
+          "the running daemon's socket is still there");
+    int fd = fx_connect(&fx->st);
+    const char *req = "{\"action\":\"heartbeat\"}";
+    uint32_t n = htonl((uint32_t)strlen(req) + 1);
+    uint8_t ver = VIRP_FRAME_VERSION;
+    uint32_t rlen = 0;
+    CHECK(fd >= 0 && send(fd, &n, 4, 0) == 4 && send(fd, &ver, 1, 0) == 1 &&
+          send(fd, req, strlen(req), 0) == (ssize_t)strlen(req) &&
+          recv(fd, &rlen, 4, MSG_WAITALL) == 4 && ntohl(rlen) > 4,
+          "and it is still the one answering requests");
+    if (fd >= 0) close(fd);
+
+    /* The lock is held until the first daemon is torn down, not merely
+     * until its loop exits — so stop AND destroy it, then try again. */
+    char path[sizeof(fx->st.socket_path)];
+    memcpy(path, fx->st.socket_path, sizeof(path));
+    fx_server_stop(fx, srv);
+    fx_destroy(fx);
+
+    CHECK(onode_init(&second, 0x5EC00002, NULL, path) == VIRP_OK,
+          "(the first daemon is gone)");
+    /* An action entry for our own uid, so that the allowlist the first
+     * start seeds is still acceptable to the restart below (a seeded
+     * allowlist reads as an explicit one the second time round). */
+    const onode_action_t hb_only[1] = { ONODE_ACTION_HEARTBEAT };
+    CHECK(onode_set_uid_actions(&second, getuid(), hb_only, 1) == VIRP_OK,
+          "(action entry for this uid)");
+    onode_shutdown(&second);                 /* so start returns at once */
+    CHECK(onode_start(&second) == VIRP_OK,
+          "with the lock released, a new daemon may take the socket");
+    /* The same state started again without being destroyed in between
+     * already holds the lock, and must not be locked out by itself. */
+    CHECK(onode_start(&second) == VIRP_OK,
+          "a state restarted without teardown is not refused by its own lock");
+    onode_destroy(&second);
+}
+
+static void t_M20_v1_sequence_survives_restart(void)
+{
+    printf("\n  M20: the v1 sequence high-water is persisted\n");
+    char path[160];
+    snprintf(path, sizeof(path), "%s/m20.v1seq", g_root);
+    static onode_state_t st;
+
+    /* First run. */
+    CHECK(onode_init(&st, 1, NULL, "/tmp/virp-review-unused.sock") == VIRP_OK &&
+          onode_set_seq_store(&st, path) == VIRP_OK, "first run: store created");
+    uint32_t last = 0;
+    for (int i = 0; i < 5; i++) last = onode_next_seq(&st);
+    CHECK(last == 5, "the sequence starts at 1 on a first run");
+
+    /* CRASH: no onode_destroy, the state is simply abandoned. */
+    static onode_state_t crashed_then_restarted;
+    CHECK(onode_init(&crashed_then_restarted, 1, NULL,
+                     "/tmp/virp-review-unused.sock") == VIRP_OK &&
+          onode_set_seq_store(&crashed_then_restarted, path) == VIRP_OK,
+          "restart after a crash: store loaded");
+    uint32_t after_crash = onode_next_seq(&crashed_then_restarted);
+    CHECK(after_crash > last,
+          "after a crash the next number is above every number issued before");
+    printf("      (issued up to %u, resumed at %u)\n", last, after_crash);
+
+    /* Cross a reservation boundary: every number stays covered on disk. */
+    uint32_t hi = after_crash;
+    for (unsigned i = 0; i < ONODE_SEQ_RESERVE_BLOCK + 10; i++)
+        hi = onode_next_seq(&crashed_then_restarted);
+    CHECK(crashed_then_restarted.seq_reserved >= hi &&
+          !crashed_then_restarted.seq_store_failed,
+          "the durable reservation is extended before numbers pass it");
+
+    /* CLEAN shutdown records the exact high-water: no gap next time. */
+    onode_destroy(&crashed_then_restarted);
+    CHECK(onode_init(&st, 1, NULL, "/tmp/virp-review-unused.sock") == VIRP_OK &&
+          onode_set_seq_store(&st, path) == VIRP_OK, "restart after a clean stop");
+    CHECK(onode_next_seq(&st) == hi + 1,
+          "after a clean shutdown the sequence continues exactly, with no gap");
+    onode_destroy(&st);
+
+    /* A store that is not a number is refused, not read as zero. */
+    FILE *f = fopen(path, "w");
+    if (f) { fputs("12abc\n", f); fclose(f); }
+    CHECK(onode_init(&st, 1, NULL, "/tmp/virp-review-unused.sock") == VIRP_OK &&
+          onode_set_seq_store(&st, path) != VIRP_OK && st.seq_num == 0 &&
+          st.seq_store_path[0] == '\0',
+          "a corrupt store is an error, not a silent restart at zero");
+    onode_destroy(&st);
+
+    /* An unwritable location is an error at setup. */
+    CHECK(onode_init(&st, 1, NULL, "/tmp/virp-review-unused.sock") == VIRP_OK &&
+          onode_set_seq_store(&st, "/nonexistent-dir-for-review/x.v1seq") != VIRP_OK,
+          "a store that cannot be written is refused at setup");
+    onode_destroy(&st);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -2909,6 +3026,9 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
                                               t_M19_v2_session_is_owned_by_binding_uid },
     { "t_M19_v3_session_is_owned_by_binding_uid",
                                               t_M19_v3_session_is_owned_by_binding_uid },
+    { "t_M20_second_instance_refuses_to_start",
+                                              t_M20_second_instance_refuses_to_start },
+    { "t_M20_v1_sequence_survives_restart",   t_M20_v1_sequence_survives_restart },
     { "t_M18_shutdown_wakes_the_accept_loop", t_M18_shutdown_wakes_the_accept_loop },
     { "t_M18_shutdown_from_signal_handler",   t_M18_shutdown_from_signal_handler },
     { "t_M18_shutdown_before_start_is_not_lost",

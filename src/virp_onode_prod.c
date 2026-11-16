@@ -1325,11 +1325,16 @@ static void usage(const char *prog)
     printf("              COMPROMISED — the window keeps honouring it.\n");
     printf("  -W <secs>   Grace window length (default 900). Only with -K.\n");
     printf("  -s <path>   Unix socket path (default: %s)\n", ONODE_SOCKET_PATH);
+    printf("              An exclusive lock on <path>.lock is held while\n");
+    printf("              running; a second daemon on the same socket\n");
+    printf("              refuses to start.\n");
     printf("  -d <path>   Device config JSON file (required)\n");
     printf("  -n <hex>    Node ID in hex (default: 0x00000001)\n");
     printf("  -c <path>   Chain database path (enables Primitive 6 trust chain;\n");
     printf("              REQUIRED when approval mode is enabled — the daemon\n");
     printf("              refuses to start in approval mode without a chain)\n");
+    printf("              The v1 sequence high-water is kept beside it, in\n");
+    printf("              <path>.v1seq, so sequence numbers never restart.\n");
     printf("  -C <path>   Chain key path (32-byte key file, required with -c)\n");
     printf("  -S <path>   Chain-signing Ed25519 SECRET key (D-1). OPT-IN:\n");
     printf("              absent = signing off, zero behaviour change.\n");
@@ -1571,6 +1576,28 @@ int main(int argc, char **argv)
         onode_destroy(&g_state);
         virp_context_destroy(ctx);
         return 1;
+    }
+
+    /* v1 sequence high-water (security review M20). Kept beside the chain
+     * database: that directory is the daemon's durable state, where the
+     * socket's directory (/run) does not survive a reboot. Fatal if it
+     * cannot be loaded or reserved — a daemon that cannot remember its
+     * sequence would re-issue numbers after the next restart. */
+    if (chain_db_path) {
+        char seq_path[512];
+        int sn = snprintf(seq_path, sizeof(seq_path), "%s.v1seq",
+                          chain_db_path);
+        virp_error_t serr = (sn < 0 || (size_t)sn >= sizeof(seq_path))
+            ? VIRP_ERR_INVALID_LENGTH
+            : onode_set_seq_store(&g_state, seq_path);
+        if (serr != VIRP_OK) {
+            fprintf(stderr, "[O-Node] FATAL: the v1 sequence high-water "
+                    "store (%s.v1seq) could not be set up: %s. Refusing to "
+                    "start.\n", chain_db_path, virp_error_str(serr));
+            onode_destroy(&g_state);
+            virp_context_destroy(ctx);
+            return 1;
+        }
     }
 
     /* D-1: opt-in detached Ed25519 chain signing. Only meaningful with a

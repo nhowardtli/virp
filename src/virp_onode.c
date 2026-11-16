@@ -37,6 +37,8 @@
 #include <sys/un.h>
 #include <sys/select.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>            /* flock — single-instance lock */
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
@@ -930,10 +932,120 @@ static bool parse_request(const char *json, size_t json_len,
  * Sequence Number
  * ========================================================================= */
 
+/* Write `value` to the sequence store durably: temp file, fsync, rename,
+ * fsync of the directory. Either the old value or the new one survives a
+ * crash, never a torn file. */
+static bool seq_store_write(const char *path, uint32_t value)
+{
+    char tmp[sizeof(((onode_state_t *)0)->seq_store_path) + 8];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (n < 0 || (size_t)n >= sizeof(tmp)) return false;
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
+    if (fd < 0) return false;
+    char text[16];
+    int len = snprintf(text, sizeof(text), "%u\n", value);
+    bool ok = write(fd, text, (size_t)len) == (ssize_t)len && fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    if (!ok || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    /* Make the rename itself durable. */
+    char dir[sizeof(tmp)];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *(slash == dir ? slash + 1 : slash) = '\0';
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+    }
+    return true;
+}
+
+virp_error_t onode_set_seq_store(onode_state_t *state, const char *path)
+{
+    if (!state || !path || !path[0])
+        return VIRP_ERR_NULL_PTR;
+    if (strlen(path) >= sizeof(state->seq_store_path))
+        return VIRP_ERR_INVALID_LENGTH;
+
+    uint32_t stored = 0;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char text[32];
+        size_t got = fread(text, 1, sizeof(text) - 1, f);
+        fclose(f);
+        text[got] = '\0';
+        /* Digits and one trailing newline, nothing else: a file that is
+         * not what this function writes is not a number to trust. */
+        size_t digits = strspn(text, "0123456789");
+        if (digits == 0 || digits > 10 ||
+            (text[digits] != '\0' && strcmp(text + digits, "\n") != 0)) {
+            fprintf(stderr, "[O-Node] sequence store %s is not a sequence "
+                    "number — refusing to guess where the sequence was\n",
+                    path);
+            return VIRP_ERR_INVALID_TYPE;
+        }
+        unsigned long long v = strtoull(text, NULL, 10);
+        if (v > UINT32_MAX) return VIRP_ERR_INVALID_TYPE;
+        stored = (uint32_t)v;
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "[O-Node] sequence store %s exists but cannot be "
+                "read: %s\n", path, strerror(errno));
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* Resume above everything the stored value could cover, and reserve
+     * the next block before a single number is issued. */
+    if (stored > UINT32_MAX - ONODE_SEQ_RESERVE_BLOCK) {
+        fprintf(stderr, "[O-Node] sequence store %s is within one block of "
+                "the 32-bit limit; the v1 sequence cannot continue\n", path);
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+    uint32_t reserve = stored + ONODE_SEQ_RESERVE_BLOCK;
+    if (!seq_store_write(path, reserve)) {
+        fprintf(stderr, "[O-Node] sequence store %s cannot be written: %s\n",
+                path, strerror(errno));
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    pthread_mutex_lock(&state->state_mutex);
+    snprintf(state->seq_store_path, sizeof(state->seq_store_path), "%s", path);
+    state->seq_num = stored;
+    state->seq_reserved = reserve;
+    state->seq_store_failed = false;
+    pthread_mutex_unlock(&state->state_mutex);
+    fprintf(stderr, "[O-Node] v1 sequence resumes above %u (store %s, "
+            "reserved to %u)\n", stored, path, reserve);
+    return VIRP_OK;
+}
+
 uint32_t onode_next_seq(onode_state_t *state)
 {
     pthread_mutex_lock(&state->state_mutex);
     uint32_t seq = ++state->seq_num;
+    /* Never issue a number the disk does not already cover (M20): extend
+     * the durable reservation first. A failure cannot be reported from
+     * here — callers are mid-signature — so it is logged once, loudly,
+     * and retried on every later number; the sequence stays monotonic
+     * for this run and the exposure is the next restart. */
+    if (state->seq_store_path[0] && seq > state->seq_reserved) {
+        uint32_t reserve = seq > UINT32_MAX - ONODE_SEQ_RESERVE_BLOCK
+                         ? UINT32_MAX : seq + ONODE_SEQ_RESERVE_BLOCK;
+        if (seq_store_write(state->seq_store_path, reserve)) {
+            state->seq_reserved = reserve;
+            state->seq_store_failed = false;
+        } else if (!state->seq_store_failed) {
+            state->seq_store_failed = true;
+            fprintf(stderr, "[O-Node] ERROR: v1 sequence reservation could "
+                    "not be written to %s (%s) — numbers issued from %u on "
+                    "are NOT covered on disk and may be reused after a "
+                    "restart\n", state->seq_store_path, strerror(errno),
+                    seq);
+        }
+    }
     pthread_mutex_unlock(&state->state_mutex);
     return seq;
 }
@@ -7975,6 +8087,7 @@ virp_error_t onode_init(onode_state_t *state,
     state->node_id = node_id;
     state->seq_num = 0;
     state->listen_fd = -1;
+    state->lock_fd = -1;
     atomic_init(&state->running, false);
     atomic_init(&state->shutdown_requested, false);
 
@@ -8637,7 +8750,48 @@ virp_error_t onode_start(onode_state_t *state)
                     virp_error_str(ncerr));
     }
 
-    /* Remove stale socket */
+    /* ── Single instance (M20) ────────────────────────────────────────
+     * The next line removes whatever socket is at this path — which is
+     * how a stale socket from a crashed daemon is cleared, and also how
+     * a SECOND daemon started on the same path silently took the socket
+     * away from a healthy first one: both kept running, with one O-Key
+     * and one chain between them, and the first became unreachable.
+     *
+     * So before touching the socket, take an exclusive flock on a
+     * lockfile beside it and hold it for the life of the process. The
+     * kernel releases it when the process dies, however it dies, so a
+     * crash never leaves the path locked. If it is already held, another
+     * daemon is alive on this socket: refuse to start and leave its
+     * socket alone.
+     *
+     * A state that already holds the lock keeps it: onode_start() can be
+     * called again on a state that was stopped but not destroyed, and a
+     * second open of the lockfile would be a second open file
+     * description — flock would see this process's OWN earlier lock as
+     * somebody else's and refuse. */
+    if (state->lock_fd < 0) {
+        char lock_path[sizeof(state->socket_path) + 8];
+        snprintf(lock_path, sizeof(lock_path), "%s.lock", state->socket_path);
+        int lfd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+                       0600);
+        if (lfd < 0) {
+            fprintf(stderr, "[O-Node] FATAL: cannot open instance lock %s: "
+                    "%s. Refusing to start.\n", lock_path, strerror(errno));
+            return VIRP_ERR_KEY_NOT_LOADED;
+        }
+        if (flock(lfd, LOCK_EX | LOCK_NB) != 0) {
+            fprintf(stderr, "[O-Node] FATAL: %s is locked — another O-Node "
+                    "is already serving %s. Refusing to start (and leaving "
+                    "its socket in place).\n", lock_path,
+                    state->socket_path);
+            close(lfd);
+            return VIRP_ERR_KEY_NOT_LOADED;
+        }
+        state->lock_fd = lfd;
+    }
+
+    /* Remove stale socket — safe now: the lock proves no live daemon
+     * owns it. */
     unlink(state->socket_path);
 
     /* Create Unix domain socket */
@@ -9008,6 +9162,22 @@ void onode_destroy(onode_state_t *state)
     if (state->listen_fd >= 0) {
         close(state->listen_fd);
         unlink(state->socket_path);
+    }
+
+    /* Clean shutdown: record the exact v1 sequence high-water, so the
+     * next start resumes from it instead of skipping the rest of the
+     * reserved block (M20). Best-effort — the reservation already on
+     * disk is the safe fallback. */
+    if (state->seq_store_path[0])
+        (void)seq_store_write(state->seq_store_path, state->seq_num);
+
+    /* Release the single-instance lock last of the socket-side state:
+     * the socket is already gone, so a successor that takes the lock
+     * finds nothing stale to remove. The lockfile itself stays — unlinking
+     * a file others may be waiting to flock is a race, and it is empty. */
+    if (state->lock_fd >= 0) {
+        close(state->lock_fd);
+        state->lock_fd = -1;
     }
 
     /* The shutdown wake. No signal handler can be mid-write on it here

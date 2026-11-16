@@ -372,6 +372,37 @@ typedef struct {
     /* Sequence tracking (anti-replay) */
     uint32_t            seq_num;        /* Monotonically increasing */
 
+    /*
+     * Persisted v1 sequence high-water (security review M20).
+     *
+     * seq_num is the sequence in every O-Key-signed (v1) message, and a
+     * receiver's replay check is "higher than the last one I accepted
+     * from this node". It started at zero on every start, so after a
+     * restart the daemon re-issued numbers it had already used: a strict
+     * receiver rejected fresh observations as replays, and a lenient one
+     * could be handed an old observation in place of a new one bearing
+     * the same number.
+     *
+     * When seq_store_path is set (onode_set_seq_store) the daemon keeps
+     * a durable RESERVATION ahead of what it hands out: seq_reserved is
+     * the highest number the file on disk covers, and it is extended by
+     * ONODE_SEQ_RESERVE_BLOCK, durably, BEFORE any number above it is
+     * issued. After a crash the daemon resumes above the reservation —
+     * skipping at most one block, never repeating. A clean shutdown
+     * writes the exact high-water, so a normal restart leaves no gap.
+     * Empty path = no persistence (the mock/dev binaries): the sequence
+     * then starts at zero each run, as before.
+     */
+    char                seq_store_path[256];
+    uint32_t            seq_reserved;
+    bool                seq_store_failed;   /* a reservation could not be
+                                               made durable; logged once */
+
+    /* Single-instance lock (M20): an exclusive flock on
+     * "<socket_path>.lock", taken in onode_start() before the stale
+     * socket is unlinked and held until onode_destroy(). -1 = not held. */
+    int                 lock_fd;
+
     /* Socket */
     int                 listen_fd;
     char                socket_path[108];  /* Must fit in sun_path */
@@ -779,6 +810,18 @@ virp_error_t onode_init(onode_state_t *state,
 virp_error_t onode_set_previous_okey(onode_state_t *state,
                                      const char *path,
                                      uint32_t window_seconds);
+
+/*
+ * Persist the v1 sequence high-water at `path` (M20). Call after
+ * onode_init and before onode_start. Loads the stored value, resumes the
+ * sequence above it and makes the first reservation durable. Fails —
+ * and the caller should refuse to start — if the file exists but is not
+ * a number, or the reservation cannot be written: a daemon that cannot
+ * remember its sequence would silently reuse numbers after the next
+ * restart. A missing file is a first run and starts at zero.
+ */
+#define ONODE_SEQ_RESERVE_BLOCK 1024u
+virp_error_t onode_set_seq_store(onode_state_t *state, const char *path);
 
 /*
  * Add a device to the O-Node's inventory.
