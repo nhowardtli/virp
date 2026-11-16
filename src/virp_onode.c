@@ -2703,6 +2703,97 @@ static virp_error_t gate_unchained_execution_obs(onode_state_t *state,
                                   &state->okey);
 }
 
+/* =========================================================================
+ * OBSERVATION-UNAVAILABLE (security review M12).
+ *
+ * The device has been dispatched to, the chain has its record, and the
+ * observation the caller asked for cannot be built. The case that
+ * matters is a session-bound request (v2 HMAC, v3 Ed25519) whose session
+ * closed or idled out WHILE the command ran: both paths re-check the
+ * session at signing time, correctly refuse to sign, and used to return
+ * the bare VIRP_ERR_SESSION_INVALID.
+ *
+ * That code is also what the caller gets when the session is missing
+ * BEFORE dispatch, where nothing ran. So the one answer meant both "you
+ * have no session, nothing happened" and "your command executed and you
+ * will never see its output" — and a client that reads it the first way
+ * re-establishes the session and sends the command again. For a
+ * state-changing command that is the authorized-once-executed-twice
+ * outcome the retry logic above goes to such lengths to prevent.
+ *
+ * So after dispatch the answer is a statement, signed with the O-Key:
+ * the command was dispatched, its record is on the chain, and the
+ * session-bound observation could not be produced. It is an ERROR
+ * observation carrying NO device output, which is why this is not the
+ * "downgrade to master-key signing" the v2 path forbids: nothing the
+ * device returned is being vouched for under the wrong key. The device
+ * bytes are simply not delivered, and the message says so.
+ *
+ * Fixed text first, command last and bounded: whatever is cut off when a
+ * long command meets the payload limit, it is never the part that says
+ * the command ran.
+ *
+ * `staged_error` is the v3 wrapper's case where the result it could not
+ * wrap was itself an ERROR observation (a refusal, an unknown outcome):
+ * the device may NOT have acted, and that text is the only account of
+ * what happened, so it is relayed rather than replaced by a claim of
+ * execution.
+ * ========================================================================= */
+static virp_error_t gate_observation_unavailable_obs(onode_state_t *state,
+                                    uint32_t node_id,
+                                    const char *device_name,
+                                    const char *command,
+                                    uint8_t obs_tier,
+                                    const virp_chain_entry_t *intent,
+                                    const char *staged_error,
+                                    size_t staged_error_len,
+                                    virp_error_t cause,
+                                    uint8_t *out_buf, size_t out_buf_len,
+                                    size_t *out_len)
+{
+    const char *what = cause == VIRP_ERR_SESSION_INVALID
+        ? "the session ended before a session-bound observation could be "
+          "produced"
+        : "the signed observation could not be produced";
+
+    char ref[128];
+    if (intent)
+        snprintf(ref, sizeof(ref), "intent %.16s", intent->chain_entry_hash);
+    else
+        snprintf(ref, sizeof(ref), "chain session gate-enforce:%.63s",
+                 device_name);
+
+    char err_msg[768];
+    if (staged_error) {
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: observation-unavailable: %s (%s) for a request on "
+                 "'%s'; this is NOT a statement that nothing happened — the "
+                 "result that could not be delivered was: [%.*s] command: "
+                 "'%.160s'",
+                 what, virp_error_str(cause), device_name,
+                 (int)(staged_error_len > 300 ? 300 : staged_error_len),
+                 staged_error, command);
+    } else {
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: observation-unavailable: the command was DISPATCHED "
+                 "to '%s' and its result is recorded (%s), but %s (%s); the "
+                 "device output is NOT in this response and re-running the "
+                 "command would execute it a second time — reconcile "
+                 "against the chain record or the target. command: '%.200s'",
+                 device_name, ref, what, virp_error_str(cause), command);
+    }
+    fprintf(stderr, "[ERROR-OBS] device=%s executed=%s reason=\"%s\"\n",
+            device_name, staged_error ? "see-staged-result" : "yes", err_msg);
+    return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                  node_id, onode_next_seq(state),
+                                  VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                  obs_tier > VIRP_TIER_RED ? VIRP_TIER_RED
+                                                           : obs_tier,
+                                  (const uint8_t *)err_msg,
+                                  (uint16_t)strlen(err_msg),
+                                  &state->okey);
+}
+
 virp_error_t onode_apply_obs(onode_state_t *state,
                              const char *proposal_id,
                              uint8_t obs_version,
@@ -3046,6 +3137,25 @@ static virp_error_t onode_execute_policy_impl(onode_state_t *state,
         idx >= 0 ? onode_typed_profile(state, idx) : NULL,
         payload, payload_len, out_buf, out_buf_len, out_len);
     pthread_mutex_unlock(&state->session_mutex);
+    if (err != VIRP_OK) {
+        /* The legacy path has RUN — the request was processed, and for a
+         * staged DEVICE_OUTPUT the device acted — and the v3 observation
+         * cannot be produced (session gone, or signing failed). A bare
+         * error here is indistinguishable from the pre-dispatch
+         * SESSION_INVALID above and invites a blind retry (M12). Say
+         * what happened, O-Key-signed, with no device bytes. A staged
+         * ERROR is relayed as text: it may be the only account of a
+         * refusal or of an unknown outcome. */
+        bool staged_err = legacy[56] == VIRP_OBS_ERROR;
+        virp_error_t ferr = gate_observation_unavailable_obs(state,
+            idx >= 0 ? state->devices[idx].node_id : state->node_id,
+            device_name, command, legacy[9], NULL,
+            staged_err ? (const char *)legacy + 60 : NULL,
+            staged_err ? legacy_len - 60 : 0,
+            err, out_buf, out_buf_len, out_len);
+        if (ferr == VIRP_OK) return VIRP_OK;
+        *out_len = 0;
+    }
     return err;
 }
 
@@ -4188,7 +4298,10 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
          * (session.last_seq under session_mutex), which is what the
          * verifier's replay high-water store checks against. If the
          * session died while the command ran, fail — never downgrade
-         * to master-key signing on a v2 request.
+         * to master-key signing on a v2 request. "Fail" is not a bare
+         * code, though: the tail of this function turns it into an
+         * O-Key-signed ERROR observation that says the command was
+         * dispatched and carries none of the device's output (M12).
          */
         onode_session_lock(state);
         if (!state->ctx ||
@@ -4270,6 +4383,22 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                 state->reconnect[dev_idx].last_read_success = time(NULL);
             pthread_mutex_unlock(&state->conn_mutex);
         }
+    } else {
+        /* The device was dispatched to and the chain has its record
+         * (gate_execution above, or the outcome), but the observation
+         * could not be built — in practice, a v2 session that died while
+         * the command ran. Never a bare code from here (M12): see
+         * gate_observation_unavailable_obs. If even that cannot be built
+         * the original error stands. */
+        virp_error_t ferr = gate_observation_unavailable_obs(state,
+                                state->devices[dev_idx].node_id,
+                                device_name, command,
+                                gate_obs_tier(gate_tier), intent,
+                                NULL, 0, err,
+                                out_buf, out_buf_len, out_len);
+        if (ferr == VIRP_OK)
+            return VIRP_OK;
+        *out_len = 0;
     }
 
     return err;

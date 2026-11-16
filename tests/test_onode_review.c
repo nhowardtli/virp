@@ -581,6 +581,7 @@ struct virp_conn { int unused; };
 
 static int  h4_dispatches;
 static bool h4_uname_is_black;       /* a table change between propose and approve */
+static void (*h4_on_execute)(void);  /* runs inside execute(), mid-command */
 
 static virp_conn_t *h4_connect(const virp_device_t *d)
 { (void)d; return calloc(1, sizeof(virp_conn_t)); }
@@ -602,6 +603,7 @@ static virp_error_t h4_execute(virp_conn_t *c, const char *cmd,
 {
     (void)c; (void)cmd;
     h4_dispatches++;
+    if (h4_on_execute) h4_on_execute();
     memset(r, 0, sizeof(*r));
     strcpy(r->output, "h4 fixture output");
     r->output_len = strlen(r->output);
@@ -679,6 +681,7 @@ static bool h4_init(fx_t *fx, const char *name, sqlite3 **db,
     fx->st.policy = h4_policy(*db, profile);
     h4_dispatches = 0;
     h4_uname_is_black = false;
+    h4_on_execute = NULL;
     return fx->st.policy != NULL;
 }
 
@@ -1927,6 +1930,148 @@ static void t_M11_verify_response_carries_verifier_state(void)
 }
 
 /* =========================================================================
+ * M12 — a session lost AFTER the device acted is not a bare error
+ * ========================================================================= */
+
+/* Real handshake over the socket: HELLO, then BIND with what came back. */
+static bool m12_bind_session(fx_t *fx, uid_t uid)
+{
+    static uint8_t resp[4096];
+    ssize_t n = fx_request(&fx->st, uid,
+        "{\"action\":\"session_hello\",\"client_id\":\"m12\","
+        "\"client_nonce\":\"0011223344556677\"}", resp, sizeof(resp) - 1);
+    if (n <= 4) return false;
+    resp[n] = '\0';
+    cJSON *ack = cJSON_Parse((const char *)resp);
+    if (!ack) return false;
+    const cJSON *sid = cJSON_GetObjectItemCaseSensitive(ack, "session_id");
+    const cJSON *cn  = cJSON_GetObjectItemCaseSensitive(ack, "client_nonce");
+    const cJSON *sn  = cJSON_GetObjectItemCaseSensitive(ack, "server_nonce");
+    char bind[512];
+    bool ok = cJSON_IsString(sid) && cJSON_IsString(cn) && cJSON_IsString(sn);
+    if (ok)
+        snprintf(bind, sizeof(bind),
+                 "{\"action\":\"session_bind\",\"client_id\":\"m12\","
+                 "\"session_id\":\"%s\",\"client_nonce\":\"%s\","
+                 "\"server_nonce\":\"%s\"}",
+                 sid->valuestring, cn->valuestring, sn->valuestring);
+    cJSON_Delete(ack);
+    if (!ok) return false;
+    n = fx_request(&fx->st, uid, bind, resp, sizeof(resp) - 1);
+    if (n <= 4) return false;
+    resp[n] = '\0';
+    return strstr((const char *)resp, "\"bound\"") != NULL;
+}
+
+/* The session ends while the command is on the device. */
+static void m12_close_session_mid_command(void)
+{
+    onode_session_lock(&g_fx.st);
+    virp_handle_session_close(g_fx.st.ctx);
+    pthread_mutex_unlock(&g_fx.st.session_mutex);
+}
+
+/* Run and unpack whatever comes back as a v1 O-Key observation. Returns
+ * the daemon's error code; *obs_type is 0 unless a v1 observation that
+ * verifies under the O-Key was returned. */
+static virp_error_t m12_run(fx_t *fx, int obs_version, uid_t uid,
+                            uint8_t *obs_type, char *payload, size_t pcap)
+{
+    static uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    *obs_type = 0;
+    payload[0] = '\0';
+    virp_error_t err = onode_execute_obs_ex(&fx->st, H4_DEV, "uptime",
+                                            obs_version, NULL, uid,
+                                            buf, sizeof(buf), &len);
+    if (err != VIRP_OK || len < VIRP_HEADER_SIZE || buf[0] != VIRP_VERSION)
+        return err;
+    virp_header_t hdr;
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t dl;
+    if (virp_validate_message(buf, len, &fx->st.okey, &hdr) == VIRP_OK &&
+        virp_parse_observation(buf + VIRP_HEADER_SIZE, len - VIRP_HEADER_SIZE,
+                               &obs, &data, &dl) == VIRP_OK) {
+        *obs_type = obs.obs_type;
+        size_t n = dl < pcap - 1 ? dl : pcap - 1;
+        memcpy(payload, data, n);
+        payload[n] = '\0';
+    }
+    return err;
+}
+
+static void m12_case(const char *name, int obs_version, bool v3)
+{
+    fx_t *fx = &g_fx;
+    sqlite3 *db = NULL;
+    if (!h4_init(fx, name, &db, "autonomous")) {
+        CHECK(false, "fixture (needs a plain build, without LINUX=1)");
+        return;
+    }
+    /* Plain gate, no owner policy: this is about the session, not policy. */
+    virp_policy_close(fx->st.policy);
+    fx->st.policy = NULL;
+    uid_t me = getuid();
+    uint8_t ot = 0;
+    char payload[1024];
+
+    if (v3) {
+        char kpath[200], ppath[200];
+        snprintf(kpath, sizeof(kpath), "%s/%s/obs-sign.key", g_root, name);
+        snprintf(ppath, sizeof(ppath), "%s/%s/obs-sign.pub", g_root, name);
+        bool keyed = virp_obskey_generate(&fx->st.obskey) == VIRP_OK &&
+                     virp_obskey_save(&fx->st.obskey, kpath, ppath) == VIRP_OK &&
+                     virp_chain_enable_signing(&fx->st.chain, kpath) == VIRP_OK;
+        CHECK(keyed, "(v3 signing key loaded)");
+        fx->st.obskey_loaded = true;
+    }
+
+    /* No session at all: refused BEFORE dispatch. This stays a bare code,
+     * and correctly — nothing ran. */
+    CHECK(m12_run(fx, obs_version, me, &ot, payload, sizeof(payload))
+              == VIRP_ERR_SESSION_INVALID && h4_dispatches == 0,
+          "no session: bare SESSION_INVALID and nothing dispatched");
+
+    CHECK(m12_bind_session(fx, me), "session bound over the socket");
+    CHECK(m12_run(fx, obs_version, me, &ot, payload, sizeof(payload))
+              == VIRP_OK && h4_dispatches == 1,
+          "with a live session the command runs and is answered");
+
+    /* The session ends while the command is running. */
+    h4_on_execute = m12_close_session_mid_command;
+    virp_error_t err = m12_run(fx, obs_version, me, &ot, payload,
+                               sizeof(payload));
+    h4_on_execute = NULL;
+    CHECK(h4_dispatches == 2, "the command was dispatched");
+    CHECK(err == VIRP_OK && ot == VIRP_OBS_ERROR,
+          "session lost mid-command: an O-Key-signed ERROR observation, not a bare code");
+    CHECK(strstr(payload, "DISPATCHED") != NULL &&
+          strstr(payload, "session ended") != NULL &&
+          strstr(payload, "would execute it a second time") != NULL,
+          "it says the command ran and that re-running would repeat it");
+    CHECK(strstr(payload, "h4 fixture output") == NULL,
+          "it carries none of the device's output");
+    CHECK(fx_session_entries(fx, "gate-enforce:" H4_DEV) == 4,
+          "both executions are on the chain (intent + execution each)");
+
+    fx_destroy(fx);
+    sqlite3_close(db);
+}
+
+static void t_M12_v2_session_lost_after_dispatch(void)
+{
+    printf("\n  M12 (v2): session lost after the device acted\n");
+    m12_case("m12-v2", 2, false);
+}
+
+static void t_M12_v3_session_lost_after_dispatch(void)
+{
+    printf("\n  M12 (v3): session lost after the device acted\n");
+    m12_case("m12-v3", 3, true);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -1963,6 +2108,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M10_uid_in_rejections_and_proposer", t_M10_uid_in_rejections_and_proposer },
     { "t_M11_verify_response_carries_verifier_state",
                                               t_M11_verify_response_carries_verifier_state },
+    { "t_M12_v2_session_lost_after_dispatch", t_M12_v2_session_lost_after_dispatch },
+    { "t_M12_v3_session_lost_after_dispatch", t_M12_v3_session_lost_after_dispatch },
 };
 
 static void rm_rf_root(void)
