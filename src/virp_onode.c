@@ -4760,6 +4760,17 @@ static virp_error_t onode_list_fleet(onode_state_t *state,
                                   &state->okey);
 }
 
+/*
+ * Thread creation seam. Production code calls pthread_create; a test
+ * that includes this file may define ONODE_PTHREAD_CREATE first to
+ * substitute a function that fails on demand, because "the kernel would
+ * not give us a thread" is otherwise untestable and is exactly the case
+ * the batch path used to get wrong (security review M17).
+ */
+#ifndef ONODE_PTHREAD_CREATE
+#define ONODE_PTHREAD_CREATE pthread_create
+#endif
+
 /* =========================================================================
  * Batch Parallel Execution (pthread-based)
  *
@@ -6968,14 +6979,43 @@ static void handle_client(onode_state_t *state, int client_fd,
             break;
         }
 
-        /* Launch one thread per device */
+        /* Launch one thread per item.
+         *
+         * pthread_create's return was ignored (M17). When it failed —
+         * thread or memory limits, which is to say under exactly the
+         * load a 16-item batch creates — three things went wrong at
+         * once: the loop below joined a pthread_t that was never
+         * written (undefined behaviour, in practice a crash or a join
+         * on a stale id); the item's `err` was still the zero from the
+         * memset, i.e. VIRP_OK; and with no response bytes the encoder
+         * emitted it as a 4-byte code of 0. The caller was told an item
+         * succeeded that never ran.
+         *
+         * Now: each item records whether its thread exists, only those
+         * are joined, and an item with no thread carries a real error.
+         * RATE_LIMITED is the honest one — nothing was dispatched for
+         * it, the daemon was out of a bounded resource, retry later —
+         * and the items that did start are unaffected. */
         pthread_t threads[ONODE_MAX_BATCH];
-        for (int i = 0; i < cmd_count; i++)
-            pthread_create(&threads[i], NULL, batch_execute_thread, &args[i]);
+        bool started[ONODE_MAX_BATCH];
+        for (int i = 0; i < cmd_count; i++) {
+            int rc = ONODE_PTHREAD_CREATE(&threads[i], NULL,
+                                          batch_execute_thread, &args[i]);
+            started[i] = (rc == 0);
+            if (!started[i]) {
+                args[i].err = VIRP_ERR_RATE_LIMITED;
+                args[i].resp_len = 0;
+                fprintf(stderr, "[O-Node] batch item %d (%s): could not "
+                        "start a worker thread (%s) — NOT dispatched, "
+                        "reported to the caller as an error\n",
+                        i, args[i].device, strerror(rc));
+            }
+        }
 
-        /* Wait for all threads to complete */
+        /* Wait for the threads that exist. */
         for (int i = 0; i < cmd_count; i++)
-            pthread_join(threads[i], NULL);
+            if (started[i])
+                pthread_join(threads[i], NULL);
 
         /* Accumulate batch response into a buffer, then send as one frame.
          * Format: 4-byte count, then per-result (4-byte len + data). */
@@ -7000,6 +7040,11 @@ static void handle_client(onode_state_t *state, int client_fd,
                     memcpy(batch_buf + off, args[i].resp_buf, args[i].resp_len);
                     off += args[i].resp_len;
                 } else {
+                    /* A 4-byte item is an ERROR code, so it must never be
+                     * 0: "VIRP_OK and no bytes" is not a result any
+                     * caller can act on, and reads as success (M17). */
+                    if (args[i].err == VIRP_OK)
+                        args[i].err = VIRP_ERR_NULL_PTR;
                     uint32_t net_len = htonl(4);
                     memcpy(batch_buf + off, &net_len, 4); off += 4;
                     uint32_t err_code = htonl((uint32_t)args[i].err);
@@ -7642,8 +7687,8 @@ virp_error_t onode_watchdog_start(onode_state_t *state)
     if (!state)
         return VIRP_ERR_NULL_PTR;
     state->watchdog_running = true;
-    if (pthread_create(&state->watchdog_thread, NULL,
-                       watchdog_thread_fn, state) != 0) {
+    if (ONODE_PTHREAD_CREATE(&state->watchdog_thread, NULL,
+                             watchdog_thread_fn, state) != 0) {
         state->watchdog_running = false;
         return VIRP_ERR_KEY_NOT_LOADED;
     }
@@ -8701,7 +8746,8 @@ virp_error_t onode_start(onode_state_t *state)
             pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
             pthread_t tid;
-            int rc = pthread_create(&tid, &attr, connection_worker, arg);
+            int rc = ONODE_PTHREAD_CREATE(&tid, &attr, connection_worker,
+                                          arg);
             pthread_attr_destroy(&attr);
             if (rc != 0) {
                 /* Thread creation failed: undo counter, slot, sem, arg. */

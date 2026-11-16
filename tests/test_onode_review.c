@@ -18,6 +18,16 @@
  * removed on exit, so this suite cannot collide with another suite's fixed
  * /tmp paths or with a second copy of itself.
  */
+/* Thread-creation seam (see ONODE_PTHREAD_CREATE in the daemon source):
+ * every pthread_create the daemon makes goes through this, so a test can
+ * make the Nth one fail. Declared before the daemon source is included. */
+#define _POSIX_C_SOURCE 200809L   /* the same two the daemon source sets; */
+#define _GNU_SOURCE               /* they must precede the first header   */
+#include <pthread.h>
+static int review_pthread_create(pthread_t *t, const pthread_attr_t *a,
+                                 void *(*fn)(void *), void *arg);
+#define ONODE_PTHREAD_CREATE review_pthread_create
+
 #include "../src/virp_onode.c"
 
 #include "virp_federation.h"
@@ -28,6 +38,17 @@
 
 extern void virp_driver_mock_init(void);
 extern int  virp_driver_mock_exec_attempts_reset(void);
+
+/* Fail the Nth creation from now (1 = the next one); 0 = never. */
+static int review_fail_create_in;
+
+static int review_pthread_create(pthread_t *t, const pthread_attr_t *a,
+                                 void *(*fn)(void *), void *arg)
+{
+    if (review_fail_create_in > 0 && --review_fail_create_in == 0)
+        return EAGAIN;
+    return pthread_create(t, a, fn, arg);
+}
 
 static int failures;
 #define CHECK(cond, msg) do {                                           \
@@ -2495,6 +2516,63 @@ static void t_M16_proposals_are_rate_limited_per_uid(void)
     fx_destroy(fx);
 }
 
+/* =========================================================================
+ * M17 — a batch item whose thread could not be created is an error
+ * ========================================================================= */
+
+static void t_M17_batch_thread_create_failure(void)
+{
+    printf("\n  M17: a batch item with no worker thread is reported as an error\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m17-batch")) { CHECK(false, "fixture"); return; }
+    static uint8_t resp[4 * VIRP_MAX_MESSAGE_SIZE];
+    const char *req =
+        "{\"action\":\"batch_execute\",\"commands\":["
+        "{\"device\":\"" FX_DEV "\",\"command\":\"show version\"},"
+        "{\"device\":\"" FX_DEV "\",\"command\":\"show inventory\"},"
+        "{\"device\":\"" FX_DEV "\",\"command\":\"show clock\"}]}";
+
+    (void)virp_driver_mock_exec_attempts_reset();
+    review_fail_create_in = 2;                 /* the SECOND item's thread */
+    ssize_t n = fx_request(&fx->st, getuid(), req, resp, sizeof(resp));
+    review_fail_create_in = 0;
+    CHECK(n > 4, "the batch is answered");
+
+    /* count, then per item: BE32 length + bytes. */
+    uint32_t count = 0, len[3] = { 0, 0, 0 };
+    const uint8_t *item[3] = { NULL, NULL, NULL };
+    bool framed = n > 4;
+    if (framed) {
+        memcpy(&count, resp, 4);
+        count = ntohl(count);
+        size_t off = 4;
+        for (uint32_t i = 0; framed && i < count && i < 3; i++) {
+            if (off + 4 > (size_t)n) { framed = false; break; }
+            memcpy(&len[i], resp + off, 4);
+            len[i] = ntohl(len[i]);
+            off += 4;
+            if (off + len[i] > (size_t)n) { framed = false; break; }
+            item[i] = resp + off;
+            off += len[i];
+        }
+    }
+    CHECK(framed && count == 3, "three items come back, well framed");
+    if (framed && count == 3) {
+        uint32_t code = 0;
+        if (len[1] == 4) { memcpy(&code, item[1], 4); code = ntohl(code); }
+        CHECK(len[1] == 4 && (int32_t)code == (int32_t)VIRP_ERR_RATE_LIMITED,
+              "the item with no thread carries a real error, not code 0");
+        virp_header_t hdr;
+        CHECK(len[0] > 4 && len[2] > 4 &&
+              virp_validate_message(item[0], len[0], &fx->st.okey, &hdr) == VIRP_OK &&
+              virp_validate_message(item[2], len[2], &fx->st.okey, &hdr) == VIRP_OK,
+              "its neighbours ran and returned signed observations");
+    }
+    CHECK(virp_driver_mock_exec_attempts_reset() == 2,
+          "exactly the two items that got a thread were dispatched");
+    fx_destroy(fx);
+}
+
 /* ---- a real listening daemon, for what only the accept loop decides ---- */
 
 static void *fx_server_thread(void *arg)
@@ -2645,6 +2723,7 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M16_open_proposals_are_deduplicated", t_M16_open_proposals_are_deduplicated },
     { "t_M16_proposals_are_rate_limited_per_uid",
                                               t_M16_proposals_are_rate_limited_per_uid },
+    { "t_M17_batch_thread_create_failure",    t_M17_batch_thread_create_failure },
     { "t_M14_request_deadline_is_absolute",   t_M14_request_deadline_is_absolute },
     { "t_M14_send_timeout_abandons_a_stalled_reader",
                                               t_M14_send_timeout_abandons_a_stalled_reader },
