@@ -5475,6 +5475,74 @@ static virp_error_t chain_append_verify_observation(
 }
 
 /*
+ * The payload of a CHAIN_VERIFY / CHAIN_VERIFY_SESSION response
+ * (security review M11). One builder for both, so the two actions cannot
+ * drift apart in what they tell a caller.
+ *
+ * WHAT WAS MISSING. The response carried `valid`, the range and two
+ * counts, and nothing else the verifier had worked out. In particular:
+ *
+ *   verifier_error / verifier_error_detail
+ *       A storage or IO failure during the walk sets valid=false. Without
+ *       this flag the socket caller could not tell "the verifier could
+ *       not read the store" from "the chain has been tampered with" —
+ *       the exact conflation the field was added to the result struct to
+ *       end (HAM item 13), surviving at the one place operators read it.
+ *   sig_era / valid_signed / sig_checked
+ *       `valid` means the chain is INTACT, not that signatures were
+ *       checked; an unsigned-era session reads valid:true. valid_signed
+ *       is the flag a clean bill of health should be gated on.
+ *   hmac_checked / head_authenticated
+ *       whether K_chain HMACs were verified and whether the head's
+ *       length claim was authenticated.
+ *   artifacts_bound / artifacts_unverifiable / executions_closed
+ *       the binding and execution grades behind the verdict.
+ *
+ * All additive; every member that existed keeps its name, type and
+ * meaning, and members stay in alphabetical order. error_detail is now
+ * present for both actions (it was session-only).
+ *
+ * Built with cJSON. The session variant used to paste error_detail into
+ * a format string on the argument that "no quotes or control bytes
+ * reach it" — true of the session id, which is validated at ingress,
+ * but the detail strings also quote artifact ids, types and hashes read
+ * back from the DATABASE, which is the thing being verified and is not
+ * trusted to be well-formed. Sequence numbers are raw integer tokens so
+ * a caller-supplied to_sequence above 2^53 is echoed exactly.
+ *
+ * Returns the length, or -1 (json_buf emptied) if it does not fit.
+ */
+static int chain_verify_result_json(const virp_chain_verify_result_t *r,
+                                    char *json_buf, size_t cap)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { if (cap) json_buf[0] = '\0'; return -1; }
+    bool ok =
+        intent_add_int64(o, "artifacts_bound", (long long)r->artifacts_bound) &&
+        intent_add_int64(o, "artifacts_unverifiable",
+                         (long long)r->artifacts_unverifiable) &&
+        intent_add_int64(o, "entries_checked", (long long)r->entries_checked) &&
+        cJSON_AddStringToObject(o, "error_detail", r->error_detail) &&
+        intent_add_int64(o, "executions_closed",
+                         (long long)r->executions_closed) &&
+        intent_add_int64(o, "executions_open", (long long)r->executions_open) &&
+        intent_add_int64(o, "first_broken", (long long)r->first_broken) &&
+        intent_add_int64(o, "from_sequence", (long long)r->from_sequence) &&
+        cJSON_AddBoolToObject(o, "head_authenticated", r->head_authenticated) &&
+        cJSON_AddBoolToObject(o, "hmac_checked", r->hmac_checked) &&
+        cJSON_AddBoolToObject(o, "sig_checked", r->sig_checked) &&
+        cJSON_AddStringToObject(o, "sig_era",
+                                virp_chain_sig_era_name(r->sig_era)) &&
+        intent_add_int64(o, "to_sequence", (long long)r->to_sequence) &&
+        cJSON_AddBoolToObject(o, "valid", r->valid) &&
+        cJSON_AddBoolToObject(o, "valid_signed", r->valid_signed) &&
+        cJSON_AddBoolToObject(o, "verifier_error", r->verifier_error) &&
+        cJSON_AddStringToObject(o, "verifier_error_detail",
+                                r->verifier_error_detail);
+    return intent_print_json(o, ok, json_buf, cap);
+}
+
+/*
  * Per-uid action-allowlist decision for a SOCKET request. Returns true if
  * the request MUST be refused (the caller then sends a typed error and
  * closes — zero dispatch). Non-static so the fail-open regression can
@@ -6202,21 +6270,11 @@ static void handle_client(onode_state_t *state, int client_fd,
                 send_framed_error(client_fd, err);
                 break;
             }
-            char json_buf[1024];
-            int jlen = snprintf(json_buf, sizeof(json_buf),
-                "{\"entries_checked\":%lld,"
-                "\"executions_open\":%lld,"
-                "\"first_broken\":%lld,"
-                "\"from_sequence\":%lld,"
-                "\"to_sequence\":%lld,"
-                "\"valid\":%s}",
-                (long long)vresult.entries_checked,
-                (long long)vresult.executions_open,
-                (long long)vresult.first_broken,
-                (long long)vresult.from_sequence,
-                (long long)vresult.to_sequence,
-                vresult.valid ? "true" : "false");
-            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+            /* Everything the verifier concluded, not just `valid` (M11). */
+            char json_buf[2048];
+            int jlen = chain_verify_result_json(&vresult, json_buf,
+                                                sizeof(json_buf));
+            if (jlen < 0) {
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 break;
             }
@@ -6272,10 +6330,11 @@ static void handle_client(onode_state_t *state, int client_fd,
          * Unlike CHAIN_VERIFY, the caller supplies NO range — the range
          * comes from the authenticated head, so a caller cannot be fooled
          * by deriving max sequence from the same (possibly truncated)
-         * database it is auditing. Same response obs type as CHAIN_VERIFY
-         * so existing consumers parse it unchanged; adds error_detail
-         * because the failure mode (truncated vs missing head vs forged
-         * head) is the point of the check. */
+         * database it is auditing. Same response obs type and the same
+         * payload members as CHAIN_VERIFY (chain_verify_result_json), so
+         * existing consumers parse it unchanged; error_detail matters
+         * most here because the failure mode (truncated vs missing head
+         * vs forged head) is the point of the check. */
         if (!state->chain_enabled) {
             send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
             break;
@@ -6292,26 +6351,11 @@ static void handle_client(onode_state_t *state, int client_fd,
                 send_framed_error(client_fd, err);
                 break;
             }
-            /* error_detail is daemon-generated prose (fixed format strings,
-             * numbers, session ids validated at ingress) — no quotes or
-             * control bytes reach it, so direct embedding is safe. */
-            char json_buf[1024];
-            int jlen = snprintf(json_buf, sizeof(json_buf),
-                "{\"entries_checked\":%lld,"
-                "\"error_detail\":\"%s\","
-                "\"executions_open\":%lld,"
-                "\"first_broken\":%lld,"
-                "\"from_sequence\":%lld,"
-                "\"to_sequence\":%lld,"
-                "\"valid\":%s}",
-                (long long)vresult.entries_checked,
-                vresult.error_detail,
-                (long long)vresult.executions_open,
-                (long long)vresult.first_broken,
-                (long long)vresult.from_sequence,
-                (long long)vresult.to_sequence,
-                vresult.valid ? "true" : "false");
-            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+            /* Same builder as CHAIN_VERIFY (M11). */
+            char json_buf[2048];
+            int jlen = chain_verify_result_json(&vresult, json_buf,
+                                                sizeof(json_buf));
+            if (jlen < 0) {
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 break;
             }

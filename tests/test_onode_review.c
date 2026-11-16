@@ -1819,6 +1819,114 @@ static void t_M10_uid_in_rejections_and_proposer(void)
 }
 
 /* =========================================================================
+ * M11 — a verify response says everything the verifier concluded
+ * ========================================================================= */
+
+static bool m11_has_all(const cJSON *o)
+{
+    static const struct { const char *key; int kind; } WANT[] = {
+        /* kind: 0 bool, 1 number, 2 string */
+        { "verifier_error", 0 }, { "verifier_error_detail", 2 },
+        { "sig_era", 2 },        { "valid_signed", 0 },
+        { "hmac_checked", 0 },   { "sig_checked", 0 },
+        { "head_authenticated", 0 },
+        { "artifacts_bound", 1 }, { "artifacts_unverifiable", 1 },
+        { "executions_closed", 1 },
+        /* and the members that were already there */
+        { "valid", 0 }, { "entries_checked", 1 }, { "executions_open", 1 },
+        { "first_broken", 1 }, { "from_sequence", 1 }, { "to_sequence", 1 },
+        { "error_detail", 2 },
+    };
+    for (size_t i = 0; i < sizeof(WANT) / sizeof(WANT[0]); i++) {
+        const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, WANT[i].key);
+        bool ok = WANT[i].kind == 0 ? cJSON_IsBool(v)
+                : WANT[i].kind == 1 ? cJSON_IsNumber(v) : cJSON_IsString(v);
+        if (!ok) {
+            printf("      missing or mistyped member: %s\n", WANT[i].key);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void t_M11_verify_response_carries_verifier_state(void)
+{
+    printf("\n  M11: chain_verify responses report verifier error, era and grades\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m11-verify")) { CHECK(false, "fixture"); return; }
+    uid_t me = getuid();
+    uint8_t ot = 0;
+    char payload[2048];
+
+    /* Two GREEN reads: two intent/execution pairs in the gate session. */
+    CHECK(fx_run(fx, FX_DEV, "show version", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 &&
+          fx_run(fx, FX_DEV, "show clock", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0, "two reads executed");
+
+    int dups = -1;
+    cJSON *vs = fx_ask_json(fx, me,
+        "{\"action\":\"chain_verify_session\","
+        "\"session_id\":\"gate-enforce:" FX_DEV "\"}",
+        VIRP_OBS_CHAIN_VERIFY, &dups);
+    CHECK(vs != NULL && dups == 0, "chain_verify_session answers one object");
+    bool complete = vs && m11_has_all(vs);
+    CHECK(complete, "it carries all ten added members, typed");
+    /* The value checks dereference those members, so only with all present. */
+    if (complete) {
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(vs, "valid")) &&
+              cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(vs, "verifier_error")) &&
+              cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(vs, "hmac_checked")) &&
+              cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(vs, "head_authenticated")),
+              "an intact session: valid, no verifier error, HMACs and head checked");
+        CHECK(cJSON_GetObjectItemCaseSensitive(vs, "executions_closed")->valuedouble == 2 &&
+              cJSON_GetObjectItemCaseSensitive(vs, "artifacts_bound")->valuedouble == 4,
+              "two closed executions, four bound bodies");
+        /* This fixture's chain has no Ed25519 signing: intact is not the
+         * same as signed, and the response now says so. */
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(vs, "valid_signed")) &&
+              strcmp(cJSON_GetObjectItemCaseSensitive(vs, "sig_era")->valuestring,
+                     "SIGNED") != 0,
+              "valid_signed is false and sig_era is not SIGNED for an unsigned chain");
+    }
+    if (vs) cJSON_Delete(vs);
+
+    cJSON *v = fx_ask_json(fx, me,
+        "{\"action\":\"chain_verify\","
+        "\"session_id\":\"gate-enforce:" FX_DEV "\","
+        "\"from_sequence\":0,\"to_sequence\":3}",
+        VIRP_OBS_CHAIN_VERIFY, &dups);
+    CHECK(v != NULL && dups == 0 && m11_has_all(v),
+          "chain_verify (ranged) carries the same members");
+    if (v) cJSON_Delete(v);
+
+    /* A detail string quoting text from the database must not be able to
+     * reshape the response. */
+    virp_chain_verify_result_t r;
+    memset(&r, 0, sizeof(r));
+    r.first_broken = -1;
+    r.verifier_error = true;
+    snprintf(r.error_detail, sizeof(r.error_detail),
+             "entry 'x\",\"valid\":true,\"y\":\"' has no body");
+    snprintf(r.verifier_error_detail, sizeof(r.verifier_error_detail),
+             "prepare failed: near \"\\\": syntax error");
+    r.to_sequence = INT64_MAX;
+    char buf[2048];
+    int n = chain_verify_result_json(&r, buf, sizeof(buf));
+    cJSON *o = n > 0 ? cJSON_ParseWithLengthOpts(buf, (size_t)n + 1, NULL, 1) : NULL;
+    CHECK(o != NULL && !json_object_has_duplicate_keys(o, 1024) &&
+          cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(o, "valid")) &&
+          cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "verifier_error")) &&
+          !strcmp(cJSON_GetObjectItemCaseSensitive(o, "error_detail")->valuestring,
+                  r.error_detail),
+          "quotes in a detail string are escaped: valid stays false, one member each");
+    CHECK(strstr(buf, "\"to_sequence\":9223372036854775807") != NULL,
+          "to_sequence is echoed exactly, not through a double");
+    if (o) cJSON_Delete(o);
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -1853,6 +1961,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M9_policy_refusal_is_chained_and_signed",
                                               t_M9_policy_refusal_is_chained_and_signed },
     { "t_M10_uid_in_rejections_and_proposer", t_M10_uid_in_rejections_and_proposer },
+    { "t_M11_verify_response_carries_verifier_state",
+                                              t_M11_verify_response_carries_verifier_state },
 };
 
 static void rm_rf_root(void)
