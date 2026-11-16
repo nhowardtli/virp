@@ -1074,6 +1074,196 @@ static void t_M3_unknown_device_uses_fixed_separator_session(void)
 }
 
 /* =========================================================================
+ * M4 — intent store / get: validated at store, well-formed when fetched
+ * ========================================================================= */
+
+/* JSON-string-escape `in` (quotes and backslashes only — enough for the
+ * payloads below) so a JSON text can ride inside a request as a string. */
+static void m4_esc(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (; *in && o + 2 < cap; in++) {
+        if (*in == '"' || *in == '\\') out[o++] = '\\';
+        out[o++] = *in;
+    }
+    out[o] = '\0';
+}
+
+/* Build an intent_store request. hash == NULL means "the true sha256". */
+static const char *m4_store(const char *id, const char *intent_json,
+                            const char *hash, const char *confidence,
+                            const char *actions, const char *constraints)
+{
+    static char req[8192];
+    char h[65], ej[2048], ea[1024], ec[1024], ei[256], ef[64];
+    gate_sha256_hex(intent_json, strlen(intent_json), h);
+    m4_esc(intent_json, ej, sizeof(ej));
+    m4_esc(actions ? actions : "", ea, sizeof(ea));
+    m4_esc(constraints ? constraints : "", ec, sizeof(ec));
+    m4_esc(id, ei, sizeof(ei));
+    m4_esc(confidence, ef, sizeof(ef));
+    int off = snprintf(req, sizeof(req),
+        "{\"action\":\"intent_store\",\"intent_id\":\"%s\","
+        "\"intent_hash\":\"%s\",\"intent_json\":\"%s\","
+        "\"confidence\":\"%s\",\"max_commands\":3",
+        ei, hash ? hash : h, ej, ef);
+    if (actions)
+        off += snprintf(req + off, sizeof(req) - (size_t)off,
+                        ",\"proposed_actions\":\"%s\"", ea);
+    if (constraints)
+        off += snprintf(req + off, sizeof(req) - (size_t)off,
+                        ",\"constraints\":\"%s\"", ec);
+    snprintf(req + off, sizeof(req) - (size_t)off, "}");
+    return req;
+}
+
+/* Send a request and return the JSON payload of the signed observation
+ * that answers it, parsed — or NULL if it was refused / not JSON. */
+static cJSON *fx_ask_json(fx_t *fx, uid_t uid, const char *json,
+                          uint8_t want_obs_type, int *dup_keys)
+{
+    static uint8_t resp[VIRP_MAX_MESSAGE_SIZE + 64];
+    ssize_t n = fx_request(&fx->st, uid, json, resp, sizeof(resp));
+    if (n <= 4) return NULL;
+    virp_header_t hdr;
+    if (virp_validate_message(resp, (size_t)n, &fx->st.okey, &hdr) != VIRP_OK)
+        return NULL;
+    virp_observation_t obs;
+    const uint8_t *data;
+    uint16_t dl;
+    if (virp_parse_observation(resp + VIRP_HEADER_SIZE,
+                               (size_t)n - VIRP_HEADER_SIZE, &obs, &data, &dl)
+            != VIRP_OK || obs.obs_type != want_obs_type)
+        return NULL;
+    static char text[VIRP_MAX_MESSAGE_SIZE];
+    memcpy(text, data, dl);
+    text[dl] = '\0';
+    cJSON *o = cJSON_ParseWithLengthOpts(text, (size_t)dl + 1, NULL, 1);
+    if (o && dup_keys)
+        *dup_keys = json_object_has_duplicate_keys(o, 1024) ? 1 : 0;
+    return o;
+}
+
+static void t_M4_intent_store_validates_and_get_is_wellformed(void)
+{
+    printf("\n  M4: intent_store validates its fields; intent_get returns well-formed JSON\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m4-intent")) { CHECK(false, "fixture"); return; }
+    onode_state_t *st = &fx->st;
+    uid_t me = getuid();
+    const char *IJ = "{\"goal\":\"audit\",\"n\":1}";
+
+    /* The well-formed case, with whitespace the daemon should normalize. */
+    int dups = -1;
+    cJSON *stored = fx_ask_json(fx, me,
+        m4_store("intent-ok", IJ, NULL, "high", "[ \"show version\" , 2 ]",
+                 "{ \"max\" : 1 }"),
+        VIRP_OBS_INTENT_STORED, &dups);
+    CHECK(stored != NULL && dups == 0 &&
+          cJSON_IsString(cJSON_GetObjectItemCaseSensitive(stored, "signature_hmac")),
+          "a well-formed intent is stored and acknowledged");
+    if (stored) cJSON_Delete(stored);
+
+    cJSON *got = fx_ask_json(fx, me,
+        "{\"action\":\"intent_get\",\"intent_id\":\"intent-ok\"}",
+        VIRP_OBS_INTENT_FETCHED, &dups);
+    CHECK(got != NULL && dups == 0, "intent_get returns one well-formed object");
+    if (got) {
+        const cJSON *c = cJSON_GetObjectItemCaseSensitive(got, "constraints");
+        const cJSON *a = cJSON_GetObjectItemCaseSensitive(got, "proposed_actions");
+        const cJSON *j = cJSON_GetObjectItemCaseSensitive(got, "intent_json");
+        const cJSON *t = cJSON_GetObjectItemCaseSensitive(got, "created_at_ns");
+        CHECK(cJSON_IsObject(c) && cJSON_IsArray(a) && cJSON_IsObject(j) &&
+              cJSON_GetArraySize(a) == 2,
+              "the three bodies come back as parsed JSON values");
+        CHECK(cJSON_IsNumber(t) && t->valuedouble > 1e18,
+              "timestamps are still JSON numbers (wire shape unchanged)");
+        cJSON_Delete(got);
+    }
+    /* What is kept for the two normalized fields is the parse. */
+    virp_intent_entry_t ie;
+    CHECK(virp_chain_intent_get(&st->chain, "intent-ok", &ie) == VIRP_OK &&
+          strcmp(ie.proposed_actions, "[\"show version\",2]") == 0 &&
+          strcmp(ie.constraints, "{\"max\":1}") == 0 &&
+          strcmp(ie.intent_json, IJ) == 0,
+          "proposed_actions/constraints stored re-serialized; intent_json byte-for-byte");
+
+    /* Injection through a body that is not JSON. */
+    CHECK(fx_ask(st, me, m4_store("inj-constraints", IJ, NULL, "high", NULL,
+              "{},\"signature_hmac\":\"" H2_HASH "\""))
+              == VIRP_ERR_INVALID_TYPE,
+          "constraints that would inject a second signature_hmac are refused");
+    CHECK(fx_ask(st, me, m4_store("inj-actions", IJ, NULL, "high",
+              "[],\"max_commands\":999", NULL)) == VIRP_ERR_INVALID_TYPE,
+          "proposed_actions that would inject a member are refused");
+    CHECK(fx_ask(st, me, m4_store("shape-actions", IJ, NULL, "high",
+              "{\"not\":\"an array\"}", NULL)) == VIRP_ERR_INVALID_TYPE,
+          "proposed_actions must be a JSON array");
+    CHECK(fx_ask(st, me, m4_store("shape-constraints", IJ, NULL, "high", NULL,
+              "[1]")) == VIRP_ERR_INVALID_TYPE,
+          "constraints must be a JSON object");
+    CHECK(fx_ask(st, me, m4_store("not-json", "definitely not json", NULL,
+              "high", NULL, NULL)) == VIRP_ERR_INVALID_TYPE,
+          "intent_json that is not JSON is refused");
+
+    /* Injection through the quoted fields. */
+    CHECK(fx_ask(st, me, m4_store("inj-conf", IJ, NULL, "a\",\"b\":\"c",
+              NULL, NULL)) == VIRP_ERR_INVALID_LENGTH,
+          "a confidence containing a quote is refused");
+    CHECK(fx_ask(st, me, m4_store("id\",\"x\":\"y", IJ, NULL, "high",
+              NULL, NULL)) == VIRP_ERR_INVALID_LENGTH,
+          "an intent_id containing a quote is refused");
+
+    /* intent_hash must commit to intent_json. */
+    CHECK(fx_ask(st, me, m4_store("bad-hash", IJ, H2_HASH, "high", NULL, NULL))
+              == VIRP_ERR_CHAIN_BROKEN,
+          "an intent_hash that is not sha256(intent_json) is refused");
+    char upper[65];
+    gate_sha256_hex(IJ, strlen(IJ), upper);
+    for (int i = 0; i < 64; i++)
+        if (upper[i] >= 'a' && upper[i] <= 'f') upper[i] = (char)(upper[i] - 32);
+    CHECK(fx_ask(st, me, m4_store("upper-hash", IJ, upper, "high", NULL, NULL))
+              == VIRP_ERR_INVALID_LENGTH,
+          "an upper-case intent_hash is refused (64 LOWERCASE hex)");
+    CHECK(virp_chain_intent_get(&st->chain, "bad-hash", &ie)
+              == VIRP_ERR_INTENT_NOT_FOUND &&
+          virp_chain_intent_get(&st->chain, "inj-constraints", &ie)
+              == VIRP_ERR_INTENT_NOT_FOUND,
+          "a refused intent was not stored");
+
+    /* A row written before these checks existed: it must not be signed. */
+    memset(&ie, 0, sizeof(ie));
+    snprintf(ie.intent_id, sizeof(ie.intent_id), "legacy-row");
+    gate_sha256_hex(IJ, strlen(IJ), ie.intent_hash);
+    snprintf(ie.intent_json, sizeof(ie.intent_json), "%s", IJ);
+    snprintf(ie.confidence, sizeof(ie.confidence), "high");
+    snprintf(ie.constraints, sizeof(ie.constraints),
+             "{},\"signature_hmac\":\"" H2_HASH "\"");
+    CHECK(virp_chain_intent_store(&st->chain, &ie) == VIRP_OK,
+          "(a pre-M4 style row is planted directly in the store)");
+    CHECK(fx_ask(st, me, "{\"action\":\"intent_get\","
+                         "\"intent_id\":\"legacy-row\"}") != VIRP_OK,
+          "intent_get refuses a stored row it cannot render as JSON");
+
+    fx_destroy(fx);
+}
+
+static void t_M4_intent_body_store_failure_is_reported(void)
+{
+    printf("\n  M4: a failed intent body store is an error, not an acknowledgement\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m4-artifact")) { CHECK(false, "fixture"); return; }
+    /* Make the artifact store — and only it — fail. */
+    CHECK(sqlite3_exec(fx->st.chain.db, "DROP TABLE artifacts;", NULL, NULL,
+                       NULL) == SQLITE_OK, "(artifact table removed)");
+    CHECK(fx_ask(&fx->st, getuid(),
+                 m4_store("no-body", "{\"goal\":\"x\"}", NULL, "high",
+                          NULL, NULL)) == VIRP_ERR_CHAIN_DB,
+          "intent_store reports the body-store failure");
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -1094,6 +1284,10 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M3_device_name_validated_at_ingress", t_M3_device_name_validated_at_ingress },
     { "t_M3_unknown_device_uses_fixed_separator_session",
                                               t_M3_unknown_device_uses_fixed_separator_session },
+    { "t_M4_intent_store_validates_and_get_is_wellformed",
+                                              t_M4_intent_store_validates_and_get_is_wellformed },
+    { "t_M4_intent_body_store_failure_is_reported",
+                                              t_M4_intent_body_store_failure_is_reported },
 };
 
 static void rm_rf_root(void)

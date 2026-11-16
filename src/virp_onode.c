@@ -25,6 +25,7 @@
 #include "virp_context.h"
 #include "virp_validator.h"
 #include "virp_scrub.h"          /* scrub-at-capture (S-1) — before sign */
+#include <stddef.h>               /* offsetof */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -4848,42 +4849,227 @@ static fed_cite_kind_t fed_outcome_citation(const char *body,
  * attacker-writable region inside the message must either sign it or
  * move the commitment to the canonical span.
  */
-/* A truncated JSON response is refused, never signed over a would-be length. */
+/* =========================================================================
+ * Intent store / get — body handling (security review M4)
+ *
+ * An intent carries three caller-supplied JSON texts: intent_json,
+ * proposed_actions and constraints. The INTENT_FETCHED response used to
+ * be built with snprintf, pasting those three in as raw JSON VALUES and
+ * intent_id / confidence in between quotes, unescaped. Nothing ever
+ * checked that the texts were JSON. So a client that stored
+ *
+ *     "constraints": "{},\"signature_hmac\":\"<64 hex of its choosing>\""
+ *
+ * got back — in an observation signed with the O-Key — an object with
+ * two signature_hmac members, and a confidence of `x","max_commands":0`
+ * rewrote the fields after it. The daemon was signing a document whose
+ * structure the caller wrote.
+ *
+ * The rules now:
+ *   - at STORE, each of the three must parse as JSON, entire string, of
+ *     the documented shape (proposed_actions an array, constraints an
+ *     object; intent_json any value). intent_id and confidence must pass
+ *     the canonical-string check. intent_hash must be 64 lowercase hex
+ *     and equal sha256(intent_json): the daemon HMACs intent_hash, and
+ *     an HMAC over a hash that does not commit to the stored body
+ *     vouches for nothing.
+ *   - proposed_actions and constraints are stored RE-SERIALIZED by
+ *     cJSON, so what is kept is the parse, not the caller's bytes.
+ *     intent_json is stored byte-for-byte: intent_hash commits to those
+ *     exact bytes, and re-serializing would break the commitment the
+ *     line above just checked.
+ *   - every response is built with cJSON. On GET the three are embedded
+ *     as PARSED values, so the response is well-formed whatever is in
+ *     the database; a legacy row whose text does not parse is refused
+ *     rather than signed.
+ *
+ * Nanosecond timestamps and the sequence are emitted as raw integer
+ * tokens (cJSON_AddRawToObject over a %lld): the same bytes the snprintf
+ * produced, where cJSON_AddNumberToObject would round a 1.79e18 value
+ * through a double. Member order is unchanged (alphabetical).
+ * ========================================================================= */
+
+/* Parse `text` as one complete JSON value. NULL unless the whole string
+ * is consumed (trailing whitespace allowed). */
+static cJSON *intent_parse_json_text(const char *text)
+{
+    if (!text || !text[0]) return NULL;
+    return cJSON_ParseWithLengthOpts(text, strlen(text) + 1, NULL, 1);
+}
+
+static bool intent_add_int64(cJSON *o, const char *key, long long v)
+{
+    char num[32];
+    snprintf(num, sizeof(num), "%lld", v);
+    return cJSON_AddRawToObject(o, key, num) != NULL;
+}
+
+/* Embed a stored JSON text as a parsed value. An EMPTY text is JSON null
+ * (the field was never supplied). A non-empty text that does not parse
+ * is a refusal: false. */
+static bool intent_add_json_text(cJSON *o, const char *key, const char *text)
+{
+    if (!text || !text[0])
+        return cJSON_AddNullToObject(o, key) != NULL;
+    cJSON *v = intent_parse_json_text(text);
+    if (!v) return false;
+    if (!cJSON_AddItemToObject(o, key, v)) {
+        cJSON_Delete(v);
+        return false;
+    }
+    return true;
+}
+
+/* Print `o` into buf, or refuse. A truncated JSON response is refused,
+ * never signed over a would-be length. Consumes `o`. */
+static int intent_print_json(cJSON *o, bool ok, char *json_buf, size_t cap)
+{
+    char *txt = ok ? cJSON_PrintUnformatted(o) : NULL;
+    cJSON_Delete(o);
+    int jlen = -1;
+    if (txt) {
+        size_t n = strlen(txt);
+        if (n < cap) {
+            memcpy(json_buf, txt, n + 1);
+            jlen = (int)n;
+        }
+        cJSON_free(txt);
+    }
+    if (jlen < 0 && cap) json_buf[0] = '\0';
+    return jlen;
+}
+
+/* INTENT_FETCHED body. Returns the length, or -1 (json_buf emptied) if it
+ * does not fit or a stored field cannot be embedded. */
 static int intent_format_json(const virp_intent_entry_t *ie, char *json_buf,
                       size_t cap)
 {
-    int jlen = snprintf(json_buf, cap,
-        "{\"commands_executed\":%d,"
-        "\"confidence\":\"%s\","
-        "\"constraints\":%s,"
-        "\"created_at_ns\":%lld,"
-        "\"expires_at_ns\":%lld,"
-        "\"intent_hash\":\"%s\","
-        "\"intent_id\":\"%s\","
-        "\"intent_json\":%s,"
-        "\"max_commands\":%d,"
-        "\"proposed_actions\":%s,"
-        "\"signature_hmac\":\"%s\","
-        "\"signature_seq\":%lld,"
-        "\"signature_timestamp_ns\":%lld}",
-        ie->commands_executed,
-        ie->confidence,
-        ie->constraints,
-        (long long)ie->created_at_ns,
-        (long long)ie->expires_at_ns,
-        ie->intent_hash,
-        ie->intent_id,
-        ie->intent_json,
-        ie->max_commands,
-        ie->proposed_actions,
-        ie->signature_hmac,
-        (long long)ie->signature_seq,
-        (long long)ie->signature_timestamp_ns);
-    if (jlen < 0 || (size_t)jlen >= cap) {
-        if (cap) json_buf[0] = '\0';
-        return -1;
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { if (cap) json_buf[0] = '\0'; return -1; }
+    bool ok =
+        cJSON_AddNumberToObject(o, "commands_executed",
+                                (double)ie->commands_executed) &&
+        cJSON_AddStringToObject(o, "confidence", ie->confidence) &&
+        intent_add_json_text(o, "constraints", ie->constraints) &&
+        intent_add_int64(o, "created_at_ns", (long long)ie->created_at_ns) &&
+        intent_add_int64(o, "expires_at_ns", (long long)ie->expires_at_ns) &&
+        cJSON_AddStringToObject(o, "intent_hash", ie->intent_hash) &&
+        cJSON_AddStringToObject(o, "intent_id", ie->intent_id) &&
+        intent_add_json_text(o, "intent_json", ie->intent_json) &&
+        cJSON_AddNumberToObject(o, "max_commands",
+                                (double)ie->max_commands) &&
+        intent_add_json_text(o, "proposed_actions", ie->proposed_actions) &&
+        cJSON_AddStringToObject(o, "signature_hmac", ie->signature_hmac) &&
+        intent_add_int64(o, "signature_seq", (long long)ie->signature_seq) &&
+        intent_add_int64(o, "signature_timestamp_ns",
+                         (long long)ie->signature_timestamp_ns);
+    return intent_print_json(o, ok, json_buf, cap);
+}
+
+/* INTENT_STORED body. */
+static int intent_format_stored_json(const virp_intent_entry_t *ie,
+                                     char *json_buf, size_t cap)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { if (cap) json_buf[0] = '\0'; return -1; }
+    bool ok =
+        cJSON_AddNumberToObject(o, "commands_executed",
+                                (double)ie->commands_executed) &&
+        cJSON_AddStringToObject(o, "intent_id", ie->intent_id) &&
+        cJSON_AddNumberToObject(o, "max_commands",
+                                (double)ie->max_commands) &&
+        cJSON_AddStringToObject(o, "signature_hmac", ie->signature_hmac) &&
+        intent_add_int64(o, "signature_seq", (long long)ie->signature_seq) &&
+        intent_add_int64(o, "signature_timestamp_ns",
+                         (long long)ie->signature_timestamp_ns);
+    return intent_print_json(o, ok, json_buf, cap);
+}
+
+/* INTENT_EXECUTED body. */
+static int intent_format_executed_json(const virp_intent_entry_t *ie,
+                                       char *json_buf, size_t cap)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { if (cap) json_buf[0] = '\0'; return -1; }
+    bool ok =
+        cJSON_AddNumberToObject(o, "commands_executed",
+                                (double)ie->commands_executed) &&
+        cJSON_AddStringToObject(o, "intent_id", ie->intent_id) &&
+        cJSON_AddNumberToObject(o, "max_commands",
+                                (double)ie->max_commands);
+    return intent_print_json(o, ok, json_buf, cap);
+}
+
+/*
+ * Validate an intent_store request and fill *ie from it (see the block
+ * comment above for each rule). Returns VIRP_OK, or the error the handler
+ * sends: INVALID_LENGTH for a non-conformant id/confidence/hash,
+ * INVALID_TYPE for a text that is not JSON of the documented shape,
+ * CHAIN_BROKEN for an intent_hash that does not commit to intent_json
+ * (the same code GATE 2 uses for a body/hash disagreement), and
+ * BUFFER_TOO_SMALL if a re-serialized text no longer fits its field.
+ */
+static virp_error_t intent_from_request(const onode_request_t *req,
+                                        virp_intent_entry_t *ie)
+{
+    memset(ie, 0, sizeof(*ie));
+
+    if (!onode_canonical_string_ok(req->intent_id) ||
+        !onode_canonical_string_ok(req->confidence))
+        return VIRP_ERR_INVALID_LENGTH;
+    if (!virp_chain_artifact_hash_ok(req->intent_hash))
+        return VIRP_ERR_INVALID_LENGTH;
+
+    char computed[65];
+    gate_sha256_hex(req->intent_json, strlen(req->intent_json), computed);
+    if (virp_consttime_eq(computed, req->intent_hash, 64) != 1)
+        return VIRP_ERR_CHAIN_BROKEN;
+
+    cJSON *ij = intent_parse_json_text(req->intent_json);
+    if (!ij) return VIRP_ERR_INVALID_TYPE;
+    cJSON_Delete(ij);
+
+    static const struct {
+        const char *name; size_t req_off; size_t ie_off; size_t ie_size;
+        bool want_array;
+    } NORMALIZED[] = {
+        { "proposed_actions", offsetof(onode_request_t, proposed_actions),
+          offsetof(virp_intent_entry_t, proposed_actions),
+          sizeof(((virp_intent_entry_t *)0)->proposed_actions), true },
+        { "constraints", offsetof(onode_request_t, constraints),
+          offsetof(virp_intent_entry_t, constraints),
+          sizeof(((virp_intent_entry_t *)0)->constraints), false },
+    };
+    for (size_t i = 0; i < sizeof(NORMALIZED) / sizeof(NORMALIZED[0]); i++) {
+        const char *src = (const char *)req + NORMALIZED[i].req_off;
+        char *dst = (char *)ie + NORMALIZED[i].ie_off;
+        if (!src[0]) continue;                 /* not supplied */
+        cJSON *v = intent_parse_json_text(src);
+        bool shape = v && (NORMALIZED[i].want_array ? cJSON_IsArray(v)
+                                                    : cJSON_IsObject(v));
+        if (!shape) {
+            if (v) cJSON_Delete(v);
+            return VIRP_ERR_INVALID_TYPE;
+        }
+        char *txt = cJSON_PrintUnformatted(v);
+        cJSON_Delete(v);
+        if (!txt) return VIRP_ERR_BUFFER_TOO_SMALL;
+        size_t n = strlen(txt);
+        if (n >= NORMALIZED[i].ie_size) {
+            cJSON_free(txt);
+            return VIRP_ERR_BUFFER_TOO_SMALL;
+        }
+        memcpy(dst, txt, n + 1);
+        cJSON_free(txt);
     }
-    return jlen;
+
+    snprintf(ie->intent_id, sizeof(ie->intent_id), "%s", req->intent_id);
+    snprintf(ie->intent_hash, sizeof(ie->intent_hash), "%s", req->intent_hash);
+    snprintf(ie->intent_json, sizeof(ie->intent_json), "%s", req->intent_json);
+    snprintf(ie->confidence, sizeof(ie->confidence), "%s", req->confidence);
+    ie->expires_at_ns = req->expires_at_ns;
+    ie->max_commands = req->max_commands;
+    return VIRP_OK;
 }
 
 static virp_error_t chain_append_verify_observation(
@@ -5842,17 +6028,17 @@ static void handle_client(onode_state_t *state, int client_fd,
         }
         {
             virp_intent_entry_t ie;
-            memset(&ie, 0, sizeof(ie));
-            snprintf(ie.intent_id, sizeof(ie.intent_id), "%s", req.intent_id);
-            snprintf(ie.intent_hash, sizeof(ie.intent_hash), "%s", req.intent_hash);
-            snprintf(ie.intent_json, sizeof(ie.intent_json), "%s", req.intent_json);
-            snprintf(ie.confidence, sizeof(ie.confidence), "%s", req.confidence);
-            ie.expires_at_ns = req.expires_at_ns;
-            ie.max_commands = req.max_commands;
-            snprintf(ie.proposed_actions, sizeof(ie.proposed_actions), "%s",
-                     req.proposed_actions);
-            snprintf(ie.constraints, sizeof(ie.constraints), "%s",
-                     req.constraints);
+            err = intent_from_request(&req, &ie);
+            if (err != VIRP_OK) {
+                fprintf(stderr, "[O-Node] intent_store REJECTED: intent "
+                        "fields failed validation (%s) — id, confidence and "
+                        "hash must be well-formed, intent_hash must equal "
+                        "sha256(intent_json), and intent_json / "
+                        "proposed_actions / constraints must be JSON\n",
+                        virp_error_str(err));
+                send_framed_error(client_fd, err);
+                break;
+            }
 
             /* Sequence for the observation response */
             uint32_t seq = onode_next_seq(state);
@@ -5864,29 +6050,35 @@ static void handle_client(onode_state_t *state, int client_fd,
                 send_framed_error(client_fd, err);
                 break;
             }
-            /* Store intent content as artifact */
-            if (ie.intent_json[0] != '\0') {
-                virp_chain_artifact_store(&state->chain,
+            /* Store intent content as artifact. The return was ignored
+             * (M4): a failed body store still answered INTENT_STORED, so
+             * the client held a signed receipt for an intent whose body
+             * the daemon never kept. Now a failure is the answer. The
+             * intent ROW is already written — the two stores are separate
+             * statements, and making them one transaction needs a chain
+             * API that does not exist yet (see REVIEW-NOTES.md) — so the
+             * journal says so by name. intent_json is non-empty here:
+             * the caller and intent_from_request both required it. */
+            {
+                virp_error_t aerr = virp_chain_artifact_store(&state->chain,
                     ie.intent_id, "intent",
                     ie.intent_json, ie.intent_hash,
                     req.session_id[0] != '\0' ? req.session_id : "intent");
+                if (aerr != VIRP_OK) {
+                    fprintf(stderr, "[O-Node] ERROR: intent '%s' was stored "
+                            "but its body could not be (%s); refusing to "
+                            "acknowledge it — the intent row exists without "
+                            "an artifact body\n", ie.intent_id,
+                            virp_error_str(aerr));
+                    send_framed_error(client_fd, aerr);
+                    break;
+                }
             }
 
             char json_buf[512];
-            int jlen = snprintf(json_buf, sizeof(json_buf),
-                "{\"commands_executed\":%d,"
-                "\"intent_id\":\"%s\","
-                "\"max_commands\":%d,"
-                "\"signature_hmac\":\"%s\","
-                "\"signature_seq\":%lld,"
-                "\"signature_timestamp_ns\":%lld}",
-                ie.commands_executed,
-                ie.intent_id,
-                ie.max_commands,
-                ie.signature_hmac,
-                (long long)ie.signature_seq,
-                (long long)ie.signature_timestamp_ns);
-            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+            int jlen = intent_format_stored_json(&ie, json_buf,
+                                                 sizeof(json_buf));
+            if (jlen < 0) {
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 break;
             }
@@ -5914,6 +6106,12 @@ static void handle_client(onode_state_t *state, int client_fd,
             break;
         }
         {
+            /* The id is a lookup key here, but it is also echoed into the
+             * signed response — same rule as at store (M4). */
+            if (!onode_canonical_string_ok(req.intent_id)) {
+                send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+                break;
+            }
             virp_intent_entry_t ie;
             err = virp_chain_intent_get(&state->chain, req.intent_id, &ie);
             if (err != VIRP_OK) {
@@ -5921,10 +6119,15 @@ static void handle_client(onode_state_t *state, int client_fd,
                 break;
             }
 
-            /* Return full intent data as JSON */
+            /* Return full intent data as JSON. -1 covers both "does not
+             * fit" and "a stored text is not JSON" (a row written before
+             * M4): either way nothing is signed. */
             char json_buf[6144];
             int jlen = intent_format_json(&ie, json_buf, sizeof(json_buf));
             if (jlen < 0) {
+                fprintf(stderr, "[O-Node] intent_get REFUSED for '%s': the "
+                        "stored intent cannot be rendered as well-formed "
+                        "JSON within the response limit\n", req.intent_id);
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 break;
             }
@@ -5960,14 +6163,9 @@ static void handle_client(onode_state_t *state, int client_fd,
             }
 
             char json_buf[512];
-            int jlen = snprintf(json_buf, sizeof(json_buf),
-                "{\"commands_executed\":%d,"
-                "\"intent_id\":\"%s\","
-                "\"max_commands\":%d}",
-                ie.commands_executed,
-                ie.intent_id,
-                ie.max_commands);
-            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+            int jlen = intent_format_executed_json(&ie, json_buf,
+                                                   sizeof(json_buf));
+            if (jlen < 0) {
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 break;
             }
