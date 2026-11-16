@@ -1437,6 +1437,81 @@ static void t_M6_observation_registered_once(void)
 }
 
 /* =========================================================================
+ * M7 — a hostname must be usable as a chain session id
+ * ========================================================================= */
+
+static virp_error_t m7_add(onode_state_t *st, const char *hostname, uint32_t nid)
+{
+    virp_device_t d;
+    memset(&d, 0, sizeof(d));
+    snprintf(d.hostname, sizeof(d.hostname), "%s", hostname);
+    snprintf(d.host, sizeof(d.host), "10.255.7.%u", nid & 0xff);
+    d.vendor = VIRP_VENDOR_MOCK; d.node_id = nid; d.enabled = true;
+    return onode_add_device(st, &d);
+}
+
+static const char *m7_name(size_t len)
+{
+    static char buf[64];
+    memset(buf, 'h', len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static void t_M7_hostname_must_fit_session_id(void)
+{
+    printf("\n  M7: hostnames the chain cannot carry as a session id are refused\n");
+    static onode_state_t st;
+    CHECK(onode_init(&st, 1, NULL, "/tmp/virp-review-unused.sock") == VIRP_OK,
+          "state initialised");
+
+    CHECK(m7_add(&st, "core\"sw", 0x70000001) == VIRP_ERR_INVALID_LENGTH,
+          "a hostname containing a quote is refused");
+    CHECK(m7_add(&st, "core\\sw", 0x70000002) == VIRP_ERR_INVALID_LENGTH,
+          "a hostname containing a backslash is refused");
+    CHECK(m7_add(&st, "core\nsw", 0x70000003) == VIRP_ERR_INVALID_LENGTH,
+          "a hostname containing a control byte is refused");
+
+    /* No epoch: gate-separator:<host> is the longest id; 15 + 48 = 63. */
+    CHECK(m7_add(&st, m7_name(49), 0x70000004) == VIRP_ERR_INVALID_LENGTH,
+          "49 bytes: gate-separator:<host> would be 64 > 63, refused");
+    CHECK(m7_add(&st, m7_name(48), 0x70000005) == VIRP_OK,
+          "48 bytes: fits exactly, accepted");
+    CHECK(st.device_count == 1, "only the fitting device was added");
+
+    /* With a 16-char epoch: gate-enforce:<host>@<epoch> = 13 + L + 17. */
+    snprintf(st.chain.native_epoch, sizeof(st.chain.native_epoch),
+             "0123456789abcdef");
+    char a34[64], a33[64];
+    memset(a34, 'e', 34); a34[34] = '\0';
+    memset(a33, 'f', 33); a33[33] = '\0';
+    CHECK(m7_add(&st, a34, 0x70000006) == VIRP_ERR_INVALID_LENGTH,
+          "with a 16-char epoch, 34 bytes is refused");
+    CHECK(m7_add(&st, a33, 0x70000007) == VIRP_OK,
+          "with a 16-char epoch, 33 bytes fits");
+    st.chain.native_epoch[0] = '\0';
+    onode_destroy(&st);
+}
+
+/* Before the fix this does not return: onode_start() binds and serves. */
+static void t_M7_start_rechecks_hostnames_against_epoch(void)
+{
+    printf("\n  M7: onode_start re-checks hostnames once the epoch is final\n");
+    static onode_state_t st;
+    char sock[128];
+    snprintf(sock, sizeof(sock), "%s/m7-start.sock", g_root);
+    CHECK(onode_init(&st, 1, NULL, sock) == VIRP_OK, "state initialised");
+    CHECK(m7_add(&st, m7_name(48), 0x70000011) == VIRP_OK,
+          "a 48-byte hostname loads while no epoch is configured");
+    snprintf(st.chain.native_epoch, sizeof(st.chain.native_epoch), "v3-20261016");
+    CHECK(onode_start(&st) == VIRP_ERR_INVALID_LENGTH,
+          "onode_start refuses: the epoch made that hostname's session id too long");
+    CHECK(access(sock, F_OK) != 0, "and nothing was bound");
+    st.chain.native_epoch[0] = '\0';
+    onode_destroy(&st);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -1464,6 +1539,9 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M5_reserved_sessions_refused_externally",
                                               t_M5_reserved_sessions_refused_externally },
     { "t_M6_observation_registered_once",     t_M6_observation_registered_once },
+    { "t_M7_hostname_must_fit_session_id",    t_M7_hostname_must_fit_session_id },
+    { "t_M7_start_rechecks_hostnames_against_epoch",
+                                              t_M7_start_rechecks_hostnames_against_epoch },
 };
 
 static void rm_rf_root(void)

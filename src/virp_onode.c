@@ -7160,6 +7160,49 @@ virp_error_t onode_init(onode_state_t *state,
     return VIRP_OK;
 }
 
+/*
+ * Can every chain session id the daemon derives from this hostname be
+ * stored? (security review M7)
+ *
+ * The daemon files its own records under ids built from the hostname:
+ *
+ *     gate-enforce:<host>      intents, executions, rejections
+ *     gate-separator:<host>    ingress separator refusals
+ *     approval:<host>          proposals, approvals, outcomes
+ *
+ * and, with a native audit epoch configured, chain_append_locked appends
+ * "@<epoch>" to the gate-enforce / approval forms. The id is stored in
+ * virp_chain_entry_t.session_id — char[64], so 63 bytes. Confirmed in
+ * src/virp_chain.c: an id that does not fit is not refused there. The
+ * epoch form returns INVALID_LENGTH, but the plain form is copied with
+ * snprintf into entry->session_id and TRUNCATED, while the "last entry of
+ * this session" lookup still uses the full string. So the first record
+ * lands under a clipped id — one another long hostname can share — and
+ * every later append finds no predecessor, tries sequence 0 again and
+ * fails the UNIQUE(session_id, sequence) constraint. Under
+ * evidence_required that means the device can never execute anything.
+ *
+ * So the hostname is refused instead, where the operator can see why.
+ * The longest derived id is the larger of "gate-separator:<host>" (never
+ * epoch-suffixed) and "gate-enforce:<host>@<epoch>". The epoch is set
+ * after the device config is loaded, so onode_add_device() checks with
+ * whatever is configured at that moment and onode_start() checks every
+ * device again once it is final.
+ */
+static bool onode_hostname_sessions_fit(const onode_state_t *state,
+                                        const char *hostname,
+                                        size_t *longest_out)
+{
+    const size_t cap = sizeof(((virp_chain_entry_t *)0)->session_id) - 1;
+    size_t h = strlen(hostname);
+    size_t e = strlen(state->chain.native_epoch);
+    size_t separator = strlen("gate-separator:") + h;
+    size_t enforce   = strlen("gate-enforce:") + h + (e ? 1 + e : 0);
+    size_t longest   = separator > enforce ? separator : enforce;
+    if (longest_out) *longest_out = longest;
+    return longest <= cap;
+}
+
 virp_error_t onode_add_device(onode_state_t *state,
                               const virp_device_t *device)
 {
@@ -7168,6 +7211,31 @@ virp_error_t onode_add_device(onode_state_t *state,
 
     if (state->device_count >= ONODE_MAX_DEVICES)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
+
+    /* The hostname becomes part of chain session ids and is written into
+     * chain record bodies and signed observations (M7). It must pass the
+     * chain's own canonical-string rule — a name the chain would refuse
+     * would make every gate record for the device fail to append — and
+     * the ids derived from it must fit the session-id field. */
+    if (!onode_canonical_string_ok(device->hostname)) {
+        fprintf(stderr, "[O-Node] refusing device: hostname contains a "
+                "quote, backslash, control byte or ill-formed UTF-8, which "
+                "the chain's canonical form cannot carry\n");
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+    {
+        size_t longest = 0;
+        if (!onode_hostname_sessions_fit(state, device->hostname, &longest)) {
+            fprintf(stderr, "[O-Node] refusing device '%s': its longest "
+                    "chain session id would be %zu bytes and the chain "
+                    "stores at most %zu — shorten the hostname%s\n",
+                    device->hostname, longest,
+                    sizeof(((virp_chain_entry_t *)0)->session_id) - 1,
+                    state->chain.native_epoch[0]
+                        ? " (or the -E epoch)" : "");
+            return VIRP_ERR_INVALID_LENGTH;
+        }
+    }
 
     /* Reserved: the chain session for separator refusals naming a device
      * this node does not serve (M3). A real device by this name would
@@ -7477,6 +7545,26 @@ virp_error_t onode_start(onode_state_t *state)
 {
     if (!state)
         return VIRP_ERR_NULL_PTR;
+
+    /* M7: re-check every hostname now that the native audit epoch (set
+     * after the device config loads) is final — "@<epoch>" lengthens the
+     * derived session ids, and one that no longer fits would make every
+     * gate record for that device fail to append. Refuse to start,
+     * naming the device, before anything is bound. */
+    for (int i = 0; i < state->device_count; i++) {
+        size_t longest = 0;
+        if (!onode_hostname_sessions_fit(state, state->devices[i].hostname,
+                                         &longest)) {
+            fprintf(stderr, "[O-Node] FATAL: device '%s': with native "
+                    "epoch '%s' its longest chain session id would be %zu "
+                    "bytes and the chain stores at most %zu. Shorten the "
+                    "hostname or the -E epoch. Refusing to start.\n",
+                    state->devices[i].hostname, state->chain.native_epoch,
+                    longest,
+                    sizeof(((virp_chain_entry_t *)0)->session_id) - 1);
+            return VIRP_ERR_INVALID_LENGTH;
+        }
+    }
 
     /*
      * Ensure parent directory exists with 0700 owned by the current

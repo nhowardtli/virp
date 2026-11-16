@@ -573,6 +573,15 @@ virp_error_t onode_set_previous_okey(onode_state_t *state,
 
 /*
  * Add a device to the O-Node's inventory.
+ *
+ * Refused with VIRP_ERR_INVALID_LENGTH when the hostname fails the
+ * chain's canonical-string check or is long enough that a chain session
+ * id derived from it ("gate-separator:<host>", "gate-enforce:<host>
+ * [@<epoch>]") would not fit virp_chain_entry_t.session_id: 48 bytes
+ * with no native epoch, down to 33 with a 16-character one. onode_start()
+ * repeats the length check once the epoch is final. Also refused:
+ * node_id 0, the reserved hostname "_unknown", and any hostname, node_id
+ * or device_id already loaded (VIRP_ERR_DUPLICATE_DEVICE).
  */
 virp_error_t onode_add_device(onode_state_t *state,
                               const virp_device_t *device);

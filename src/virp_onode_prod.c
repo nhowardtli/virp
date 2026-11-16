@@ -1166,6 +1166,19 @@ int load_devices(onode_state_t *state, const char *path)
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] Failed to add %s: %s\n",
                     device.hostname, virp_error_str(err));
+            /* Listed, like every other refusal in this loop, so a device
+             * the operator configured and the daemon would not govern is
+             * visible in list_fleet rather than only in this log line.
+             * INVALID_LENGTH is the hostname check in onode_add_device
+             * (M7); the name itself is not echoed into the listing when
+             * it is the thing that failed validation. */
+            if (err == VIRP_ERR_INVALID_LENGTH)
+                onode_note_rejected(state, "", device.host, device.vendor,
+                                    "hostname not usable as a chain "
+                                    "session id (characters or length)");
+            else
+                onode_note_rejected(state, device.hostname, device.host,
+                                    device.vendor, virp_error_str(err));
             continue;
         }
 
