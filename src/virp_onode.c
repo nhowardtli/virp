@@ -2732,7 +2732,144 @@ static _Thread_local struct {
     virp_policy_t *policy;
     int64_t ticket;
     bool known;
+    /* Non-NULL when the owner policy REFUSED this request before any
+     * dispatch: the BLACK-nn reason code. `policy` stays NULL in that
+     * case — nothing was admitted — and onode_execute_legacy answers
+     * with policy_refuse_obs() before it does anything else (M9). */
+    const char *refusal;
+    uid_t refusal_uid;
 } policy_call;
+
+/* =========================================================================
+ * Owner-policy refusal — the chain record and the signed answer
+ * (security review M9).
+ *
+ * A request the owner policy refused — a principal with no rule for the
+ * operation, an expired grant, a protected resource, a command outside
+ * the closed grammar, or a device this node does not serve — used to end
+ * in `return VIRP_ERR_ACTION_FORBIDDEN`. One line on stderr, a bare
+ * 4-byte code to the caller, and NOTHING on the chain. Every tier refusal
+ * beside it writes a gate_rejection/1 and answers with a signed ERROR
+ * observation, so on a policy-mode node the most important refusals —
+ * the ones that are the owner's boundary rather than a tier table — were
+ * the only ones an audit could not find and a caller could not prove.
+ *
+ * Shape, deliberately parallel to separator_refuse_chain():
+ *
+ *  - schema gate_rejection/1 with refusal_stage "owner-policy" and the
+ *    policy's own reason code, so a reader does not mistake this for a
+ *    tier decision. classified_tier is UNCLASSIFIED for audit honesty:
+ *    the driver's classifier never ran.
+ *  - NO PROPOSAL. A policy refusal is not approvable — an approval cannot
+ *    add a rule the owner did not write (tests/test_policy_daemon.c pins
+ *    that a genuine approval still cannot override Observe or a
+ *    protected resource) — so no escalation path is offered.
+ *  - session "gate-enforce:<device>" for a device this node serves, so
+ *    it interleaves with that device's other gate records; the fixed
+ *    "gate-enforce:_unknown" otherwise, for M3's reason: the caller does
+ *    not get to name a chain session.
+ *
+ * The command is recorded in full in the chain body (cJSON escapes it).
+ * In the observation it is rendered printable and bounded: this refusal
+ * runs BEFORE the separator check, so the text may carry control bytes,
+ * and a signed payload should not relay them.
+ *
+ * Best-effort like the other rejection writes: a chain failure is logged
+ * and never weakens the refusal, which has already been decided.
+ *
+ * Returned through onode_execute_legacy rather than straight from
+ * onode_execute_obs_ex so that a v3 node wraps it exactly as it wraps
+ * every other refusal — a v3 caller never receives a v1 answer.
+ * ========================================================================= */
+static virp_error_t policy_refuse_obs(onode_state_t *state,
+                                      const char *device_name,
+                                      const char *command,
+                                      const char *why, uid_t client_uid,
+                                      uint8_t *out_buf, size_t out_buf_len,
+                                      size_t *out_len)
+{
+    int dev_idx = find_device(state, device_name);
+    bool known = dev_idx >= 0;
+    if (!why || !why[0]) why = "BLACK-13";
+
+    char shown[201];
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)command;
+         *p && n < sizeof(shown) - 1; p++)
+        shown[n++] = (*p < 0x20 || *p == 0x7f) ? '?' : (char)*p;
+    shown[n] = '\0';
+
+    char err_msg[512];
+    snprintf(err_msg, sizeof(err_msg),
+             "ERROR: owner policy refused '%s'%s on '%s' (%s%s); nothing "
+             "was dispatched",
+             shown, command[n] ? "..." : "", device_name, why,
+             known ? "" : ", device not served by this node");
+
+    fprintf(stderr, "[POLICY] %s uid=%ld device=%s: operation refused "
+            "before dispatch\n", why,
+            (client_uid == (uid_t)-1) ? -1L : (long)client_uid, device_name);
+
+    if (state->chain_enabled) {
+        char session_id[96];
+        snprintf(session_id, sizeof(session_id), "gate-enforce:%s",
+                 known ? device_name : ONODE_SEPARATOR_UNKNOWN_DEVICE);
+
+        char *body = NULL;
+        cJSON *o = cJSON_CreateObject();
+        if (o) {
+            cJSON_AddStringToObject(o, "schema", "gate_rejection/1");
+            cJSON_AddStringToObject(o, "device", device_name);
+            cJSON_AddBoolToObject(o, "device_known", known);
+            cJSON_AddStringToObject(o, "refusal_stage", "owner-policy");
+            cJSON_AddStringToObject(o, "reason", why);
+            cJSON_AddStringToObject(o, "command", command);
+            cJSON_AddStringToObject(o, "classified_tier", "UNCLASSIFIED");
+            cJSON_AddStringToObject(o, "gate_mode", "ENFORCE");
+            if (client_uid == (uid_t)-1)
+                cJSON_AddNullToObject(o, "uid");
+            else
+                cJSON_AddNumberToObject(o, "uid", (double)client_uid);
+            cJSON_AddStringToObject(o, "message", err_msg);
+            cJSON_AddBoolToObject(o, "executed", false);
+            body = cJSON_PrintUnformatted(o);
+            cJSON_Delete(o);
+        }
+        char artifact_hash[65];
+        const char *commit_src = body ? body : err_msg;
+        gate_sha256_hex(commit_src, strlen(commit_src), artifact_hash);
+        /* The sequence number keeps two refusals of the same command by
+         * the same uid from sharing an artifact id (the body carries no
+         * clock). */
+        char artifact_id[64];
+        snprintf(artifact_id, sizeof(artifact_id), "policyreject-%.16s-%u",
+                 artifact_hash, onode_next_seq(state));
+
+        virp_chain_entry_t ce;
+        virp_error_t cerr = virp_chain_append_with_artifact(
+                                &state->chain, session_id, "gate_rejection",
+                                artifact_id, artifact_hash, body, &ce);
+        if (cerr == VIRP_OK)
+            fprintf(stderr, "[GATE] policy rejection persisted: session=%s "
+                    "seq=%lld hash=%.16s reason=%s\n", session_id,
+                    (long long)ce.sequence, ce.chain_entry_hash, why);
+        else
+            fprintf(stderr, "[GATE] policy rejection chain append+store "
+                    "failed: %s\n", virp_error_str(cerr));
+        if (body) cJSON_free(body);
+    }
+
+    log_error_obs(device_name, VIRP_TIER_UNCLASSIFIED, err_msg);
+    return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                  known ? state->devices[dev_idx].node_id
+                                        : state->node_id,
+                                  onode_next_seq(state),
+                                  VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                  VIRP_TIER_UNCLASSIFIED,
+                                  (const uint8_t *)err_msg,
+                                  (uint16_t)strlen(err_msg),
+                                  &state->okey);
+}
 
 static virp_error_t policy_driver_execute(const virp_driver_t *drv,
     virp_conn_t *conn, const char *command, virp_exec_result_t *result)
@@ -2768,12 +2905,18 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         const char *why = "BLACK-13";
         if (idx < 0 || virp_policy_check(state->policy, client_uid,
                 &state->devices[idx], command, &policy_call.action, &why)) {
-            fprintf(stderr, "[POLICY] %s uid=%lu: operation refused before dispatch\n",
-                    why, (unsigned long)client_uid);
-            return VIRP_ERR_ACTION_FORBIDDEN;
+            /* REFUSED — but as a record and a signed answer, not a bare
+             * code (M9). policy_call.policy stays NULL: nothing was
+             * admitted, no reservation is made, and the legacy path
+             * answers with policy_refuse_obs() before it does anything
+             * else. The caller's ORIGINAL command text is what gets
+             * recorded; the policy never produced a normalized form. */
+            policy_call.refusal = why ? why : "BLACK-13";
+            policy_call.refusal_uid = client_uid;
+        } else {
+            policy_call.policy = state->policy;
+            command = policy_call.action.command;
         }
-        policy_call.policy = state->policy;
-        command = policy_call.action.command;
     }
     virp_error_t err = onode_execute_policy_impl(state, device_name, command,
         obs_version, proposal_id, client_uid, out_buf, out_buf_len, out_len);
@@ -2863,6 +3006,18 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
         return VIRP_ERR_NULL_PTR;
     if (obs_version != 1 && obs_version != 2)
         return VIRP_ERR_VERSION_MISMATCH;
+
+    /* ── Layer 0: owner-policy refusal (M9) ───────────────────────────
+     * onode_execute_obs_ex already decided this request is refused; all
+     * that is left is to record it and say so, signed. First thing in
+     * this function so nothing below — separator scan, session probe,
+     * device or driver lookup — runs for a request the owner's policy
+     * has already turned away. */
+    if (policy_call.refusal)
+        return policy_refuse_obs(state, device_name, command,
+                                 policy_call.refusal,
+                                 policy_call.refusal_uid,
+                                 out_buf, out_buf_len, out_len);
 
     /* ── Layer 1: single-command boundary ─────────────────────────────
      * Every classifier prefix-matches from index 0 while the drivers

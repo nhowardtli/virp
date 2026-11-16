@@ -1620,6 +1620,124 @@ static void t_M8_ns_fields_are_decimal_strings(void)
 }
 
 /* =========================================================================
+ * M9 — an owner-policy refusal is recorded and answered with a signed
+ * observation, not a bare error code
+ * ========================================================================= */
+
+/* How many gate_rejection bodies in `session` carry this refusal_stage
+ * (any stage when NULL). *last_out, if asked for, is the newest match. */
+static int fx_rejections(fx_t *fx, const char *session, const char *stage,
+                         cJSON **last_out)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (last_out) *last_out = NULL;
+    if (sqlite3_prepare_v2(fx->st.chain.db,
+            "SELECT a.artifact_content FROM chain_entries c "
+            "JOIN artifacts a ON a.artifact_id = c.artifact_id "
+            "               AND a.artifact_hash = c.artifact_hash "
+            "WHERE c.session_id = ? AND c.artifact_type = 'gate_rejection' "
+            "ORDER BY c.sequence", -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(st, 1, session, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        cJSON *o = cJSON_Parse((const char *)sqlite3_column_text(st, 0));
+        if (!o) continue;
+        const cJSON *s = cJSON_GetObjectItemCaseSensitive(o, "refusal_stage");
+        bool match = stage ? (cJSON_IsString(s) && !strcmp(s->valuestring, stage))
+                           : true;
+        if (match) {
+            n++;
+            if (last_out) {
+                if (*last_out) cJSON_Delete(*last_out);
+                *last_out = o;
+                continue;
+            }
+        }
+        cJSON_Delete(o);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+static void t_M9_policy_refusal_is_chained_and_signed(void)
+{
+    printf("\n  M9: owner-policy refusals leave a chain record and a signed answer\n");
+    fx_t *fx = &g_fx;
+    sqlite3 *db = NULL;
+    if (!h4_init(fx, "m9-policy", &db, "observe")) {
+        CHECK(false, "fixture (needs a plain build, without LINUX=1)");
+        return;
+    }
+    uid_t me = getuid();
+    uint8_t ot = 0;
+    char payload[2048] = "";
+
+    /* Observe profile, disruptive operation: refused by the policy. */
+    CHECK(fx_run(fx, H4_DEV, "reboot", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR,
+          "a policy refusal is a signed ERROR observation, not a bare code");
+    CHECK(strstr(payload, "owner policy refused 'reboot'") != NULL &&
+          strstr(payload, "nothing was dispatched") != NULL,
+          "it says what was refused and that nothing ran");
+    CHECK(h4_dispatches == 0, "nothing was dispatched");
+    cJSON *body = NULL;
+    CHECK(fx_rejections(fx, "gate-enforce:" H4_DEV, "owner-policy", &body) == 1,
+          "ONE gate_rejection, stage owner-policy, in the device's gate session");
+    if (body) {
+        const cJSON *uid = cJSON_GetObjectItemCaseSensitive(body, "uid");
+        const cJSON *ex  = cJSON_GetObjectItemCaseSensitive(body, "executed");
+        const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(body, "command");
+        CHECK(cJSON_IsNumber(uid) && (uid_t)uid->valuedouble == me &&
+              cJSON_IsFalse(ex) && cJSON_IsString(cmd) &&
+              !strcmp(cmd->valuestring, "reboot"),
+              "the record names the uid and the command, executed=false");
+        cJSON_Delete(body);
+    }
+
+    /* Outside the policy's closed grammar. */
+    ot = 0;
+    CHECK(fx_run(fx, H4_DEV, "rm -rf /", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR &&
+          fx_rejections(fx, "gate-enforce:" H4_DEV, "owner-policy", NULL) == 2,
+          "a command outside the grammar is refused the same way");
+
+    /* A principal the policy does not know. */
+    ot = 0;
+    CHECK(fx_run(fx, H4_DEV, "uptime", NULL, me + 1, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR &&
+          fx_rejections(fx, "gate-enforce:" H4_DEV, "owner-policy", NULL) == 3,
+          "an unknown principal is refused the same way");
+
+    /* A device this node does not serve: one fixed session. */
+    ot = 0;
+    CHECK(fx_run(fx, "ghost-device", "uptime", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR &&
+          strstr(payload, "device not served by this node") != NULL,
+          "policy mode: an unknown device is a signed ERROR observation");
+    body = NULL;
+    CHECK(fx_rejections(fx, "gate-enforce:_unknown", "owner-policy", &body) == 1 &&
+          fx_session_entries(fx, "gate-enforce:ghost-device") == 0,
+          "recorded under the fixed session, not one the caller named");
+    if (body) {
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(body, "device_known")),
+              "and marked device_known=false");
+        cJSON_Delete(body);
+    }
+
+    /* Control bytes are not relayed in the signed payload. */
+    ot = 0;
+    CHECK(fx_run(fx, H4_DEV, "up\x01time\nreboot", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR &&
+          strstr(payload, "'up?time?reboot'") != NULL,
+          "control bytes in the refused command are rendered '?' in the observation");
+    CHECK(h4_dispatches == 0, "still nothing dispatched");
+
+    fx_destroy(fx);
+    sqlite3_close(db);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -1651,6 +1769,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M7_start_rechecks_hostnames_against_epoch",
                                               t_M7_start_rechecks_hostnames_against_epoch },
     { "t_M8_ns_fields_are_decimal_strings",   t_M8_ns_fields_are_decimal_strings },
+    { "t_M9_policy_refusal_is_chained_and_signed",
+                                              t_M9_policy_refusal_is_chained_and_signed },
 };
 
 static void rm_rf_root(void)
