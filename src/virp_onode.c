@@ -909,6 +909,52 @@ static virp_trust_tier_t gate_classify(const virp_driver_t *drv,
 }
 
 /*
+ * The tier an OWNER-POLICY action is gated at: the stricter of what the
+ * policy says and what the device's own driver says (security review H4).
+ *
+ * Policy mode used to take the policy's effect class as the tier and
+ * never call the driver's classifier at all. The policy's closed grammar
+ * decides WHO may ask for WHAT; it knows nothing about the device-side
+ * tables — which guests are protected, which endpoints are destructive,
+ * what a driver considers unapprovable. Those live in route_command(),
+ * and skipping it meant a command the driver calls BLACK was gated as
+ * whatever effect class the policy grammar gave it, with only the
+ * driver's own execute() backstop (where one exists) behind it.
+ *
+ * Rules, in order:
+ *   - driver BLACK is BLACK, unless this exact action is the typed
+ *     reboot capability (virp_policy_reboot_permitted) — the one BLACK
+ *     the owner policy can express. Then the policy tier stands. The
+ *     capability is consulted under the same dispatch context the driver
+ *     will see, so the gate and the driver backstop cannot disagree
+ *     about whether this command is the permitted reboot.
+ *   - driver UNCLASSIFIED is UNCLASSIFIED: a driver with no opinion is
+ *     not a driver that agrees, and the gate fails closed on it.
+ *   - otherwise the numerically higher of the two (GREEN < YELLOW < RED).
+ *
+ * The policy can therefore only ever be TIGHTENED by the driver, never
+ * loosened: a policy verdict of RED stays RED whatever the driver says.
+ */
+static virp_trust_tier_t gate_policy_tier(const virp_driver_t *drv,
+                                          const virp_policy_action_t *action)
+{
+    virp_trust_tier_t policy_tier =
+        action->effect == 0 ? VIRP_TIER_GREEN :
+        action->effect == 1 ? VIRP_TIER_YELLOW : VIRP_TIER_RED;
+    virp_trust_tier_t drv_tier = gate_classify(drv, action->command);
+
+    if (drv_tier == VIRP_TIER_BLACK) {
+        virp_policy_dispatch_enter(action);
+        bool reboot = virp_policy_reboot_permitted(action->command);
+        virp_policy_dispatch_leave();
+        return reboot ? policy_tier : VIRP_TIER_BLACK;
+    }
+    if (drv_tier == VIRP_TIER_UNCLASSIFIED)
+        return VIRP_TIER_UNCLASSIFIED;
+    return drv_tier > policy_tier ? drv_tier : policy_tier;
+}
+
+/*
  * Map a gate-computed tier to the value stamped on the observation header.
  *
  * Audit honesty (Snow): record the ACTUAL computed tier. GREEN/YELLOW/RED
@@ -1799,9 +1845,20 @@ static virp_error_t onode_approval_challenge(onode_state_t *state,
 
         const virp_driver_t *drv =
             virp_driver_lookup(state->devices[didx].vendor);
+        /* Under owner policy, judge exactly what apply will judge (H4):
+         * apply runs the proposal's command through virp_policy_check,
+         * which substitutes the policy-normalized form, and then gates it
+         * at gate_policy_tier(). This used to skip the driver entirely
+         * whenever the policy grammar recognised the command, so a
+         * proposal the driver now calls BLACK still got a challenge. A
+         * command the grammar does not recognise falls back to the
+         * driver's verdict on the stored text, as before. */
         virp_policy_action_t action;
         bool typed = state->policy && !virp_policy_classify(state->devices[didx].vendor, prop.command, &action);
-        if (!typed && gate_classify(drv, prop.command) == VIRP_TIER_BLACK) {
+        virp_trust_tier_t appliable_tier = typed
+            ? gate_policy_tier(drv, &action)
+            : gate_classify(drv, prop.command);
+        if (appliable_tier == VIRP_TIER_BLACK) {
             fprintf(stderr, "[APPROVAL] challenge refused: proposal=%s "
                     "command is BLACK — not appliable at any tier\n",
                     proposal_id);
@@ -2677,9 +2734,13 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                                       (uint16_t)strlen(err_msg),
                                       &state->okey);
     }
+    /* Under owner policy the driver's classifier is STILL consulted (H4):
+     * the tier is the stricter of the two, and a driver BLACK stands
+     * unless this is the policy's typed reboot. `command` here is
+     * policy_call.action.command — onode_execute_obs_ex substituted the
+     * policy-normalized form before calling down. */
     virp_trust_tier_t gate_tier = policy_call.policy
-        ? (policy_call.action.effect == 0 ? VIRP_TIER_GREEN :
-           policy_call.action.effect == 1 ? VIRP_TIER_YELLOW : VIRP_TIER_RED)
+        ? gate_policy_tier(drv, &policy_call.action)
         : gate_classify(drv, command);
 
     /* Approval-apply state: set when a valid, consumed approval admits a

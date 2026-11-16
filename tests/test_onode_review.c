@@ -502,6 +502,223 @@ static void t_H3_uid_ceiling_contract(void)
 }
 
 /* =========================================================================
+ * H4 — owner-policy mode still consults the driver's classifier
+ *
+ * A second driver, registered for the PROXMOX vendor (not compiled into
+ * this build), whose classifier is a small switchable table and whose
+ * execute() has NO backstop of its own — so if the gate admits something
+ * it should not, the dispatch counter says so directly instead of a
+ * driver belt masking it. The owner policy's closed grammar recognises
+ * `uptime`, `hostname` and `uname -sr` as system.read (GREEN) and
+ * `reboot` as host.reboot (RED) for this vendor.
+ * ========================================================================= */
+
+struct virp_conn { int unused; };
+
+static int  h4_dispatches;
+static bool h4_uname_is_black;       /* a table change between propose and approve */
+
+static virp_conn_t *h4_connect(const virp_device_t *d)
+{ (void)d; return calloc(1, sizeof(virp_conn_t)); }
+static void h4_disconnect(virp_conn_t *c) { free(c); }
+static virp_error_t h4_health(virp_conn_t *c) { (void)c; return VIRP_OK; }
+
+static virp_trust_tier_t h4_classify(const char *cmd)
+{
+    if (!strcmp(cmd, "uptime"))   return VIRP_TIER_GREEN;
+    if (!strcmp(cmd, "hostname")) return VIRP_TIER_BLACK;   /* policy: GREEN */
+    if (!strcmp(cmd, "uname -sr"))
+        return h4_uname_is_black ? VIRP_TIER_BLACK : VIRP_TIER_RED;
+    if (!strcmp(cmd, "reboot"))   return VIRP_TIER_BLACK;   /* typed reboot */
+    return VIRP_TIER_UNCLASSIFIED;
+}
+
+static virp_error_t h4_execute(virp_conn_t *c, const char *cmd,
+                               virp_exec_result_t *r)
+{
+    (void)c; (void)cmd;
+    h4_dispatches++;
+    memset(r, 0, sizeof(*r));
+    strcpy(r->output, "h4 fixture output");
+    r->output_len = strlen(r->output);
+    r->success = true;
+    r->exit_code_trusted = true;
+    r->disposition = VIRP_DISPOSITION_EXECUTED_CONFIRMED;
+    return VIRP_OK;
+}
+
+#define H4_DEV    "L-POL"
+#define H4_DEV_ID 0x21ULL
+
+static sqlite3 *h4_journal(void)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open(":memory:", &db) != SQLITE_OK) return NULL;
+    FILE *f = fopen("deploy/policy-schema.sql", "r");
+    if (!f) { sqlite3_close(db); return NULL; }
+    char schema[8192];
+    size_t n = fread(schema, 1, sizeof(schema) - 1, f);
+    fclose(f);
+    schema[n] = '\0';
+    if (sqlite3_exec(db, schema, NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    return db;
+}
+
+static virp_policy_t *h4_policy(sqlite3 *db, const char *profile)
+{
+    char text[2048];
+    snprintf(text, sizeof(text),
+        "{\"version\":1,\"max_calls\":100,\"max_disruptive\":10,"
+        "\"max_inflight\":1,\"protected\":[],"
+        "\"principals\":[{\"uid\":%u,\"profile\":\"%s\","
+        "\"expires\":4102444800,\"rules\":["
+        "{\"device_id\":\"%016llx\",\"host\":\"127.0.0.1\",\"port\":22,"
+        "\"vendor\":%d,\"operation\":\"host.reboot\",\"resource\":\"host\"},"
+        "{\"device_id\":\"%016llx\",\"host\":\"127.0.0.1\",\"port\":22,"
+        "\"vendor\":%d,\"operation\":\"system.read\",\"resource\":\"host\"}]}]}",
+        (unsigned)getuid(), profile,
+        (unsigned long long)H4_DEV_ID, (int)VIRP_VENDOR_PROXMOX,
+        (unsigned long long)H4_DEV_ID, (int)VIRP_VENDOR_PROXMOX);
+    return virp_policy_parse(text, db);
+}
+
+/* fx + the policy fixture device + an owner policy at `profile`. */
+static bool h4_init(fx_t *fx, const char *name, sqlite3 **db,
+                    const char *profile)
+{
+    static bool registered;
+    if (!registered) {
+        static const virp_driver_t drv = {
+            .name = "review-h4", .vendor = VIRP_VENDOR_PROXMOX,
+            .connect = h4_connect, .disconnect = h4_disconnect,
+            .execute = h4_execute, .health_check = h4_health,
+            .route_command = h4_classify,
+        };
+        /* Fails only if a real driver already owns the vendor, i.e. this
+         * suite was built with LINUX=1 — it is a plain-build suite. */
+        if (virp_driver_register(&drv) != VIRP_OK) return false;
+        registered = true;
+    }
+    if (!fx_init(fx, name)) return false;
+    virp_device_t d;
+    memset(&d, 0, sizeof(d));
+    snprintf(d.hostname, sizeof(d.hostname), "%s", H4_DEV);
+    snprintf(d.host, sizeof(d.host), "127.0.0.1");
+    d.port = 22; d.vendor = VIRP_VENDOR_PROXMOX;
+    d.node_id = 0x21212121; d.device_id = H4_DEV_ID; d.enabled = true;
+    if (onode_add_device(&fx->st, &d) != VIRP_OK) return false;
+    *db = h4_journal();
+    if (!*db) return false;
+    fx->st.policy = h4_policy(*db, profile);
+    h4_dispatches = 0;
+    h4_uname_is_black = false;
+    return fx->st.policy != NULL;
+}
+
+static void h4_set_profile(fx_t *fx, sqlite3 *db, const char *profile)
+{
+    virp_policy_close(fx->st.policy);
+    fx->st.policy = h4_policy(db, profile);
+}
+
+static void t_H4_policy_mode_consults_driver(void)
+{
+    printf("\n  H4: policy mode gates at the stricter of policy and driver\n");
+    fx_t *fx = &g_fx;
+    sqlite3 *db = NULL;
+    if (!h4_init(fx, "h4-gate", &db, "autonomous")) {
+        CHECK(false, "fixture (needs a plain build, without LINUX=1)");
+        return;
+    }
+    uid_t me = getuid();
+    uint8_t ot = 0;
+    char payload[2048] = "";
+
+    CHECK(fx_run(fx, H4_DEV, "uptime", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 &&
+          ot == VIRP_OBS_DEVICE_OUTPUT && h4_dispatches == 1,
+          "policy GREEN + driver GREEN executes");
+
+    /* The policy grammar calls `hostname` a read. The driver calls it
+     * BLACK. It is not the typed reboot, so BLACK stands. */
+    ot = 0;
+    CHECK(fx_run(fx, H4_DEV, "hostname", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR,
+          "a policy-permitted command the driver calls BLACK is REFUSED");
+    CHECK(h4_dispatches == 1, "and never dispatched");
+    CHECK(strstr(payload, "tier=BLACK") != NULL &&
+          strstr(payload, "proposal_id=") == NULL,
+          "refused AS BLACK: no proposal, no escalation path");
+
+    /* The one BLACK the policy can express. */
+    ot = 0;
+    CHECK(fx_run(fx, H4_DEV, "reboot", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 &&
+          ot == VIRP_OBS_DEVICE_OUTPUT && h4_dispatches == 2,
+          "driver-BLACK reboot still runs as the policy's typed reboot");
+
+    /* Policy says read (GREEN); driver says RED. Under an observe
+     * profile the ceiling is GREEN, so the stricter tier must block. */
+    h4_set_profile(fx, db, "observe");
+    ot = 0;
+    CHECK(fx_run(fx, H4_DEV, "uname -sr", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR &&
+          strstr(payload, "tier=RED max=GREEN") != NULL,
+          "driver RED over policy GREEN is gated as RED and blocked");
+    CHECK(h4_dispatches == 2, "and never dispatched");
+
+    /* A driver with no opinion is not a driver that agrees. */
+    h4_set_profile(fx, db, "autonomous");
+    ot = 0;
+    CHECK(fx_run(fx, H4_DEV, "systemctl reboot", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR &&
+          h4_dispatches == 2,
+          "a driver-UNCLASSIFIED command is blocked under policy mode");
+
+    fx_destroy(fx);
+    sqlite3_close(db);
+}
+
+static void t_H4_challenge_consults_driver(void)
+{
+    printf("\n  H4: approval challenge reflects the driver's table under policy\n");
+    fx_t *fx = &g_fx;
+    sqlite3 *db = NULL;
+    if (!h4_init(fx, "h4-chal", &db, "observe")) {
+        CHECK(false, "fixture (needs a plain build, without LINUX=1)");
+        return;
+    }
+    uid_t me = getuid();
+    uint8_t ot = 0;
+    char payload[2048] = "";
+    uint8_t out[VIRP_MAX_MESSAGE_SIZE];
+    size_t out_len = 0;
+
+    /* RED now -> blocked under the GREEN ceiling -> a proposal is filed. */
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    CHECK(fx_run(fx, H4_DEV, "uname -sr", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR &&
+          fx_extract_pid(payload, pid) == 0,
+          "a RED-by-driver command files a proposal");
+    CHECK(onode_approval_challenge(&fx->st, pid, out, sizeof(out), &out_len)
+              == VIRP_OK,
+          "while the driver calls it RED the proposal is challengeable");
+
+    /* The driver's table changes before the human signs. */
+    h4_uname_is_black = true;
+    CHECK(onode_approval_challenge(&fx->st, pid, out, sizeof(out), &out_len)
+              == VIRP_ERR_TIER_VIOLATION,
+          "once the driver calls it BLACK the challenge is refused");
+    h4_uname_is_black = false;
+
+    fx_destroy(fx);
+    sqlite3_close(db);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -512,6 +729,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_H1_unspent_record_must_match_chain", t_H1_unspent_record_must_match_chain },
     { "t_H2_executed_must_be_single_boolean", t_H2_executed_must_be_single_boolean },
     { "t_H3_uid_ceiling_contract",            t_H3_uid_ceiling_contract },
+    { "t_H4_policy_mode_consults_driver",     t_H4_policy_mode_consults_driver },
+    { "t_H4_challenge_consults_driver",       t_H4_challenge_consults_driver },
 };
 
 static void rm_rf_root(void)
