@@ -6476,11 +6476,44 @@ static void handle_client(onode_state_t *state, int client_fd,
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
+        /* RANGE CAP (M15). The walk holds the chain lock for its whole
+         * range, and every execution needs that lock — while holding its
+         * device's exec_mutex — to commit a pre-dispatch intent. One
+         * request with to_sequence = INT64_MAX used to stall every device
+         * for the length of the session. Unsigned arithmetic: both ends
+         * are already bounded to [0, INT64_MAX] by the parser, and an
+         * inverted range (to < from) is left to the verifier, which
+         * reports it as invalid. */
+        if (req.to_sequence >= req.from_sequence &&
+            (uint64_t)req.to_sequence - (uint64_t)req.from_sequence
+                >= (uint64_t)ONODE_CHAIN_VERIFY_MAX_RANGE) {
+            fprintf(stderr, "[O-Node] chain_verify REFUSED: range %lld..%lld "
+                    "covers more than %d entries (uid=%u session=%s) — page "
+                    "the range, or use chain_verify_session\n",
+                    (long long)req.from_sequence, (long long)req.to_sequence,
+                    ONODE_CHAIN_VERIFY_MAX_RANGE, (unsigned)client_uid,
+                    req.session_id);
+            send_framed_error(client_fd, VIRP_ERR_MESSAGE_TOO_LARGE);
+            break;
+        }
         {
+            /* PER-UID BUDGET (M15): one verify in flight per uid, and a
+             * bounded share of each window spent holding the chain lock. */
+            int64_t v0 = onode_monotonic_ms();
+            if (!onode_verify_enter(state, client_uid, v0)) {
+                fprintf(stderr, "[O-Node] chain_verify RATE LIMITED: uid %u "
+                        "has a verify in flight or has used its %d ms of "
+                        "verify time for this %d s window\n",
+                        (unsigned)client_uid, ONODE_VERIFY_BUDGET_MS,
+                        ONODE_VERIFY_WINDOW_SEC);
+                send_framed_error(client_fd, VIRP_ERR_RATE_LIMITED);
+                break;
+            }
             virp_chain_verify_result_t vresult;
             err = virp_chain_verify(&state->chain, req.session_id,
                                      req.from_sequence, req.to_sequence,
                                      &vresult);
+            onode_verify_leave(state, client_uid, onode_monotonic_ms() - v0);
             if (err != VIRP_OK) {
                 send_framed_error(client_fd, err);
                 break;
@@ -6559,9 +6592,23 @@ static void handle_client(onode_state_t *state, int client_fd,
             break;
         }
         {
+            /* No range to cap here — the whole session against its signed
+             * head is the point — so this is bounded by the per-uid
+             * verify budget alone (M15). */
+            int64_t v0 = onode_monotonic_ms();
+            if (!onode_verify_enter(state, client_uid, v0)) {
+                fprintf(stderr, "[O-Node] chain_verify_session RATE LIMITED: "
+                        "uid %u has a verify in flight or has used its %d ms "
+                        "of verify time for this %d s window\n",
+                        (unsigned)client_uid, ONODE_VERIFY_BUDGET_MS,
+                        ONODE_VERIFY_WINDOW_SEC);
+                send_framed_error(client_fd, VIRP_ERR_RATE_LIMITED);
+                break;
+            }
             virp_chain_verify_result_t vresult;
             err = virp_chain_verify_session(&state->chain, req.session_id,
                                             &vresult);
+            onode_verify_leave(state, client_uid, onode_monotonic_ms() - v0);
             if (err != VIRP_OK) {
                 send_framed_error(client_fd, err);
                 break;
@@ -7600,6 +7647,72 @@ void onode_worker_release(onode_state_t *state, uid_t uid)
         if (state->worker_uid_live[i].live > 0 &&
             state->worker_uid_live[i].uid == uid) {
             state->worker_uid_live[i].live--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&state->state_mutex);
+}
+
+/*
+ * Per-uid verify limiter (M15) — see the header. Under state_mutex;
+ * never blocks. A uid with no slot and no free slot is refused: the
+ * table is as large as the worker pool, so that cannot happen while the
+ * pool semaphore holds, and refusing is the safe answer if it ever did.
+ */
+bool onode_verify_enter(onode_state_t *state, uid_t uid, int64_t now_ms)
+{
+    if (!state) return false;
+    const int64_t window = (int64_t)ONODE_VERIFY_WINDOW_SEC * 1000;
+    bool ok = false;
+    pthread_mutex_lock(&state->state_mutex);
+    int mine = -1, spare = -1;
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++) {
+        if (state->verify_uid[i].in_use && state->verify_uid[i].uid == uid) {
+            mine = i;
+            break;
+        }
+        /* A slot whose window has lapsed with nothing in flight is
+         * reusable: its owner is back to a full budget either way. */
+        if (spare < 0 && (!state->verify_uid[i].in_use ||
+                          (!state->verify_uid[i].in_flight &&
+                           now_ms - state->verify_uid[i].window_start_ms
+                               >= window)))
+            spare = i;
+    }
+    if (mine < 0 && spare >= 0) {
+        mine = spare;
+        state->verify_uid[mine].uid = uid;
+        state->verify_uid[mine].in_use = true;
+        state->verify_uid[mine].in_flight = false;
+        state->verify_uid[mine].window_start_ms = now_ms;
+        state->verify_uid[mine].used_ms = 0;
+    }
+    if (mine >= 0) {
+        if (now_ms - state->verify_uid[mine].window_start_ms >= window) {
+            state->verify_uid[mine].window_start_ms = now_ms;
+            state->verify_uid[mine].used_ms = 0;
+        }
+        if (!state->verify_uid[mine].in_flight &&
+            state->verify_uid[mine].used_ms < ONODE_VERIFY_BUDGET_MS) {
+            state->verify_uid[mine].in_flight = true;
+            ok = true;
+        }
+    }
+    pthread_mutex_unlock(&state->state_mutex);
+    return ok;
+}
+
+void onode_verify_leave(onode_state_t *state, uid_t uid, int64_t elapsed_ms)
+{
+    if (!state) return;
+    if (elapsed_ms < 0) elapsed_ms = 0;
+    pthread_mutex_lock(&state->state_mutex);
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++) {
+        if (state->verify_uid[i].in_use && state->verify_uid[i].uid == uid) {
+            state->verify_uid[i].in_flight = false;
+            /* At least 1 ms per request, so a flood of trivial verifies
+             * still runs the budget down. */
+            state->verify_uid[i].used_ms += elapsed_ms > 0 ? elapsed_ms : 1;
             break;
         }
     }

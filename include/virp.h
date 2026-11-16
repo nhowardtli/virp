@@ -607,6 +607,15 @@ typedef enum {
      * conflated the first two. */
     VIRP_ERR_APPROVAL_STORE_ABSENT    = -56,
 
+    /* The request is well-formed and this principal is allowed to make
+     * it — just not this often (O-Node security review M15/M16). The
+     * daemon bounds how much of a shared resource one uid can take: time
+     * holding the chain lock for verification, and proposals filed.
+     * Distinct from VIRP_ERR_ACTION_FORBIDDEN (-50) on purpose: that is
+     * a policy answer and retrying is pointless; this is a load answer,
+     * and the correct client response is to back off and retry later. */
+    VIRP_ERR_RATE_LIMITED             = -57,
+
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */
     VIRP_APPROVAL_ALREADY_EXISTS      =  1,   /* Submit lost an idempotency

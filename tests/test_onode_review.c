@@ -2279,6 +2279,101 @@ static void t_M14_per_uid_worker_cap(void)
     onode_destroy(&st);
 }
 
+/* =========================================================================
+ * M15 — chain_verify is bounded per request and per uid
+ * ========================================================================= */
+
+static const char *m15_verify(const char *session, long long from, long long to)
+{
+    static char req[256];
+    snprintf(req, sizeof(req),
+             "{\"action\":\"chain_verify\",\"session_id\":\"%s\","
+             "\"from_sequence\":\"%lld\",\"to_sequence\":\"%lld\"}",
+             session, from, to);
+    return req;
+}
+
+static void t_M15_verify_range_is_capped(void)
+{
+    printf("\n  M15: one chain_verify request covers a bounded range\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m15-range")) { CHECK(false, "fixture"); return; }
+    onode_state_t *st = &fx->st;
+    uid_t me = getuid();
+    uint8_t ot;
+    char payload[1024];
+    CHECK(fx_run(fx, FX_DEV, "show version", NULL, me, &ot, payload,
+                 sizeof(payload)) == 0, "a session exists to verify");
+    const char *S = "gate-enforce:" FX_DEV;
+
+    CHECK(fx_ask(st, me, m15_verify(S, 0, 1)) == VIRP_OK,
+          "a small range is verified");
+    CHECK(fx_ask(st, me, m15_verify(S, 0, ONODE_CHAIN_VERIFY_MAX_RANGE - 1))
+              == VIRP_OK, "a range of exactly the cap is accepted");
+    CHECK(fx_ask(st, me, m15_verify(S, 0, ONODE_CHAIN_VERIFY_MAX_RANGE))
+              == VIRP_ERR_MESSAGE_TOO_LARGE,
+          "one entry more than the cap is refused");
+    CHECK(fx_ask(st, me, m15_verify(S, 0, INT64_MAX))
+              == VIRP_ERR_MESSAGE_TOO_LARGE,
+          "to_sequence = INT64_MAX is refused, not walked");
+    CHECK(fx_ask(st, me, m15_verify(S, INT64_MAX - 5, INT64_MAX)) == VIRP_OK,
+          "a small range at the top of the number space is not confused for a huge one");
+    CHECK(fx_ask(st, me, "{\"action\":\"chain_verify_session\","
+                         "\"session_id\":\"gate-enforce:" FX_DEV "\"}")
+              == VIRP_OK,
+          "chain_verify_session (no range) is still answered");
+    fx_destroy(fx);
+}
+
+static void t_M15_verify_is_rate_limited_per_uid(void)
+{
+    printf("\n  M15: verify time is budgeted per uid\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m15-rate")) { CHECK(false, "fixture"); return; }
+    onode_state_t *st = &fx->st;
+    const int64_t T = 1000000;                 /* an arbitrary monotonic ms */
+    const int64_t WINDOW = (int64_t)ONODE_VERIFY_WINDOW_SEC * 1000;
+
+    CHECK(onode_verify_enter(st, 7001, T), "a first verify is admitted");
+    CHECK(!onode_verify_enter(st, 7001, T + 1),
+          "a second while it is in flight is refused");
+    CHECK(onode_verify_enter(st, 7002, T + 1),
+          "another uid is unaffected");
+    onode_verify_leave(st, 7001, 100);
+    onode_verify_leave(st, 7002, 100);
+    CHECK(onode_verify_enter(st, 7001, T + 200), "admitted again once it finished");
+
+    /* Spend the whole budget. */
+    onode_verify_leave(st, 7001, ONODE_VERIFY_BUDGET_MS);
+    CHECK(!onode_verify_enter(st, 7001, T + 300),
+          "with the window's budget spent, further verifies are refused");
+    CHECK(onode_verify_enter(st, 7002, T + 300),
+          "that does not touch another uid's budget");
+    onode_verify_leave(st, 7002, 1);
+    CHECK(!onode_verify_enter(st, 7001, T + WINDOW - 1),
+          "still refused just before the window ends");
+    CHECK(onode_verify_enter(st, 7001, T + WINDOW + 1),
+          "a new window restores the budget");
+    onode_verify_leave(st, 7001, 1);
+
+    /* And the socket path actually asks. */
+    uid_t me = getuid();
+    CHECK(fx_ask(st, me, "{\"action\":\"chain_verify_session\","
+                         "\"session_id\":\"s\"}") != VIRP_ERR_RATE_LIMITED,
+          "a uid inside its budget is not rate limited");
+    int64_t now = onode_monotonic_ms();
+    CHECK(onode_verify_enter(st, me, now), "(budget consumed for this uid)");
+    onode_verify_leave(st, me, ONODE_VERIFY_BUDGET_MS);
+    CHECK(fx_ask(st, me, "{\"action\":\"chain_verify_session\","
+                         "\"session_id\":\"s\"}") == VIRP_ERR_RATE_LIMITED,
+          "chain_verify_session over budget answers RATE_LIMITED");
+    CHECK(fx_ask(st, me, m15_verify("s", 0, 1)) == VIRP_ERR_RATE_LIMITED,
+          "chain_verify over budget answers RATE_LIMITED");
+    CHECK(strcmp(virp_error_str(VIRP_ERR_RATE_LIMITED), "Unknown error") != 0,
+          "the new code has its own error text");
+    fx_destroy(fx);
+}
+
 /* ---- a real listening daemon, for what only the accept loop decides ---- */
 
 static void *fx_server_thread(void *arg)
@@ -2424,6 +2519,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M12_v3_session_lost_after_dispatch", t_M12_v3_session_lost_after_dispatch },
     { "t_M13_proposal_id_survives_long_command",
                                               t_M13_proposal_id_survives_long_command },
+    { "t_M15_verify_range_is_capped",         t_M15_verify_range_is_capped },
+    { "t_M15_verify_is_rate_limited_per_uid", t_M15_verify_is_rate_limited_per_uid },
     { "t_M14_request_deadline_is_absolute",   t_M14_request_deadline_is_absolute },
     { "t_M14_send_timeout_abandons_a_stalled_reader",
                                               t_M14_send_timeout_abandons_a_stalled_reader },

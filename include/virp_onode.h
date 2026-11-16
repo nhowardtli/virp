@@ -113,6 +113,44 @@ const char *onode_health_command(virp_vendor_t vendor);
 #define ONODE_DRAIN_TIMEOUT_SEC 30
 #endif
 
+/*
+ * chain_verify bounds (security review M15).
+ *
+ * A verify walks its range holding the chain lock, and every execution
+ * needs that lock to commit its pre-dispatch intent while it holds the
+ * device's exec_mutex — so for as long as one verify runs, no device can
+ * execute anything and the watchdog cannot probe. Before these bounds a
+ * single request with to_sequence = INT64_MAX held it for the whole
+ * session, and nothing stopped a uid from issuing them back to back.
+ *
+ *   ONODE_CHAIN_VERIFY_MAX_RANGE   entries one ranged CHAIN_VERIFY may
+ *       cover. Measured ~23 us per entry, so a full-size request holds
+ *       the lock for about a second. A larger range is refused with
+ *       VIRP_ERR_MESSAGE_TOO_LARGE; the caller pages, or asks for
+ *       CHAIN_VERIFY_SESSION.
+ *   ONODE_VERIFY_BUDGET_MS / ONODE_VERIFY_WINDOW_SEC   per uid: the
+ *       verify time one principal may consume per window. Past it, and
+ *       while that uid already has a verify in flight, further verifies
+ *       are refused with VIRP_ERR_RATE_LIMITED. A third of the window by
+ *       default, so no single uid can deny the chain lock to executions
+ *       for more than that fraction — while a chainwalk that verifies
+ *       hundreds of small sessions one after another is untouched,
+ *       because what is metered is time, not request count.
+ *
+ * CHAIN_VERIFY_SESSION has no range to cap — covering the whole session
+ * against its signed head is its purpose — so it is bounded by the
+ * budget only. See REVIEW-NOTES.md for what that leaves open.
+ */
+#ifndef ONODE_CHAIN_VERIFY_MAX_RANGE
+#define ONODE_CHAIN_VERIFY_MAX_RANGE 50000
+#endif
+#ifndef ONODE_VERIFY_WINDOW_SEC
+#define ONODE_VERIFY_WINDOW_SEC      60
+#endif
+#ifndef ONODE_VERIFY_BUDGET_MS
+#define ONODE_VERIFY_BUDGET_MS       20000
+#endif
+
 /* Auto-reconnect configuration */
 #define ONODE_WATCHDOG_INTERVAL_SEC  5   /* How often the watchdog checks */
 #define ONODE_RECONNECT_BACKOFF_INIT 5   /* Initial backoff: 5 seconds */
@@ -542,6 +580,22 @@ typedef struct {
     uint32_t            request_deadline_ms;
     uint32_t            send_timeout_ms;
 
+    /*
+     * Per-uid verify accounting (M15), under state_mutex. `in_flight`
+     * is set between onode_verify_enter() and onode_verify_leave();
+     * `used_ms` is the verify time charged in the window that began at
+     * `window_start_ms` (CLOCK_MONOTONIC). A slot with used_ms == 0 and
+     * nothing in flight is free. Sized by the worker pool: at most that
+     * many distinct uids can be mid-request.
+     */
+    struct {
+        uid_t       uid;
+        bool        in_use;
+        bool        in_flight;
+        int64_t     window_start_ms;
+        int64_t     used_ms;
+    }                   verify_uid[ONODE_MAX_WORKERS];
+
     /* Runtime */
     bool                running;
     uint32_t            uptime_start;   /* time(NULL) at startup */
@@ -676,6 +730,17 @@ virp_error_t onode_watchdog_start(onode_state_t *state);
  */
 bool onode_worker_admit(onode_state_t *state, uid_t uid);
 void onode_worker_release(onode_state_t *state, uid_t uid);
+
+/*
+ * Per-uid verify limiter (M15). onode_verify_enter() returns false when
+ * `uid` already has a verify in flight or has spent its budget for the
+ * current window; otherwise it marks one in flight and returns true, and
+ * the caller owes exactly one onode_verify_leave(uid, elapsed_ms) with
+ * the time the verify took. `now_ms` is CLOCK_MONOTONIC milliseconds,
+ * passed in so the window arithmetic can be tested without sleeping.
+ */
+bool onode_verify_enter(onode_state_t *state, uid_t uid, int64_t now_ms);
+void onode_verify_leave(onode_state_t *state, uid_t uid, int64_t elapsed_ms);
 
 /*
  * Signal the O-Node to shut down gracefully.

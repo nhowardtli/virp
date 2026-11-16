@@ -1100,6 +1100,7 @@ const char *virp_error_str(virp_error_t err)
     case VIRP_ERR_TRANSPORT_WRITE:   return "Transport write failed: the device channel would not accept bytes (peer closed, reset, or session idled out) - nothing was dispatched";
     case VIRP_ERR_TRANSPORT_CLOSED:  return "Transport closed: the device closed the session (idle timeout or reset) - nothing was dispatched; one reconnect is warranted";
     case VIRP_ERR_APPROVAL_STORE_ABSENT: return "Approval store directory not present on this host (wrong host, or the store is not configured here)";
+    case VIRP_ERR_RATE_LIMITED:      return "Rate limited: this principal has used its share of a bounded daemon resource - back off and retry later";
     default:                         return "Unknown error";
     }
 }
