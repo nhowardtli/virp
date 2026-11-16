@@ -77,7 +77,13 @@ int main(void)
         "[-1]", "[4294967296]", "[\"7junk\"]", "[7,\"8\"]" };
     for (size_t i = 0; i < sizeof(allowlists)/sizeof(allowlists[0]); i++) {
         FILE *f = fopen(path, "w"); assert(f);
-        fprintf(f, "{\"socket_allowed_uids\":%s,\"devices\":[]}", allowlists[i]);
+        /* An explicit allowlist must come with ceilings (security review
+         * M22). They are supplied here for uids 7 and 8 so that what
+         * decides each case is still the ALLOWLIST's own validity, which
+         * is what this table is about. */
+        fprintf(f, "{\"socket_allowed_uids\":%s,"
+                   "\"socket_uid_tier_ceilings\":{\"7\":\"green\",\"8\":\"green\"},"
+                   "\"devices\":[]}", allowlists[i]);
         fclose(f);
         assert(onode_init(&state, 1, NULL, "/tmp/unused-security-regressions.sock") == VIRP_OK);
         int rc = load_devices(&state, path);

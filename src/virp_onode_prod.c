@@ -270,8 +270,10 @@ static int load_socket_allowed_uids(onode_state_t *state,
  *
  * Keys are uid strings (matching how socket_allowed_uids may be given as
  * strings); values are "green"/"yellow"/"red". "black" is refused
- * outright — the per-uid BLACK passthrough is retired. Absent object
- * preserves the node-wide default. A present map must cover every allowed
+ * outright — the per-uid BLACK passthrough is retired. The object may be
+ * absent only when socket_allowed_uids is absent too (the self-seeded
+ * default); load_devices() refuses an explicit allowlist without it
+ * (M22). A present map must cover every allowed
  * uid; malformed or incomplete policy refuses startup. Rows outside the
  * allowlist are retained with a warning and do not grant socket access.
  */
@@ -691,6 +693,57 @@ static int load_gate_config(onode_state_t *state, struct json_object *root)
 }
 
 /*
+ * The top-level keys this loader understands (security review M22).
+ *
+ * The config is a posture document: who may connect, at what ceiling,
+ * under which gate mode, with or without evidence. An unknown top-level
+ * key used to be ignored — so a typo did not fail, it silently fell back
+ * to a DEFAULT. "socket_uid_tier_cielings" loaded with every uid at the
+ * node-wide ceiling instead of the one the operator wrote;
+ * "gate_defualt_mode": "enforce" and "evidence_requried": true read as
+ * if the line were not there. The operator saw the daemon start and
+ * believed the posture they had typed.
+ *
+ * A key beginning with '_' is an annotation ("_comment",
+ * "_socket_allowlist_policy", ...): the shipped templates carry their
+ * rationale that way, and they are ignored by design. Everything else
+ * must be on this list or the config is refused, naming the key.
+ * Device objects are not policed here — only the root.
+ */
+static const char *const LOAD_DEVICES_TOP_LEVEL_KEYS[] = {
+    "devices",
+    "socket_path",
+    "socket_allowed_uids",
+    "socket_uid_tier_ceilings",
+    "socket_uid_action_allow",
+    "socket_uid_chain_append_types",
+    "gate_max_tier",
+    "gate_default_mode",
+    "gate_mode",                /* deprecated alias, still parsed */
+    "gate_modes",
+    "evidence_required",
+};
+
+static const char *unknown_top_level_key(struct json_object *root)
+{
+    json_object_object_foreach(root, key, val) {
+        (void)val;
+        if (key[0] == '_')
+            continue;                       /* annotation */
+        bool known = false;
+        for (size_t i = 0; i < sizeof(LOAD_DEVICES_TOP_LEVEL_KEYS) /
+                               sizeof(LOAD_DEVICES_TOP_LEVEL_KEYS[0]); i++)
+            if (strcmp(key, LOAD_DEVICES_TOP_LEVEL_KEYS[i]) == 0) {
+                known = true;
+                break;
+            }
+        if (!known)
+            return key;
+    }
+    return NULL;
+}
+
+/*
  * Not static: the issue #7 regression test in tests/test_onode.c links
  * against the prod parser (via the *_lib.o object compiled with
  * VIRP_ONODE_PROD_NO_MAIN) and calls this directly.
@@ -711,6 +764,52 @@ int load_devices(onode_state_t *state, const char *path)
     if (!root) {
         fprintf(stderr, "[O-Node] Failed to parse device config: %s\n", path);
         return -1;
+    }
+
+    if (!json_object_is_type(root, json_type_object)) {
+        fprintf(stderr, "[O-Node] FATAL: device config %s is not a JSON "
+                "object\n", path);
+        json_object_put(root);
+        return -1;
+    }
+
+    /* Refuse a key this loader does not know, before anything is
+     * installed from the file (M22). */
+    {
+        const char *unknown = unknown_top_level_key(root);
+        if (unknown) {
+            fprintf(stderr, "[O-Node] FATAL: device config %s has an "
+                    "unrecognized top-level key \"%s\". An unknown key is "
+                    "refused, not ignored: a misspelled posture key would "
+                    "otherwise fall back to its default without a word. "
+                    "(Prefix a key with '_' to make it a comment.)\n",
+                    path, unknown);
+            json_object_put(root);
+            return -1;
+        }
+    }
+
+    /* An EXPLICIT allowlist must come with explicit ceilings (M22). With
+     * socket_allowed_uids present and socket_uid_tier_ceilings absent,
+     * every listed uid got the node-wide gate_max_tier — the remote
+     * requester and the local operator alike — and nothing in the file
+     * said so. load_uid_tier_ceilings() already requires the map to
+     * cover every allowed uid when it IS present; requiring it to be
+     * present closes the other half. The self-seeded default (no
+     * allowlist at all: the daemon's own uid only) needs no map. */
+    {
+        struct json_object *au = NULL, *ce = NULL;
+        if (json_object_object_get_ex(root, "socket_allowed_uids", &au) &&
+            !json_object_object_get_ex(root, "socket_uid_tier_ceilings", &ce)) {
+            fprintf(stderr, "[O-Node] FATAL: device config %s sets "
+                    "socket_allowed_uids but not socket_uid_tier_ceilings. "
+                    "Every allowed uid must be given a tier ceiling "
+                    "(\"<uid>\": \"green\"|\"yellow\"|\"red\"); without "
+                    "the map each one silently gets the node-wide "
+                    "gate_max_tier.\n", path);
+            json_object_put(root);
+            return -1;
+        }
     }
 
     /* Socket access gate: install allowlist before onode_start(). */

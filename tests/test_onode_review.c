@@ -37,6 +37,8 @@ static int review_pthread_create(pthread_t *t, const pthread_attr_t *a,
 #include <sys/wait.h>
 
 extern void virp_driver_mock_init(void);
+/* The production config loader (virp_onode_prod.c, linked NO_MAIN). */
+extern int load_devices(onode_state_t *state, const char *path);
 extern int  virp_driver_mock_exec_attempts_reset(void);
 
 /* Fail the Nth creation from now (1 = the next one); 0 = never. */
@@ -3037,6 +3039,125 @@ static void t_M21_v3_with_separate_observation_key(void)
 }
 
 /* =========================================================================
+ * M22 — the device config is refused for what it does not say clearly
+ * ========================================================================= */
+
+/* Write `json` as a config file and load it into a fresh state.
+ * Returns load_devices()' result (-1 = refused). */
+static int cfg_load(const char *name, const char *json, onode_state_t *out)
+{
+    static onode_state_t scratch;
+    onode_state_t *st = out ? out : &scratch;
+    char path[200];
+    snprintf(path, sizeof(path), "%s/%s.json", g_root, name);
+    FILE *f = fopen(path, "w");
+    if (!f) return -99;
+    fputs(json, f);
+    fclose(f);
+    if (onode_init(st, 1, NULL, "/tmp/virp-review-unused.sock") != VIRP_OK)
+        return -98;
+    int rc = load_devices(st, path);
+    if (!out) onode_destroy(st);
+    return rc;
+}
+
+static void t_M22_unknown_top_level_key_is_fatal(void)
+{
+    printf("\n  M22: an unrecognized top-level config key refuses the config\n");
+    CHECK(cfg_load("m22-plain", "{\"devices\":[]}", NULL) == 0,
+          "a minimal config loads");
+    CHECK(cfg_load("m22-comment",
+                   "{\"_comment\":\"why\",\"_gate_note\":{\"x\":1},"
+                   "\"devices\":[]}", NULL) == 0,
+          "keys beginning with '_' are annotations and are accepted");
+    static const char *const TYPOS[] = {
+        "{\"gate_max_teir\":\"green\",\"devices\":[]}",
+        "{\"evidence_requried\":true,\"devices\":[]}",
+        "{\"gate_defualt_mode\":\"enforce\",\"devices\":[]}",
+        "{\"socket_allowed_uid\":[7],\"devices\":[]}",
+        "{\"Devices\":[],\"devices\":[]}",
+        "{\"notes\":\"free text\",\"devices\":[]}",
+    };
+    for (size_t i = 0; i < sizeof(TYPOS) / sizeof(TYPOS[0]); i++) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "refused: %.70s", TYPOS[i]);
+        CHECK(cfg_load("m22-typo", TYPOS[i], NULL) == -1, msg);
+    }
+    /* The case that mattered: a misspelled ceilings map used to leave
+     * every uid at the node-wide ceiling. */
+    static onode_state_t st;
+    CHECK(cfg_load("m22-ceil-typo",
+                   "{\"socket_allowed_uids\":[7],"
+                   "\"socket_uid_tier_cielings\":{\"7\":\"green\"},"
+                   "\"devices\":[]}", &st) == -1 && st.uid_ceiling_count == 0,
+          "a misspelled socket_uid_tier_ceilings is refused, not ignored");
+    onode_destroy(&st);
+    CHECK(cfg_load("m22-notobj", "[]", NULL) == -1,
+          "a config that is not a JSON object is refused");
+}
+
+static void t_M22_explicit_allowlist_requires_ceilings(void)
+{
+    printf("\n  M22: socket_allowed_uids without socket_uid_tier_ceilings is refused\n");
+    CHECK(cfg_load("m22-noceil",
+                   "{\"socket_allowed_uids\":[7,8],\"devices\":[]}", NULL) == -1,
+          "an explicit allowlist with no ceilings map is refused");
+    static onode_state_t st;
+    CHECK(cfg_load("m22-ceil",
+                   "{\"socket_allowed_uids\":[7,8],"
+                   "\"socket_uid_tier_ceilings\":{\"7\":\"green\",\"8\":\"red\"},"
+                   "\"devices\":[]}", &st) == 0 &&
+          onode_effective_max_tier(&st, 7) == VIRP_TIER_GREEN &&
+          onode_effective_max_tier(&st, 8) == VIRP_TIER_RED,
+          "with a ceiling for every allowed uid it loads, and they apply");
+    onode_destroy(&st);
+    CHECK(cfg_load("m22-partial",
+                   "{\"socket_allowed_uids\":[7,8],"
+                   "\"socket_uid_tier_ceilings\":{\"7\":\"green\"},"
+                   "\"devices\":[]}", NULL) == -1,
+          "a map that omits an allowed uid is still refused");
+    CHECK(cfg_load("m22-default", "{\"gate_max_tier\":\"green\",\"devices\":[]}",
+                   NULL) == 0,
+          "no allowlist at all (the self-seeded default) needs no ceilings");
+}
+
+/* The configs this repository ships must still load under the stricter
+ * rules. Placeholders are substituted the way render-devices.sh would. */
+static void t_M22_shipped_templates_still_load(void)
+{
+    printf("\n  M22: every shipped device template passes the stricter loader\n");
+    static const char *const SHIPPED[] = {
+        "deploy/devices.template.json", "deploy/devices.home.template.json",
+        "deploy/devices.node2.template.json", "demo/devices.json",
+    };
+    for (size_t i = 0; i < sizeof(SHIPPED) / sizeof(SHIPPED[0]); i++) {
+        static char text[512 * 1024], out[512 * 1024];
+        FILE *f = fopen(SHIPPED[i], "r");
+        if (!f) { CHECK(false, SHIPPED[i]); continue; }
+        size_t n = fread(text, 1, sizeof(text) - 1, f);
+        fclose(f);
+        text[n] = '\0';
+        /* ${NAME} -> 900 (a number that works as a uid, a port, a string). */
+        size_t o = 0;
+        for (size_t k = 0; k < n && o + 4 < sizeof(out); k++) {
+            if (text[k] == '$' && text[k + 1] == '{') {
+                const char *end = strchr(text + k, '}');
+                if (end) {
+                    memcpy(out + o, "900", 3); o += 3;
+                    k = (size_t)(end - text);
+                    continue;
+                }
+            }
+            out[o++] = text[k];
+        }
+        out[o] = '\0';
+        char msg[160];
+        snprintf(msg, sizeof(msg), "%s is not refused", SHIPPED[i]);
+        CHECK(cfg_load("m22-shipped", out, NULL) >= 0, msg);
+    }
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -3092,6 +3213,10 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M20_v1_sequence_survives_restart",   t_M20_v1_sequence_survives_restart },
     { "t_M21_v3_with_separate_observation_key",
                                               t_M21_v3_with_separate_observation_key },
+    { "t_M22_unknown_top_level_key_is_fatal", t_M22_unknown_top_level_key_is_fatal },
+    { "t_M22_explicit_allowlist_requires_ceilings",
+                                              t_M22_explicit_allowlist_requires_ceilings },
+    { "t_M22_shipped_templates_still_load",   t_M22_shipped_templates_still_load },
     { "t_M18_shutdown_wakes_the_accept_loop", t_M18_shutdown_wakes_the_accept_loop },
     { "t_M18_shutdown_from_signal_handler",   t_M18_shutdown_from_signal_handler },
     { "t_M18_shutdown_before_start_is_not_lost",
