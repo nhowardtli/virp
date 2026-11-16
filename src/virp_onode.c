@@ -308,6 +308,28 @@ static const char *onode_typed_profile(onode_state_t *state, int dev_idx)
 #define ONODE_JSON_SAFE_INT_MAX  9007199254740992LL   /* 2^53 */
 
 /*
+ * The PRODUCING half of the rule above (security review M8): add an
+ * evidence integer that may exceed 2^53 as a DECIMAL STRING.
+ *
+ * The daemon enforced the rule on what it read and broke it in what it
+ * wrote. intent_ns (gate_intent bodies), emitted_ns (node_config bodies)
+ * and approved_at_ns (the approval challenge and result payloads) all
+ * went out through cJSON_AddNumberToObject((double)ns). A nanosecond
+ * timestamp is about 1.79e18; a double carries 53 bits, so the value
+ * written was the true one rounded to a multiple of 256 — and for
+ * approved_at_ns that is a field the approver's signature covers
+ * exactly, shown to the operator wrong. Same form as virp_approval.c's
+ * jadd_u64str, which has always written the on-disk copy of
+ * approved_at_ns this way.
+ */
+static bool json_add_u64_string(cJSON *o, const char *key, uint64_t v)
+{
+    char num[24];
+    snprintf(num, sizeof(num), "%llu", (unsigned long long)v);
+    return cJSON_AddStringToObject(o, key, num) != NULL;
+}
+
+/*
  * Extract a signed-integer-valued key.
  *
  * Accepts a decimal STRING (exact, the required form for any value that
@@ -1763,8 +1785,11 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
         }
         cJSON_AddNumberToObject(o, "obs_version", (double)(execute_wrapping_v3 ? 3 : obs_version));
         /* Wall clock at intent time, so two dispatches of the same command
-         * by the same principal never share a body (and so an artifact_id). */
-        cJSON_AddNumberToObject(o, "intent_ns", (double)intent_ns);
+         * by the same principal never share a body (and so an artifact_id).
+         * A decimal STRING (M8): as a JSON number it was rounded through a
+         * double, which also meant two intents inside the same 256 ns
+         * could share the value this field exists to keep distinct. */
+        json_add_u64_string(o, "intent_ns", intent_ns);
         body = cJSON_PrintUnformatted(o);
         cJSON_Delete(o);
     }
@@ -1869,7 +1894,8 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
         }
         if (state->chain.native_epoch[0])
             cJSON_AddStringToObject(o, "native_audit_epoch", state->chain.native_epoch);
-        cJSON_AddNumberToObject(o, "emitted_ns", (double)now_ns);
+        /* Decimal string, not a JSON number (M8, EVIDENCE-INTEGERS). */
+        json_add_u64_string(o, "emitted_ns", now_ns);
         body = cJSON_PrintUnformatted(o);
         cJSON_Delete(o);
     }
@@ -2082,7 +2108,11 @@ static virp_error_t onode_approval_challenge(onode_state_t *state,
     cJSON_AddStringToObject(o, "command_hash", ch.command_hash);
     cJSON_AddStringToObject(o, "tier", ch.tier);
     cJSON_AddNumberToObject(o, "device_node_id", (double)ch.device_node_id);
-    cJSON_AddNumberToObject(o, "approved_at_ns", (double)ch.approved_at_ns);
+    /* Decimal string (M8): this value is INSIDE the canonical bytes the
+     * approver signs (offset 60, 8 bytes). As a JSON number it reached
+     * the operator rounded through a double, so the timestamp displayed
+     * was not the timestamp being signed. */
+    json_add_u64_string(o, "approved_at_ns", ch.approved_at_ns);
     cJSON_AddNumberToObject(o, "ttl_seconds", (double)ch.ttl_seconds);
     char *json = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -2153,7 +2183,8 @@ static virp_error_t onode_approval_submit(onode_state_t *state,
     cJSON_AddStringToObject(o, "approver_key_id", apr.approver_key_id);
     cJSON_AddStringToObject(o, "operator", apr.operator);
     cJSON_AddStringToObject(o, "chain_entry_hash", apr.chain_entry_hash);
-    cJSON_AddNumberToObject(o, "approved_at_ns", (double)apr.approved_at_ns);
+    /* Decimal string (M8) — the same form the on-disk record uses. */
+    json_add_u64_string(o, "approved_at_ns", apr.approved_at_ns);
     cJSON_AddNumberToObject(o, "ttl_seconds", (double)apr.ttl_seconds);
     cJSON_AddBoolToObject(o, "already_approved",
                           err == VIRP_APPROVAL_ALREADY_EXISTS);

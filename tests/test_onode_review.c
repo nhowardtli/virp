@@ -1512,6 +1512,114 @@ static void t_M7_start_rechecks_hostnames_against_epoch(void)
 }
 
 /* =========================================================================
+ * M8 — nanosecond evidence integers leave the daemon as decimal strings
+ * ========================================================================= */
+
+/* The newest stored body of `type`, parsed. Caller cJSON_Delete()s. */
+static cJSON *fx_latest_body(fx_t *fx, const char *type)
+{
+    sqlite3_stmt *st = NULL;
+    cJSON *o = NULL;
+    if (sqlite3_prepare_v2(fx->st.chain.db,
+            "SELECT artifact_content FROM artifacts WHERE artifact_type = ? "
+            "ORDER BY id DESC LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, type, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            o = cJSON_Parse((const char *)sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+    return o;
+}
+
+/* A member that is a string of 19 decimal digits (a 2026-era ns clock),
+ * returned as a number; 0 if it is anything else. */
+static uint64_t m8_ns_string(const cJSON *o, const char *key)
+{
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, key);
+    if (!cJSON_IsString(v) || !v->valuestring) return 0;
+    if (strlen(v->valuestring) != 19 ||
+        strspn(v->valuestring, "0123456789") != 19)
+        return 0;
+    return strtoull(v->valuestring, NULL, 10);
+}
+
+static uint64_t m8_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void t_M8_ns_fields_are_decimal_strings(void)
+{
+    printf("\n  M8: intent_ns / emitted_ns / approved_at_ns are exact decimal strings\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m8-ns")) { CHECK(false, "fixture"); return; }
+    onode_state_t *st = &fx->st;
+    uint8_t ot = 0;
+    char payload[2048];
+
+    /* gate_intent.intent_ns */
+    uint64_t t0 = m8_now_ns();
+    CHECK(fx_run(fx, FX_DEV, "show version", NULL, (uid_t)-1, &ot, payload,
+                 sizeof(payload)) == 0, "a GREEN read executes");
+    uint64_t t1 = m8_now_ns();
+    cJSON *intent = fx_latest_body(fx, "gate_intent");
+    uint64_t ins = intent ? m8_ns_string(intent, "intent_ns") : 0;
+    CHECK(ins >= t0 && ins <= t1,
+          "gate_intent.intent_ns is a decimal string inside the dispatch window");
+    if (intent) cJSON_Delete(intent);
+
+    /* node_config.emitted_ns */
+    t0 = m8_now_ns();
+    CHECK(onode_emit_node_config(st) == VIRP_OK, "node_config recorded");
+    t1 = m8_now_ns();
+    cJSON *nc = fx_latest_body(fx, "node_config");
+    uint64_t ens = nc ? m8_ns_string(nc, "emitted_ns") : 0;
+    CHECK(ens >= t0 && ens <= t1,
+          "node_config.emitted_ns is a decimal string inside the emit window");
+    if (nc) cJSON_Delete(nc);
+
+    /* approval challenge: the displayed value must be the SIGNED value. */
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    CHECK(fx_propose(fx, "reload", pid) == 0, "proposal filed");
+    char reqbuf[256];
+    snprintf(reqbuf, sizeof(reqbuf),
+             "{\"action\":\"approval_challenge\",\"proposal_id\":\"%s\"}", pid);
+    cJSON *ch = fx_ask_json(fx, getuid(), reqbuf, VIRP_OBS_APPROVAL_CHALLENGE,
+                            NULL);
+    CHECK(ch != NULL, "challenge issued");
+    uint64_t shown = ch ? m8_ns_string(ch, "approved_at_ns") : 0;
+    uint64_t in_canon = 0;
+    uint8_t canon[VIRP_APPROVAL_CANON_SIZE];
+    const cJSON *cj = ch ? cJSON_GetObjectItemCaseSensitive(ch, "canonical") : NULL;
+    if (cJSON_IsString(cj) &&
+        virp_hex_decode(cj->valuestring, canon, sizeof(canon)) == (int)sizeof(canon))
+        for (int i = 0; i < 8; i++)
+            in_canon = (in_canon << 8) | canon[60 + i];
+    CHECK(shown != 0 && shown == in_canon,
+          "challenge approved_at_ns is a decimal string EQUAL to the 8 bytes being signed");
+
+    /* approval result */
+    uint8_t sig[VIRP_APPROVER_SIG_SIZE];
+    char kid[33], sighex[2 * VIRP_APPROVER_SIG_SIZE + 1], sub[512];
+    fx_keyid_hex(&fx->kp, kid);
+    CHECK(in_canon != 0 &&
+          virp_fed_sign(&fx->kp, canon, VIRP_APPROVAL_CANON_SIZE, sig) == VIRP_OK,
+          "challenge signed");
+    hex_of(sig, sizeof(sig), sighex);
+    snprintf(sub, sizeof(sub),
+             "{\"action\":\"approval_submit\",\"proposal_id\":\"%s\","
+             "\"key_id\":\"%s\",\"signature\":\"%s\"}", pid, kid, sighex);
+    cJSON *res = fx_ask_json(fx, getuid(), sub, VIRP_OBS_APPROVAL_RESULT, NULL);
+    CHECK(res != NULL && m8_ns_string(res, "approved_at_ns") == in_canon,
+          "approval result approved_at_ns is the same exact decimal string");
+    if (ch) cJSON_Delete(ch);
+    if (res) cJSON_Delete(res);
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -1542,6 +1650,7 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M7_hostname_must_fit_session_id",    t_M7_hostname_must_fit_session_id },
     { "t_M7_start_rechecks_hostnames_against_epoch",
                                               t_M7_start_rechecks_hostnames_against_epoch },
+    { "t_M8_ns_fields_are_decimal_strings",   t_M8_ns_fields_are_decimal_strings },
 };
 
 static void rm_rf_root(void)

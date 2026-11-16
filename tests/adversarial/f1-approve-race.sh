@@ -51,7 +51,10 @@ ok=$(grep -l 'rc=0' "$OUT"/child.* 2>/dev/null | wc -l)
 echo "clients reporting SUCCESS (rc=0)   : $ok / $N"
 echo "clients reporting failure          : $(( N - ok ))"
 echo "distinct approved_at_ns printed by clients:"
-cat "$OUT"/child.* 2>/dev/null | grep -o 'approved_at_ns":[0-9.e+]*' | sort -u | sed 's/^/    /'
+# The daemon emits approved_at_ns as a decimal STRING since security
+# review M8 (it was a lossy JSON number); accept either so this still
+# reads transcripts from older builds.
+cat "$OUT"/child.* 2>/dev/null | grep -o 'approved_at_ns":"\{0,1\}[0-9.e+]*' | sort -u | sed 's/^/    /'
 echo "non-zero rc detail (if any):"
 cat "$OUT"/child.* 2>/dev/null | awk -F'\t' '$2!="rc=0"' | sed 's/^/    /' | head
 
