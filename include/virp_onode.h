@@ -1193,4 +1193,14 @@ const char *virp_config_file_blocked(const char *path);
  */
 bool onode_parse_request_fuzz(const uint8_t *data, size_t n);
 
+/*
+ * The same, for the batch_execute command-array parser and for the
+ * fed_outcome citation reader (GATE 4). Each returns what its parser
+ * decided and abort()s if that result breaks the parser's own
+ * postcondition, so a fuzzer finds logic errors as well as memory
+ * errors. See tests/fuzz_onode_parsers.c and `make fuzz-onode-parsers`.
+ */
+int onode_parse_batch_fuzz(const uint8_t *data, size_t n);
+int onode_fed_outcome_citation_fuzz(const uint8_t *data, size_t n);
+
 #endif /* VIRP_ONODE_H */

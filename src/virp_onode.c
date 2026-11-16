@@ -5563,7 +5563,15 @@ static fed_cite_kind_t fed_outcome_citation(const char *body,
         }
         if (ex_count > 1 || (ex_count == 1 && !cJSON_IsBool(ex)))
             kind = FED_CITE_NONE;
-        else if (claims_executed)
+        /* An execution claim is reported ONLY together with a citation.
+         * It used to be set whenever a lone boolean `executed` was
+         * present, citation or not, so a body with no usable citation
+         * could still come back "claims executed". The one caller
+         * refuses FED_CITE_NONE before it looks at the flag, so nothing
+         * was reachable — but a result that says "nothing is cited, and
+         * it executed" is a trap for the next caller. Found by
+         * tests/fuzz_onode_parsers.c on its first run. */
+        else if (claims_executed && kind != FED_CITE_NONE)
             *claims_executed = cJSON_IsTrue(ex);
     }
     cJSON_Delete(root);
@@ -9376,4 +9384,83 @@ bool onode_parse_request_fuzz(const uint8_t *data, size_t n)
     bool ok = parse_request(buf, n, &req);
     free(buf);
     return ok;
+}
+
+/*
+ * Fuzz entry points for the two other parsers a socket client's bytes
+ * reach (O-Node security review, "FINALLY"). Same contract as
+ * onode_parse_request_fuzz above: arbitrary bytes in, MUST NOT crash,
+ * and each one aborts — so a fuzzer or a sanitizer build reports it — if
+ * the parser returns something that breaks its own postcondition.
+ *
+ * onode_parse_batch_fuzz: the batch_execute `commands` parser, a second
+ * and independent parse of the frame. Returns the number of commands
+ * accepted (0 = refused). Postcondition checked here: an accepted batch
+ * has 1..ONODE_MAX_BATCH items, each with a non-empty, NUL-terminated,
+ * canonical device and a non-empty, NUL-terminated command.
+ *
+ * onode_fed_outcome_citation_fuzz: GATE 4's reader for a fed_outcome
+ * body. Returns 0 (no usable citation), 1 (observation) or 2 (error).
+ * Postcondition: a citation that is reported is exactly 64 lowercase hex
+ * characters, and an "executed" claim is only ever reported alongside
+ * one.
+ */
+int onode_parse_batch_fuzz(const uint8_t *data, size_t n)
+{
+    if (n > ONODE_MAX_REQUEST_SIZE) return 0;
+
+    char *buf = (char *)malloc(n + 1);
+    batch_thread_arg_t *args = calloc(ONODE_MAX_BATCH, sizeof(*args));
+    if (!buf || !args) { free(buf); free(args); return 0; }
+    if (n > 0) memcpy(buf, data, n);
+    buf[n] = '\0';
+
+    int count = parse_batch_commands(buf, n, args, ONODE_MAX_BATCH);
+    if (count < 0 || count > ONODE_MAX_BATCH) {
+        fprintf(stderr, "FUZZ: batch parser returned count %d\n", count);
+        abort();
+    }
+    for (int i = 0; i < count; i++) {
+        size_t dl = strnlen(args[i].device, sizeof(args[i].device));
+        size_t cl = strnlen(args[i].command, sizeof(args[i].command));
+        if (dl == 0 || dl >= sizeof(args[i].device) ||
+            cl == 0 || cl >= sizeof(args[i].command) ||
+            !onode_canonical_string_ok(args[i].device)) {
+            fprintf(stderr, "FUZZ: batch parser accepted a malformed item "
+                    "%d\n", i);
+            abort();
+        }
+    }
+    free(args);
+    free(buf);
+    return count;
+}
+
+int onode_fed_outcome_citation_fuzz(const uint8_t *data, size_t n)
+{
+    if (n > ONODE_MAX_REQUEST_SIZE) return 0;
+
+    char *buf = (char *)malloc(n + 1);
+    if (!buf) return 0;
+    if (n > 0) memcpy(buf, data, n);
+    buf[n] = '\0';
+
+    char cited[65];
+    memset(cited, 'Z', sizeof(cited));     /* never valid hex if untouched */
+    bool claims = false;
+    fed_cite_kind_t kind = fed_outcome_citation(buf, cited, &claims);
+    if (kind != FED_CITE_NONE) {
+        if (cited[64] != '\0' ||
+            strspn(cited, "0123456789abcdef") != 64) {
+            fprintf(stderr, "FUZZ: fed_outcome_citation reported a "
+                    "citation that is not 64 lowercase hex\n");
+            abort();
+        }
+    } else if (claims) {
+        fprintf(stderr, "FUZZ: fed_outcome_citation reported an execution "
+                "claim with no citation\n");
+        abort();
+    }
+    free(buf);
+    return (int)kind;
 }

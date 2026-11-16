@@ -3584,6 +3584,34 @@ static void t_LOW_device_numbers_are_range_checked(void)
 }
 
 /* =========================================================================
+ * Found by the fuzz harness (tests/fuzz_onode_parsers.c) on its first run
+ * ========================================================================= */
+
+static void t_FUZZ_no_execution_claim_without_a_citation(void)
+{
+    printf("\n  FUZZ: fed_outcome_citation reports a claim only with a citation\n");
+    static const char *const BODIES[] = {
+        "{\"executed\":true}",
+        "{\"executed\":true,\"observation_sha256\":null}",
+        "{\"executed\":true,\"observation_sha256\":\"" H2_HASH "\","
+            "\"error_sha256\":\"" H2_HASH "\"}",
+        "{\"executed\":true,\"observation_sha256\":\"not-a-hash\"}",
+    };
+    for (size_t i = 0; i < sizeof(BODIES) / sizeof(BODIES[0]); i++) {
+        char cited[65] = "";
+        bool claims = true;
+        CHECK(fed_outcome_citation(BODIES[i], cited, &claims) == FED_CITE_NONE &&
+              !claims, BODIES[i]);
+        CHECK(onode_fed_outcome_citation_fuzz((const uint8_t *)BODIES[i],
+                                              strlen(BODIES[i])) == 0,
+              "  ... and the fuzz entry point's postcondition holds for it");
+    }
+    static const char ok[] = "{\"commands\":[{\"device\":\"R1\",\"command\":\"a\"}]}";
+    CHECK(onode_parse_batch_fuzz((const uint8_t *)ok, sizeof(ok) - 1) == 1,
+          "the batch fuzz entry point accepts a well-formed batch");
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -3649,6 +3677,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
                                               t_M25_declared_empty_protected_vmids_is_fatal },
     { "t_M26_production_refuses_evidence_required_false",
                                               t_M26_production_refuses_evidence_required_false },
+    { "t_FUZZ_no_execution_claim_without_a_citation",
+                                              t_FUZZ_no_execution_claim_without_a_citation },
     { "t_LOW_request_threads_get_an_explicit_stack",
                                               t_LOW_request_threads_get_an_explicit_stack },
     { "t_LOW_failed_start_forgets_the_listen_fd",

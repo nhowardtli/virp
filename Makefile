@@ -2340,8 +2340,10 @@ asan-test:
 	$(MAKE) --no-print-directory clean
 
 # ThreadSanitizer over the threaded suites: concurrent onode_execute
-# against a disrupted connection, and concurrent chain append / verify /
-# artifact-store. Separate object tree (build-tsan/) — TSan and ASan
+# against a disrupted connection, concurrent chain append / verify /
+# artifact-store, and the security-review regressions — which start real
+# accept loops, worker threads, batch threads and the watchdog, and so
+# exercise the daemon's shared counters and shutdown path under TSan. Separate object tree (build-tsan/) — TSan and ASan
 # cannot share one, and instrumented objects must not leak into build/.
 #
 # TSAN_RUN disables ASLR for the test process. With the kernel's default
@@ -2359,11 +2361,60 @@ tsan-test:
 	$(MAKE) BUILD_DIR=build-tsan CC=gcc \
 	        CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
 	        LDFLAGS_EXTRA="-fsanitize=thread" \
-	        build-tsan/test_onode_concurrency build-tsan/test_chain_concurrency
+	        build-tsan/test_onode_concurrency build-tsan/test_chain_concurrency \
+	        build-tsan/test_onode_review
 	@echo "=== Running threaded suites under ThreadSanitizer ==="
 	TSAN_OPTIONS=halt_on_error=1 $(TSAN_RUN) ./build-tsan/test_onode_concurrency
 	TSAN_OPTIONS=halt_on_error=1 $(TSAN_RUN) ./build-tsan/test_chain_concurrency
+	TSAN_OPTIONS=halt_on_error=1 $(TSAN_RUN) ./build-tsan/test_onode_review
 	@echo "=== ThreadSanitizer run complete ==="
+
+# libFuzzer targets for the O-Node's socket-facing parsers (security
+# review): the request parser, the batch command-array parser and the
+# fed_outcome citation reader. One harness, three binaries, selected with
+# -DFUZZ_ONODE_TARGET. Library and harness are both instrumented, in
+# their own object tree. Needs clang.
+#   make fuzz-onode-parsers
+#   ./build-fuzz-onode/fuzz_onode_request -max_total_time=60
+FUZZ_ONODE_DIR = build-fuzz-onode
+FUZZ_ONODE_TARGETS = request:1 batch:2 fed_outcome:3
+.PHONY: fuzz-onode-parsers
+fuzz-onode-parsers:
+	$(MAKE) BUILD_DIR=$(FUZZ_ONODE_DIR) CC=clang \
+	        CFLAGS_EXTRA="$(CFLAGS_EXTRA) -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer" \
+	        $(FUZZ_ONODE_DIR)/libvirp.a
+	@for t in $(FUZZ_ONODE_TARGETS); do \
+	    name=$${t%%:*}; num=$${t##*:}; \
+	    echo "clang ... -DFUZZ_ONODE_TARGET=$$num -> $(FUZZ_ONODE_DIR)/fuzz_onode_$$name"; \
+	    clang $(CFLAGS) -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+	          -DFUZZ_ONODE_TARGET=$$num tests/fuzz_onode_parsers.c \
+	          $(FUZZ_ONODE_DIR)/libvirp.a $(LDFLAGS) \
+	          -o $(FUZZ_ONODE_DIR)/fuzz_onode_$$name || exit 1; \
+	done
+	@echo "Built $(FUZZ_ONODE_DIR)/fuzz_onode_{request,batch,fed_outcome} — run each with -max_total_time=<secs>"
+
+# The same harness WITHOUT libFuzzer: gcc + ASan + UBSan and the
+# harness's own main() (-DVIRP_FUZZ_STANDALONE), which replays the seed
+# corpus and a fixed set of deterministic mutations of it. A regression
+# smoke test, not a fuzzing campaign — it keeps the harness exercised on
+# machines with no clang. Own object tree, so nothing instrumented lands
+# in build/.
+FUZZ_ONODE_SMOKE_DIR = build-fuzz-onode-smoke
+.PHONY: fuzz-onode-parsers-smoke
+fuzz-onode-parsers-smoke:
+	$(MAKE) BUILD_DIR=$(FUZZ_ONODE_SMOKE_DIR) CC=gcc \
+	        CFLAGS_EXTRA="$(CFLAGS_EXTRA) -fsanitize=address,undefined -fno-omit-frame-pointer" \
+	        $(FUZZ_ONODE_SMOKE_DIR)/libvirp.a
+	@for t in $(FUZZ_ONODE_TARGETS); do \
+	    name=$${t%%:*}; num=$${t##*:}; \
+	    $(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer \
+	          -DVIRP_FUZZ_STANDALONE -DFUZZ_ONODE_TARGET=$$num tests/fuzz_onode_parsers.c \
+	          $(FUZZ_ONODE_SMOKE_DIR)/libvirp.a $(LDFLAGS) -fsanitize=address,undefined \
+	          -o $(FUZZ_ONODE_SMOKE_DIR)/fuzz_onode_$$name || exit 1; \
+	    ./$(FUZZ_ONODE_SMOKE_DIR)/fuzz_onode_$$name 2>$(FUZZ_ONODE_SMOKE_DIR)/fuzz_onode_$$name.log || \
+	        { echo "FAIL: fuzz_onode_$$name — last lines of its report:"; \
+	          grep -v '^\[O-Node\]' $(FUZZ_ONODE_SMOKE_DIR)/fuzz_onode_$$name.log | tail -20; exit 1; }; \
+	done
 
 # Driver suites under ASan+UBSan. Separate from asan-test because the
 # driver objects need their -D guards, which are evaluated at Makefile
