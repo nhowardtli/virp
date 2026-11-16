@@ -1028,7 +1028,10 @@ class VirpShell(cmd.Cmd):
             ("node_id", "0x%08x" % info["node_id"]),
             ("uptime", fmt_uptime(info["uptime_seconds"])),
             ("onode_ok", "yes" if info["onode_ok"] else "NO"),
-            ("rnode_ok", "yes" if info["rnode_ok"] else "NO"),
+            # The O-Node does not vouch for the R-Node (it has no channel to
+            # it and used to send 1 unconditionally), so 0 here is "not
+            # reported", not an outage.
+            ("rnode_ok", "yes" if info["rnode_ok"] else "not reported"),
             ("active_observations", info["active_observations"]),
             ("active_proposals", info["active_proposals"]),
         ]

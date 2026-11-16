@@ -201,15 +201,6 @@ static bool json_get_string(struct json_object *obj, const char *key,
     return true;
 }
 
-static bool json_get_int(struct json_object *obj, const char *key, int *out)
-{
-    struct json_object *val;
-    if (!json_object_object_get_ex(obj, key, &val)) return false;
-    if (!json_object_is_type(val, json_type_int)) return false;
-    *out = json_object_get_int(val);
-    return true;
-}
-
 static bool json_get_bool(struct json_object *obj, const char *key, bool *out)
 {
     struct json_object *val;
@@ -217,6 +208,75 @@ static bool json_get_bool(struct json_object *obj, const char *key, bool *out)
     if (!json_object_is_type(val, json_type_boolean)) return false;
     *out = json_object_get_boolean(val);
     return true;
+}
+
+/*
+ * Strict numeric parsing for config values and command-line options.
+ *
+ * Every one of these replaced a bare strtoul()/cast that turned a value
+ * it could not represent into a DIFFERENT valid one:
+ *   port 70000        -> (uint16_t) 4464, a port nobody configured
+ *   node_id "1FFFFFFFF" -> truncated to 0xFFFFFFFF
+ *   node_id "0x0A00.." or "zz" -> 0 (read as "absent")
+ *   -n garbage        -> node id 0
+ *   -W -1             -> a grace window of 136 years
+ * A value that does not fit is refused, never reduced.
+ */
+
+/* Hex digits only (no "0x", no sign, no blanks), 1..max_digits of them. */
+static bool parse_hex_u64(const char *text, int max_digits, uint64_t *out)
+{
+    if (!text || !*text) return false;
+    uint64_t v = 0;
+    int n = 0;
+    for (const char *p = text; *p; p++) {
+        int d;
+        if      (*p >= '0' && *p <= '9') d = *p - '0';
+        else if (*p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+        else if (*p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+        else return false;
+        if (++n > max_digits) return false;
+        v = (v << 4) | (uint64_t)d;
+    }
+    *out = v;
+    return true;
+}
+
+/* A TCP port from a config integer: 1..65535. */
+static bool parse_port(struct json_object *val, uint16_t *out)
+{
+    if (!json_object_is_type(val, json_type_int)) return false;
+    int64_t v = json_object_get_int64(val);
+    if (v < 1 || v > 65535) return false;
+    *out = (uint16_t)v;
+    return true;
+}
+
+/*
+ * A device identity from the config: a hex STRING of at most
+ * `max_hex_digits` digits, or a non-negative JSON integer that fits
+ * `max_value`. false (and *out untouched) for anything else.
+ */
+static bool parse_identity(struct json_object *val, int max_hex_digits,
+                           uint64_t max_value, uint64_t *out)
+{
+    if (json_object_is_type(val, json_type_string)) {
+        const char *s = json_object_get_string(val);
+        if (!s || (size_t)json_object_get_string_len(val) != strlen(s))
+            return false;                      /* embedded NUL */
+        uint64_t v;
+        if (!parse_hex_u64(s, max_hex_digits, &v) || v > max_value)
+            return false;
+        *out = v;
+        return true;
+    }
+    if (json_object_is_type(val, json_type_int)) {
+        int64_t v = json_object_get_int64(val);
+        if (v < 0 || (uint64_t)v > max_value) return false;
+        *out = (uint64_t)v;
+        return true;
+    }
+    return false;
 }
 
 /*
@@ -1041,9 +1101,20 @@ static int load_devices_impl(onode_state_t *state, const char *path,
         json_get_string(dev_obj, "enable",   device.enable_password,
                         sizeof(device.enable_password));
 
-        int port_val;
-        if (json_get_int(dev_obj, "port", &port_val))
-            device.port = (uint16_t)port_val;
+        /* A port that is present must be a real port. `(uint16_t)` on
+         * the parsed int used to wrap 70000 to 4464 and -1 to 65535 and
+         * connect there. Fatal: a device entry that names the wrong
+         * endpoint is not one to load and let fail somewhere else. */
+        {
+            struct json_object *pv;
+            if (json_object_object_get_ex(dev_obj, "port", &pv) &&
+                !parse_port(pv, &device.port)) {
+                fprintf(stderr, "[O-Node] FATAL: device %d: \"port\" must "
+                        "be an integer 1..65535 — refusing the config\n", i);
+                json_object_put(root);
+                return -1;
+            }
+        }
 
         char vendor_str[32] = {0};
         if (json_get_string(dev_obj, "vendor", vendor_str, sizeof(vendor_str)))
@@ -1074,12 +1145,21 @@ static int load_devices_impl(onode_state_t *state, const char *path,
          */
         struct json_object *nid_val;
         if (json_object_object_get_ex(dev_obj, "node_id", &nid_val)) {
-            if (json_object_is_type(nid_val, json_type_string)) {
-                const char *s = json_object_get_string(nid_val);
-                if (s) device.node_id = (uint32_t)strtoul(s, NULL, 16);
-            } else if (json_object_is_type(nid_val, json_type_int)) {
-                device.node_id = (uint32_t)json_object_get_int64(nid_val);
+            /* node_id is what an approval is cryptographically bound to
+             * (see onode_add_device). A PRESENT value that is not a
+             * 32-bit identity is fatal: strtoul(s, NULL, 16) read
+             * "1FFFFFFFF" as 0xFFFFFFFF and "zz" as 0, and the int form
+             * was cast straight to uint32_t, so two different configs
+             * could name the same device identity. */
+            uint64_t nid = 0;
+            if (!parse_identity(nid_val, 8, UINT32_MAX, &nid)) {
+                fprintf(stderr, "[O-Node] FATAL: device %d: \"node_id\" "
+                        "must be a hex string of 1..8 digits (no 0x) or an "
+                        "integer 0..4294967295 — refusing the config\n", i);
+                json_object_put(root);
+                return -1;
             }
+            device.node_id = (uint32_t)nid;
         }
 
         /*
@@ -1091,21 +1171,34 @@ static int load_devices_impl(onode_state_t *state, const char *path,
          */
         struct json_object *did_val;
         if (json_object_object_get_ex(dev_obj, "device_id", &did_val)) {
-            if (json_object_is_type(did_val, json_type_string)) {
-                const char *s = json_object_get_string(did_val);
-                if (s) device.device_id = (uint64_t)strtoull(s, NULL, 16);
-            } else if (json_object_is_type(did_val, json_type_int)) {
-                device.device_id = (uint64_t)json_object_get_int64(did_val);
+            /* Same strictness as node_id: device_id binds v2/v3
+             * observations to a device. */
+            uint64_t did = 0;
+            if (!parse_identity(did_val, 16, UINT64_MAX, &did)) {
+                fprintf(stderr, "[O-Node] FATAL: device %d: \"device_id\" "
+                        "must be a hex string of 1..16 digits (no 0x) or a "
+                        "non-negative integer — refusing the config\n", i);
+                json_object_put(root);
+                return -1;
             }
+            device.device_id = did;
         }
 
         /* FortiGate-specific fields (ignored for other vendors) */
         json_get_string(dev_obj, "api_token", device.api_token,
                         sizeof(device.api_token));
 
-        int api_port_val;
-        if (json_get_int(dev_obj, "api_port", &api_port_val))
-            device.api_port = (uint16_t)api_port_val;
+        {
+            struct json_object *apv;
+            if (json_object_object_get_ex(dev_obj, "api_port", &apv) &&
+                !parse_port(apv, &device.api_port)) {
+                fprintf(stderr, "[O-Node] FATAL: device %d: \"api_port\" "
+                        "must be an integer 1..65535 — refusing the "
+                        "config\n", i);
+                json_object_put(root);
+                return -1;
+            }
+        }
 
         json_get_string(dev_obj, "vdom", device.vdom, sizeof(device.vdom));
 
@@ -1722,18 +1815,39 @@ int main(int argc, char **argv)
         case 'K':
             prev_okey_path = optarg;
             break;
-        case 'W':
-            prev_okey_window = (uint32_t)strtoul(optarg, NULL, 10);
+        case 'W': {
+            /* 1 second .. 7 days. strtoul + a uint32_t cast accepted
+             * "-1" (a window of 136 years — a second live key, in
+             * effect) and wrapped anything past 2^32. */
+            uid_t w_as_number;      /* parse_uid: decimal digits, in range */
+            if (!parse_uid(optarg, &w_as_number) || w_as_number < 1 ||
+                w_as_number > 7u * 86400u) {
+                fprintf(stderr, "FATAL: -W %s: the grace window must be a "
+                        "whole number of seconds, 1..604800 (7 days)\n",
+                        optarg);
+                return 1;
+            }
+            prev_okey_window = (uint32_t)w_as_number;
             break;
+        }
         case 's':
             socket_path = optarg;
             break;
         case 'd':
             devices_path = optarg;
             break;
-        case 'n':
-            node_id = (uint32_t)strtoul(optarg, NULL, 16);
+        case 'n': {
+            /* 1..8 hex digits, non-zero. Unparseable input used to become
+             * node id 0 and the daemon signed under it. */
+            uint64_t n64 = 0;
+            if (!parse_hex_u64(optarg, 8, &n64) || n64 == 0) {
+                fprintf(stderr, "FATAL: -n %s: the node id must be 1..8 hex "
+                        "digits (no 0x) and not zero\n", optarg);
+                return 1;
+            }
+            node_id = (uint32_t)n64;
             break;
+        }
         case 'c':
             chain_db_path = optarg;
             break;

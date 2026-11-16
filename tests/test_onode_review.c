@@ -44,10 +44,20 @@ extern int  virp_driver_mock_exec_attempts_reset(void);
 
 /* Fail the Nth creation from now (1 = the next one); 0 = never. */
 static int review_fail_create_in;
+/* Smallest stack size any creation asked for since it was last reset
+ * (SIZE_MAX = none seen; 0 = one was created with default attributes). */
+static size_t review_min_stack = SIZE_MAX;
 
 static int review_pthread_create(pthread_t *t, const pthread_attr_t *a,
                                  void *(*fn)(void *), void *arg)
 {
+    size_t sz = 0;
+    if (a && pthread_attr_getstacksize(a, &sz) != 0) sz = 0;
+    /* The watchdog is not a request thread and is created with default
+     * attributes on purpose; only attributed creations are sampled, plus
+     * any un-attributed one that is not the watchdog's. */
+    if (a || fn != watchdog_thread_fn)
+        if (sz < review_min_stack) review_min_stack = sz;
     if (review_fail_create_in > 0 && --review_fail_create_in == 0)
         return EAGAIN;
     return pthread_create(t, a, fn, arg);
@@ -3394,6 +3404,186 @@ static void t_M26_production_refuses_evidence_required_false(void)
 }
 
 /* =========================================================================
+ * LOW — the small ones, one check each
+ * ========================================================================= */
+
+static void t_LOW_request_threads_get_an_explicit_stack(void)
+{
+    printf("\n  LOW: worker and batch threads are created with an explicit stack size\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "low-stack")) { CHECK(false, "fixture"); return; }
+    static uint8_t resp[4 * VIRP_MAX_MESSAGE_SIZE];
+
+    review_min_stack = SIZE_MAX;
+    ssize_t n = fx_request(&fx->st, getuid(),
+        "{\"action\":\"batch_execute\",\"commands\":["
+        "{\"device\":\"" FX_DEV "\",\"command\":\"show version\"},"
+        "{\"device\":\"" FX_DEV "\",\"command\":\"show clock\"}]}",
+        resp, sizeof(resp));
+    CHECK(n > 4 && review_min_stack != SIZE_MAX &&
+          review_min_stack >= ONODE_THREAD_STACK_BYTES,
+          "batch item threads: stack size set, at least ONODE_THREAD_STACK_BYTES");
+
+    pthread_t srv;
+    review_min_stack = SIZE_MAX;
+    if (!fx_server_start(fx, &srv)) { CHECK(false, "server start"); return; }
+    int fd = fx_connect(&fx->st);
+    const char *req = "{\"action\":\"heartbeat\"}";
+    uint32_t len = htonl((uint32_t)strlen(req) + 1), rlen = 0;
+    uint8_t ver = VIRP_FRAME_VERSION;
+    bool answered = fd >= 0 && send(fd, &len, 4, 0) == 4 &&
+                    send(fd, &ver, 1, 0) == 1 &&
+                    send(fd, req, strlen(req), 0) == (ssize_t)strlen(req) &&
+                    recv(fd, &rlen, 4, MSG_WAITALL) == 4;
+    if (fd >= 0) close(fd);
+    CHECK(answered && review_min_stack != SIZE_MAX &&
+          review_min_stack >= ONODE_THREAD_STACK_BYTES,
+          "connection workers: stack size set, at least ONODE_THREAD_STACK_BYTES");
+
+    /* While it is up: the listening socket is close-on-exec. */
+    int fl = fcntl(fx->st.listen_fd, F_GETFD);
+    CHECK(fl >= 0 && (fl & FD_CLOEXEC),
+          "the listening socket is close-on-exec");
+    fx_server_stop(fx, srv);
+    fx_destroy(fx);
+}
+
+static void t_LOW_failed_start_forgets_the_listen_fd(void)
+{
+    printf("\n  LOW: a failed bind does not leave a stale listen_fd behind\n");
+    static onode_state_t st;
+    char path[128];
+    /* A DIRECTORY at the socket path: unlink() of it fails, so bind()
+     * fails with EADDRINUSE after the socket was created. */
+    snprintf(path, sizeof(path), "%s/low-bind.d", g_root);
+    CHECK(mkdir(path, 0700) == 0, "(a directory occupies the socket path)");
+    CHECK(onode_init(&st, 1, NULL, path) == VIRP_OK, "state initialised");
+    CHECK(onode_start(&st) != VIRP_OK, "onode_start() fails at bind");
+    CHECK(st.listen_fd == -1,
+          "listen_fd is -1 afterwards, so teardown cannot close a recycled fd number");
+    /* Prove the point: whatever now holds the lowest free descriptor
+     * must survive onode_destroy(). */
+    int canary = open("/dev/null", O_RDONLY);
+    onode_destroy(&st);
+    CHECK(canary >= 0 && fcntl(canary, F_GETFD) >= 0,
+          "a descriptor opened after the failure survives onode_destroy()");
+    if (canary >= 0) close(canary);
+}
+
+static void t_LOW_heartbeat_is_honest(void)
+{
+    printf("\n  LOW: the heartbeat does not vouch for the R-Node or wrap its count\n");
+    static onode_state_t st;
+    CHECK(onode_init(&st, 7, NULL, "/tmp/virp-review-unused.sock") == VIRP_OK,
+          "state initialised");
+    st.observations_sent = 70000;            /* past the 16-bit wire field */
+    uint8_t buf[256];
+    size_t len = 0;
+    virp_heartbeat_t hb;
+    memset(&hb, 0xff, sizeof(hb));
+    CHECK(onode_heartbeat(&st, buf, sizeof(buf), &len) == VIRP_OK &&
+          virp_parse_heartbeat(buf + VIRP_HEADER_SIZE, len - VIRP_HEADER_SIZE,
+                               &hb) == VIRP_OK, "heartbeat built and parsed");
+    CHECK(hb.onode_ok == 1 && hb.rnode_ok == 0,
+          "onode_ok is set; rnode_ok is NOT asserted");
+    CHECK(hb.active_observations == UINT16_MAX,
+          "70000 observations saturate the 16-bit field at 65535 (it used to wrap to 4464)");
+    st.observations_sent = 12;
+    CHECK(onode_heartbeat(&st, buf, sizeof(buf), &len) == VIRP_OK &&
+          virp_parse_heartbeat(buf + VIRP_HEADER_SIZE, len - VIRP_HEADER_SIZE,
+                               &hb) == VIRP_OK && hb.active_observations == 12,
+          "a count that fits is reported exactly");
+    onode_destroy(&st);
+}
+
+static void t_LOW_every_action_answers(void)
+{
+    printf("\n  LOW: failures answer with a framed error; a missing context is not a crash\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "low-answers")) { CHECK(false, "fixture"); return; }
+    onode_state_t *st = &fx->st;
+    uid_t me = getuid();
+    static uint8_t resp[VIRP_MAX_MESSAGE_SIZE + 64];
+
+    /* No protocol context: the handshake actions must refuse, not
+     * dereference NULL (session_bind did). */
+    virp_context_t *ctx = st->ctx;
+    st->ctx = NULL;
+    CHECK(fx_ask(st, me, "{\"action\":\"session_bind\",\"client_id\":\"x\","
+                 "\"session_id\":\"00112233445566778899aabbccddeeff\","
+                 "\"client_nonce\":\"0011223344556677\","
+                 "\"server_nonce\":\"0011223344556677\"}")
+              == VIRP_ERR_SESSION_INVALID,
+          "session_bind with no protocol context is refused (it used to crash)");
+    CHECK(fx_ask(st, me, "{\"action\":\"session_hello\",\"client_id\":\"x\"}")
+              == VIRP_ERR_SESSION_INVALID,
+          "session_hello with no protocol context is refused");
+    st->ctx = ctx;
+
+    /* Make the signer fail: every builder below then returns an error,
+     * and each action must still put a frame on the wire. */
+    virp_signing_key_t saved = st->okey;
+    memset(&st->okey, 0, sizeof(st->okey));
+    static const char *const ACTIONS[] = { "heartbeat", "list_devices", "list_fleet" };
+    for (size_t i = 0; i < 3; i++) {
+        char req[64], msg[96];
+        snprintf(req, sizeof(req), "{\"action\":\"%s\"}", ACTIONS[i]);
+        ssize_t n = fx_request(st, me, req, resp, sizeof(resp));
+        snprintf(msg, sizeof(msg), "%s: a failed build answers with a framed "
+                 "error code", ACTIONS[i]);
+        CHECK(n == 4 && fx_resp_err(resp, n) != VIRP_OK, msg);
+    }
+    st->okey = saved;
+    fx_destroy(fx);
+}
+
+static void t_LOW_device_numbers_are_range_checked(void)
+{
+    printf("\n  LOW: port, node_id and device_id are refused when out of range\n");
+#define LOW_DEV(extra) "{\"devices\":[{\"hostname\":\"r1\",\"host\":\"10.255.7.31\"," \
+                       "\"vendor\":\"mock\"" extra "}]}"
+    static const struct { const char *json; const char *what; } BAD[] = {
+        { LOW_DEV(",\"node_id\":\"0A000001\",\"port\":70000"),
+          "port 70000 (was: wrapped to 4464)" },
+        { LOW_DEV(",\"node_id\":\"0A000001\",\"port\":0"), "port 0" },
+        { LOW_DEV(",\"node_id\":\"0A000001\",\"port\":-1"),
+          "port -1 (was: 65535)" },
+        { LOW_DEV(",\"node_id\":\"0A000001\",\"port\":\"22\""),
+          "a string port (was: ignored)" },
+        { LOW_DEV(",\"node_id\":\"0A000001\",\"api_port\":99999"),
+          "api_port 99999" },
+        { LOW_DEV(",\"node_id\":\"1FFFFFFFF\""),
+          "a 9-digit node_id (was: truncated)" },
+        { LOW_DEV(",\"node_id\":\"0x0A000001\""),
+          "node_id with a 0x prefix (was: read as 0)" },
+        { LOW_DEV(",\"node_id\":\"0A00zz01\""), "a non-hex node_id" },
+        { LOW_DEV(",\"node_id\":-5"), "a negative node_id" },
+        { LOW_DEV(",\"node_id\":4294967296"), "a node_id past 32 bits" },
+        { LOW_DEV(",\"node_id\":true"), "a boolean node_id" },
+        { LOW_DEV(",\"node_id\":\"0A000001\",\"device_id\":\"12345678901234567\""),
+          "a 17-digit device_id" },
+    };
+    for (size_t i = 0; i < sizeof(BAD) / sizeof(BAD[0]); i++) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "refused: %s", BAD[i].what);
+        CHECK(cfg_load("low-range", BAD[i].json, NULL) == -1, msg);
+    }
+    static onode_state_t st;
+    CHECK(cfg_load("low-range-ok",
+                   LOW_DEV(",\"node_id\":\"0A000001\",\"port\":2222,"
+                           "\"device_id\":\"00000000000000AB\""), &st) == 1 &&
+          st.devices[0].port == 2222 && st.devices[0].node_id == 0x0A000001 &&
+          st.devices[0].device_id == 0xAB,
+          "in-range values load exactly as written");
+    onode_destroy(&st);
+    CHECK(cfg_load("low-range-int", LOW_DEV(",\"node_id\":167772161"), &st) == 1 &&
+          st.devices[0].node_id == 167772161u && st.devices[0].port == 22,
+          "an integer node_id loads; an absent port is the default 22");
+    onode_destroy(&st);
+#undef LOW_DEV
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -3459,6 +3649,14 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
                                               t_M25_declared_empty_protected_vmids_is_fatal },
     { "t_M26_production_refuses_evidence_required_false",
                                               t_M26_production_refuses_evidence_required_false },
+    { "t_LOW_request_threads_get_an_explicit_stack",
+                                              t_LOW_request_threads_get_an_explicit_stack },
+    { "t_LOW_failed_start_forgets_the_listen_fd",
+                                              t_LOW_failed_start_forgets_the_listen_fd },
+    { "t_LOW_heartbeat_is_honest",            t_LOW_heartbeat_is_honest },
+    { "t_LOW_every_action_answers",           t_LOW_every_action_answers },
+    { "t_LOW_device_numbers_are_range_checked",
+                                              t_LOW_device_numbers_are_range_checked },
     { "t_M18_shutdown_wakes_the_accept_loop", t_M18_shutdown_wakes_the_accept_loop },
     { "t_M18_shutdown_from_signal_handler",   t_M18_shutdown_from_signal_handler },
     { "t_M18_shutdown_before_start_is_not_lost",

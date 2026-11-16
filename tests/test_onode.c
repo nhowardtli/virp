@@ -948,7 +948,10 @@ TEST(test_heartbeat)
     virp_parse_heartbeat(resp + VIRP_HEADER_SIZE,
                          (size_t)n - VIRP_HEADER_SIZE, &hb);
     ASSERT_EQ(hb.onode_ok, 1);
-    ASSERT_EQ(hb.rnode_ok, 1);
+    /* 0, not 1: the O-Node has no way to observe the R-Node, and used to
+     * assert its health unconditionally. A signed heartbeat now reports
+     * only what the signer can see (security review, LOW). */
+    ASSERT_EQ(hb.rnode_ok, 0);
 }
 
 TEST(test_list_devices)

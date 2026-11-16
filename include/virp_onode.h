@@ -181,6 +181,24 @@ const char *onode_health_command(virp_vendor_t vendor);
 #define ONODE_PROPOSAL_WINDOW_SEC  60
 #endif
 
+/*
+ * Stack size for every thread the daemon creates that runs a request:
+ * connection workers and batch item threads. Explicit, because the
+ * request path keeps large buffers on the stack — a 128 KiB receive
+ * buffer and a 128 KiB frame buffer in handle_client(), the parsed
+ * request (which holds a full artifact body), 64 KiB response and
+ * staging buffers, a driver result with its own output buffer — several
+ * hundred KiB before any driver or library frame. The default thread
+ * stack is whatever RLIMIT_STACK says when the process starts: 8 MiB on
+ * a stock system, but a unit with LimitSTACK= or a different libc can
+ * make it far smaller, and an overrun there is a segfault in the
+ * process that holds the O-Key. 4 MiB is several times the measured
+ * need and independent of the environment.
+ */
+#ifndef ONODE_THREAD_STACK_BYTES
+#define ONODE_THREAD_STACK_BYTES (4u * 1024u * 1024u)
+#endif
+
 /* Auto-reconnect configuration */
 #define ONODE_WATCHDOG_INTERVAL_SEC  5   /* How often the watchdog checks */
 #define ONODE_RECONNECT_BACKOFF_INIT 5   /* Initial backoff: 5 seconds */
@@ -335,7 +353,9 @@ typedef struct {
     virp_signing_key_t  prev_okey;
     bool                prev_okey_loaded;
     uint64_t            prev_okey_deadline_ns;   /* CLOCK_REALTIME */
-    uint32_t            prev_okey_accepts;       /* grace-path uses */
+    atomic_uint         prev_okey_accepts;       /* grace-path uses;
+                                                    bumped by concurrent
+                                                    workers, hence atomic */
 
     /*
      * Tier-enforcement gate (Phase B), per-driver scoped.
@@ -550,7 +570,10 @@ typedef struct {
     bool                     approvers_loaded;
 
     /* Thread safety */
-    pthread_mutex_t     state_mutex;    /* Protects seq_num, observations_sent */
+    pthread_mutex_t     state_mutex;    /* Protects seq_num, observations_sent,
+                                           reconnects, worker accounting —
+                                           READS included: the heartbeat
+                                           takes it to sample them */
     pthread_mutex_t     conn_mutex;     /* Protects connections[] and reconnect[] */
     /*
      * Serializes access to `ctx` during session handshake messages

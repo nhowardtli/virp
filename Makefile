@@ -2605,7 +2605,7 @@ all-tests: test-onode-review
 # Command-line contract of the production daemon's main() (security review
 # M21, M26): things no unit test can reach. Needs only the binary.
 .PHONY: test-prod-cli
-test-prod-cli: $(ONODE_PROD)
+test-prod-cli: $(ONODE_PROD) $(ONODE_BIN)
 	tests/test_prod_cli.sh ./$(ONODE_PROD)
 all-tests: test-prod-cli
 

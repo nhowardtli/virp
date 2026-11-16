@@ -1349,12 +1349,28 @@ static void log_error_obs(const char *device, virp_trust_tier_t tier,
 }
 
 /* SHA-256 → lowercase hex (65 bytes incl. NUL). Used to hash a gate
- * rejection record before persisting it to the trust chain. */
+ * rejection record before persisting it to the trust chain.
+ *
+ * EVP_Digest's return is checked. It was not, so a failed digest (an
+ * allocation failure inside OpenSSL, a provider that will not load)
+ * left `md` uninitialized and this function returned 64 hex characters
+ * of stack garbage — a well-formed "hash" of nothing. On failure `out`
+ * is now the EMPTY string: every consumer either compares it to a real
+ * hash (and fails) or hands it to the chain, whose artifact-hash check
+ * refuses anything that is not 64 hex. Fail closed, without a return
+ * value every one of the call sites would have to remember to test. */
 static void gate_sha256_hex(const void *data, size_t len, char out[65])
 {
     unsigned char md[32];
     unsigned int mdlen = 0;
-    EVP_Digest(data, len, md, &mdlen, EVP_sha256(), NULL);
+    if (EVP_Digest(data, len, md, &mdlen, EVP_sha256(), NULL) != 1 ||
+        mdlen != sizeof(md)) {
+        out[0] = '\0';
+        fprintf(stderr, "[O-Node] ERROR: SHA-256 digest failed; the "
+                "record it was for will be refused, not stored under a "
+                "wrong hash\n");
+        return;
+    }
     for (int i = 0; i < 32; i++)
         snprintf(out + i * 2, 3, "%02x", md[i]);
 }
@@ -1767,7 +1783,7 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
                                          "gate_execution record");
     }
 
-    if (body) free(body);
+    if (body) cJSON_free(body);
     return cerr;
 }
 
@@ -1957,7 +1973,7 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
                 "refusing to dispatch device=%s command=\"%s\"\n",
                 virp_error_str(cerr), device_name, command);
     }
-    free(body);
+    cJSON_free(body);
     return cerr;
 }
 
@@ -2061,7 +2077,7 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
     else
         fprintf(stderr, "[O-Node] node_config append failed: %s\n",
                 virp_error_str(cerr));
-    free(body);
+    cJSON_free(body);
     return cerr;
 }
 
@@ -2514,7 +2530,10 @@ static void separator_refuse_chain(onode_state_t *state,
         fprintf(stderr, "[GATE] separator rejection chain append+store "
                 "failed: %s\n", virp_error_str(cerr));
 
-    if (body) free(body);
+    /* cJSON_PrintUnformatted allocates with cJSON's allocator; pair it
+     * with cJSON_free, not free(), so a custom allocator hook cannot
+     * turn this into a mismatched free. Same at every site below. */
+    if (body) cJSON_free(body);
 }
 
 /* -------------------------------------------------------------------------
@@ -2897,7 +2916,7 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
                     "failed: %s\n", virp_error_str(cerr));
         }
 
-        if (body) free(body);
+        if (body) cJSON_free(body);
     }
 
     log_error_obs(device_name, gate_tier, err_msg);
@@ -4711,10 +4730,28 @@ virp_error_t onode_heartbeat(onode_state_t *state,
 
     uint32_t uptime = (uint32_t)(time(NULL) - state->uptime_start);
 
+    /* observations_sent is written by worker threads under state_mutex;
+     * read it the same way. */
+    pthread_mutex_lock(&state->state_mutex);
+    uint32_t sent = state->observations_sent;
+    pthread_mutex_unlock(&state->state_mutex);
+
+    /* The wire field is 16 bits. It used to be a bare (uint16_t) cast, so
+     * the count WRAPPED: a node that had signed 65,537 observations
+     * reported 1. Saturate instead — 65535 reads as "at least this many",
+     * which is true; a wrapped count is simply false. */
+    uint16_t sent_wire = sent > UINT16_MAX ? UINT16_MAX : (uint16_t)sent;
+
+    /* rnode_ok is FALSE. The O-Node has no channel to the R-Node and no
+     * way to know its state; this used to assert true unconditionally,
+     * in a message signed with the O-Key — a signed statement about
+     * something the signer never observed. false is "not vouched for by
+     * this node", which is all the O-Node can say. onode_ok stays true:
+     * the process building this message is, at least, running. */
     return virp_build_heartbeat(out_buf, out_buf_len, out_len,
                                 state->node_id, onode_next_seq(state),
-                                uptime, true, true,
-                                (uint16_t)state->observations_sent,
+                                uptime, true, false,
+                                sent_wire,
                                 0,  /* R-Node tracks proposals */
                                 &state->okey);
 }
@@ -5873,14 +5910,15 @@ static virp_error_t chain_append_verify_observation(
                                                           &state->prev_okey,
                                                           &hdr);
                 if (perr == VIRP_OK) {
-                    state->prev_okey_accepts++;
+                    unsigned accepts =
+                        atomic_fetch_add(&state->prev_okey_accepts, 1) + 1;
                     fprintf(stderr, "[O-Node] chain_append: observation "
                             "verified under the PREVIOUS O-Key (rotation "
                             "grace window, %u accepted so far; %llu s of "
                             "window left). This is expected only while "
                             "in-flight observations from before a rotation "
                             "drain.\n",
-                            state->prev_okey_accepts,
+                            accepts,
                             (unsigned long long)
                               ((state->prev_okey_deadline_ns - now_ns)
                                / 1000000000ULL));
@@ -6286,22 +6324,35 @@ static void handle_client(onode_state_t *state, int client_fd,
         }
         break;
 
+    /* These three used to send NOTHING when the builder failed: the
+     * client saw the connection close with no frame and could not tell a
+     * refused request from a crashed daemon. Every action answers, and a
+     * failure answers with its framed error code. */
     case ONODE_ACTION_HEARTBEAT:
         err = onode_heartbeat(state, resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
+        else
+            send_framed_error(client_fd,
+                              err != VIRP_OK ? err : VIRP_ERR_NULL_PTR);
         break;
 
     case ONODE_ACTION_LIST:
         err = onode_list_devices(state, resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
+        else
+            send_framed_error(client_fd,
+                              err != VIRP_OK ? err : VIRP_ERR_NULL_PTR);
         break;
 
     case ONODE_ACTION_LIST_FLEET:
         err = onode_list_fleet(state, resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
+        else
+            send_framed_error(client_fd,
+                              err != VIRP_OK ? err : VIRP_ERR_NULL_PTR);
         break;
 
     case ONODE_ACTION_SIGN_INTENT:
@@ -7146,8 +7197,16 @@ static void handle_client(onode_state_t *state, int client_fd,
          * and the items that did start are unaffected. */
         pthread_t threads[ONODE_MAX_BATCH];
         bool started[ONODE_MAX_BATCH];
+        /* Explicit stack size — see ONODE_THREAD_STACK_BYTES. Each item
+         * runs the whole execute path on its own thread. If the attribute
+         * cannot be set the default is used, as before. */
+        pthread_attr_t battr;
+        bool battr_ok = pthread_attr_init(&battr) == 0;
+        if (battr_ok)
+            (void)pthread_attr_setstacksize(&battr, ONODE_THREAD_STACK_BYTES);
         for (int i = 0; i < cmd_count; i++) {
-            int rc = ONODE_PTHREAD_CREATE(&threads[i], NULL,
+            int rc = ONODE_PTHREAD_CREATE(&threads[i],
+                                          battr_ok ? &battr : NULL,
                                           batch_execute_thread, &args[i]);
             started[i] = (rc == 0);
             if (!started[i]) {
@@ -7159,6 +7218,9 @@ static void handle_client(onode_state_t *state, int client_fd,
                         i, args[i].device, strerror(rc));
             }
         }
+
+        if (battr_ok)
+            pthread_attr_destroy(&battr);
 
         /* Wait for the threads that exist. */
         for (int i = 0; i < cmd_count; i++)
@@ -7289,7 +7351,7 @@ static void handle_client(onode_state_t *state, int client_fd,
                                                 mani_json, mani_len,
                                                 prose_str, prose_len,
                                                 fallback_sid, &vr);
-        if (mani_json) free(mani_json);
+        if (mani_json) cJSON_free(mani_json);
         cJSON_Delete(root);
 
         if (verr != VIRP_OK) {
@@ -7401,6 +7463,13 @@ static void handle_client(onode_state_t *state, int client_fd,
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
+        /* No protocol context means no session machinery at all (a main()
+         * that never assigned state->ctx). Say so rather than hand the
+         * handshake a NULL. */
+        if (!state->ctx) {
+            send_framed_error(client_fd, VIRP_ERR_SESSION_INVALID);
+            break;
+        }
 
         /* Build SESSION_HELLO from request fields */
         virp_session_hello_t hello;
@@ -7492,11 +7561,28 @@ static void handle_client(onode_state_t *state, int client_fd,
             ack.accepted_channels,
             sid_hex, cn_hex, sn_hex);
 
+        /* snprintf returns the WOULD-BE length. Unchecked, a response
+         * that did not fit would have been "sent" with that length —
+         * reading past json_resp. server_id is the only variable-width
+         * member and is bounded well inside the buffer today; the check
+         * is what keeps a wider field from turning into an over-read. */
+        if (jlen < 0 || (size_t)jlen >= sizeof(json_resp)) {
+            send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+            break;
+        }
         send_framed(client_fd, json_resp, (size_t)jlen);
         break;
     }
 
     case ONODE_ACTION_SESSION_BIND: {
+        /* state->ctx is dereferenced a few lines down (server_id) before
+         * any handshake function gets the chance to refuse a NULL: a
+         * daemon without a protocol context would have crashed here on
+         * the first bind. */
+        if (!state->ctx) {
+            send_framed_error(client_fd, VIRP_ERR_SESSION_INVALID);
+            break;
+        }
         /* Build SESSION_BIND from request fields */
         virp_session_bind_t bind_msg;
         memset(&bind_msg, 0, sizeof(bind_msg));
@@ -7737,11 +7823,14 @@ static void *watchdog_thread_fn(void *arg)
         watchdog_try_connect(state, i, drv, true);
     }
 
-    /* Log initial pass summary */
+    /* Log initial pass summary. connections[] is conn_mutex's — worker
+     * threads connect and drop while this thread counts. */
     {
         int up = 0;
+        pthread_mutex_lock(&state->conn_mutex);
         for (int i = 0; i < state->device_count; i++)
             if (state->devices[i].enabled && state->connections[i]) up++;
+        pthread_mutex_unlock(&state->conn_mutex);
         fprintf(stderr, "[Watchdog] Initial pass complete: connected=%d/%d\n", up, enabled);
     }
 
@@ -8427,7 +8516,7 @@ virp_error_t onode_set_previous_okey(onode_state_t *state,
         (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec +
         (uint64_t)window_seconds * 1000000000ULL;
     state->prev_okey_loaded = true;
-    state->prev_okey_accepts = 0;
+    atomic_store(&state->prev_okey_accepts, 0);
 
     fprintf(stderr, "[O-Node] Rotation grace window OPEN for %u s: "
             "observations signed under the previous O-Key (fingerprint ",
@@ -8626,12 +8715,17 @@ virp_error_t onode_start(onode_state_t *state)
         if (n >= sizeof(dir)) n = sizeof(dir) - 1;
         memcpy(dir, state->socket_path, n);
         dir[n] = '\0';
-        if (mkdir(dir, 0700) < 0 && errno != EEXIST) {
-            fprintf(stderr, "[O-Node] mkdir %s: %s (continuing)\n",
-                    dir, strerror(errno));
-        } else if (errno != EEXIST) {
+        /* Decide on mkdir's RETURN, not on errno. The old test was
+         * `else if (errno != EEXIST)`, which also ran when mkdir had
+         * succeeded — and errno is not cleared by success, so whether a
+         * freshly created directory got its chmod depended on whatever
+         * call last failed before this one. */
+        if (mkdir(dir, 0700) == 0) {
             /* Newly created — tighten owner/mode in case umask relaxed it. */
             chmod(dir, 0700);
+        } else if (errno != EEXIST) {
+            fprintf(stderr, "[O-Node] mkdir %s: %s (continuing)\n",
+                    dir, strerror(errno));
         }
     }
 
@@ -8802,8 +8896,10 @@ virp_error_t onode_start(onode_state_t *state)
      * owns it. */
     unlink(state->socket_path);
 
-    /* Create Unix domain socket */
-    state->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    /* Create Unix domain socket. Close-on-exec, atomically at creation:
+     * nothing this daemon might ever exec should inherit the socket that
+     * requests arrive on (same for every accepted client fd below). */
+    state->listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (state->listen_fd < 0) {
         perror("[O-Node] socket");
         return VIRP_ERR_KEY_NOT_LOADED;
@@ -8827,7 +8923,13 @@ virp_error_t onode_start(onode_state_t *state)
     if (bind_rc < 0) {
         errno = bind_errno;
         perror("[O-Node] bind");
+        /* Closed AND forgotten. listen_fd used to keep the stale number,
+         * and onode_destroy() closes any listen_fd >= 0: by then the
+         * number could belong to something else this process opened —
+         * a chain database, a device connection — and it would have
+         * closed that instead. */
         close(state->listen_fd);
+        state->listen_fd = -1;
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
@@ -8837,6 +8939,7 @@ virp_error_t onode_start(onode_state_t *state)
     if (listen(state->listen_fd, ONODE_LISTEN_BACKLOG) < 0) {
         perror("[O-Node] listen");
         close(state->listen_fd);
+        state->listen_fd = -1;
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
@@ -8889,16 +8992,26 @@ virp_error_t onode_start(onode_state_t *state)
             size_t hb_len;
             if (onode_heartbeat(state, hb_buf, sizeof(hb_buf), &hb_len) == VIRP_OK) {
                 uint32_t uptime = (uint32_t)(time(NULL) - state->uptime_start);
+                /* Sample each group under the lock that guards it. These
+                 * were read bare from the main thread while workers and
+                 * the watchdog wrote them. */
                 int conn_up = 0, conn_total = 0;
+                pthread_mutex_lock(&state->conn_mutex);
                 for (int ci = 0; ci < state->device_count; ci++) {
                     if (state->devices[ci].enabled) {
                         conn_total++;
                         if (state->connections[ci]) conn_up++;
                     }
                 }
+                pthread_mutex_unlock(&state->conn_mutex);
+                pthread_mutex_lock(&state->state_mutex);
+                uint32_t obs_sent = state->observations_sent;
+                uint32_t seq_now = state->seq_num;
+                uint32_t reconn = state->reconnects;
+                pthread_mutex_unlock(&state->state_mutex);
                 fprintf(stderr, "[O-Node] Heartbeat: uptime=%us obs=%u seq=%u connected=%d/%d reconnects=%u\n",
-                        uptime, state->observations_sent, state->seq_num,
-                        conn_up, conn_total, state->reconnects);
+                        uptime, obs_sent, seq_now,
+                        conn_up, conn_total, reconn);
             }
             continue;
         }
@@ -8916,7 +9029,8 @@ virp_error_t onode_start(onode_state_t *state)
         }
 
         if (FD_ISSET(state->listen_fd, &readfds)) {
-            int client_fd = accept(state->listen_fd, NULL, NULL);
+            int client_fd = accept4(state->listen_fd, NULL, NULL,
+                                    SOCK_CLOEXEC);
             if (client_fd < 0) {
                 perror("[O-Node] accept");
                 continue;
@@ -9015,6 +9129,9 @@ virp_error_t onode_start(onode_state_t *state)
             pthread_attr_t attr;
             pthread_attr_init(&attr);
             pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            /* handle_client keeps several hundred KiB on its stack; do
+             * not leave the size to RLIMIT_STACK. */
+            (void)pthread_attr_setstacksize(&attr, ONODE_THREAD_STACK_BYTES);
 
             pthread_t tid;
             int rc = ONODE_PTHREAD_CREATE(&tid, &attr, connection_worker,

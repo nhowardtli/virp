@@ -395,7 +395,11 @@ static int cmd_inspect(int argc, char **argv)
             if (virp_parse_heartbeat(payload, payload_len, &hb) == VIRP_OK) {
                 printf("  Uptime:     %u seconds\n", hb.uptime_seconds);
                 printf("  O-Node:     %s\n", hb.onode_ok ? "OK" : "DOWN");
-                printf("  R-Node:     %s\n", hb.rnode_ok ? "OK" : "DOWN");
+                /* The O-Node no longer asserts rnode_ok: it has no channel
+                 * to the R-Node and used to send 1 unconditionally. 0 from
+                 * an O-Node therefore means "not vouched for", not "down". */
+                printf("  R-Node:     %s\n",
+                       hb.rnode_ok ? "OK" : "not reported by this node");
                 printf("  Active Obs: %u\n", hb.active_observations);
                 printf("  Active Prop: %u\n", hb.active_proposals);
             }

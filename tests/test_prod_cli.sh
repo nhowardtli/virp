@@ -13,6 +13,10 @@
 # M26:
 #   - main() loads its config with the production loader and does not
 #     assign evidence_required afterwards.
+# LOW:
+#   - -n and -W are range-checked instead of cast;
+#   - the mock daemon (virp-onode) no longer carries an unreachable device
+#     loader or the VIRP_ALLOWED_UIDS environment override.
 #
 # Every check here must be answerable by the binary ALONE: no config file,
 # no keys, no socket, no root. That is why the -k check sits ahead of the
@@ -72,6 +76,51 @@ if grep -q 'load_devices_production(&g_state' "$SRC"; then
     ok "main() loads its config through the production loader"
 else
     bad "main() does not call load_devices_production()"
+fi
+
+# ---- -n and -W are range-checked (LOW) --------------------------------------
+# Both used to go through a bare strtoul() and a cast: unparseable -n became
+# node id 0, and -W -1 became a grace window of about 136 years.
+for bad in zz 0 0x0A 123456789 ""; do
+    out=$("$BIN" -k /nonexistent/onode.key -n "$bad" 2>&1); rc=$?
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -q -- '-n '; then
+        ok "-n '$bad' is refused"
+    else
+        bad "-n '$bad' was not refused by the option parser (rc=$rc)"
+    fi
+done
+for bad in -1 0 abc 604801 99999999999 1.5; do
+    out=$("$BIN" -k /nonexistent/onode.key -K /nonexistent/prev.key -W "$bad" 2>&1); rc=$?
+    if [ "$rc" -ne 0 ] && echo "$out" | grep -q -- '-W '; then
+        ok "-W '$bad' is refused"
+    else
+        bad "-W '$bad' was not refused by the option parser (rc=$rc)"
+    fi
+done
+out=$("$BIN" -k /nonexistent/onode.key -n 0A0000D3 -W 900 2>&1)
+if echo "$out" | grep -Eq -- 'FATAL: -[nW] '; then
+    bad "a valid -n / -W was refused"
+else
+    ok "a valid -n and -W pass the option parser"
+fi
+
+# ---- the mock daemon carries no dead loader and no env allowlist (LOW) ------
+MOCK_SRC="$(dirname "$0")/../src/virp_onode_main.c"
+if grep -Eq 'getenv\(|json_object|load_devices_json[[:space:]]*\(' "$MOCK_SRC"; then
+    bad "virp_onode_main.c still reads the environment or parses a device file"
+else
+    ok "virp_onode_main.c has no device-file loader and reads no environment"
+fi
+MOCK_BIN="$(dirname "$BIN")/virp-onode"
+if [ -x "$MOCK_BIN" ]; then
+    if "$MOCK_BIN" -h 2>&1 | grep -q -- '-d <path>'; then
+        bad "the mock daemon's usage still offers -d"
+    else
+        ok "the mock daemon's usage no longer offers -d"
+    fi
+    "$MOCK_BIN" -m -n zz >/dev/null 2>&1; rc=$?
+    if [ "$rc" -ne 0 ]; then ok "mock daemon: -n zz is refused"
+    else bad "mock daemon: -n zz was accepted"; fi
 fi
 
 # ---- usage text ------------------------------------------------------------
