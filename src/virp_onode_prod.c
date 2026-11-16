@@ -1122,14 +1122,25 @@ int load_devices(onode_state_t *state, const char *path)
          * protected_vmids (Proxmox-on-linux): guests this gate may not
          * touch at any tier. Accepts the natural JSON spelling —
          * "protected_vmids": [313] — and an equivalent CSV string, and
-         * normalizes to CSV. A malformed entry sets nothing: the
-         * classifier then refuses every VMID-bearing Proxmox command,
-         * which is the fail-closed reading of "this config did not
-         * parse" and is loud at the first request rather than silent
-         * forever.
+         * normalizes to CSV.
+         *
+         * A list that is DECLARED and comes out empty is FATAL (security
+         * review M25) — see the check after the vendor tests below. This
+         * comment used to say a malformed entry "sets nothing: the
+         * classifier then refuses every VMID-bearing Proxmox command".
+         * It did set nothing; the refusal did not follow. An empty set
+         * registers no protection, the loader only pushed a non-empty
+         * one into the gate, and the host loaded with its protected
+         * guests unprotected behind one "ignoring the whole list" line.
+         * A wrong JSON type (a bare number, an object) was not even
+         * logged. `pv_declared` records that the operator wrote the key,
+         * so "wrote it and it did not survive parsing" can be told apart
+         * from "never asked".
          */
+        bool pv_declared = false;
         struct json_object *pv_val;
         if (json_object_object_get_ex(dev_obj, "protected_vmids", &pv_val)) {
+            pv_declared = true;
             if (json_object_is_type(pv_val, json_type_array)) {
                 size_t used = 0;
                 int n_vm = (int)json_object_array_length(pv_val);
@@ -1301,6 +1312,29 @@ int load_devices(onode_state_t *state, const char *path)
                                     "cisco_asa without \"enable\" credential (#14)");
                 continue;
             }
+        }
+
+        /*
+         * A DECLARED protected_vmids that normalized to nothing is fatal
+         * (M25), exactly as protected_agents is below and for the same
+         * reason: the field exists so that a named guest cannot be
+         * touched, and loading the host without it leaves the operator
+         * believing a protection that is not in force. This covers a
+         * non-integer entry, a list too long for the field, a JSON type
+         * that is neither array nor string, and an explicitly empty
+         * list. Not conditional on the linux driver being compiled in:
+         * the config is wrong either way.
+         */
+        if ((device.vendor == VIRP_VENDOR_LINUX ||
+             device.vendor == VIRP_VENDOR_PROXMOX) &&
+            pv_declared && device.protected_vmids[0] == '\0') {
+            fprintf(stderr, "[O-Node] FATAL: %s: protected_vmids was "
+                    "declared but no VMID survived parsing (want an array "
+                    "of integers, or a comma-separated string) — refusing "
+                    "the config rather than running without the protection "
+                    "it declares\n", device.hostname);
+            json_object_put(root);
+            return -1;
         }
 
 #ifdef VIRP_DRIVER_LINUX

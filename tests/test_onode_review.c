@@ -3288,6 +3288,61 @@ static void t_M24_uid_keys_are_parsed_strictly(void)
 }
 
 /* =========================================================================
+ * M25 — a declared protected_vmids that comes out empty refuses the config
+ * ========================================================================= */
+
+/* One proxmox device whose protected_vmids member is `pv` (raw JSON), or
+ * absent when pv is NULL. */
+static const char *m25_cfg(const char *vendor, const char *pv)
+{
+    static char json[1024];
+    int off = snprintf(json, sizeof(json),
+        "{\"devices\":[{\"hostname\":\"pve-m25\",\"host\":\"10.255.7.25\","
+        "\"vendor\":\"%s\",\"node_id\":\"0A0000FD\"", vendor);
+    if (pv)
+        off += snprintf(json + off, sizeof(json) - (size_t)off,
+                        ",\"protected_vmids\":%s", pv);
+    snprintf(json + off, sizeof(json) - (size_t)off, "}]}");
+    return json;
+}
+
+static void t_M25_declared_empty_protected_vmids_is_fatal(void)
+{
+    printf("\n  M25: protected_vmids declared but empty refuses the config\n");
+    static const struct { const char *pv; const char *what; } BAD[] = {
+        { "[313, \"x\"]",    "an array with a non-integer entry (was: list ignored, host loaded)" },
+        { "[313, 3.5]",       "an array with a non-integer number" },
+        { "[]",               "an explicitly empty array" },
+        { "313",              "a bare number (was: silently ignored)" },
+        { "{\"vmid\":313}",   "an object (was: silently ignored)" },
+        { "true",             "a boolean" },
+        { "null",             "null" },
+        { "\"\"",             "an empty string" },
+    };
+    for (size_t i = 0; i < sizeof(BAD) / sizeof(BAD[0]); i++) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "proxmox: refused — %s", BAD[i].what);
+        CHECK(cfg_load("m25-bad", m25_cfg("proxmox", BAD[i].pv), NULL) == -1, msg);
+    }
+    CHECK(cfg_load("m25-linux", m25_cfg("linux", "[313, \"x\"]"), NULL) == -1,
+          "linux: the same refusal");
+
+    static onode_state_t st;
+    CHECK(cfg_load("m25-ok", m25_cfg("proxmox", "[313, 105]"), &st) == 1 &&
+          strcmp(st.devices[0].protected_vmids, "313,105") == 0,
+          "a well-formed array loads and normalizes to CSV");
+    onode_destroy(&st);
+    CHECK(cfg_load("m25-csv", m25_cfg("proxmox", "\"313,105\""), &st) == 1 &&
+          strcmp(st.devices[0].protected_vmids, "313,105") == 0,
+          "the CSV string spelling still loads");
+    onode_destroy(&st);
+    CHECK(cfg_load("m25-absent", m25_cfg("proxmox", NULL), NULL) == 1,
+          "a host that declares no protected_vmids loads as before");
+    CHECK(cfg_load("m25-other", m25_cfg("mock", "313"), NULL) == 1,
+          "the key is not policed on a vendor that has no VMIDs");
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -3349,6 +3404,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M22_shipped_templates_still_load",   t_M22_shipped_templates_still_load },
     { "t_M23_gate_config_values_are_strict",  t_M23_gate_config_values_are_strict },
     { "t_M24_uid_keys_are_parsed_strictly",   t_M24_uid_keys_are_parsed_strictly },
+    { "t_M25_declared_empty_protected_vmids_is_fatal",
+                                              t_M25_declared_empty_protected_vmids_is_fatal },
     { "t_M18_shutdown_wakes_the_accept_loop", t_M18_shutdown_wakes_the_accept_loop },
     { "t_M18_shutdown_from_signal_handler",   t_M18_shutdown_from_signal_handler },
     { "t_M18_shutdown_before_start_is_not_lost",
