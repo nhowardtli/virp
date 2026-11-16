@@ -49,6 +49,11 @@
 /* Legacy encoder stages v3 bodies locally; evidence retains v3 identity. */
 static _Thread_local bool execute_wrapping_v3;
 
+/* CLOCK_MONOTONIC in milliseconds — every deadline, budget and rate
+ * window in this file is measured on it, so a wall-clock step can
+ * neither stretch nor collapse one. Defined with the socket framing. */
+static int64_t onode_monotonic_ms(void);
+
 /* =========================================================================
  * JSON Request Parsing
  *
@@ -2384,6 +2389,90 @@ static void separator_refuse_chain(onode_state_t *state,
     if (body) free(body);
 }
 
+/* -------------------------------------------------------------------------
+ * Proposal dedupe + per-uid rate limit (security review M16). All three
+ * helpers are called with state->proposal_mutex held.
+ * ------------------------------------------------------------------------- */
+
+/* The id of a remembered, still-OPEN proposal for this exact key, or
+ * false. A remembered proposal that has since been approved or spent is
+ * forgotten: the next refusal files a fresh one. */
+static bool proposal_cache_find(onode_state_t *state, const char *device,
+                                const char *command_hash,
+                                const char *proposer, char out_id[33])
+{
+    for (size_t i = 0; i < ONODE_PROPOSAL_CACHE; i++) {
+        if (!state->proposal_cache[i].in_use ||
+            strcmp(state->proposal_cache[i].device, device) != 0 ||
+            strcmp(state->proposal_cache[i].command_hash, command_hash) != 0 ||
+            strcmp(state->proposal_cache[i].proposer, proposer) != 0)
+            continue;
+        bool open = false;
+        if (virp_approval_is_open(state->approval_dir,
+                                  state->chain_enabled ? &state->chain : NULL,
+                                  state->proposal_cache[i].proposal_id,
+                                  &open) == VIRP_OK && open) {
+            memcpy(out_id, state->proposal_cache[i].proposal_id, 33);
+            return true;
+        }
+        state->proposal_cache[i].in_use = false;
+    }
+    return false;
+}
+
+static void proposal_cache_remember(onode_state_t *state, const char *device,
+                                    const char *command_hash,
+                                    const char *proposer, const char *id)
+{
+    size_t i = state->proposal_cache_next % ONODE_PROPOSAL_CACHE;
+    state->proposal_cache_next = (i + 1) % ONODE_PROPOSAL_CACHE;
+    state->proposal_cache[i].in_use = true;
+    snprintf(state->proposal_cache[i].device,
+             sizeof(state->proposal_cache[i].device), "%s", device);
+    snprintf(state->proposal_cache[i].command_hash,
+             sizeof(state->proposal_cache[i].command_hash), "%s",
+             command_hash);
+    snprintf(state->proposal_cache[i].proposer,
+             sizeof(state->proposal_cache[i].proposer), "%s", proposer);
+    snprintf(state->proposal_cache[i].proposal_id,
+             sizeof(state->proposal_cache[i].proposal_id), "%s", id);
+}
+
+/* May this uid file one more NEW proposal in the current window? Counts
+ * it if so. Never limits the internal caller. No table slot is a
+ * refusal (cannot happen while the worker pool bounds distinct uids). */
+static bool proposal_rate_take(onode_state_t *state, uid_t uid,
+                               int64_t now_ms)
+{
+    if (uid == (uid_t)-1) return true;
+    const int64_t window = (int64_t)ONODE_PROPOSAL_WINDOW_SEC * 1000;
+    int mine = -1, spare = -1;
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++) {
+        if (state->proposal_uid[i].in_use &&
+            state->proposal_uid[i].uid == uid) { mine = i; break; }
+        if (spare < 0 && (!state->proposal_uid[i].in_use ||
+                          now_ms - state->proposal_uid[i].window_start_ms
+                              >= window))
+            spare = i;
+    }
+    if (mine < 0) {
+        if (spare < 0) return false;
+        mine = spare;
+        state->proposal_uid[mine].uid = uid;
+        state->proposal_uid[mine].in_use = true;
+        state->proposal_uid[mine].window_start_ms = now_ms;
+        state->proposal_uid[mine].filed = 0;
+    }
+    if (now_ms - state->proposal_uid[mine].window_start_ms >= window) {
+        state->proposal_uid[mine].window_start_ms = now_ms;
+        state->proposal_uid[mine].filed = 0;
+    }
+    if (state->proposal_uid[mine].filed >= ONODE_PROPOSAL_BURST)
+        return false;
+    state->proposal_uid[mine].filed++;
+    return true;
+}
+
 /* =========================================================================
  * Gate refusal — shared by BOTH refusal sites in onode_execute_obs_ex():
  * the unconditional BLACK branch (any mode) and the ENFORCE over-tier /
@@ -2463,29 +2552,65 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
                              sizeof(session_marker));
         approval_proposer_with_uid(session_marker, client_uid, proposer,
                                    sizeof(proposer));
-        virp_proposal_rec_t prop;
-        virp_error_t perr = virp_approval_propose(
-                state->approval_dir,
-                state->chain_enabled ? &state->chain : NULL,
-                session_marker, device_name,
-                state->devices[dev_idx].node_id,
-                command,
-                onode_typed_profile(state, dev_idx),
-                proposer, gate_tier_name(gate_tier),
-                &prop);
-        if (perr == VIRP_OK) {
+        /*
+         * ONE OPEN PROPOSAL PER (device, command hash, proposer), and a
+         * bounded number of new ones per uid (M16). Asked and answered
+         * under proposal_mutex so two identical refusals arriving
+         * together file exactly one. A command that cannot be hashed
+         * cannot be proposed at all (virp_approval_propose fails on the
+         * same limit), so that case just falls through to the attempt.
+         */
+        const char *typed_profile = onode_typed_profile(state, dev_idx);
+        char chash[65] = "";
+        bool hashed = virp_approval_command_hash(command, typed_profile,
+                                                 chash) == VIRP_OK;
+        char existing[33] = "";
+
+        pthread_mutex_lock(&state->proposal_mutex);
+        if (hashed && proposal_cache_find(state, device_name, chash,
+                                          proposer, existing)) {
             snprintf(proposal_tag, sizeof(proposal_tag), "proposal_id=%s ",
-                     prop.proposal_id);
-            fprintf(stderr, "[GATE] proposal filed: proposal=%s "
-                    "device=%s tier=%s chain=%.16s\n",
-                    prop.proposal_id, device_name,
-                    gate_tier_name(gate_tier),
-                    prop.chain_entry_hash[0] ? prop.chain_entry_hash
-                                             : "-");
+                     existing);
+            fprintf(stderr, "[GATE] proposal reused: proposal=%s device=%s "
+                    "tier=%s — an open proposal for this exact command "
+                    "from this proposer already exists; nothing new filed\n",
+                    existing, device_name, gate_tier_name(gate_tier));
+        } else if (!proposal_rate_take(state, client_uid,
+                                       onode_monotonic_ms())) {
+            fprintf(stderr, "[GATE] proposal NOT filed: uid %ld has filed "
+                    "%d new proposals in the current %d s window — the "
+                    "refusal stands and is recorded, without a proposal "
+                    "id\n",
+                    (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
+                    ONODE_PROPOSAL_BURST, ONODE_PROPOSAL_WINDOW_SEC);
         } else {
-            fprintf(stderr, "[GATE] proposal filing failed: %s\n",
-                    virp_error_str(perr));
+            virp_proposal_rec_t prop;
+            virp_error_t perr = virp_approval_propose(
+                    state->approval_dir,
+                    state->chain_enabled ? &state->chain : NULL,
+                    session_marker, device_name,
+                    state->devices[dev_idx].node_id,
+                    command, typed_profile,
+                    proposer, gate_tier_name(gate_tier),
+                    &prop);
+            if (perr == VIRP_OK) {
+                snprintf(proposal_tag, sizeof(proposal_tag),
+                         "proposal_id=%s ", prop.proposal_id);
+                proposal_cache_remember(state, device_name,
+                                        prop.command_hash, proposer,
+                                        prop.proposal_id);
+                fprintf(stderr, "[GATE] proposal filed: proposal=%s "
+                        "device=%s tier=%s chain=%.16s\n",
+                        prop.proposal_id, device_name,
+                        gate_tier_name(gate_tier),
+                        prop.chain_entry_hash[0] ? prop.chain_entry_hash
+                                                 : "-");
+            } else {
+                fprintf(stderr, "[GATE] proposal filing failed: %s\n",
+                        virp_error_str(perr));
+            }
         }
+        pthread_mutex_unlock(&state->proposal_mutex);
     }
 
     /* Classifier-supplied instructive reason (optional hook), so the
@@ -7772,6 +7897,7 @@ virp_error_t onode_init(onode_state_t *state,
     pthread_mutex_init(&state->state_mutex, NULL);
     pthread_mutex_init(&state->conn_mutex, NULL);
     pthread_mutex_init(&state->session_mutex, NULL);
+    pthread_mutex_init(&state->proposal_mutex, NULL);
     for (int i = 0; i < ONODE_MAX_DEVICES; i++)
         pthread_mutex_init(&state->exec_mutex[i], NULL);
 
@@ -8736,6 +8862,7 @@ void onode_destroy(onode_state_t *state)
     pthread_mutex_destroy(&state->state_mutex);
     pthread_mutex_destroy(&state->conn_mutex);
     pthread_mutex_destroy(&state->session_mutex);
+    pthread_mutex_destroy(&state->proposal_mutex);
     for (int i = 0; i < state->device_count; i++)
         pthread_mutex_destroy(&state->exec_mutex[i]);
     if (state->worker_sem_inited) {

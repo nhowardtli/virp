@@ -111,6 +111,14 @@ static virp_error_t command_hash_hex(const char *command,
     return VIRP_OK;
 }
 
+virp_error_t virp_approval_command_hash(const char *command,
+                                        const char *typed_profile,
+                                        char out_hex[65])
+{
+    if (!command || !out_hex) return VIRP_ERR_NULL_PTR;
+    return command_hash_hex(command, typed_profile, out_hex);
+}
+
 /*
  * proposal_id values come from clients and become path components:
  * accept EXACTLY 32 lowercase hex chars, nothing else.
@@ -668,6 +676,39 @@ static bool approval_has_outcome(virp_chain_state_t *chain,
     if (virp_chain_artifact_type_exists(chain, aid, "outcome", &exists) != VIRP_OK)
         return true;
     return exists;
+}
+
+virp_error_t virp_approval_is_open(const char *dir,
+                                   virp_chain_state_t *chain,
+                                   const char *proposal_id,
+                                   bool *open)
+{
+    if (!dir || !open) return VIRP_ERR_NULL_PTR;
+    *open = false;
+    if (!proposal_id_valid(proposal_id))
+        return VIRP_ERR_APPROVAL_NOT_FOUND;
+
+    virp_proposal_rec_t prop;
+    virp_error_t err = virp_approval_load_proposal(dir, proposal_id, &prop);
+    if (err != VIRP_OK) return err;
+
+    /* Approved already? The record's existence is the test; reading its
+     * first bytes is the same probe virp_approval_submit() uses. An
+     * approval record that exists but cannot be read is NOT "no approval". */
+    char apath[VIRP_APPROVAL_DIR_MAX + 64];
+    approval_path(dir, proposal_id, apath, sizeof(apath));
+    char probe[16];
+    errno = 0;
+    if (read_file(apath, probe, sizeof(probe)) >= 0)
+        return VIRP_OK;                       /* approved: not open */
+    if (errno != ENOENT)
+        return VIRP_ERR_APPROVAL_STORE_UNREADABLE;
+
+    if (approval_has_outcome(chain, proposal_id))
+        return VIRP_OK;                       /* spent: not open */
+
+    *open = true;
+    return VIRP_OK;
 }
 
 /* =========================================================================

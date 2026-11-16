@@ -151,6 +151,36 @@ const char *onode_health_command(virp_vendor_t vendor);
 #define ONODE_VERIFY_BUDGET_MS       20000
 #endif
 
+/*
+ * Proposal bounds (security review M16).
+ *
+ * Every gate refusal of an approvable command filed a brand-new
+ * proposal: a record on disk and a PROPOSAL chain entry, both permanent.
+ * A client that simply repeated one refused command grew the approval
+ * store and the chain without limit and buried the approver's queue in
+ * copies of the same request.
+ *
+ *   ONODE_PROPOSAL_CACHE   how many recently filed proposals the daemon
+ *       remembers, keyed (device, command hash, proposer). A refusal
+ *       whose key matches a remembered proposal that is still OPEN is
+ *       answered with that proposal's id; nothing new is filed.
+ *   ONODE_PROPOSAL_BURST / ONODE_PROPOSAL_WINDOW_SEC   per uid: how many
+ *       NEW proposals one principal may file per window. Past it the
+ *       refusal is unchanged — still recorded, still a signed ERROR —
+ *       but carries no proposal id until the window turns over. The
+ *       internal caller ((uid_t)-1) is not a socket principal and is not
+ *       limited.
+ */
+#ifndef ONODE_PROPOSAL_CACHE
+#define ONODE_PROPOSAL_CACHE       128
+#endif
+#ifndef ONODE_PROPOSAL_BURST
+#define ONODE_PROPOSAL_BURST       20
+#endif
+#ifndef ONODE_PROPOSAL_WINDOW_SEC
+#define ONODE_PROPOSAL_WINDOW_SEC  60
+#endif
+
 /* Auto-reconnect configuration */
 #define ONODE_WATCHDOG_INTERVAL_SEC  5   /* How often the watchdog checks */
 #define ONODE_RECONNECT_BACKOFF_INIT 5   /* Initial backoff: 5 seconds */
@@ -595,6 +625,33 @@ typedef struct {
         int64_t     window_start_ms;
         int64_t     used_ms;
     }                   verify_uid[ONODE_MAX_WORKERS];
+
+    /*
+     * Proposal dedupe and rate limit (M16). proposal_mutex is held
+     * across "is there an open proposal for this key?" and the filing
+     * that follows, so two identical refusals arriving together still
+     * file exactly one proposal. It is taken with no other daemon lock
+     * held and only ever wraps approval-store and chain calls.
+     * proposal_cache is a ring (proposal_cache_next is the slot to
+     * overwrite); proposal_uid counts new proposals per uid per window.
+     * In memory only: after a restart the first repeat of an open
+     * proposal files one more, then dedupes again.
+     */
+    pthread_mutex_t     proposal_mutex;
+    struct {
+        bool        in_use;
+        char        device[64];
+        char        command_hash[65];
+        char        proposer[64];
+        char        proposal_id[33];
+    }                   proposal_cache[ONODE_PROPOSAL_CACHE];
+    size_t              proposal_cache_next;
+    struct {
+        uid_t       uid;
+        bool        in_use;
+        int64_t     window_start_ms;
+        uint32_t    filed;
+    }                   proposal_uid[ONODE_MAX_WORKERS];
 
     /* Runtime */
     bool                running;

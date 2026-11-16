@@ -2374,6 +2374,127 @@ static void t_M15_verify_is_rate_limited_per_uid(void)
     fx_destroy(fx);
 }
 
+/* =========================================================================
+ * M16 — one open proposal per (device, command, proposer); bounded per uid
+ * ========================================================================= */
+
+static int m16_count_proposals(const fx_t *fx)
+{
+    char cmd[400];
+    snprintf(cmd, sizeof(cmd), "ls -1 %s/proposals 2>/dev/null | wc -l", fx->dir);
+    FILE *p = popen(cmd, "r");
+    int n = -1;
+    if (p) { if (fscanf(p, "%d", &n) != 1) n = -1; pclose(p); }
+    return n;
+}
+
+/* Refuse `cmd` as `uid`; returns the proposal id in the refusal ("" if
+ * the refusal carried none). */
+static const char *m16_refuse(fx_t *fx, const char *cmd, uid_t uid)
+{
+    static char pid[VIRP_APPROVAL_ID_HEX_LEN + 1];
+    static char payload[2048];
+    uint8_t ot = 0;
+    pid[0] = '\0';
+    if (fx_run(fx, FX_DEV, cmd, NULL, uid, &ot, payload, sizeof(payload)) != 0 ||
+        ot != VIRP_OBS_ERROR)
+        return "!";
+    (void)fx_extract_pid(payload, pid);
+    return pid;
+}
+
+static void t_M16_open_proposals_are_deduplicated(void)
+{
+    printf("\n  M16: repeating a refused command does not file another proposal\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m16-dedupe")) { CHECK(false, "fixture"); return; }
+    const uid_t A = 4301, B = 4302;
+    char first[33], again[33], other_uid[33], other_cmd[33], ws[33];
+
+    snprintf(first, sizeof(first), "%s", m16_refuse(fx, "reload", A));
+    CHECK(strlen(first) == 32, "the first refusal files a proposal");
+    int chain0 = fx_session_entries(fx, "approval:" FX_DEV);
+    for (int i = 0; i < 5; i++)
+        snprintf(again, sizeof(again), "%s", m16_refuse(fx, "reload", A));
+    CHECK(strcmp(first, again) == 0,
+          "five repeats are answered with the SAME proposal id");
+    CHECK(m16_count_proposals(fx) == 1 &&
+          fx_session_entries(fx, "approval:" FX_DEV) == chain0,
+          "and filed no further record or PROPOSAL chain entry");
+
+    /* Whitespace does not make it a different command: the proposal's
+     * hash is over the canonical form. */
+    snprintf(ws, sizeof(ws), "%s", m16_refuse(fx, "reload  ", A));
+    CHECK(strcmp(first, ws) == 0,
+          "a whitespace variant with the same command hash is the same proposal");
+
+    snprintf(other_uid, sizeof(other_uid), "%s", m16_refuse(fx, "reload", B));
+    CHECK(strlen(other_uid) == 32 && strcmp(first, other_uid) != 0,
+          "a different proposer gets a proposal of its own");
+    snprintf(other_cmd, sizeof(other_cmd), "%s", m16_refuse(fx, "erase flash", A));
+    CHECK(strlen(other_cmd) == 32 && strcmp(first, other_cmd) != 0,
+          "a different command gets a proposal of its own");
+    CHECK(m16_count_proposals(fx) == 3, "three distinct proposals on record");
+
+    /* Once approved the proposal is no longer open: a new refusal of the
+     * same command needs — and gets — a new proposal. */
+    virp_approval_rec_t apr;
+    CHECK(fx_approve(fx, first, &apr) == VIRP_OK, "the first proposal is approved");
+    snprintf(again, sizeof(again), "%s", m16_refuse(fx, "reload", A));
+    CHECK(strlen(again) == 32 && strcmp(first, again) != 0,
+          "after approval, the same refusal files a NEW proposal");
+    fx_destroy(fx);
+}
+
+static void t_M16_proposals_are_rate_limited_per_uid(void)
+{
+    printf("\n  M16: new proposals per uid are bounded per window\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m16-rate")) { CHECK(false, "fixture"); return; }
+    const uid_t A = 4311, B = 4312;
+    char cmd[64];
+
+    int filed = 0, without = 0;
+    for (int i = 0; i < ONODE_PROPOSAL_BURST + 5; i++) {
+        snprintf(cmd, sizeof(cmd), "reload in %d", i + 1);   /* distinct, RED */
+        const char *pid = m16_refuse(fx, cmd, A);
+        if (strlen(pid) == 32) filed++;
+        else if (pid[0] == '\0') without++;
+    }
+    CHECK(filed == ONODE_PROPOSAL_BURST && without == 5,
+          "one uid files up to the burst; further refusals carry no proposal id");
+    CHECK(m16_count_proposals(fx) == ONODE_PROPOSAL_BURST,
+          "and no record was written past the limit");
+    CHECK(fx_rejections(fx, "gate-enforce:" FX_DEV, NULL, NULL)
+              == ONODE_PROPOSAL_BURST + 5,
+          "every refusal — limited or not — is still on the chain");
+
+    CHECK(strlen(m16_refuse(fx, "reload in 999", B)) == 32,
+          "another uid still files");
+    CHECK(strlen(m16_refuse(fx, "reload in 3", A)) == 32,
+          "an already-open proposal is still handed back to the limited uid");
+
+    /* The window turning over restores the allowance. */
+    pthread_mutex_lock(&fx->st.proposal_mutex);
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++)
+        if (fx->st.proposal_uid[i].in_use && fx->st.proposal_uid[i].uid == A)
+            fx->st.proposal_uid[i].window_start_ms -=
+                (int64_t)ONODE_PROPOSAL_WINDOW_SEC * 1000 + 1;
+    pthread_mutex_unlock(&fx->st.proposal_mutex);
+    CHECK(strlen(m16_refuse(fx, "reload in 1000", A)) == 32,
+          "after the window, the uid files again");
+
+    /* The internal caller is not a socket principal. */
+    int internal = 0;
+    for (int i = 0; i < ONODE_PROPOSAL_BURST + 3; i++) {
+        snprintf(cmd, sizeof(cmd), "erase %d", i + 1);
+        if (strlen(m16_refuse(fx, cmd, (uid_t)-1)) == 32) internal++;
+    }
+    CHECK(internal == ONODE_PROPOSAL_BURST + 3,
+          "the internal caller is not rate limited");
+    fx_destroy(fx);
+}
+
 /* ---- a real listening daemon, for what only the accept loop decides ---- */
 
 static void *fx_server_thread(void *arg)
@@ -2521,6 +2642,9 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
                                               t_M13_proposal_id_survives_long_command },
     { "t_M15_verify_range_is_capped",         t_M15_verify_range_is_capped },
     { "t_M15_verify_is_rate_limited_per_uid", t_M15_verify_is_rate_limited_per_uid },
+    { "t_M16_open_proposals_are_deduplicated", t_M16_open_proposals_are_deduplicated },
+    { "t_M16_proposals_are_rate_limited_per_uid",
+                                              t_M16_proposals_are_rate_limited_per_uid },
     { "t_M14_request_deadline_is_absolute",   t_M14_request_deadline_is_absolute },
     { "t_M14_send_timeout_abandons_a_stalled_reader",
                                               t_M14_send_timeout_abandons_a_stalled_reader },
