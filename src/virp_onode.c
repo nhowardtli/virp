@@ -5878,8 +5878,14 @@ static void handle_client(onode_state_t *state, int client_fd,
              * typed error instead of acking an entry whose committed body
              * was silently dropped. Content-less appends remain valid:
              * commitment-only is a caller choice, not a failure mode. */
+            /* GATE 6 — one observation, one registration (M6) — is not
+             * checked here either, for the same reason: it is enforced
+             * inside the append transaction, which is why this is the
+             * _external append. The same signed observation may not be
+             * registered a second time under another id or in another
+             * session; that too comes back as DUPLICATE_MISMATCH. */
             virp_chain_entry_t chain_entry;
-            err = virp_chain_append_with_artifact(&state->chain,
+            err = virp_chain_append_external(&state->chain,
                                      req.session_id,
                                      req.artifact_type, req.artifact_id,
                                      req.artifact_hash,
@@ -5889,10 +5895,14 @@ static void handle_client(onode_state_t *state, int client_fd,
             if (err != VIRP_OK) {
                 if (err == VIRP_ERR_DUPLICATE_MISMATCH)
                     fprintf(stderr, "[O-Node] chain_append REJECTED: "
-                            "federation artifact_id '%s' is already stored "
-                            "with a different body hash — a retry must "
-                            "resend identical bytes, or mint a new "
-                            "correlation (session=%s type=%s)\n",
+                            "duplicate mismatch — either federation "
+                            "artifact_id '%s' is already stored with a "
+                            "different body hash (a retry must resend "
+                            "identical bytes, or mint a new correlation), "
+                            "or this observation's hash is already "
+                            "registered under another artifact_id or "
+                            "session (one observation, one registration) "
+                            "(session=%s type=%s)\n",
                             req.artifact_id, req.session_id,
                             req.artifact_type);
                 send_framed_error(client_fd, err);

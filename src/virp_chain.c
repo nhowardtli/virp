@@ -47,6 +47,16 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
                                         const char *artifact_hash,
                                         const char *artifact_content,
                                         virp_chain_entry_t *entry);
+/* Append-time policy the caller opts into; see chain_append_core_locked. */
+#define CHAIN_APPEND_UNIQUE_OBSERVATION 0x1u
+static virp_error_t chain_append_core_locked(virp_chain_state_t *state,
+                                        const char *session_id,
+                                        const char *artifact_type,
+                                        const char *artifact_id,
+                                        const char *artifact_hash,
+                                        const char *artifact_content,
+                                        unsigned flags,
+                                        virp_chain_entry_t *entry);
 static virp_error_t chain_verify_locked(virp_chain_state_t *state,
                                         const char *session_id,
                                         int64_t from_sequence,
@@ -158,6 +168,28 @@ virp_error_t virp_chain_append_with_artifact(virp_chain_state_t *state,
     virp_error_t rc = chain_append_locked(state, session_id, artifact_type,
                                           artifact_id, artifact_hash,
                                           artifact_content, entry);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+/* The append a SOCKET CLIENT's submission goes through — see the header.
+ * Identical to virp_chain_append_with_artifact() except that it opts in
+ * to the one-observation-one-registration rule. */
+virp_error_t virp_chain_append_external(virp_chain_state_t *state,
+                                        const char *session_id,
+                                        const char *artifact_type,
+                                        const char *artifact_id,
+                                        const char *artifact_hash,
+                                        const char *artifact_content,
+                                        virp_chain_entry_t *entry)
+{
+    if (!state) return VIRP_ERR_NULL_PTR;
+    pthread_mutex_lock(&state->lock);
+    virp_error_t rc = chain_append_core_locked(state, session_id,
+                                          artifact_type, artifact_id,
+                                          artifact_hash, artifact_content,
+                                          CHAIN_APPEND_UNIQUE_OBSERVATION,
+                                          entry);
     pthread_mutex_unlock(&state->lock);
     return rc;
 }
@@ -1314,6 +1346,25 @@ static const char *SCHEMA_SQL =
      * next open — no migration step. */
     "CREATE INDEX IF NOT EXISTS idx_chain_artifact_id "
     "  ON chain_entries(artifact_id);"
+    /* The one-observation-one-registration check (security review M6)
+     * asks, on EVERY external observation append and inside the append's
+     * write transaction, whether some other entry already commits to
+     * this artifact_hash. GATE 4's virp_chain_entry_commits_to() asks
+     * the same column the same question for every fed_outcome. Neither
+     * may read the artifacts table instead — a commitment-only
+     * observation has no row there — so without this index both are a
+     * full scan of chain_entries: MEASURED 69 ms per lookup on a
+     * synthetic 500,000-entry table, 0.007 ms with the index.
+     *
+     * IF NOT EXISTS, so an existing chain.db gains it on the next
+     * writer open with no migration step. DEPLOY COST, same synthetic
+     * table: the index builds in 0.5 s; a 64-hex key per row is roughly
+     * 40 MB per 500,000 entries. Not UNIQUE — nothing here asserts that
+     * hashes are unique across the table, only observation types are
+     * policed, and only on append. This adds an index and nothing else:
+     * no row, column or canonical byte changes. */
+    "CREATE INDEX IF NOT EXISTS idx_chain_artifact_hash "
+    "  ON chain_entries(artifact_hash);"
     /* The evidence-required grading resolves an intent or a closer by its
      * chain_entry_hash. Without this index that is a full table scan per
      * lookup: measured 4.7 ms on .211's 349,697 entries, x 117,066
@@ -2463,6 +2514,20 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
                                const char *artifact_content,
                                virp_chain_entry_t *entry)
 {
+    return chain_append_core_locked(state, session_id, artifact_type,
+                                    artifact_id, artifact_hash,
+                                    artifact_content, 0, entry);
+}
+
+static virp_error_t chain_append_core_locked(virp_chain_state_t *state,
+                               const char *session_id,
+                               const char *artifact_type,
+                               const char *artifact_id,
+                               const char *artifact_hash,
+                               const char *artifact_content,
+                               unsigned flags,
+                               virp_chain_entry_t *entry)
+{
     if (!state || !session_id || !artifact_type ||
         !artifact_id || !artifact_hash || !entry)
         return VIRP_ERR_NULL_PTR;
@@ -2560,6 +2625,61 @@ static virp_error_t chain_append_locked(virp_chain_state_t *state,
         }
         sqlite3_bind_text(st, 1, artifact_id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, artifact_hash, -1, SQLITE_TRANSIENT);
+        int step = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (step != SQLITE_DONE) {
+            sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+            return (step == SQLITE_ROW) ? VIRP_ERR_DUPLICATE_MISMATCH
+                                        : VIRP_ERR_CHAIN_DB;
+        }
+    }
+
+    /* GATE 6 — one observation, one registration (security review M6).
+     *
+     * GATE 5 above refuses one ID under two HASHES. This is the other
+     * direction: one HASH under two ids, or in two sessions. An
+     * observation is a single signed statement about one command on one
+     * device at one moment; its registration is what a fed_outcome, a
+     * comparator verdict or an evidence item later points at. Register
+     * the same signed bytes a second time under another id or in another
+     * session and one piece of evidence now "backs" two claims — both
+     * entries carry a genuine K_chain HMAC, both pass GATE 3 (the
+     * signature is real), and nothing downstream can tell which
+     * registration the observation was actually minted for.
+     *
+     * A resubmission under the SAME id in the SAME session is not a
+     * conflict, for GATE 5's reason: it is the retry of a lost
+     * acknowledgement, and it must be able to obtain one.
+     *
+     * Opt-in (CHAIN_APPEND_UNIQUE_OBSERVATION), set only by
+     * virp_chain_append_external(): this is a rule about what a socket
+     * client may submit, and the library's other callers — the daemon's
+     * own gate records never use these types; tools and fixtures that
+     * build chains directly do — keep the historical behaviour. Both
+     * observation types are policed together, so the same bytes cannot
+     * be registered once as `observation` and again as
+     * `fed_observation`.
+     *
+     * Inside the transaction for GATE 5's reason too: a probe before the
+     * append is check-then-act. Reads chain_entries, not artifacts — a
+     * commitment-only prior has no body row. idx_chain_artifact_hash
+     * keeps it a lookup. Fail closed on a store that cannot answer. */
+    if ((flags & CHAIN_APPEND_UNIQUE_OBSERVATION) &&
+        (strcmp(artifact_type, "observation") == 0 ||
+         strcmp(artifact_type, "fed_observation") == 0)) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(state->db,
+                "SELECT 1 FROM chain_entries "
+                "WHERE artifact_hash = ? "
+                "AND artifact_type IN ('observation','fed_observation') "
+                "AND (artifact_id <> ? OR session_id <> ?) LIMIT 1",
+                -1, &st, NULL) != SQLITE_OK) {
+            sqlite3_exec(state->db, "ROLLBACK;", NULL, NULL, NULL);
+            return VIRP_ERR_CHAIN_DB;
+        }
+        sqlite3_bind_text(st, 1, artifact_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, artifact_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, session_id, -1, SQLITE_TRANSIENT);
         int step = sqlite3_step(st);
         sqlite3_finalize(st);
         if (step != SQLITE_DONE) {

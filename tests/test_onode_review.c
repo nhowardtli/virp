@@ -1345,6 +1345,98 @@ static void t_M5_reserved_sessions_refused_externally(void)
 }
 
 /* =========================================================================
+ * M6 — one observation, one registration
+ * ========================================================================= */
+
+/* Mint a real O-Key-signed observation and wrap it as a chain_append
+ * request. Observation `which` (1..M6_OBS) is minted ONCE per fixture and
+ * then reused byte-for-byte: the header carries a timestamp, so minting
+ * again would be a different observation with a different hash. */
+#define M6_OBS 4
+static struct { uint8_t wire[512]; size_t n; } m6_obs[M6_OBS + 1];
+
+static const char *m6_append(fx_t *fx, uint32_t which, const char *type,
+                             const char *session, const char *id,
+                             bool with_body)
+{
+    static char req[4096];
+    if (which == 0 || which > M6_OBS) return "";
+    if (m6_obs[which].n == 0 &&
+        virp_build_observation(m6_obs[which].wire, sizeof(m6_obs[which].wire),
+                               &m6_obs[which].n, fx->st.node_id, which,
+                               VIRP_OBS_DEVICE_OUTPUT, VIRP_SCOPE_LOCAL,
+                               (const uint8_t *)"m6 output", 9,
+                               &fx->st.okey) != VIRP_OK)
+        return "";
+    char content[1024] = "base64:";
+    EVP_EncodeBlock((unsigned char *)content + 7, m6_obs[which].wire,
+                    (int)m6_obs[which].n);
+    char hash[65];
+    if (virp_chain_artifact_digest(content, hash) != VIRP_OK) return "";
+    int off = snprintf(req, sizeof(req),
+        "{\"action\":\"chain_append\",\"session_id\":\"%s\","
+        "\"artifact_type\":\"%s\",\"artifact_id\":\"%s\","
+        "\"artifact_hash\":\"%s\"", session, type, id, hash);
+    if (with_body)
+        off += snprintf(req + off, sizeof(req) - (size_t)off,
+                        ",\"artifact_content\":\"%s\"", content);
+    snprintf(req + off, sizeof(req) - (size_t)off, "}");
+    return req;
+}
+
+static void t_M6_observation_registered_once(void)
+{
+    printf("\n  M6: a signed observation cannot be registered twice under another id or session\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m6-obs")) { CHECK(false, "fixture"); return; }
+    onode_state_t *st = &fx->st;
+    uid_t me = getuid();
+    memset(m6_obs, 0, sizeof(m6_obs));     /* new fixture, new O-Key */
+
+    CHECK(fx_ask(st, me, m6_append(fx, 1, "observation", "s1", "obs-a", true))
+              == VIRP_OK, "an observation registers");
+    CHECK(fx_ask(st, me, m6_append(fx, 1, "observation", "s1", "obs-a", true))
+              == VIRP_OK,
+          "the same id in the same session again is a retry, not a conflict");
+    CHECK(fx_ask(st, me, m6_append(fx, 1, "observation", "s1", "obs-b", true))
+              == VIRP_ERR_DUPLICATE_MISMATCH,
+          "the same observation under a DIFFERENT id is refused");
+    CHECK(fx_ask(st, me, m6_append(fx, 1, "observation", "s2", "obs-a", true))
+              == VIRP_ERR_DUPLICATE_MISMATCH,
+          "the same observation in a DIFFERENT session is refused");
+    CHECK(fx_ask(st, me, m6_append(fx, 1, "fed_observation", "s3", "obs-c", true))
+              == VIRP_ERR_DUPLICATE_MISMATCH,
+          "re-registering it as fed_observation is refused too");
+    CHECK(fx_ask(st, me, m6_append(fx, 1, "observation", "s4", "obs-d", false))
+              == VIRP_ERR_DUPLICATE_MISMATCH,
+          "a commitment-only re-registration is refused as well");
+    CHECK(fx_session_entries(fx, "s2") == 0 && fx_session_entries(fx, "s3") == 0 &&
+          fx_session_entries(fx, "s4") == 0 && fx_session_entries(fx, "s1") == 2,
+          "nothing landed for the refused appends");
+
+    CHECK(fx_ask(st, me, m6_append(fx, 2, "observation", "s2", "obs-a", true))
+              == VIRP_OK,
+          "a DIFFERENT observation may reuse an id in another session");
+
+    /* A commitment-only prior counts: authority is the chain entry. */
+    CHECK(fx_ask(st, me, m6_append(fx, 3, "fed_observation", "s5", "fo-1", false))
+              == VIRP_OK, "a commitment-only fed_observation registers");
+    CHECK(fx_ask(st, me, m6_append(fx, 3, "fed_observation", "s5", "fo-2", true))
+              == VIRP_ERR_DUPLICATE_MISMATCH,
+          "and its hash cannot then be registered under another id");
+
+    /* The rule is about socket submissions; the library append that
+     * tools and fixtures use is unchanged. */
+    virp_chain_entry_t e;
+    CHECK(virp_chain_append(&st->chain, "lib-1", "observation", "x1",
+                            H2_HASH, &e) == VIRP_OK &&
+          virp_chain_append(&st->chain, "lib-2", "observation", "x2",
+                            H2_HASH, &e) == VIRP_OK,
+          "virp_chain_append (direct library use) is not subject to it");
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -1371,6 +1463,7 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
                                               t_M4_intent_body_store_failure_is_reported },
     { "t_M5_reserved_sessions_refused_externally",
                                               t_M5_reserved_sessions_refused_externally },
+    { "t_M6_observation_registered_once",     t_M6_observation_registered_once },
 };
 
 static void rm_rf_root(void)

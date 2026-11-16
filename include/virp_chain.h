@@ -576,6 +576,31 @@ virp_error_t virp_chain_append_with_artifact(virp_chain_state_t *state,
                                              virp_chain_entry_t *entry);
 
 /*
+ * The append for a submission that came from OUTSIDE the daemon — the
+ * socket CHAIN_APPEND handler. Same arguments, same transaction and same
+ * results as virp_chain_append_with_artifact(), plus one rule that is
+ * about external submissions only (security review M6):
+ *
+ *   ONE OBSERVATION, ONE REGISTRATION. For artifact_type 'observation'
+ *   and 'fed_observation', the append is refused with
+ *   VIRP_ERR_DUPLICATE_MISMATCH if another entry of either type already
+ *   commits to the same artifact_hash under a DIFFERENT artifact_id or in
+ *   a DIFFERENT session. A resubmission under the same id in the same
+ *   session is not a conflict (it is the retry of a lost ack).
+ *
+ * The check runs inside the append's own write transaction. Callers that
+ * build chains directly (tools, fixtures, the daemon's own records) use
+ * the plain appends above and are not subject to it.
+ */
+virp_error_t virp_chain_append_external(virp_chain_state_t *state,
+                                        const char *session_id,
+                                        const char *artifact_type,
+                                        const char *artifact_id,
+                                        const char *artifact_hash,
+                                        const char *artifact_content,
+                                        virp_chain_entry_t *entry);
+
+/*
  * Verify chain integrity for a sequence range within a session.
  * Re-hashes each entry and verifies HMAC + previous_entry_hash linkage.
  *

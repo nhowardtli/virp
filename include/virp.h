@@ -551,7 +551,14 @@ typedef enum {
      * reuses already names other bytes. The correct client response is
      * to stop retrying this correlation and mint a new one — never to
      * re-serialize under the same id. Byte-identical resubmission does
-     * NOT raise this; it is a legitimate retry and succeeds. */
+     * NOT raise this; it is a legitimate retry and succeeds.
+     *
+     * GATE 6 (security review M6) raises it for the mirror image: an
+     * `observation` / `fed_observation` whose artifact_hash is ALREADY
+     * registered under a different artifact_id or in a different
+     * session. Same meaning for the client — this submission conflicts
+     * with what the chain already holds, and resending it will not
+     * help: one observation backs one registration. */
     VIRP_ERR_DUPLICATE_MISMATCH       = -51,  /* fed artifact_id reused
                                                  with different body
                                                  bytes */
