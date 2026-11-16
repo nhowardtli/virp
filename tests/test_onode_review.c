@@ -1264,6 +1264,87 @@ static void t_M4_intent_body_store_failure_is_reported(void)
 }
 
 /* =========================================================================
+ * M5 — the daemon's own chain sessions are not appendable from the socket
+ * ========================================================================= */
+
+/* A commitment-only evidence_item append: a legal type for an unrestricted
+ * uid, so the only thing that can refuse it is the session. */
+static const char *m5_append(const char *session)
+{
+    static char req[512];
+    snprintf(req, sizeof(req),
+             "{\"action\":\"chain_append\",\"session_id\":\"%s\","
+             "\"artifact_type\":\"evidence_item\",\"artifact_id\":\"m5-item\","
+             "\"artifact_hash\":\"" H2_HASH "\"}", session);
+    return req;
+}
+
+static const char *m5_validate(const char *req_session,
+                               const char *manifest_session)
+{
+    static char req[768];
+    snprintf(req, sizeof(req),
+             "{\"action\":\"validate_turn\",\"session_id\":\"%s\","
+             "\"prose\":\"x\",\"manifest\":{\"session_id\":\"%s\"}}",
+             req_session, manifest_session);
+    return req;
+}
+
+static void t_M5_reserved_sessions_refused_externally(void)
+{
+    printf("\n  M5: external appends cannot target the daemon's own sessions\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m5-sess")) { CHECK(false, "fixture"); return; }
+    onode_state_t *st = &fx->st;
+    uid_t me = getuid();
+
+    CHECK(fx_ask(st, me, m5_append("client-session-1")) == VIRP_OK,
+          "an ordinary session is appendable");
+    static const char *const RESERVED[] = {
+        "gate-enforce:" FX_DEV, "gate-separator:" FX_DEV,
+        "gate-separator:_unknown", "approval:" FX_DEV,
+        "node-config:5EC00001", "gate-enforce:",
+    };
+    for (size_t i = 0; i < sizeof(RESERVED) / sizeof(RESERVED[0]); i++) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "chain_append to '%s' is refused",
+                 RESERVED[i]);
+        CHECK(fx_ask(st, me, m5_append(RESERVED[i])) == VIRP_ERR_ACTION_FORBIDDEN,
+              msg);
+        CHECK(fx_session_entries(fx, RESERVED[i]) == 0,
+              "and nothing was appended there");
+    }
+
+    CHECK(fx_ask(st, me, m5_validate("gate-enforce:" FX_DEV, "turn-1"))
+              == VIRP_ERR_ACTION_FORBIDDEN,
+          "validate_turn with a reserved fallback session is refused");
+    CHECK(fx_ask(st, me, m5_validate("turn-1", "approval:" FX_DEV))
+              == VIRP_ERR_ACTION_FORBIDDEN,
+          "validate_turn whose MANIFEST names a reserved session is refused");
+    CHECK(fx_session_entries(fx, "approval:" FX_DEV) == 0 &&
+          fx_session_entries(fx, "gate-enforce:" FX_DEV) == 0,
+          "and no validation entry landed in either");
+    CHECK(fx_ask(st, me, m5_validate("turn-1", "turn-1"))
+              != VIRP_ERR_ACTION_FORBIDDEN,
+          "validate_turn on an ordinary session is not refused by this gate");
+
+    /* The epoch marker identifies the daemon's native namespace. */
+    snprintf(st->chain.native_epoch, sizeof(st->chain.native_epoch), "ep1");
+    CHECK(fx_ask(st, me, m5_append("anything@ep1")) == VIRP_ERR_ACTION_FORBIDDEN,
+          "with a native epoch set, a session ending @<epoch> is refused");
+    CHECK(fx_ask(st, me, m5_append("anything@ep2")) == VIRP_OK,
+          "a different suffix is just a session id");
+    st->chain.native_epoch[0] = '\0';
+
+    /* Reading the daemon's sessions stays allowed. */
+    CHECK(fx_ask(st, me, "{\"action\":\"chain_verify_session\","
+                         "\"session_id\":\"gate-enforce:" FX_DEV "\"}")
+              != VIRP_ERR_ACTION_FORBIDDEN,
+          "chain_verify_session on a reserved session is still permitted");
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -1288,6 +1369,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
                                               t_M4_intent_store_validates_and_get_is_wellformed },
     { "t_M4_intent_body_store_failure_is_reported",
                                               t_M4_intent_body_store_failure_is_reported },
+    { "t_M5_reserved_sessions_refused_externally",
+                                              t_M5_reserved_sessions_refused_externally },
 };
 
 static void rm_rf_root(void)

@@ -4820,6 +4820,52 @@ static fed_cite_kind_t fed_outcome_citation(const char *body,
 }
 
 /*
+ * Is this chain session id one of the daemon's own? (security review M5)
+ *
+ * GATE 1 reserves the daemon's artifact TYPES, so a socket client cannot
+ * mint a gate_intent or an approval. It did not reserve the daemon's
+ * SESSIONS. A client could append an entry of a perfectly legal type —
+ * an evidence_item, a fed_request — into "gate-enforce:<device>", and
+ * validate_turn would append its `validation` entry into whatever session
+ * id the caller's manifest named. Either lands, with a genuine K_chain
+ * HMAC and the next sequence number, in the middle of the daemon's own
+ * record of what it refused and executed on that device: a reader walking
+ * that session sees caller-chosen entries interleaved with the gate's,
+ * and with a native epoch configured the chain rewrites the id into the
+ * daemon's epoch namespace as well.
+ *
+ * The four prefixes are every session the daemon writes for itself
+ * (gate_emit_*, separator_refuse_chain, virp_approval.c,
+ * onode_emit_node_config). The epoch test covers what the review called
+ * the "native-epoch prefix": there is no such prefix — the epoch is a
+ * SUFFIX, "<session>@<epoch>", applied by chain_append_locked — so the
+ * equivalent refusal is an id that ends in the configured epoch marker.
+ *
+ * READ paths (chain_verify, chain_verify_session, list_sessions) are
+ * deliberately not restricted: auditing these sessions is the point.
+ */
+static bool onode_session_id_is_daemon_reserved(const onode_state_t *state,
+                                                const char *session_id)
+{
+    static const char *const PREFIXES[] = {
+        "gate-enforce:", "gate-separator:", "approval:", "node-config:",
+    };
+    if (!session_id) return false;
+    for (size_t i = 0; i < sizeof(PREFIXES) / sizeof(PREFIXES[0]); i++)
+        if (strncmp(session_id, PREFIXES[i], strlen(PREFIXES[i])) == 0)
+            return true;
+
+    const char *epoch = state->chain_enabled ? state->chain.native_epoch : "";
+    if (epoch[0]) {
+        size_t sl = strlen(session_id), el = strlen(epoch);
+        if (sl > el && session_id[sl - el - 1] == '@' &&
+            strcmp(session_id + sl - el, epoch) == 0)
+            return true;
+    }
+    return false;
+}
+
+/*
  * WHAT artifact_hash COMMITS TO — decided, not incidental (F2 follow-up).
  *
  * The commitment is over the FULL submitted message bytes, not over the
@@ -5575,6 +5621,20 @@ static void handle_client(onode_state_t *state, int client_fd,
          * mint their own hashes from bodies they built.
          */
 
+        /* GATE 0 — session namespace (M5). The daemon's own sessions are
+         * not appendable from the socket, whatever the type. Checked
+         * before the type gate so the refusal names the real reason. */
+        if (onode_session_id_is_daemon_reserved(state, req.session_id)) {
+            fprintf(stderr, "[O-Node] chain_append REJECTED: session '%s' "
+                    "is one of the daemon's own (gate / approval / "
+                    "node-config records) and may not be appended to by a "
+                    "socket client (uid=%u type=%s id=%s)\n",
+                    req.session_id, (unsigned)client_uid, req.artifact_type,
+                    req.artifact_id);
+            send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+            break;
+        }
+
         /* GATE 1 — type namespace. Daemon-minted semantic types are
          * refused outright, and unknown types are refused rather than
          * recorded as if they meant something. */
@@ -6309,6 +6369,30 @@ static void handle_client(onode_state_t *state, int client_fd,
 
         cJSON *mani  = cJSON_GetObjectItemCaseSensitive(root, "manifest");
         cJSON *prose = cJSON_GetObjectItemCaseSensitive(root, "prose");
+
+        /* The validator appends its `validation` entry to the session the
+         * MANIFEST names, falling back to the request's session_id. Both
+         * are caller-chosen, so both are held out of the daemon's own
+         * sessions (M5) before the validator runs. The manifest's field
+         * is read the way validator_parse_manifest reads it: a root-level
+         * string member. */
+        {
+            const cJSON *msid = cJSON_IsObject(mani)
+                ? cJSON_GetObjectItemCaseSensitive(mani, "session_id") : NULL;
+            const char *msid_s = (cJSON_IsString(msid) && msid->valuestring)
+                                 ? msid->valuestring : NULL;
+            if (onode_session_id_is_daemon_reserved(state, req.session_id) ||
+                onode_session_id_is_daemon_reserved(state, msid_s)) {
+                fprintf(stderr, "[O-Node] validate_turn REJECTED: the "
+                        "session it would record under ('%s') is one of "
+                        "the daemon's own (uid=%u)\n",
+                        msid_s ? msid_s : req.session_id,
+                        (unsigned)client_uid);
+                cJSON_Delete(root);
+                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+                break;
+            }
+        }
 
         char *mani_json = NULL;
         size_t mani_len = 0;
