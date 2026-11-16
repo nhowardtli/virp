@@ -377,27 +377,64 @@ static int load_uid_tier_ceilings(onode_state_t *state,
  * restrict fully unrestricted. Fail-closed instead — any malformed
  * value or unknown action name installs a DENY-ALL entry for that uid
  * and logs loudly; the uid keeps connecting but can do nothing until
- * the config is fixed. A non-numeric key names no uid to restrict and
- * is logged as an ERROR.
+ * the config is fixed.
+ *
+ * THE KEY IS A UID AND IS PARSED AS ONE (security review M24). It used
+ * to go through a bare strtoul() and a (uid_t) cast, which accepts far
+ * more than a uid and maps some of it onto the WRONG uid:
+ *     "-1"          -> 4294967295, i.e. (uid_t)-1, the daemon's own
+ *                      "unknown identity" sentinel
+ *     "4294967303"  -> wraps to uid 7: a rule written for a uid that
+ *                      does not exist lands on one that does
+ *     "+7", " 7"    -> uid 7, under a key no reviewer would read as "7"
+ * and a key that was not a number at all was logged and SKIPPED, leaving
+ * the uid the operator meant to restrict unrestricted by this map.
+ * parse_uid() — the function socket_allowed_uids already uses — takes
+ * decimal digits only, in range, and never the sentinel. Anything else
+ * is FATAL. So is the same uid appearing twice ("7" and "07"): the
+ * second entry used to replace the first without a word, and which of
+ * two contradictory action sets applies must not depend on key order.
+ * Returns 0, or -1 to refuse the config.
  */
-static void load_uid_action_allow(onode_state_t *state,
-                                  struct json_object *root)
+static int load_uid_action_allow(onode_state_t *state,
+                                 struct json_object *root)
 {
     struct json_object *obj;
-    if (!json_object_object_get_ex(root, "socket_uid_action_allow", &obj) ||
-        !json_object_is_type(obj, json_type_object)) {
-        return;  /* optional */
+    if (!json_object_object_get_ex(root, "socket_uid_action_allow", &obj))
+        return 0;  /* optional */
+    if (!json_object_is_type(obj, json_type_object)) {
+        fprintf(stderr, "[O-Node] FATAL: socket_uid_action_allow must be an "
+                        "object mapping uid to an action list\n");
+        return -1;
     }
 
+    uid_t seen[ONODE_MAX_ALLOWED_UIDS];
+    size_t seen_n = 0;
+
     json_object_object_foreach(obj, key, val) {
-        char *end = NULL;
-        unsigned long uidv = strtoul(key, &end, 10);
-        if (!end || *end != '\0') {
-            fprintf(stderr, "[O-Node] ERROR: socket_uid_action_allow key "
-                            "'%s' is not a numeric uid — this entry "
-                            "restricts NOBODY; fix the config\n", key);
-            continue;
+        uid_t parsed;
+        if (!parse_uid(key, &parsed)) {
+            fprintf(stderr, "[O-Node] FATAL: socket_uid_action_allow key "
+                            "'%s' is not a uid (decimal digits, in range). "
+                            "Refusing the config: an entry that names no "
+                            "uid restricts nobody.\n", key);
+            return -1;
         }
+        for (size_t i = 0; i < seen_n; i++)
+            if (seen[i] == parsed) {
+                fprintf(stderr, "[O-Node] FATAL: socket_uid_action_allow "
+                                "names uid %lu more than once (key '%s'). "
+                                "Refusing the config.\n",
+                        (unsigned long)parsed, key);
+                return -1;
+            }
+        if (seen_n >= ONODE_MAX_ALLOWED_UIDS) {
+            fprintf(stderr, "[O-Node] FATAL: socket_uid_action_allow has "
+                            "more than %d entries\n", ONODE_MAX_ALLOWED_UIDS);
+            return -1;
+        }
+        seen[seen_n++] = parsed;
+        unsigned long uidv = (unsigned long)parsed;
 
         onode_action_t actions[ONODE_MAX_UID_ACTIONS];
         size_t count = 0;
@@ -442,9 +479,12 @@ static void load_uid_action_allow(onode_state_t *state,
         virp_error_t err = onode_set_uid_actions(state, (uid_t)uidv,
                                                  actions, count);
         if (err != VIRP_OK) {
-            fprintf(stderr, "[O-Node] onode_set_uid_actions(uid %lu) "
+            /* The entry could not be installed at all, so not even the
+             * deny-all stands for this uid: refuse rather than leave it
+             * unrestricted by this map. */
+            fprintf(stderr, "[O-Node] FATAL: onode_set_uid_actions(uid %lu) "
                             "failed: %d\n", uidv, (int)err);
-            continue;
+            return -1;
         }
         fprintf(stderr, "[O-Node] uid %lu action allowlist: %zu "
                         "action(s)%s\n", uidv, count,
@@ -462,6 +502,7 @@ static void load_uid_action_allow(onode_state_t *state,
                             "no effect (connection would be refused)\n",
                     uidv);
     }
+    return 0;
 }
 
 /*
@@ -497,26 +538,51 @@ static char *load_socket_path_override(struct json_object *root)
  * A uid that may chain_append is restricted to exactly these artifact
  * types. onode_start() refuses to boot if any allowlisted uid whose
  * action set includes chain_append has no entry here. A malformed entry
- * installs a deny-all-types policy (fail closed) for that uid.
+ * installs a deny-all-types policy (fail closed) for that uid. The key
+ * is parsed with parse_uid() and a uid named twice is fatal, for the
+ * reasons given on load_uid_action_allow() (M24). Returns 0, or -1 to
+ * refuse the config.
  */
-static void load_uid_chain_append_types(onode_state_t *state,
-                                        struct json_object *root)
+static int load_uid_chain_append_types(onode_state_t *state,
+                                       struct json_object *root)
 {
     struct json_object *obj;
     if (!json_object_object_get_ex(root, "socket_uid_chain_append_types",
-                                   &obj) ||
-        !json_object_is_type(obj, json_type_object)) {
-        return;  /* optional; the boot invariant catches a missing one */
+                                   &obj))
+        return 0;  /* optional; the boot invariant catches a missing one */
+    if (!json_object_is_type(obj, json_type_object)) {
+        fprintf(stderr, "[O-Node] FATAL: socket_uid_chain_append_types must "
+                        "be an object mapping uid to a type list\n");
+        return -1;
     }
 
+    uid_t seen[ONODE_MAX_ALLOWED_UIDS];
+    size_t seen_n = 0;
+
     json_object_object_foreach(obj, key, val) {
-        char *end = NULL;
-        unsigned long uidv = strtoul(key, &end, 10);
-        if (!end || *end != '\0') {
-            fprintf(stderr, "[O-Node] ERROR: socket_uid_chain_append_types "
-                            "key '%s' is not a numeric uid\n", key);
-            continue;
+        uid_t parsed;
+        if (!parse_uid(key, &parsed)) {
+            fprintf(stderr, "[O-Node] FATAL: socket_uid_chain_append_types "
+                            "key '%s' is not a uid (decimal digits, in "
+                            "range). Refusing the config.\n", key);
+            return -1;
         }
+        for (size_t i = 0; i < seen_n; i++)
+            if (seen[i] == parsed) {
+                fprintf(stderr, "[O-Node] FATAL: "
+                                "socket_uid_chain_append_types names uid %lu "
+                                "more than once (key '%s'). Refusing the "
+                                "config.\n", (unsigned long)parsed, key);
+                return -1;
+            }
+        if (seen_n >= ONODE_MAX_ALLOWED_UIDS) {
+            fprintf(stderr, "[O-Node] FATAL: socket_uid_chain_append_types "
+                            "has more than %d entries\n",
+                    ONODE_MAX_ALLOWED_UIDS);
+            return -1;
+        }
+        seen[seen_n++] = parsed;
+        unsigned long uidv = (unsigned long)parsed;
         const char *types[ONODE_MAX_UID_CAPP_TYPES];
         size_t count = 0;
         bool malformed = false;
@@ -545,13 +611,15 @@ static void load_uid_chain_append_types(onode_state_t *state,
         virp_error_t err = onode_set_uid_chain_append_types(
                 state, (uid_t)uidv, types, count);
         if (err != VIRP_OK) {
-            fprintf(stderr, "[O-Node] onode_set_uid_chain_append_types(uid "
-                            "%lu) failed: %d\n", uidv, (int)err);
-            continue;
+            fprintf(stderr, "[O-Node] FATAL: "
+                            "onode_set_uid_chain_append_types(uid %lu) "
+                            "failed: %d\n", uidv, (int)err);
+            return -1;
         }
         fprintf(stderr, "[O-Node] uid %lu chain_append types: %zu%s\n",
                 uidv, count, count == 0 ? " (DENY-ALL)" : "");
     }
+    return 0;
 }
 
 static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
@@ -882,8 +950,13 @@ int load_devices(onode_state_t *state, const char *path)
         json_object_put(root);
         return -1;
     }
-    load_uid_action_allow(state, root);
-    load_uid_chain_append_types(state, root);
+    if (load_uid_action_allow(state, root) != 0 ||
+        load_uid_chain_append_types(state, root) != 0) {
+        fprintf(stderr, "[O-Node] FATAL: invalid socket_uid_action_allow or "
+                        "socket_uid_chain_append_types\n");
+        json_object_put(root);
+        return -1;
+    }
 
     /* Tier-enforcement gate (Phase B): override SHADOW/YELLOW defaults
      * from config if present. Installed before onode_start(). A strict

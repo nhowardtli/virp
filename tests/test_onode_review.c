@@ -3228,6 +3228,66 @@ static void t_M23_gate_config_values_are_strict(void)
 }
 
 /* =========================================================================
+ * M24 — the uid keys of the per-uid policy maps are parsed as uids
+ * ========================================================================= */
+
+static void t_M24_uid_keys_are_parsed_strictly(void)
+{
+    printf("\n  M24: per-uid action/type maps take real uids, each once\n");
+    static const char *const MAPS[] = {
+        "socket_uid_action_allow", "socket_uid_chain_append_types",
+    };
+    static const char *const VALUE[] = { "[\"health\"]", "[\"observation\"]" };
+    static const struct { const char *key; const char *what; } BAD[] = {
+        { "-1",         "\"-1\" (would be the unknown-identity sentinel)" },
+        { "4294967295", "\"4294967295\" ((uid_t)-1 spelled out)" },
+        { "4294967303", "\"4294967303\" (wraps to uid 7)" },
+        { "+7",         "\"+7\"" },
+        { " 7",         "\" 7\"" },
+        { "7x",         "\"7x\"" },
+        { "0x7",        "\"0x7\"" },
+        { "",           "an empty key" },
+        { "seven",      "\"seven\" (was: logged and skipped)" },
+    };
+    for (int m = 0; m < 2; m++) {
+        for (size_t i = 0; i < sizeof(BAD) / sizeof(BAD[0]); i++) {
+            char json[256], msg[200];
+            snprintf(json, sizeof(json), "{\"%s\":{\"%s\":%s},\"devices\":[]}",
+                     MAPS[m], BAD[i].key, VALUE[m]);
+            snprintf(msg, sizeof(msg), "%s: refused key %s", MAPS[m],
+                     BAD[i].what);
+            CHECK(cfg_load("m24-bad", json, NULL) == -1, msg);
+        }
+        char dup[256], msg[160];
+        snprintf(dup, sizeof(dup),
+                 "{\"%s\":{\"7\":%s,\"07\":[]},\"devices\":[]}",
+                 MAPS[m], VALUE[m]);
+        snprintf(msg, sizeof(msg),
+                 "%s: the same uid under two keys (\"7\", \"07\") is refused",
+                 MAPS[m]);
+        CHECK(cfg_load("m24-dup", dup, NULL) == -1, msg);
+        snprintf(dup, sizeof(dup), "{\"%s\":[7],\"devices\":[]}", MAPS[m]);
+        snprintf(msg, sizeof(msg), "%s: a non-object map is refused", MAPS[m]);
+        CHECK(cfg_load("m24-type", dup, NULL) == -1, msg);
+    }
+
+    static onode_state_t st;
+    CHECK(cfg_load("m24-ok",
+                   "{\"socket_uid_action_allow\":{\"7\":[\"health\"],"
+                   "\"8\":[\"chain_append\"]},"
+                   "\"socket_uid_chain_append_types\":{\"8\":[\"observation\"]},"
+                   "\"devices\":[]}", &st) == 0 &&
+          onode_uid_action_set_has(&st, 7, ONODE_ACTION_HEALTH) &&
+          !onode_uid_action_set_has(&st, 7, ONODE_ACTION_SHUTDOWN) &&
+          onode_uid_capp_type_allowed(&st, 8, "observation"),
+          "well-formed maps load and apply to exactly the uids written");
+    CHECK(!onode_uid_has_capp_policy(&st, (uid_t)-1) &&
+          !onode_uid_action_set_has(&st, (uid_t)-1, ONODE_ACTION_HEALTH),
+          "nothing was installed for the unknown-identity sentinel");
+    onode_destroy(&st);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -3288,6 +3348,7 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
                                               t_M22_explicit_allowlist_requires_ceilings },
     { "t_M22_shipped_templates_still_load",   t_M22_shipped_templates_still_load },
     { "t_M23_gate_config_values_are_strict",  t_M23_gate_config_values_are_strict },
+    { "t_M24_uid_keys_are_parsed_strictly",   t_M24_uid_keys_are_parsed_strictly },
     { "t_M18_shutdown_wakes_the_accept_loop", t_M18_shutdown_wakes_the_accept_loop },
     { "t_M18_shutdown_from_signal_handler",   t_M18_shutdown_from_signal_handler },
     { "t_M18_shutdown_before_start_is_not_lost",
