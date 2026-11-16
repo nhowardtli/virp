@@ -145,13 +145,104 @@ static bool json_extract_string_cjson(cJSON *root, const char *key,
     }
     if (out_len == 0 || strlen(item->valuestring) >= out_len) {
         /* Over-length: refuse the value. parse_request turns this into a
-         * refusal of the whole request for the chain fields, and every
-         * other optional field is left empty rather than half-copied. */
+         * refusal of the whole request for the chain fields; every other
+         * optional field goes through json_extract_optional_string below,
+         * which refuses the whole request as well (M2). */
         out[0] = '\0';
         return false;
     }
     snprintf(out, out_len, "%s", item->valuestring);
     return true;
+}
+
+/*
+ * Extract an OPTIONAL string field. Three outcomes, and the caller must
+ * tell them apart (security review M2):
+ *
+ *    0  absent, or JSON null — the field was not supplied; out is "".
+ *    1  supplied and copied.
+ *   -1  supplied but UNUSABLE — longer than the receiver, or not a
+ *       string at all. The caller refuses the WHOLE request.
+ *
+ * json_extract_string_cjson above already refuses to truncate, but it
+ * reports "over-length" and "absent" identically, and for every field
+ * outside the chain trio the parser then carried on with an empty value.
+ * So an intent_store whose constraints ran one byte over stored an
+ * intent with NO constraints, a 17-character client_nonce became a
+ * handshake with an all-zero nonce, and an over-long command was
+ * answered "missing command". Dropping a field the caller supplied is
+ * still reshaping the request — silently removing a constraint is worse
+ * than truncating one. Reject, never truncate; and never quietly omit.
+ *
+ * A wrong-typed value ("constraints": {...}, "device": 7) is refused for
+ * the same reason. JSON null is the one explicit way to say "no value"
+ * and is treated as absent.
+ */
+static int json_extract_optional_string(cJSON *root, const char *key,
+                                        char *out, size_t out_len)
+{
+    if (out_len) out[0] = '\0';
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!item || cJSON_IsNull(item))
+        return 0;
+    if (!cJSON_IsString(item) || item->valuestring == NULL)
+        return -1;
+    if (out_len == 0 || strlen(item->valuestring) >= out_len)
+        return -1;
+    snprintf(out, out_len, "%s", item->valuestring);
+    return 1;
+}
+
+/*
+ * Decode a hex field that must be EXACTLY `want` bytes — a nonce, a
+ * session id. virp_hex_decode() reports how many bytes it wrote and -1
+ * on a bad digit, and it writes as it goes: a caller that ignores the
+ * return (every handshake caller did, M2) is left with a buffer that is
+ * part decoded, part whatever it was before. "abcd" as a 16-byte session
+ * id decoded two bytes and left fourteen zeros; "zz" as a nonce decoded
+ * nothing and the handshake proceeded on an all-zero nonce. Decodes into
+ * a scratch buffer and copies only on an exact-length success, so `out`
+ * is either the whole value or untouched.
+ */
+static bool hex_decode_exact(const char *hex, uint8_t *out, size_t want)
+{
+    uint8_t tmp[32];
+    if (!hex || want == 0 || want > sizeof(tmp)) return false;
+    if (strlen(hex) != 2 * want) return false;
+    if (virp_hex_decode(hex, tmp, want) != (int)want) return false;
+    memcpy(out, tmp, want);
+    return true;
+}
+
+/*
+ * Parse a comma-separated list of small decimal integers ("2,1") into
+ * out[0..max). Strict: every token is 1-3 digits, 0..255, no blanks, no
+ * signs, no empty tokens, and no more than `max` of them. The handshake
+ * used strtok + atoi + a (uint8_t) cast here, so "x" was version 0,
+ * "258" was version 2, and tokens past the array bound were dropped —
+ * three quiet rewrites of what the client asked for. Returns the token
+ * count, or -1 to refuse.
+ */
+static int parse_u8_csv(const char *s, uint8_t *out, int max)
+{
+    int n = 0;
+    const char *p = s;
+    if (!s || !*s) return -1;
+    for (;;) {
+        unsigned v = 0;
+        int digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            if (++digits > 3) return -1;
+            v = v * 10 + (unsigned)(*p - '0');
+            p++;
+        }
+        if (digits == 0 || v > 255) return -1;
+        if (n >= max) return -1;
+        out[n++] = (uint8_t)v;
+        if (*p == '\0') return n;
+        if (*p != ',') return -1;
+        p++;
+    }
 }
 
 /*
@@ -533,10 +624,19 @@ static bool parse_request(const char *json, size_t json_len,
     }
 
 #define EXTRACT_STR(key, dst, sz)  json_extract_string_cjson(root, key, dst, sz)
+/* Optional field: absent is fine, present-but-unusable refuses the whole
+ * request (M2) — see json_extract_optional_string. */
+#define OPTIONAL_STR(key, dst, sz)                                        \
+    do {                                                                  \
+        if (json_extract_optional_string(root, key, dst, sz) < 0) {       \
+            cJSON_Delete(root);                                           \
+            return false;                                                 \
+        }                                                                 \
+    } while (0)
 
     /* Extract optional string fields */
-    EXTRACT_STR("device", req->device, sizeof(req->device));
-    EXTRACT_STR("command", req->command, sizeof(req->command));
+    OPTIONAL_STR("device", req->device, sizeof(req->device));
+    OPTIONAL_STR("command", req->command, sizeof(req->command));
 
     /*
      * Approval reference for apply. If present it must be exactly the
@@ -708,9 +808,9 @@ static bool parse_request(const char *json, size_t json_len,
     }
 
     /* Intent fields */
-    EXTRACT_STR("intent_id", req->intent_id, sizeof(req->intent_id));
-    EXTRACT_STR("intent_hash", req->intent_hash, sizeof(req->intent_hash));
-    EXTRACT_STR("confidence", req->confidence, sizeof(req->confidence));
+    OPTIONAL_STR("intent_id", req->intent_id, sizeof(req->intent_id));
+    OPTIONAL_STR("intent_hash", req->intent_hash, sizeof(req->intent_hash));
+    OPTIONAL_STR("confidence", req->confidence, sizeof(req->confidence));
     {
         uint64_t v = 0;
         if (json_extract_u64_bounded(root, "expires_at_ns",
@@ -734,17 +834,19 @@ static bool parse_request(const char *json, size_t json_len,
             return false;
         }
     }
-    EXTRACT_STR("intent_json", req->intent_json, sizeof(req->intent_json));
-    EXTRACT_STR("proposed_actions", req->proposed_actions,
-                sizeof(req->proposed_actions));
-    EXTRACT_STR("constraints", req->constraints, sizeof(req->constraints));
+    OPTIONAL_STR("intent_json", req->intent_json, sizeof(req->intent_json));
+    OPTIONAL_STR("proposed_actions", req->proposed_actions,
+                 sizeof(req->proposed_actions));
+    OPTIONAL_STR("constraints", req->constraints, sizeof(req->constraints));
 
-    /* Handshake fields */
-    EXTRACT_STR("client_id", req->client_id, sizeof(req->client_id));
-    EXTRACT_STR("client_nonce", req->client_nonce, sizeof(req->client_nonce));
-    EXTRACT_STR("server_nonce", req->server_nonce, sizeof(req->server_nonce));
-    EXTRACT_STR("versions", req->versions, sizeof(req->versions));
-    EXTRACT_STR("algorithms", req->algorithms, sizeof(req->algorithms));
+    /* Handshake fields. The nonces are sized for exactly 16 hex chars, so
+     * anything longer is refused here; shorter or non-hex is refused
+     * where they are decoded (hex_decode_exact, in the handshake cases). */
+    OPTIONAL_STR("client_id", req->client_id, sizeof(req->client_id));
+    OPTIONAL_STR("client_nonce", req->client_nonce, sizeof(req->client_nonce));
+    OPTIONAL_STR("server_nonce", req->server_nonce, sizeof(req->server_nonce));
+    OPTIONAL_STR("versions", req->versions, sizeof(req->versions));
+    OPTIONAL_STR("algorithms", req->algorithms, sizeof(req->algorithms));
 
     /*
      * supported_channels is a bitmask that gets cast to uint32_t later
@@ -763,6 +865,7 @@ static bool parse_request(const char *json, size_t json_len,
     }
 
 #undef EXTRACT_STR
+#undef OPTIONAL_STR
 
     cJSON_Delete(root);
     return true;
@@ -6103,32 +6206,32 @@ static void handle_client(onode_state_t *state, int client_fd,
         hello.msg_type = VIRP_MSG_SESSION_HELLO;
         snprintf(hello.client_id, sizeof(hello.client_id), "%s", req.client_id);
 
-        /* Parse versions: comma-separated string e.g. "2,1" */
+        /* Parse versions: comma-separated string e.g. "2,1". A list that
+         * does not parse cleanly refuses the handshake (M2) — it is what
+         * the negotiation is negotiated FROM. */
         if (req.versions[0]) {
-            char vtmp[32];
-            snprintf(vtmp, sizeof(vtmp), "%s", req.versions);
-            char *saveptr = NULL;
-            char *tok = strtok_r(vtmp, ",", &saveptr);
-            while (tok && hello.version_count < VIRP_MAX_VERSIONS) {
-                hello.versions[hello.version_count++] = (uint8_t)atoi(tok);
-                tok = strtok_r(NULL, ",", &saveptr);
+            int nv = parse_u8_csv(req.versions, hello.versions,
+                                  VIRP_MAX_VERSIONS);
+            if (nv < 0) {
+                send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+                break;
             }
+            hello.version_count = (uint8_t)nv;
         } else {
             hello.versions[0] = 2;
             hello.versions[1] = 1;
             hello.version_count = 2;
         }
 
-        /* Parse algorithms: comma-separated string */
+        /* Parse algorithms: comma-separated string, same strictness. */
         if (req.algorithms[0]) {
-            char atmp[32];
-            snprintf(atmp, sizeof(atmp), "%s", req.algorithms);
-            char *saveptr = NULL;
-            char *tok = strtok_r(atmp, ",", &saveptr);
-            while (tok && hello.algorithm_count < VIRP_MAX_ALGORITHMS) {
-                hello.algorithms[hello.algorithm_count++] = (uint8_t)atoi(tok);
-                tok = strtok_r(NULL, ",", &saveptr);
+            int na = parse_u8_csv(req.algorithms, hello.algorithms,
+                                  VIRP_MAX_ALGORITHMS);
+            if (na < 0) {
+                send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+                break;
             }
+            hello.algorithm_count = (uint8_t)na;
         } else {
             hello.algorithms[0] = VIRP_ALG_HMAC_SHA256;
             hello.algorithm_count = 1;
@@ -6136,9 +6239,16 @@ static void handle_client(onode_state_t *state, int client_fd,
 
         hello.supported_channels = (uint32_t)req.supported_channels;
 
-        /* Parse client_nonce from hex (8 bytes = 16 hex chars) */
-        if (req.client_nonce[0]) {
-            virp_hex_decode(req.client_nonce, hello.client_nonce, 8);
+        /* Parse client_nonce from hex (8 bytes = 16 hex chars). When the
+         * client supplies one it must be EXACTLY that: a short, odd or
+         * non-hex value used to leave hello.client_nonce part-decoded or
+         * all zero and the handshake went ahead anyway (M2). Absent is
+         * still accepted — the client chose to contribute no nonce, and
+         * the server's own is what keeps the session id fresh. */
+        if (req.client_nonce[0] &&
+            !hex_decode_exact(req.client_nonce, hello.client_nonce, 8)) {
+            send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+            break;
         }
 
         {
@@ -6201,15 +6311,20 @@ static void handle_client(onode_state_t *state, int client_fd,
         snprintf(bind_msg.server_id, sizeof(bind_msg.server_id),
                  "%s", state->ctx->session.server_id);
 
-        /* session_id from hex (reuse req.session_id, 16 bytes = 32 hex) */
-        if (req.session_id[0]) {
-            virp_hex_decode(req.session_id, bind_msg.session_id, 16);
+        /* session_id (16 bytes = 32 hex, reusing req.session_id) and both
+         * nonces (8 bytes = 16 hex each) are what BIND confirms, so all
+         * three are REQUIRED here and must decode to their exact lengths
+         * (M2). They used to be decoded only "if present" with the result
+         * ignored: a missing, short or malformed value left zero or
+         * part-decoded bytes for virp_handle_session_bind to compare,
+         * which refused it — but only because zeros happened not to
+         * match. Refuse it for what it is. */
+        if (!hex_decode_exact(req.session_id, bind_msg.session_id, 16) ||
+            !hex_decode_exact(req.client_nonce, bind_msg.client_nonce, 8) ||
+            !hex_decode_exact(req.server_nonce, bind_msg.server_nonce, 8)) {
+            send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+            break;
         }
-
-        if (req.client_nonce[0])
-            virp_hex_decode(req.client_nonce, bind_msg.client_nonce, 8);
-        if (req.server_nonce[0])
-            virp_hex_decode(req.server_nonce, bind_msg.server_nonce, 8);
 
         {
             struct timespec ts;

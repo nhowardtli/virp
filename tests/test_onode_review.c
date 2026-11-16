@@ -190,6 +190,70 @@ static virp_error_t fx_approve(fx_t *fx, const char *pid,
 }
 
 /* =========================================================================
+ * Socket harness: drive handle_client() itself over a socketpair.
+ *
+ * The request is written first and handle_client() is then called on the
+ * other end, on this thread: it reads one frame, answers, and closes. No
+ * listener, no worker thread, no SO_PEERCRED — the peer uid is the
+ * argument the accept loop would have threaded in. Returns the response
+ * payload length, or -1 if the daemon closed without answering. A 4-byte
+ * payload is a framed virp_error_t; fx_resp_err() decodes it.
+ * ========================================================================= */
+
+static ssize_t fx_request_raw(onode_state_t *st, uid_t uid,
+                              const void *payload, size_t plen,
+                              uint8_t *resp, size_t resp_cap)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    uint32_t n = htonl((uint32_t)plen + 1);
+    uint8_t ver = VIRP_FRAME_VERSION;
+    if (send(sv[0], &n, 4, 0) != 4 || send(sv[0], &ver, 1, 0) != 1 ||
+        (plen && send(sv[0], payload, plen, 0) != (ssize_t)plen)) {
+        close(sv[0]); close(sv[1]);
+        return -1;
+    }
+    handle_client(st, sv[1], uid);          /* closes sv[1] */
+
+    uint32_t rn = 0;
+    ssize_t got = recv(sv[0], &rn, 4, MSG_WAITALL);
+    if (got != 4) { close(sv[0]); return -1; }
+    rn = ntohl(rn);
+    if (rn > resp_cap) { close(sv[0]); return -1; }
+    if (rn && recv(sv[0], resp, rn, MSG_WAITALL) != (ssize_t)rn) {
+        close(sv[0]);
+        return -1;
+    }
+    close(sv[0]);
+    return (ssize_t)rn;
+}
+
+static ssize_t fx_request(onode_state_t *st, uid_t uid, const char *json,
+                          uint8_t *resp, size_t resp_cap)
+{
+    return fx_request_raw(st, uid, json, strlen(json), resp, resp_cap);
+}
+
+/* The framed error a response carries, or VIRP_OK if it is not one. */
+static virp_error_t fx_resp_err(const uint8_t *resp, ssize_t n)
+{
+    if (n != 4) return VIRP_OK;
+    uint32_t v;
+    memcpy(&v, resp, 4);
+    return (virp_error_t)(int32_t)ntohl(v);
+}
+
+/* One request, one answer: the error it was refused with (VIRP_OK if it
+ * was answered with something else). */
+static virp_error_t fx_ask(onode_state_t *st, uid_t uid, const char *json)
+{
+    static uint8_t resp[VIRP_MAX_MESSAGE_SIZE + 64];
+    ssize_t n = fx_request(st, uid, json, resp, sizeof(resp));
+    if (n < 0) return VIRP_ERR_NULL_PTR;
+    return fx_resp_err(resp, n);
+}
+
+/* =========================================================================
  * H1 — approved-apply replay guard
  *
  * The approval record on disk is three lines: the signed body, the
@@ -813,6 +877,99 @@ static void t_M1_whole_buffer_exact_length_no_duplicate_keys(void)
 }
 
 /* =========================================================================
+ * M2 — a supplied field that cannot be used refuses the request
+ * ========================================================================= */
+
+/* {"action":"heartbeat","<key>":"<n x's>"} */
+static bool m2_with_len(const char *key, size_t n)
+{
+    static char buf[8192];
+    int off = snprintf(buf, sizeof(buf), "{\"action\":\"heartbeat\",\"%s\":\"",
+                       key);
+    memset(buf + off, 'x', n);
+    snprintf(buf + off + n, sizeof(buf) - (size_t)off - n, "\"}");
+    return m1_parse(buf, strlen(buf));
+}
+
+static void t_M2_overlength_optional_field_rejects_request(void)
+{
+    printf("\n  M2: present-but-over-length optional fields reject the request\n");
+    /* Receiver widths from onode_request_t, including the NUL. */
+    static const struct { const char *key; size_t width; } F[] = {
+        { "device", 64 },          { "command", 1024 },
+        { "intent_id", 128 },      { "confidence", 16 },
+        { "intent_json", 4096 },   { "proposed_actions", 2048 },
+        { "constraints", 512 },    { "client_id", 64 },
+        { "client_nonce", 17 },    { "server_nonce", 17 },
+        { "versions", 32 },        { "algorithms", 32 },
+        { "intent_hash", 65 },
+    };
+    for (size_t i = 0; i < sizeof(F) / sizeof(F[0]); i++) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s: longest fitting value accepted, "
+                 "one byte more REJECTS the request", F[i].key);
+        CHECK(m2_with_len(F[i].key, F[i].width - 1) &&
+              !m2_with_len(F[i].key, F[i].width), msg);
+    }
+    CHECK(!m1_parse(M1_STR("{\"action\":\"heartbeat\",\"device\":7}")),
+          "a non-string device rejects the request");
+    CHECK(!m1_parse(M1_STR("{\"action\":\"heartbeat\","
+                           "\"constraints\":{\"max\":1}}")),
+          "an object where a string belongs rejects the request");
+    CHECK(m1_parse(M1_STR("{\"action\":\"heartbeat\",\"device\":null}")),
+          "JSON null is 'not supplied' and is accepted");
+}
+
+static void t_M2_handshake_hex_exact_length(void)
+{
+    printf("\n  M2: handshake hex fields decode to their exact length or refuse\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m2-hs")) { CHECK(false, "fixture"); return; }
+    onode_state_t *st = &fx->st;
+    uid_t me = getuid();
+#define M2_HELLO(extra) "{\"action\":\"session_hello\",\"client_id\":\"rev\"" extra "}"
+
+    CHECK(fx_ask(st, me, M2_HELLO(",\"client_nonce\":\"0011223344556677\""))
+              == VIRP_OK, "a 16-hex client_nonce is accepted");
+    CHECK(fx_ask(st, me, M2_HELLO(",\"client_nonce\":\"zz11223344556677\""))
+              == VIRP_ERR_INVALID_LENGTH, "a non-hex client_nonce is refused");
+    CHECK(fx_ask(st, me, M2_HELLO(",\"client_nonce\":\"00112233445566\""))
+              == VIRP_ERR_INVALID_LENGTH, "a short client_nonce is refused");
+    CHECK(fx_ask(st, me, M2_HELLO(",\"client_nonce\":\"001122334455667\""))
+              == VIRP_ERR_INVALID_LENGTH, "an odd-length client_nonce is refused");
+    CHECK(fx_ask(st, me, M2_HELLO(",\"versions\":\"2,x\""))
+              == VIRP_ERR_INVALID_LENGTH, "a non-numeric version token is refused");
+    CHECK(fx_ask(st, me, M2_HELLO(",\"versions\":\"258\""))
+              == VIRP_ERR_INVALID_LENGTH,
+          "version 258 is refused, not wrapped to 2");
+    CHECK(fx_ask(st, me, M2_HELLO(",\"versions\":\"1,2,3,4,5,6,7,8,9\""))
+              == VIRP_ERR_INVALID_LENGTH,
+          "more versions than the handshake holds is refused, not trimmed");
+    CHECK(fx_ask(st, me, M2_HELLO(",\"algorithms\":\"1,,2\""))
+              == VIRP_ERR_INVALID_LENGTH, "an empty algorithm token is refused");
+    CHECK(fx_ask(st, me, M2_HELLO(",\"versions\":\"2,1\",\"algorithms\":\"1\""))
+              == VIRP_OK, "well-formed lists still negotiate");
+
+    /* BIND: all three hex fields required, each at its exact length. */
+    CHECK(fx_ask(st, me, "{\"action\":\"session_bind\",\"client_id\":\"rev\","
+                 "\"session_id\":\"abcd\","
+                 "\"client_nonce\":\"0011223344556677\","
+                 "\"server_nonce\":\"0011223344556677\"}")
+              == VIRP_ERR_INVALID_LENGTH, "bind: a short session_id is refused");
+    CHECK(fx_ask(st, me, "{\"action\":\"session_bind\",\"client_id\":\"rev\","
+                 "\"session_id\":\"00112233445566778899aabbccddeeff\","
+                 "\"client_nonce\":\"0011223344556677\"}")
+              == VIRP_ERR_INVALID_LENGTH, "bind: a missing server_nonce is refused");
+    CHECK(fx_ask(st, me, "{\"action\":\"session_bind\",\"client_id\":\"rev\","
+                 "\"session_id\":\"00112233445566778899aabbccddeegg\","
+                 "\"client_nonce\":\"0011223344556677\","
+                 "\"server_nonce\":\"0011223344556677\"}")
+              == VIRP_ERR_INVALID_LENGTH, "bind: a non-hex session_id is refused");
+#undef M2_HELLO
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -827,6 +984,9 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_H4_challenge_consults_driver",       t_H4_challenge_consults_driver },
     { "t_M1_whole_buffer_exact_length_no_duplicate_keys",
                                               t_M1_whole_buffer_exact_length_no_duplicate_keys },
+    { "t_M2_overlength_optional_field_rejects_request",
+                                              t_M2_overlength_optional_field_rejects_request },
+    { "t_M2_handshake_hex_exact_length",      t_M2_handshake_hex_exact_length },
 };
 
 static void rm_rf_root(void)
