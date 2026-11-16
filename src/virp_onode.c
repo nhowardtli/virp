@@ -2700,8 +2700,11 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
         approval_proposer_with_uid(session_marker, client_uid, proposer,
                                    sizeof(proposer));
         /*
-         * ONE OPEN PROPOSAL PER (device, command hash, proposer), and a
-         * bounded number of new ones per uid (M16). Asked and answered
+         * A bounded number of new proposals per uid, always; and, only
+         * where state->proposal_dedupe is set, ONE OPEN PROPOSAL PER
+         * (device, command hash, proposer) (M16). Dedupe is opt-in
+         * because the port cage needs several distinct proposals for one
+         * command — see ONODE_PROPOSAL_CACHE in virp_onode.h. Asked and answered
          * under proposal_mutex so two identical refusals arriving
          * together file exactly one. A command that cannot be hashed
          * cannot be proposed at all (virp_approval_propose fails on the
@@ -2714,8 +2717,9 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
         char existing[33] = "";
 
         pthread_mutex_lock(&state->proposal_mutex);
-        if (hashed && proposal_cache_find(state, device_name, chash,
-                                          proposer, existing)) {
+        if (state->proposal_dedupe && hashed &&
+            proposal_cache_find(state, device_name, chash,
+                                proposer, existing)) {
             snprintf(proposal_tag, sizeof(proposal_tag), "proposal_id=%s ",
                      existing);
             fprintf(stderr, "[GATE] proposal reused: proposal=%s device=%s "

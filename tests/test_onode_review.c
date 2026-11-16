@@ -2446,6 +2446,17 @@ static void t_M16_open_proposals_are_deduplicated(void)
     const uid_t A = 4301, B = 4302;
     char first[33], again[33], other_uid[33], other_cmd[33], ws[33];
 
+    /* Off by default: the port cage files several proposals for one
+     * command on purpose and each must be distinct. */
+    char d1[33], d2[33];
+    snprintf(d1, sizeof(d1), "%s", m16_refuse(fx, "reload", A));
+    snprintf(d2, sizeof(d2), "%s", m16_refuse(fx, "reload", A));
+    CHECK(strlen(d1) == 32 && strlen(d2) == 32 && strcmp(d1, d2) != 0,
+          "by default a repeated refusal files a DISTINCT proposal");
+    fx_destroy(fx);
+    if (!fx_init(fx, "m16-dedupe-on")) { CHECK(false, "fixture"); return; }
+    fx->st.proposal_dedupe = true;
+
     snprintf(first, sizeof(first), "%s", m16_refuse(fx, "reload", A));
     CHECK(strlen(first) == 32, "the first refusal files a proposal");
     int chain0 = fx_session_entries(fx, "approval:" FX_DEV);
@@ -2506,8 +2517,14 @@ static void t_M16_proposals_are_rate_limited_per_uid(void)
 
     CHECK(strlen(m16_refuse(fx, "reload in 999", B)) == 32,
           "another uid still files");
+    CHECK(strlen(m16_refuse(fx, "reload in 3", A)) == 0,
+          "with dedupe off (the default) the limited uid gets no id even "
+          "for a command it already has an open proposal for");
+    fx->st.proposal_dedupe = true;
     CHECK(strlen(m16_refuse(fx, "reload in 3", A)) == 32,
-          "an already-open proposal is still handed back to the limited uid");
+          "with dedupe on, an already-open proposal is still handed back "
+          "to the limited uid");
+    fx->st.proposal_dedupe = false;
 
     /* The window turning over restores the allowance. */
     pthread_mutex_lock(&fx->st.proposal_mutex);

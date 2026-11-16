@@ -170,12 +170,22 @@ const char *onode_health_command(virp_vendor_t vendor);
  *       but carries no proposal id until the window turns over. The
  *       internal caller ((uid_t)-1) is not a socket principal and is not
  *       limited.
+ *
+ * DEDUPE IS OFF UNLESS state->proposal_dedupe IS SET, and nothing in
+ * this tree sets it outside the tests. The port cage
+ * (tools/cage/port_prepare.py) files SEVERAL proposals for one command
+ * on purpose — one single-use approval per verification step — and
+ * needs each to be a distinct proposal; answering the second with the
+ * first's id breaks it (found by tests/test_port_native_pipeline.py in
+ * CI). The rate limit is always on, and the burst is sized for that same
+ * client: one cage transaction files 8 proposals and its test runs
+ * several inside a window.
  */
 #ifndef ONODE_PROPOSAL_CACHE
 #define ONODE_PROPOSAL_CACHE       128
 #endif
 #ifndef ONODE_PROPOSAL_BURST
-#define ONODE_PROPOSAL_BURST       20
+#define ONODE_PROPOSAL_BURST       120
 #endif
 #ifndef ONODE_PROPOSAL_WINDOW_SEC
 #define ONODE_PROPOSAL_WINDOW_SEC  60
@@ -727,6 +737,8 @@ typedef struct {
      * proposal files one more, then dedupes again.
      */
     pthread_mutex_t     proposal_mutex;
+    bool                proposal_dedupe;   /* default false — see
+                                            * ONODE_PROPOSAL_CACHE */
     struct {
         bool        in_use;
         char        device[64];
