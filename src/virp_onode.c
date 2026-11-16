@@ -3369,9 +3369,17 @@ static virp_error_t onode_execute_policy_impl(onode_state_t *state,
         return onode_execute_legacy(state, device_name, command, obs_version,
             proposal_id, client_uid, out_buf, out_buf_len, out_len);
     *out_len = 0;
+    /* v3 needs a signed chain and a loaded observation key. It no longer
+     * needs them to be the SAME key (security review M21): the daemon
+     * used to refuse v3 unless the observation key's public half equalled
+     * the chain-signing key's, which made one Ed25519 key sign two
+     * unrelated kinds of statement — chain entries and device
+     * observations — so that rotating or compromising either meant
+     * rotating both. They are separate options now (-S and -O); the same
+     * key in both is still accepted, as the configuration deployed before
+     * the split. */
     if (!state->chain_enabled || !state->chain.sign_enabled ||
-        !state->obskey_loaded ||
-        memcmp(state->chain.sign_key.public_key, state->obskey.public_key, 32))
+        !state->obskey_loaded)
         return VIRP_ERR_KEY_NOT_LOADED;
     if (out_buf_len < VIRP_MAX_MESSAGE_SIZE) return VIRP_ERR_BUFFER_TOO_SMALL;
     char canonical[512];

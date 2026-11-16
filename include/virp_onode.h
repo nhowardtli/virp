@@ -277,15 +277,24 @@ typedef struct {
     virp_signing_key_t  okey;           /* THE key — never leaves this process */
 
     /*
-     * Observation-signing keypair (wire version 3). OPTIONAL: absent on
-     * every deployment that has not generated one, which is all of them
-     * today. Its ONLY use in the daemon is verifying v3 observation
-     * bodies submitted to CHAIN_APPEND; when it is not loaded, v3
-     * bodies are REFUSED rather than recorded unverified.
+     * Observation-signing keypair (wire version 3). OPTIONAL. Loaded
+     * from -O (virp-onode-prod). Two uses: verifying v3 observation
+     * bodies submitted to CHAIN_APPEND — when it is not loaded, v3 bodies
+     * are REFUSED rather than recorded unverified — and, under -3,
+     * signing execute observations.
+     *
+     * It is its OWN key (security review M21). It used to have to be the
+     * chain-signing key (-S): the daemon loaded it from that file and
+     * refused v3 unless the two public halves matched, so one Ed25519
+     * key vouched for both chain entries and device observations. -O
+     * names a separate file; -3 without -O still falls back to the -S
+     * key, with a warning, so an existing unit keeps starting.
      */
     virp_obskey_t       obskey;
     bool                obskey_loaded;
-    bool                execute_v3; /* opt-in -3; requires -S, same key */
+    bool                execute_v3; /* opt-in -3; needs a signed chain (-S)
+                                       and an observation key (-O, or the
+                                       -S key as a deprecated fallback) */
 
     /*
      * PREVIOUS O-Key — VERIFY-ONLY, TIME-BOUNDED. Optional.

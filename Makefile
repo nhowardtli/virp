@@ -2602,6 +2602,13 @@ test-onode-review: $(BUILD_DIR)/test_onode_review
 	./$(BUILD_DIR)/test_onode_review
 all-tests: test-onode-review
 
+# Command-line contract of the production daemon's main() (security review
+# M21, M26): things no unit test can reach. Needs only the binary.
+.PHONY: test-prod-cli
+test-prod-cli: $(ONODE_PROD)
+	tests/test_prod_cli.sh ./$(ONODE_PROD)
+all-tests: test-prod-cli
+
 .PHONY: test-execute-v3
 test-execute-v3: build/libvirp.a
 	$(CC) $(CFLAGS) tests/test_execute_v3.c build/libvirp.a $(LDFLAGS) -o build/test_execute_v3

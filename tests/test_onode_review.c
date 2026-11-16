@@ -2976,6 +2976,67 @@ static void t_M20_v1_sequence_survives_restart(void)
 }
 
 /* =========================================================================
+ * M21 — the observation key is its own key
+ * ========================================================================= */
+
+static void t_M21_v3_with_separate_observation_key(void)
+{
+    printf("\n  M21: v3 execute works when the observation key is NOT the chain-signing key\n");
+    fx_t *fx = &g_fx;
+    sqlite3 *db = NULL;
+    if (!h4_init(fx, "m21-keys", &db, "autonomous")) {
+        CHECK(false, "fixture (needs a plain build, without LINUX=1)");
+        return;
+    }
+    virp_policy_close(fx->st.policy);
+    fx->st.policy = NULL;
+    onode_state_t *st = &fx->st;
+    uid_t me = getuid();
+
+    /* Chain-signing key: one keypair. */
+    virp_obskey_t chain_key;
+    char kpath[200], ppath[200];
+    snprintf(kpath, sizeof(kpath), "%s/m21-keys/chain-sign.key", g_root);
+    snprintf(ppath, sizeof(ppath), "%s/m21-keys/chain-sign.pub", g_root);
+    CHECK(virp_obskey_generate(&chain_key) == VIRP_OK &&
+          virp_obskey_save(&chain_key, kpath, ppath) == VIRP_OK &&
+          virp_chain_enable_signing(&st->chain, kpath) == VIRP_OK,
+          "chain signing enabled with one key");
+    /* Observation key: a DIFFERENT keypair. */
+    CHECK(virp_obskey_generate(&st->obskey) == VIRP_OK &&
+          memcmp(st->obskey.public_key, chain_key.public_key, 32) != 0,
+          "the observation key is a different key");
+    st->obskey_loaded = true;
+
+    CHECK(m12_bind_session(fx, me), "session bound");
+    static uint8_t buf[VIRP_MAX_MESSAGE_SIZE];
+    size_t len = 0;
+    virp_error_t err = onode_execute_obs_ex(st, H4_DEV, "uptime", 3, NULL, me,
+                                            buf, sizeof(buf), &len);
+    CHECK(err == VIRP_OK && len > 0 && buf[0] == VIRP_VERSION_3 &&
+          h4_dispatches == 1,
+          "a v3 execute is served (it used to be refused: keys had to match)");
+    CHECK(err == VIRP_OK &&
+          virp_verify_observation_ed25519(st->obskey.public_key, buf, len,
+                                          NULL, NULL, NULL) == VIRP_OK,
+          "the observation verifies under the OBSERVATION key");
+    CHECK(err == VIRP_OK &&
+          virp_verify_observation_ed25519(chain_key.public_key, buf, len,
+                                          NULL, NULL, NULL) != VIRP_OK,
+          "and does NOT verify under the chain-signing key");
+
+    /* Still required: an observation key at all. */
+    st->obskey_loaded = false;
+    CHECK(onode_execute_obs_ex(st, H4_DEV, "uptime", 3, NULL, me, buf,
+                               sizeof(buf), &len) == VIRP_ERR_KEY_NOT_LOADED &&
+          h4_dispatches == 1,
+          "with no observation key loaded, v3 is refused before dispatch");
+    st->obskey_loaded = true;
+    fx_destroy(fx);
+    sqlite3_close(db);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -3029,6 +3090,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M20_second_instance_refuses_to_start",
                                               t_M20_second_instance_refuses_to_start },
     { "t_M20_v1_sequence_survives_restart",   t_M20_v1_sequence_survives_restart },
+    { "t_M21_v3_with_separate_observation_key",
+                                              t_M21_v3_with_separate_observation_key },
     { "t_M18_shutdown_wakes_the_accept_loop", t_M18_shutdown_wakes_the_accept_loop },
     { "t_M18_shutdown_from_signal_handler",   t_M18_shutdown_from_signal_handler },
     { "t_M18_shutdown_before_start_is_not_lost",

@@ -5,7 +5,9 @@
  *
  * Usage:
  *   virp-onode-prod [options]
- *     -k <okey_path>      Path to O-Key file (generates if absent)
+ *     -k <okey_path>      Path to O-Key file. REQUIRED, and the file must
+ *                         exist: the production daemon never generates an
+ *                         O-Key (virp-tool keygen okey <path> does).
  *     -K <prev_okey_path> Previous O-Key, VERIFY-ONLY, for the rotation
  *                         grace window. Lets observations minted before a
  *                         rotation still register instead of being lost.
@@ -1316,7 +1318,10 @@ static void usage(const char *prog)
     printf("Options:\n");
     printf("  -P <path>   Required root-owned owner policy (docs/BLACK-POLICY.md)\n");
     printf("  -J <path>   Required existing daemon-private persistent policy journal\n");
-    printf("  -k <path>   O-Key file path (generates new key if file doesn't exist)\n");
+    printf("  -k <path>   O-Key file (REQUIRED). The file must already exist,\n");
+    printf("              0600 and owned by the daemon user; this daemon\n");
+    printf("              never generates one. Create it with:\n");
+    printf("                virp-tool keygen okey <path>\n");
     printf("  -K <path>   PREVIOUS O-Key, VERIFY-ONLY, for the rotation grace\n");
     printf("              window. Observations minted before a rotation and\n");
     printf("              registered after it would otherwise be refused by\n");
@@ -1343,8 +1348,15 @@ static void usage(const char *prog)
     printf("              canonical bytes) so a third party can verify with\n");
     printf("              the public key alone. Requires -c/-C. Generate\n");
     printf("              with: virp-tool keygen chainsign <prefix>\n");
-    printf("  -3          Sign execute observations as v3 Ed25519 using -S.\n");
-    printf("              Requires an active bound session; no v1 fallback.\n");
+    printf("  -O <path>   Observation-signing Ed25519 SECRET key: verifies v3\n");
+    printf("              observation bodies submitted to chain_append and,\n");
+    printf("              with -3, signs execute observations. A key of its\n");
+    printf("              own — keep it distinct from -S. Generate with:\n");
+    printf("                virp-tool keygen obskey <prefix>\n");
+    printf("  -3          Sign execute observations as v3 Ed25519 with the -O\n");
+    printf("              key. Requires -S (a signed chain) and an active\n");
+    printf("              bound session; no v1 fallback. Without -O the -S\n");
+    printf("              key is used for both (DEPRECATED, warns at start).\n");
     printf("  -E <epoch>  Fresh native audit sessions (1..16 alnum/hyphen, requires -S).\n");
     printf("  -a <path>   Approval store dir (default: /var/lib/virp/approvals)\n");
     printf("  -A <path>   Approver registry (default: /etc/virp/approvers.json)\n");
@@ -1366,6 +1378,7 @@ int main(int argc, char **argv)
     bool execute_v3 = false;
     const char *native_epoch = NULL;
     const char *chain_sign_key_path = NULL;   /* D-1: -S, opt-in */
+    const char *obs_key_path = NULL;          /* -O: observation key (M21) */
     const char *approval_dir = "/var/lib/virp/approvals";
     const char *approvers_path = "/etc/virp/approvers.json";
     uint32_t node_id = 0x00000001;
@@ -1386,7 +1399,7 @@ int main(int argc, char **argv)
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "3k:K:W:s:d:n:c:C:S:E:a:A:P:J:h")) != -1) {
+    while ((opt = getopt(argc, argv, "3k:K:W:s:d:n:c:C:S:O:E:a:A:P:J:h")) != -1) {
         switch (opt) {
         case 'P': policy_path = optarg; break;
         case 'J': policy_journal = optarg; break;
@@ -1421,6 +1434,9 @@ int main(int argc, char **argv)
         case 'S':
             chain_sign_key_path = optarg;
             break;
+        case 'O':
+            obs_key_path = optarg;
+            break;
         case 'a':
             approval_dir = optarg;
             break;
@@ -1432,6 +1448,23 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return (opt == 'h') ? 0 : 1;
         }
+    }
+
+    /* -k is REQUIRED in production (security review M21). Without it
+     * onode_init() GENERATES an O-Key in memory — fine for the mock
+     * daemon, wrong here: every observation the node signed would be
+     * under a key that exists nowhere else and is gone at the next
+     * restart, so nothing it produced could be verified afterwards and
+     * chain_append would refuse the node's own earlier observations.
+     * The usage text also claimed a key is generated "if the file
+     * doesn't exist"; it never was — a missing file fails the load.
+     * Checked first, before any option that needs privileged files. */
+    if (!okey_path) {
+        fprintf(stderr, "FATAL: production requires -k <onode.key>. This "
+                "daemon does not generate an O-Key: without -k it would "
+                "sign with a throwaway key nothing could verify after a "
+                "restart. Create one with: virp-tool keygen okey <path>\n");
+        return 1;
     }
 
     if (!policy_path || !policy_journal || !devices_path ||
@@ -1630,13 +1663,42 @@ int main(int argc, char **argv)
         onode_destroy(&g_state); virp_context_destroy(ctx); return 1;
     }
 
-    if (execute_v3) {
-        if (!chain_sign_key_path ||
-            virp_obskey_load(&g_state.obskey, chain_sign_key_path) != VIRP_OK) {
-            fprintf(stderr, "[O-Node] -3 requires a valid -S signing key\n");
+    /* Observation key (M21). -O names it; it is a key of its own. -3
+     * without -O falls back to the chain-signing key, which is what -3
+     * always did — kept so a unit written before the split still starts,
+     * but it means one key signs both chain entries and observations,
+     * so it warns on every start until -O is added. */
+    const char *obs_from = obs_key_path;
+    if (execute_v3 && !obs_from) {
+        obs_from = chain_sign_key_path;
+        if (obs_from)
+            fprintf(stderr, "[O-Node] WARNING: -3 without -O — signing "
+                    "observations with the CHAIN-SIGNING key (-S %s). One "
+                    "key is vouching for two different things. Generate a "
+                    "separate observation key (virp-tool keygen obskey "
+                    "<prefix>) and pass it with -O. DEPRECATED.\n",
+                    obs_from);
+    }
+    if (obs_from) {
+        if (virp_obskey_load(&g_state.obskey, obs_from) != VIRP_OK) {
+            fprintf(stderr, "[O-Node] FATAL: observation key %s could not "
+                    "be loaded. Refusing to start.\n", obs_from);
             onode_destroy(&g_state); virp_context_destroy(ctx); return 1;
         }
         g_state.obskey_loaded = true;
+        if (obs_key_path && chain_sign_key_path && g_state.chain.sign_enabled &&
+            memcmp(g_state.chain.sign_key.public_key,
+                   g_state.obskey.public_key, 32) == 0)
+            fprintf(stderr, "[O-Node] WARNING: -O and -S are the SAME key. "
+                    "Accepted, but the point of -O is that they differ.\n");
+    }
+    if (execute_v3) {
+        if (!chain_sign_key_path || !g_state.obskey_loaded) {
+            fprintf(stderr, "[O-Node] FATAL: -3 requires -S (a signed "
+                    "chain) and an observation key (-O). Refusing to "
+                    "start.\n");
+            onode_destroy(&g_state); virp_context_destroy(ctx); return 1;
+        }
         g_state.execute_v3 = true;
     }
 
