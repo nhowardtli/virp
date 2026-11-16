@@ -970,6 +970,110 @@ static void t_M2_handshake_hex_exact_length(void)
 }
 
 /* =========================================================================
+ * M3 — the device name is validated at ingress, and an unknown one cannot
+ * name a chain session
+ * ========================================================================= */
+
+static int fx_session_entries(fx_t *fx, const char *session)
+{
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(fx->st.chain.db,
+            "SELECT COUNT(*) FROM chain_entries WHERE session_id = ?",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, session, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+static int fx_distinct_sessions(fx_t *fx, const char *like)
+{
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(fx->st.chain.db,
+            "SELECT COUNT(DISTINCT session_id) FROM chain_entries "
+            "WHERE session_id LIKE ?", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, like, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+static void t_M3_device_name_validated_at_ingress(void)
+{
+    printf("\n  M3: a non-canonical device name is refused at ingress\n");
+    CHECK(m1_parse(M1_STR("{\"action\":\"execute\",\"device\":\"R-1 core\","
+                          "\"command\":\"show version\"}")),
+          "an ordinary device name parses");
+    CHECK(!m1_parse(M1_STR("{\"action\":\"execute\",\"device\":\"R1\\\"x\","
+                           "\"command\":\"show version\"}")),
+          "a device name containing a quote is refused");
+    CHECK(!m1_parse(M1_STR("{\"action\":\"execute\",\"device\":\"R1\\nx\","
+                           "\"command\":\"show version\"}")),
+          "a device name containing a newline is refused");
+    CHECK(!m1_parse(M1_STR("{\"action\":\"execute\",\"device\":\"R1\\\\x\","
+                           "\"command\":\"show version\"}")),
+          "a device name containing a backslash is refused");
+    CHECK(!m1_parse(M1_STR("{\"action\":\"health\",\"device\":\"\xc0\xaf\"}")),
+          "a device name that is not well-formed UTF-8 is refused");
+
+    static batch_thread_arg_t args[ONODE_MAX_BATCH];
+    const char *bad = "{\"commands\":[{\"device\":\"R1\",\"command\":\"show version\"},"
+                      "{\"device\":\"R2\\\"x\",\"command\":\"show version\"}]}";
+    CHECK(parse_batch_commands(bad, strlen(bad), args, ONODE_MAX_BATCH) == 0,
+          "batch: one non-canonical device name refuses the batch");
+}
+
+static void t_M3_unknown_device_uses_fixed_separator_session(void)
+{
+    printf("\n  M3: separator refusals for unknown devices share ONE fixed session\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m3-sep")) { CHECK(false, "fixture"); return; }
+    uint8_t ot = 0;
+    char payload[2048];
+
+    /* A known device keeps its own session, as before. */
+    CHECK(fx_run(fx, FX_DEV, "show version ; reload", NULL, (uid_t)-1, &ot,
+                 payload, sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR,
+          "a separator-carrying command is refused");
+    CHECK(fx_session_entries(fx, "gate-separator:" FX_DEV) == 1,
+          "known device: recorded under gate-separator:<hostname>");
+
+    /* Three invented devices, one of them long enough that the session
+     * id built from it would not fit the 64-byte field. */
+    static const char *const GHOSTS[] = {
+        "ghost-one", "ghost-two",
+        "a-device-name-that-is-sixty-three-characters-long-xxxxxxxxxxxxx",
+    };
+    for (size_t i = 0; i < 3; i++) {
+        ot = 0;
+        CHECK(fx_run(fx, GHOSTS[i], "show version ; reload", NULL, (uid_t)-1,
+                     &ot, payload, sizeof(payload)) == 0 &&
+              ot == VIRP_OBS_ERROR,
+              "a separator-carrying command for an unknown device is refused");
+    }
+    CHECK(fx_session_entries(fx, "gate-separator:_unknown") == 3,
+          "all three are recorded under the ONE fixed session");
+    CHECK(fx_distinct_sessions(fx, "gate-separator:%") == 2,
+          "and the caller's device names minted no session of their own");
+
+    /* The reserved name cannot be a configured device. */
+    virp_device_t d;
+    memset(&d, 0, sizeof(d));
+    snprintf(d.hostname, sizeof(d.hostname), "_unknown");
+    snprintf(d.host, sizeof(d.host), "10.255.7.99");
+    d.vendor = VIRP_VENDOR_MOCK; d.node_id = 0x5EC0D0D9; d.enabled = true;
+    CHECK(onode_add_device(&fx->st, &d) != VIRP_OK,
+          "a device may not take the reserved name");
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -987,6 +1091,9 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M2_overlength_optional_field_rejects_request",
                                               t_M2_overlength_optional_field_rejects_request },
     { "t_M2_handshake_hex_exact_length",      t_M2_handshake_hex_exact_length },
+    { "t_M3_device_name_validated_at_ingress", t_M3_device_name_validated_at_ingress },
+    { "t_M3_unknown_device_uses_fixed_separator_session",
+                                              t_M3_unknown_device_uses_fixed_separator_session },
 };
 
 static void rm_rf_root(void)

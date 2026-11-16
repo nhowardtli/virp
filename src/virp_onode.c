@@ -638,6 +638,16 @@ static bool parse_request(const char *json, size_t json_len,
     OPTIONAL_STR("device", req->device, sizeof(req->device));
     OPTIONAL_STR("command", req->command, sizeof(req->command));
 
+    /* The device name is not just a lookup key (security review M3): it
+     * is echoed into signed ERROR observations, into chain record bodies
+     * and — for a refusal — into a chain SESSION ID. Hold it to the
+     * canonical-string rule the chain itself enforces, here, so a name
+     * the chain would refuse never gets as far as being looked up. */
+    if (req->device[0] && !onode_canonical_string_ok(req->device)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
     /*
      * Approval reference for apply. If present it must be exactly the
      * 32-lowercase-hex proposal id — anything else rejects the request
@@ -2191,6 +2201,12 @@ static void approval_proposer_id(onode_state_t *state, int obs_version,
     snprintf(out, out_len, "unauthenticated-v1");
 }
 
+/* The one chain session every separator refusal for a device this node
+ * does not serve is filed under (M3). A leading underscore is not a
+ * legal hostname start, and onode_add_device() refuses the name outright
+ * so no configured device can ever share the session. */
+#define ONODE_SEPARATOR_UNKNOWN_DEVICE "_unknown"
+
 /* =========================================================================
  * Ingress separator refusal — the chain record.
  *
@@ -2214,9 +2230,18 @@ static void approval_proposer_id(onode_state_t *state, int obs_version,
  *
  *  - Its own session id (gate-separator:<device>, not
  *    gate-enforce:<device>) and refusal_stage=ingress-separator. The
- *    refusal happens before dev_idx and the driver are resolved and
- *    before any classifier runs, so there is no driver name and no
- *    real tier to record. UNCLASSIFIED appears in the body for the same
+ *    refusal happens before the driver is resolved and before any
+ *    classifier runs, so there is no driver name and no real tier to
+ *    record. The device IS resolved first, but only to choose the
+ *    session: `session_device` is the configured hostname for a device
+ *    this node serves and the fixed ONODE_SEPARATOR_UNKNOWN_DEVICE
+ *    otherwise (security review M3). The session id used to be built
+ *    from the request's device string as given, so any client allowed
+ *    to execute could mint an unbounded number of chain sessions with
+ *    names of its choosing — one per invented device — and a name too
+ *    long for the session-id field was truncated into someone else's.
+ *    The body still records the name the caller CLAIMED, in `device`:
+ *    that is evidence, and cJSON escapes it. UNCLASSIFIED appears in the body for the same
  *    reason it appears in the observation — audit honesty about what
  *    was never classified — and refusal_stage is what stops a reader
  *    concluding that a tier decision blocked this.
@@ -2225,6 +2250,7 @@ static void approval_proposer_id(onode_state_t *state, int obs_version,
  * never weakens the refusal, which has already been decided.
  * ========================================================================= */
 static void separator_refuse_chain(onode_state_t *state,
+                                   const char *session_device,
                                    const char *device_name,
                                    const char *command,
                                    const char *why,
@@ -2235,7 +2261,7 @@ static void separator_refuse_chain(onode_state_t *state,
 
     char session_id[96];
     snprintf(session_id, sizeof(session_id), "gate-separator:%s",
-             device_name);
+             session_device);
 
     /* cJSON does the escaping: `command` is attacker-controlled and by
      * definition contains bytes we refused, so it must never be pasted
@@ -2245,6 +2271,11 @@ static void separator_refuse_chain(onode_state_t *state,
     if (o) {
         cJSON_AddStringToObject(o, "schema", "gate_rejection/1");
         cJSON_AddStringToObject(o, "device", device_name);
+        /* Additive: false when `device` is only what the caller claimed
+         * and this node serves no such device. */
+        cJSON_AddBoolToObject(o, "device_known",
+                              strcmp(session_device,
+                                     ONODE_SEPARATOR_UNKNOWN_DEVICE) != 0);
         cJSON_AddStringToObject(o, "refusal_stage", "ingress-separator");
         cJSON_AddStringToObject(o, "command", command);
         cJSON_AddStringToObject(o, "classified_tier", "UNCLASSIFIED");
@@ -2838,8 +2869,15 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
             snprintf(err_msg, sizeof(err_msg),
                      "ERROR: multi-command / illegal separator rejected "
                      "for '%s': %s", device_name, why);
-            separator_refuse_chain(state, device_name, command, why,
-                                   err_msg);
+            /* Resolve the device BEFORE recording, so the chain session
+             * is one this node owns and not one the caller named (M3).
+             * Nothing else about the ordering moves: this is still ahead
+             * of the v2 canonicalization probe and of every classifier. */
+            const char *session_device =
+                find_device(state, device_name) >= 0
+                    ? device_name : ONODE_SEPARATOR_UNKNOWN_DEVICE;
+            separator_refuse_chain(state, session_device, device_name,
+                                   command, why, err_msg);
             log_error_obs(device_name, VIRP_TIER_UNCLASSIFIED, err_msg);
             return virp_build_observation_tiered(
                         out_buf, out_buf_len, out_len,
@@ -4284,6 +4322,11 @@ static int parse_batch_commands(const char *json, size_t json_len,
             !json_extract_string_cjson(item, "command", args[count].command,
                                        sizeof(args[count].command)) ||
             !args[count].device[0] || !args[count].command[0]) {
+            cJSON_Delete(root);
+            return 0;
+        }
+        /* Same device-name rule as the single path (M3). */
+        if (!onode_canonical_string_ok(args[count].device)) {
             cJSON_Delete(root);
             return 0;
         }
@@ -6833,6 +6876,15 @@ virp_error_t onode_add_device(onode_state_t *state,
 
     if (state->device_count >= ONODE_MAX_DEVICES)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
+
+    /* Reserved: the chain session for separator refusals naming a device
+     * this node does not serve (M3). A real device by this name would
+     * have its refusals mixed with every unknown caller's. */
+    if (strcmp(device->hostname, ONODE_SEPARATOR_UNKNOWN_DEVICE) == 0) {
+        fprintf(stderr, "[O-Node] FATAL: device hostname '%s' is reserved "
+                "for the daemon's own chain records\n", device->hostname);
+        return VIRP_ERR_DUPLICATE_DEVICE;
+    }
 
     memcpy(&state->devices[state->device_count], device, sizeof(*device));
 
