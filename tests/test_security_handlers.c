@@ -18,15 +18,18 @@ int main(void)
     assert(json[0] == 0);
 
     batch_thread_arg_t args[ONODE_MAX_BATCH] = {0};
-    assert(parse_batch_commands("{\"commands\":[{\"device\":\"R1\",\"command\":\"show version\"}]}",
-                                args, ONODE_MAX_BATCH) == 1);
+    /* parse_batch_commands takes the frame's declared payload length
+     * (security review M1); these are plain C strings, so strlen. */
+    const char *one = "{\"commands\":[{\"device\":\"R1\",\"command\":\"show version\"}]}";
+    assert(parse_batch_commands(one, strlen(one), args, ONODE_MAX_BATCH) == 1);
     char longcmd[1025], request[1400];
     memset(longcmd, 'x', 1024); longcmd[1024] = 0;
     snprintf(request, sizeof(request),
         "{\"commands\":[{\"device\":\"R1\",\"command\":\"show version\"},"
         "{\"device\":\"R1\",\"command\":\"%s\"}]}", longcmd);
-    assert(parse_batch_commands(request, args, ONODE_MAX_BATCH) == 0);
-    assert(parse_batch_commands("{\"commands\":[false]}", args, ONODE_MAX_BATCH) == 0);
+    assert(parse_batch_commands(request, strlen(request), args, ONODE_MAX_BATCH) == 0);
+    const char *notobj = "{\"commands\":[false]}";
+    assert(parse_batch_commands(notobj, strlen(notobj), args, ONODE_MAX_BATCH) == 0);
 
     onode_state_t state;
     assert(onode_init(&state, 1, NULL, "/tmp/unused-security-regressions.sock") == VIRP_OK);

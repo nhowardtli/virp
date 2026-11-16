@@ -719,6 +719,100 @@ static void t_H4_challenge_consults_driver(void)
 }
 
 /* =========================================================================
+ * M1 — the request the daemon parses is the request that was sent
+ *
+ * Driven through onode_parse_request_fuzz(), the exported (bytes, length)
+ * entry the socket path's parser sits behind, and through the batch
+ * parser with an explicit length.
+ * ========================================================================= */
+
+static bool m1_parse(const char *bytes, size_t n)
+{
+    return onode_parse_request_fuzz((const uint8_t *)bytes, n);
+}
+#define M1_STR(s) (s), strlen(s)
+/* For literals with an embedded NUL, where strlen would stop early. */
+#define M1_LIT(s) (s), (sizeof(s) - 1)
+
+static void t_M1_whole_buffer_exact_length_no_duplicate_keys(void)
+{
+    printf("\n  M1: whole buffer, exact length, no duplicate root keys\n");
+
+    CHECK(m1_parse(M1_STR("{\"action\":\"heartbeat\"}")),
+          "a plain request parses");
+    CHECK(m1_parse(M1_STR("{\"action\":\"heartbeat\"} \n\t ")),
+          "trailing whitespace is still fine");
+
+    CHECK(!m1_parse(M1_STR("{\"action\":\"heartbeat\"}"
+                           "{\"action\":\"shutdown\"}")),
+          "a second object after the first is refused");
+    CHECK(!m1_parse(M1_STR("{\"action\":\"heartbeat\"} x")),
+          "trailing garbage is refused");
+    CHECK(!m1_parse(M1_STR("{\"action\":\"heartbeat\"},")),
+          "a trailing comma is refused");
+
+    CHECK(!m1_parse(M1_LIT("{\"action\":\"heartbeat\"}\0"
+                           "{\"action\":\"shutdown\"}")),
+          "a raw NUL inside the declared length is refused");
+    CHECK(!m1_parse(M1_LIT("{\"action\":\"heartbeat\"}\0")),
+          "a payload one NUL longer than its text is refused");
+
+    CHECK(!m1_parse(M1_STR("{\"action\":\"heartbeat\","
+                           "\"action\":\"shutdown\"}")),
+          "a duplicate action key is refused");
+    CHECK(!m1_parse(M1_STR("{\"action\":\"execute\",\"device\":\"R1\","
+                           "\"command\":\"show version\","
+                           "\"command\":\"reload\"}")),
+          "a duplicate command key is refused");
+    CHECK(!m1_parse(M1_STR("{\"action\":\"execute\",\"device\":\"R1\","
+                           "\"command\":\"show version\","
+                           "\"note\":1,\"note\":2}")),
+          "a duplicate of a key the daemon does not even read is refused");
+    CHECK(m1_parse(M1_STR("{\"action\":\"execute\",\"device\":\"R1\","
+                          "\"command\":\"show version\","
+                          "\"meta\":{\"a\":1,\"a\":2}}")),
+          "only ROOT keys are policed here (nested objects are not ours to read)");
+
+    /* More root members than the wire vocabulary could ever need. */
+    char many[4096];
+    size_t off = (size_t)snprintf(many, sizeof(many), "{\"action\":\"heartbeat\"");
+    for (int i = 0; i < ONODE_MAX_ROOT_KEYS; i++)
+        off += (size_t)snprintf(many + off, sizeof(many) - off,
+                                ",\"k%d\":%d", i, i);
+    snprintf(many + off, sizeof(many) - off, "}");
+    CHECK(!m1_parse(M1_STR(many)),
+          "a root object with more members than the cap is refused");
+
+    /* The batch parser is a second, independent parse of the same frame. */
+    static batch_thread_arg_t args[ONODE_MAX_BATCH];
+    const char *ok = "{\"action\":\"batch_execute\",\"commands\":"
+                     "[{\"device\":\"R1\",\"command\":\"show version\"}]}";
+    CHECK(parse_batch_commands(ok, strlen(ok), args, ONODE_MAX_BATCH) == 1,
+          "a plain batch parses");
+    const char *trail = "{\"commands\":[{\"device\":\"R1\","
+                        "\"command\":\"show version\"}]}"
+                        "{\"commands\":[]}";
+    CHECK(parse_batch_commands(trail, strlen(trail), args, ONODE_MAX_BATCH) == 0,
+          "batch: a second object after the first is refused");
+    const char *dupc = "{\"commands\":[{\"device\":\"R1\","
+                       "\"command\":\"show version\"}],"
+                       "\"commands\":[{\"device\":\"R1\","
+                       "\"command\":\"reload\"}]}";
+    CHECK(parse_batch_commands(dupc, strlen(dupc), args, ONODE_MAX_BATCH) == 0,
+          "batch: a duplicate commands key is refused");
+    const char *dupi = "{\"commands\":[{\"device\":\"R1\","
+                       "\"command\":\"show version\","
+                       "\"command\":\"reload\"}]}";
+    CHECK(parse_batch_commands(dupi, strlen(dupi), args, ONODE_MAX_BATCH) == 0,
+          "batch: a duplicate key inside an item is refused");
+    static const char nul[] = "{\"commands\":[{\"device\":\"R1\","
+                              "\"command\":\"show version\"}]}\0"
+                              "{\"commands\":[]}";
+    CHECK(parse_batch_commands(nul, sizeof(nul) - 1, args, ONODE_MAX_BATCH) == 0,
+          "batch: a raw NUL inside the declared length is refused");
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -731,6 +825,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_H3_uid_ceiling_contract",            t_H3_uid_ceiling_contract },
     { "t_H4_policy_mode_consults_driver",     t_H4_policy_mode_consults_driver },
     { "t_H4_challenge_consults_driver",       t_H4_challenge_consults_driver },
+    { "t_M1_whole_buffer_exact_length_no_duplicate_keys",
+                                              t_M1_whole_buffer_exact_length_no_duplicate_keys },
 };
 
 static void rm_rf_root(void)

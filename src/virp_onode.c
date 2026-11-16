@@ -62,6 +62,11 @@ static _Thread_local bool execute_wrapping_v3;
  * fields that feed into unsigned receiver types (supported_channels,
  * sequence numbers, expires_at_ns) are range-checked: negatives and
  * values above the receiver's max are rejected outright.
+ *
+ * Both ingress parsers start at onode_parse_root_object() (security
+ * review M1): the whole frame payload must be one JSON object and
+ * nothing else, of exactly the declared length, with no root key
+ * repeated.
  * ========================================================================= */
 
 typedef struct {
@@ -353,6 +358,92 @@ static bool json_has_nul_escape(const char *json)
 }
 
 /*
+ * Parse a request frame into its root JSON object — the ONE structural
+ * gate both ingress parsers (parse_request, parse_batch_commands) go
+ * through, so they cannot disagree about what a well-formed request is.
+ * Returns the root object (caller cJSON_Delete()s it) or NULL.
+ *
+ * Security review M1. Everything refused here is a way for the request
+ * the daemon acts on to differ from the request that was sent:
+ *
+ *  - LENGTH. `len` is the payload length the frame header declared. A raw
+ *    NUL byte inside it ends the C string early, so every strlen-based
+ *    reader saw a shorter request than the frame carried and the tail
+ *    was dropped without a word. Refused: the payload must be exactly
+ *    `len` bytes of text.
+ *  - WHOLE BUFFER. cJSON_Parse stops at the end of the first value and
+ *    ignores whatever follows, so `{"action":"heartbeat"}{"action":
+ *    "shutdown"}` was a valid heartbeat. cJSON_ParseWithLengthOpts with
+ *    require_null_terminated accepts trailing whitespace and nothing
+ *    else. (It wants the terminator counted in the length — hence len+1;
+ *    json[len] is the NUL the caller wrote.)
+ *  - ROOT OBJECT. A bare array or string parses but has no keys, which
+ *    would bypass the action gate.
+ *  - DUPLICATE ROOT KEYS. cJSON_GetObjectItemCaseSensitive returns the
+ *    FIRST member of a name; Python's json, Go's encoding/json and most
+ *    other readers keep the LAST. A request carrying a key twice is
+ *    therefore two different requests depending on who reads it — the
+ *    same first-vs-last split GATE 4 refuses in a fed_outcome. Refused
+ *    outright rather than resolved either way.
+ *  - MEMBER COUNT. The duplicate scan is quadratic, and the wire
+ *    vocabulary is about forty keys; a root object with more members
+ *    than ONODE_MAX_ROOT_KEYS is refused before the scan, so a 128 KiB
+ *    frame of junk keys cannot buy a few hundred million comparisons.
+ *
+ * Also carries the encoded-NUL check (json_has_nul_escape), which used
+ * to be repeated at the top of each parser.
+ */
+#define ONODE_MAX_ROOT_KEYS 64
+
+static bool json_object_has_duplicate_keys(const cJSON *obj, int max_keys)
+{
+    int n = 0;
+    for (const cJSON *a = obj->child; a; a = a->next) {
+        if (++n > max_keys)
+            return true;              /* too many to vouch for: refuse */
+        if (!a->string)
+            continue;
+        for (const cJSON *b = a->next; b; b = b->next)
+            if (b->string && strcmp(a->string, b->string) == 0)
+                return true;
+    }
+    return false;
+}
+
+static cJSON *onode_parse_root_object(const char *json, size_t len,
+                                      const char *what)
+{
+    if (!json) return NULL;
+
+    if (memchr(json, '\0', len) != NULL) {
+        fprintf(stderr, "[O-Node] %s carries a raw NUL byte inside its "
+                        "declared length — refusing the whole request; the "
+                        "bytes after it would have been dropped unread\n",
+                what);
+        return NULL;
+    }
+
+    /* Length divergence: refuse a request carrying an encoded NUL before
+     * anything copies a field out of it. */
+    if (json_has_nul_escape(json)) {
+        fprintf(stderr, "[O-Node] %s contains an encoded NUL "
+                        "(\\u0000) — refusing the whole request; a value "
+                        "that continues past a NUL is not the value that "
+                        "would be executed\n", what);
+        return NULL;
+    }
+
+    cJSON *root = cJSON_ParseWithLengthOpts(json, len + 1, NULL, 1);
+    if (!root) return NULL;
+    if (!cJSON_IsObject(root) ||
+        json_object_has_duplicate_keys(root, ONODE_MAX_ROOT_KEYS)) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+    return root;
+}
+
+/*
  * The wire name ↔ action table — the ONE list parse_request and the
  * socket_uid_action_allow config loader both read, so the dispatch and
  * the policy can never disagree about what an action is called.
@@ -410,34 +501,22 @@ static void onode_session_lock(onode_state_t *state)
     if (state->ctx) (void)virp_session_check_timeouts(state->ctx);
 }
 
-static bool parse_request(const char *json, onode_request_t *req)
+/*
+ * `json_len` is the payload length the frame declared; json[json_len]
+ * must be the terminating NUL (handle_client writes it). The length is
+ * an argument, not a strlen(), on purpose: see onode_parse_root_object.
+ */
+static bool parse_request(const char *json, size_t json_len,
+                          onode_request_t *req)
 {
     if (!json || !req) return false;
 
     memset(req, 0, sizeof(*req));
 
-    /* Length divergence: refuse a request carrying an encoded NUL before
-     * anything copies a field out of it. */
-    if (json_has_nul_escape(json)) {
-        fprintf(stderr, "[O-Node] request contains an encoded NUL "
-                        "(\\u0000) — refusing the whole request; a value "
-                        "that continues past a NUL is not the value that "
-                        "would be executed\n");
-        return false;
-    }
-
-    /*
-     * Structural validation: cJSON_Parse rejects malformed JSON. We
-     * additionally require the root be an object — a bare array or
-     * string parses successfully but has no keys to look up, which
-     * would silently bypass the action gate.
-     */
-    cJSON *root = cJSON_Parse(json);
+    /* Structural validation — whole buffer, exact length, root object,
+     * no duplicate root keys, no encoded NUL (M1). */
+    cJSON *root = onode_parse_root_object(json, json_len, "request");
     if (!root) return false;
-    if (!cJSON_IsObject(root)) {
-        cJSON_Delete(root);
-        return false;
-    }
 
     /* Action (required) */
     char action_str[32];
@@ -4056,23 +4135,15 @@ static void *batch_execute_thread(void *arg)
  * Parse batch commands from JSON "commands" array.
  * Returns count of commands parsed (0 on error/empty).
  */
-static int parse_batch_commands(const char *json,
+static int parse_batch_commands(const char *json, size_t json_len,
                                  batch_thread_arg_t *args,
                                  int max_cmds)
 {
-    /* Same ingress rule as the single path — the batch array is exactly
-     * where a smuggled NUL would be cheapest to hide. */
-    if (json_has_nul_escape(json)) {
-        fprintf(stderr, "[O-Node] batch contains an encoded NUL "
-                        "(\\u0000) — refusing the whole batch\n");
-        return 0;
-    }
-    cJSON *root = cJSON_Parse(json);
+    /* Same ingress rules as the single path, from the same function —
+     * the batch array is exactly where a smuggled NUL, a trailing second
+     * object or a repeated key would be cheapest to hide. */
+    cJSON *root = onode_parse_root_object(json, json_len, "batch");
     if (!root) return 0;
-    if (!cJSON_IsObject(root)) {
-        cJSON_Delete(root);
-        return 0;
-    }
 
     cJSON *commands = cJSON_GetObjectItemCaseSensitive(root, "commands");
     if (!cJSON_IsArray(commands)) {
@@ -4092,6 +4163,15 @@ static int parse_batch_commands(const char *json,
          * whole batch rather than silently dropping the field (the
          * unknown-field standard from the obs_version fix). */
         if (cJSON_GetObjectItemCaseSensitive(item, "proposal_id")) {
+            cJSON_Delete(root);
+            return 0;
+        }
+
+        /* A repeated "device" or "command" inside one item is the same
+         * first-vs-last ambiguity as a repeated root key (M1): the daemon
+         * would execute the first while a reader of the request sees the
+         * last. Refuse the whole batch. */
+        if (json_object_has_duplicate_keys(item, ONODE_MAX_ROOT_KEYS)) {
             cJSON_Delete(root);
             return 0;
         }
@@ -4900,9 +4980,10 @@ static void handle_client(onode_state_t *state, int client_fd,
     memcpy(recv_buf, frame_buf + 1, json_len);
     recv_buf[json_len] = '\0';
 
-    /* Parse request */
+    /* Parse request. json_len is passed down so the parser can refuse a
+     * payload whose text is shorter than the frame said it was (M1). */
     onode_request_t req;
-    if (!parse_request(recv_buf, &req)) {
+    if (!parse_request(recv_buf, json_len, &req)) {
         /* Bad request — send error code */
         send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
         close(client_fd);
@@ -5763,7 +5844,8 @@ static void handle_client(onode_state_t *state, int client_fd,
         batch_thread_arg_t args[ONODE_MAX_BATCH];
         memset(args, 0, sizeof(args));
 
-        int cmd_count = parse_batch_commands(recv_buf, args, ONODE_MAX_BATCH);
+        int cmd_count = parse_batch_commands(recv_buf, json_len, args,
+                                             ONODE_MAX_BATCH);
         if (cmd_count <= 0) {
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
@@ -5872,9 +5954,11 @@ static void handle_client(onode_state_t *state, int client_fd,
             break;
         }
 
-        cJSON *root = cJSON_Parse(recv_buf);
-        if (!root || !cJSON_IsObject(root)) {
-            if (root) cJSON_Delete(root);
+        /* Same structural gate as the first parse of this frame, so the
+         * two cannot read different requests out of one buffer. */
+        cJSON *root = onode_parse_root_object(recv_buf, json_len,
+                                              "validate_turn");
+        if (!root) {
             send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
             break;
         }
@@ -7448,8 +7532,10 @@ bool onode_parse_request_fuzz(const uint8_t *data, size_t n)
     if (n > 0) memcpy(buf, data, n);
     buf[n] = '\0';
 
+    /* The length-aware entry, so an input with an embedded NUL reaches
+     * the same refusal the socket path applies. */
     onode_request_t req;
-    bool ok = parse_request(buf, &req);
+    bool ok = parse_request(buf, n, &req);
     free(buf);
     return ok;
 }
