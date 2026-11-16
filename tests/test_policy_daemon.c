@@ -41,6 +41,21 @@ static virp_policy_t *policy(sqlite3 *db,const char *profile,bool protected){
       protected?"{\"device_id\":\"0000000000000011\",\"resource\":\"host\",\"reason\":\"BLACK-04\"}":"",(unsigned)getuid(),profile);
     virp_policy_t *p=virp_policy_parse(text,db);assert(p);return p;
 }
+/* A request the owner policy refuses is answered with a signed ERROR
+ * observation and a gate_rejection chain entry (security review M9) — it
+ * used to be a bare ACTION_FORBIDDEN code. What these call sites pin is
+ * unchanged: the policy refused, and (asserted beside each call) nothing
+ * was dispatched. */
+static void policy_refused(const char *device,const char *command,const char *proposal,uid_t uid) {
+    unsigned char out[VIRP_MAX_MESSAGE_SIZE];size_t len=0;
+    assert(onode_execute_obs_ex(&node,device,command,1,proposal,uid,out,sizeof(out),&len)==VIRP_OK);
+    virp_header_t hdr;assert(virp_validate_message(out,len,&node.okey,&hdr)==VIRP_OK);
+    virp_observation_t obs;const uint8_t *data;uint16_t n;
+    assert(virp_parse_observation(out+VIRP_HEADER_SIZE,len-VIRP_HEADER_SIZE,&obs,&data,&n)==VIRP_OK);
+    assert(obs.obs_type==VIRP_OBS_ERROR);
+    char text[1024];assert(n<sizeof(text));memcpy(text,data,n);text[n]=0;
+    assert(strstr(text,"owner policy refused"));
+}
 static void supervised_approval(sqlite3 *db,const char *temp) {
     virp_fed_keypair_t kp;assert(virp_fed_generate(&kp,1)==VIRP_OK);
     uint8_t spki[44];char entry[1024],registry[256],dir[256];
@@ -62,9 +77,9 @@ static void supervised_approval(sqlite3 *db,const char *temp) {
     virp_approval_rec_t apr;assert(virp_approval_submit(dir,&node.approvers,&node.chain,id,kid,sig,sizeof(sig),&apr)==VIRP_OK);
     /* A genuine approval still cannot override Observe or protected resources. */
     virp_policy_close(node.policy);node.policy=policy(db,"observe",false);
-    assert(onode_execute_obs_ex(&node,"fixture","reboot",1,id,getuid(),output,sizeof(output),&len)==VIRP_ERR_ACTION_FORBIDDEN);
+    policy_refused("fixture","reboot",id,getuid());
     virp_policy_close(node.policy);node.policy=policy(db,"supervised",true);
-    assert(onode_execute_obs_ex(&node,"fixture","reboot",1,id,getuid(),output,sizeof(output),&len)==VIRP_ERR_ACTION_FORBIDDEN);
+    policy_refused("fixture","reboot",id,getuid());
     assert(atomic_load(&dispatches)==0);
     virp_policy_close(node.policy);node.policy=policy(db,"supervised",false);
     assert(onode_execute_obs_ex(&node,"fixture","reboot",1,id,getuid(),output,sizeof(output),&len)==VIRP_OK);
@@ -94,16 +109,16 @@ int main(void){
     sqlite3 *db;assert(sqlite3_open(":memory:",&db)==SQLITE_OK);char *schema=readall("deploy/policy-schema.sql");assert(sqlite3_exec(db,schema,NULL,NULL,NULL)==SQLITE_OK);free(schema);
     unsigned char output[VIRP_MAX_MESSAGE_SIZE];size_t len=0;
     node.policy=policy(db,"observe",false);node.gate_default_mode=GATE_MODE_SHADOW;node.gate_max_tier=VIRP_TIER_BLACK;
-    assert(onode_execute_obs_ex(&node,"fixture","reboot",1,NULL,getuid(),output,sizeof(output),&len)==VIRP_ERR_ACTION_FORBIDDEN);assert(atomic_load(&dispatches)==0);
+    policy_refused("fixture","reboot",NULL,getuid());assert(atomic_load(&dispatches)==0);
     virp_policy_close(node.policy);node.policy=policy(db,"supervised",false);
     assert(onode_execute_obs_ex(&node,"fixture","reboot",1,NULL,getuid(),output,sizeof(output),&len)==VIRP_OK);assert(atomic_load(&dispatches)==0);
     supervised_approval(db,temp);
     virp_policy_close(node.policy);node.policy=policy(db,"autonomous",true);
-    assert(onode_execute_obs_ex(&node,"fixture","reboot",1,"pretend-approval",getuid(),output,sizeof(output),&len)==VIRP_ERR_ACTION_FORBIDDEN);assert(atomic_load(&dispatches)==0);
+    policy_refused("fixture","reboot","pretend-approval",getuid());assert(atomic_load(&dispatches)==0);
     virp_policy_close(node.policy);node.policy=policy(db,"autonomous",false);
     assert(onode_execute_obs_ex(&node,"fixture","reboot",1,NULL,getuid(),output,sizeof(output),&len)==VIRP_OK);assert(atomic_load(&dispatches)==1);
-    assert(onode_execute_obs_ex(&node,"fixture","sudo reboot",1,NULL,getuid(),output,sizeof(output),&len)==VIRP_ERR_ACTION_FORBIDDEN);assert(atomic_load(&dispatches)==1);
-    assert(onode_execute_obs_ex(&node,"fixture","reboot",1,NULL,getuid()+1,output,sizeof(output),&len)==VIRP_ERR_ACTION_FORBIDDEN);
+    policy_refused("fixture","sudo reboot",NULL,getuid());assert(atomic_load(&dispatches)==1);
+    policy_refused("fixture","reboot",NULL,getuid()+1);
     uid_t uid=getuid();assert(onode_set_allowed_uids(&node,&uid,1)==VIRP_OK);
     onode_action_t actions[]={ONODE_ACTION_EXECUTE,ONODE_ACTION_BATCH_EXECUTE,ONODE_ACTION_SHUTDOWN,ONODE_ACTION_SIGN_INTENT};assert(onode_set_uid_actions(&node,uid,actions,4)==VIRP_OK);
     pthread_t thread;assert(!pthread_create(&thread,NULL,server,NULL));for(int i=0;i<100&&access(sock,F_OK);i++)pause_ms(10);assert(!access(sock,F_OK));

@@ -1495,12 +1495,24 @@ proofs:
 # by timestamp).
 DRIVER_BUILD_DIR = build-drivers
 
+# Unmapped commands classify RED in all five table-driven CLI drivers
+# (security review H3). Pure classification, no device contact.
+$(BUILD_DIR)/test_driver_route_defaults: tests/test_driver_route_defaults.c $(LIB)
+	@test -n "$(ASA)" -a -n "$(JUNIPER)" -a -n "$(FORTIGATE)" -a -n "$(PANOS)" -a -n "$(CISCO)" || \
+	    { echo "ERROR: test-route-defaults needs CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 (run: make test-drivers)"; exit 1; }
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+.PHONY: test-route-defaults
+test-route-defaults: $(BUILD_DIR)/test_driver_route_defaults
+	./$(BUILD_DIR)/test_driver_route_defaults
+
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-io, cisco-reconnect, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, zammad-gate, typed-hash, ingress-nul, pbs-trunc) ==="
+	@echo "=== driver test suites (cisco, cisco-io, cisco-reconnect, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, zammad-gate, typed-hash, ingress-nul, pbs-trunc, route-defaults) ==="
 	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 ZAMMAD=1 \
 	        test-cisco test-cisco-io test-cisco-reconnect test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms \
-	        test-pbs test-pbs-gate test-zammad-gate test-typed-hash test-ingress-nul test-pbs-trunc test-cisco-description
+	        test-pbs test-pbs-gate test-zammad-gate test-typed-hash test-ingress-nul test-pbs-trunc test-cisco-description \
+	        test-route-defaults
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.
 #
@@ -2300,7 +2312,8 @@ asan-test:
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO) $(TEST_FG_SCRUB) $(TEST_CHAIN) \
 	        $(TEST_OBSKEY) $(TEST_OBS_ED25519) $(TEST_OBS_FORGE) $(TEST_OBS_NEG) \
-	        $(BUILD_DIR)/test_security_bounds $(BUILD_DIR)/test_security_handlers $(BUILD_DIR)/test_onode_security
+	        $(BUILD_DIR)/test_security_bounds $(BUILD_DIR)/test_security_handlers $(BUILD_DIR)/test_onode_security \
+	        $(BUILD_DIR)/test_onode_review
 	@echo "=== Running tests under ASan+UBSan ==="
 	./$(TEST_BIN) 2>&1
 	./$(TEST_ONODE) 2>&1
@@ -2314,6 +2327,7 @@ asan-test:
 	./$(BUILD_DIR)/test_security_bounds 2>&1
 	./$(BUILD_DIR)/test_security_handlers 2>&1
 	./$(BUILD_DIR)/test_onode_security 2>&1
+	./$(BUILD_DIR)/test_onode_review 2>&1
 	@echo "=== ASan+UBSan test run complete ==="
 	# Leave no instrumented residue in the shared build/ tree. asan-test
 	# already clean-builds at the start, so the tree is disposable; a
@@ -2324,6 +2338,83 @@ asan-test:
 	# is INTERRUPTED before this line, run `make clean` once.
 	@echo "=== cleaning instrumented build/ so later plain builds are safe ==="
 	$(MAKE) --no-print-directory clean
+
+# ThreadSanitizer over the threaded suites: concurrent onode_execute
+# against a disrupted connection, concurrent chain append / verify /
+# artifact-store, and the security-review regressions — which start real
+# accept loops, worker threads, batch threads and the watchdog, and so
+# exercise the daemon's shared counters and shutdown path under TSan. Separate object tree (build-tsan/) — TSan and ASan
+# cannot share one, and instrumented objects must not leak into build/.
+#
+# TSAN_RUN disables ASLR for the test process. With the kernel's default
+# mmap entropy (vm.mmap_rnd_bits=32 on current distro kernels) gcc's
+# libtsan aborts at startup with "FATAL: ThreadSanitizer: unexpected
+# memory mapping" before a single test line runs; `setarch -R` is the
+# per-process fix and needs no sysctl. Override TSAN_RUN= (empty) on a
+# toolchain that does not need it.
+#
+# halt_on_error=1: a race is a failure, not a log line.
+TSAN_RUN ?= setarch $(shell uname -m) -R
+.PHONY: tsan-test
+tsan-test:
+	rm -rf build-tsan
+	$(MAKE) BUILD_DIR=build-tsan CC=gcc \
+	        CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+	        LDFLAGS_EXTRA="-fsanitize=thread" \
+	        build-tsan/test_onode_concurrency build-tsan/test_chain_concurrency \
+	        build-tsan/test_onode_review
+	@echo "=== Running threaded suites under ThreadSanitizer ==="
+	TSAN_OPTIONS=halt_on_error=1 $(TSAN_RUN) ./build-tsan/test_onode_concurrency
+	TSAN_OPTIONS=halt_on_error=1 $(TSAN_RUN) ./build-tsan/test_chain_concurrency
+	TSAN_OPTIONS=halt_on_error=1 $(TSAN_RUN) ./build-tsan/test_onode_review
+	@echo "=== ThreadSanitizer run complete ==="
+
+# libFuzzer targets for the O-Node's socket-facing parsers (security
+# review): the request parser, the batch command-array parser and the
+# fed_outcome citation reader. One harness, three binaries, selected with
+# -DFUZZ_ONODE_TARGET. Library and harness are both instrumented, in
+# their own object tree. Needs clang.
+#   make fuzz-onode-parsers
+#   ./build-fuzz-onode/fuzz_onode_request -max_total_time=60
+FUZZ_ONODE_DIR = build-fuzz-onode
+FUZZ_ONODE_TARGETS = request:1 batch:2 fed_outcome:3
+.PHONY: fuzz-onode-parsers
+fuzz-onode-parsers:
+	$(MAKE) BUILD_DIR=$(FUZZ_ONODE_DIR) CC=clang \
+	        CFLAGS_EXTRA="$(CFLAGS_EXTRA) -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer" \
+	        $(FUZZ_ONODE_DIR)/libvirp.a
+	@for t in $(FUZZ_ONODE_TARGETS); do \
+	    name=$${t%%:*}; num=$${t##*:}; \
+	    echo "clang ... -DFUZZ_ONODE_TARGET=$$num -> $(FUZZ_ONODE_DIR)/fuzz_onode_$$name"; \
+	    clang $(CFLAGS) -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+	          -DFUZZ_ONODE_TARGET=$$num tests/fuzz_onode_parsers.c \
+	          $(FUZZ_ONODE_DIR)/libvirp.a $(LDFLAGS) \
+	          -o $(FUZZ_ONODE_DIR)/fuzz_onode_$$name || exit 1; \
+	done
+	@echo "Built $(FUZZ_ONODE_DIR)/fuzz_onode_{request,batch,fed_outcome} — run each with -max_total_time=<secs>"
+
+# The same harness WITHOUT libFuzzer: gcc + ASan + UBSan and the
+# harness's own main() (-DVIRP_FUZZ_STANDALONE), which replays the seed
+# corpus and a fixed set of deterministic mutations of it. A regression
+# smoke test, not a fuzzing campaign — it keeps the harness exercised on
+# machines with no clang. Own object tree, so nothing instrumented lands
+# in build/.
+FUZZ_ONODE_SMOKE_DIR = build-fuzz-onode-smoke
+.PHONY: fuzz-onode-parsers-smoke
+fuzz-onode-parsers-smoke:
+	$(MAKE) BUILD_DIR=$(FUZZ_ONODE_SMOKE_DIR) CC=gcc \
+	        CFLAGS_EXTRA="$(CFLAGS_EXTRA) -fsanitize=address,undefined -fno-omit-frame-pointer" \
+	        $(FUZZ_ONODE_SMOKE_DIR)/libvirp.a
+	@for t in $(FUZZ_ONODE_TARGETS); do \
+	    name=$${t%%:*}; num=$${t##*:}; \
+	    $(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer \
+	          -DVIRP_FUZZ_STANDALONE -DFUZZ_ONODE_TARGET=$$num tests/fuzz_onode_parsers.c \
+	          $(FUZZ_ONODE_SMOKE_DIR)/libvirp.a $(LDFLAGS) -fsanitize=address,undefined \
+	          -o $(FUZZ_ONODE_SMOKE_DIR)/fuzz_onode_$$name || exit 1; \
+	    ./$(FUZZ_ONODE_SMOKE_DIR)/fuzz_onode_$$name 2>$(FUZZ_ONODE_SMOKE_DIR)/fuzz_onode_$$name.log || \
+	        { echo "FAIL: fuzz_onode_$$name — last lines of its report:"; \
+	          grep -v '^\[O-Node\]' $(FUZZ_ONODE_SMOKE_DIR)/fuzz_onode_$$name.log | tail -20; exit 1; }; \
+	done
 
 # Driver suites under ASan+UBSan. Separate from asan-test because the
 # driver objects need their -D guards, which are evaluated at Makefile
@@ -2549,6 +2640,25 @@ $(BUILD_DIR)/test_onode_security: tests/test_onode_security.c tests/test_onode.c
 test-onode-security: $(BUILD_DIR)/test_onode_security
 	./$(BUILD_DIR)/test_onode_security
 all-tests: test-onode-security
+
+# O-Node security review regressions (security/onode-review-1): one test
+# function per finding ID. Includes src/virp_onode.c directly, like
+# test_security_handlers, so the static parsers and gate helpers are
+# reachable without a socket.
+$(BUILD_DIR)/test_onode_review: tests/test_onode_review.c src/virp_onode.c $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB) $(LDFLAGS) -ljson-c -o $@
+.PHONY: test-onode-review
+test-onode-review: $(BUILD_DIR)/test_onode_review
+	./$(BUILD_DIR)/test_onode_review
+all-tests: test-onode-review
+
+# Command-line contract of the production daemon's main() (security review
+# M21, M26): things no unit test can reach. Needs only the binary.
+.PHONY: test-prod-cli
+test-prod-cli: $(ONODE_PROD) $(ONODE_BIN)
+	tests/test_prod_cli.sh ./$(ONODE_PROD)
+all-tests: test-prod-cli
 
 .PHONY: test-execute-v3
 test-execute-v3: build/libvirp.a

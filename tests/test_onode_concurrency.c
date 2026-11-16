@@ -22,6 +22,7 @@
 #include "virp_onode.h"
 #include "virp_driver.h"
 #include "virp_message.h"
+#include <stdatomic.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,7 +85,10 @@ static void *worker_fn(void *p)
  * public-ish path of repeatedly nulling the slot to force get_connection()
  * to re-establish. We don't call drv->disconnect here because that's
  * internal; the public surface is this test just forcing reconnect churn. */
-static volatile int g_disruptor_running = 1;
+/* atomic, not volatile: main clears this while the disruptor thread reads
+ * it, which is a data race ThreadSanitizer reports — and a report from
+ * the harness would mask one from the daemon under test (make tsan-test). */
+static atomic_int g_disruptor_running = 1;
 static void *disruptor_fn(void *unused)
 {
     (void)unused;

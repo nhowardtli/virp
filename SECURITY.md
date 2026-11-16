@@ -238,10 +238,17 @@ currently supports Linux only; the BSD `getpeereid` equivalent is not
 implemented. Every `accept()` reads the connecting process's UID and
 compares it against a startup-loaded allowlist:
 
-- `VIRP_ALLOWED_UIDS` — comma-separated UID list (e.g. `VIRP_ALLOWED_UIDS=0,1001`)
-- Prod builds also honor `socket_allowed_uids` in the JSON config
-- If neither is set, the allowlist defaults to the daemon's own
+- `socket_allowed_uids` in the JSON config (`virp-onode-prod`). An
+  explicit list must be accompanied by `socket_uid_action_allow` and
+  `socket_uid_tier_ceilings` entries for every uid on it, or the daemon
+  refuses to start.
+- If it is not set, the allowlist defaults to the daemon's own
   effective UID — closed to every other local user
+
+The `VIRP_ALLOWED_UIDS` environment variable this section used to list
+was read only by the mock demonstration daemon and has been removed: it
+installed an allowlist with no action map, which `onode_start()` refuses,
+so setting it could only stop the daemon from starting.
 
 Rejected connections are closed immediately without reading any bytes
 and produce a single `REJECTED connection: peer uid=...` log line.

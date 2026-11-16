@@ -46,7 +46,10 @@ const char *onode_health_command(virp_vendor_t vendor);
 #define ONODE_SOCKET_PATH       "/run/virp/onode.sock"
 #define ONODE_HEARTBEAT_SEC     30
 #define ONODE_MAX_CLIENTS       8
-#define ONODE_RECV_TIMEOUT_SEC  5
+#define ONODE_RECV_TIMEOUT_SEC  5   /* ONE deadline for a whole request
+                                       frame, header to last byte */
+#define ONODE_SEND_TIMEOUT_SEC  10  /* a peer that stops reading its
+                                       response is abandoned after this */
 #define ONODE_MAX_REQUEST_SIZE  131072
 #define ONODE_MAX_ALLOWED_UIDS  16
 #define ONODE_MAX_UID_CAPP_TYPES 16 /* max chain_append types per uid (v0.2.1) */
@@ -74,6 +77,21 @@ const char *onode_health_command(virp_vendor_t vendor);
 #endif
 
 /*
+ * Per-uid share of the worker pool (security review M14). The pool cap
+ * above is global, so one allowed uid could hold all of it — by design
+ * or by a stuck client library — and every other principal's
+ * connections were then closed at accept. No single uid may hold more
+ * than this many workers at once; a connection over the cap is closed
+ * at accept exactly like a saturated pool. Half the pool by default:
+ * far above any legitimate client's fan-out (batch_execute multiplexes
+ * inside ONE connection), and it always leaves room for someone else.
+ * Override at build time with -DONODE_MAX_WORKERS_PER_UID=N.
+ */
+#ifndef ONODE_MAX_WORKERS_PER_UID
+#define ONODE_MAX_WORKERS_PER_UID (ONODE_MAX_WORKERS / 2)
+#endif
+
+/*
  * Kernel accept queue. Must comfortably exceed ONODE_MAX_WORKERS so
  * that short bursts of connections don't get RST'd before the accept
  * loop can dispatch them.
@@ -93,6 +111,102 @@ const char *onode_health_command(virp_vendor_t vendor);
  */
 #ifndef ONODE_DRAIN_TIMEOUT_SEC
 #define ONODE_DRAIN_TIMEOUT_SEC 30
+#endif
+
+/*
+ * chain_verify bounds (security review M15).
+ *
+ * A verify walks its range holding the chain lock, and every execution
+ * needs that lock to commit its pre-dispatch intent while it holds the
+ * device's exec_mutex — so for as long as one verify runs, no device can
+ * execute anything and the watchdog cannot probe. Before these bounds a
+ * single request with to_sequence = INT64_MAX held it for the whole
+ * session, and nothing stopped a uid from issuing them back to back.
+ *
+ *   ONODE_CHAIN_VERIFY_MAX_RANGE   entries one ranged CHAIN_VERIFY may
+ *       cover. Measured ~23 us per entry, so a full-size request holds
+ *       the lock for about a second. A larger range is refused with
+ *       VIRP_ERR_MESSAGE_TOO_LARGE; the caller pages, or asks for
+ *       CHAIN_VERIFY_SESSION.
+ *   ONODE_VERIFY_BUDGET_MS / ONODE_VERIFY_WINDOW_SEC   per uid: the
+ *       verify time one principal may consume per window. Past it, and
+ *       while that uid already has a verify in flight, further verifies
+ *       are refused with VIRP_ERR_RATE_LIMITED. A third of the window by
+ *       default, so no single uid can deny the chain lock to executions
+ *       for more than that fraction — while a chainwalk that verifies
+ *       hundreds of small sessions one after another is untouched,
+ *       because what is metered is time, not request count.
+ *
+ * CHAIN_VERIFY_SESSION has no range to cap — covering the whole session
+ * against its signed head is its purpose — so it is bounded by the
+ * budget only. See REVIEW-NOTES.md for what that leaves open.
+ */
+#ifndef ONODE_CHAIN_VERIFY_MAX_RANGE
+#define ONODE_CHAIN_VERIFY_MAX_RANGE 50000
+#endif
+#ifndef ONODE_VERIFY_WINDOW_SEC
+#define ONODE_VERIFY_WINDOW_SEC      60
+#endif
+#ifndef ONODE_VERIFY_BUDGET_MS
+#define ONODE_VERIFY_BUDGET_MS       20000
+#endif
+
+/*
+ * Proposal bounds (security review M16).
+ *
+ * Every gate refusal of an approvable command filed a brand-new
+ * proposal: a record on disk and a PROPOSAL chain entry, both permanent.
+ * A client that simply repeated one refused command grew the approval
+ * store and the chain without limit and buried the approver's queue in
+ * copies of the same request.
+ *
+ *   ONODE_PROPOSAL_CACHE   how many recently filed proposals the daemon
+ *       remembers, keyed (device, command hash, proposer). A refusal
+ *       whose key matches a remembered proposal that is still OPEN is
+ *       answered with that proposal's id; nothing new is filed.
+ *   ONODE_PROPOSAL_BURST / ONODE_PROPOSAL_WINDOW_SEC   per uid: how many
+ *       NEW proposals one principal may file per window. Past it the
+ *       refusal is unchanged — still recorded, still a signed ERROR —
+ *       but carries no proposal id until the window turns over. The
+ *       internal caller ((uid_t)-1) is not a socket principal and is not
+ *       limited.
+ *
+ * DEDUPE IS OFF UNLESS state->proposal_dedupe IS SET, and nothing in
+ * this tree sets it outside the tests. The port cage
+ * (tools/cage/port_prepare.py) files SEVERAL proposals for one command
+ * on purpose — one single-use approval per verification step — and
+ * needs each to be a distinct proposal; answering the second with the
+ * first's id breaks it (found by tests/test_port_native_pipeline.py in
+ * CI). The rate limit is always on, and the burst is sized for that same
+ * client: one cage transaction files 8 proposals and its test runs
+ * several inside a window.
+ */
+#ifndef ONODE_PROPOSAL_CACHE
+#define ONODE_PROPOSAL_CACHE       128
+#endif
+#ifndef ONODE_PROPOSAL_BURST
+#define ONODE_PROPOSAL_BURST       120
+#endif
+#ifndef ONODE_PROPOSAL_WINDOW_SEC
+#define ONODE_PROPOSAL_WINDOW_SEC  60
+#endif
+
+/*
+ * Stack size for every thread the daemon creates that runs a request:
+ * connection workers and batch item threads. Explicit, because the
+ * request path keeps large buffers on the stack — a 128 KiB receive
+ * buffer and a 128 KiB frame buffer in handle_client(), the parsed
+ * request (which holds a full artifact body), 64 KiB response and
+ * staging buffers, a driver result with its own output buffer — several
+ * hundred KiB before any driver or library frame. The default thread
+ * stack is whatever RLIMIT_STACK says when the process starts: 8 MiB on
+ * a stock system, but a unit with LimitSTACK= or a different libc can
+ * make it far smaller, and an overrun there is a segfault in the
+ * process that holds the O-Key. 4 MiB is several times the measured
+ * need and independent of the environment.
+ */
+#ifndef ONODE_THREAD_STACK_BYTES
+#define ONODE_THREAD_STACK_BYTES (4u * 1024u * 1024u)
 #endif
 
 /* Auto-reconnect configuration */
@@ -191,15 +305,24 @@ typedef struct {
     virp_signing_key_t  okey;           /* THE key — never leaves this process */
 
     /*
-     * Observation-signing keypair (wire version 3). OPTIONAL: absent on
-     * every deployment that has not generated one, which is all of them
-     * today. Its ONLY use in the daemon is verifying v3 observation
-     * bodies submitted to CHAIN_APPEND; when it is not loaded, v3
-     * bodies are REFUSED rather than recorded unverified.
+     * Observation-signing keypair (wire version 3). OPTIONAL. Loaded
+     * from -O (virp-onode-prod). Two uses: verifying v3 observation
+     * bodies submitted to CHAIN_APPEND — when it is not loaded, v3 bodies
+     * are REFUSED rather than recorded unverified — and, under -3,
+     * signing execute observations.
+     *
+     * It is its OWN key (security review M21). It used to have to be the
+     * chain-signing key (-S): the daemon loaded it from that file and
+     * refused v3 unless the two public halves matched, so one Ed25519
+     * key vouched for both chain entries and device observations. -O
+     * names a separate file; -3 without -O still falls back to the -S
+     * key, with a warning, so an existing unit keeps starting.
      */
     virp_obskey_t       obskey;
     bool                obskey_loaded;
-    bool                execute_v3; /* opt-in -3; requires -S, same key */
+    bool                execute_v3; /* opt-in -3; needs a signed chain (-S)
+                                       and an observation key (-O, or the
+                                       -S key as a deprecated fallback) */
 
     /*
      * PREVIOUS O-Key — VERIFY-ONLY, TIME-BOUNDED. Optional.
@@ -240,7 +363,9 @@ typedef struct {
     virp_signing_key_t  prev_okey;
     bool                prev_okey_loaded;
     uint64_t            prev_okey_deadline_ns;   /* CLOCK_REALTIME */
-    uint32_t            prev_okey_accepts;       /* grace-path uses */
+    atomic_uint         prev_okey_accepts;       /* grace-path uses;
+                                                    bumped by concurrent
+                                                    workers, hence atomic */
 
     /*
      * Tier-enforcement gate (Phase B), per-driver scoped.
@@ -286,6 +411,37 @@ typedef struct {
     /* Sequence tracking (anti-replay) */
     uint32_t            seq_num;        /* Monotonically increasing */
 
+    /*
+     * Persisted v1 sequence high-water (security review M20).
+     *
+     * seq_num is the sequence in every O-Key-signed (v1) message, and a
+     * receiver's replay check is "higher than the last one I accepted
+     * from this node". It started at zero on every start, so after a
+     * restart the daemon re-issued numbers it had already used: a strict
+     * receiver rejected fresh observations as replays, and a lenient one
+     * could be handed an old observation in place of a new one bearing
+     * the same number.
+     *
+     * When seq_store_path is set (onode_set_seq_store) the daemon keeps
+     * a durable RESERVATION ahead of what it hands out: seq_reserved is
+     * the highest number the file on disk covers, and it is extended by
+     * ONODE_SEQ_RESERVE_BLOCK, durably, BEFORE any number above it is
+     * issued. After a crash the daemon resumes above the reservation —
+     * skipping at most one block, never repeating. A clean shutdown
+     * writes the exact high-water, so a normal restart leaves no gap.
+     * Empty path = no persistence (the mock/dev binaries): the sequence
+     * then starts at zero each run, as before.
+     */
+    char                seq_store_path[256];
+    uint32_t            seq_reserved;
+    bool                seq_store_failed;   /* a reservation could not be
+                                               made durable; logged once */
+
+    /* Single-instance lock (M20): an exclusive flock on
+     * "<socket_path>.lock", taken in onode_start() before the stale
+     * socket is unlinked and held until onode_destroy(). -1 = not held. */
+    int                 lock_fd;
+
     /* Socket */
     int                 listen_fd;
     char                socket_path[108];  /* Must fit in sun_path */
@@ -302,8 +458,11 @@ typedef struct {
 
     /*
      * Per-uid gate policy (optional). An explicit row overrides the
-     * node-wide gate_max_tier and may raise or lower it. BLACK selects
-     * passthrough, including driver backstops; it is not a denial tier.
+     * node-wide gate_max_tier and may raise or lower it. A row is GREEN,
+     * YELLOW or RED. BLACK is NOT a ceiling: the per-uid BLACK
+     * passthrough is retired — onode_set_uid_ceilings() rejects it, the
+     * production loader refuses a config that asks for it, and BLACK is
+     * refused by the gate unconditionally, whatever the ceiling.
      * Without a row, callers use the node-wide default. The production
      * config loader requires every allowed UID to have a row when this
      * map is present. This policy authenticates a Unix UID, not human
@@ -421,7 +580,10 @@ typedef struct {
     bool                     approvers_loaded;
 
     /* Thread safety */
-    pthread_mutex_t     state_mutex;    /* Protects seq_num, observations_sent */
+    pthread_mutex_t     state_mutex;    /* Protects seq_num, observations_sent,
+                                           reconnects, worker accounting —
+                                           READS included: the heartbeat
+                                           takes it to sample them */
     pthread_mutex_t     conn_mutex;     /* Protects connections[] and reconnect[] */
     /*
      * Serializes access to `ctx` during session handshake messages
@@ -433,6 +595,32 @@ typedef struct {
      * handshake calls — never around SSH I/O.
      */
     pthread_mutex_t     session_mutex;
+
+    /*
+     * WHO BOUND THE SESSION (security review M19), under session_mutex.
+     *
+     * The daemon holds one session, and it was nobody's in particular:
+     * any allowed uid could close it, and any allowed uid's v2/v3
+     * execute rode on it. So uid B could end uid A's session whenever
+     * it liked, and B's observations were signed under the session A
+     * negotiated and counted against A's sequence numbers — A's replay
+     * window advanced by requests A never made.
+     *
+     * SESSION_BIND records the peer uid here. While it is set, only
+     * that uid may close the session or have a v2/v3 observation signed
+     * under it; anyone else is told SESSION_INVALID / ACTION_FORBIDDEN
+     * exactly as if they had no session, which they do not.
+     *
+     * `session_owner_generation` is the session generation the owner
+     * record belongs to. A session that idles out and is re-established
+     * by a path that does not go through the socket handler (tests bind
+     * the context directly) has a different generation, and the stale
+     * owner record must not be enforced against it: ownership applies
+     * only while owner_set && generation matches.
+     */
+    bool                session_owner_set;
+    uid_t               session_owner_uid;
+    uint64_t            session_owner_generation;
 
     /*
      * Per-device execution mutex.
@@ -492,8 +680,107 @@ typedef struct {
     uint32_t            workers_rejected;   /* saturated-pool rejections */
     bool                drain_failed;       /* drain timed out; leak, don't free */
 
-    /* Runtime */
-    bool                running;
+    /*
+     * Live workers per peer uid (M14), under state_mutex. A slot is
+     * claimed by onode_worker_admit() at accept and returned by
+     * onode_worker_release() when the worker ends; a slot whose count is
+     * zero is free for another uid. Sized by the pool, not by the
+     * allowlist: at most ONODE_MAX_WORKERS workers are live, so at most
+     * that many distinct uids can hold one.
+     */
+    struct {
+        uid_t       uid;
+        uint32_t    live;
+    }                   worker_uid_live[ONODE_MAX_WORKERS];
+    uint32_t            workers_rejected_uid_cap;
+
+    /*
+     * Client I/O bounds in milliseconds (M14). onode_init() sets them
+     * from ONODE_RECV_TIMEOUT_SEC / ONODE_SEND_TIMEOUT_SEC; they are
+     * fields rather than constants only so a test can shorten them.
+     *   request_deadline_ms  ONE absolute deadline for receiving a whole
+     *                        request frame. It used to be a per-recv()
+     *                        timeout, which a peer sending one byte every
+     *                        few seconds never tripped.
+     *   send_timeout_ms      SO_SNDTIMEO on the client socket: a peer
+     *                        that stops reading is abandoned instead of
+     *                        pinning its worker until restart.
+     */
+    uint32_t            request_deadline_ms;
+    uint32_t            send_timeout_ms;
+
+    /*
+     * Per-uid verify accounting (M15), under state_mutex. `in_flight`
+     * is set between onode_verify_enter() and onode_verify_leave();
+     * `used_ms` is the verify time charged in the window that began at
+     * `window_start_ms` (CLOCK_MONOTONIC). A slot with used_ms == 0 and
+     * nothing in flight is free. Sized by the worker pool: at most that
+     * many distinct uids can be mid-request.
+     */
+    struct {
+        uid_t       uid;
+        bool        in_use;
+        bool        in_flight;
+        int64_t     window_start_ms;
+        int64_t     used_ms;
+    }                   verify_uid[ONODE_MAX_WORKERS];
+
+    /*
+     * Proposal dedupe and rate limit (M16). proposal_mutex is held
+     * across "is there an open proposal for this key?" and the filing
+     * that follows, so two identical refusals arriving together still
+     * file exactly one proposal. It is taken with no other daemon lock
+     * held and only ever wraps approval-store and chain calls.
+     * proposal_cache is a ring (proposal_cache_next is the slot to
+     * overwrite); proposal_uid counts new proposals per uid per window.
+     * In memory only: after a restart the first repeat of an open
+     * proposal files one more, then dedupes again.
+     */
+    pthread_mutex_t     proposal_mutex;
+    bool                proposal_dedupe;   /* default false — see
+                                            * ONODE_PROPOSAL_CACHE */
+    struct {
+        bool        in_use;
+        char        device[64];
+        char        command_hash[65];
+        char        proposer[64];
+        char        proposal_id[33];
+    }                   proposal_cache[ONODE_PROPOSAL_CACHE];
+    size_t              proposal_cache_next;
+    struct {
+        uid_t       uid;
+        bool        in_use;
+        int64_t     window_start_ms;
+        uint32_t    filed;
+    }                   proposal_uid[ONODE_MAX_WORKERS];
+
+    /*
+     * Shutdown request (security review M18).
+     *
+     * `running` is ATOMIC: it is cleared by onode_shutdown(), which runs
+     * in a signal handler (SIGINT/SIGTERM in both mains) and on a worker
+     * thread (ONODE_ACTION_SHUTDOWN), and read by the accept loop on the
+     * main thread. A plain bool written from a handler is a data race
+     * and, for a signal handler, undefined behaviour.
+     *
+     * `wake_fd` is an eventfd the accept loop's select() watches.
+     * Clearing a flag does not interrupt a select() that is already
+     * blocked: a signal did so only when it happened to be delivered to
+     * the main thread, and a shutdown REQUEST over the socket never did
+     * — the loop noticed at its next heartbeat timeout, up to
+     * ONODE_HEARTBEAT_SEC later. onode_shutdown() writes to the eventfd
+     * (write(2) is async-signal-safe) and the loop returns at once.
+     * Created in onode_init(), closed in onode_destroy(); `wake_ready`
+     * guards a state that never went through onode_init().
+     */
+    atomic_bool         running;
+    /* Latched by onode_shutdown() and never cleared: a request that
+     * arrives BEFORE onode_start() has entered its loop (a signal during
+     * startup) must not be lost when onode_start() then sets `running`.
+     * onode_start() honours it and returns without serving. */
+    atomic_bool         shutdown_requested;
+    int                 wake_fd;
+    bool                wake_ready;
     uint32_t            uptime_start;   /* time(NULL) at startup */
     uint32_t            observations_sent;
     uint32_t            errors;
@@ -569,7 +856,28 @@ virp_error_t onode_set_previous_okey(onode_state_t *state,
                                      uint32_t window_seconds);
 
 /*
+ * Persist the v1 sequence high-water at `path` (M20). Call after
+ * onode_init and before onode_start. Loads the stored value, resumes the
+ * sequence above it and makes the first reservation durable. Fails —
+ * and the caller should refuse to start — if the file exists but is not
+ * a number, or the reservation cannot be written: a daemon that cannot
+ * remember its sequence would silently reuse numbers after the next
+ * restart. A missing file is a first run and starts at zero.
+ */
+#define ONODE_SEQ_RESERVE_BLOCK 1024u
+virp_error_t onode_set_seq_store(onode_state_t *state, const char *path);
+
+/*
  * Add a device to the O-Node's inventory.
+ *
+ * Refused with VIRP_ERR_INVALID_LENGTH when the hostname fails the
+ * chain's canonical-string check or is long enough that a chain session
+ * id derived from it ("gate-separator:<host>", "gate-enforce:<host>
+ * [@<epoch>]") would not fit virp_chain_entry_t.session_id: 48 bytes
+ * with no native epoch, down to 33 with a 16-character one. onode_start()
+ * repeats the length check once the epoch is final. Also refused:
+ * node_id 0, the reserved hostname "_unknown", and any hostname, node_id
+ * or device_id already loaded (VIRP_ERR_DUPLICATE_DEVICE).
  */
 virp_error_t onode_add_device(onode_state_t *state,
                               const virp_device_t *device);
@@ -607,8 +915,36 @@ virp_error_t onode_start(onode_state_t *state);
 virp_error_t onode_watchdog_start(onode_state_t *state);
 
 /*
+ * Per-uid worker accounting (M14). onode_worker_admit() returns false —
+ * and counts nothing — when `uid` already holds
+ * ONODE_MAX_WORKERS_PER_UID workers; otherwise it claims one and returns
+ * true, and the caller owes exactly one onode_worker_release(uid). The
+ * accept loop calls admit before spawning and the worker (or the
+ * spawn-failure path) calls release. Exposed so the cap can be tested
+ * without a listening socket.
+ */
+bool onode_worker_admit(onode_state_t *state, uid_t uid);
+void onode_worker_release(onode_state_t *state, uid_t uid);
+
+/*
+ * Per-uid verify limiter (M15). onode_verify_enter() returns false when
+ * `uid` already has a verify in flight or has spent its budget for the
+ * current window; otherwise it marks one in flight and returns true, and
+ * the caller owes exactly one onode_verify_leave(uid, elapsed_ms) with
+ * the time the verify took. `now_ms` is CLOCK_MONOTONIC milliseconds,
+ * passed in so the window arithmetic can be tested without sleeping.
+ */
+bool onode_verify_enter(onode_state_t *state, uid_t uid, int64_t now_ms);
+void onode_verify_leave(onode_state_t *state, uid_t uid, int64_t elapsed_ms);
+
+/*
  * Signal the O-Node to shut down gracefully.
- * Can be called from a signal handler.
+ *
+ * ASYNC-SIGNAL-SAFE, and that is a contract, not an accident (M18): it
+ * does two lock-free atomic stores and one write(2) to an eventfd, and
+ * preserves errno. No stdio, no locks, no allocation. Both mains call it
+ * straight from their SIGINT/SIGTERM handlers, and the handler does
+ * nothing else. Also safe from any thread. Idempotent.
  */
 void onode_shutdown(onode_state_t *state);
 
@@ -676,9 +1012,10 @@ virp_error_t onode_set_approvers(onode_state_t *state,
  */
 /*
  * client_uid — the SO_PEERCRED uid of the connecting socket client, used
- * to apply a per-uid tier ceiling (onode_effective_max_tier). Pass
- * (uid_t)-1 for internal / non-socket callers, which then get only the
- * node-wide gate_max_tier. The socket handler and the batch fan-out both
+ * to select that uid's tier ceiling (onode_effective_max_tier: an explicit
+ * per-uid row decides, tighter or looser; otherwise the node-wide one).
+ * Pass (uid_t)-1 for internal / non-socket callers, which then get only
+ * the node-wide gate_max_tier. The socket handler and the batch fan-out both
  * pass the real peer uid.
  */
 /*
@@ -745,9 +1082,11 @@ virp_error_t onode_set_allowed_uids(onode_state_t *state,
                                     const uid_t *uids, size_t count);
 
 /*
- * Set per-uid tier ceilings. `uids[i]` is capped at `tiers[i]`
- * (GREEN/YELLOW/RED/BLACK; UNCLASSIFIED is rejected). Explicit rows
- * override the node-wide gate_max_tier; BLACK enables passthrough.
+ * Set per-uid tier ceilings. `uids[i]` is capped at `tiers[i]`, which
+ * must be GREEN, YELLOW or RED. UNCLASSIFIED and BLACK are rejected with
+ * VIRP_ERR_INVALID_TYPE and nothing is installed: the BLACK passthrough
+ * is retired and no ceiling can confer BLACK authority. Explicit rows
+ * override the node-wide gate_max_tier in both directions.
  * Replaces any existing entries. Returns
  * VIRP_ERR_MESSAGE_TOO_LARGE if `count` exceeds ONODE_MAX_ALLOWED_UIDS.
  */
@@ -836,9 +1175,13 @@ onode_action_t onode_action_from_name(const char *name);
 int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len);
 
 /*
- * Autopilot hard exclusions: 10.0.10.1 and 10.0.10.10 must never appear
- * in a device config. Boundary-aware scan of raw config text (so
- * 10.0.10.12 / 10.0.10.100 do not false-positive). Returns the blocked
+ * Autopilot hard exclusions: an address on the daemon's blocklist must
+ * never appear in a device config. The PRODUCTION list has been empty
+ * since 2026-09-08 (it held 10.0.10.1 and 10.0.10.10; see the note on
+ * ONODE_BLOCKED_ADDRS in virp_onode.c), so today this returns NULL for
+ * every input — the check and its severity are kept so re-arming is a
+ * one-line change. Boundary-aware scan of raw config text (so
+ * 10.0.10.12 / 10.0.10.100 would not false-positive on 10.0.10.1). Returns the blocked
  * address (static string) on a hit, NULL when clean. The file variant
  * reads up to 1 MiB of `path`; unreadable files return NULL — the
  * loader's own error handling covers those. Every config loader MUST
@@ -861,5 +1204,15 @@ const char *virp_config_file_blocked(const char *path);
  * a valid request.
  */
 bool onode_parse_request_fuzz(const uint8_t *data, size_t n);
+
+/*
+ * The same, for the batch_execute command-array parser and for the
+ * fed_outcome citation reader (GATE 4). Each returns what its parser
+ * decided and abort()s if that result breaks the parser's own
+ * postcondition, so a fuzzer finds logic errors as well as memory
+ * errors. See tests/fuzz_onode_parsers.c and `make fuzz-onode-parsers`.
+ */
+int onode_parse_batch_fuzz(const uint8_t *data, size_t n);
+int onode_fed_outcome_citation_fuzz(const uint8_t *data, size_t n);
 
 #endif /* VIRP_ONODE_H */

@@ -116,8 +116,19 @@ COMMAND_ACTIONS = {
     "show chain": "list_sessions",     # + one chain_verify per listed session
 }
 
+# Entries one ranged chain_verify may cover — the daemon's
+# ONODE_CHAIN_VERIFY_MAX_RANGE (O-Node security review M15). A request for
+# more is refused with MESSAGE_TOO_LARGE (-15): the walk holds the chain
+# lock, and executions queue behind it.
+VERIFY_MAX_RANGE = 50000
+
 PROPOSAL_RE = re.compile(r"proposal_id=([0-9a-f]{32})")
-BLOCKED_RE = re.compile(r"tier gate blocked '(.*)' on '([^']+)' \(tier=([A-Z]+) max=([A-Z]+)\)")
+# Since the O-Node security review (M13) the daemon puts the proposal id
+# BEFORE the command — "tier gate blocked proposal_id=<hex> '<cmd>' on ..."
+# — so a long command can no longer push it out of the message. The
+# optional group keeps this matching refusals from older daemons, and
+# refusals that filed no proposal (BLACK), which have no id there at all.
+BLOCKED_RE = re.compile(r"tier gate blocked (?:proposal_id=[0-9a-f]{32} )?'(.*)' on '([^']+)' \(tier=([A-Z]+) max=([A-Z]+)\)")
 
 # ── wire constants (include/virp.h) ────────────────────────────────────
 
@@ -166,7 +177,7 @@ VIRP_ERRORS = {
     -50: "ACTION_FORBIDDEN", -51: "DUPLICATE_MISMATCH",
     -52: "APPROVAL_STORE_UNREADABLE", -53: "EVIDENCE_UNAVAILABLE",
     -54: "TRANSPORT_WRITE", -55: "TRANSPORT_CLOSED",
-    -56: "APPROVAL_STORE_ABSENT",
+    -56: "APPROVAL_STORE_ABSENT", -57: "RATE_LIMITED",
 }
 
 
@@ -1017,7 +1028,10 @@ class VirpShell(cmd.Cmd):
             ("node_id", "0x%08x" % info["node_id"]),
             ("uptime", fmt_uptime(info["uptime_seconds"])),
             ("onode_ok", "yes" if info["onode_ok"] else "NO"),
-            ("rnode_ok", "yes" if info["rnode_ok"] else "NO"),
+            # The O-Node does not vouch for the R-Node (it has no channel to
+            # it and used to send 1 unconditionally), so 0 here is "not
+            # reported", not an outage.
+            ("rnode_ok", "yes" if info["rnode_ok"] else "not reported"),
             ("active_observations", info["active_observations"]),
             ("active_proposals", info["active_proposals"]),
         ]
@@ -1033,6 +1047,11 @@ class VirpShell(cmd.Cmd):
                 req["to_sequence"] = int(args[2])
         except ValueError:
             raise GateError("from/to must be integers")
+        span = req.get("to_sequence", 0) - req.get("from_sequence", 0)
+        if span >= VERIFY_MAX_RANGE:
+            raise GateError("range covers %d entries; one chain_verify may "
+                            "cover at most %d — verify it in pieces"
+                            % (span + 1, VERIFY_MAX_RANGE))
         info = self._reply(req)
         try:
             res = json.loads(info.get("text", "") or "{}")
@@ -1161,13 +1180,24 @@ class VirpShell(cmd.Cmd):
             sid = s.get("session_id", "?")
             try:
                 # verify the WHOLE listed range; without to_sequence the
-                # daemon checks 0..0 (one entry) and reports valid for it
+                # daemon checks 0..0 (one entry) and reports valid for it.
+                # A session longer than one request may cover is verified
+                # over its NEWEST VERIFY_MAX_RANGE entries, and the row
+                # says so ("tail") rather than passing a partial check off
+                # as the whole session.
+                first = int(s.get("first_sequence", 0))
+                last = int(s.get("last_sequence", 0))
+                tail = last - first >= VERIFY_MAX_RANGE
+                if tail:
+                    first = last - VERIFY_MAX_RANGE + 1
                 v = self._reply({"action": COMMAND_ACTIONS["verify chain"],
                                  "session_id": sid,
-                                 "from_sequence": int(s.get("first_sequence", 0)),
-                                 "to_sequence": int(s.get("last_sequence", 0))})
+                                 "from_sequence": first,
+                                 "to_sequence": last})
                 res = json.loads(v.get("text", "") or "{}")
                 valid = "yes" if res.get("valid") else "NO"
+                if tail:
+                    valid += " (tail)"
                 checked = res.get("entries_checked", "?")
                 fb = res.get("first_broken", -1)
                 opened = res.get("executions_open", "?")

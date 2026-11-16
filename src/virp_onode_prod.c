@@ -5,7 +5,9 @@
  *
  * Usage:
  *   virp-onode-prod [options]
- *     -k <okey_path>      Path to O-Key file (generates if absent)
+ *     -k <okey_path>      Path to O-Key file. REQUIRED, and the file must
+ *                         exist: the production daemon never generates an
+ *                         O-Key (virp-tool keygen okey <path> does).
  *     -K <prev_okey_path> Previous O-Key, VERIFY-ONLY, for the rotation
  *                         grace window. Lets observations minted before a
  *                         rotation still register instead of being lost.
@@ -114,10 +116,18 @@ extern void virp_driver_gns3_init(void);
 #include <curl/curl.h>
 #endif
 
+/*
+ * SIGINT / SIGTERM. Nothing but onode_shutdown(), which is
+ * async-signal-safe by contract (two atomic stores and an eventfd
+ * write). This used to fprintf() first — stdio is not async-signal-safe,
+ * and a signal landing while another thread held the stderr lock could
+ * deadlock the handler inside the very path meant to stop the daemon
+ * (security review M18). The "shutting down" line is printed by
+ * onode_start() once its loop has actually exited.
+ */
 static void signal_handler(int sig)
 {
     (void)sig;
-    fprintf(stderr, "\n[O-Node] Signal received, shutting down...\n");
     onode_shutdown(&g_state);
 }
 
@@ -191,15 +201,6 @@ static bool json_get_string(struct json_object *obj, const char *key,
     return true;
 }
 
-static bool json_get_int(struct json_object *obj, const char *key, int *out)
-{
-    struct json_object *val;
-    if (!json_object_object_get_ex(obj, key, &val)) return false;
-    if (!json_object_is_type(val, json_type_int)) return false;
-    *out = json_object_get_int(val);
-    return true;
-}
-
 static bool json_get_bool(struct json_object *obj, const char *key, bool *out)
 {
     struct json_object *val;
@@ -207,6 +208,75 @@ static bool json_get_bool(struct json_object *obj, const char *key, bool *out)
     if (!json_object_is_type(val, json_type_boolean)) return false;
     *out = json_object_get_boolean(val);
     return true;
+}
+
+/*
+ * Strict numeric parsing for config values and command-line options.
+ *
+ * Every one of these replaced a bare strtoul()/cast that turned a value
+ * it could not represent into a DIFFERENT valid one:
+ *   port 70000        -> (uint16_t) 4464, a port nobody configured
+ *   node_id "1FFFFFFFF" -> truncated to 0xFFFFFFFF
+ *   node_id "0x0A00.." or "zz" -> 0 (read as "absent")
+ *   -n garbage        -> node id 0
+ *   -W -1             -> a grace window of 136 years
+ * A value that does not fit is refused, never reduced.
+ */
+
+/* Hex digits only (no "0x", no sign, no blanks), 1..max_digits of them. */
+static bool parse_hex_u64(const char *text, int max_digits, uint64_t *out)
+{
+    if (!text || !*text) return false;
+    uint64_t v = 0;
+    int n = 0;
+    for (const char *p = text; *p; p++) {
+        int d;
+        if      (*p >= '0' && *p <= '9') d = *p - '0';
+        else if (*p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+        else if (*p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+        else return false;
+        if (++n > max_digits) return false;
+        v = (v << 4) | (uint64_t)d;
+    }
+    *out = v;
+    return true;
+}
+
+/* A TCP port from a config integer: 1..65535. */
+static bool parse_port(struct json_object *val, uint16_t *out)
+{
+    if (!json_object_is_type(val, json_type_int)) return false;
+    int64_t v = json_object_get_int64(val);
+    if (v < 1 || v > 65535) return false;
+    *out = (uint16_t)v;
+    return true;
+}
+
+/*
+ * A device identity from the config: a hex STRING of at most
+ * `max_hex_digits` digits, or a non-negative JSON integer that fits
+ * `max_value`. false (and *out untouched) for anything else.
+ */
+static bool parse_identity(struct json_object *val, int max_hex_digits,
+                           uint64_t max_value, uint64_t *out)
+{
+    if (json_object_is_type(val, json_type_string)) {
+        const char *s = json_object_get_string(val);
+        if (!s || (size_t)json_object_get_string_len(val) != strlen(s))
+            return false;                      /* embedded NUL */
+        uint64_t v;
+        if (!parse_hex_u64(s, max_hex_digits, &v) || v > max_value)
+            return false;
+        *out = v;
+        return true;
+    }
+    if (json_object_is_type(val, json_type_int)) {
+        int64_t v = json_object_get_int64(val);
+        if (v < 0 || (uint64_t)v > max_value) return false;
+        *out = (uint64_t)v;
+        return true;
+    }
+    return false;
 }
 
 /*
@@ -259,8 +329,11 @@ static int load_socket_allowed_uids(onode_state_t *state,
  *   "socket_uid_tier_ceilings": { "993": "green", "1002": "yellow" }
  *
  * Keys are uid strings (matching how socket_allowed_uids may be given as
- * strings); values are "green"/"yellow"/"red"/"black". Absent object
- * preserves the node-wide default. A present map must cover every allowed
+ * strings); values are "green"/"yellow"/"red". "black" is refused
+ * outright — the per-uid BLACK passthrough is retired. The object may be
+ * absent only when socket_allowed_uids is absent too (the self-seeded
+ * default); load_devices() refuses an explicit allowlist without it
+ * (M22). A present map must cover every allowed
  * uid; malformed or incomplete policy refuses startup. Rows outside the
  * allowlist are retained with a warning and do not grant socket access.
  */
@@ -310,7 +383,7 @@ static int load_uid_tier_ceilings(onode_state_t *state,
         }
         else {
             fprintf(stderr, "[O-Node] socket_uid_tier_ceilings['%s'] = '%s' "
-                            "unrecognized (want green/yellow/red/black) — "
+                            "unrecognized (want green/yellow/red) — "
                             "refusing\n", key, s);
             return -1;
         }
@@ -364,27 +437,64 @@ static int load_uid_tier_ceilings(onode_state_t *state,
  * restrict fully unrestricted. Fail-closed instead — any malformed
  * value or unknown action name installs a DENY-ALL entry for that uid
  * and logs loudly; the uid keeps connecting but can do nothing until
- * the config is fixed. A non-numeric key names no uid to restrict and
- * is logged as an ERROR.
+ * the config is fixed.
+ *
+ * THE KEY IS A UID AND IS PARSED AS ONE (security review M24). It used
+ * to go through a bare strtoul() and a (uid_t) cast, which accepts far
+ * more than a uid and maps some of it onto the WRONG uid:
+ *     "-1"          -> 4294967295, i.e. (uid_t)-1, the daemon's own
+ *                      "unknown identity" sentinel
+ *     "4294967303"  -> wraps to uid 7: a rule written for a uid that
+ *                      does not exist lands on one that does
+ *     "+7", " 7"    -> uid 7, under a key no reviewer would read as "7"
+ * and a key that was not a number at all was logged and SKIPPED, leaving
+ * the uid the operator meant to restrict unrestricted by this map.
+ * parse_uid() — the function socket_allowed_uids already uses — takes
+ * decimal digits only, in range, and never the sentinel. Anything else
+ * is FATAL. So is the same uid appearing twice ("7" and "07"): the
+ * second entry used to replace the first without a word, and which of
+ * two contradictory action sets applies must not depend on key order.
+ * Returns 0, or -1 to refuse the config.
  */
-static void load_uid_action_allow(onode_state_t *state,
-                                  struct json_object *root)
+static int load_uid_action_allow(onode_state_t *state,
+                                 struct json_object *root)
 {
     struct json_object *obj;
-    if (!json_object_object_get_ex(root, "socket_uid_action_allow", &obj) ||
-        !json_object_is_type(obj, json_type_object)) {
-        return;  /* optional */
+    if (!json_object_object_get_ex(root, "socket_uid_action_allow", &obj))
+        return 0;  /* optional */
+    if (!json_object_is_type(obj, json_type_object)) {
+        fprintf(stderr, "[O-Node] FATAL: socket_uid_action_allow must be an "
+                        "object mapping uid to an action list\n");
+        return -1;
     }
 
+    uid_t seen[ONODE_MAX_ALLOWED_UIDS];
+    size_t seen_n = 0;
+
     json_object_object_foreach(obj, key, val) {
-        char *end = NULL;
-        unsigned long uidv = strtoul(key, &end, 10);
-        if (!end || *end != '\0') {
-            fprintf(stderr, "[O-Node] ERROR: socket_uid_action_allow key "
-                            "'%s' is not a numeric uid — this entry "
-                            "restricts NOBODY; fix the config\n", key);
-            continue;
+        uid_t parsed;
+        if (!parse_uid(key, &parsed)) {
+            fprintf(stderr, "[O-Node] FATAL: socket_uid_action_allow key "
+                            "'%s' is not a uid (decimal digits, in range). "
+                            "Refusing the config: an entry that names no "
+                            "uid restricts nobody.\n", key);
+            return -1;
         }
+        for (size_t i = 0; i < seen_n; i++)
+            if (seen[i] == parsed) {
+                fprintf(stderr, "[O-Node] FATAL: socket_uid_action_allow "
+                                "names uid %lu more than once (key '%s'). "
+                                "Refusing the config.\n",
+                        (unsigned long)parsed, key);
+                return -1;
+            }
+        if (seen_n >= ONODE_MAX_ALLOWED_UIDS) {
+            fprintf(stderr, "[O-Node] FATAL: socket_uid_action_allow has "
+                            "more than %d entries\n", ONODE_MAX_ALLOWED_UIDS);
+            return -1;
+        }
+        seen[seen_n++] = parsed;
+        unsigned long uidv = (unsigned long)parsed;
 
         onode_action_t actions[ONODE_MAX_UID_ACTIONS];
         size_t count = 0;
@@ -429,9 +539,12 @@ static void load_uid_action_allow(onode_state_t *state,
         virp_error_t err = onode_set_uid_actions(state, (uid_t)uidv,
                                                  actions, count);
         if (err != VIRP_OK) {
-            fprintf(stderr, "[O-Node] onode_set_uid_actions(uid %lu) "
+            /* The entry could not be installed at all, so not even the
+             * deny-all stands for this uid: refuse rather than leave it
+             * unrestricted by this map. */
+            fprintf(stderr, "[O-Node] FATAL: onode_set_uid_actions(uid %lu) "
                             "failed: %d\n", uidv, (int)err);
-            continue;
+            return -1;
         }
         fprintf(stderr, "[O-Node] uid %lu action allowlist: %zu "
                         "action(s)%s\n", uidv, count,
@@ -449,6 +562,7 @@ static void load_uid_action_allow(onode_state_t *state,
                             "no effect (connection would be refused)\n",
                     uidv);
     }
+    return 0;
 }
 
 /*
@@ -484,26 +598,51 @@ static char *load_socket_path_override(struct json_object *root)
  * A uid that may chain_append is restricted to exactly these artifact
  * types. onode_start() refuses to boot if any allowlisted uid whose
  * action set includes chain_append has no entry here. A malformed entry
- * installs a deny-all-types policy (fail closed) for that uid.
+ * installs a deny-all-types policy (fail closed) for that uid. The key
+ * is parsed with parse_uid() and a uid named twice is fatal, for the
+ * reasons given on load_uid_action_allow() (M24). Returns 0, or -1 to
+ * refuse the config.
  */
-static void load_uid_chain_append_types(onode_state_t *state,
-                                        struct json_object *root)
+static int load_uid_chain_append_types(onode_state_t *state,
+                                       struct json_object *root)
 {
     struct json_object *obj;
     if (!json_object_object_get_ex(root, "socket_uid_chain_append_types",
-                                   &obj) ||
-        !json_object_is_type(obj, json_type_object)) {
-        return;  /* optional; the boot invariant catches a missing one */
+                                   &obj))
+        return 0;  /* optional; the boot invariant catches a missing one */
+    if (!json_object_is_type(obj, json_type_object)) {
+        fprintf(stderr, "[O-Node] FATAL: socket_uid_chain_append_types must "
+                        "be an object mapping uid to a type list\n");
+        return -1;
     }
 
+    uid_t seen[ONODE_MAX_ALLOWED_UIDS];
+    size_t seen_n = 0;
+
     json_object_object_foreach(obj, key, val) {
-        char *end = NULL;
-        unsigned long uidv = strtoul(key, &end, 10);
-        if (!end || *end != '\0') {
-            fprintf(stderr, "[O-Node] ERROR: socket_uid_chain_append_types "
-                            "key '%s' is not a numeric uid\n", key);
-            continue;
+        uid_t parsed;
+        if (!parse_uid(key, &parsed)) {
+            fprintf(stderr, "[O-Node] FATAL: socket_uid_chain_append_types "
+                            "key '%s' is not a uid (decimal digits, in "
+                            "range). Refusing the config.\n", key);
+            return -1;
         }
+        for (size_t i = 0; i < seen_n; i++)
+            if (seen[i] == parsed) {
+                fprintf(stderr, "[O-Node] FATAL: "
+                                "socket_uid_chain_append_types names uid %lu "
+                                "more than once (key '%s'). Refusing the "
+                                "config.\n", (unsigned long)parsed, key);
+                return -1;
+            }
+        if (seen_n >= ONODE_MAX_ALLOWED_UIDS) {
+            fprintf(stderr, "[O-Node] FATAL: socket_uid_chain_append_types "
+                            "has more than %d entries\n",
+                    ONODE_MAX_ALLOWED_UIDS);
+            return -1;
+        }
+        seen[seen_n++] = parsed;
+        unsigned long uidv = (unsigned long)parsed;
         const char *types[ONODE_MAX_UID_CAPP_TYPES];
         size_t count = 0;
         bool malformed = false;
@@ -532,13 +671,15 @@ static void load_uid_chain_append_types(onode_state_t *state,
         virp_error_t err = onode_set_uid_chain_append_types(
                 state, (uid_t)uidv, types, count);
         if (err != VIRP_OK) {
-            fprintf(stderr, "[O-Node] onode_set_uid_chain_append_types(uid "
-                            "%lu) failed: %d\n", uidv, (int)err);
-            continue;
+            fprintf(stderr, "[O-Node] FATAL: "
+                            "onode_set_uid_chain_append_types(uid %lu) "
+                            "failed: %d\n", uidv, (int)err);
+            return -1;
         }
         fprintf(stderr, "[O-Node] uid %lu chain_append types: %zu%s\n",
                 uidv, count, count == 0 ? " (DENY-ALL)" : "");
     }
+    return 0;
 }
 
 static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
@@ -571,64 +712,121 @@ static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
  *                        with evidence required and no chain.
  *                        false: record after the fact, best-effort (the
  *                        pre-Task-5 shape); every dispatch logs a WARNING
- *                        that it ran without a durable record. A value
- *                        that is not a JSON boolean is logged and IGNORED
- *                        — the default stays true (fail closed).
+ *                        that it ran without a durable record. LAB ONLY:
+ *                        the production loader refuses false (M26). A
+ *                        value that is not a JSON boolean is FATAL in
+ *                        both.
  *
  * Absent keys leave the onode_init() defaults (ENFORCE default / no
- * overrides / YELLOW / evidence required) in place. Unrecognized values
- * are logged and ignored.
+ * overrides / YELLOW / evidence required) in place. A key that is
+ * PRESENT with a value this loader cannot use — wrong JSON type, an
+ * unrecognized string, more gate_modes entries than fit — is FATAL
+ * (security review M23): nothing here falls back to a default.
  */
-static int load_gate_config(onode_state_t *state, struct json_object *root)
+static int load_gate_config(onode_state_t *state, struct json_object *root,
+                            bool production)
 {
     struct json_object *v;
 
+    /*
+     * STRICT (security review M23). Each of the three gate keys used to
+     * tolerate a value it could not use: a wrong JSON type was skipped
+     * without a word, and an unrecognized string was logged and the
+     * default kept. For gate_max_tier the default is YELLOW, so
+     * "gate_max_tier": "grren" — or 1, or "GREEN " with a trailing space
+     * — ran the node one tier LOOSER than the operator wrote. For
+     * gate_modes a misspelled or mistyped entry left that driver on the
+     * default mode, and an entry past the override limit was dropped.
+     * The same reasoning as evidence_required below (1.4): a posture key
+     * means exactly what it says or the daemon does not load.
+     */
+
     /* Max tier. */
-    if (json_object_object_get_ex(root, "gate_max_tier", &v) &&
-        json_object_is_type(v, json_type_string)) {
-        const char *s = json_object_get_string(v);
-        if      (strcasecmp(s, "green")  == 0) state->gate_max_tier = VIRP_TIER_GREEN;
-        else if (strcasecmp(s, "yellow") == 0) state->gate_max_tier = VIRP_TIER_YELLOW;
-        else if (strcasecmp(s, "red")    == 0) state->gate_max_tier = VIRP_TIER_RED;
-        else fprintf(stderr, "[O-Node] gate_max_tier '%s' unrecognized — "
-                             "keeping YELLOW\n", s);
+    if (json_object_object_get_ex(root, "gate_max_tier", &v)) {
+        const char *s = json_object_is_type(v, json_type_string)
+                      ? json_object_get_string(v) : NULL;
+        if      (s && strcasecmp(s, "green")  == 0) state->gate_max_tier = VIRP_TIER_GREEN;
+        else if (s && strcasecmp(s, "yellow") == 0) state->gate_max_tier = VIRP_TIER_YELLOW;
+        else if (s && strcasecmp(s, "red")    == 0) state->gate_max_tier = VIRP_TIER_RED;
+        else {
+            fprintf(stderr, "[O-Node] FATAL: gate_max_tier must be \"green\", "
+                    "\"yellow\" or \"red\"; got %s%s%s. Refusing to load "
+                    "the config rather than fall back to YELLOW.\n",
+                    s ? "\"" : "", s ? s
+                        : json_type_to_name(json_object_get_type(v)),
+                    s ? "\"" : "");
+            return -1;
+        }
     }
 
-    /* Default mode: gate_default_mode (canonical) or gate_mode (deprecated). */
-    if (json_object_object_get_ex(root, "gate_default_mode", &v) &&
-        json_object_is_type(v, json_type_string)) {
-        const char *s = json_object_get_string(v);
-        if (!parse_gate_mode(s, &state->gate_default_mode))
-            fprintf(stderr, "[O-Node] gate_default_mode '%s' unrecognized — "
-                            "keeping ENFORCE default\n", s);
-    } else if (json_object_object_get_ex(root, "gate_mode", &v) &&
-               json_object_is_type(v, json_type_string)) {
-        const char *s = json_object_get_string(v);
-        if (parse_gate_mode(s, &state->gate_default_mode))
-            fprintf(stderr, "[O-Node] gate_mode is deprecated — "
-                            "use gate_default_mode\n");
-        else
-            fprintf(stderr, "[O-Node] gate_mode '%s' unrecognized — "
-                            "keeping ENFORCE default\n", s);
+    /* Default mode: gate_default_mode (canonical) or gate_mode (deprecated).
+     * Giving both is refused: two keys for one setting is a config that
+     * can disagree with itself. */
+    {
+        struct json_object *canon = NULL, *alias = NULL;
+        bool has_canon = json_object_object_get_ex(root, "gate_default_mode",
+                                                   &canon);
+        bool has_alias = json_object_object_get_ex(root, "gate_mode", &alias);
+        if (has_canon && has_alias) {
+            fprintf(stderr, "[O-Node] FATAL: both gate_default_mode and its "
+                    "deprecated alias gate_mode are set — keep "
+                    "gate_default_mode only. Refusing to load the config.\n");
+            return -1;
+        }
+        if (has_canon || has_alias) {
+            const char *name = has_canon ? "gate_default_mode" : "gate_mode";
+            v = has_canon ? canon : alias;
+            const char *s = json_object_is_type(v, json_type_string)
+                          ? json_object_get_string(v) : NULL;
+            if (!s || !parse_gate_mode(s, &state->gate_default_mode)) {
+                fprintf(stderr, "[O-Node] FATAL: %s must be \"enforce\" or "
+                        "\"shadow\"; got %s%s%s. Refusing to load the "
+                        "config.\n", name, s ? "\"" : "",
+                        s ? s : json_type_to_name(json_object_get_type(v)),
+                        s ? "\"" : "");
+                return -1;
+            }
+            if (has_alias)
+                fprintf(stderr, "[O-Node] gate_mode is deprecated — "
+                                "use gate_default_mode\n");
+        }
     }
 
     /* Per-driver overrides. */
-    if (json_object_object_get_ex(root, "gate_modes", &v) &&
-        json_object_is_type(v, json_type_object)) {
+    if (json_object_object_get_ex(root, "gate_modes", &v)) {
+        if (!json_object_is_type(v, json_type_object)) {
+            fprintf(stderr, "[O-Node] FATAL: gate_modes must be an object "
+                    "mapping driver names to \"enforce\"/\"shadow\"; got "
+                    "%s. Refusing to load the config.\n",
+                    json_type_to_name(json_object_get_type(v)));
+            return -1;
+        }
         json_object_object_foreach(v, drv_name, mode_obj) {
-            if (!json_object_is_type(mode_obj, json_type_string))
-                continue;
-            if (state->gate_overrides_count >= ONODE_MAX_GATE_OVERRIDES) {
-                fprintf(stderr, "[O-Node] gate_modes: override limit reached, "
-                                "ignoring '%s'\n", drv_name);
-                continue;
-            }
+            const char *ms = json_object_is_type(mode_obj, json_type_string)
+                           ? json_object_get_string(mode_obj) : NULL;
             onode_gate_mode_t m;
-            const char *ms = json_object_get_string(mode_obj);
-            if (!parse_gate_mode(ms, &m)) {
-                fprintf(stderr, "[O-Node] gate_modes['%s']='%s' unrecognized — "
-                                "ignoring\n", drv_name, ms);
-                continue;
+            if (!ms || !parse_gate_mode(ms, &m)) {
+                fprintf(stderr, "[O-Node] FATAL: gate_modes[\"%s\"] must be "
+                        "\"enforce\" or \"shadow\"; got %s%s%s. Refusing to "
+                        "load the config.\n", drv_name, ms ? "\"" : "",
+                        ms ? ms
+                           : json_type_to_name(json_object_get_type(mode_obj)),
+                        ms ? "\"" : "");
+                return -1;
+            }
+            if (state->gate_overrides_count >= ONODE_MAX_GATE_OVERRIDES) {
+                fprintf(stderr, "[O-Node] FATAL: gate_modes has more than %d "
+                        "entries; \"%s\" would be dropped and run under the "
+                        "default mode. Refusing to load the config.\n",
+                        ONODE_MAX_GATE_OVERRIDES, drv_name);
+                return -1;
+            }
+            if (strlen(drv_name) >=
+                    sizeof(state->gate_overrides[0].driver)) {
+                fprintf(stderr, "[O-Node] FATAL: gate_modes key \"%s\" is "
+                        "longer than any driver name. Refusing to load the "
+                        "config.\n", drv_name);
+                return -1;
             }
             size_t idx = state->gate_overrides_count++;
             snprintf(state->gate_overrides[idx].driver,
@@ -641,8 +839,31 @@ static int load_gate_config(onode_state_t *state, struct json_object *root)
      * a string "false", a 0, or a typo keeps the compiled-in true. */
     if (json_object_object_get_ex(root, "evidence_required", &v)) {
         if (json_object_is_type(v, json_type_boolean)) {
-            state->evidence_required = json_object_get_boolean(v) ? true
-                                                                  : false;
+            bool want = json_object_get_boolean(v) ? true : false;
+            /*
+             * PRODUCTION DOES NOT RUN WITHOUT EVIDENCE (security review
+             * M26). virp-onode-prod's main() used to follow the load by
+             * assigning true to this field — so a config saying false
+             * was accepted, logged the WARNING below ("executions
+             * will be recorded AFTER the device acts"), and was then
+             * silently overruled. The outcome was the safe one, but the
+             * operator had been told the opposite of what the daemon
+             * did, and a file that says false while the node runs true
+             * is a file nobody can trust on the next line either. The
+             * override is gone; in production the value is refused
+             * instead, so the posture in the file is the posture
+             * running. The lab loaders (the mock daemon, the test
+             * fixtures) keep the opt-out, with its warning.
+             */
+            if (!want && production) {
+                fprintf(stderr, "[O-Node] FATAL: \"evidence_required\": "
+                        "false is not accepted by the production daemon. "
+                        "Every execution must be preceded by a durable "
+                        "pre-execution record. Remove the key or set it to "
+                        "true. Refusing to load the config.\n");
+                return -1;
+            }
+            state->evidence_required = want;
             if (!state->evidence_required)
                 fprintf(stderr, "[O-Node] WARNING: evidence_required=false "
                         "— executions will be recorded AFTER the device "
@@ -680,11 +901,63 @@ static int load_gate_config(onode_state_t *state, struct json_object *root)
 }
 
 /*
- * Not static: the issue #7 regression test in tests/test_onode.c links
- * against the prod parser (via the *_lib.o object compiled with
- * VIRP_ONODE_PROD_NO_MAIN) and calls this directly.
+ * The top-level keys this loader understands (security review M22).
+ *
+ * The config is a posture document: who may connect, at what ceiling,
+ * under which gate mode, with or without evidence. An unknown top-level
+ * key used to be ignored — so a typo did not fail, it silently fell back
+ * to a DEFAULT. "socket_uid_tier_cielings" loaded with every uid at the
+ * node-wide ceiling instead of the one the operator wrote;
+ * "gate_defualt_mode": "enforce" and "evidence_requried": true read as
+ * if the line were not there. The operator saw the daemon start and
+ * believed the posture they had typed.
+ *
+ * A key beginning with '_' is an annotation ("_comment",
+ * "_socket_allowlist_policy", ...): the shipped templates carry their
+ * rationale that way, and they are ignored by design. Everything else
+ * must be on this list or the config is refused, naming the key.
+ * Device objects are not policed here — only the root.
  */
-int load_devices(onode_state_t *state, const char *path)
+static const char *const LOAD_DEVICES_TOP_LEVEL_KEYS[] = {
+    "devices",
+    "socket_path",
+    "socket_allowed_uids",
+    "socket_uid_tier_ceilings",
+    "socket_uid_action_allow",
+    "socket_uid_chain_append_types",
+    "gate_max_tier",
+    "gate_default_mode",
+    "gate_mode",                /* deprecated alias, still parsed */
+    "gate_modes",
+    "evidence_required",
+};
+
+static const char *unknown_top_level_key(struct json_object *root)
+{
+    json_object_object_foreach(root, key, val) {
+        (void)val;
+        if (key[0] == '_')
+            continue;                       /* annotation */
+        bool known = false;
+        for (size_t i = 0; i < sizeof(LOAD_DEVICES_TOP_LEVEL_KEYS) /
+                               sizeof(LOAD_DEVICES_TOP_LEVEL_KEYS[0]); i++)
+            if (strcmp(key, LOAD_DEVICES_TOP_LEVEL_KEYS[i]) == 0) {
+                known = true;
+                break;
+            }
+        if (!known)
+            return key;
+    }
+    return NULL;
+}
+
+/*
+ * The loader itself. `production` selects the production posture rules
+ * — today, that "evidence_required": false is refused (M26). Reached
+ * through the two wrappers below, never directly.
+ */
+static int load_devices_impl(onode_state_t *state, const char *path,
+                             bool production)
 {
     /* Autopilot hard exclusion — non-negotiable: refuse the entire
      * config if it mentions a blocked address anywhere. */
@@ -702,6 +975,52 @@ int load_devices(onode_state_t *state, const char *path)
         return -1;
     }
 
+    if (!json_object_is_type(root, json_type_object)) {
+        fprintf(stderr, "[O-Node] FATAL: device config %s is not a JSON "
+                "object\n", path);
+        json_object_put(root);
+        return -1;
+    }
+
+    /* Refuse a key this loader does not know, before anything is
+     * installed from the file (M22). */
+    {
+        const char *unknown = unknown_top_level_key(root);
+        if (unknown) {
+            fprintf(stderr, "[O-Node] FATAL: device config %s has an "
+                    "unrecognized top-level key \"%s\". An unknown key is "
+                    "refused, not ignored: a misspelled posture key would "
+                    "otherwise fall back to its default without a word. "
+                    "(Prefix a key with '_' to make it a comment.)\n",
+                    path, unknown);
+            json_object_put(root);
+            return -1;
+        }
+    }
+
+    /* An EXPLICIT allowlist must come with explicit ceilings (M22). With
+     * socket_allowed_uids present and socket_uid_tier_ceilings absent,
+     * every listed uid got the node-wide gate_max_tier — the remote
+     * requester and the local operator alike — and nothing in the file
+     * said so. load_uid_tier_ceilings() already requires the map to
+     * cover every allowed uid when it IS present; requiring it to be
+     * present closes the other half. The self-seeded default (no
+     * allowlist at all: the daemon's own uid only) needs no map. */
+    {
+        struct json_object *au = NULL, *ce = NULL;
+        if (json_object_object_get_ex(root, "socket_allowed_uids", &au) &&
+            !json_object_object_get_ex(root, "socket_uid_tier_ceilings", &ce)) {
+            fprintf(stderr, "[O-Node] FATAL: device config %s sets "
+                    "socket_allowed_uids but not socket_uid_tier_ceilings. "
+                    "Every allowed uid must be given a tier ceiling "
+                    "(\"<uid>\": \"green\"|\"yellow\"|\"red\"); without "
+                    "the map each one silently gets the node-wide "
+                    "gate_max_tier.\n", path);
+            json_object_put(root);
+            return -1;
+        }
+    }
+
     /* Socket access gate: install allowlist before onode_start(). */
     if (load_socket_allowed_uids(state, root) != 0) {
         fprintf(stderr, "[O-Node] FATAL: invalid socket_allowed_uids\n");
@@ -717,14 +1036,19 @@ int load_devices(onode_state_t *state, const char *path)
         json_object_put(root);
         return -1;
     }
-    load_uid_action_allow(state, root);
-    load_uid_chain_append_types(state, root);
+    if (load_uid_action_allow(state, root) != 0 ||
+        load_uid_chain_append_types(state, root) != 0) {
+        fprintf(stderr, "[O-Node] FATAL: invalid socket_uid_action_allow or "
+                        "socket_uid_chain_append_types\n");
+        json_object_put(root);
+        return -1;
+    }
 
     /* Tier-enforcement gate (Phase B): override SHADOW/YELLOW defaults
      * from config if present. Installed before onode_start(). A strict
      * failure here (e.g. a non-boolean evidence_required, 1.4) aborts the
      * load rather than running with a guessed posture. */
-    if (load_gate_config(state, root) != 0) {
+    if (load_gate_config(state, root, production) != 0) {
         json_object_put(root);
         return -1;
     }
@@ -777,9 +1101,20 @@ int load_devices(onode_state_t *state, const char *path)
         json_get_string(dev_obj, "enable",   device.enable_password,
                         sizeof(device.enable_password));
 
-        int port_val;
-        if (json_get_int(dev_obj, "port", &port_val))
-            device.port = (uint16_t)port_val;
+        /* A port that is present must be a real port. `(uint16_t)` on
+         * the parsed int used to wrap 70000 to 4464 and -1 to 65535 and
+         * connect there. Fatal: a device entry that names the wrong
+         * endpoint is not one to load and let fail somewhere else. */
+        {
+            struct json_object *pv;
+            if (json_object_object_get_ex(dev_obj, "port", &pv) &&
+                !parse_port(pv, &device.port)) {
+                fprintf(stderr, "[O-Node] FATAL: device %d: \"port\" must "
+                        "be an integer 1..65535 — refusing the config\n", i);
+                json_object_put(root);
+                return -1;
+            }
+        }
 
         char vendor_str[32] = {0};
         if (json_get_string(dev_obj, "vendor", vendor_str, sizeof(vendor_str)))
@@ -810,12 +1145,21 @@ int load_devices(onode_state_t *state, const char *path)
          */
         struct json_object *nid_val;
         if (json_object_object_get_ex(dev_obj, "node_id", &nid_val)) {
-            if (json_object_is_type(nid_val, json_type_string)) {
-                const char *s = json_object_get_string(nid_val);
-                if (s) device.node_id = (uint32_t)strtoul(s, NULL, 16);
-            } else if (json_object_is_type(nid_val, json_type_int)) {
-                device.node_id = (uint32_t)json_object_get_int64(nid_val);
+            /* node_id is what an approval is cryptographically bound to
+             * (see onode_add_device). A PRESENT value that is not a
+             * 32-bit identity is fatal: strtoul(s, NULL, 16) read
+             * "1FFFFFFFF" as 0xFFFFFFFF and "zz" as 0, and the int form
+             * was cast straight to uint32_t, so two different configs
+             * could name the same device identity. */
+            uint64_t nid = 0;
+            if (!parse_identity(nid_val, 8, UINT32_MAX, &nid)) {
+                fprintf(stderr, "[O-Node] FATAL: device %d: \"node_id\" "
+                        "must be a hex string of 1..8 digits (no 0x) or an "
+                        "integer 0..4294967295 — refusing the config\n", i);
+                json_object_put(root);
+                return -1;
             }
+            device.node_id = (uint32_t)nid;
         }
 
         /*
@@ -827,21 +1171,34 @@ int load_devices(onode_state_t *state, const char *path)
          */
         struct json_object *did_val;
         if (json_object_object_get_ex(dev_obj, "device_id", &did_val)) {
-            if (json_object_is_type(did_val, json_type_string)) {
-                const char *s = json_object_get_string(did_val);
-                if (s) device.device_id = (uint64_t)strtoull(s, NULL, 16);
-            } else if (json_object_is_type(did_val, json_type_int)) {
-                device.device_id = (uint64_t)json_object_get_int64(did_val);
+            /* Same strictness as node_id: device_id binds v2/v3
+             * observations to a device. */
+            uint64_t did = 0;
+            if (!parse_identity(did_val, 16, UINT64_MAX, &did)) {
+                fprintf(stderr, "[O-Node] FATAL: device %d: \"device_id\" "
+                        "must be a hex string of 1..16 digits (no 0x) or a "
+                        "non-negative integer — refusing the config\n", i);
+                json_object_put(root);
+                return -1;
             }
+            device.device_id = did;
         }
 
         /* FortiGate-specific fields (ignored for other vendors) */
         json_get_string(dev_obj, "api_token", device.api_token,
                         sizeof(device.api_token));
 
-        int api_port_val;
-        if (json_get_int(dev_obj, "api_port", &api_port_val))
-            device.api_port = (uint16_t)api_port_val;
+        {
+            struct json_object *apv;
+            if (json_object_object_get_ex(dev_obj, "api_port", &apv) &&
+                !parse_port(apv, &device.api_port)) {
+                fprintf(stderr, "[O-Node] FATAL: device %d: \"api_port\" "
+                        "must be an integer 1..65535 — refusing the "
+                        "config\n", i);
+                json_object_put(root);
+                return -1;
+            }
+        }
 
         json_get_string(dev_obj, "vdom", device.vdom, sizeof(device.vdom));
 
@@ -884,14 +1241,25 @@ int load_devices(onode_state_t *state, const char *path)
          * protected_vmids (Proxmox-on-linux): guests this gate may not
          * touch at any tier. Accepts the natural JSON spelling —
          * "protected_vmids": [313] — and an equivalent CSV string, and
-         * normalizes to CSV. A malformed entry sets nothing: the
-         * classifier then refuses every VMID-bearing Proxmox command,
-         * which is the fail-closed reading of "this config did not
-         * parse" and is loud at the first request rather than silent
-         * forever.
+         * normalizes to CSV.
+         *
+         * A list that is DECLARED and comes out empty is FATAL (security
+         * review M25) — see the check after the vendor tests below. This
+         * comment used to say a malformed entry "sets nothing: the
+         * classifier then refuses every VMID-bearing Proxmox command".
+         * It did set nothing; the refusal did not follow. An empty set
+         * registers no protection, the loader only pushed a non-empty
+         * one into the gate, and the host loaded with its protected
+         * guests unprotected behind one "ignoring the whole list" line.
+         * A wrong JSON type (a bare number, an object) was not even
+         * logged. `pv_declared` records that the operator wrote the key,
+         * so "wrote it and it did not survive parsing" can be told apart
+         * from "never asked".
          */
+        bool pv_declared = false;
         struct json_object *pv_val;
         if (json_object_object_get_ex(dev_obj, "protected_vmids", &pv_val)) {
+            pv_declared = true;
             if (json_object_is_type(pv_val, json_type_array)) {
                 size_t used = 0;
                 int n_vm = (int)json_object_array_length(pv_val);
@@ -1065,6 +1433,29 @@ int load_devices(onode_state_t *state, const char *path)
             }
         }
 
+        /*
+         * A DECLARED protected_vmids that normalized to nothing is fatal
+         * (M25), exactly as protected_agents is below and for the same
+         * reason: the field exists so that a named guest cannot be
+         * touched, and loading the host without it leaves the operator
+         * believing a protection that is not in force. This covers a
+         * non-integer entry, a list too long for the field, a JSON type
+         * that is neither array nor string, and an explicitly empty
+         * list. Not conditional on the linux driver being compiled in:
+         * the config is wrong either way.
+         */
+        if ((device.vendor == VIRP_VENDOR_LINUX ||
+             device.vendor == VIRP_VENDOR_PROXMOX) &&
+            pv_declared && device.protected_vmids[0] == '\0') {
+            fprintf(stderr, "[O-Node] FATAL: %s: protected_vmids was "
+                    "declared but no VMID survived parsing (want an array "
+                    "of integers, or a comma-separated string) — refusing "
+                    "the config rather than running without the protection "
+                    "it declares\n", device.hostname);
+            json_object_put(root);
+            return -1;
+        }
+
 #ifdef VIRP_DRIVER_LINUX
         /*
          * Push this device's protected VMIDs into the linux gate before
@@ -1165,6 +1556,19 @@ int load_devices(onode_state_t *state, const char *path)
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] Failed to add %s: %s\n",
                     device.hostname, virp_error_str(err));
+            /* Listed, like every other refusal in this loop, so a device
+             * the operator configured and the daemon would not govern is
+             * visible in list_fleet rather than only in this log line.
+             * INVALID_LENGTH is the hostname check in onode_add_device
+             * (M7); the name itself is not echoed into the listing when
+             * it is the thing that failed validation. */
+            if (err == VIRP_ERR_INVALID_LENGTH)
+                onode_note_rejected(state, "", device.host, device.vendor,
+                                    "hostname not usable as a chain "
+                                    "session id (characters or length)");
+            else
+                onode_note_rejected(state, device.hostname, device.host,
+                                    device.vendor, virp_error_str(err));
             continue;
         }
 
@@ -1177,6 +1581,31 @@ int load_devices(onode_state_t *state, const char *path)
             loaded, count, path);
 
     return loaded;
+}
+
+/*
+ * LAB loader: the mock demonstration daemon and the test fixtures. Accepts
+ * everything load_devices_production() does, plus the documented opt-out
+ * "evidence_required": false.
+ *
+ * Not static: the issue #7 regression test in tests/test_onode.c links
+ * against the prod parser (via the *_lib.o object compiled with
+ * VIRP_ONODE_PROD_NO_MAIN) and calls this directly.
+ */
+int load_devices(onode_state_t *state, const char *path)
+{
+    return load_devices_impl(state, path, false);
+}
+
+/*
+ * PRODUCTION loader — what virp-onode-prod's main() calls. Identical to
+ * load_devices() except that a config asking for
+ * "evidence_required": false is a fatal error (M26). Not static, so the
+ * rule is testable without running main().
+ */
+int load_devices_production(onode_state_t *state, const char *path)
+{
+    return load_devices_impl(state, path, true);
 }
 
 /*
@@ -1294,7 +1723,10 @@ static void usage(const char *prog)
     printf("Options:\n");
     printf("  -P <path>   Required root-owned owner policy (docs/BLACK-POLICY.md)\n");
     printf("  -J <path>   Required existing daemon-private persistent policy journal\n");
-    printf("  -k <path>   O-Key file path (generates new key if file doesn't exist)\n");
+    printf("  -k <path>   O-Key file (REQUIRED). The file must already exist,\n");
+    printf("              0600 and owned by the daemon user; this daemon\n");
+    printf("              never generates one. Create it with:\n");
+    printf("                virp-tool keygen okey <path>\n");
     printf("  -K <path>   PREVIOUS O-Key, VERIFY-ONLY, for the rotation grace\n");
     printf("              window. Observations minted before a rotation and\n");
     printf("              registered after it would otherwise be refused by\n");
@@ -1303,11 +1735,16 @@ static void usage(const char *prog)
     printf("              COMPROMISED — the window keeps honouring it.\n");
     printf("  -W <secs>   Grace window length (default 900). Only with -K.\n");
     printf("  -s <path>   Unix socket path (default: %s)\n", ONODE_SOCKET_PATH);
+    printf("              An exclusive lock on <path>.lock is held while\n");
+    printf("              running; a second daemon on the same socket\n");
+    printf("              refuses to start.\n");
     printf("  -d <path>   Device config JSON file (required)\n");
     printf("  -n <hex>    Node ID in hex (default: 0x00000001)\n");
     printf("  -c <path>   Chain database path (enables Primitive 6 trust chain;\n");
     printf("              REQUIRED when approval mode is enabled — the daemon\n");
     printf("              refuses to start in approval mode without a chain)\n");
+    printf("              The v1 sequence high-water is kept beside it, in\n");
+    printf("              <path>.v1seq, so sequence numbers never restart.\n");
     printf("  -C <path>   Chain key path (32-byte key file, required with -c)\n");
     printf("  -S <path>   Chain-signing Ed25519 SECRET key (D-1). OPT-IN:\n");
     printf("              absent = signing off, zero behaviour change.\n");
@@ -1316,8 +1753,15 @@ static void usage(const char *prog)
     printf("              canonical bytes) so a third party can verify with\n");
     printf("              the public key alone. Requires -c/-C. Generate\n");
     printf("              with: virp-tool keygen chainsign <prefix>\n");
-    printf("  -3          Sign execute observations as v3 Ed25519 using -S.\n");
-    printf("              Requires an active bound session; no v1 fallback.\n");
+    printf("  -O <path>   Observation-signing Ed25519 SECRET key: verifies v3\n");
+    printf("              observation bodies submitted to chain_append and,\n");
+    printf("              with -3, signs execute observations. A key of its\n");
+    printf("              own — keep it distinct from -S. Generate with:\n");
+    printf("                virp-tool keygen obskey <prefix>\n");
+    printf("  -3          Sign execute observations as v3 Ed25519 with the -O\n");
+    printf("              key. Requires -S (a signed chain) and an active\n");
+    printf("              bound session; no v1 fallback. Without -O the -S\n");
+    printf("              key is used for both (DEPRECATED, warns at start).\n");
     printf("  -E <epoch>  Fresh native audit sessions (1..16 alnum/hyphen, requires -S).\n");
     printf("  -a <path>   Approval store dir (default: /var/lib/virp/approvals)\n");
     printf("  -A <path>   Approver registry (default: /etc/virp/approvers.json)\n");
@@ -1339,6 +1783,7 @@ int main(int argc, char **argv)
     bool execute_v3 = false;
     const char *native_epoch = NULL;
     const char *chain_sign_key_path = NULL;   /* D-1: -S, opt-in */
+    const char *obs_key_path = NULL;          /* -O: observation key (M21) */
     const char *approval_dir = "/var/lib/virp/approvals";
     const char *approvers_path = "/etc/virp/approvers.json";
     uint32_t node_id = 0x00000001;
@@ -1359,7 +1804,7 @@ int main(int argc, char **argv)
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "3k:K:W:s:d:n:c:C:S:E:a:A:P:J:h")) != -1) {
+    while ((opt = getopt(argc, argv, "3k:K:W:s:d:n:c:C:S:O:E:a:A:P:J:h")) != -1) {
         switch (opt) {
         case 'P': policy_path = optarg; break;
         case 'J': policy_journal = optarg; break;
@@ -1370,18 +1815,39 @@ int main(int argc, char **argv)
         case 'K':
             prev_okey_path = optarg;
             break;
-        case 'W':
-            prev_okey_window = (uint32_t)strtoul(optarg, NULL, 10);
+        case 'W': {
+            /* 1 second .. 7 days. strtoul + a uint32_t cast accepted
+             * "-1" (a window of 136 years — a second live key, in
+             * effect) and wrapped anything past 2^32. */
+            uid_t w_as_number;      /* parse_uid: decimal digits, in range */
+            if (!parse_uid(optarg, &w_as_number) || w_as_number < 1 ||
+                w_as_number > 7u * 86400u) {
+                fprintf(stderr, "FATAL: -W %s: the grace window must be a "
+                        "whole number of seconds, 1..604800 (7 days)\n",
+                        optarg);
+                return 1;
+            }
+            prev_okey_window = (uint32_t)w_as_number;
             break;
+        }
         case 's':
             socket_path = optarg;
             break;
         case 'd':
             devices_path = optarg;
             break;
-        case 'n':
-            node_id = (uint32_t)strtoul(optarg, NULL, 16);
+        case 'n': {
+            /* 1..8 hex digits, non-zero. Unparseable input used to become
+             * node id 0 and the daemon signed under it. */
+            uint64_t n64 = 0;
+            if (!parse_hex_u64(optarg, 8, &n64) || n64 == 0) {
+                fprintf(stderr, "FATAL: -n %s: the node id must be 1..8 hex "
+                        "digits (no 0x) and not zero\n", optarg);
+                return 1;
+            }
+            node_id = (uint32_t)n64;
             break;
+        }
         case 'c':
             chain_db_path = optarg;
             break;
@@ -1394,6 +1860,9 @@ int main(int argc, char **argv)
         case 'S':
             chain_sign_key_path = optarg;
             break;
+        case 'O':
+            obs_key_path = optarg;
+            break;
         case 'a':
             approval_dir = optarg;
             break;
@@ -1405,6 +1874,23 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return (opt == 'h') ? 0 : 1;
         }
+    }
+
+    /* -k is REQUIRED in production (security review M21). Without it
+     * onode_init() GENERATES an O-Key in memory — fine for the mock
+     * daemon, wrong here: every observation the node signed would be
+     * under a key that exists nowhere else and is gone at the next
+     * restart, so nothing it produced could be verified afterwards and
+     * chain_append would refuse the node's own earlier observations.
+     * The usage text also claimed a key is generated "if the file
+     * doesn't exist"; it never was — a missing file fails the load.
+     * Checked first, before any option that needs privileged files. */
+    if (!okey_path) {
+        fprintf(stderr, "FATAL: production requires -k <onode.key>. This "
+                "daemon does not generate an O-Key: without -k it would "
+                "sign with a throwaway key nothing could verify after a "
+                "restart. Create one with: virp-tool keygen okey <path>\n");
+        return 1;
     }
 
     if (!policy_path || !policy_journal || !devices_path ||
@@ -1525,16 +2011,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Load devices from JSON config */
-    int loaded = load_devices(&g_state, devices_path);
+    /* Load devices from JSON config — the PRODUCTION loader, which
+     * refuses "evidence_required": false outright (M26). There is
+     * deliberately no assignment to evidence_required after this: it is
+     * true because onode_init() set it and the loader would not clear
+     * it, not because main() overruled the file. */
+    int loaded = load_devices_production(&g_state, devices_path);
     if (loaded <= 0) {
         fprintf(stderr, "[O-Node] No devices loaded. Exiting.\n");
         onode_destroy(&g_state);
         virp_context_destroy(ctx);
         return 1;
     }
-
-    g_state.evidence_required = true;
 
     /*
      * Trust chain (Primitive 6) + approval flow. Fatal if approval mode
@@ -1549,6 +2037,28 @@ int main(int argc, char **argv)
         onode_destroy(&g_state);
         virp_context_destroy(ctx);
         return 1;
+    }
+
+    /* v1 sequence high-water (security review M20). Kept beside the chain
+     * database: that directory is the daemon's durable state, where the
+     * socket's directory (/run) does not survive a reboot. Fatal if it
+     * cannot be loaded or reserved — a daemon that cannot remember its
+     * sequence would re-issue numbers after the next restart. */
+    if (chain_db_path) {
+        char seq_path[512];
+        int sn = snprintf(seq_path, sizeof(seq_path), "%s.v1seq",
+                          chain_db_path);
+        virp_error_t serr = (sn < 0 || (size_t)sn >= sizeof(seq_path))
+            ? VIRP_ERR_INVALID_LENGTH
+            : onode_set_seq_store(&g_state, seq_path);
+        if (serr != VIRP_OK) {
+            fprintf(stderr, "[O-Node] FATAL: the v1 sequence high-water "
+                    "store (%s.v1seq) could not be set up: %s. Refusing to "
+                    "start.\n", chain_db_path, virp_error_str(serr));
+            onode_destroy(&g_state);
+            virp_context_destroy(ctx);
+            return 1;
+        }
     }
 
     /* D-1: opt-in detached Ed25519 chain signing. Only meaningful with a
@@ -1581,13 +2091,42 @@ int main(int argc, char **argv)
         onode_destroy(&g_state); virp_context_destroy(ctx); return 1;
     }
 
-    if (execute_v3) {
-        if (!chain_sign_key_path ||
-            virp_obskey_load(&g_state.obskey, chain_sign_key_path) != VIRP_OK) {
-            fprintf(stderr, "[O-Node] -3 requires a valid -S signing key\n");
+    /* Observation key (M21). -O names it; it is a key of its own. -3
+     * without -O falls back to the chain-signing key, which is what -3
+     * always did — kept so a unit written before the split still starts,
+     * but it means one key signs both chain entries and observations,
+     * so it warns on every start until -O is added. */
+    const char *obs_from = obs_key_path;
+    if (execute_v3 && !obs_from) {
+        obs_from = chain_sign_key_path;
+        if (obs_from)
+            fprintf(stderr, "[O-Node] WARNING: -3 without -O — signing "
+                    "observations with the CHAIN-SIGNING key (-S %s). One "
+                    "key is vouching for two different things. Generate a "
+                    "separate observation key (virp-tool keygen obskey "
+                    "<prefix>) and pass it with -O. DEPRECATED.\n",
+                    obs_from);
+    }
+    if (obs_from) {
+        if (virp_obskey_load(&g_state.obskey, obs_from) != VIRP_OK) {
+            fprintf(stderr, "[O-Node] FATAL: observation key %s could not "
+                    "be loaded. Refusing to start.\n", obs_from);
             onode_destroy(&g_state); virp_context_destroy(ctx); return 1;
         }
         g_state.obskey_loaded = true;
+        if (obs_key_path && chain_sign_key_path && g_state.chain.sign_enabled &&
+            memcmp(g_state.chain.sign_key.public_key,
+                   g_state.obskey.public_key, 32) == 0)
+            fprintf(stderr, "[O-Node] WARNING: -O and -S are the SAME key. "
+                    "Accepted, but the point of -O is that they differ.\n");
+    }
+    if (execute_v3) {
+        if (!chain_sign_key_path || !g_state.obskey_loaded) {
+            fprintf(stderr, "[O-Node] FATAL: -3 requires -S (a signed "
+                    "chain) and an observation key (-O). Refusing to "
+                    "start.\n");
+            onode_destroy(&g_state); virp_context_destroy(ctx); return 1;
+        }
         g_state.execute_v3 = true;
     }
 

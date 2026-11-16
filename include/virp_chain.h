@@ -576,6 +576,31 @@ virp_error_t virp_chain_append_with_artifact(virp_chain_state_t *state,
                                              virp_chain_entry_t *entry);
 
 /*
+ * The append for a submission that came from OUTSIDE the daemon — the
+ * socket CHAIN_APPEND handler. Same arguments, same transaction and same
+ * results as virp_chain_append_with_artifact(), plus one rule that is
+ * about external submissions only (security review M6):
+ *
+ *   ONE OBSERVATION, ONE REGISTRATION. For artifact_type 'observation'
+ *   and 'fed_observation', the append is refused with
+ *   VIRP_ERR_DUPLICATE_MISMATCH if another entry of either type already
+ *   commits to the same artifact_hash under a DIFFERENT artifact_id or in
+ *   a DIFFERENT session. A resubmission under the same id in the same
+ *   session is not a conflict (it is the retry of a lost ack).
+ *
+ * The check runs inside the append's own write transaction. Callers that
+ * build chains directly (tools, fixtures, the daemon's own records) use
+ * the plain appends above and are not subject to it.
+ */
+virp_error_t virp_chain_append_external(virp_chain_state_t *state,
+                                        const char *session_id,
+                                        const char *artifact_type,
+                                        const char *artifact_id,
+                                        const char *artifact_hash,
+                                        const char *artifact_content,
+                                        virp_chain_entry_t *entry);
+
+/*
  * Verify chain integrity for a sequence range within a session.
  * Re-hashes each entry and verifies HMAC + previous_entry_hash linkage.
  *
@@ -768,6 +793,25 @@ virp_error_t virp_chain_error_entry_commits_to(virp_chain_state_t *state,
 virp_error_t virp_chain_count_intents_for_approval(virp_chain_state_t *state,
                                                    const char *approval_entry_hash,
                                                    int *count);
+
+/*
+ * Security review H1 — the two replay keys that do not depend on the
+ * unsigned chain-hash line of the on-disk approval record.
+ *
+ * count_intents_for_proposal: committed gate_intent entries whose body
+ * names this proposal id. approval_entry_hash: the entry hash of the
+ * 'approval' entry the daemon appended as "approval:<proposal_id>";
+ * *count is how many such entries exist and out_hash is filled only when
+ * that is exactly one. Both are read-only and return VIRP_OK on a
+ * successful query whether or not anything matched.
+ */
+virp_error_t virp_chain_count_intents_for_proposal(virp_chain_state_t *state,
+                                                   const char *proposal_id,
+                                                   int *count);
+virp_error_t virp_chain_approval_entry_hash(virp_chain_state_t *state,
+                                            const char *proposal_id,
+                                            char out_hash[65],
+                                            int *count);
 
 /*
  * Set *conflict to true iff the artifacts table already holds a body

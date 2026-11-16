@@ -948,7 +948,10 @@ TEST(test_heartbeat)
     virp_parse_heartbeat(resp + VIRP_HEADER_SIZE,
                          (size_t)n - VIRP_HEADER_SIZE, &hb);
     ASSERT_EQ(hb.onode_ok, 1);
-    ASSERT_EQ(hb.rnode_ok, 1);
+    /* 0, not 1: the O-Node has no way to observe the R-Node, and used to
+     * assert its health unconditionally. A signed heartbeat now reports
+     * only what the signer can see (security review, LOW). */
+    ASSERT_EQ(hb.rnode_ok, 0);
 }
 
 TEST(test_list_devices)
@@ -8181,8 +8184,14 @@ TEST(test_uid_chain_append_type_policy_narrows_types)
 
     /* any OTHER type from the restricted uid is refused — including the
      * commitment-only observation form that is legal for everyone else */
+    /* A commitment of this test's own. An earlier test registers an
+     * observation under sha256("bytes the chain will not hold"), and
+     * since the O-Node security review (M6) one observation hash has one
+     * registration: reusing that hash here under another id and session
+     * is now refused for THAT reason, which is not what this test is
+     * about. */
     char h[65];
-    ca_sha256_hex("bytes the chain will not hold", h);
+    ca_sha256_hex("bytes the chain will not hold (item8 type narrowing)", h);
     n = ca_append("ncfed-item8-t1", "observation",
                   "item8-obs-refused-1", h, NULL, resp, sizeof(resp));
     ASSERT_EQ((int)n, 4);

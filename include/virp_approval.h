@@ -116,6 +116,33 @@ virp_error_t virp_approval_propose(const char *dir,
                                    const char *tier_name,
                                    virp_proposal_rec_t *out);
 
+/*
+ * The command hash a proposal for `command` would carry — the same
+ * derivation virp_approval_propose() and virp_approval_verify() use
+ * (typed-operation hash when typed_profile is non-NULL, SHA-256 of the
+ * canonicalized command otherwise). Exposed so the daemon can recognise
+ * "this exact command is already proposed" BEFORE filing a second
+ * proposal for it (security review M16). VIRP_ERR_INVALID_LENGTH when
+ * the command cannot be hashed (its canonical form is too long) — which
+ * is also why no proposal can be filed for it.
+ */
+virp_error_t virp_approval_command_hash(const char *command,
+                                        const char *typed_profile,
+                                        char out_hex[65]);
+
+/*
+ * Is this proposal still OPEN — on record, not yet approved, and with no
+ * OUTCOME on the chain? Only an open proposal may be handed back to a
+ * caller in place of filing a new one (M16): one that has been approved
+ * is already bound to a challenge timestamp, and one that has an outcome
+ * is spent. *open is false on every error (fail closed: when in doubt,
+ * file a fresh proposal rather than reuse a stale id). chain may be NULL.
+ */
+virp_error_t virp_approval_is_open(const char *dir,
+                                   virp_chain_state_t *chain,
+                                   const char *proposal_id,
+                                   bool *open);
+
 /* Load a proposal record by id. VIRP_ERR_APPROVAL_NOT_FOUND if absent. */
 virp_error_t virp_approval_load_proposal(const char *dir,
                                          const char *proposal_id,
@@ -266,5 +293,19 @@ void virp_approval_consume_lock(void);
 void virp_approval_consume_unlock(void);
 virp_error_t virp_approval_commit_consume_locked(const char *dir,
                                                  const char *proposal_id);
+
+/*
+ * Is proposal_id already on consumed.list? Read-only; the caller must
+ * hold consume_lock. The apply path asks this BEFORE committing the
+ * consuming gate_intent (security review H1): the commit above reports
+ * REUSED only after the intent is already durable, which is too late to
+ * refuse cleanly. *consumed is left TRUE on any error, so a store that
+ * cannot answer reads as spent (fail closed). A missing list is an empty
+ * list; an existing list that cannot be opened is
+ * VIRP_ERR_APPROVAL_STORE_UNREADABLE.
+ */
+virp_error_t virp_approval_is_consumed_locked(const char *dir,
+                                              const char *proposal_id,
+                                              bool *consumed);
 
 #endif /* VIRP_APPROVAL_H */

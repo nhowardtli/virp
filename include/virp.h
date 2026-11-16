@@ -49,18 +49,30 @@
  * Trust Tiers
  *
  * Mapped from TLI Ops Center command tiers:
- *   GREEN  → Tier 1 (passive, no approval)
- *   YELLOW → Tier 2 (active, single approval)
- *   RED    → Tier 3 (critical) — currently ONE enrolled approver's
- *            signature, the SAME mechanism as YELLOW. m-of-n quorum
- *            approval is a roadmap item, not implemented.
+ *   GREEN  → Tier 1 (passive)
+ *   YELLOW → Tier 2 (active)
+ *   RED    → Tier 3 (critical)
  *   BLACK  → Tier 0 (impossible — not in message format)
+ *
+ * WHAT A TIER DOES, as the O-Node gate enforces it (virp_onode.c). The
+ * tiers are an ORDER, GREEN < YELLOW < RED, compared against the caller's
+ * effective ceiling: a command at or under the ceiling executes with no
+ * approval; a command above it is refused and can run only as an
+ * approved apply. The ceiling is the caller's per-uid row when it has
+ * one, else the node-wide gate_max_tier, which defaults to YELLOW. So on
+ * a default node YELLOW executes WITHOUT approval — it needs one only
+ * for a uid capped at GREEN — and RED is the first tier that does.
+ * Approval is the same mechanism at every tier: ONE enrolled approver's
+ * signature. m-of-n quorum approval is a roadmap item, not implemented.
+ * BLACK and UNCLASSIFIED are outside the order: BLACK is refused
+ * unconditionally and is unapprovable; UNCLASSIFIED blocks like an
+ * over-ceiling tier.
  * ========================================================================= */
 
 #define VIRP_TIER_UNCLASSIFIED  0x00    /* No classifier table matched — gate fails closed */
 #define VIRP_TIER_GREEN         0x01    /* Passive — no approval required */
-#define VIRP_TIER_YELLOW        0x02    /* Active — single approval required */
-#define VIRP_TIER_RED           0x03    /* Critical — single enrolled-approver signature (same mechanism as YELLOW); m-of-n quorum is roadmap, not implemented */
+#define VIRP_TIER_YELLOW        0x02    /* Active — executes without approval at the default (YELLOW) ceiling; needs one only under a GREEN ceiling */
+#define VIRP_TIER_RED           0x03    /* Critical — above the default ceiling: single enrolled-approver signature (m-of-n quorum is roadmap, not implemented) */
 #define VIRP_TIER_BLACK         0xFF    /* Forbidden — never transmitted */
 
 /* =========================================================================
@@ -539,7 +551,14 @@ typedef enum {
      * reuses already names other bytes. The correct client response is
      * to stop retrying this correlation and mint a new one — never to
      * re-serialize under the same id. Byte-identical resubmission does
-     * NOT raise this; it is a legitimate retry and succeeds. */
+     * NOT raise this; it is a legitimate retry and succeeds.
+     *
+     * GATE 6 (security review M6) raises it for the mirror image: an
+     * `observation` / `fed_observation` whose artifact_hash is ALREADY
+     * registered under a different artifact_id or in a different
+     * session. Same meaning for the client — this submission conflicts
+     * with what the chain already holds, and resending it will not
+     * help: one observation backs one registration. */
     VIRP_ERR_DUPLICATE_MISMATCH       = -51,  /* fed artifact_id reused
                                                  with different body
                                                  bytes */
@@ -587,6 +606,15 @@ typedef enum {
      * wrong host, wrong id, wrong uid — and tonight's message
      * conflated the first two. */
     VIRP_ERR_APPROVAL_STORE_ABSENT    = -56,
+
+    /* The request is well-formed and this principal is allowed to make
+     * it — just not this often (O-Node security review M15/M16). The
+     * daemon bounds how much of a shared resource one uid can take: time
+     * holding the chain lock for verification, and proposals filed.
+     * Distinct from VIRP_ERR_ACTION_FORBIDDEN (-50) on purpose: that is
+     * a policy answer and retrying is pointless; this is a load answer,
+     * and the correct client response is to back off and retry later. */
+    VIRP_ERR_RATE_LIMITED             = -57,
 
     /* Success-class status codes (> 0). Not errors: the operation's
      * postcondition holds, but not because of this call. */

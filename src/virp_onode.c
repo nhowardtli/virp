@@ -25,6 +25,7 @@
 #include "virp_context.h"
 #include "virp_validator.h"
 #include "virp_scrub.h"          /* scrub-at-capture (S-1) — before sign */
+#include <stddef.h>               /* offsetof */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/select.h>
+#include <sys/eventfd.h>
+#include <sys/file.h>            /* flock — single-instance lock */
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -46,6 +51,11 @@
 
 /* Legacy encoder stages v3 bodies locally; evidence retains v3 identity. */
 static _Thread_local bool execute_wrapping_v3;
+
+/* CLOCK_MONOTONIC in milliseconds — every deadline, budget and rate
+ * window in this file is measured on it, so a wall-clock step can
+ * neither stretch nor collapse one. Defined with the socket framing. */
+static int64_t onode_monotonic_ms(void);
 
 /* =========================================================================
  * JSON Request Parsing
@@ -62,6 +72,11 @@ static _Thread_local bool execute_wrapping_v3;
  * fields that feed into unsigned receiver types (supported_channels,
  * sequence numbers, expires_at_ns) are range-checked: negatives and
  * values above the receiver's max are rejected outright.
+ *
+ * Both ingress parsers start at onode_parse_root_object() (security
+ * review M1): the whole frame payload must be one JSON object and
+ * nothing else, of exactly the declared length, with no root key
+ * repeated.
  * ========================================================================= */
 
 typedef struct {
@@ -140,13 +155,104 @@ static bool json_extract_string_cjson(cJSON *root, const char *key,
     }
     if (out_len == 0 || strlen(item->valuestring) >= out_len) {
         /* Over-length: refuse the value. parse_request turns this into a
-         * refusal of the whole request for the chain fields, and every
-         * other optional field is left empty rather than half-copied. */
+         * refusal of the whole request for the chain fields; every other
+         * optional field goes through json_extract_optional_string below,
+         * which refuses the whole request as well (M2). */
         out[0] = '\0';
         return false;
     }
     snprintf(out, out_len, "%s", item->valuestring);
     return true;
+}
+
+/*
+ * Extract an OPTIONAL string field. Three outcomes, and the caller must
+ * tell them apart (security review M2):
+ *
+ *    0  absent, or JSON null — the field was not supplied; out is "".
+ *    1  supplied and copied.
+ *   -1  supplied but UNUSABLE — longer than the receiver, or not a
+ *       string at all. The caller refuses the WHOLE request.
+ *
+ * json_extract_string_cjson above already refuses to truncate, but it
+ * reports "over-length" and "absent" identically, and for every field
+ * outside the chain trio the parser then carried on with an empty value.
+ * So an intent_store whose constraints ran one byte over stored an
+ * intent with NO constraints, a 17-character client_nonce became a
+ * handshake with an all-zero nonce, and an over-long command was
+ * answered "missing command". Dropping a field the caller supplied is
+ * still reshaping the request — silently removing a constraint is worse
+ * than truncating one. Reject, never truncate; and never quietly omit.
+ *
+ * A wrong-typed value ("constraints": {...}, "device": 7) is refused for
+ * the same reason. JSON null is the one explicit way to say "no value"
+ * and is treated as absent.
+ */
+static int json_extract_optional_string(cJSON *root, const char *key,
+                                        char *out, size_t out_len)
+{
+    if (out_len) out[0] = '\0';
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!item || cJSON_IsNull(item))
+        return 0;
+    if (!cJSON_IsString(item) || item->valuestring == NULL)
+        return -1;
+    if (out_len == 0 || strlen(item->valuestring) >= out_len)
+        return -1;
+    snprintf(out, out_len, "%s", item->valuestring);
+    return 1;
+}
+
+/*
+ * Decode a hex field that must be EXACTLY `want` bytes — a nonce, a
+ * session id. virp_hex_decode() reports how many bytes it wrote and -1
+ * on a bad digit, and it writes as it goes: a caller that ignores the
+ * return (every handshake caller did, M2) is left with a buffer that is
+ * part decoded, part whatever it was before. "abcd" as a 16-byte session
+ * id decoded two bytes and left fourteen zeros; "zz" as a nonce decoded
+ * nothing and the handshake proceeded on an all-zero nonce. Decodes into
+ * a scratch buffer and copies only on an exact-length success, so `out`
+ * is either the whole value or untouched.
+ */
+static bool hex_decode_exact(const char *hex, uint8_t *out, size_t want)
+{
+    uint8_t tmp[32];
+    if (!hex || want == 0 || want > sizeof(tmp)) return false;
+    if (strlen(hex) != 2 * want) return false;
+    if (virp_hex_decode(hex, tmp, want) != (int)want) return false;
+    memcpy(out, tmp, want);
+    return true;
+}
+
+/*
+ * Parse a comma-separated list of small decimal integers ("2,1") into
+ * out[0..max). Strict: every token is 1-3 digits, 0..255, no blanks, no
+ * signs, no empty tokens, and no more than `max` of them. The handshake
+ * used strtok + atoi + a (uint8_t) cast here, so "x" was version 0,
+ * "258" was version 2, and tokens past the array bound were dropped —
+ * three quiet rewrites of what the client asked for. Returns the token
+ * count, or -1 to refuse.
+ */
+static int parse_u8_csv(const char *s, uint8_t *out, int max)
+{
+    int n = 0;
+    const char *p = s;
+    if (!s || !*s) return -1;
+    for (;;) {
+        unsigned v = 0;
+        int digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            if (++digits > 3) return -1;
+            v = v * 10 + (unsigned)(*p - '0');
+            p++;
+        }
+        if (digits == 0 || v > 255) return -1;
+        if (n >= max) return -1;
+        out[n++] = (uint8_t)v;
+        if (*p == '\0') return n;
+        if (*p != ',') return -1;
+        p++;
+    }
 }
 
 /*
@@ -209,6 +315,28 @@ static const char *onode_typed_profile(onode_state_t *state, int dev_idx)
  * this correctly (jadd_u64str / jget_u64str).
  */
 #define ONODE_JSON_SAFE_INT_MAX  9007199254740992LL   /* 2^53 */
+
+/*
+ * The PRODUCING half of the rule above (security review M8): add an
+ * evidence integer that may exceed 2^53 as a DECIMAL STRING.
+ *
+ * The daemon enforced the rule on what it read and broke it in what it
+ * wrote. intent_ns (gate_intent bodies), emitted_ns (node_config bodies)
+ * and approved_at_ns (the approval challenge and result payloads) all
+ * went out through cJSON_AddNumberToObject((double)ns). A nanosecond
+ * timestamp is about 1.79e18; a double carries 53 bits, so the value
+ * written was the true one rounded to a multiple of 256 — and for
+ * approved_at_ns that is a field the approver's signature covers
+ * exactly, shown to the operator wrong. Same form as virp_approval.c's
+ * jadd_u64str, which has always written the on-disk copy of
+ * approved_at_ns this way.
+ */
+static bool json_add_u64_string(cJSON *o, const char *key, uint64_t v)
+{
+    char num[24];
+    snprintf(num, sizeof(num), "%llu", (unsigned long long)v);
+    return cJSON_AddStringToObject(o, key, num) != NULL;
+}
 
 /*
  * Extract a signed-integer-valued key.
@@ -353,6 +481,92 @@ static bool json_has_nul_escape(const char *json)
 }
 
 /*
+ * Parse a request frame into its root JSON object — the ONE structural
+ * gate both ingress parsers (parse_request, parse_batch_commands) go
+ * through, so they cannot disagree about what a well-formed request is.
+ * Returns the root object (caller cJSON_Delete()s it) or NULL.
+ *
+ * Security review M1. Everything refused here is a way for the request
+ * the daemon acts on to differ from the request that was sent:
+ *
+ *  - LENGTH. `len` is the payload length the frame header declared. A raw
+ *    NUL byte inside it ends the C string early, so every strlen-based
+ *    reader saw a shorter request than the frame carried and the tail
+ *    was dropped without a word. Refused: the payload must be exactly
+ *    `len` bytes of text.
+ *  - WHOLE BUFFER. cJSON_Parse stops at the end of the first value and
+ *    ignores whatever follows, so `{"action":"heartbeat"}{"action":
+ *    "shutdown"}` was a valid heartbeat. cJSON_ParseWithLengthOpts with
+ *    require_null_terminated accepts trailing whitespace and nothing
+ *    else. (It wants the terminator counted in the length — hence len+1;
+ *    json[len] is the NUL the caller wrote.)
+ *  - ROOT OBJECT. A bare array or string parses but has no keys, which
+ *    would bypass the action gate.
+ *  - DUPLICATE ROOT KEYS. cJSON_GetObjectItemCaseSensitive returns the
+ *    FIRST member of a name; Python's json, Go's encoding/json and most
+ *    other readers keep the LAST. A request carrying a key twice is
+ *    therefore two different requests depending on who reads it — the
+ *    same first-vs-last split GATE 4 refuses in a fed_outcome. Refused
+ *    outright rather than resolved either way.
+ *  - MEMBER COUNT. The duplicate scan is quadratic, and the wire
+ *    vocabulary is about forty keys; a root object with more members
+ *    than ONODE_MAX_ROOT_KEYS is refused before the scan, so a 128 KiB
+ *    frame of junk keys cannot buy a few hundred million comparisons.
+ *
+ * Also carries the encoded-NUL check (json_has_nul_escape), which used
+ * to be repeated at the top of each parser.
+ */
+#define ONODE_MAX_ROOT_KEYS 64
+
+static bool json_object_has_duplicate_keys(const cJSON *obj, int max_keys)
+{
+    int n = 0;
+    for (const cJSON *a = obj->child; a; a = a->next) {
+        if (++n > max_keys)
+            return true;              /* too many to vouch for: refuse */
+        if (!a->string)
+            continue;
+        for (const cJSON *b = a->next; b; b = b->next)
+            if (b->string && strcmp(a->string, b->string) == 0)
+                return true;
+    }
+    return false;
+}
+
+static cJSON *onode_parse_root_object(const char *json, size_t len,
+                                      const char *what)
+{
+    if (!json) return NULL;
+
+    if (memchr(json, '\0', len) != NULL) {
+        fprintf(stderr, "[O-Node] %s carries a raw NUL byte inside its "
+                        "declared length — refusing the whole request; the "
+                        "bytes after it would have been dropped unread\n",
+                what);
+        return NULL;
+    }
+
+    /* Length divergence: refuse a request carrying an encoded NUL before
+     * anything copies a field out of it. */
+    if (json_has_nul_escape(json)) {
+        fprintf(stderr, "[O-Node] %s contains an encoded NUL "
+                        "(\\u0000) — refusing the whole request; a value "
+                        "that continues past a NUL is not the value that "
+                        "would be executed\n", what);
+        return NULL;
+    }
+
+    cJSON *root = cJSON_ParseWithLengthOpts(json, len + 1, NULL, 1);
+    if (!root) return NULL;
+    if (!cJSON_IsObject(root) ||
+        json_object_has_duplicate_keys(root, ONODE_MAX_ROOT_KEYS)) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+    return root;
+}
+
+/*
  * The wire name ↔ action table — the ONE list parse_request and the
  * socket_uid_action_allow config loader both read, so the dispatch and
  * the policy can never disagree about what an action is called.
@@ -410,34 +624,37 @@ static void onode_session_lock(onode_state_t *state)
     if (state->ctx) (void)virp_session_check_timeouts(state->ctx);
 }
 
-static bool parse_request(const char *json, onode_request_t *req)
+/*
+ * `json_len` is the payload length the frame declared; json[json_len]
+ * must be the terminating NUL (handle_client writes it). The length is
+ * an argument, not a strlen(), on purpose: see onode_parse_root_object.
+ */
+/*
+ * May `uid` use the session as it stands? (M19) Caller holds
+ * session_mutex. True when nobody recorded ownership of the CURRENT
+ * session generation — an unowned session, e.g. one a test bound on the
+ * context directly — or when `uid` is the uid that bound it.
+ */
+static bool onode_session_usable_by(const onode_state_t *state, uid_t uid)
+{
+    if (!state->ctx || !state->session_owner_set)
+        return true;
+    if (state->session_owner_generation != state->ctx->session.generation)
+        return true;              /* owner record is for an older session */
+    return state->session_owner_uid == uid;
+}
+
+static bool parse_request(const char *json, size_t json_len,
+                          onode_request_t *req)
 {
     if (!json || !req) return false;
 
     memset(req, 0, sizeof(*req));
 
-    /* Length divergence: refuse a request carrying an encoded NUL before
-     * anything copies a field out of it. */
-    if (json_has_nul_escape(json)) {
-        fprintf(stderr, "[O-Node] request contains an encoded NUL "
-                        "(\\u0000) — refusing the whole request; a value "
-                        "that continues past a NUL is not the value that "
-                        "would be executed\n");
-        return false;
-    }
-
-    /*
-     * Structural validation: cJSON_Parse rejects malformed JSON. We
-     * additionally require the root be an object — a bare array or
-     * string parses successfully but has no keys to look up, which
-     * would silently bypass the action gate.
-     */
-    cJSON *root = cJSON_Parse(json);
+    /* Structural validation — whole buffer, exact length, root object,
+     * no duplicate root keys, no encoded NUL (M1). */
+    cJSON *root = onode_parse_root_object(json, json_len, "request");
     if (!root) return false;
-    if (!cJSON_IsObject(root)) {
-        cJSON_Delete(root);
-        return false;
-    }
 
     /* Action (required) */
     char action_str[32];
@@ -454,10 +671,29 @@ static bool parse_request(const char *json, onode_request_t *req)
     }
 
 #define EXTRACT_STR(key, dst, sz)  json_extract_string_cjson(root, key, dst, sz)
+/* Optional field: absent is fine, present-but-unusable refuses the whole
+ * request (M2) — see json_extract_optional_string. */
+#define OPTIONAL_STR(key, dst, sz)                                        \
+    do {                                                                  \
+        if (json_extract_optional_string(root, key, dst, sz) < 0) {       \
+            cJSON_Delete(root);                                           \
+            return false;                                                 \
+        }                                                                 \
+    } while (0)
 
     /* Extract optional string fields */
-    EXTRACT_STR("device", req->device, sizeof(req->device));
-    EXTRACT_STR("command", req->command, sizeof(req->command));
+    OPTIONAL_STR("device", req->device, sizeof(req->device));
+    OPTIONAL_STR("command", req->command, sizeof(req->command));
+
+    /* The device name is not just a lookup key (security review M3): it
+     * is echoed into signed ERROR observations, into chain record bodies
+     * and — for a refusal — into a chain SESSION ID. Hold it to the
+     * canonical-string rule the chain itself enforces, here, so a name
+     * the chain would refuse never gets as far as being looked up. */
+    if (req->device[0] && !onode_canonical_string_ok(req->device)) {
+        cJSON_Delete(root);
+        return false;
+    }
 
     /*
      * Approval reference for apply. If present it must be exactly the
@@ -629,9 +865,9 @@ static bool parse_request(const char *json, onode_request_t *req)
     }
 
     /* Intent fields */
-    EXTRACT_STR("intent_id", req->intent_id, sizeof(req->intent_id));
-    EXTRACT_STR("intent_hash", req->intent_hash, sizeof(req->intent_hash));
-    EXTRACT_STR("confidence", req->confidence, sizeof(req->confidence));
+    OPTIONAL_STR("intent_id", req->intent_id, sizeof(req->intent_id));
+    OPTIONAL_STR("intent_hash", req->intent_hash, sizeof(req->intent_hash));
+    OPTIONAL_STR("confidence", req->confidence, sizeof(req->confidence));
     {
         uint64_t v = 0;
         if (json_extract_u64_bounded(root, "expires_at_ns",
@@ -655,17 +891,19 @@ static bool parse_request(const char *json, onode_request_t *req)
             return false;
         }
     }
-    EXTRACT_STR("intent_json", req->intent_json, sizeof(req->intent_json));
-    EXTRACT_STR("proposed_actions", req->proposed_actions,
-                sizeof(req->proposed_actions));
-    EXTRACT_STR("constraints", req->constraints, sizeof(req->constraints));
+    OPTIONAL_STR("intent_json", req->intent_json, sizeof(req->intent_json));
+    OPTIONAL_STR("proposed_actions", req->proposed_actions,
+                 sizeof(req->proposed_actions));
+    OPTIONAL_STR("constraints", req->constraints, sizeof(req->constraints));
 
-    /* Handshake fields */
-    EXTRACT_STR("client_id", req->client_id, sizeof(req->client_id));
-    EXTRACT_STR("client_nonce", req->client_nonce, sizeof(req->client_nonce));
-    EXTRACT_STR("server_nonce", req->server_nonce, sizeof(req->server_nonce));
-    EXTRACT_STR("versions", req->versions, sizeof(req->versions));
-    EXTRACT_STR("algorithms", req->algorithms, sizeof(req->algorithms));
+    /* Handshake fields. The nonces are sized for exactly 16 hex chars, so
+     * anything longer is refused here; shorter or non-hex is refused
+     * where they are decoded (hex_decode_exact, in the handshake cases). */
+    OPTIONAL_STR("client_id", req->client_id, sizeof(req->client_id));
+    OPTIONAL_STR("client_nonce", req->client_nonce, sizeof(req->client_nonce));
+    OPTIONAL_STR("server_nonce", req->server_nonce, sizeof(req->server_nonce));
+    OPTIONAL_STR("versions", req->versions, sizeof(req->versions));
+    OPTIONAL_STR("algorithms", req->algorithms, sizeof(req->algorithms));
 
     /*
      * supported_channels is a bitmask that gets cast to uint32_t later
@@ -684,6 +922,7 @@ static bool parse_request(const char *json, onode_request_t *req)
     }
 
 #undef EXTRACT_STR
+#undef OPTIONAL_STR
 
     cJSON_Delete(root);
     return true;
@@ -693,10 +932,120 @@ static bool parse_request(const char *json, onode_request_t *req)
  * Sequence Number
  * ========================================================================= */
 
+/* Write `value` to the sequence store durably: temp file, fsync, rename,
+ * fsync of the directory. Either the old value or the new one survives a
+ * crash, never a torn file. */
+static bool seq_store_write(const char *path, uint32_t value)
+{
+    char tmp[sizeof(((onode_state_t *)0)->seq_store_path) + 8];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (n < 0 || (size_t)n >= sizeof(tmp)) return false;
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
+    if (fd < 0) return false;
+    char text[16];
+    int len = snprintf(text, sizeof(text), "%u\n", value);
+    bool ok = write(fd, text, (size_t)len) == (ssize_t)len && fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    if (!ok || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    /* Make the rename itself durable. */
+    char dir[sizeof(tmp)];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *(slash == dir ? slash + 1 : slash) = '\0';
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+    }
+    return true;
+}
+
+virp_error_t onode_set_seq_store(onode_state_t *state, const char *path)
+{
+    if (!state || !path || !path[0])
+        return VIRP_ERR_NULL_PTR;
+    if (strlen(path) >= sizeof(state->seq_store_path))
+        return VIRP_ERR_INVALID_LENGTH;
+
+    uint32_t stored = 0;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char text[32];
+        size_t got = fread(text, 1, sizeof(text) - 1, f);
+        fclose(f);
+        text[got] = '\0';
+        /* Digits and one trailing newline, nothing else: a file that is
+         * not what this function writes is not a number to trust. */
+        size_t digits = strspn(text, "0123456789");
+        if (digits == 0 || digits > 10 ||
+            (text[digits] != '\0' && strcmp(text + digits, "\n") != 0)) {
+            fprintf(stderr, "[O-Node] sequence store %s is not a sequence "
+                    "number — refusing to guess where the sequence was\n",
+                    path);
+            return VIRP_ERR_INVALID_TYPE;
+        }
+        unsigned long long v = strtoull(text, NULL, 10);
+        if (v > UINT32_MAX) return VIRP_ERR_INVALID_TYPE;
+        stored = (uint32_t)v;
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "[O-Node] sequence store %s exists but cannot be "
+                "read: %s\n", path, strerror(errno));
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    /* Resume above everything the stored value could cover, and reserve
+     * the next block before a single number is issued. */
+    if (stored > UINT32_MAX - ONODE_SEQ_RESERVE_BLOCK) {
+        fprintf(stderr, "[O-Node] sequence store %s is within one block of "
+                "the 32-bit limit; the v1 sequence cannot continue\n", path);
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+    uint32_t reserve = stored + ONODE_SEQ_RESERVE_BLOCK;
+    if (!seq_store_write(path, reserve)) {
+        fprintf(stderr, "[O-Node] sequence store %s cannot be written: %s\n",
+                path, strerror(errno));
+        return VIRP_ERR_CHAIN_DB;
+    }
+
+    pthread_mutex_lock(&state->state_mutex);
+    snprintf(state->seq_store_path, sizeof(state->seq_store_path), "%s", path);
+    state->seq_num = stored;
+    state->seq_reserved = reserve;
+    state->seq_store_failed = false;
+    pthread_mutex_unlock(&state->state_mutex);
+    fprintf(stderr, "[O-Node] v1 sequence resumes above %u (store %s, "
+            "reserved to %u)\n", stored, path, reserve);
+    return VIRP_OK;
+}
+
 uint32_t onode_next_seq(onode_state_t *state)
 {
     pthread_mutex_lock(&state->state_mutex);
     uint32_t seq = ++state->seq_num;
+    /* Never issue a number the disk does not already cover (M20): extend
+     * the durable reservation first. A failure cannot be reported from
+     * here — callers are mid-signature — so it is logged once, loudly,
+     * and retried on every later number; the sequence stays monotonic
+     * for this run and the exposure is the next restart. */
+    if (state->seq_store_path[0] && seq > state->seq_reserved) {
+        uint32_t reserve = seq > UINT32_MAX - ONODE_SEQ_RESERVE_BLOCK
+                         ? UINT32_MAX : seq + ONODE_SEQ_RESERVE_BLOCK;
+        if (seq_store_write(state->seq_store_path, reserve)) {
+            state->seq_reserved = reserve;
+            state->seq_store_failed = false;
+        } else if (!state->seq_store_failed) {
+            state->seq_store_failed = true;
+            fprintf(stderr, "[O-Node] ERROR: v1 sequence reservation could "
+                    "not be written to %s (%s) — numbers issued from %u on "
+                    "are NOT covered on disk and may be reused after a "
+                    "restart\n", state->seq_store_path, strerror(errno),
+                    seq);
+        }
+    }
     pthread_mutex_unlock(&state->state_mutex);
     return seq;
 }
@@ -843,12 +1192,13 @@ static bool gate_tier_blocks(virp_trust_tier_t tier, virp_trust_tier_t max_tier)
 }
 
 /*
- * Effective ceiling for a specific connecting uid. Starts from the
- * node-wide gate_max_tier and TIGHTENS (never raises) it if that uid has
- * a per-uid ceiling configured. client_uid == (uid_t)-1 means an
- * internal / non-socket caller with no per-uid entry: the node-wide
- * ceiling applies unchanged. Because tiers order GREEN(1) < YELLOW(2) <
- * RED(3), "tighter" is the numerically smaller value.
+ * Effective ceiling for a specific connecting uid. An EXPLICIT per-uid
+ * entry is authoritative in both directions (2026-09-15, see below): it
+ * replaces the node-wide gate_max_tier whether it is tighter or looser.
+ * A uid with no entry, and client_uid == (uid_t)-1 (an internal /
+ * non-socket caller), get the node-wide ceiling unchanged. A ceiling is
+ * always GREEN, YELLOW or RED — onode_set_uid_ceilings() refuses anything
+ * else, so no entry can confer BLACK.
  */
 static virp_trust_tier_t onode_effective_max_tier(const onode_state_t *state,
                                                   uid_t client_uid)
@@ -875,12 +1225,11 @@ static virp_trust_tier_t onode_effective_max_tier(const onode_state_t *state,
 
 /*
  * Where the effective ceiling that onode_effective_max_tier() returned came
- * from, for the audit record. "per-uid" only when this uid has a per-uid
- * entry AND that entry is at least as tight as the node-wide ceiling — a
- * LOOSER per-uid entry never binds, because the effective-ceiling helper
- * only tightens, so the node-wide ceiling is what actually decided. Mirrors
- * that helper's logic exactly so the recorded source can never disagree with
- * the recorded effective ceiling.
+ * from, for the audit record. "per-uid" whenever this uid has an explicit
+ * entry — tighter or looser than the node-wide ceiling, the entry is what
+ * decided — and "node-wide" otherwise. Mirrors that helper's logic exactly
+ * so the recorded source can never disagree with the recorded effective
+ * ceiling.
  */
 static const char *onode_ceiling_source(const onode_state_t *state,
                                         uid_t client_uid)
@@ -906,6 +1255,52 @@ static virp_trust_tier_t gate_classify(const virp_driver_t *drv,
     if (drv && drv->route_command)
         return drv->route_command(command);
     return VIRP_TIER_UNCLASSIFIED;
+}
+
+/*
+ * The tier an OWNER-POLICY action is gated at: the stricter of what the
+ * policy says and what the device's own driver says (security review H4).
+ *
+ * Policy mode used to take the policy's effect class as the tier and
+ * never call the driver's classifier at all. The policy's closed grammar
+ * decides WHO may ask for WHAT; it knows nothing about the device-side
+ * tables — which guests are protected, which endpoints are destructive,
+ * what a driver considers unapprovable. Those live in route_command(),
+ * and skipping it meant a command the driver calls BLACK was gated as
+ * whatever effect class the policy grammar gave it, with only the
+ * driver's own execute() backstop (where one exists) behind it.
+ *
+ * Rules, in order:
+ *   - driver BLACK is BLACK, unless this exact action is the typed
+ *     reboot capability (virp_policy_reboot_permitted) — the one BLACK
+ *     the owner policy can express. Then the policy tier stands. The
+ *     capability is consulted under the same dispatch context the driver
+ *     will see, so the gate and the driver backstop cannot disagree
+ *     about whether this command is the permitted reboot.
+ *   - driver UNCLASSIFIED is UNCLASSIFIED: a driver with no opinion is
+ *     not a driver that agrees, and the gate fails closed on it.
+ *   - otherwise the numerically higher of the two (GREEN < YELLOW < RED).
+ *
+ * The policy can therefore only ever be TIGHTENED by the driver, never
+ * loosened: a policy verdict of RED stays RED whatever the driver says.
+ */
+static virp_trust_tier_t gate_policy_tier(const virp_driver_t *drv,
+                                          const virp_policy_action_t *action)
+{
+    virp_trust_tier_t policy_tier =
+        action->effect == 0 ? VIRP_TIER_GREEN :
+        action->effect == 1 ? VIRP_TIER_YELLOW : VIRP_TIER_RED;
+    virp_trust_tier_t drv_tier = gate_classify(drv, action->command);
+
+    if (drv_tier == VIRP_TIER_BLACK) {
+        virp_policy_dispatch_enter(action);
+        bool reboot = virp_policy_reboot_permitted(action->command);
+        virp_policy_dispatch_leave();
+        return reboot ? policy_tier : VIRP_TIER_BLACK;
+    }
+    if (drv_tier == VIRP_TIER_UNCLASSIFIED)
+        return VIRP_TIER_UNCLASSIFIED;
+    return drv_tier > policy_tier ? drv_tier : policy_tier;
 }
 
 /*
@@ -954,12 +1349,28 @@ static void log_error_obs(const char *device, virp_trust_tier_t tier,
 }
 
 /* SHA-256 → lowercase hex (65 bytes incl. NUL). Used to hash a gate
- * rejection record before persisting it to the trust chain. */
+ * rejection record before persisting it to the trust chain.
+ *
+ * EVP_Digest's return is checked. It was not, so a failed digest (an
+ * allocation failure inside OpenSSL, a provider that will not load)
+ * left `md` uninitialized and this function returned 64 hex characters
+ * of stack garbage — a well-formed "hash" of nothing. On failure `out`
+ * is now the EMPTY string: every consumer either compares it to a real
+ * hash (and fails) or hands it to the chain, whose artifact-hash check
+ * refuses anything that is not 64 hex. Fail closed, without a return
+ * value every one of the call sites would have to remember to test. */
 static void gate_sha256_hex(const void *data, size_t len, char out[65])
 {
     unsigned char md[32];
     unsigned int mdlen = 0;
-    EVP_Digest(data, len, md, &mdlen, EVP_sha256(), NULL);
+    if (EVP_Digest(data, len, md, &mdlen, EVP_sha256(), NULL) != 1 ||
+        mdlen != sizeof(md)) {
+        out[0] = '\0';
+        fprintf(stderr, "[O-Node] ERROR: SHA-256 digest failed; the "
+                "record it was for will be refused, not stored under a "
+                "wrong hash\n");
+        return;
+    }
     for (int i = 0; i < 32; i++)
         snprintf(out + i * 2, 3, "%02x", md[i]);
 }
@@ -1215,8 +1626,8 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
         cJSON_AddStringToObject(o, "classified_tier",
                                 gate_tier_name(gate_tier));
         /* Both ceilings: the node-wide one (what gate_rejection/1 records
-         * under this name) and the per-uid-tightened one that actually
-         * decided this execution. */
+         * under this name) and the effective one — the per-uid entry when
+         * this uid has one — that actually decided this execution. */
         cJSON_AddStringToObject(o, "gate_max_tier",
                                 gate_tier_name(state->gate_max_tier));
         cJSON_AddStringToObject(o, "effective_max_tier",
@@ -1372,7 +1783,7 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
                                          "gate_execution record");
     }
 
-    if (body) free(body);
+    if (body) cJSON_free(body);
     return cerr;
 }
 
@@ -1500,9 +1911,12 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
         /* APPROVAL BINDING (Sep 1 review, 1.1). For an approved apply the
          * intent carries the same two hashes the outcome body does, so the
          * intent — the record that CONSUMES the approval — names exactly
-         * what it consumed. approval_entry_hash is the apply-time replay
-         * key (virp_chain_count_intents_for_approval). Null for an
-         * auto-executed GREEN read, which consumes no approval. */
+         * what it consumed. approval_entry_hash and proposal_id (above)
+         * are the two apply-time replay keys
+         * (virp_chain_count_intents_for_approval / _for_proposal); the
+         * caller has already checked apr->chain_entry_hash against the
+         * chain's own APPROVAL entry (H1). Null for an auto-executed
+         * GREEN read, which consumes no approval. */
         if (apr && apr->chain_entry_hash[0]) {
             cJSON_AddStringToObject(o, "approval_entry_hash",
                                     apr->chain_entry_hash);
@@ -1521,8 +1935,11 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
         }
         cJSON_AddNumberToObject(o, "obs_version", (double)(execute_wrapping_v3 ? 3 : obs_version));
         /* Wall clock at intent time, so two dispatches of the same command
-         * by the same principal never share a body (and so an artifact_id). */
-        cJSON_AddNumberToObject(o, "intent_ns", (double)intent_ns);
+         * by the same principal never share a body (and so an artifact_id).
+         * A decimal STRING (M8): as a JSON number it was rounded through a
+         * double, which also meant two intents inside the same 256 ns
+         * could share the value this field exists to keep distinct. */
+        json_add_u64_string(o, "intent_ns", intent_ns);
         body = cJSON_PrintUnformatted(o);
         cJSON_Delete(o);
     }
@@ -1556,7 +1973,7 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
                 "refusing to dispatch device=%s command=\"%s\"\n",
                 virp_error_str(cerr), device_name, command);
     }
-    free(body);
+    cJSON_free(body);
     return cerr;
 }
 
@@ -1627,7 +2044,8 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
         }
         if (state->chain.native_epoch[0])
             cJSON_AddStringToObject(o, "native_audit_epoch", state->chain.native_epoch);
-        cJSON_AddNumberToObject(o, "emitted_ns", (double)now_ns);
+        /* Decimal string, not a JSON number (M8, EVIDENCE-INTEGERS). */
+        json_add_u64_string(o, "emitted_ns", now_ns);
         body = cJSON_PrintUnformatted(o);
         cJSON_Delete(o);
     }
@@ -1659,7 +2077,7 @@ static virp_error_t onode_emit_node_config(onode_state_t *state)
     else
         fprintf(stderr, "[O-Node] node_config append failed: %s\n",
                 virp_error_str(cerr));
-    free(body);
+    cJSON_free(body);
     return cerr;
 }
 
@@ -1796,9 +2214,20 @@ static virp_error_t onode_approval_challenge(onode_state_t *state,
 
         const virp_driver_t *drv =
             virp_driver_lookup(state->devices[didx].vendor);
+        /* Under owner policy, judge exactly what apply will judge (H4):
+         * apply runs the proposal's command through virp_policy_check,
+         * which substitutes the policy-normalized form, and then gates it
+         * at gate_policy_tier(). This used to skip the driver entirely
+         * whenever the policy grammar recognised the command, so a
+         * proposal the driver now calls BLACK still got a challenge. A
+         * command the grammar does not recognise falls back to the
+         * driver's verdict on the stored text, as before. */
         virp_policy_action_t action;
         bool typed = state->policy && !virp_policy_classify(state->devices[didx].vendor, prop.command, &action);
-        if (!typed && gate_classify(drv, prop.command) == VIRP_TIER_BLACK) {
+        virp_trust_tier_t appliable_tier = typed
+            ? gate_policy_tier(drv, &action)
+            : gate_classify(drv, prop.command);
+        if (appliable_tier == VIRP_TIER_BLACK) {
             fprintf(stderr, "[APPROVAL] challenge refused: proposal=%s "
                     "command is BLACK — not appliable at any tier\n",
                     proposal_id);
@@ -1829,7 +2258,11 @@ static virp_error_t onode_approval_challenge(onode_state_t *state,
     cJSON_AddStringToObject(o, "command_hash", ch.command_hash);
     cJSON_AddStringToObject(o, "tier", ch.tier);
     cJSON_AddNumberToObject(o, "device_node_id", (double)ch.device_node_id);
-    cJSON_AddNumberToObject(o, "approved_at_ns", (double)ch.approved_at_ns);
+    /* Decimal string (M8): this value is INSIDE the canonical bytes the
+     * approver signs (offset 60, 8 bytes). As a JSON number it reached
+     * the operator rounded through a double, so the timestamp displayed
+     * was not the timestamp being signed. */
+    json_add_u64_string(o, "approved_at_ns", ch.approved_at_ns);
     cJSON_AddNumberToObject(o, "ttl_seconds", (double)ch.ttl_seconds);
     char *json = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -1900,7 +2333,8 @@ static virp_error_t onode_approval_submit(onode_state_t *state,
     cJSON_AddStringToObject(o, "approver_key_id", apr.approver_key_id);
     cJSON_AddStringToObject(o, "operator", apr.operator);
     cJSON_AddStringToObject(o, "chain_entry_hash", apr.chain_entry_hash);
-    cJSON_AddNumberToObject(o, "approved_at_ns", (double)apr.approved_at_ns);
+    /* Decimal string (M8) — the same form the on-disk record uses. */
+    json_add_u64_string(o, "approved_at_ns", apr.approved_at_ns);
     cJSON_AddNumberToObject(o, "ttl_seconds", (double)apr.ttl_seconds);
     cJSON_AddBoolToObject(o, "already_approved",
                           err == VIRP_APPROVAL_ALREADY_EXISTS);
@@ -1917,7 +2351,46 @@ static virp_error_t onode_approval_submit(onode_state_t *state,
     return err;
 }
 
-/* Proposer identity for a PROPOSAL record: the active v2 session id if
+/* The peer uid as a chain-body member: a number, or JSON null for the
+ * internal caller ((uid_t)-1 is not a uid, and a reader must never
+ * render it as 4294967295). */
+static void json_add_uid(cJSON *o, uid_t uid)
+{
+    if (uid == (uid_t)-1)
+        cJSON_AddNullToObject(o, "uid");
+    else
+        cJSON_AddNumberToObject(o, "uid", (double)uid);
+}
+
+/*
+ * WHO FILED IT (security review M10): the proposer string for a PROPOSAL
+ * record — approval_proposer_id()'s session marker followed by the peer
+ * uid, "session:<16 hex> uid:<n>" / "unauthenticated-v1 uid:<n>".
+ *
+ * The session marker alone identified nobody. Every v1 client was the
+ * same "unauthenticated-v1", and the daemon holds ONE v2 session that
+ * any connecting uid's requests ride on, so "session:<id>" named the
+ * session and not the caller either. The peer uid is the one identity
+ * the daemon actually authenticates (SO_PEERCRED at accept), and it was
+ * already recorded on intents and executions — just not on the request
+ * that asks a human to approve something. An approver deciding whether
+ * to sign should be able to see which principal is asking.
+ *
+ * The internal caller is spelled out rather than omitted, so the absence
+ * of a uid is never ambiguous.
+ */
+static void approval_proposer_with_uid(const char *session_marker,
+                                       uid_t client_uid,
+                                       char *out, size_t out_len)
+{
+    if (client_uid == (uid_t)-1)
+        snprintf(out, out_len, "%s uid:internal", session_marker);
+    else
+        snprintf(out, out_len, "%s uid:%lu", session_marker,
+                 (unsigned long)client_uid);
+}
+
+/* Session marker for a PROPOSAL record: the active v2 session id if
  * one is bound, else a fixed marker for legacy v1 clients. */
 static void approval_proposer_id(onode_state_t *state, int obs_version,
                                  char *out, size_t out_len)
@@ -1949,6 +2422,12 @@ static void approval_proposer_id(onode_state_t *state, int obs_version,
     snprintf(out, out_len, "unauthenticated-v1");
 }
 
+/* The one chain session every separator refusal for a device this node
+ * does not serve is filed under (M3). A leading underscore is not a
+ * legal hostname start, and onode_add_device() refuses the name outright
+ * so no configured device can ever share the session. */
+#define ONODE_SEPARATOR_UNKNOWN_DEVICE "_unknown"
+
 /* =========================================================================
  * Ingress separator refusal — the chain record.
  *
@@ -1972,9 +2451,18 @@ static void approval_proposer_id(onode_state_t *state, int obs_version,
  *
  *  - Its own session id (gate-separator:<device>, not
  *    gate-enforce:<device>) and refusal_stage=ingress-separator. The
- *    refusal happens before dev_idx and the driver are resolved and
- *    before any classifier runs, so there is no driver name and no
- *    real tier to record. UNCLASSIFIED appears in the body for the same
+ *    refusal happens before the driver is resolved and before any
+ *    classifier runs, so there is no driver name and no real tier to
+ *    record. The device IS resolved first, but only to choose the
+ *    session: `session_device` is the configured hostname for a device
+ *    this node serves and the fixed ONODE_SEPARATOR_UNKNOWN_DEVICE
+ *    otherwise (security review M3). The session id used to be built
+ *    from the request's device string as given, so any client allowed
+ *    to execute could mint an unbounded number of chain sessions with
+ *    names of its choosing — one per invented device — and a name too
+ *    long for the session-id field was truncated into someone else's.
+ *    The body still records the name the caller CLAIMED, in `device`:
+ *    that is evidence, and cJSON escapes it. UNCLASSIFIED appears in the body for the same
  *    reason it appears in the observation — audit honesty about what
  *    was never classified — and refusal_stage is what stops a reader
  *    concluding that a tier decision blocked this.
@@ -1983,17 +2471,19 @@ static void approval_proposer_id(onode_state_t *state, int obs_version,
  * never weakens the refusal, which has already been decided.
  * ========================================================================= */
 static void separator_refuse_chain(onode_state_t *state,
+                                   const char *session_device,
                                    const char *device_name,
                                    const char *command,
                                    const char *why,
-                                   const char *err_msg)
+                                   const char *err_msg,
+                                   uid_t client_uid)
 {
     if (!state->chain_enabled)
         return;
 
     char session_id[96];
     snprintf(session_id, sizeof(session_id), "gate-separator:%s",
-             device_name);
+             session_device);
 
     /* cJSON does the escaping: `command` is attacker-controlled and by
      * definition contains bytes we refused, so it must never be pasted
@@ -2003,10 +2493,17 @@ static void separator_refuse_chain(onode_state_t *state,
     if (o) {
         cJSON_AddStringToObject(o, "schema", "gate_rejection/1");
         cJSON_AddStringToObject(o, "device", device_name);
+        /* Additive: false when `device` is only what the caller claimed
+         * and this node serves no such device. */
+        cJSON_AddBoolToObject(o, "device_known",
+                              strcmp(session_device,
+                                     ONODE_SEPARATOR_UNKNOWN_DEVICE) != 0);
         cJSON_AddStringToObject(o, "refusal_stage", "ingress-separator");
         cJSON_AddStringToObject(o, "command", command);
         cJSON_AddStringToObject(o, "classified_tier", "UNCLASSIFIED");
         cJSON_AddStringToObject(o, "refused_sequence", why);
+        /* Additive (M10): which principal sent it. */
+        json_add_uid(o, client_uid);
         cJSON_AddStringToObject(o, "message", err_msg);
         cJSON_AddBoolToObject(o, "executed", false);
         body = cJSON_PrintUnformatted(o);
@@ -2033,7 +2530,94 @@ static void separator_refuse_chain(onode_state_t *state,
         fprintf(stderr, "[GATE] separator rejection chain append+store "
                 "failed: %s\n", virp_error_str(cerr));
 
-    if (body) free(body);
+    /* cJSON_PrintUnformatted allocates with cJSON's allocator; pair it
+     * with cJSON_free, not free(), so a custom allocator hook cannot
+     * turn this into a mismatched free. Same at every site below. */
+    if (body) cJSON_free(body);
+}
+
+/* -------------------------------------------------------------------------
+ * Proposal dedupe + per-uid rate limit (security review M16). All three
+ * helpers are called with state->proposal_mutex held.
+ * ------------------------------------------------------------------------- */
+
+/* The id of a remembered, still-OPEN proposal for this exact key, or
+ * false. A remembered proposal that has since been approved or spent is
+ * forgotten: the next refusal files a fresh one. */
+static bool proposal_cache_find(onode_state_t *state, const char *device,
+                                const char *command_hash,
+                                const char *proposer, char out_id[33])
+{
+    for (size_t i = 0; i < ONODE_PROPOSAL_CACHE; i++) {
+        if (!state->proposal_cache[i].in_use ||
+            strcmp(state->proposal_cache[i].device, device) != 0 ||
+            strcmp(state->proposal_cache[i].command_hash, command_hash) != 0 ||
+            strcmp(state->proposal_cache[i].proposer, proposer) != 0)
+            continue;
+        bool open = false;
+        if (virp_approval_is_open(state->approval_dir,
+                                  state->chain_enabled ? &state->chain : NULL,
+                                  state->proposal_cache[i].proposal_id,
+                                  &open) == VIRP_OK && open) {
+            memcpy(out_id, state->proposal_cache[i].proposal_id, 33);
+            return true;
+        }
+        state->proposal_cache[i].in_use = false;
+    }
+    return false;
+}
+
+static void proposal_cache_remember(onode_state_t *state, const char *device,
+                                    const char *command_hash,
+                                    const char *proposer, const char *id)
+{
+    size_t i = state->proposal_cache_next % ONODE_PROPOSAL_CACHE;
+    state->proposal_cache_next = (i + 1) % ONODE_PROPOSAL_CACHE;
+    state->proposal_cache[i].in_use = true;
+    snprintf(state->proposal_cache[i].device,
+             sizeof(state->proposal_cache[i].device), "%s", device);
+    snprintf(state->proposal_cache[i].command_hash,
+             sizeof(state->proposal_cache[i].command_hash), "%s",
+             command_hash);
+    snprintf(state->proposal_cache[i].proposer,
+             sizeof(state->proposal_cache[i].proposer), "%s", proposer);
+    snprintf(state->proposal_cache[i].proposal_id,
+             sizeof(state->proposal_cache[i].proposal_id), "%s", id);
+}
+
+/* May this uid file one more NEW proposal in the current window? Counts
+ * it if so. Never limits the internal caller. No table slot is a
+ * refusal (cannot happen while the worker pool bounds distinct uids). */
+static bool proposal_rate_take(onode_state_t *state, uid_t uid,
+                               int64_t now_ms)
+{
+    if (uid == (uid_t)-1) return true;
+    const int64_t window = (int64_t)ONODE_PROPOSAL_WINDOW_SEC * 1000;
+    int mine = -1, spare = -1;
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++) {
+        if (state->proposal_uid[i].in_use &&
+            state->proposal_uid[i].uid == uid) { mine = i; break; }
+        if (spare < 0 && (!state->proposal_uid[i].in_use ||
+                          now_ms - state->proposal_uid[i].window_start_ms
+                              >= window))
+            spare = i;
+    }
+    if (mine < 0) {
+        if (spare < 0) return false;
+        mine = spare;
+        state->proposal_uid[mine].uid = uid;
+        state->proposal_uid[mine].in_use = true;
+        state->proposal_uid[mine].window_start_ms = now_ms;
+        state->proposal_uid[mine].filed = 0;
+    }
+    if (now_ms - state->proposal_uid[mine].window_start_ms >= window) {
+        state->proposal_uid[mine].window_start_ms = now_ms;
+        state->proposal_uid[mine].filed = 0;
+    }
+    if (state->proposal_uid[mine].filed >= ONODE_PROPOSAL_BURST)
+        return false;
+    state->proposal_uid[mine].filed++;
+    return true;
 }
 
 /* =========================================================================
@@ -2041,7 +2625,9 @@ static void separator_refuse_chain(onode_state_t *state,
  * the unconditional BLACK branch (any mode) and the ENFORCE over-tier /
  * unclassified branch. Files the escalation proposal when the tier
  * allows one (never for BLACK), persists the gate_rejection/1 chain
- * entry, logs, and builds the signed ERROR observation.
+ * entry, logs, and builds the signed ERROR observation — whose text
+ * carries the proposal id BEFORE the command (M13, see the layout note
+ * in the function).
  *
  * `mode` is recorded in the chain body (gate_mode, additive to schema
  * gate_rejection/1 — the same field gate_execution/1 has carried from
@@ -2067,24 +2653,34 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
                                     uint8_t *out_buf, size_t out_buf_len,
                                     size_t *out_len)
 {
-    char err_msg[448];
-    snprintf(err_msg, sizeof(err_msg),
-             "ERROR: tier gate blocked '%s' on '%s' "
-             "(tier=%s max=%s)",
-             command, device_name, gate_tier_name(gate_tier),
-             gate_tier_name(eff_max));
-
-    /* Classifier-supplied instructive reason (optional hook):
-     * appended before the proposal_id so the rejection payload
-     * teaches the escalation path, not just the tier math. */
-    if (drv->route_reason) {
-        const char *why = drv->route_reason(command);
-        if (why) {
-            size_t off = strlen(err_msg);
-            snprintf(err_msg + off, sizeof(err_msg) - off,
-                     " reason: %s", why);
-        }
-    }
+    /*
+     * MESSAGE LAYOUT (security review M13).
+     *
+     *   ERROR: tier gate blocked [proposal_id=<32 hex> ]'<command>' on
+     *   '<device>' (tier=<T> max=<M>)[ reason: <why>]
+     *
+     * The proposal id used to be APPENDED, after the command, into a
+     * 448-byte buffer. A command of ~380 bytes or more filled the buffer
+     * first, the append was truncated to nothing, and the caller received
+     * a refusal with no proposal id in it: a proposal existed on disk and
+     * on the chain, and the one party who needed its id to ask for
+     * approval was never told. Long commands are exactly the config lines
+     * that end up needing approval.
+     *
+     * Two changes, either of which alone would have been enough:
+     *  - the proposal is filed FIRST and its id is placed BEFORE the
+     *    command text, so nothing caller-controlled sits between the
+     *    start of the message and the id;
+     *  - the buffer is sized for the longest request the socket can
+     *    carry (a 1023-byte command, a 63-byte device, a bounded reason)
+     *    so the tier and device after the command survive as well.
+     *
+     * "ERROR: tier gate blocked " stays the literal prefix — the cage
+     * (tools/cage/port_native.py) requires it — and the quoted command
+     * still follows "blocked " directly when no proposal was filed
+     * (BLACK, or no approval store), so that form is byte-identical to
+     * what it was. tools/virp-shell.py's pattern accepts both.
+     */
 
     /*
      * PROPOSE: file a signed proposal so a human can escalate
@@ -2092,35 +2688,93 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
      * proposal failure never weakens the rejection — and never
      * offered for BLACK: inexpressible has no escalation path.
      */
+    char proposal_tag[16 + VIRP_APPROVAL_ID_HEX_LEN] = "";
     if (state->approval_dir[0] && gate_tier != VIRP_TIER_BLACK) {
-        char proposer[80];
-        approval_proposer_id(state, obs_version, proposer,
-                             sizeof(proposer));
-        virp_proposal_rec_t prop;
-        virp_error_t perr = virp_approval_propose(
-                state->approval_dir,
-                state->chain_enabled ? &state->chain : NULL,
-                proposer, device_name,
-                state->devices[dev_idx].node_id,
-                command,
-                onode_typed_profile(state, dev_idx),
-                proposer, gate_tier_name(gate_tier),
-                &prop);
-        if (perr == VIRP_OK) {
-            size_t off = strlen(err_msg);
-            snprintf(err_msg + off, sizeof(err_msg) - off,
-                     " proposal_id=%s", prop.proposal_id);
-            fprintf(stderr, "[GATE] proposal filed: proposal=%s "
-                    "device=%s tier=%s chain=%.16s\n",
-                    prop.proposal_id, device_name,
-                    gate_tier_name(gate_tier),
-                    prop.chain_entry_hash[0] ? prop.chain_entry_hash
-                                             : "-");
+        /* The record's session_id keeps the bare session marker it has
+         * always carried; `proposer` additionally names the peer uid
+         * (M10). Sized so neither can truncate: marker <= 24 bytes,
+         * " uid:" + 10 digits on top, against proposer[64]. */
+        char session_marker[40], proposer[64];
+        approval_proposer_id(state, obs_version, session_marker,
+                             sizeof(session_marker));
+        approval_proposer_with_uid(session_marker, client_uid, proposer,
+                                   sizeof(proposer));
+        /*
+         * A bounded number of new proposals per uid, always; and, only
+         * where state->proposal_dedupe is set, ONE OPEN PROPOSAL PER
+         * (device, command hash, proposer) (M16). Dedupe is opt-in
+         * because the port cage needs several distinct proposals for one
+         * command — see ONODE_PROPOSAL_CACHE in virp_onode.h. Asked and answered
+         * under proposal_mutex so two identical refusals arriving
+         * together file exactly one. A command that cannot be hashed
+         * cannot be proposed at all (virp_approval_propose fails on the
+         * same limit), so that case just falls through to the attempt.
+         */
+        const char *typed_profile = onode_typed_profile(state, dev_idx);
+        char chash[65] = "";
+        bool hashed = virp_approval_command_hash(command, typed_profile,
+                                                 chash) == VIRP_OK;
+        char existing[33] = "";
+
+        pthread_mutex_lock(&state->proposal_mutex);
+        if (state->proposal_dedupe && hashed &&
+            proposal_cache_find(state, device_name, chash,
+                                proposer, existing)) {
+            snprintf(proposal_tag, sizeof(proposal_tag), "proposal_id=%s ",
+                     existing);
+            fprintf(stderr, "[GATE] proposal reused: proposal=%s device=%s "
+                    "tier=%s — an open proposal for this exact command "
+                    "from this proposer already exists; nothing new filed\n",
+                    existing, device_name, gate_tier_name(gate_tier));
+        } else if (!proposal_rate_take(state, client_uid,
+                                       onode_monotonic_ms())) {
+            fprintf(stderr, "[GATE] proposal NOT filed: uid %ld has filed "
+                    "%d new proposals in the current %d s window — the "
+                    "refusal stands and is recorded, without a proposal "
+                    "id\n",
+                    (client_uid == (uid_t)-1) ? -1L : (long)client_uid,
+                    ONODE_PROPOSAL_BURST, ONODE_PROPOSAL_WINDOW_SEC);
         } else {
-            fprintf(stderr, "[GATE] proposal filing failed: %s\n",
-                    virp_error_str(perr));
+            virp_proposal_rec_t prop;
+            virp_error_t perr = virp_approval_propose(
+                    state->approval_dir,
+                    state->chain_enabled ? &state->chain : NULL,
+                    session_marker, device_name,
+                    state->devices[dev_idx].node_id,
+                    command, typed_profile,
+                    proposer, gate_tier_name(gate_tier),
+                    &prop);
+            if (perr == VIRP_OK) {
+                snprintf(proposal_tag, sizeof(proposal_tag),
+                         "proposal_id=%s ", prop.proposal_id);
+                proposal_cache_remember(state, device_name,
+                                        prop.command_hash, proposer,
+                                        prop.proposal_id);
+                fprintf(stderr, "[GATE] proposal filed: proposal=%s "
+                        "device=%s tier=%s chain=%.16s\n",
+                        prop.proposal_id, device_name,
+                        gate_tier_name(gate_tier),
+                        prop.chain_entry_hash[0] ? prop.chain_entry_hash
+                                                 : "-");
+            } else {
+                fprintf(stderr, "[GATE] proposal filing failed: %s\n",
+                        virp_error_str(perr));
+            }
         }
+        pthread_mutex_unlock(&state->proposal_mutex);
     }
+
+    /* Classifier-supplied instructive reason (optional hook), so the
+     * rejection payload teaches the escalation path, not just the tier
+     * math. Driver-supplied static text; bounded all the same. */
+    const char *why = drv->route_reason ? drv->route_reason(command) : NULL;
+
+    char err_msg[2048];
+    snprintf(err_msg, sizeof(err_msg),
+             "ERROR: tier gate blocked %s'%s' on '%s' (tier=%s max=%s)%s%.256s",
+             proposal_tag, command, device_name, gate_tier_name(gate_tier),
+             gate_tier_name(eff_max),
+             why ? " reason: " : "", why ? why : "");
 
     /* Phase C — rejection persistence: write a durable, HMAC-signed
      * entry to the trust chain via the same append path the AI
@@ -2218,6 +2872,12 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
                 cJSON_AddStringToObject(o, "matched_rule", matched);
             else
                 cJSON_AddNullToObject(o, "matched_rule");
+            /* Additive to gate_rejection/1 (M10): the peer uid. The
+             * gate_intent and gate_execution bodies have carried it from
+             * the start; a REFUSAL was the one gate record that did not
+             * say who it refused. ceiling_source above says whether a
+             * per-uid row decided — this says which uid. */
+            json_add_uid(o, client_uid);
             cJSON_AddStringToObject(o, "message", err_msg);
             cJSON_AddBoolToObject(o, "executed", false);
             body = cJSON_PrintUnformatted(o);
@@ -2260,7 +2920,7 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
                     "failed: %s\n", virp_error_str(cerr));
         }
 
-        if (body) free(body);
+        if (body) cJSON_free(body);
     }
 
     log_error_obs(device_name, gate_tier, err_msg);
@@ -2344,6 +3004,97 @@ static virp_error_t gate_unchained_execution_obs(onode_state_t *state,
                                   &state->okey);
 }
 
+/* =========================================================================
+ * OBSERVATION-UNAVAILABLE (security review M12).
+ *
+ * The device has been dispatched to, the chain has its record, and the
+ * observation the caller asked for cannot be built. The case that
+ * matters is a session-bound request (v2 HMAC, v3 Ed25519) whose session
+ * closed or idled out WHILE the command ran: both paths re-check the
+ * session at signing time, correctly refuse to sign, and used to return
+ * the bare VIRP_ERR_SESSION_INVALID.
+ *
+ * That code is also what the caller gets when the session is missing
+ * BEFORE dispatch, where nothing ran. So the one answer meant both "you
+ * have no session, nothing happened" and "your command executed and you
+ * will never see its output" — and a client that reads it the first way
+ * re-establishes the session and sends the command again. For a
+ * state-changing command that is the authorized-once-executed-twice
+ * outcome the retry logic above goes to such lengths to prevent.
+ *
+ * So after dispatch the answer is a statement, signed with the O-Key:
+ * the command was dispatched, its record is on the chain, and the
+ * session-bound observation could not be produced. It is an ERROR
+ * observation carrying NO device output, which is why this is not the
+ * "downgrade to master-key signing" the v2 path forbids: nothing the
+ * device returned is being vouched for under the wrong key. The device
+ * bytes are simply not delivered, and the message says so.
+ *
+ * Fixed text first, command last and bounded: whatever is cut off when a
+ * long command meets the payload limit, it is never the part that says
+ * the command ran.
+ *
+ * `staged_error` is the v3 wrapper's case where the result it could not
+ * wrap was itself an ERROR observation (a refusal, an unknown outcome):
+ * the device may NOT have acted, and that text is the only account of
+ * what happened, so it is relayed rather than replaced by a claim of
+ * execution.
+ * ========================================================================= */
+static virp_error_t gate_observation_unavailable_obs(onode_state_t *state,
+                                    uint32_t node_id,
+                                    const char *device_name,
+                                    const char *command,
+                                    uint8_t obs_tier,
+                                    const virp_chain_entry_t *intent,
+                                    const char *staged_error,
+                                    size_t staged_error_len,
+                                    virp_error_t cause,
+                                    uint8_t *out_buf, size_t out_buf_len,
+                                    size_t *out_len)
+{
+    const char *what = cause == VIRP_ERR_SESSION_INVALID
+        ? "the session ended before a session-bound observation could be "
+          "produced"
+        : "the signed observation could not be produced";
+
+    char ref[128];
+    if (intent)
+        snprintf(ref, sizeof(ref), "intent %.16s", intent->chain_entry_hash);
+    else
+        snprintf(ref, sizeof(ref), "chain session gate-enforce:%.63s",
+                 device_name);
+
+    char err_msg[768];
+    if (staged_error) {
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: observation-unavailable: %s (%s) for a request on "
+                 "'%s'; this is NOT a statement that nothing happened — the "
+                 "result that could not be delivered was: [%.*s] command: "
+                 "'%.160s'",
+                 what, virp_error_str(cause), device_name,
+                 (int)(staged_error_len > 300 ? 300 : staged_error_len),
+                 staged_error, command);
+    } else {
+        snprintf(err_msg, sizeof(err_msg),
+                 "ERROR: observation-unavailable: the command was DISPATCHED "
+                 "to '%s' and its result is recorded (%s), but %s (%s); the "
+                 "device output is NOT in this response and re-running the "
+                 "command would execute it a second time — reconcile "
+                 "against the chain record or the target. command: '%.200s'",
+                 device_name, ref, what, virp_error_str(cause), command);
+    }
+    fprintf(stderr, "[ERROR-OBS] device=%s executed=%s reason=\"%s\"\n",
+            device_name, staged_error ? "see-staged-result" : "yes", err_msg);
+    return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                  node_id, onode_next_seq(state),
+                                  VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                  obs_tier > VIRP_TIER_RED ? VIRP_TIER_RED
+                                                           : obs_tier,
+                                  (const uint8_t *)err_msg,
+                                  (uint16_t)strlen(err_msg),
+                                  &state->okey);
+}
+
 virp_error_t onode_apply_obs(onode_state_t *state,
                              const char *proposal_id,
                              uint8_t obs_version,
@@ -2385,7 +3136,8 @@ virp_error_t onode_apply_obs(onode_state_t *state,
  * The outcome ID is populated only if that outcome actually exists. A crash
  * after intent leaves a null outcome, never an invented successful result. */
 static virp_error_t replay_refusal_record(onode_state_t *state,
-    const char *device, const char *proposal_id, const char *command)
+    const char *device, const char *proposal_id, const char *command,
+    uid_t client_uid)
 {
     if (!state->chain_enabled) return VIRP_OK;
     char outcome[64], session[96], artifact[96], hash[65];
@@ -2402,6 +3154,7 @@ static virp_error_t replay_refusal_record(onode_state_t *state,
     cJSON_AddStringToObject(o, "proposal_id", proposal_id);
     cJSON_AddStringToObject(o, "device", device);
     cJSON_AddStringToObject(o, "command", command);
+    json_add_uid(o, client_uid);      /* who tried the replay (M10) */
     cJSON_AddBoolToObject(o, "executed", false);
     if (exists) cJSON_AddStringToObject(o, "original_outcome_id", outcome);
     else { cJSON_AddNullToObject(o, "original_outcome_id");
@@ -2427,7 +3180,144 @@ static _Thread_local struct {
     virp_policy_t *policy;
     int64_t ticket;
     bool known;
+    /* Non-NULL when the owner policy REFUSED this request before any
+     * dispatch: the BLACK-nn reason code. `policy` stays NULL in that
+     * case — nothing was admitted — and onode_execute_legacy answers
+     * with policy_refuse_obs() before it does anything else (M9). */
+    const char *refusal;
+    uid_t refusal_uid;
 } policy_call;
+
+/* =========================================================================
+ * Owner-policy refusal — the chain record and the signed answer
+ * (security review M9).
+ *
+ * A request the owner policy refused — a principal with no rule for the
+ * operation, an expired grant, a protected resource, a command outside
+ * the closed grammar, or a device this node does not serve — used to end
+ * in `return VIRP_ERR_ACTION_FORBIDDEN`. One line on stderr, a bare
+ * 4-byte code to the caller, and NOTHING on the chain. Every tier refusal
+ * beside it writes a gate_rejection/1 and answers with a signed ERROR
+ * observation, so on a policy-mode node the most important refusals —
+ * the ones that are the owner's boundary rather than a tier table — were
+ * the only ones an audit could not find and a caller could not prove.
+ *
+ * Shape, deliberately parallel to separator_refuse_chain():
+ *
+ *  - schema gate_rejection/1 with refusal_stage "owner-policy" and the
+ *    policy's own reason code, so a reader does not mistake this for a
+ *    tier decision. classified_tier is UNCLASSIFIED for audit honesty:
+ *    the driver's classifier never ran.
+ *  - NO PROPOSAL. A policy refusal is not approvable — an approval cannot
+ *    add a rule the owner did not write (tests/test_policy_daemon.c pins
+ *    that a genuine approval still cannot override Observe or a
+ *    protected resource) — so no escalation path is offered.
+ *  - session "gate-enforce:<device>" for a device this node serves, so
+ *    it interleaves with that device's other gate records; the fixed
+ *    "gate-enforce:_unknown" otherwise, for M3's reason: the caller does
+ *    not get to name a chain session.
+ *
+ * The command is recorded in full in the chain body (cJSON escapes it).
+ * In the observation it is rendered printable and bounded: this refusal
+ * runs BEFORE the separator check, so the text may carry control bytes,
+ * and a signed payload should not relay them.
+ *
+ * Best-effort like the other rejection writes: a chain failure is logged
+ * and never weakens the refusal, which has already been decided.
+ *
+ * Returned through onode_execute_legacy rather than straight from
+ * onode_execute_obs_ex so that a v3 node wraps it exactly as it wraps
+ * every other refusal — a v3 caller never receives a v1 answer.
+ * ========================================================================= */
+static virp_error_t policy_refuse_obs(onode_state_t *state,
+                                      const char *device_name,
+                                      const char *command,
+                                      const char *why, uid_t client_uid,
+                                      uint8_t *out_buf, size_t out_buf_len,
+                                      size_t *out_len)
+{
+    int dev_idx = find_device(state, device_name);
+    bool known = dev_idx >= 0;
+    if (!why || !why[0]) why = "BLACK-13";
+
+    char shown[201];
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)command;
+         *p && n < sizeof(shown) - 1; p++)
+        shown[n++] = (*p < 0x20 || *p == 0x7f) ? '?' : (char)*p;
+    shown[n] = '\0';
+
+    char err_msg[512];
+    snprintf(err_msg, sizeof(err_msg),
+             "ERROR: owner policy refused '%s'%s on '%s' (%s%s); nothing "
+             "was dispatched",
+             shown, command[n] ? "..." : "", device_name, why,
+             known ? "" : ", device not served by this node");
+
+    fprintf(stderr, "[POLICY] %s uid=%ld device=%s: operation refused "
+            "before dispatch\n", why,
+            (client_uid == (uid_t)-1) ? -1L : (long)client_uid, device_name);
+
+    if (state->chain_enabled) {
+        char session_id[96];
+        snprintf(session_id, sizeof(session_id), "gate-enforce:%s",
+                 known ? device_name : ONODE_SEPARATOR_UNKNOWN_DEVICE);
+
+        char *body = NULL;
+        cJSON *o = cJSON_CreateObject();
+        if (o) {
+            cJSON_AddStringToObject(o, "schema", "gate_rejection/1");
+            cJSON_AddStringToObject(o, "device", device_name);
+            cJSON_AddBoolToObject(o, "device_known", known);
+            cJSON_AddStringToObject(o, "refusal_stage", "owner-policy");
+            cJSON_AddStringToObject(o, "reason", why);
+            cJSON_AddStringToObject(o, "command", command);
+            cJSON_AddStringToObject(o, "classified_tier", "UNCLASSIFIED");
+            cJSON_AddStringToObject(o, "gate_mode", "ENFORCE");
+            if (client_uid == (uid_t)-1)
+                cJSON_AddNullToObject(o, "uid");
+            else
+                cJSON_AddNumberToObject(o, "uid", (double)client_uid);
+            cJSON_AddStringToObject(o, "message", err_msg);
+            cJSON_AddBoolToObject(o, "executed", false);
+            body = cJSON_PrintUnformatted(o);
+            cJSON_Delete(o);
+        }
+        char artifact_hash[65];
+        const char *commit_src = body ? body : err_msg;
+        gate_sha256_hex(commit_src, strlen(commit_src), artifact_hash);
+        /* The sequence number keeps two refusals of the same command by
+         * the same uid from sharing an artifact id (the body carries no
+         * clock). */
+        char artifact_id[64];
+        snprintf(artifact_id, sizeof(artifact_id), "policyreject-%.16s-%u",
+                 artifact_hash, onode_next_seq(state));
+
+        virp_chain_entry_t ce;
+        virp_error_t cerr = virp_chain_append_with_artifact(
+                                &state->chain, session_id, "gate_rejection",
+                                artifact_id, artifact_hash, body, &ce);
+        if (cerr == VIRP_OK)
+            fprintf(stderr, "[GATE] policy rejection persisted: session=%s "
+                    "seq=%lld hash=%.16s reason=%s\n", session_id,
+                    (long long)ce.sequence, ce.chain_entry_hash, why);
+        else
+            fprintf(stderr, "[GATE] policy rejection chain append+store "
+                    "failed: %s\n", virp_error_str(cerr));
+        if (body) cJSON_free(body);
+    }
+
+    log_error_obs(device_name, VIRP_TIER_UNCLASSIFIED, err_msg);
+    return virp_build_observation_tiered(out_buf, out_buf_len, out_len,
+                                  known ? state->devices[dev_idx].node_id
+                                        : state->node_id,
+                                  onode_next_seq(state),
+                                  VIRP_OBS_ERROR, VIRP_SCOPE_LOCAL,
+                                  VIRP_TIER_UNCLASSIFIED,
+                                  (const uint8_t *)err_msg,
+                                  (uint16_t)strlen(err_msg),
+                                  &state->okey);
+}
 
 static virp_error_t policy_driver_execute(const virp_driver_t *drv,
     virp_conn_t *conn, const char *command, virp_exec_result_t *result)
@@ -2463,12 +3353,18 @@ virp_error_t onode_execute_obs_ex(onode_state_t *state,
         const char *why = "BLACK-13";
         if (idx < 0 || virp_policy_check(state->policy, client_uid,
                 &state->devices[idx], command, &policy_call.action, &why)) {
-            fprintf(stderr, "[POLICY] %s uid=%lu: operation refused before dispatch\n",
-                    why, (unsigned long)client_uid);
-            return VIRP_ERR_ACTION_FORBIDDEN;
+            /* REFUSED — but as a record and a signed answer, not a bare
+             * code (M9). policy_call.policy stays NULL: nothing was
+             * admitted, no reservation is made, and the legacy path
+             * answers with policy_refuse_obs() before it does anything
+             * else. The caller's ORIGINAL command text is what gets
+             * recorded; the policy never produced a normalized form. */
+            policy_call.refusal = why ? why : "BLACK-13";
+            policy_call.refusal_uid = client_uid;
+        } else {
+            policy_call.policy = state->policy;
+            command = policy_call.action.command;
         }
-        policy_call.policy = state->policy;
-        command = policy_call.action.command;
     }
     virp_error_t err = onode_execute_policy_impl(state, device_name, command,
         obs_version, proposal_id, client_uid, out_buf, out_buf_len, out_len);
@@ -2496,9 +3392,17 @@ static virp_error_t onode_execute_policy_impl(onode_state_t *state,
         return onode_execute_legacy(state, device_name, command, obs_version,
             proposal_id, client_uid, out_buf, out_buf_len, out_len);
     *out_len = 0;
+    /* v3 needs a signed chain and a loaded observation key. It no longer
+     * needs them to be the SAME key (security review M21): the daemon
+     * used to refuse v3 unless the observation key's public half equalled
+     * the chain-signing key's, which made one Ed25519 key sign two
+     * unrelated kinds of statement — chain entries and device
+     * observations — so that rotating or compromising either meant
+     * rotating both. They are separate options now (-S and -O); the same
+     * key in both is still accepted, as the configuration deployed before
+     * the split. */
     if (!state->chain_enabled || !state->chain.sign_enabled ||
-        !state->obskey_loaded ||
-        memcmp(state->chain.sign_key.public_key, state->obskey.public_key, 32))
+        !state->obskey_loaded)
         return VIRP_ERR_KEY_NOT_LOADED;
     if (out_buf_len < VIRP_MAX_MESSAGE_SIZE) return VIRP_ERR_BUFFER_TOO_SMALL;
     char canonical[512];
@@ -2508,9 +3412,14 @@ static virp_error_t onode_execute_policy_impl(onode_state_t *state,
     uint64_t session_generation = state->ctx ? state->ctx->session.generation : 0;
     uint8_t session_id[16] = {0};
     if (state->ctx) memcpy(session_id, state->ctx->session.session_id, sizeof(session_id));
+    /* The session must be active AND this caller's (M19): a uid that did
+     * not bind it has no session, whatever another uid negotiated. The
+     * generation re-check after the legacy stage already refuses a
+     * session replaced mid-command, owner included. */
     bool active = state->ctx &&
         virp_session_require_active(state->ctx) == VIRP_OK &&
-        state->ctx->session.session_key_valid;
+        state->ctx->session.session_key_valid &&
+        onode_session_usable_by(state, client_uid);
     pthread_mutex_unlock(&state->session_mutex);
     if (!active) return VIRP_ERR_SESSION_INVALID;
     uint8_t legacy[VIRP_MAX_MESSAGE_SIZE]; size_t legacy_len = 0;
@@ -2542,6 +3451,25 @@ static virp_error_t onode_execute_policy_impl(onode_state_t *state,
         idx >= 0 ? onode_typed_profile(state, idx) : NULL,
         payload, payload_len, out_buf, out_buf_len, out_len);
     pthread_mutex_unlock(&state->session_mutex);
+    if (err != VIRP_OK) {
+        /* The legacy path has RUN — the request was processed, and for a
+         * staged DEVICE_OUTPUT the device acted — and the v3 observation
+         * cannot be produced (session gone, or signing failed). A bare
+         * error here is indistinguishable from the pre-dispatch
+         * SESSION_INVALID above and invites a blind retry (M12). Say
+         * what happened, O-Key-signed, with no device bytes. A staged
+         * ERROR is relayed as text: it may be the only account of a
+         * refusal or of an unknown outcome. */
+        bool staged_err = legacy[56] == VIRP_OBS_ERROR;
+        virp_error_t ferr = gate_observation_unavailable_obs(state,
+            idx >= 0 ? state->devices[idx].node_id : state->node_id,
+            device_name, command, legacy[9], NULL,
+            staged_err ? (const char *)legacy + 60 : NULL,
+            staged_err ? legacy_len - 60 : 0,
+            err, out_buf, out_buf_len, out_len);
+        if (ferr == VIRP_OK) return VIRP_OK;
+        *out_len = 0;
+    }
     return err;
 }
 
@@ -2558,6 +3486,18 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
         return VIRP_ERR_NULL_PTR;
     if (obs_version != 1 && obs_version != 2)
         return VIRP_ERR_VERSION_MISMATCH;
+
+    /* ── Layer 0: owner-policy refusal (M9) ───────────────────────────
+     * onode_execute_obs_ex already decided this request is refused; all
+     * that is left is to record it and say so, signed. First thing in
+     * this function so nothing below — separator scan, session probe,
+     * device or driver lookup — runs for a request the owner's policy
+     * has already turned away. */
+    if (policy_call.refusal)
+        return policy_refuse_obs(state, device_name, command,
+                                 policy_call.refusal,
+                                 policy_call.refusal_uid,
+                                 out_buf, out_buf_len, out_len);
 
     /* ── Layer 1: single-command boundary ─────────────────────────────
      * Every classifier prefix-matches from index 0 while the drivers
@@ -2596,8 +3536,15 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
             snprintf(err_msg, sizeof(err_msg),
                      "ERROR: multi-command / illegal separator rejected "
                      "for '%s': %s", device_name, why);
-            separator_refuse_chain(state, device_name, command, why,
-                                   err_msg);
+            /* Resolve the device BEFORE recording, so the chain session
+             * is one this node owns and not one the caller named (M3).
+             * Nothing else about the ordering moves: this is still ahead
+             * of the v2 canonicalization probe and of every classifier. */
+            const char *session_device =
+                find_device(state, device_name) >= 0
+                    ? device_name : ONODE_SEPARATOR_UNKNOWN_DEVICE;
+            separator_refuse_chain(state, session_device, device_name,
+                                   command, why, err_msg, client_uid);
             log_error_obs(device_name, VIRP_TIER_UNCLASSIFIED, err_msg);
             return virp_build_observation_tiered(
                         out_buf, out_buf_len, out_len,
@@ -2617,9 +3564,11 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
      */
     if (obs_version == 2) {
         onode_session_lock(state);
+        /* ... and it must be THIS caller's session (M19). */
         bool ok = state->ctx &&
                   virp_session_require_active(state->ctx) == VIRP_OK &&
-                  state->ctx->session.session_key_valid;
+                  state->ctx->session.session_key_valid &&
+                  onode_session_usable_by(state, client_uid);
         pthread_mutex_unlock(&state->session_mutex);
         if (!ok)
             return VIRP_ERR_SESSION_INVALID;
@@ -2674,9 +3623,13 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                                       (uint16_t)strlen(err_msg),
                                       &state->okey);
     }
+    /* Under owner policy the driver's classifier is STILL consulted (H4):
+     * the tier is the stricter of the two, and a driver BLACK stands
+     * unless this is the policy's typed reboot. `command` here is
+     * policy_call.action.command — onode_execute_obs_ex substituted the
+     * policy-normalized form before calling down. */
     virp_trust_tier_t gate_tier = policy_call.policy
-        ? (policy_call.action.effect == 0 ? VIRP_TIER_GREEN :
-           policy_call.action.effect == 1 ? VIRP_TIER_YELLOW : VIRP_TIER_RED)
+        ? gate_policy_tier(drv, &policy_call.action)
         : gate_classify(drv, command);
 
     /* Approval-apply state: set when a valid, consumed approval admits a
@@ -2717,12 +3670,12 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
      * with it (Phase C truth-fix). */
     {
         onode_gate_mode_t mode = policy_call.policy ? GATE_MODE_ENFORCE : gate_effective_mode(state, drv->name);
-        /* Effective ceiling = node-wide gate_max_tier, tightened by any
-         * per-uid ceiling for the connecting socket client. A remote
-         * requester capped at GREEN thus has YELLOW/RED blocked (and
-         * therefore proposal-only) while local operators keep the
-         * node-wide ceiling. client_uid == (uid_t)-1 (internal callers)
-         * leaves gate_max_tier unchanged. */
+        /* Effective ceiling = the connecting socket client's per-uid
+         * entry when it has one, else the node-wide gate_max_tier. A
+         * remote requester capped at GREEN thus has YELLOW/RED blocked
+         * (and therefore proposal-only) while uids without an entry keep
+         * the node-wide ceiling. client_uid == (uid_t)-1 (internal
+         * callers) leaves gate_max_tier unchanged. */
         virp_trust_tier_t eff_max = policy_call.policy ? policy_call.action.ceiling : onode_effective_max_tier(state, client_uid);
         bool block = gate_tier_blocks(gate_tier, eff_max);
 
@@ -2734,8 +3687,9 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
          * an ENFORCE rejection read like a logged-but-executed change.
          * BLACK logs "block" in BOTH modes — its refusal below is
          * unconditional, so there is nothing hypothetical to report.
-         * threshold= reports the EFFECTIVE ceiling (post per-uid tighten)
-         * so the log shows what actually decided this connection. */
+         * threshold= reports the EFFECTIVE ceiling (the per-uid entry
+         * when one applies) so the log shows what actually decided this
+         * connection. */
         fprintf(stderr,
                 "[GATE] mode=%s device=%s driver=%s tier=%s threshold=%s "
                 "uid=%ld decision=%s command=\"%s\"\n",
@@ -2827,7 +3781,7 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                 /* fall through: the approved command executes below */
             } else {
                 if (aerr == VIRP_ERR_APPROVAL_REUSED) {
-                    virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command);
+                    virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command, client_uid);
                     if (re != VIRP_OK) { pthread_mutex_unlock(&state->exec_mutex[dev_idx]); return re; }
                 }
                 pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -2985,16 +3939,19 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
          *   item 2  TTL re-check: connect can take seconds on a dead
          *           device, so an approval valid at verify may have expired
          *           by now. Refuse expired here, consuming nothing.
-         *   item 1  replay guard: a committed gate_intent already citing
-         *           this approval entry hash means it was already spent
-         *           (the chain is the authority; this survives a lost
-         *           consumed.list cache write). Refuse reused.
-         *           gate_emit_intent then commits under the same lock.
+         *   item 1  replay guard: consumed.list, the chain's own APPROVAL
+         *           entry for this proposal, and committed gate_intents
+         *           naming the proposal or citing that entry (the chain is
+         *           the authority; this survives a lost consumed.list
+         *           cache write, and a tampered record hash line — H1).
+         *           Refuse reused. gate_emit_intent then commits under the
+         *           same lock.
          *   item 3  consume: the intent is durable, so update the cache.
-         *           A cache-write failure AFTER the intent committed is
-         *           logged at error level and execution CONTINUES — the
-         *           chain already records the consumption and the replay
-         *           guard reads the chain, not the cache. */
+         *           A cache-write PERSIST failure AFTER the intent
+         *           committed is logged at error level and execution
+         *           CONTINUES — the chain already records the consumption
+         *           and the replay guard reads the chain, not the cache.
+         *           REUSED from that write is a refusal, not a log line. */
         virp_error_t refuse_err = VIRP_OK;
         char refuse_msg[416];
         refuse_msg[0] = '\0';
@@ -3021,12 +3978,83 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                      proposal_id, device_name, gate_tier_name(gate_tier));
         }
 
-        /* item 1 — replay guard, atomic with the append below. */
-        if (refuse_err == VIRP_OK && apr.chain_entry_hash[0]) {
-            int prior = 0;
+        /* item 1 — replay guard, atomic with the append below.
+         *
+         * FOUR KEYS, NOT ONE (security review H1). This used to be a
+         * single count keyed on apr.chain_entry_hash, and skipped when
+         * that field was empty. But apr.chain_entry_hash is the third
+         * line of the on-disk approval record, and the approver's
+         * signature covers the canonical payload only — not that line.
+         * Whoever can write the approval store could blank it (guard
+         * skipped) or alter it (count of a hash nothing cites: 0) and
+         * replay a spent approval for as long as its TTL ran. None of the
+         * keys below can be steered that way: the proposal id is inside
+         * the signed payload and names the record's own path, and the
+         * chain entries are daemon-reserved types no client can mint.
+         *
+         *   (a) consumed.list already names this proposal. Asked HERE,
+         *       before the intent, so a spent approval is refused with
+         *       nothing committed; it used to be discovered only when the
+         *       post-intent cache write returned REUSED, which was logged
+         *       and ignored.
+         *   (b) the APPROVAL entry the daemon appended for this proposal
+         *       must exist on the chain and its hash must equal the
+         *       record's. An empty record hash therefore refuses instead
+         *       of skipping the guard.
+         *   (c) no committed gate_intent may name this proposal id, nor
+         *       cite the chain's own approval entry hash. Both, because
+         *       either alone leaves a way round: the proposal id survives
+         *       a tampered hash line, and the hash survives anything that
+         *       is not a gate_intent body field.
+         *
+         * A store or chain that cannot answer is a refusal, never a pass. */
+        char chain_aeh[65];
+        chain_aeh[0] = '\0';
+        if (refuse_err == VIRP_OK) {
+            bool listed = true;
+            virp_error_t le = virp_approval_is_consumed_locked(
+                    state->approval_dir, proposal_id, &listed);
+            if (le != VIRP_OK || listed) {
+                refuse_err = VIRP_ERR_APPROVAL_REUSED;
+                snprintf(refuse_msg, sizeof(refuse_msg),
+                         "ERROR: apply rejected (%s, err=%d) for proposal %s "
+                         "on '%s': approval already consumed (tier=%s)",
+                         virp_approval_err_name(refuse_err), (int)refuse_err,
+                         proposal_id, device_name, gate_tier_name(gate_tier));
+                fprintf(stderr, "[GATE] apply rejected: proposal=%s device=%s "
+                        "reason=consumed-list (query_rc=%d listed=%d)\n",
+                        proposal_id, device_name, (int)le, (int)listed);
+            }
+        }
+        if (refuse_err == VIRP_OK) {
+            int approvals = 0;
+            virp_error_t ae = virp_chain_approval_entry_hash(
+                    &state->chain, proposal_id, chain_aeh, &approvals);
+            if (ae != VIRP_OK || approvals != 1 ||
+                strlen(apr.chain_entry_hash) != 64 ||
+                virp_consttime_eq(apr.chain_entry_hash, chain_aeh, 64) != 1) {
+                refuse_err = VIRP_ERR_APPROVAL_NOT_FOUND;
+                snprintf(refuse_msg, sizeof(refuse_msg),
+                         "ERROR: apply rejected (%s, err=%d) for proposal %s "
+                         "on '%s': the approval record does not match the "
+                         "APPROVAL entry on the chain (tier=%s)",
+                         virp_approval_err_name(refuse_err), (int)refuse_err,
+                         proposal_id, device_name, gate_tier_name(gate_tier));
+                fprintf(stderr, "[GATE] apply rejected: proposal=%s device=%s "
+                        "reason=approval-entry-mismatch (query_rc=%d "
+                        "chain_entries=%d record_hash=%s)\n",
+                        proposal_id, device_name, (int)ae, approvals,
+                        apr.chain_entry_hash[0] ? "present" : "empty");
+            }
+        }
+        if (refuse_err == VIRP_OK) {
+            int by_hash = 0, by_proposal = 0;
             virp_error_t qe = virp_chain_count_intents_for_approval(
-                    &state->chain, apr.chain_entry_hash, &prior);
-            if (qe != VIRP_OK || prior > 0) {
+                    &state->chain, chain_aeh, &by_hash);
+            virp_error_t pe = virp_chain_count_intents_for_proposal(
+                    &state->chain, proposal_id, &by_proposal);
+            if (qe != VIRP_OK || pe != VIRP_OK ||
+                by_hash > 0 || by_proposal > 0) {
                 refuse_err = VIRP_ERR_APPROVAL_REUSED;
                 snprintf(refuse_msg, sizeof(refuse_msg),
                          "ERROR: apply rejected (%s, err=%d) for proposal %s "
@@ -3035,14 +4063,15 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                          virp_approval_err_name(refuse_err), (int)refuse_err,
                          proposal_id, device_name, gate_tier_name(gate_tier));
                 fprintf(stderr, "[GATE] apply rejected: proposal=%s device=%s "
-                        "reason=intent-already-committed (query_rc=%d "
-                        "prior=%d)\n", proposal_id, device_name,
-                        (int)qe, prior);
+                        "reason=intent-already-committed (query_rc=%d/%d "
+                        "by_hash=%d by_proposal=%d)\n", proposal_id,
+                        device_name, (int)qe, (int)pe, by_hash, by_proposal);
             }
         }
 
         /* item 1 — the intent commit is the consumption event. */
         virp_error_t ierr = VIRP_OK;
+        bool reused_after_intent = false;
         if (refuse_err == VIRP_OK) {
             ierr = gate_emit_intent(state, device_name, drv, command,
                                     gate_tier, gate_eff_max, gate_mode,
@@ -3050,10 +4079,30 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                                     &apr, &intent_ce);
             if (ierr == VIRP_OK) {
                 intent = &intent_ce;
-                /* item 3 — cache update; failure is logged, not fatal. */
+                /* item 3 — cache update. A PERSIST failure is logged, not
+                 * fatal: the committed intent is the authority and guard
+                 * (c) reads the chain. REUSED is a different thing and is
+                 * a REFUSAL (H1): guard (a) read the same list under this
+                 * same lock a moment ago and it was not there, so the list
+                 * changed underneath the daemon. Something else is
+                 * consuming this approval; do not dispatch. */
                 virp_error_t ce = virp_approval_commit_consume_locked(
                         state->approval_dir, proposal_id);
-                if (ce != VIRP_OK)
+                if (ce == VIRP_ERR_APPROVAL_REUSED) {
+                    reused_after_intent = true;
+                    refuse_err = VIRP_ERR_APPROVAL_REUSED;
+                    snprintf(refuse_msg, sizeof(refuse_msg),
+                             "ERROR: apply rejected (%s, err=%d) for proposal "
+                             "%s on '%s': approval was consumed concurrently; "
+                             "nothing was dispatched (tier=%s)",
+                             virp_approval_err_name(refuse_err),
+                             (int)refuse_err, proposal_id, device_name,
+                             gate_tier_name(gate_tier));
+                    fprintf(stderr, "[GATE] apply rejected: proposal=%s "
+                            "device=%s reason=consumed-list-changed-under-"
+                            "lock — refusing AFTER the intent committed\n",
+                            proposal_id, device_name);
+                } else if (ce != VIRP_OK)
                     fprintf(stderr, "[GATE] ERROR: consumed.list cache write "
                             "failed for proposal=%s (%s) AFTER the intent "
                             "committed; the committed intent is the authority "
@@ -3066,8 +4115,19 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
         virp_approval_consume_unlock();
 
         if (refuse_err != VIRP_OK) {
+            if (reused_after_intent) {
+                /* The intent is on the chain and nothing was dispatched.
+                 * Close it, so the verifier does not grade a refusal as
+                 * an OPEN execution ("attempted, disposition unknown"):
+                 * the outcome names this intent with success=false. A
+                 * closer that cannot be written latches evidence-degraded
+                 * inside approval_emit_outcome, exactly as it does after
+                 * a real dispatch. */
+                (void)approval_emit_outcome(state, proposal_id, &apr,
+                                            device_name, false, intent);
+            }
             if (refuse_err == VIRP_ERR_APPROVAL_REUSED) {
-                virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command);
+                virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command, client_uid);
                 if (re != VIRP_OK) { pthread_mutex_unlock(&state->exec_mutex[dev_idx]); return re; }
             }
             pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -3115,7 +4175,8 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
             if (ce != VIRP_OK) {
                 if (ce == VIRP_ERR_APPROVAL_REUSED) {
                     virp_error_t re = replay_refusal_record(state, device_name,
-                                                           proposal_id, command);
+                                                           proposal_id, command,
+                                                           client_uid);
                     if (re != VIRP_OK) {
                         pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
                         return re;
@@ -3553,12 +4614,20 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
          * (session.last_seq under session_mutex), which is what the
          * verifier's replay high-water store checks against. If the
          * session died while the command ran, fail — never downgrade
-         * to master-key signing on a v2 request.
+         * to master-key signing on a v2 request. "Fail" is not a bare
+         * code, though: the tail of this function turns it into an
+         * O-Key-signed ERROR observation that says the command was
+         * dispatched and carries none of the device's output (M12).
          */
         onode_session_lock(state);
         if (!state->ctx ||
             virp_session_require_active(state->ctx) != VIRP_OK ||
-            !state->ctx->session.session_key_valid) {
+            !state->ctx->session.session_key_valid ||
+            /* Re-checked at signing time like everything else here: the
+             * caller's session may have been closed and another uid's
+             * bound while the command ran, and this observation must
+             * not be signed under that one (M19). */
+            !onode_session_usable_by(state, client_uid)) {
             err = VIRP_ERR_SESSION_INVALID;
         } else {
             /* Truncate like the v1 path does rather than erroring:
@@ -3635,6 +4704,22 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                 state->reconnect[dev_idx].last_read_success = time(NULL);
             pthread_mutex_unlock(&state->conn_mutex);
         }
+    } else {
+        /* The device was dispatched to and the chain has its record
+         * (gate_execution above, or the outcome), but the observation
+         * could not be built — in practice, a v2 session that died while
+         * the command ran. Never a bare code from here (M12): see
+         * gate_observation_unavailable_obs. If even that cannot be built
+         * the original error stands. */
+        virp_error_t ferr = gate_observation_unavailable_obs(state,
+                                state->devices[dev_idx].node_id,
+                                device_name, command,
+                                gate_obs_tier(gate_tier), intent,
+                                NULL, 0, err,
+                                out_buf, out_buf_len, out_len);
+        if (ferr == VIRP_OK)
+            return VIRP_OK;
+        *out_len = 0;
     }
 
     return err;
@@ -3649,10 +4734,28 @@ virp_error_t onode_heartbeat(onode_state_t *state,
 
     uint32_t uptime = (uint32_t)(time(NULL) - state->uptime_start);
 
+    /* observations_sent is written by worker threads under state_mutex;
+     * read it the same way. */
+    pthread_mutex_lock(&state->state_mutex);
+    uint32_t sent = state->observations_sent;
+    pthread_mutex_unlock(&state->state_mutex);
+
+    /* The wire field is 16 bits. It used to be a bare (uint16_t) cast, so
+     * the count WRAPPED: a node that had signed 65,537 observations
+     * reported 1. Saturate instead — 65535 reads as "at least this many",
+     * which is true; a wrapped count is simply false. */
+    uint16_t sent_wire = sent > UINT16_MAX ? UINT16_MAX : (uint16_t)sent;
+
+    /* rnode_ok is FALSE. The O-Node has no channel to the R-Node and no
+     * way to know its state; this used to assert true unconditionally,
+     * in a message signed with the O-Key — a signed statement about
+     * something the signer never observed. false is "not vouched for by
+     * this node", which is all the O-Node can say. onode_ok stays true:
+     * the process building this message is, at least, running. */
     return virp_build_heartbeat(out_buf, out_buf_len, out_len,
                                 state->node_id, onode_next_seq(state),
-                                uptime, true, true,
-                                (uint16_t)state->observations_sent,
+                                uptime, true, false,
+                                sent_wire,
                                 0,  /* R-Node tracks proposals */
                                 &state->okey);
 }
@@ -3846,6 +4949,22 @@ static virp_error_t onode_list_fleet(onode_state_t *state,
                                   &state->okey);
 }
 
+/*
+ * Thread creation seam. Production code calls pthread_create; a test
+ * that includes this file may define ONODE_PTHREAD_CREATE first to
+ * substitute a function that fails on demand, because "the kernel would
+ * not give us a thread" is otherwise untestable and is exactly the case
+ * the batch path used to get wrong (security review M17).
+ */
+#ifdef ONODE_PTHREAD_CREATE
+/* Declared here rather than by the test, so the test needs no header
+ * ahead of this file's feature-test macros. */
+static int ONODE_PTHREAD_CREATE(pthread_t *t, const pthread_attr_t *a,
+                                void *(*fn)(void *), void *arg);
+#else
+#define ONODE_PTHREAD_CREATE pthread_create
+#endif
+
 /* =========================================================================
  * Batch Parallel Execution (pthread-based)
  *
@@ -3885,23 +5004,15 @@ static void *batch_execute_thread(void *arg)
  * Parse batch commands from JSON "commands" array.
  * Returns count of commands parsed (0 on error/empty).
  */
-static int parse_batch_commands(const char *json,
+static int parse_batch_commands(const char *json, size_t json_len,
                                  batch_thread_arg_t *args,
                                  int max_cmds)
 {
-    /* Same ingress rule as the single path — the batch array is exactly
-     * where a smuggled NUL would be cheapest to hide. */
-    if (json_has_nul_escape(json)) {
-        fprintf(stderr, "[O-Node] batch contains an encoded NUL "
-                        "(\\u0000) — refusing the whole batch\n");
-        return 0;
-    }
-    cJSON *root = cJSON_Parse(json);
+    /* Same ingress rules as the single path, from the same function —
+     * the batch array is exactly where a smuggled NUL, a trailing second
+     * object or a repeated key would be cheapest to hide. */
+    cJSON *root = onode_parse_root_object(json, json_len, "batch");
     if (!root) return 0;
-    if (!cJSON_IsObject(root)) {
-        cJSON_Delete(root);
-        return 0;
-    }
 
     cJSON *commands = cJSON_GetObjectItemCaseSensitive(root, "commands");
     if (!cJSON_IsArray(commands)) {
@@ -3925,11 +5036,25 @@ static int parse_batch_commands(const char *json,
             return 0;
         }
 
+        /* A repeated "device" or "command" inside one item is the same
+         * first-vs-last ambiguity as a repeated root key (M1): the daemon
+         * would execute the first while a reader of the request sees the
+         * last. Refuse the whole batch. */
+        if (json_object_has_duplicate_keys(item, ONODE_MAX_ROOT_KEYS)) {
+            cJSON_Delete(root);
+            return 0;
+        }
+
         if (!json_extract_string_cjson(item, "device", args[count].device,
                                        sizeof(args[count].device)) ||
             !json_extract_string_cjson(item, "command", args[count].command,
                                        sizeof(args[count].command)) ||
             !args[count].device[0] || !args[count].command[0]) {
+            cJSON_Delete(root);
+            return 0;
+        }
+        /* Same device-name rule as the single path (M3). */
+        if (!onode_canonical_string_ok(args[count].device)) {
             cJSON_Delete(root);
             return 0;
         }
@@ -3985,9 +5110,13 @@ static int hex_nibble(char c)
  * that permanently fences off exactly them makes the system unable to do
  * the job it now exists to do. The self-lockout risk is real but it is a
  * TIER question, not a device question: every `config ...` on the
- * FortiGate is RED by absence in driver_fortigate.c's route table, so a
- * change already requires a signed human approval rather than an
- * autopilot decision.
+ * FortiGate is RED — by the explicit { "config", RED } row in
+ * driver_fortigate.c's route table, and a command that table does not
+ * list at all is RED too (fg_route_command's fail-closed default; both
+ * pinned by tests/test_driver_route_defaults.c). So a change already
+ * requires a signed human approval rather than an autopilot decision.
+ * That argument covers the FortiGate only: pve1 is governed by the
+ * linux driver's gate, not by this table.
  *
  * A NULL pointer with count 0 rather than an empty initializer: a
  * zero-length array initializer is a constraint violation under
@@ -4098,27 +5227,59 @@ static void hex_encode(char *buf, size_t buf_size, const uint8_t *data, size_t l
  * a raw 4-byte VIRP_ERR_PROTOCOL_VERSION and closes.
  * ========================================================================= */
 
+static int64_t onode_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 /*
- * Read exactly `len` bytes from fd into buf.
- * Handles partial reads, distinguishes EAGAIN/EINTR from EOF.
- * Returns 0 on success, -1 on EOF or fatal error.
+ * Read exactly `len` bytes from fd into buf, all of them before
+ * `deadline_ms` (CLOCK_MONOTONIC milliseconds).
+ * Returns 0 on success, -1 on EOF, error, or the deadline passing.
+ *
+ * ONE DEADLINE FOR THE WHOLE REQUEST (security review M14). This used to
+ * be recv() under SO_RCVTIMEO, and that timeout restarts on every byte:
+ * a peer that sent one byte every four seconds never tripped the
+ * five-second limit and could hold a worker for the days a 128 KiB frame
+ * takes at that rate. The pool is 32 workers and the peer needs only to
+ * be on the allowlist, so a single slow — or merely stuck — client
+ * library could starve every other principal. The caller computes the
+ * deadline once, before the length prefix, and passes the same value for
+ * the payload: what is bounded is the request, not each read.
+ *
+ * poll() carries the wait so the bound holds however the bytes dribble
+ * in; the recv is MSG_DONTWAIT so a spurious wakeup cannot block past
+ * the deadline. CLOCK_MONOTONIC, so a wall-clock step neither stretches
+ * nor collapses it.
  */
-static int recv_exact(int fd, void *buf, size_t len)
+static int recv_exact(int fd, void *buf, size_t len, int64_t deadline_ms)
 {
     size_t got = 0;
     while (got < len) {
-        ssize_t n = recv(fd, (uint8_t *)buf + got, len - got, 0);
+        int64_t left = deadline_ms - onode_monotonic_ms();
+        if (left <= 0)
+            return -1;      /* request deadline passed */
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, left > INT32_MAX ? INT32_MAX : (int)left);
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;   /* signal interrupted — re-check the deadline */
+            return -1;
+        }
+        if (pr == 0)
+            return -1;      /* deadline passed while waiting */
+
+        ssize_t n = recv(fd, (uint8_t *)buf + got, len - got, MSG_DONTWAIT);
         if (n > 0) {
             got += (size_t)n;
         } else if (n == 0) {
             /* EOF — peer closed */
             return -1;
         } else {
-            /* n < 0: check errno */
-            if (errno == EINTR)
-                continue;   /* signal interrupted — retry */
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return -1;  /* timeout or non-blocking — treat as failure */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;   /* nothing there after all — poll again */
             return -1;      /* other error */
         }
     }
@@ -4134,11 +5295,12 @@ static int recv_exact(int fd, void *buf, size_t len)
  * So: loop until every byte is out, retry on EINTR.
  *
  * EAGAIN/EWOULDBLOCK is fatal by design. Client fds here are blocking
- * (only SO_RCVTIMEO is set), so EAGAIN can only appear if someone later
- * configures SO_SNDTIMEO — and a frame cannot be resumed after a
- * mid-frame timeout. On a hypothetical non-blocking fd, retrying
- * without poll() would spin. Either way the framing on this connection
- * is unrecoverable: return -1 and let the caller treat it as dead.
+ * with SO_SNDTIMEO set (handle_client, M14), so EAGAIN means the peer
+ * stopped reading for the whole send timeout — and a frame cannot be
+ * resumed after a mid-frame timeout. On a hypothetical non-blocking fd,
+ * retrying without poll() would spin. Either way the framing on this
+ * connection is unrecoverable: return -1 and let the caller treat it as
+ * dead.
  *
  * MSG_NOSIGNAL on every daemon send: a client that closes before
  * reading its response would otherwise raise SIGPIPE, whose default
@@ -4321,7 +5483,9 @@ static bool peer_uid_allowed(onode_state_t *state, int client_fd,
  * GATE 2 hashed with, and then the field checked would not be the
  * field stored. Fail-closed throughout: a body this cannot read is a
  * body whose citation cannot be checked, which is the case the gate
- * exists to stop.
+ * exists to stop. The same goes for a root-level "executed" that is
+ * repeated or is not a JSON boolean (H2): FED_CITE_NONE, and the caller
+ * refuses the outcome.
  */
 /* Which body a fed_outcome says it is backed by. Exactly one citation
  * may be present: an outcome cannot be backed by signed evidence AND by
@@ -4384,14 +5548,89 @@ static fed_cite_kind_t fed_outcome_citation(const char *body,
             memcpy(out_hex, err, 65);
             kind = FED_CITE_ERROR;
         }
-        if (claims_executed) {
-            const cJSON *ex = cJSON_GetObjectItemCaseSensitive(root,
-                                                               "executed");
-            *claims_executed = cJSON_IsTrue(ex);
+        /* "executed" is held to the same standard as the citation it
+         * qualifies (security review H2): at most ONE root-level member,
+         * and a JSON boolean when present. It used to be read with
+         * cJSON_GetObjectItemCaseSensitive + cJSON_IsTrue, which takes
+         * the FIRST member of that name and treats everything that is not
+         * the literal `true` as "does not claim execution". So
+         *     {"executed":false, ..., "executed":true}
+         * passed the error-backed check on its first value while every
+         * JSON reader downstream returns the last, and `"executed":1` or
+         * `"executed":"true"` — which a loosely typed consumer reads as
+         * truthy — passed as no claim at all. An ambiguous or mistyped
+         * claim is not a claim this gate can grade: the outcome is
+         * refused, exactly like an ambiguous citation. Absent is fine and
+         * means no execution is claimed. */
+        const cJSON *ex = NULL;
+        int ex_count = 0;
+        for (const cJSON *m = root->child; m; m = m->next) {
+            if (m->string && strcmp(m->string, "executed") == 0) {
+                ex_count++;
+                ex = m;
+            }
         }
+        if (ex_count > 1 || (ex_count == 1 && !cJSON_IsBool(ex)))
+            kind = FED_CITE_NONE;
+        /* An execution claim is reported ONLY together with a citation.
+         * It used to be set whenever a lone boolean `executed` was
+         * present, citation or not, so a body with no usable citation
+         * could still come back "claims executed". The one caller
+         * refuses FED_CITE_NONE before it looks at the flag, so nothing
+         * was reachable — but a result that says "nothing is cited, and
+         * it executed" is a trap for the next caller. Found by
+         * tests/fuzz_onode_parsers.c on its first run. */
+        else if (claims_executed && kind != FED_CITE_NONE)
+            *claims_executed = cJSON_IsTrue(ex);
     }
     cJSON_Delete(root);
     return kind;
+}
+
+/*
+ * Is this chain session id one of the daemon's own? (security review M5)
+ *
+ * GATE 1 reserves the daemon's artifact TYPES, so a socket client cannot
+ * mint a gate_intent or an approval. It did not reserve the daemon's
+ * SESSIONS. A client could append an entry of a perfectly legal type —
+ * an evidence_item, a fed_request — into "gate-enforce:<device>", and
+ * validate_turn would append its `validation` entry into whatever session
+ * id the caller's manifest named. Either lands, with a genuine K_chain
+ * HMAC and the next sequence number, in the middle of the daemon's own
+ * record of what it refused and executed on that device: a reader walking
+ * that session sees caller-chosen entries interleaved with the gate's,
+ * and with a native epoch configured the chain rewrites the id into the
+ * daemon's epoch namespace as well.
+ *
+ * The four prefixes are every session the daemon writes for itself
+ * (gate_emit_*, separator_refuse_chain, virp_approval.c,
+ * onode_emit_node_config). The epoch test covers what the review called
+ * the "native-epoch prefix": there is no such prefix — the epoch is a
+ * SUFFIX, "<session>@<epoch>", applied by chain_append_locked — so the
+ * equivalent refusal is an id that ends in the configured epoch marker.
+ *
+ * READ paths (chain_verify, chain_verify_session, list_sessions) are
+ * deliberately not restricted: auditing these sessions is the point.
+ */
+static bool onode_session_id_is_daemon_reserved(const onode_state_t *state,
+                                                const char *session_id)
+{
+    static const char *const PREFIXES[] = {
+        "gate-enforce:", "gate-separator:", "approval:", "node-config:",
+    };
+    if (!session_id) return false;
+    for (size_t i = 0; i < sizeof(PREFIXES) / sizeof(PREFIXES[0]); i++)
+        if (strncmp(session_id, PREFIXES[i], strlen(PREFIXES[i])) == 0)
+            return true;
+
+    const char *epoch = state->chain_enabled ? state->chain.native_epoch : "";
+    if (epoch[0]) {
+        size_t sl = strlen(session_id), el = strlen(epoch);
+        if (sl > el && session_id[sl - el - 1] == '@' &&
+            strcmp(session_id + sl - el, epoch) == 0)
+            return true;
+    }
+    return false;
 }
 
 /*
@@ -4424,42 +5663,227 @@ static fed_cite_kind_t fed_outcome_citation(const char *body,
  * attacker-writable region inside the message must either sign it or
  * move the commitment to the canonical span.
  */
-/* A truncated JSON response is refused, never signed over a would-be length. */
+/* =========================================================================
+ * Intent store / get — body handling (security review M4)
+ *
+ * An intent carries three caller-supplied JSON texts: intent_json,
+ * proposed_actions and constraints. The INTENT_FETCHED response used to
+ * be built with snprintf, pasting those three in as raw JSON VALUES and
+ * intent_id / confidence in between quotes, unescaped. Nothing ever
+ * checked that the texts were JSON. So a client that stored
+ *
+ *     "constraints": "{},\"signature_hmac\":\"<64 hex of its choosing>\""
+ *
+ * got back — in an observation signed with the O-Key — an object with
+ * two signature_hmac members, and a confidence of `x","max_commands":0`
+ * rewrote the fields after it. The daemon was signing a document whose
+ * structure the caller wrote.
+ *
+ * The rules now:
+ *   - at STORE, each of the three must parse as JSON, entire string, of
+ *     the documented shape (proposed_actions an array, constraints an
+ *     object; intent_json any value). intent_id and confidence must pass
+ *     the canonical-string check. intent_hash must be 64 lowercase hex
+ *     and equal sha256(intent_json): the daemon HMACs intent_hash, and
+ *     an HMAC over a hash that does not commit to the stored body
+ *     vouches for nothing.
+ *   - proposed_actions and constraints are stored RE-SERIALIZED by
+ *     cJSON, so what is kept is the parse, not the caller's bytes.
+ *     intent_json is stored byte-for-byte: intent_hash commits to those
+ *     exact bytes, and re-serializing would break the commitment the
+ *     line above just checked.
+ *   - every response is built with cJSON. On GET the three are embedded
+ *     as PARSED values, so the response is well-formed whatever is in
+ *     the database; a legacy row whose text does not parse is refused
+ *     rather than signed.
+ *
+ * Nanosecond timestamps and the sequence are emitted as raw integer
+ * tokens (cJSON_AddRawToObject over a %lld): the same bytes the snprintf
+ * produced, where cJSON_AddNumberToObject would round a 1.79e18 value
+ * through a double. Member order is unchanged (alphabetical).
+ * ========================================================================= */
+
+/* Parse `text` as one complete JSON value. NULL unless the whole string
+ * is consumed (trailing whitespace allowed). */
+static cJSON *intent_parse_json_text(const char *text)
+{
+    if (!text || !text[0]) return NULL;
+    return cJSON_ParseWithLengthOpts(text, strlen(text) + 1, NULL, 1);
+}
+
+static bool intent_add_int64(cJSON *o, const char *key, long long v)
+{
+    char num[32];
+    snprintf(num, sizeof(num), "%lld", v);
+    return cJSON_AddRawToObject(o, key, num) != NULL;
+}
+
+/* Embed a stored JSON text as a parsed value. An EMPTY text is JSON null
+ * (the field was never supplied). A non-empty text that does not parse
+ * is a refusal: false. */
+static bool intent_add_json_text(cJSON *o, const char *key, const char *text)
+{
+    if (!text || !text[0])
+        return cJSON_AddNullToObject(o, key) != NULL;
+    cJSON *v = intent_parse_json_text(text);
+    if (!v) return false;
+    if (!cJSON_AddItemToObject(o, key, v)) {
+        cJSON_Delete(v);
+        return false;
+    }
+    return true;
+}
+
+/* Print `o` into buf, or refuse. A truncated JSON response is refused,
+ * never signed over a would-be length. Consumes `o`. */
+static int intent_print_json(cJSON *o, bool ok, char *json_buf, size_t cap)
+{
+    char *txt = ok ? cJSON_PrintUnformatted(o) : NULL;
+    cJSON_Delete(o);
+    int jlen = -1;
+    if (txt) {
+        size_t n = strlen(txt);
+        if (n < cap) {
+            memcpy(json_buf, txt, n + 1);
+            jlen = (int)n;
+        }
+        cJSON_free(txt);
+    }
+    if (jlen < 0 && cap) json_buf[0] = '\0';
+    return jlen;
+}
+
+/* INTENT_FETCHED body. Returns the length, or -1 (json_buf emptied) if it
+ * does not fit or a stored field cannot be embedded. */
 static int intent_format_json(const virp_intent_entry_t *ie, char *json_buf,
                       size_t cap)
 {
-    int jlen = snprintf(json_buf, cap,
-        "{\"commands_executed\":%d,"
-        "\"confidence\":\"%s\","
-        "\"constraints\":%s,"
-        "\"created_at_ns\":%lld,"
-        "\"expires_at_ns\":%lld,"
-        "\"intent_hash\":\"%s\","
-        "\"intent_id\":\"%s\","
-        "\"intent_json\":%s,"
-        "\"max_commands\":%d,"
-        "\"proposed_actions\":%s,"
-        "\"signature_hmac\":\"%s\","
-        "\"signature_seq\":%lld,"
-        "\"signature_timestamp_ns\":%lld}",
-        ie->commands_executed,
-        ie->confidence,
-        ie->constraints,
-        (long long)ie->created_at_ns,
-        (long long)ie->expires_at_ns,
-        ie->intent_hash,
-        ie->intent_id,
-        ie->intent_json,
-        ie->max_commands,
-        ie->proposed_actions,
-        ie->signature_hmac,
-        (long long)ie->signature_seq,
-        (long long)ie->signature_timestamp_ns);
-    if (jlen < 0 || (size_t)jlen >= cap) {
-        if (cap) json_buf[0] = '\0';
-        return -1;
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { if (cap) json_buf[0] = '\0'; return -1; }
+    bool ok =
+        cJSON_AddNumberToObject(o, "commands_executed",
+                                (double)ie->commands_executed) &&
+        cJSON_AddStringToObject(o, "confidence", ie->confidence) &&
+        intent_add_json_text(o, "constraints", ie->constraints) &&
+        intent_add_int64(o, "created_at_ns", (long long)ie->created_at_ns) &&
+        intent_add_int64(o, "expires_at_ns", (long long)ie->expires_at_ns) &&
+        cJSON_AddStringToObject(o, "intent_hash", ie->intent_hash) &&
+        cJSON_AddStringToObject(o, "intent_id", ie->intent_id) &&
+        intent_add_json_text(o, "intent_json", ie->intent_json) &&
+        cJSON_AddNumberToObject(o, "max_commands",
+                                (double)ie->max_commands) &&
+        intent_add_json_text(o, "proposed_actions", ie->proposed_actions) &&
+        cJSON_AddStringToObject(o, "signature_hmac", ie->signature_hmac) &&
+        intent_add_int64(o, "signature_seq", (long long)ie->signature_seq) &&
+        intent_add_int64(o, "signature_timestamp_ns",
+                         (long long)ie->signature_timestamp_ns);
+    return intent_print_json(o, ok, json_buf, cap);
+}
+
+/* INTENT_STORED body. */
+static int intent_format_stored_json(const virp_intent_entry_t *ie,
+                                     char *json_buf, size_t cap)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { if (cap) json_buf[0] = '\0'; return -1; }
+    bool ok =
+        cJSON_AddNumberToObject(o, "commands_executed",
+                                (double)ie->commands_executed) &&
+        cJSON_AddStringToObject(o, "intent_id", ie->intent_id) &&
+        cJSON_AddNumberToObject(o, "max_commands",
+                                (double)ie->max_commands) &&
+        cJSON_AddStringToObject(o, "signature_hmac", ie->signature_hmac) &&
+        intent_add_int64(o, "signature_seq", (long long)ie->signature_seq) &&
+        intent_add_int64(o, "signature_timestamp_ns",
+                         (long long)ie->signature_timestamp_ns);
+    return intent_print_json(o, ok, json_buf, cap);
+}
+
+/* INTENT_EXECUTED body. */
+static int intent_format_executed_json(const virp_intent_entry_t *ie,
+                                       char *json_buf, size_t cap)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { if (cap) json_buf[0] = '\0'; return -1; }
+    bool ok =
+        cJSON_AddNumberToObject(o, "commands_executed",
+                                (double)ie->commands_executed) &&
+        cJSON_AddStringToObject(o, "intent_id", ie->intent_id) &&
+        cJSON_AddNumberToObject(o, "max_commands",
+                                (double)ie->max_commands);
+    return intent_print_json(o, ok, json_buf, cap);
+}
+
+/*
+ * Validate an intent_store request and fill *ie from it (see the block
+ * comment above for each rule). Returns VIRP_OK, or the error the handler
+ * sends: INVALID_LENGTH for a non-conformant id/confidence/hash,
+ * INVALID_TYPE for a text that is not JSON of the documented shape,
+ * CHAIN_BROKEN for an intent_hash that does not commit to intent_json
+ * (the same code GATE 2 uses for a body/hash disagreement), and
+ * BUFFER_TOO_SMALL if a re-serialized text no longer fits its field.
+ */
+static virp_error_t intent_from_request(const onode_request_t *req,
+                                        virp_intent_entry_t *ie)
+{
+    memset(ie, 0, sizeof(*ie));
+
+    if (!onode_canonical_string_ok(req->intent_id) ||
+        !onode_canonical_string_ok(req->confidence))
+        return VIRP_ERR_INVALID_LENGTH;
+    if (!virp_chain_artifact_hash_ok(req->intent_hash))
+        return VIRP_ERR_INVALID_LENGTH;
+
+    char computed[65];
+    gate_sha256_hex(req->intent_json, strlen(req->intent_json), computed);
+    if (virp_consttime_eq(computed, req->intent_hash, 64) != 1)
+        return VIRP_ERR_CHAIN_BROKEN;
+
+    cJSON *ij = intent_parse_json_text(req->intent_json);
+    if (!ij) return VIRP_ERR_INVALID_TYPE;
+    cJSON_Delete(ij);
+
+    static const struct {
+        const char *name; size_t req_off; size_t ie_off; size_t ie_size;
+        bool want_array;
+    } NORMALIZED[] = {
+        { "proposed_actions", offsetof(onode_request_t, proposed_actions),
+          offsetof(virp_intent_entry_t, proposed_actions),
+          sizeof(((virp_intent_entry_t *)0)->proposed_actions), true },
+        { "constraints", offsetof(onode_request_t, constraints),
+          offsetof(virp_intent_entry_t, constraints),
+          sizeof(((virp_intent_entry_t *)0)->constraints), false },
+    };
+    for (size_t i = 0; i < sizeof(NORMALIZED) / sizeof(NORMALIZED[0]); i++) {
+        const char *src = (const char *)req + NORMALIZED[i].req_off;
+        char *dst = (char *)ie + NORMALIZED[i].ie_off;
+        if (!src[0]) continue;                 /* not supplied */
+        cJSON *v = intent_parse_json_text(src);
+        bool shape = v && (NORMALIZED[i].want_array ? cJSON_IsArray(v)
+                                                    : cJSON_IsObject(v));
+        if (!shape) {
+            if (v) cJSON_Delete(v);
+            return VIRP_ERR_INVALID_TYPE;
+        }
+        char *txt = cJSON_PrintUnformatted(v);
+        cJSON_Delete(v);
+        if (!txt) return VIRP_ERR_BUFFER_TOO_SMALL;
+        size_t n = strlen(txt);
+        if (n >= NORMALIZED[i].ie_size) {
+            cJSON_free(txt);
+            return VIRP_ERR_BUFFER_TOO_SMALL;
+        }
+        memcpy(dst, txt, n + 1);
+        cJSON_free(txt);
     }
-    return jlen;
+
+    snprintf(ie->intent_id, sizeof(ie->intent_id), "%s", req->intent_id);
+    snprintf(ie->intent_hash, sizeof(ie->intent_hash), "%s", req->intent_hash);
+    snprintf(ie->intent_json, sizeof(ie->intent_json), "%s", req->intent_json);
+    snprintf(ie->confidence, sizeof(ie->confidence), "%s", req->confidence);
+    ie->expires_at_ns = req->expires_at_ns;
+    ie->max_commands = req->max_commands;
+    return VIRP_OK;
 }
 
 static virp_error_t chain_append_verify_observation(
@@ -4503,14 +5927,15 @@ static virp_error_t chain_append_verify_observation(
                                                           &state->prev_okey,
                                                           &hdr);
                 if (perr == VIRP_OK) {
-                    state->prev_okey_accepts++;
+                    unsigned accepts =
+                        atomic_fetch_add(&state->prev_okey_accepts, 1) + 1;
                     fprintf(stderr, "[O-Node] chain_append: observation "
                             "verified under the PREVIOUS O-Key (rotation "
                             "grace window, %u accepted so far; %llu s of "
                             "window left). This is expected only while "
                             "in-flight observations from before a rotation "
                             "drain.\n",
-                            state->prev_okey_accepts,
+                            accepts,
                             (unsigned long long)
                               ((state->prev_okey_deadline_ns - now_ns)
                                / 1000000000ULL));
@@ -4576,6 +6001,74 @@ static virp_error_t chain_append_verify_observation(
 }
 
 /*
+ * The payload of a CHAIN_VERIFY / CHAIN_VERIFY_SESSION response
+ * (security review M11). One builder for both, so the two actions cannot
+ * drift apart in what they tell a caller.
+ *
+ * WHAT WAS MISSING. The response carried `valid`, the range and two
+ * counts, and nothing else the verifier had worked out. In particular:
+ *
+ *   verifier_error / verifier_error_detail
+ *       A storage or IO failure during the walk sets valid=false. Without
+ *       this flag the socket caller could not tell "the verifier could
+ *       not read the store" from "the chain has been tampered with" —
+ *       the exact conflation the field was added to the result struct to
+ *       end (HAM item 13), surviving at the one place operators read it.
+ *   sig_era / valid_signed / sig_checked
+ *       `valid` means the chain is INTACT, not that signatures were
+ *       checked; an unsigned-era session reads valid:true. valid_signed
+ *       is the flag a clean bill of health should be gated on.
+ *   hmac_checked / head_authenticated
+ *       whether K_chain HMACs were verified and whether the head's
+ *       length claim was authenticated.
+ *   artifacts_bound / artifacts_unverifiable / executions_closed
+ *       the binding and execution grades behind the verdict.
+ *
+ * All additive; every member that existed keeps its name, type and
+ * meaning, and members stay in alphabetical order. error_detail is now
+ * present for both actions (it was session-only).
+ *
+ * Built with cJSON. The session variant used to paste error_detail into
+ * a format string on the argument that "no quotes or control bytes
+ * reach it" — true of the session id, which is validated at ingress,
+ * but the detail strings also quote artifact ids, types and hashes read
+ * back from the DATABASE, which is the thing being verified and is not
+ * trusted to be well-formed. Sequence numbers are raw integer tokens so
+ * a caller-supplied to_sequence above 2^53 is echoed exactly.
+ *
+ * Returns the length, or -1 (json_buf emptied) if it does not fit.
+ */
+static int chain_verify_result_json(const virp_chain_verify_result_t *r,
+                                    char *json_buf, size_t cap)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { if (cap) json_buf[0] = '\0'; return -1; }
+    bool ok =
+        intent_add_int64(o, "artifacts_bound", (long long)r->artifacts_bound) &&
+        intent_add_int64(o, "artifacts_unverifiable",
+                         (long long)r->artifacts_unverifiable) &&
+        intent_add_int64(o, "entries_checked", (long long)r->entries_checked) &&
+        cJSON_AddStringToObject(o, "error_detail", r->error_detail) &&
+        intent_add_int64(o, "executions_closed",
+                         (long long)r->executions_closed) &&
+        intent_add_int64(o, "executions_open", (long long)r->executions_open) &&
+        intent_add_int64(o, "first_broken", (long long)r->first_broken) &&
+        intent_add_int64(o, "from_sequence", (long long)r->from_sequence) &&
+        cJSON_AddBoolToObject(o, "head_authenticated", r->head_authenticated) &&
+        cJSON_AddBoolToObject(o, "hmac_checked", r->hmac_checked) &&
+        cJSON_AddBoolToObject(o, "sig_checked", r->sig_checked) &&
+        cJSON_AddStringToObject(o, "sig_era",
+                                virp_chain_sig_era_name(r->sig_era)) &&
+        intent_add_int64(o, "to_sequence", (long long)r->to_sequence) &&
+        cJSON_AddBoolToObject(o, "valid", r->valid) &&
+        cJSON_AddBoolToObject(o, "valid_signed", r->valid_signed) &&
+        cJSON_AddBoolToObject(o, "verifier_error", r->verifier_error) &&
+        cJSON_AddStringToObject(o, "verifier_error_detail",
+                                r->verifier_error_detail);
+    return intent_print_json(o, ok, json_buf, cap);
+}
+
+/*
  * Per-uid action-allowlist decision for a SOCKET request. Returns true if
  * the request MUST be refused (the caller then sends a typed error and
  * closes — zero dispatch). Non-static so the fail-open regression can
@@ -4622,9 +6115,37 @@ static void handle_client(onode_state_t *state, int client_fd,
     uint8_t resp_buf[VIRP_MAX_MESSAGE_SIZE];
     size_t resp_len = 0;
 
-    /* Set receive timeout */
-    struct timeval tv = { .tv_sec = ONODE_RECV_TIMEOUT_SEC, .tv_usec = 0 };
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* ── Client I/O bounds (M14) ──────────────────────────────────────
+     * Receive: one absolute deadline for the whole request frame, fixed
+     * NOW and enforced by recv_exact() — not a per-recv() timeout, which
+     * a slow sender resets with every byte.
+     *
+     * Send: SO_SNDTIMEO. Nothing bounded the response before: a peer
+     * that asked for a large answer (a 16-item batch is up to 1 MiB) and
+     * then stopped reading left its worker blocked in send() until the
+     * daemon restarted, holding its pool slot and — at shutdown — the
+     * drain. send_all() already treats the resulting EAGAIN as fatal
+     * for the connection. A failed setsockopt is not ignored: an
+     * unbounded send is the defect, so the connection is refused. */
+    /* 0 means "not configured" (a state that did not come from
+     * onode_init), never "no limit": fall back to the compiled bounds. */
+    const uint32_t deadline_ms = state->request_deadline_ms
+        ? state->request_deadline_ms : ONODE_RECV_TIMEOUT_SEC * 1000u;
+    const uint32_t send_ms = state->send_timeout_ms
+        ? state->send_timeout_ms : ONODE_SEND_TIMEOUT_SEC * 1000u;
+    const int64_t recv_deadline = onode_monotonic_ms() + (int64_t)deadline_ms;
+    {
+        struct timeval stv = {
+            .tv_sec  = (time_t)(send_ms / 1000),
+            .tv_usec = (suseconds_t)((send_ms % 1000) * 1000),
+        };
+        if (setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &stv,
+                       sizeof(stv)) != 0) {
+            perror("[O-Node] setsockopt SO_SNDTIMEO");
+            close(client_fd);
+            return;
+        }
+    }
 
     /* client_uid is the peer uid the ACCEPT loop validated via SO_PEERCRED
      * (peer_uid_allowed) and threaded in through worker_arg. There is
@@ -4643,7 +6164,7 @@ static void handle_client(onode_state_t *state, int client_fd,
      * Read 4-byte big-endian length prefix. If the first byte is
      * non-zero, the client is sending raw JSON (v1) — reject cleanly. */
     uint8_t len_buf[4];
-    if (recv_exact(client_fd, len_buf, 4) < 0) {
+    if (recv_exact(client_fd, len_buf, 4, recv_deadline) < 0) {
         close(client_fd);
         return;
     }
@@ -4685,7 +6206,7 @@ static void handle_client(onode_state_t *state, int client_fd,
 
     /* Read exactly frame_len bytes */
     char frame_buf[ONODE_MAX_REQUEST_SIZE];
-    if (recv_exact(client_fd, frame_buf, frame_len) < 0) {
+    if (recv_exact(client_fd, frame_buf, frame_len, recv_deadline) < 0) {
         close(client_fd);
         return;
     }
@@ -4702,9 +6223,10 @@ static void handle_client(onode_state_t *state, int client_fd,
     memcpy(recv_buf, frame_buf + 1, json_len);
     recv_buf[json_len] = '\0';
 
-    /* Parse request */
+    /* Parse request. json_len is passed down so the parser can refuse a
+     * payload whose text is shorter than the frame said it was (M1). */
     onode_request_t req;
-    if (!parse_request(recv_buf, &req)) {
+    if (!parse_request(recv_buf, json_len, &req)) {
         /* Bad request — send error code */
         send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
         close(client_fd);
@@ -4819,22 +6341,35 @@ static void handle_client(onode_state_t *state, int client_fd,
         }
         break;
 
+    /* These three used to send NOTHING when the builder failed: the
+     * client saw the connection close with no frame and could not tell a
+     * refused request from a crashed daemon. Every action answers, and a
+     * failure answers with its framed error code. */
     case ONODE_ACTION_HEARTBEAT:
         err = onode_heartbeat(state, resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
+        else
+            send_framed_error(client_fd,
+                              err != VIRP_OK ? err : VIRP_ERR_NULL_PTR);
         break;
 
     case ONODE_ACTION_LIST:
         err = onode_list_devices(state, resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
+        else
+            send_framed_error(client_fd,
+                              err != VIRP_OK ? err : VIRP_ERR_NULL_PTR);
         break;
 
     case ONODE_ACTION_LIST_FLEET:
         err = onode_list_fleet(state, resp_buf, sizeof(resp_buf), &resp_len);
         if (err == VIRP_OK && resp_len > 0)
             send_framed(client_fd, resp_buf, resp_len);
+        else
+            send_framed_error(client_fd,
+                              err != VIRP_OK ? err : VIRP_ERR_NULL_PTR);
         break;
 
     case ONODE_ACTION_SIGN_INTENT:
@@ -4963,6 +6498,20 @@ static void handle_client(onode_state_t *state, int client_fd,
          * only — internal callers reach the chain writer directly and
          * mint their own hashes from bodies they built.
          */
+
+        /* GATE 0 — session namespace (M5). The daemon's own sessions are
+         * not appendable from the socket, whatever the type. Checked
+         * before the type gate so the refusal names the real reason. */
+        if (onode_session_id_is_daemon_reserved(state, req.session_id)) {
+            fprintf(stderr, "[O-Node] chain_append REJECTED: session '%s' "
+                    "is one of the daemon's own (gate / approval / "
+                    "node-config records) and may not be appended to by a "
+                    "socket client (uid=%u type=%s id=%s)\n",
+                    req.session_id, (unsigned)client_uid, req.artifact_type,
+                    req.artifact_id);
+            send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+            break;
+        }
 
         /* GATE 1 — type namespace. Daemon-minted semantic types are
          * refused outright, and unknown types are refused rather than
@@ -5126,7 +6675,8 @@ static void handle_client(onode_state_t *state, int client_fd,
                         "64-hex string, either observation_sha256 (the "
                         "signed observation) or error_sha256 (the fed_error "
                         "saying why there is none), never both and never "
-                        "null (session=%s id=%s)\n",
+                        "null; and \"executed\", when present, exactly once "
+                        "as a JSON boolean (session=%s id=%s)\n",
                         req.session_id, req.artifact_id);
                 send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
                 break;
@@ -5206,8 +6756,14 @@ static void handle_client(onode_state_t *state, int client_fd,
              * typed error instead of acking an entry whose committed body
              * was silently dropped. Content-less appends remain valid:
              * commitment-only is a caller choice, not a failure mode. */
+            /* GATE 6 — one observation, one registration (M6) — is not
+             * checked here either, for the same reason: it is enforced
+             * inside the append transaction, which is why this is the
+             * _external append. The same signed observation may not be
+             * registered a second time under another id or in another
+             * session; that too comes back as DUPLICATE_MISMATCH. */
             virp_chain_entry_t chain_entry;
-            err = virp_chain_append_with_artifact(&state->chain,
+            err = virp_chain_append_external(&state->chain,
                                      req.session_id,
                                      req.artifact_type, req.artifact_id,
                                      req.artifact_hash,
@@ -5217,10 +6773,14 @@ static void handle_client(onode_state_t *state, int client_fd,
             if (err != VIRP_OK) {
                 if (err == VIRP_ERR_DUPLICATE_MISMATCH)
                     fprintf(stderr, "[O-Node] chain_append REJECTED: "
-                            "federation artifact_id '%s' is already stored "
-                            "with a different body hash — a retry must "
-                            "resend identical bytes, or mint a new "
-                            "correlation (session=%s type=%s)\n",
+                            "duplicate mismatch — either federation "
+                            "artifact_id '%s' is already stored with a "
+                            "different body hash (a retry must resend "
+                            "identical bytes, or mint a new correlation), "
+                            "or this observation's hash is already "
+                            "registered under another artifact_id or "
+                            "session (one observation, one registration) "
+                            "(session=%s type=%s)\n",
                             req.artifact_id, req.session_id,
                             req.artifact_type);
                 send_framed_error(client_fd, err);
@@ -5268,30 +6828,53 @@ static void handle_client(onode_state_t *state, int client_fd,
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
+        /* RANGE CAP (M15). The walk holds the chain lock for its whole
+         * range, and every execution needs that lock — while holding its
+         * device's exec_mutex — to commit a pre-dispatch intent. One
+         * request with to_sequence = INT64_MAX used to stall every device
+         * for the length of the session. Unsigned arithmetic: both ends
+         * are already bounded to [0, INT64_MAX] by the parser, and an
+         * inverted range (to < from) is left to the verifier, which
+         * reports it as invalid. */
+        if (req.to_sequence >= req.from_sequence &&
+            (uint64_t)req.to_sequence - (uint64_t)req.from_sequence
+                >= (uint64_t)ONODE_CHAIN_VERIFY_MAX_RANGE) {
+            fprintf(stderr, "[O-Node] chain_verify REFUSED: range %lld..%lld "
+                    "covers more than %d entries (uid=%u session=%s) — page "
+                    "the range, or use chain_verify_session\n",
+                    (long long)req.from_sequence, (long long)req.to_sequence,
+                    ONODE_CHAIN_VERIFY_MAX_RANGE, (unsigned)client_uid,
+                    req.session_id);
+            send_framed_error(client_fd, VIRP_ERR_MESSAGE_TOO_LARGE);
+            break;
+        }
         {
+            /* PER-UID BUDGET (M15): one verify in flight per uid, and a
+             * bounded share of each window spent holding the chain lock. */
+            int64_t v0 = onode_monotonic_ms();
+            if (!onode_verify_enter(state, client_uid, v0)) {
+                fprintf(stderr, "[O-Node] chain_verify RATE LIMITED: uid %u "
+                        "has a verify in flight or has used its %d ms of "
+                        "verify time for this %d s window\n",
+                        (unsigned)client_uid, ONODE_VERIFY_BUDGET_MS,
+                        ONODE_VERIFY_WINDOW_SEC);
+                send_framed_error(client_fd, VIRP_ERR_RATE_LIMITED);
+                break;
+            }
             virp_chain_verify_result_t vresult;
             err = virp_chain_verify(&state->chain, req.session_id,
                                      req.from_sequence, req.to_sequence,
                                      &vresult);
+            onode_verify_leave(state, client_uid, onode_monotonic_ms() - v0);
             if (err != VIRP_OK) {
                 send_framed_error(client_fd, err);
                 break;
             }
-            char json_buf[1024];
-            int jlen = snprintf(json_buf, sizeof(json_buf),
-                "{\"entries_checked\":%lld,"
-                "\"executions_open\":%lld,"
-                "\"first_broken\":%lld,"
-                "\"from_sequence\":%lld,"
-                "\"to_sequence\":%lld,"
-                "\"valid\":%s}",
-                (long long)vresult.entries_checked,
-                (long long)vresult.executions_open,
-                (long long)vresult.first_broken,
-                (long long)vresult.from_sequence,
-                (long long)vresult.to_sequence,
-                vresult.valid ? "true" : "false");
-            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+            /* Everything the verifier concluded, not just `valid` (M11). */
+            char json_buf[2048];
+            int jlen = chain_verify_result_json(&vresult, json_buf,
+                                                sizeof(json_buf));
+            if (jlen < 0) {
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 break;
             }
@@ -5347,10 +6930,11 @@ static void handle_client(onode_state_t *state, int client_fd,
          * Unlike CHAIN_VERIFY, the caller supplies NO range — the range
          * comes from the authenticated head, so a caller cannot be fooled
          * by deriving max sequence from the same (possibly truncated)
-         * database it is auditing. Same response obs type as CHAIN_VERIFY
-         * so existing consumers parse it unchanged; adds error_detail
-         * because the failure mode (truncated vs missing head vs forged
-         * head) is the point of the check. */
+         * database it is auditing. Same response obs type and the same
+         * payload members as CHAIN_VERIFY (chain_verify_result_json), so
+         * existing consumers parse it unchanged; error_detail matters
+         * most here because the failure mode (truncated vs missing head
+         * vs forged head) is the point of the check. */
         if (!state->chain_enabled) {
             send_framed_error(client_fd, VIRP_ERR_CHAIN_DB);
             break;
@@ -5360,33 +6944,32 @@ static void handle_client(onode_state_t *state, int client_fd,
             break;
         }
         {
+            /* No range to cap here — the whole session against its signed
+             * head is the point — so this is bounded by the per-uid
+             * verify budget alone (M15). */
+            int64_t v0 = onode_monotonic_ms();
+            if (!onode_verify_enter(state, client_uid, v0)) {
+                fprintf(stderr, "[O-Node] chain_verify_session RATE LIMITED: "
+                        "uid %u has a verify in flight or has used its %d ms "
+                        "of verify time for this %d s window\n",
+                        (unsigned)client_uid, ONODE_VERIFY_BUDGET_MS,
+                        ONODE_VERIFY_WINDOW_SEC);
+                send_framed_error(client_fd, VIRP_ERR_RATE_LIMITED);
+                break;
+            }
             virp_chain_verify_result_t vresult;
             err = virp_chain_verify_session(&state->chain, req.session_id,
                                             &vresult);
+            onode_verify_leave(state, client_uid, onode_monotonic_ms() - v0);
             if (err != VIRP_OK) {
                 send_framed_error(client_fd, err);
                 break;
             }
-            /* error_detail is daemon-generated prose (fixed format strings,
-             * numbers, session ids validated at ingress) — no quotes or
-             * control bytes reach it, so direct embedding is safe. */
-            char json_buf[1024];
-            int jlen = snprintf(json_buf, sizeof(json_buf),
-                "{\"entries_checked\":%lld,"
-                "\"error_detail\":\"%s\","
-                "\"executions_open\":%lld,"
-                "\"first_broken\":%lld,"
-                "\"from_sequence\":%lld,"
-                "\"to_sequence\":%lld,"
-                "\"valid\":%s}",
-                (long long)vresult.entries_checked,
-                vresult.error_detail,
-                (long long)vresult.executions_open,
-                (long long)vresult.first_broken,
-                (long long)vresult.from_sequence,
-                (long long)vresult.to_sequence,
-                vresult.valid ? "true" : "false");
-            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+            /* Same builder as CHAIN_VERIFY (M11). */
+            char json_buf[2048];
+            int jlen = chain_verify_result_json(&vresult, json_buf,
+                                                sizeof(json_buf));
+            if (jlen < 0) {
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 break;
             }
@@ -5416,17 +6999,17 @@ static void handle_client(onode_state_t *state, int client_fd,
         }
         {
             virp_intent_entry_t ie;
-            memset(&ie, 0, sizeof(ie));
-            snprintf(ie.intent_id, sizeof(ie.intent_id), "%s", req.intent_id);
-            snprintf(ie.intent_hash, sizeof(ie.intent_hash), "%s", req.intent_hash);
-            snprintf(ie.intent_json, sizeof(ie.intent_json), "%s", req.intent_json);
-            snprintf(ie.confidence, sizeof(ie.confidence), "%s", req.confidence);
-            ie.expires_at_ns = req.expires_at_ns;
-            ie.max_commands = req.max_commands;
-            snprintf(ie.proposed_actions, sizeof(ie.proposed_actions), "%s",
-                     req.proposed_actions);
-            snprintf(ie.constraints, sizeof(ie.constraints), "%s",
-                     req.constraints);
+            err = intent_from_request(&req, &ie);
+            if (err != VIRP_OK) {
+                fprintf(stderr, "[O-Node] intent_store REJECTED: intent "
+                        "fields failed validation (%s) — id, confidence and "
+                        "hash must be well-formed, intent_hash must equal "
+                        "sha256(intent_json), and intent_json / "
+                        "proposed_actions / constraints must be JSON\n",
+                        virp_error_str(err));
+                send_framed_error(client_fd, err);
+                break;
+            }
 
             /* Sequence for the observation response */
             uint32_t seq = onode_next_seq(state);
@@ -5438,29 +7021,35 @@ static void handle_client(onode_state_t *state, int client_fd,
                 send_framed_error(client_fd, err);
                 break;
             }
-            /* Store intent content as artifact */
-            if (ie.intent_json[0] != '\0') {
-                virp_chain_artifact_store(&state->chain,
+            /* Store intent content as artifact. The return was ignored
+             * (M4): a failed body store still answered INTENT_STORED, so
+             * the client held a signed receipt for an intent whose body
+             * the daemon never kept. Now a failure is the answer. The
+             * intent ROW is already written — the two stores are separate
+             * statements, and making them one transaction needs a chain
+             * API that does not exist yet (see REVIEW-NOTES.md) — so the
+             * journal says so by name. intent_json is non-empty here:
+             * the caller and intent_from_request both required it. */
+            {
+                virp_error_t aerr = virp_chain_artifact_store(&state->chain,
                     ie.intent_id, "intent",
                     ie.intent_json, ie.intent_hash,
                     req.session_id[0] != '\0' ? req.session_id : "intent");
+                if (aerr != VIRP_OK) {
+                    fprintf(stderr, "[O-Node] ERROR: intent '%s' was stored "
+                            "but its body could not be (%s); refusing to "
+                            "acknowledge it — the intent row exists without "
+                            "an artifact body\n", ie.intent_id,
+                            virp_error_str(aerr));
+                    send_framed_error(client_fd, aerr);
+                    break;
+                }
             }
 
             char json_buf[512];
-            int jlen = snprintf(json_buf, sizeof(json_buf),
-                "{\"commands_executed\":%d,"
-                "\"intent_id\":\"%s\","
-                "\"max_commands\":%d,"
-                "\"signature_hmac\":\"%s\","
-                "\"signature_seq\":%lld,"
-                "\"signature_timestamp_ns\":%lld}",
-                ie.commands_executed,
-                ie.intent_id,
-                ie.max_commands,
-                ie.signature_hmac,
-                (long long)ie.signature_seq,
-                (long long)ie.signature_timestamp_ns);
-            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+            int jlen = intent_format_stored_json(&ie, json_buf,
+                                                 sizeof(json_buf));
+            if (jlen < 0) {
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 break;
             }
@@ -5488,6 +7077,12 @@ static void handle_client(onode_state_t *state, int client_fd,
             break;
         }
         {
+            /* The id is a lookup key here, but it is also echoed into the
+             * signed response — same rule as at store (M4). */
+            if (!onode_canonical_string_ok(req.intent_id)) {
+                send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+                break;
+            }
             virp_intent_entry_t ie;
             err = virp_chain_intent_get(&state->chain, req.intent_id, &ie);
             if (err != VIRP_OK) {
@@ -5495,10 +7090,15 @@ static void handle_client(onode_state_t *state, int client_fd,
                 break;
             }
 
-            /* Return full intent data as JSON */
+            /* Return full intent data as JSON. -1 covers both "does not
+             * fit" and "a stored text is not JSON" (a row written before
+             * M4): either way nothing is signed. */
             char json_buf[6144];
             int jlen = intent_format_json(&ie, json_buf, sizeof(json_buf));
             if (jlen < 0) {
+                fprintf(stderr, "[O-Node] intent_get REFUSED for '%s': the "
+                        "stored intent cannot be rendered as well-formed "
+                        "JSON within the response limit\n", req.intent_id);
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 break;
             }
@@ -5534,14 +7134,9 @@ static void handle_client(onode_state_t *state, int client_fd,
             }
 
             char json_buf[512];
-            int jlen = snprintf(json_buf, sizeof(json_buf),
-                "{\"commands_executed\":%d,"
-                "\"intent_id\":\"%s\","
-                "\"max_commands\":%d}",
-                ie.commands_executed,
-                ie.intent_id,
-                ie.max_commands);
-            if (jlen < 0 || (size_t)jlen >= sizeof(json_buf)) {
+            int jlen = intent_format_executed_json(&ie, json_buf,
+                                                   sizeof(json_buf));
+            if (jlen < 0) {
                 send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
                 break;
             }
@@ -5564,7 +7159,8 @@ static void handle_client(onode_state_t *state, int client_fd,
         batch_thread_arg_t args[ONODE_MAX_BATCH];
         memset(args, 0, sizeof(args));
 
-        int cmd_count = parse_batch_commands(recv_buf, args, ONODE_MAX_BATCH);
+        int cmd_count = parse_batch_commands(recv_buf, json_len, args,
+                                             ONODE_MAX_BATCH);
         if (cmd_count <= 0) {
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
@@ -5599,14 +7195,54 @@ static void handle_client(onode_state_t *state, int client_fd,
             break;
         }
 
-        /* Launch one thread per device */
+        /* Launch one thread per item.
+         *
+         * pthread_create's return was ignored (M17). When it failed —
+         * thread or memory limits, which is to say under exactly the
+         * load a 16-item batch creates — three things went wrong at
+         * once: the loop below joined a pthread_t that was never
+         * written (undefined behaviour, in practice a crash or a join
+         * on a stale id); the item's `err` was still the zero from the
+         * memset, i.e. VIRP_OK; and with no response bytes the encoder
+         * emitted it as a 4-byte code of 0. The caller was told an item
+         * succeeded that never ran.
+         *
+         * Now: each item records whether its thread exists, only those
+         * are joined, and an item with no thread carries a real error.
+         * RATE_LIMITED is the honest one — nothing was dispatched for
+         * it, the daemon was out of a bounded resource, retry later —
+         * and the items that did start are unaffected. */
         pthread_t threads[ONODE_MAX_BATCH];
-        for (int i = 0; i < cmd_count; i++)
-            pthread_create(&threads[i], NULL, batch_execute_thread, &args[i]);
+        bool started[ONODE_MAX_BATCH];
+        /* Explicit stack size — see ONODE_THREAD_STACK_BYTES. Each item
+         * runs the whole execute path on its own thread. If the attribute
+         * cannot be set the default is used, as before. */
+        pthread_attr_t battr;
+        bool battr_ok = pthread_attr_init(&battr) == 0;
+        if (battr_ok)
+            (void)pthread_attr_setstacksize(&battr, ONODE_THREAD_STACK_BYTES);
+        for (int i = 0; i < cmd_count; i++) {
+            int rc = ONODE_PTHREAD_CREATE(&threads[i],
+                                          battr_ok ? &battr : NULL,
+                                          batch_execute_thread, &args[i]);
+            started[i] = (rc == 0);
+            if (!started[i]) {
+                args[i].err = VIRP_ERR_RATE_LIMITED;
+                args[i].resp_len = 0;
+                fprintf(stderr, "[O-Node] batch item %d (%s): could not "
+                        "start a worker thread (%s) — NOT dispatched, "
+                        "reported to the caller as an error\n",
+                        i, args[i].device, strerror(rc));
+            }
+        }
 
-        /* Wait for all threads to complete */
+        if (battr_ok)
+            pthread_attr_destroy(&battr);
+
+        /* Wait for the threads that exist. */
         for (int i = 0; i < cmd_count; i++)
-            pthread_join(threads[i], NULL);
+            if (started[i])
+                pthread_join(threads[i], NULL);
 
         /* Accumulate batch response into a buffer, then send as one frame.
          * Format: 4-byte count, then per-result (4-byte len + data). */
@@ -5631,6 +7267,11 @@ static void handle_client(onode_state_t *state, int client_fd,
                     memcpy(batch_buf + off, args[i].resp_buf, args[i].resp_len);
                     off += args[i].resp_len;
                 } else {
+                    /* A 4-byte item is an ERROR code, so it must never be
+                     * 0: "VIRP_OK and no bytes" is not a result any
+                     * caller can act on, and reads as success (M17). */
+                    if (args[i].err == VIRP_OK)
+                        args[i].err = VIRP_ERR_NULL_PTR;
                     uint32_t net_len = htonl(4);
                     memcpy(batch_buf + off, &net_len, 4); off += 4;
                     uint32_t err_code = htonl((uint32_t)args[i].err);
@@ -5673,15 +7314,41 @@ static void handle_client(onode_state_t *state, int client_fd,
             break;
         }
 
-        cJSON *root = cJSON_Parse(recv_buf);
-        if (!root || !cJSON_IsObject(root)) {
-            if (root) cJSON_Delete(root);
+        /* Same structural gate as the first parse of this frame, so the
+         * two cannot read different requests out of one buffer. */
+        cJSON *root = onode_parse_root_object(recv_buf, json_len,
+                                              "validate_turn");
+        if (!root) {
             send_framed_error(client_fd, VIRP_ERR_INVALID_TYPE);
             break;
         }
 
         cJSON *mani  = cJSON_GetObjectItemCaseSensitive(root, "manifest");
         cJSON *prose = cJSON_GetObjectItemCaseSensitive(root, "prose");
+
+        /* The validator appends its `validation` entry to the session the
+         * MANIFEST names, falling back to the request's session_id. Both
+         * are caller-chosen, so both are held out of the daemon's own
+         * sessions (M5) before the validator runs. The manifest's field
+         * is read the way validator_parse_manifest reads it: a root-level
+         * string member. */
+        {
+            const cJSON *msid = cJSON_IsObject(mani)
+                ? cJSON_GetObjectItemCaseSensitive(mani, "session_id") : NULL;
+            const char *msid_s = (cJSON_IsString(msid) && msid->valuestring)
+                                 ? msid->valuestring : NULL;
+            if (onode_session_id_is_daemon_reserved(state, req.session_id) ||
+                onode_session_id_is_daemon_reserved(state, msid_s)) {
+                fprintf(stderr, "[O-Node] validate_turn REJECTED: the "
+                        "session it would record under ('%s') is one of "
+                        "the daemon's own (uid=%u)\n",
+                        msid_s ? msid_s : req.session_id,
+                        (unsigned)client_uid);
+                cJSON_Delete(root);
+                send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+                break;
+            }
+        }
 
         char *mani_json = NULL;
         size_t mani_len = 0;
@@ -5701,7 +7368,7 @@ static void handle_client(onode_state_t *state, int client_fd,
                                                 mani_json, mani_len,
                                                 prose_str, prose_len,
                                                 fallback_sid, &vr);
-        if (mani_json) free(mani_json);
+        if (mani_json) cJSON_free(mani_json);
         cJSON_Delete(root);
 
         if (verr != VIRP_OK) {
@@ -5813,6 +7480,13 @@ static void handle_client(onode_state_t *state, int client_fd,
             send_framed_error(client_fd, VIRP_ERR_NULL_PTR);
             break;
         }
+        /* No protocol context means no session machinery at all (a main()
+         * that never assigned state->ctx). Say so rather than hand the
+         * handshake a NULL. */
+        if (!state->ctx) {
+            send_framed_error(client_fd, VIRP_ERR_SESSION_INVALID);
+            break;
+        }
 
         /* Build SESSION_HELLO from request fields */
         virp_session_hello_t hello;
@@ -5820,32 +7494,32 @@ static void handle_client(onode_state_t *state, int client_fd,
         hello.msg_type = VIRP_MSG_SESSION_HELLO;
         snprintf(hello.client_id, sizeof(hello.client_id), "%s", req.client_id);
 
-        /* Parse versions: comma-separated string e.g. "2,1" */
+        /* Parse versions: comma-separated string e.g. "2,1". A list that
+         * does not parse cleanly refuses the handshake (M2) — it is what
+         * the negotiation is negotiated FROM. */
         if (req.versions[0]) {
-            char vtmp[32];
-            snprintf(vtmp, sizeof(vtmp), "%s", req.versions);
-            char *saveptr = NULL;
-            char *tok = strtok_r(vtmp, ",", &saveptr);
-            while (tok && hello.version_count < VIRP_MAX_VERSIONS) {
-                hello.versions[hello.version_count++] = (uint8_t)atoi(tok);
-                tok = strtok_r(NULL, ",", &saveptr);
+            int nv = parse_u8_csv(req.versions, hello.versions,
+                                  VIRP_MAX_VERSIONS);
+            if (nv < 0) {
+                send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+                break;
             }
+            hello.version_count = (uint8_t)nv;
         } else {
             hello.versions[0] = 2;
             hello.versions[1] = 1;
             hello.version_count = 2;
         }
 
-        /* Parse algorithms: comma-separated string */
+        /* Parse algorithms: comma-separated string, same strictness. */
         if (req.algorithms[0]) {
-            char atmp[32];
-            snprintf(atmp, sizeof(atmp), "%s", req.algorithms);
-            char *saveptr = NULL;
-            char *tok = strtok_r(atmp, ",", &saveptr);
-            while (tok && hello.algorithm_count < VIRP_MAX_ALGORITHMS) {
-                hello.algorithms[hello.algorithm_count++] = (uint8_t)atoi(tok);
-                tok = strtok_r(NULL, ",", &saveptr);
+            int na = parse_u8_csv(req.algorithms, hello.algorithms,
+                                  VIRP_MAX_ALGORITHMS);
+            if (na < 0) {
+                send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+                break;
             }
+            hello.algorithm_count = (uint8_t)na;
         } else {
             hello.algorithms[0] = VIRP_ALG_HMAC_SHA256;
             hello.algorithm_count = 1;
@@ -5853,9 +7527,16 @@ static void handle_client(onode_state_t *state, int client_fd,
 
         hello.supported_channels = (uint32_t)req.supported_channels;
 
-        /* Parse client_nonce from hex (8 bytes = 16 hex chars) */
-        if (req.client_nonce[0]) {
-            virp_hex_decode(req.client_nonce, hello.client_nonce, 8);
+        /* Parse client_nonce from hex (8 bytes = 16 hex chars). When the
+         * client supplies one it must be EXACTLY that: a short, odd or
+         * non-hex value used to leave hello.client_nonce part-decoded or
+         * all zero and the handshake went ahead anyway (M2). Absent is
+         * still accepted — the client chose to contribute no nonce, and
+         * the server's own is what keeps the session id fresh. */
+        if (req.client_nonce[0] &&
+            !hex_decode_exact(req.client_nonce, hello.client_nonce, 8)) {
+            send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+            break;
         }
 
         {
@@ -5897,11 +7578,28 @@ static void handle_client(onode_state_t *state, int client_fd,
             ack.accepted_channels,
             sid_hex, cn_hex, sn_hex);
 
+        /* snprintf returns the WOULD-BE length. Unchecked, a response
+         * that did not fit would have been "sent" with that length —
+         * reading past json_resp. server_id is the only variable-width
+         * member and is bounded well inside the buffer today; the check
+         * is what keeps a wider field from turning into an over-read. */
+        if (jlen < 0 || (size_t)jlen >= sizeof(json_resp)) {
+            send_framed_error(client_fd, VIRP_ERR_BUFFER_TOO_SMALL);
+            break;
+        }
         send_framed(client_fd, json_resp, (size_t)jlen);
         break;
     }
 
     case ONODE_ACTION_SESSION_BIND: {
+        /* state->ctx is dereferenced a few lines down (server_id) before
+         * any handshake function gets the chance to refuse a NULL: a
+         * daemon without a protocol context would have crashed here on
+         * the first bind. */
+        if (!state->ctx) {
+            send_framed_error(client_fd, VIRP_ERR_SESSION_INVALID);
+            break;
+        }
         /* Build SESSION_BIND from request fields */
         virp_session_bind_t bind_msg;
         memset(&bind_msg, 0, sizeof(bind_msg));
@@ -5918,15 +7616,20 @@ static void handle_client(onode_state_t *state, int client_fd,
         snprintf(bind_msg.server_id, sizeof(bind_msg.server_id),
                  "%s", state->ctx->session.server_id);
 
-        /* session_id from hex (reuse req.session_id, 16 bytes = 32 hex) */
-        if (req.session_id[0]) {
-            virp_hex_decode(req.session_id, bind_msg.session_id, 16);
+        /* session_id (16 bytes = 32 hex, reusing req.session_id) and both
+         * nonces (8 bytes = 16 hex each) are what BIND confirms, so all
+         * three are REQUIRED here and must decode to their exact lengths
+         * (M2). They used to be decoded only "if present" with the result
+         * ignored: a missing, short or malformed value left zero or
+         * part-decoded bytes for virp_handle_session_bind to compare,
+         * which refused it — but only because zeros happened not to
+         * match. Refuse it for what it is. */
+        if (!hex_decode_exact(req.session_id, bind_msg.session_id, 16) ||
+            !hex_decode_exact(req.client_nonce, bind_msg.client_nonce, 8) ||
+            !hex_decode_exact(req.server_nonce, bind_msg.server_nonce, 8)) {
+            send_framed_error(client_fd, VIRP_ERR_INVALID_LENGTH);
+            break;
         }
-
-        if (req.client_nonce[0])
-            virp_hex_decode(req.client_nonce, bind_msg.client_nonce, 8);
-        if (req.server_nonce[0])
-            virp_hex_decode(req.server_nonce, bind_msg.server_nonce, 8);
 
         {
             struct timespec ts;
@@ -5943,6 +7646,15 @@ static void handle_client(onode_state_t *state, int client_fd,
         if (err == VIRP_OK) {
             err = virp_session_derive_key(state->ctx, state->okey.key.key);
         }
+        if (err == VIRP_OK) {
+            /* The session now belongs to the uid that bound it (M19).
+             * Recorded under the same lock as the bind, against this
+             * session's generation. */
+            state->session_owner_set = true;
+            state->session_owner_uid = client_uid;
+            state->session_owner_generation =
+                state->ctx->session.generation;
+        }
         pthread_mutex_unlock(&state->session_mutex);
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] session bind/derive failed: %d\n",
@@ -5956,19 +7668,51 @@ static void handle_client(onode_state_t *state, int client_fd,
         break;
     }
 
-    case ONODE_ACTION_SESSION_CLOSE:
+    case ONODE_ACTION_SESSION_CLOSE: {
+        /* Only the uid that bound the session may close it (M19). A
+         * session that is not active — never bound, idled out, already
+         * closed — has no owner to protect, and closing it is the
+         * harmless reset it always was. */
         onode_session_lock(state);
-        virp_handle_session_close(state->ctx);
+        bool live = state->ctx &&
+                    virp_session_state(state->ctx) == VIRP_SESSION_ACTIVE;
+        bool mine = onode_session_usable_by(state, client_uid);
+        if (!live || mine) {
+            if (state->ctx) virp_handle_session_close(state->ctx);
+            state->session_owner_set = false;
+        }
         pthread_mutex_unlock(&state->session_mutex);
+        if (live && !mine) {
+            fprintf(stderr, "[O-Node] session_close REFUSED: uid %ld did "
+                    "not bind the active session\n",
+                    (client_uid == (uid_t)-1) ? -1L : (long)client_uid);
+            send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+            break;
+        }
         fprintf(stderr, "[O-Node] Session closed by client\n");
         {
             const char *close_resp = "{\"status\":\"closed\"}";
             send_framed(client_fd, close_resp, strlen(close_resp));
         }
         break;
+    }
 
     case ONODE_ACTION_SHUTDOWN:
-        fprintf(stderr, "[O-Node] Shutdown requested\n");
+        fprintf(stderr, "[O-Node] Shutdown requested by uid %ld\n",
+                (client_uid == (uid_t)-1) ? -1L : (long)client_uid);
+        /* Acknowledge FIRST, then ask (M18). The caller used to get a
+         * bare EOF, indistinguishable from the daemon dying or the
+         * request being dropped. And the order matters: once shutdown
+         * is requested the drain shuts down every worker's client
+         * socket, this one included, so an acknowledgement sent
+         * afterwards may never leave. The send is bounded by
+         * SO_SNDTIMEO, so a caller that does not read cannot delay the
+         * shutdown it asked for. onode_shutdown() wakes the accept loop
+         * through the same eventfd a signal uses. */
+        {
+            const char *ack = "{\"status\":\"shutting_down\"}";
+            (void)send_framed(client_fd, ack, strlen(ack));
+        }
         onode_shutdown(state);
         break;
     }
@@ -6096,11 +7840,14 @@ static void *watchdog_thread_fn(void *arg)
         watchdog_try_connect(state, i, drv, true);
     }
 
-    /* Log initial pass summary */
+    /* Log initial pass summary. connections[] is conn_mutex's — worker
+     * threads connect and drop while this thread counts. */
     {
         int up = 0;
+        pthread_mutex_lock(&state->conn_mutex);
         for (int i = 0; i < state->device_count; i++)
             if (state->devices[i].enabled && state->connections[i]) up++;
+        pthread_mutex_unlock(&state->conn_mutex);
         fprintf(stderr, "[Watchdog] Initial pass complete: connected=%d/%d\n", up, enabled);
     }
 
@@ -6235,8 +7982,8 @@ virp_error_t onode_watchdog_start(onode_state_t *state)
     if (!state)
         return VIRP_ERR_NULL_PTR;
     state->watchdog_running = true;
-    if (pthread_create(&state->watchdog_thread, NULL,
-                       watchdog_thread_fn, state) != 0) {
+    if (ONODE_PTHREAD_CREATE(&state->watchdog_thread, NULL,
+                             watchdog_thread_fn, state) != 0) {
         state->watchdog_running = false;
         return VIRP_ERR_KEY_NOT_LOADED;
     }
@@ -6296,6 +8043,10 @@ static void *connection_worker(void *raw_arg)
     /* handle_client() closes the fd on every return path. */
     handle_client(state, fd, client_uid);
 
+    /* Return this uid's share of the pool (M14) — the accept loop
+     * claimed it with onode_worker_admit() before spawning us. */
+    onode_worker_release(state, client_uid);
+
     /* Clear the drain-registration slot (closing our dup of the client
      * fd), release the worker slot, and update the live counter. The
      * broadcast is the shutdown barrier: onode_start()'s drain waits on
@@ -6316,6 +8067,123 @@ static void *connection_worker(void *raw_arg)
     return NULL;
 }
 
+/*
+ * Per-uid worker accounting (M14) — see the header. Both run under
+ * state_mutex; neither blocks.
+ */
+bool onode_worker_admit(onode_state_t *state, uid_t uid)
+{
+    if (!state) return false;
+    bool admitted = false;
+    pthread_mutex_lock(&state->state_mutex);
+    int free_slot = -1, mine = -1;
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++) {
+        if (state->worker_uid_live[i].live == 0) {
+            if (free_slot < 0) free_slot = i;
+        } else if (state->worker_uid_live[i].uid == uid) {
+            mine = i;
+            break;
+        }
+    }
+    if (mine >= 0) {
+        if (state->worker_uid_live[mine].live < ONODE_MAX_WORKERS_PER_UID) {
+            state->worker_uid_live[mine].live++;
+            admitted = true;
+        }
+    } else if (free_slot >= 0) {
+        state->worker_uid_live[free_slot].uid = uid;
+        state->worker_uid_live[free_slot].live = 1;
+        admitted = true;
+    }
+    /* No slot of its own and none free cannot happen while the pool
+     * semaphore holds (one slot per live worker at most); if it ever
+     * did, refusing is the safe answer. */
+    if (!admitted)
+        state->workers_rejected_uid_cap++;
+    pthread_mutex_unlock(&state->state_mutex);
+    return admitted;
+}
+
+void onode_worker_release(onode_state_t *state, uid_t uid)
+{
+    if (!state) return;
+    pthread_mutex_lock(&state->state_mutex);
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++) {
+        if (state->worker_uid_live[i].live > 0 &&
+            state->worker_uid_live[i].uid == uid) {
+            state->worker_uid_live[i].live--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&state->state_mutex);
+}
+
+/*
+ * Per-uid verify limiter (M15) — see the header. Under state_mutex;
+ * never blocks. A uid with no slot and no free slot is refused: the
+ * table is as large as the worker pool, so that cannot happen while the
+ * pool semaphore holds, and refusing is the safe answer if it ever did.
+ */
+bool onode_verify_enter(onode_state_t *state, uid_t uid, int64_t now_ms)
+{
+    if (!state) return false;
+    const int64_t window = (int64_t)ONODE_VERIFY_WINDOW_SEC * 1000;
+    bool ok = false;
+    pthread_mutex_lock(&state->state_mutex);
+    int mine = -1, spare = -1;
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++) {
+        if (state->verify_uid[i].in_use && state->verify_uid[i].uid == uid) {
+            mine = i;
+            break;
+        }
+        /* A slot whose window has lapsed with nothing in flight is
+         * reusable: its owner is back to a full budget either way. */
+        if (spare < 0 && (!state->verify_uid[i].in_use ||
+                          (!state->verify_uid[i].in_flight &&
+                           now_ms - state->verify_uid[i].window_start_ms
+                               >= window)))
+            spare = i;
+    }
+    if (mine < 0 && spare >= 0) {
+        mine = spare;
+        state->verify_uid[mine].uid = uid;
+        state->verify_uid[mine].in_use = true;
+        state->verify_uid[mine].in_flight = false;
+        state->verify_uid[mine].window_start_ms = now_ms;
+        state->verify_uid[mine].used_ms = 0;
+    }
+    if (mine >= 0) {
+        if (now_ms - state->verify_uid[mine].window_start_ms >= window) {
+            state->verify_uid[mine].window_start_ms = now_ms;
+            state->verify_uid[mine].used_ms = 0;
+        }
+        if (!state->verify_uid[mine].in_flight &&
+            state->verify_uid[mine].used_ms < ONODE_VERIFY_BUDGET_MS) {
+            state->verify_uid[mine].in_flight = true;
+            ok = true;
+        }
+    }
+    pthread_mutex_unlock(&state->state_mutex);
+    return ok;
+}
+
+void onode_verify_leave(onode_state_t *state, uid_t uid, int64_t elapsed_ms)
+{
+    if (!state) return;
+    if (elapsed_ms < 0) elapsed_ms = 0;
+    pthread_mutex_lock(&state->state_mutex);
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++) {
+        if (state->verify_uid[i].in_use && state->verify_uid[i].uid == uid) {
+            state->verify_uid[i].in_flight = false;
+            /* At least 1 ms per request, so a flood of trivial verifies
+             * still runs the budget down. */
+            state->verify_uid[i].used_ms += elapsed_ms > 0 ? elapsed_ms : 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&state->state_mutex);
+}
+
 /* =========================================================================
  * Lifecycle
  * ========================================================================= */
@@ -6333,7 +8201,21 @@ virp_error_t onode_init(onode_state_t *state,
     state->node_id = node_id;
     state->seq_num = 0;
     state->listen_fd = -1;
-    state->running = false;
+    state->lock_fd = -1;
+    atomic_init(&state->running, false);
+    atomic_init(&state->shutdown_requested, false);
+
+    /* Shutdown wake (M18). Non-blocking so the write in onode_shutdown()
+     * can never stall a signal handler, and so the accept loop can drain
+     * it; close-on-exec so it is not inherited by anything the daemon
+     * might ever exec. If it cannot be created the daemon still works —
+     * shutdown then waits for the loop's next timeout, as it always
+     * used to — and says so. */
+    state->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    state->wake_ready = state->wake_fd >= 0;
+    if (!state->wake_ready)
+        perror("[O-Node] eventfd (shutdown wake unavailable; shutdown "
+               "will wait for the next heartbeat tick)");
 
     /* Tier-enforcement gate default posture: ENFORCE — hard-reject
      * over-tier and UNCLASSIFIED commands. This is the intended v1
@@ -6369,6 +8251,7 @@ virp_error_t onode_init(onode_state_t *state,
     pthread_mutex_init(&state->state_mutex, NULL);
     pthread_mutex_init(&state->conn_mutex, NULL);
     pthread_mutex_init(&state->session_mutex, NULL);
+    pthread_mutex_init(&state->proposal_mutex, NULL);
     for (int i = 0; i < ONODE_MAX_DEVICES; i++)
         pthread_mutex_init(&state->exec_mutex[i], NULL);
 
@@ -6384,6 +8267,8 @@ virp_error_t onode_init(onode_state_t *state,
     state->workers_live = 0;
     state->workers_rejected = 0;
     state->drain_failed = false;
+    state->request_deadline_ms = ONODE_RECV_TIMEOUT_SEC * 1000u;
+    state->send_timeout_ms = ONODE_SEND_TIMEOUT_SEC * 1000u;
     for (int i = 0; i < ONODE_MAX_WORKERS; i++)
         state->worker_fds[i] = -1;
     /* Monotonic clock for the drain barrier's timedwait — a wall-clock
@@ -6427,6 +8312,49 @@ virp_error_t onode_init(onode_state_t *state,
     return VIRP_OK;
 }
 
+/*
+ * Can every chain session id the daemon derives from this hostname be
+ * stored? (security review M7)
+ *
+ * The daemon files its own records under ids built from the hostname:
+ *
+ *     gate-enforce:<host>      intents, executions, rejections
+ *     gate-separator:<host>    ingress separator refusals
+ *     approval:<host>          proposals, approvals, outcomes
+ *
+ * and, with a native audit epoch configured, chain_append_locked appends
+ * "@<epoch>" to the gate-enforce / approval forms. The id is stored in
+ * virp_chain_entry_t.session_id — char[64], so 63 bytes. Confirmed in
+ * src/virp_chain.c: an id that does not fit is not refused there. The
+ * epoch form returns INVALID_LENGTH, but the plain form is copied with
+ * snprintf into entry->session_id and TRUNCATED, while the "last entry of
+ * this session" lookup still uses the full string. So the first record
+ * lands under a clipped id — one another long hostname can share — and
+ * every later append finds no predecessor, tries sequence 0 again and
+ * fails the UNIQUE(session_id, sequence) constraint. Under
+ * evidence_required that means the device can never execute anything.
+ *
+ * So the hostname is refused instead, where the operator can see why.
+ * The longest derived id is the larger of "gate-separator:<host>" (never
+ * epoch-suffixed) and "gate-enforce:<host>@<epoch>". The epoch is set
+ * after the device config is loaded, so onode_add_device() checks with
+ * whatever is configured at that moment and onode_start() checks every
+ * device again once it is final.
+ */
+static bool onode_hostname_sessions_fit(const onode_state_t *state,
+                                        const char *hostname,
+                                        size_t *longest_out)
+{
+    const size_t cap = sizeof(((virp_chain_entry_t *)0)->session_id) - 1;
+    size_t h = strlen(hostname);
+    size_t e = strlen(state->chain.native_epoch);
+    size_t separator = strlen("gate-separator:") + h;
+    size_t enforce   = strlen("gate-enforce:") + h + (e ? 1 + e : 0);
+    size_t longest   = separator > enforce ? separator : enforce;
+    if (longest_out) *longest_out = longest;
+    return longest <= cap;
+}
+
 virp_error_t onode_add_device(onode_state_t *state,
                               const virp_device_t *device)
 {
@@ -6435,6 +8363,40 @@ virp_error_t onode_add_device(onode_state_t *state,
 
     if (state->device_count >= ONODE_MAX_DEVICES)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
+
+    /* The hostname becomes part of chain session ids and is written into
+     * chain record bodies and signed observations (M7). It must pass the
+     * chain's own canonical-string rule — a name the chain would refuse
+     * would make every gate record for the device fail to append — and
+     * the ids derived from it must fit the session-id field. */
+    if (!onode_canonical_string_ok(device->hostname)) {
+        fprintf(stderr, "[O-Node] refusing device: hostname contains a "
+                "quote, backslash, control byte or ill-formed UTF-8, which "
+                "the chain's canonical form cannot carry\n");
+        return VIRP_ERR_INVALID_LENGTH;
+    }
+    {
+        size_t longest = 0;
+        if (!onode_hostname_sessions_fit(state, device->hostname, &longest)) {
+            fprintf(stderr, "[O-Node] refusing device '%s': its longest "
+                    "chain session id would be %zu bytes and the chain "
+                    "stores at most %zu — shorten the hostname%s\n",
+                    device->hostname, longest,
+                    sizeof(((virp_chain_entry_t *)0)->session_id) - 1,
+                    state->chain.native_epoch[0]
+                        ? " (or the -E epoch)" : "");
+            return VIRP_ERR_INVALID_LENGTH;
+        }
+    }
+
+    /* Reserved: the chain session for separator refusals naming a device
+     * this node does not serve (M3). A real device by this name would
+     * have its refusals mixed with every unknown caller's. */
+    if (strcmp(device->hostname, ONODE_SEPARATOR_UNKNOWN_DEVICE) == 0) {
+        fprintf(stderr, "[O-Node] FATAL: device hostname '%s' is reserved "
+                "for the daemon's own chain records\n", device->hostname);
+        return VIRP_ERR_DUPLICATE_DEVICE;
+    }
 
     memcpy(&state->devices[state->device_count], device, sizeof(*device));
 
@@ -6571,7 +8533,7 @@ virp_error_t onode_set_previous_okey(onode_state_t *state,
         (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec +
         (uint64_t)window_seconds * 1000000000ULL;
     state->prev_okey_loaded = true;
-    state->prev_okey_accepts = 0;
+    atomic_store(&state->prev_okey_accepts, 0);
 
     fprintf(stderr, "[O-Node] Rotation grace window OPEN for %u s: "
             "observations signed under the previous O-Key (fingerprint ",
@@ -6606,12 +8568,18 @@ virp_error_t onode_set_uid_ceilings(onode_state_t *state,
         return VIRP_ERR_NULL_PTR;
     if (count > ONODE_MAX_ALLOWED_UIDS)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
+    /* Validate the WHOLE set before touching the table. This used to
+     * validate and store in one pass, so a bad tier at index N returned
+     * an error having already overwritten rows 0..N-1 of the live table
+     * — a refused call that still changed which ceiling a uid got. */
     for (size_t i = 0; i < count; i++) {
         /* Legacy ceilings can never confer BLACK authority. */
         if (tiers[i] != VIRP_TIER_GREEN &&
             tiers[i] != VIRP_TIER_YELLOW &&
             tiers[i] != VIRP_TIER_RED)
             return VIRP_ERR_INVALID_TYPE;
+    }
+    for (size_t i = 0; i < count; i++) {
         state->uid_ceiling_uids[i]  = uids[i];
         state->uid_ceiling_tiers[i] = tiers[i];
     }
@@ -6730,6 +8698,26 @@ virp_error_t onode_start(onode_state_t *state)
     if (!state)
         return VIRP_ERR_NULL_PTR;
 
+    /* M7: re-check every hostname now that the native audit epoch (set
+     * after the device config loads) is final — "@<epoch>" lengthens the
+     * derived session ids, and one that no longer fits would make every
+     * gate record for that device fail to append. Refuse to start,
+     * naming the device, before anything is bound. */
+    for (int i = 0; i < state->device_count; i++) {
+        size_t longest = 0;
+        if (!onode_hostname_sessions_fit(state, state->devices[i].hostname,
+                                         &longest)) {
+            fprintf(stderr, "[O-Node] FATAL: device '%s': with native "
+                    "epoch '%s' its longest chain session id would be %zu "
+                    "bytes and the chain stores at most %zu. Shorten the "
+                    "hostname or the -E epoch. Refusing to start.\n",
+                    state->devices[i].hostname, state->chain.native_epoch,
+                    longest,
+                    sizeof(((virp_chain_entry_t *)0)->session_id) - 1);
+            return VIRP_ERR_INVALID_LENGTH;
+        }
+    }
+
     /*
      * Ensure parent directory exists with 0700 owned by the current
      * effective UID. /run/virp is the canonical location; /tmp/-style
@@ -6744,12 +8732,17 @@ virp_error_t onode_start(onode_state_t *state)
         if (n >= sizeof(dir)) n = sizeof(dir) - 1;
         memcpy(dir, state->socket_path, n);
         dir[n] = '\0';
-        if (mkdir(dir, 0700) < 0 && errno != EEXIST) {
-            fprintf(stderr, "[O-Node] mkdir %s: %s (continuing)\n",
-                    dir, strerror(errno));
-        } else if (errno != EEXIST) {
+        /* Decide on mkdir's RETURN, not on errno. The old test was
+         * `else if (errno != EEXIST)`, which also ran when mkdir had
+         * succeeded — and errno is not cleared by success, so whether a
+         * freshly created directory got its chmod depended on whatever
+         * call last failed before this one. */
+        if (mkdir(dir, 0700) == 0) {
             /* Newly created — tighten owner/mode in case umask relaxed it. */
             chmod(dir, 0700);
+        } else if (errno != EEXIST) {
+            fprintf(stderr, "[O-Node] mkdir %s: %s (continuing)\n",
+                    dir, strerror(errno));
         }
     }
 
@@ -6876,11 +8869,54 @@ virp_error_t onode_start(onode_state_t *state)
                     virp_error_str(ncerr));
     }
 
-    /* Remove stale socket */
+    /* ── Single instance (M20) ────────────────────────────────────────
+     * The next line removes whatever socket is at this path — which is
+     * how a stale socket from a crashed daemon is cleared, and also how
+     * a SECOND daemon started on the same path silently took the socket
+     * away from a healthy first one: both kept running, with one O-Key
+     * and one chain between them, and the first became unreachable.
+     *
+     * So before touching the socket, take an exclusive flock on a
+     * lockfile beside it and hold it for the life of the process. The
+     * kernel releases it when the process dies, however it dies, so a
+     * crash never leaves the path locked. If it is already held, another
+     * daemon is alive on this socket: refuse to start and leave its
+     * socket alone.
+     *
+     * A state that already holds the lock keeps it: onode_start() can be
+     * called again on a state that was stopped but not destroyed, and a
+     * second open of the lockfile would be a second open file
+     * description — flock would see this process's OWN earlier lock as
+     * somebody else's and refuse. */
+    if (state->lock_fd < 0) {
+        char lock_path[sizeof(state->socket_path) + 8];
+        snprintf(lock_path, sizeof(lock_path), "%s.lock", state->socket_path);
+        int lfd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+                       0600);
+        if (lfd < 0) {
+            fprintf(stderr, "[O-Node] FATAL: cannot open instance lock %s: "
+                    "%s. Refusing to start.\n", lock_path, strerror(errno));
+            return VIRP_ERR_KEY_NOT_LOADED;
+        }
+        if (flock(lfd, LOCK_EX | LOCK_NB) != 0) {
+            fprintf(stderr, "[O-Node] FATAL: %s is locked — another O-Node "
+                    "is already serving %s. Refusing to start (and leaving "
+                    "its socket in place).\n", lock_path,
+                    state->socket_path);
+            close(lfd);
+            return VIRP_ERR_KEY_NOT_LOADED;
+        }
+        state->lock_fd = lfd;
+    }
+
+    /* Remove stale socket — safe now: the lock proves no live daemon
+     * owns it. */
     unlink(state->socket_path);
 
-    /* Create Unix domain socket */
-    state->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    /* Create Unix domain socket. Close-on-exec, atomically at creation:
+     * nothing this daemon might ever exec should inherit the socket that
+     * requests arrive on (same for every accepted client fd below). */
+    state->listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (state->listen_fd < 0) {
         perror("[O-Node] socket");
         return VIRP_ERR_KEY_NOT_LOADED;
@@ -6904,7 +8940,13 @@ virp_error_t onode_start(onode_state_t *state)
     if (bind_rc < 0) {
         errno = bind_errno;
         perror("[O-Node] bind");
+        /* Closed AND forgotten. listen_fd used to keep the stale number,
+         * and onode_destroy() closes any listen_fd >= 0: by then the
+         * number could belong to something else this process opened —
+         * a chain database, a device connection — and it would have
+         * closed that instead. */
         close(state->listen_fd);
+        state->listen_fd = -1;
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
@@ -6914,6 +8956,7 @@ virp_error_t onode_start(onode_state_t *state)
     if (listen(state->listen_fd, ONODE_LISTEN_BACKLOG) < 0) {
         perror("[O-Node] listen");
         close(state->listen_fd);
+        state->listen_fd = -1;
         return VIRP_ERR_KEY_NOT_LOADED;
     }
 
@@ -6922,22 +8965,37 @@ virp_error_t onode_start(onode_state_t *state)
     fprintf(stderr, "[O-Node] Devices: %d\n", state->device_count);
     fprintf(stderr, "[O-Node] Ready.\n\n");
 
-    state->running = true;
+    /* A shutdown requested while we were still starting (a signal before
+     * this line) must win: it is latched, so do not overwrite it by
+     * declaring the daemon running. The loop below is then skipped and
+     * the normal drain and teardown follow. */
+    atomic_store(&state->running,
+                 !atomic_load(&state->shutdown_requested));
 
-    /* Start auto-reconnect watchdog thread */
-    if (onode_watchdog_start(state) != VIRP_OK)
+    /* Start auto-reconnect watchdog thread — unless shutdown is already
+     * pending, in which case there is nothing for it to keep connected. */
+    if (atomic_load(&state->running) &&
+        onode_watchdog_start(state) != VIRP_OK)
         perror("[O-Node] Failed to start watchdog thread");
 
-    /* Event loop */
-    while (state->running) {
+    /* Event loop. Watches the listen socket AND the shutdown eventfd
+     * (M18): onode_shutdown() writes to it from a signal handler or a
+     * worker thread, select() returns, and the loop condition sees the
+     * cleared flag — no waiting out the heartbeat timeout. */
+    while (atomic_load(&state->running)) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(state->listen_fd, &readfds);
+        int nfds = state->listen_fd + 1;
+        if (state->wake_ready && state->wake_fd < FD_SETSIZE) {
+            FD_SET(state->wake_fd, &readfds);
+            if (state->wake_fd >= nfds) nfds = state->wake_fd + 1;
+        }
 
         /* Timeout for periodic heartbeat */
         struct timeval tv = { .tv_sec = ONODE_HEARTBEAT_SEC, .tv_usec = 0 };
 
-        int ready = select(state->listen_fd + 1, &readfds, NULL, NULL, &tv);
+        int ready = select(nfds, &readfds, NULL, NULL, &tv);
 
         if (ready < 0) {
             if (errno == EINTR) continue;  /* Signal interrupted */
@@ -6951,22 +9009,45 @@ virp_error_t onode_start(onode_state_t *state)
             size_t hb_len;
             if (onode_heartbeat(state, hb_buf, sizeof(hb_buf), &hb_len) == VIRP_OK) {
                 uint32_t uptime = (uint32_t)(time(NULL) - state->uptime_start);
+                /* Sample each group under the lock that guards it. These
+                 * were read bare from the main thread while workers and
+                 * the watchdog wrote them. */
                 int conn_up = 0, conn_total = 0;
+                pthread_mutex_lock(&state->conn_mutex);
                 for (int ci = 0; ci < state->device_count; ci++) {
                     if (state->devices[ci].enabled) {
                         conn_total++;
                         if (state->connections[ci]) conn_up++;
                     }
                 }
+                pthread_mutex_unlock(&state->conn_mutex);
+                pthread_mutex_lock(&state->state_mutex);
+                uint32_t obs_sent = state->observations_sent;
+                uint32_t seq_now = state->seq_num;
+                uint32_t reconn = state->reconnects;
+                pthread_mutex_unlock(&state->state_mutex);
                 fprintf(stderr, "[O-Node] Heartbeat: uptime=%us obs=%u seq=%u connected=%d/%d reconnects=%u\n",
-                        uptime, state->observations_sent, state->seq_num,
-                        conn_up, conn_total, state->reconnects);
+                        uptime, obs_sent, seq_now,
+                        conn_up, conn_total, reconn);
             }
             continue;
         }
 
+        if (state->wake_ready && state->wake_fd < FD_SETSIZE &&
+            FD_ISSET(state->wake_fd, &readfds)) {
+            /* Shutdown was requested. Drain the counter (non-blocking)
+             * and let the loop condition decide; a connection that
+             * raced in is left in the backlog and closed with the
+             * listen socket. */
+            uint64_t n;
+            ssize_t r = read(state->wake_fd, &n, sizeof(n));
+            (void)r;
+            continue;
+        }
+
         if (FD_ISSET(state->listen_fd, &readfds)) {
-            int client_fd = accept(state->listen_fd, NULL, NULL);
+            int client_fd = accept4(state->listen_fd, NULL, NULL,
+                                    SOCK_CLOEXEC);
             if (client_fd < 0) {
                 perror("[O-Node] accept");
                 continue;
@@ -6983,11 +9064,29 @@ virp_error_t onode_start(onode_state_t *state)
             }
 
             /*
+             * Per-uid share first (M14): a uid already holding
+             * ONODE_MAX_WORKERS_PER_UID workers gets no more, so no
+             * single principal can take the whole pool and lock the
+             * others out. Closed without a response, like a saturated
+             * pool — the accept loop must never block on a send.
+             */
+            if (!onode_worker_admit(state, peer_uid)) {
+                fprintf(stderr,
+                        "[O-Node] per-uid worker cap reached (max=%d per "
+                        "uid) — closing peer uid=%u pid=%d\n",
+                        ONODE_MAX_WORKERS_PER_UID,
+                        (unsigned)peer_uid, (int)peer_pid);
+                close(client_fd);
+                continue;
+            }
+
+            /*
              * Reserve a worker slot. sem_trywait never blocks — if the
              * pool is full we reject immediately rather than letting
              * slow SSH sessions pile up behind the accept loop.
              */
             if (sem_trywait(&state->worker_sem) != 0) {
+                onode_worker_release(state, peer_uid);
                 pthread_mutex_lock(&state->state_mutex);
                 state->workers_rejected++;
                 uint32_t rej = state->workers_rejected;
@@ -7005,6 +9104,7 @@ virp_error_t onode_start(onode_state_t *state)
             if (!arg) {
                 /* malloc failure: return the slot and drop the client. */
                 sem_post(&state->worker_sem);
+                onode_worker_release(state, peer_uid);
                 fprintf(stderr, "[O-Node] worker_arg alloc failed — dropping\n");
                 close(client_fd);
                 continue;
@@ -7046,9 +9146,13 @@ virp_error_t onode_start(onode_state_t *state)
             pthread_attr_t attr;
             pthread_attr_init(&attr);
             pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            /* handle_client keeps several hundred KiB on its stack; do
+             * not leave the size to RLIMIT_STACK. */
+            (void)pthread_attr_setstacksize(&attr, ONODE_THREAD_STACK_BYTES);
 
             pthread_t tid;
-            int rc = pthread_create(&tid, &attr, connection_worker, arg);
+            int rc = ONODE_PTHREAD_CREATE(&tid, &attr, connection_worker,
+                                          arg);
             pthread_attr_destroy(&attr);
             if (rc != 0) {
                 /* Thread creation failed: undo counter, slot, sem, arg. */
@@ -7063,6 +9167,7 @@ virp_error_t onode_start(onode_state_t *state)
                     pthread_cond_broadcast(&state->workers_cv);
                 pthread_mutex_unlock(&state->state_mutex);
                 sem_post(&state->worker_sem);
+                onode_worker_release(state, peer_uid);
                 free(arg);
                 fprintf(stderr, "[O-Node] pthread_create failed: %s\n",
                         strerror(rc));
@@ -7118,11 +9223,23 @@ virp_error_t onode_start(onode_state_t *state)
     return VIRP_OK;
 }
 
+/* ASYNC-SIGNAL-SAFE — see the header. Keep it that way: no stdio, no
+ * locks, no allocation, errno preserved. */
 void onode_shutdown(onode_state_t *state)
 {
     if (!state) return;
-    state->running = false;
-    state->watchdog_running = false;
+    int saved_errno = errno;
+    atomic_store(&state->shutdown_requested, true);
+    atomic_store(&state->running, false);
+    atomic_store(&state->watchdog_running, false);
+    if (state->wake_ready) {
+        /* An eventfd write only fails with EAGAIN when the counter is
+         * about to overflow — i.e. the wake is already pending. */
+        const uint64_t one = 1;
+        ssize_t w = write(state->wake_fd, &one, sizeof(one));
+        (void)w;
+    }
+    errno = saved_errno;
 }
 
 void onode_destroy(onode_state_t *state)
@@ -7189,6 +9306,32 @@ void onode_destroy(onode_state_t *state)
         unlink(state->socket_path);
     }
 
+    /* Clean shutdown: record the exact v1 sequence high-water, so the
+     * next start resumes from it instead of skipping the rest of the
+     * reserved block (M20). Best-effort — the reservation already on
+     * disk is the safe fallback. */
+    if (state->seq_store_path[0])
+        (void)seq_store_write(state->seq_store_path, state->seq_num);
+
+    /* Release the single-instance lock last of the socket-side state:
+     * the socket is already gone, so a successor that takes the lock
+     * finds nothing stale to remove. The lockfile itself stays — unlinking
+     * a file others may be waiting to flock is a race, and it is empty. */
+    if (state->lock_fd >= 0) {
+        close(state->lock_fd);
+        state->lock_fd = -1;
+    }
+
+    /* The shutdown wake. No signal handler can be mid-write on it here
+     * that matters: wake_ready is cleared first, and a handler that
+     * already read it true writes to an fd this thread closes only
+     * afterwards — at worst EBADF, which onode_shutdown ignores. */
+    if (state->wake_ready) {
+        state->wake_ready = false;
+        close(state->wake_fd);
+        state->wake_fd = -1;
+    }
+
     /* Destroy trust chain */
     if (state->chain_enabled)
         virp_chain_destroy(&state->chain);
@@ -7208,6 +9351,7 @@ void onode_destroy(onode_state_t *state)
     pthread_mutex_destroy(&state->state_mutex);
     pthread_mutex_destroy(&state->conn_mutex);
     pthread_mutex_destroy(&state->session_mutex);
+    pthread_mutex_destroy(&state->proposal_mutex);
     for (int i = 0; i < state->device_count; i++)
         pthread_mutex_destroy(&state->exec_mutex[i]);
     if (state->worker_sem_inited) {
@@ -7243,8 +9387,89 @@ bool onode_parse_request_fuzz(const uint8_t *data, size_t n)
     if (n > 0) memcpy(buf, data, n);
     buf[n] = '\0';
 
+    /* The length-aware entry, so an input with an embedded NUL reaches
+     * the same refusal the socket path applies. */
     onode_request_t req;
-    bool ok = parse_request(buf, &req);
+    bool ok = parse_request(buf, n, &req);
     free(buf);
     return ok;
+}
+
+/*
+ * Fuzz entry points for the two other parsers a socket client's bytes
+ * reach (O-Node security review, "FINALLY"). Same contract as
+ * onode_parse_request_fuzz above: arbitrary bytes in, MUST NOT crash,
+ * and each one aborts — so a fuzzer or a sanitizer build reports it — if
+ * the parser returns something that breaks its own postcondition.
+ *
+ * onode_parse_batch_fuzz: the batch_execute `commands` parser, a second
+ * and independent parse of the frame. Returns the number of commands
+ * accepted (0 = refused). Postcondition checked here: an accepted batch
+ * has 1..ONODE_MAX_BATCH items, each with a non-empty, NUL-terminated,
+ * canonical device and a non-empty, NUL-terminated command.
+ *
+ * onode_fed_outcome_citation_fuzz: GATE 4's reader for a fed_outcome
+ * body. Returns 0 (no usable citation), 1 (observation) or 2 (error).
+ * Postcondition: a citation that is reported is exactly 64 lowercase hex
+ * characters, and an "executed" claim is only ever reported alongside
+ * one.
+ */
+int onode_parse_batch_fuzz(const uint8_t *data, size_t n)
+{
+    if (n > ONODE_MAX_REQUEST_SIZE) return 0;
+
+    char *buf = (char *)malloc(n + 1);
+    batch_thread_arg_t *args = calloc(ONODE_MAX_BATCH, sizeof(*args));
+    if (!buf || !args) { free(buf); free(args); return 0; }
+    if (n > 0) memcpy(buf, data, n);
+    buf[n] = '\0';
+
+    int count = parse_batch_commands(buf, n, args, ONODE_MAX_BATCH);
+    if (count < 0 || count > ONODE_MAX_BATCH) {
+        fprintf(stderr, "FUZZ: batch parser returned count %d\n", count);
+        abort();
+    }
+    for (int i = 0; i < count; i++) {
+        size_t dl = strnlen(args[i].device, sizeof(args[i].device));
+        size_t cl = strnlen(args[i].command, sizeof(args[i].command));
+        if (dl == 0 || dl >= sizeof(args[i].device) ||
+            cl == 0 || cl >= sizeof(args[i].command) ||
+            !onode_canonical_string_ok(args[i].device)) {
+            fprintf(stderr, "FUZZ: batch parser accepted a malformed item "
+                    "%d\n", i);
+            abort();
+        }
+    }
+    free(args);
+    free(buf);
+    return count;
+}
+
+int onode_fed_outcome_citation_fuzz(const uint8_t *data, size_t n)
+{
+    if (n > ONODE_MAX_REQUEST_SIZE) return 0;
+
+    char *buf = (char *)malloc(n + 1);
+    if (!buf) return 0;
+    if (n > 0) memcpy(buf, data, n);
+    buf[n] = '\0';
+
+    char cited[65];
+    memset(cited, 'Z', sizeof(cited));     /* never valid hex if untouched */
+    bool claims = false;
+    fed_cite_kind_t kind = fed_outcome_citation(buf, cited, &claims);
+    if (kind != FED_CITE_NONE) {
+        if (cited[64] != '\0' ||
+            strspn(cited, "0123456789abcdef") != 64) {
+            fprintf(stderr, "FUZZ: fed_outcome_citation reported a "
+                    "citation that is not 64 lowercase hex\n");
+            abort();
+        }
+    } else if (claims) {
+        fprintf(stderr, "FUZZ: fed_outcome_citation reported an execution "
+                "claim with no citation\n");
+        abort();
+    }
+    free(buf);
+    return (int)kind;
 }
