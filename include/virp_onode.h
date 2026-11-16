@@ -524,6 +524,32 @@ typedef struct {
     pthread_mutex_t     session_mutex;
 
     /*
+     * WHO BOUND THE SESSION (security review M19), under session_mutex.
+     *
+     * The daemon holds one session, and it was nobody's in particular:
+     * any allowed uid could close it, and any allowed uid's v2/v3
+     * execute rode on it. So uid B could end uid A's session whenever
+     * it liked, and B's observations were signed under the session A
+     * negotiated and counted against A's sequence numbers — A's replay
+     * window advanced by requests A never made.
+     *
+     * SESSION_BIND records the peer uid here. While it is set, only
+     * that uid may close the session or have a v2/v3 observation signed
+     * under it; anyone else is told SESSION_INVALID / ACTION_FORBIDDEN
+     * exactly as if they had no session, which they do not.
+     *
+     * `session_owner_generation` is the session generation the owner
+     * record belongs to. A session that idles out and is re-established
+     * by a path that does not go through the socket handler (tests bind
+     * the context directly) has a different generation, and the stale
+     * owner record must not be enforced against it: ownership applies
+     * only while owner_set && generation matches.
+     */
+    bool                session_owner_set;
+    uid_t               session_owner_uid;
+    uint64_t            session_owner_generation;
+
+    /*
      * Per-device execution mutex.
      *
      * virp_conn_t is not thread-safe: libssh2 sessions and channels

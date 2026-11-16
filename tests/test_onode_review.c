@@ -2780,6 +2780,85 @@ static void t_M18_shutdown_action_is_acknowledged(void)
 }
 
 /* =========================================================================
+ * M19 — the session belongs to the uid that bound it
+ * ========================================================================= */
+
+static void m19_case(const char *name, int obs_version, bool v3)
+{
+    fx_t *fx = &g_fx;
+    sqlite3 *db = NULL;
+    if (!h4_init(fx, name, &db, "autonomous")) {
+        CHECK(false, "fixture (needs a plain build, without LINUX=1)");
+        return;
+    }
+    virp_policy_close(fx->st.policy);
+    fx->st.policy = NULL;
+    onode_state_t *st = &fx->st;
+    const uid_t A = 4401, B = 4402;
+    uint8_t ot = 0;
+    char payload[1024];
+
+    if (v3) {
+        char kpath[200], ppath[200];
+        snprintf(kpath, sizeof(kpath), "%s/%s/obs-sign.key", g_root, name);
+        snprintf(ppath, sizeof(ppath), "%s/%s/obs-sign.pub", g_root, name);
+        CHECK(virp_obskey_generate(&st->obskey) == VIRP_OK &&
+              virp_obskey_save(&st->obskey, kpath, ppath) == VIRP_OK &&
+              virp_chain_enable_signing(&st->chain, kpath) == VIRP_OK,
+              "(v3 signing key loaded)");
+        st->obskey_loaded = true;
+    }
+
+    CHECK(m12_bind_session(fx, A), "uid A binds a session");
+    CHECK(m12_run(fx, obs_version, A, &ot, payload, sizeof(payload)) == VIRP_OK &&
+          h4_dispatches == 1, "A's session-bound execute runs");
+
+    CHECK(m12_run(fx, obs_version, B, &ot, payload, sizeof(payload))
+              == VIRP_ERR_SESSION_INVALID && h4_dispatches == 1,
+          "uid B's execute is refused before dispatch: B has no session");
+    CHECK(fx_ask(st, B, "{\"action\":\"session_close\"}")
+              == VIRP_ERR_ACTION_FORBIDDEN,
+          "uid B may not close A's session");
+    CHECK(m12_run(fx, obs_version, A, &ot, payload, sizeof(payload)) == VIRP_OK &&
+          h4_dispatches == 2, "A's session survived B's close attempt");
+
+    CHECK(fx_ask(st, A, "{\"action\":\"session_close\"}") == VIRP_OK,
+          "A closes its own session");
+    CHECK(m12_run(fx, obs_version, A, &ot, payload, sizeof(payload))
+              == VIRP_ERR_SESSION_INVALID && h4_dispatches == 2,
+          "after closing, A has no session either");
+
+    /* The session is free: B binds and now B is the owner. */
+    CHECK(m12_bind_session(fx, B), "uid B binds a new session");
+    CHECK(m12_run(fx, obs_version, B, &ot, payload, sizeof(payload)) == VIRP_OK &&
+          h4_dispatches == 3, "B's session-bound execute runs");
+    CHECK(m12_run(fx, obs_version, A, &ot, payload, sizeof(payload))
+              == VIRP_ERR_SESSION_INVALID && h4_dispatches == 3,
+          "and now it is A that is refused");
+
+    /* Closing a session that is not active stays the harmless reset it
+     * was, whoever asks. */
+    CHECK(fx_ask(st, B, "{\"action\":\"session_close\"}") == VIRP_OK &&
+          fx_ask(st, A, "{\"action\":\"session_close\"}") == VIRP_OK,
+          "closing an already-closed session is not refused");
+
+    fx_destroy(fx);
+    sqlite3_close(db);
+}
+
+static void t_M19_v2_session_is_owned_by_binding_uid(void)
+{
+    printf("\n  M19 (v2): only the binding uid may use or close the session\n");
+    m19_case("m19-v2", 2, false);
+}
+
+static void t_M19_v3_session_is_owned_by_binding_uid(void)
+{
+    printf("\n  M19 (v3): only the binding uid may use or close the session\n");
+    m19_case("m19-v3", 3, true);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -2826,6 +2905,10 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M16_proposals_are_rate_limited_per_uid",
                                               t_M16_proposals_are_rate_limited_per_uid },
     { "t_M17_batch_thread_create_failure",    t_M17_batch_thread_create_failure },
+    { "t_M19_v2_session_is_owned_by_binding_uid",
+                                              t_M19_v2_session_is_owned_by_binding_uid },
+    { "t_M19_v3_session_is_owned_by_binding_uid",
+                                              t_M19_v3_session_is_owned_by_binding_uid },
     { "t_M18_shutdown_wakes_the_accept_loop", t_M18_shutdown_wakes_the_accept_loop },
     { "t_M18_shutdown_from_signal_handler",   t_M18_shutdown_from_signal_handler },
     { "t_M18_shutdown_before_start_is_not_lost",

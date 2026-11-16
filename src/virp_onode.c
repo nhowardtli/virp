@@ -627,6 +627,21 @@ static void onode_session_lock(onode_state_t *state)
  * must be the terminating NUL (handle_client writes it). The length is
  * an argument, not a strlen(), on purpose: see onode_parse_root_object.
  */
+/*
+ * May `uid` use the session as it stands? (M19) Caller holds
+ * session_mutex. True when nobody recorded ownership of the CURRENT
+ * session generation — an unowned session, e.g. one a test bound on the
+ * context directly — or when `uid` is the uid that bound it.
+ */
+static bool onode_session_usable_by(const onode_state_t *state, uid_t uid)
+{
+    if (!state->ctx || !state->session_owner_set)
+        return true;
+    if (state->session_owner_generation != state->ctx->session.generation)
+        return true;              /* owner record is for an older session */
+    return state->session_owner_uid == uid;
+}
+
 static bool parse_request(const char *json, size_t json_len,
                           onode_request_t *req)
 {
@@ -3254,9 +3269,14 @@ static virp_error_t onode_execute_policy_impl(onode_state_t *state,
     uint64_t session_generation = state->ctx ? state->ctx->session.generation : 0;
     uint8_t session_id[16] = {0};
     if (state->ctx) memcpy(session_id, state->ctx->session.session_id, sizeof(session_id));
+    /* The session must be active AND this caller's (M19): a uid that did
+     * not bind it has no session, whatever another uid negotiated. The
+     * generation re-check after the legacy stage already refuses a
+     * session replaced mid-command, owner included. */
     bool active = state->ctx &&
         virp_session_require_active(state->ctx) == VIRP_OK &&
-        state->ctx->session.session_key_valid;
+        state->ctx->session.session_key_valid &&
+        onode_session_usable_by(state, client_uid);
     pthread_mutex_unlock(&state->session_mutex);
     if (!active) return VIRP_ERR_SESSION_INVALID;
     uint8_t legacy[VIRP_MAX_MESSAGE_SIZE]; size_t legacy_len = 0;
@@ -3401,9 +3421,11 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
      */
     if (obs_version == 2) {
         onode_session_lock(state);
+        /* ... and it must be THIS caller's session (M19). */
         bool ok = state->ctx &&
                   virp_session_require_active(state->ctx) == VIRP_OK &&
-                  state->ctx->session.session_key_valid;
+                  state->ctx->session.session_key_valid &&
+                  onode_session_usable_by(state, client_uid);
         pthread_mutex_unlock(&state->session_mutex);
         if (!ok)
             return VIRP_ERR_SESSION_INVALID;
@@ -4457,7 +4479,12 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
         onode_session_lock(state);
         if (!state->ctx ||
             virp_session_require_active(state->ctx) != VIRP_OK ||
-            !state->ctx->session.session_key_valid) {
+            !state->ctx->session.session_key_valid ||
+            /* Re-checked at signing time like everything else here: the
+             * caller's session may have been closed and another uid's
+             * bound while the command ran, and this observation must
+             * not be signed under that one (M19). */
+            !onode_session_usable_by(state, client_uid)) {
             err = VIRP_ERR_SESSION_INVALID;
         } else {
             /* Truncate like the v1 path does rather than erroring:
@@ -7396,6 +7423,15 @@ static void handle_client(onode_state_t *state, int client_fd,
         if (err == VIRP_OK) {
             err = virp_session_derive_key(state->ctx, state->okey.key.key);
         }
+        if (err == VIRP_OK) {
+            /* The session now belongs to the uid that bound it (M19).
+             * Recorded under the same lock as the bind, against this
+             * session's generation. */
+            state->session_owner_set = true;
+            state->session_owner_uid = client_uid;
+            state->session_owner_generation =
+                state->ctx->session.generation;
+        }
         pthread_mutex_unlock(&state->session_mutex);
         if (err != VIRP_OK) {
             fprintf(stderr, "[O-Node] session bind/derive failed: %d\n",
@@ -7409,16 +7445,34 @@ static void handle_client(onode_state_t *state, int client_fd,
         break;
     }
 
-    case ONODE_ACTION_SESSION_CLOSE:
+    case ONODE_ACTION_SESSION_CLOSE: {
+        /* Only the uid that bound the session may close it (M19). A
+         * session that is not active — never bound, idled out, already
+         * closed — has no owner to protect, and closing it is the
+         * harmless reset it always was. */
         onode_session_lock(state);
-        virp_handle_session_close(state->ctx);
+        bool live = state->ctx &&
+                    virp_session_state(state->ctx) == VIRP_SESSION_ACTIVE;
+        bool mine = onode_session_usable_by(state, client_uid);
+        if (!live || mine) {
+            if (state->ctx) virp_handle_session_close(state->ctx);
+            state->session_owner_set = false;
+        }
         pthread_mutex_unlock(&state->session_mutex);
+        if (live && !mine) {
+            fprintf(stderr, "[O-Node] session_close REFUSED: uid %ld did "
+                    "not bind the active session\n",
+                    (client_uid == (uid_t)-1) ? -1L : (long)client_uid);
+            send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
+            break;
+        }
         fprintf(stderr, "[O-Node] Session closed by client\n");
         {
             const char *close_resp = "{\"status\":\"closed\"}";
             send_framed(client_fd, close_resp, strlen(close_resp));
         }
         break;
+    }
 
     case ONODE_ACTION_SHUTDOWN:
         fprintf(stderr, "[O-Node] Shutdown requested by uid %ld\n",
