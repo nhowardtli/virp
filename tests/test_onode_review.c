@@ -380,6 +380,68 @@ static void t_H1_unspent_record_must_match_chain(void)
 }
 
 /* =========================================================================
+ * H2 — fed_outcome "executed" must be unambiguous
+ *
+ * An error-backed outcome may not claim execution. Each body below cites
+ * error_sha256 and smuggles an execution claim past a reader that takes
+ * the first "executed" member, or that only recognises the literal true.
+ * ========================================================================= */
+
+#define H2_HASH "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+static void t_H2_executed_must_be_single_boolean(void)
+{
+    printf("\n  H2: fed_outcome 'executed' is at most once and a JSON boolean\n");
+    static const struct { const char *body; const char *what; } REFUSED[] = {
+        { "{\"error_sha256\":\"" H2_HASH "\",\"executed\":false,"
+          "\"executed\":true}",
+          "duplicate executed (false then true) is refused" },
+        { "{\"executed\":true,\"error_sha256\":\"" H2_HASH "\","
+          "\"executed\":false}",
+          "duplicate executed (true then false) is refused" },
+        { "{\"error_sha256\":\"" H2_HASH "\",\"executed\":1}",
+          "executed:1 is refused" },
+        { "{\"error_sha256\":\"" H2_HASH "\",\"executed\":\"true\"}",
+          "executed:\"true\" is refused" },
+        { "{\"error_sha256\":\"" H2_HASH "\",\"executed\":null}",
+          "executed:null is refused" },
+        { "{\"observation_sha256\":\"" H2_HASH "\",\"executed\":\"yes\"}",
+          "a mistyped executed is refused on an observation-backed outcome too" },
+    };
+    for (size_t i = 0; i < sizeof(REFUSED) / sizeof(REFUSED[0]); i++) {
+        char cited[65] = "";
+        bool claims = true;
+        fed_cite_kind_t k = fed_outcome_citation(REFUSED[i].body, cited,
+                                                 &claims);
+        CHECK(k == FED_CITE_NONE && !claims, REFUSED[i].what);
+    }
+
+    /* The well-formed shapes are untouched. */
+    char cited[65];
+    bool claims = true;
+    CHECK(fed_outcome_citation("{\"error_sha256\":\"" H2_HASH "\","
+                               "\"executed\":false}", cited, &claims)
+              == FED_CITE_ERROR && !claims && strcmp(cited, H2_HASH) == 0,
+          "error-backed, executed:false is still an error citation");
+    claims = true;
+    CHECK(fed_outcome_citation("{\"error_sha256\":\"" H2_HASH "\"}",
+                               cited, &claims) == FED_CITE_ERROR && !claims,
+          "error-backed with no executed member claims nothing");
+    claims = false;
+    CHECK(fed_outcome_citation("{\"error_sha256\":\"" H2_HASH "\","
+                               "\"executed\":true}", cited, &claims)
+              == FED_CITE_ERROR && claims,
+          "a single boolean true is still reported as a claim (GATE 4 refuses it)");
+    claims = false;
+    CHECK(fed_outcome_citation("{\"observation_sha256\":\"" H2_HASH "\","
+                               "\"executed\":true,"
+                               "\"detail\":{\"executed\":\"nested\"}}",
+                               cited, &claims)
+              == FED_CITE_OBSERVATION && claims,
+          "a nested executed is not the root claim and does not count");
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -388,6 +450,7 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_H1_altered_hash_replay",             t_H1_altered_hash_replay },
     { "t_H1_second_apply_inside_ttl",         t_H1_second_apply_inside_ttl },
     { "t_H1_unspent_record_must_match_chain", t_H1_unspent_record_must_match_chain },
+    { "t_H2_executed_must_be_single_boolean", t_H2_executed_must_be_single_boolean },
 };
 
 static void rm_rf_root(void)

@@ -4430,7 +4430,9 @@ static bool peer_uid_allowed(onode_state_t *state, int client_fd,
  * GATE 2 hashed with, and then the field checked would not be the
  * field stored. Fail-closed throughout: a body this cannot read is a
  * body whose citation cannot be checked, which is the case the gate
- * exists to stop.
+ * exists to stop. The same goes for a root-level "executed" that is
+ * repeated or is not a JSON boolean (H2): FED_CITE_NONE, and the caller
+ * refuses the outcome.
  */
 /* Which body a fed_outcome says it is backed by. Exactly one citation
  * may be present: an outcome cannot be backed by signed evidence AND by
@@ -4493,11 +4495,32 @@ static fed_cite_kind_t fed_outcome_citation(const char *body,
             memcpy(out_hex, err, 65);
             kind = FED_CITE_ERROR;
         }
-        if (claims_executed) {
-            const cJSON *ex = cJSON_GetObjectItemCaseSensitive(root,
-                                                               "executed");
-            *claims_executed = cJSON_IsTrue(ex);
+        /* "executed" is held to the same standard as the citation it
+         * qualifies (security review H2): at most ONE root-level member,
+         * and a JSON boolean when present. It used to be read with
+         * cJSON_GetObjectItemCaseSensitive + cJSON_IsTrue, which takes
+         * the FIRST member of that name and treats everything that is not
+         * the literal `true` as "does not claim execution". So
+         *     {"executed":false, ..., "executed":true}
+         * passed the error-backed check on its first value while every
+         * JSON reader downstream returns the last, and `"executed":1` or
+         * `"executed":"true"` — which a loosely typed consumer reads as
+         * truthy — passed as no claim at all. An ambiguous or mistyped
+         * claim is not a claim this gate can grade: the outcome is
+         * refused, exactly like an ambiguous citation. Absent is fine and
+         * means no execution is claimed. */
+        const cJSON *ex = NULL;
+        int ex_count = 0;
+        for (const cJSON *m = root->child; m; m = m->next) {
+            if (m->string && strcmp(m->string, "executed") == 0) {
+                ex_count++;
+                ex = m;
+            }
         }
+        if (ex_count > 1 || (ex_count == 1 && !cJSON_IsBool(ex)))
+            kind = FED_CITE_NONE;
+        else if (claims_executed)
+            *claims_executed = cJSON_IsTrue(ex);
     }
     cJSON_Delete(root);
     return kind;
@@ -5235,7 +5258,8 @@ static void handle_client(onode_state_t *state, int client_fd,
                         "64-hex string, either observation_sha256 (the "
                         "signed observation) or error_sha256 (the fed_error "
                         "saying why there is none), never both and never "
-                        "null (session=%s id=%s)\n",
+                        "null; and \"executed\", when present, exactly once "
+                        "as a JSON boolean (session=%s id=%s)\n",
                         req.session_id, req.artifact_id);
                 send_framed_error(client_fd, VIRP_ERR_ACTION_FORBIDDEN);
                 break;
