@@ -65,7 +65,7 @@ commands are gated at a higher tier than before (H4).
 | M13 | fixed | Proposal id precedes the command; buffer sized |
 | M14 | fixed | Absolute receive deadline, send timeout, per-uid worker cap |
 | M15 | fixed, one part deferred | Range cap and per-uid verify budget; whole-session verify still holds the chain lock |
-| M16 | fixed | Proposal dedupe and per-uid rate limit |
+| M16 | fixed (rate limit); dedupe built but off — it breaks the port cage | Per-uid proposal rate limit; opt-in dedupe |
 | M17 | fixed | Batch `pthread_create` checked |
 | M18 | fixed | Signal-safe shutdown, eventfd wake, acknowledgement |
 | M19 | fixed | Session owned by the binding uid |
@@ -173,6 +173,28 @@ Things worth knowing about that procedure:
   recompiles the same objects into the same `build/`. The script now
   builds the three targets one after another, as CI does, and that
   commit was verified again.
+
+**What the per-commit procedure did not cover, and CI caught.** The
+first push failed four CI jobs, from two causes, both now fixed in
+follow-up commits:
+
+- *A build failure on the runner's newer C library* (three jobs). The
+  review test included `<pthread.h>` ahead of the daemon source; glibc
+  2.41 and later then defines a newer `_POSIX_C_SOURCE` than the source
+  sets, which is a redefinition under `-Werror`. glibc 2.39 here defines
+  the same value, so nothing local could show it. See the M17 follow-up.
+- *The port cage's native pipeline test* (`python3 -m pytest`, which
+  needs a `CISCO=1` fixture binary that `make all-tests` does not
+  build). It is not part of the C battery, so the per-commit run never
+  executed it — a gap in my procedure, not in the repository. It found a
+  real conflict with M16; see that section. The complete Python suite
+  was then run locally the way CI runs it: no failures. (22 errors
+  remain locally in `tests/test_virp_verify.py`, which needs a key file
+  under `/opt/virp/keys` that this machine does not have; CI skips those
+  and they do not touch this branch's code.)
+
+The consequence for the "one commit per finding" rule: M16 and M17 each
+have a second commit. Folding them in would have needed a force-push.
 
 **Not run locally:** the clang/libFuzzer build (`make
 fuzz-onode-parsers`). The build host has no clang. The gcc smoke target
@@ -574,11 +596,40 @@ and was not attempted here.
 
 ### M16 — proposals
 
-Dedupe key is `(device, command hash, proposer)` with the proposal's own
-hash, so a whitespace variant is the same proposal. Only an *open*
-proposal is reused. 20 new proposals per uid per 60 s; past it the
-refusal is unchanged but carries no id. The cache is in memory: after a
-restart the first repeat files one more.
+**Verified.** Every refusal of an approvable command filed a new record
+and a new PROPOSAL chain entry, without limit.
+
+**Changed.** A per-uid limit on *new* proposals: 120 per 60 s
+(`ONODE_PROPOSAL_BURST`, build-time overridable). Past it the refusal is
+unchanged — still recorded, still signed — but carries no id.
+
+**The dedupe half of the recommendation is implemented but OFF, because
+it is wrong for this codebase as it stands.** The first version of this
+commit answered a repeated refusal with the existing open proposal's id
+and limited a uid to 20 new proposals a minute. CI's
+`tests/test_port_native_pipeline.py` failed on it, correctly: the port
+cage (`tools/cage/port_prepare.py`) files **several proposals for the
+same command on purpose** — one single-use approval per verification
+step, plus forward, restore and preflight, eight per transaction — and
+requires each to be a distinct proposal filed after its own request. Both
+the dedupe and the 20-per-minute figure broke a client that is doing
+exactly what the approval design intends.
+
+So, in a follow-up commit (the branch was already pushed):
+
+- dedupe runs only when `state->proposal_dedupe` is set. Nothing in the
+  tree sets it outside the test. Key, when on: `(device, command hash,
+  proposer)`, open proposals only; the cache is in memory.
+- the burst went from 20 to 120, sized from that client: one cage
+  transaction is 8 proposals and its test runs several in a window.
+
+**Deferred, and it is a design question rather than a code one:**
+whether repeated identical proposals should ever be collapsed. Doing it
+would need the cage to obtain its verification budget some other way
+(one proposal approved for N uses does not exist, and H1 now enforces
+single use three ways). Until then the rate limit is the bound on a
+client that loops on a refused command: 120 records a minute per uid
+instead of unlimited.
 
 ### M17 — batch threads
 
@@ -743,8 +794,8 @@ Things that change on the first restart with this branch.
   they did not.
 - With `-3` and no `-O`, a warning on every start (M21).
 - One uid can hold at most half the worker pool (M14).
-- A uid that repeats a refused command gets the same proposal back; past
-  20 new proposals a minute it gets refusals with no id (M16).
+- A uid past 120 new proposals a minute gets refusals with no proposal
+  id until the window turns over (M16).
 
 ## Things noticed and not touched
 
