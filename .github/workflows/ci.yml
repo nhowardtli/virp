@@ -101,6 +101,12 @@ jobs:
       # targets (core + onode + ssh-io + fg-scrub + chain, and the driver
       # suites with their -D guards). Use them rather than hand-rolling
       # CFLAGS here, so CI and local runs sanitize the same way.
+      #
+      # asan-test includes build/test_onode_review — the O-Node security
+      # review's regressions (one test function per finding ID). They
+      # drive handle_client over socketpairs and start real accept loops,
+      # so the request path, the approval path and the config loader all
+      # run instrumented here.
       - name: Build and test under ASan + UBSan
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
@@ -108,6 +114,28 @@ jobs:
         run: |
           make asan-test
           make asan-drivers
+
+  thread-sanitizer:
+    name: ThreadSanitizer (threaded suites)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.DEPS }}
+      # tsan-test builds the threaded suites in build-tsan/ and runs them
+      # with halt_on_error=1: concurrent execute against a disrupted
+      # connection, concurrent chain append/verify, and the security-review
+      # regressions (accept loop, workers, batch threads, watchdog,
+      # shutdown). A data race is a failure, not a log line.
+      #
+      # gcc's libtsan aborts at startup ("unexpected memory mapping") under
+      # the kernel's default mmap entropy. The Makefile runs each binary
+      # under `setarch -R`; the sysctl is the belt for a runner where
+      # personality(2) is filtered. Neither weakens what TSan checks.
+      - name: Lower mmap entropy for libtsan
+        run: sudo sysctl -w vm.mmap_rnd_bits=28 || true
+      - name: Build and test under TSan
+        run: make tsan-test
 
   valgrind:
     name: Valgrind (core test binary)
@@ -143,6 +171,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang
           make fuzz-device-output
           ./build-fuzz-device/fuzz_device_output -max_total_time=60 -max_len=65535
+      # The O-Node's three socket-facing JSON parsers: the request, the
+      # batch command array, and the fed_outcome citation reader. First the
+      # deterministic gcc smoke (seed corpus + fixed mutations — the same
+      # inputs every run, so a failure here is reproducible by anyone),
+      # then a short bounded libFuzzer run of each. Like the step above,
+      # this is a regression gate, not a campaign.
+      - name: O-Node parsers, deterministic smoke (gcc, ASan + UBSan)
+        run: make fuzz-onode-parsers-smoke
+      - name: O-Node parsers under libFuzzer and sanitizers
+        run: |
+          make fuzz-onode-parsers
+          for t in request batch fed_outcome; do
+            ./build-fuzz-onode/fuzz_onode_$t -max_total_time=30 -max_len=8192
+          done
 
   static-analysis:
     name: clang-tidy
