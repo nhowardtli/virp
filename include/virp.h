@@ -49,18 +49,30 @@
  * Trust Tiers
  *
  * Mapped from TLI Ops Center command tiers:
- *   GREEN  → Tier 1 (passive, no approval)
- *   YELLOW → Tier 2 (active, single approval)
- *   RED    → Tier 3 (critical) — currently ONE enrolled approver's
- *            signature, the SAME mechanism as YELLOW. m-of-n quorum
- *            approval is a roadmap item, not implemented.
+ *   GREEN  → Tier 1 (passive)
+ *   YELLOW → Tier 2 (active)
+ *   RED    → Tier 3 (critical)
  *   BLACK  → Tier 0 (impossible — not in message format)
+ *
+ * WHAT A TIER DOES, as the O-Node gate enforces it (virp_onode.c). The
+ * tiers are an ORDER, GREEN < YELLOW < RED, compared against the caller's
+ * effective ceiling: a command at or under the ceiling executes with no
+ * approval; a command above it is refused and can run only as an
+ * approved apply. The ceiling is the caller's per-uid row when it has
+ * one, else the node-wide gate_max_tier, which defaults to YELLOW. So on
+ * a default node YELLOW executes WITHOUT approval — it needs one only
+ * for a uid capped at GREEN — and RED is the first tier that does.
+ * Approval is the same mechanism at every tier: ONE enrolled approver's
+ * signature. m-of-n quorum approval is a roadmap item, not implemented.
+ * BLACK and UNCLASSIFIED are outside the order: BLACK is refused
+ * unconditionally and is unapprovable; UNCLASSIFIED blocks like an
+ * over-ceiling tier.
  * ========================================================================= */
 
 #define VIRP_TIER_UNCLASSIFIED  0x00    /* No classifier table matched — gate fails closed */
 #define VIRP_TIER_GREEN         0x01    /* Passive — no approval required */
-#define VIRP_TIER_YELLOW        0x02    /* Active — single approval required */
-#define VIRP_TIER_RED           0x03    /* Critical — single enrolled-approver signature (same mechanism as YELLOW); m-of-n quorum is roadmap, not implemented */
+#define VIRP_TIER_YELLOW        0x02    /* Active — executes without approval at the default (YELLOW) ceiling; needs one only under a GREEN ceiling */
+#define VIRP_TIER_RED           0x03    /* Critical — above the default ceiling: single enrolled-approver signature (m-of-n quorum is roadmap, not implemented) */
 #define VIRP_TIER_BLACK         0xFF    /* Forbidden — never transmitted */
 
 /* =========================================================================

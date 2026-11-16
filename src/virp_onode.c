@@ -843,12 +843,13 @@ static bool gate_tier_blocks(virp_trust_tier_t tier, virp_trust_tier_t max_tier)
 }
 
 /*
- * Effective ceiling for a specific connecting uid. Starts from the
- * node-wide gate_max_tier and TIGHTENS (never raises) it if that uid has
- * a per-uid ceiling configured. client_uid == (uid_t)-1 means an
- * internal / non-socket caller with no per-uid entry: the node-wide
- * ceiling applies unchanged. Because tiers order GREEN(1) < YELLOW(2) <
- * RED(3), "tighter" is the numerically smaller value.
+ * Effective ceiling for a specific connecting uid. An EXPLICIT per-uid
+ * entry is authoritative in both directions (2026-09-15, see below): it
+ * replaces the node-wide gate_max_tier whether it is tighter or looser.
+ * A uid with no entry, and client_uid == (uid_t)-1 (an internal /
+ * non-socket caller), get the node-wide ceiling unchanged. A ceiling is
+ * always GREEN, YELLOW or RED — onode_set_uid_ceilings() refuses anything
+ * else, so no entry can confer BLACK.
  */
 static virp_trust_tier_t onode_effective_max_tier(const onode_state_t *state,
                                                   uid_t client_uid)
@@ -875,12 +876,11 @@ static virp_trust_tier_t onode_effective_max_tier(const onode_state_t *state,
 
 /*
  * Where the effective ceiling that onode_effective_max_tier() returned came
- * from, for the audit record. "per-uid" only when this uid has a per-uid
- * entry AND that entry is at least as tight as the node-wide ceiling — a
- * LOOSER per-uid entry never binds, because the effective-ceiling helper
- * only tightens, so the node-wide ceiling is what actually decided. Mirrors
- * that helper's logic exactly so the recorded source can never disagree with
- * the recorded effective ceiling.
+ * from, for the audit record. "per-uid" whenever this uid has an explicit
+ * entry — tighter or looser than the node-wide ceiling, the entry is what
+ * decided — and "node-wide" otherwise. Mirrors that helper's logic exactly
+ * so the recorded source can never disagree with the recorded effective
+ * ceiling.
  */
 static const char *onode_ceiling_source(const onode_state_t *state,
                                         uid_t client_uid)
@@ -1215,8 +1215,8 @@ static virp_error_t gate_emit_execution(onode_state_t *state,
         cJSON_AddStringToObject(o, "classified_tier",
                                 gate_tier_name(gate_tier));
         /* Both ceilings: the node-wide one (what gate_rejection/1 records
-         * under this name) and the per-uid-tightened one that actually
-         * decided this execution. */
+         * under this name) and the effective one — the per-uid entry when
+         * this uid has one — that actually decided this execution. */
         cJSON_AddStringToObject(o, "gate_max_tier",
                                 gate_tier_name(state->gate_max_tier));
         cJSON_AddStringToObject(o, "effective_max_tier",
@@ -2720,12 +2720,12 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
      * with it (Phase C truth-fix). */
     {
         onode_gate_mode_t mode = policy_call.policy ? GATE_MODE_ENFORCE : gate_effective_mode(state, drv->name);
-        /* Effective ceiling = node-wide gate_max_tier, tightened by any
-         * per-uid ceiling for the connecting socket client. A remote
-         * requester capped at GREEN thus has YELLOW/RED blocked (and
-         * therefore proposal-only) while local operators keep the
-         * node-wide ceiling. client_uid == (uid_t)-1 (internal callers)
-         * leaves gate_max_tier unchanged. */
+        /* Effective ceiling = the connecting socket client's per-uid
+         * entry when it has one, else the node-wide gate_max_tier. A
+         * remote requester capped at GREEN thus has YELLOW/RED blocked
+         * (and therefore proposal-only) while uids without an entry keep
+         * the node-wide ceiling. client_uid == (uid_t)-1 (internal
+         * callers) leaves gate_max_tier unchanged. */
         virp_trust_tier_t eff_max = policy_call.policy ? policy_call.action.ceiling : onode_effective_max_tier(state, client_uid);
         bool block = gate_tier_blocks(gate_tier, eff_max);
 
@@ -2737,8 +2737,9 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
          * an ENFORCE rejection read like a logged-but-executed change.
          * BLACK logs "block" in BOTH modes — its refusal below is
          * unconditional, so there is nothing hypothetical to report.
-         * threshold= reports the EFFECTIVE ceiling (post per-uid tighten)
-         * so the log shows what actually decided this connection. */
+         * threshold= reports the EFFECTIVE ceiling (the per-uid entry
+         * when one applies) so the log shows what actually decided this
+         * connection. */
         fprintf(stderr,
                 "[GATE] mode=%s device=%s driver=%s tier=%s threshold=%s "
                 "uid=%ld decision=%s command=\"%s\"\n",
@@ -4094,9 +4095,13 @@ static int hex_nibble(char c)
  * that permanently fences off exactly them makes the system unable to do
  * the job it now exists to do. The self-lockout risk is real but it is a
  * TIER question, not a device question: every `config ...` on the
- * FortiGate is RED by absence in driver_fortigate.c's route table, so a
- * change already requires a signed human approval rather than an
- * autopilot decision.
+ * FortiGate is RED — by the explicit { "config", RED } row in
+ * driver_fortigate.c's route table, and a command that table does not
+ * list at all is RED too (fg_route_command's fail-closed default; both
+ * pinned by tests/test_driver_route_defaults.c). So a change already
+ * requires a signed human approval rather than an autopilot decision.
+ * That argument covers the FortiGate only: pve1 is governed by the
+ * linux driver's gate, not by this table.
  *
  * A NULL pointer with count 0 rather than an empty initializer: a
  * zero-length array initializer is a constraint violation under
@@ -6739,12 +6744,18 @@ virp_error_t onode_set_uid_ceilings(onode_state_t *state,
         return VIRP_ERR_NULL_PTR;
     if (count > ONODE_MAX_ALLOWED_UIDS)
         return VIRP_ERR_MESSAGE_TOO_LARGE;
+    /* Validate the WHOLE set before touching the table. This used to
+     * validate and store in one pass, so a bad tier at index N returned
+     * an error having already overwritten rows 0..N-1 of the live table
+     * — a refused call that still changed which ceiling a uid got. */
     for (size_t i = 0; i < count; i++) {
         /* Legacy ceilings can never confer BLACK authority. */
         if (tiers[i] != VIRP_TIER_GREEN &&
             tiers[i] != VIRP_TIER_YELLOW &&
             tiers[i] != VIRP_TIER_RED)
             return VIRP_ERR_INVALID_TYPE;
+    }
+    for (size_t i = 0; i < count; i++) {
         state->uid_ceiling_uids[i]  = uids[i];
         state->uid_ceiling_tiers[i] = tiers[i];
     }

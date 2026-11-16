@@ -302,8 +302,11 @@ typedef struct {
 
     /*
      * Per-uid gate policy (optional). An explicit row overrides the
-     * node-wide gate_max_tier and may raise or lower it. BLACK selects
-     * passthrough, including driver backstops; it is not a denial tier.
+     * node-wide gate_max_tier and may raise or lower it. A row is GREEN,
+     * YELLOW or RED. BLACK is NOT a ceiling: the per-uid BLACK
+     * passthrough is retired — onode_set_uid_ceilings() rejects it, the
+     * production loader refuses a config that asks for it, and BLACK is
+     * refused by the gate unconditionally, whatever the ceiling.
      * Without a row, callers use the node-wide default. The production
      * config loader requires every allowed UID to have a row when this
      * map is present. This policy authenticates a Unix UID, not human
@@ -676,9 +679,10 @@ virp_error_t onode_set_approvers(onode_state_t *state,
  */
 /*
  * client_uid — the SO_PEERCRED uid of the connecting socket client, used
- * to apply a per-uid tier ceiling (onode_effective_max_tier). Pass
- * (uid_t)-1 for internal / non-socket callers, which then get only the
- * node-wide gate_max_tier. The socket handler and the batch fan-out both
+ * to select that uid's tier ceiling (onode_effective_max_tier: an explicit
+ * per-uid row decides, tighter or looser; otherwise the node-wide one).
+ * Pass (uid_t)-1 for internal / non-socket callers, which then get only
+ * the node-wide gate_max_tier. The socket handler and the batch fan-out both
  * pass the real peer uid.
  */
 /*
@@ -745,9 +749,11 @@ virp_error_t onode_set_allowed_uids(onode_state_t *state,
                                     const uid_t *uids, size_t count);
 
 /*
- * Set per-uid tier ceilings. `uids[i]` is capped at `tiers[i]`
- * (GREEN/YELLOW/RED/BLACK; UNCLASSIFIED is rejected). Explicit rows
- * override the node-wide gate_max_tier; BLACK enables passthrough.
+ * Set per-uid tier ceilings. `uids[i]` is capped at `tiers[i]`, which
+ * must be GREEN, YELLOW or RED. UNCLASSIFIED and BLACK are rejected with
+ * VIRP_ERR_INVALID_TYPE and nothing is installed: the BLACK passthrough
+ * is retired and no ceiling can confer BLACK authority. Explicit rows
+ * override the node-wide gate_max_tier in both directions.
  * Replaces any existing entries. Returns
  * VIRP_ERR_MESSAGE_TOO_LARGE if `count` exceeds ONODE_MAX_ALLOWED_UIDS.
  */
@@ -836,9 +842,13 @@ onode_action_t onode_action_from_name(const char *name);
 int virp_hex_decode(const char *hex, uint8_t *out, size_t out_len);
 
 /*
- * Autopilot hard exclusions: 10.0.10.1 and 10.0.10.10 must never appear
- * in a device config. Boundary-aware scan of raw config text (so
- * 10.0.10.12 / 10.0.10.100 do not false-positive). Returns the blocked
+ * Autopilot hard exclusions: an address on the daemon's blocklist must
+ * never appear in a device config. The PRODUCTION list has been empty
+ * since 2026-09-08 (it held 10.0.10.1 and 10.0.10.10; see the note on
+ * ONODE_BLOCKED_ADDRS in virp_onode.c), so today this returns NULL for
+ * every input — the check and its severity are kept so re-arming is a
+ * one-line change. Boundary-aware scan of raw config text (so
+ * 10.0.10.12 / 10.0.10.100 would not false-positive on 10.0.10.1). Returns the blocked
  * address (static string) on a hit, NULL when clean. The file variant
  * reads up to 1 MiB of `path`; unreadable files return NULL — the
  * loader's own error handling covers those. Every config loader MUST

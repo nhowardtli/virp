@@ -259,7 +259,8 @@ static int load_socket_allowed_uids(onode_state_t *state,
  *   "socket_uid_tier_ceilings": { "993": "green", "1002": "yellow" }
  *
  * Keys are uid strings (matching how socket_allowed_uids may be given as
- * strings); values are "green"/"yellow"/"red"/"black". Absent object
+ * strings); values are "green"/"yellow"/"red". "black" is refused
+ * outright — the per-uid BLACK passthrough is retired. Absent object
  * preserves the node-wide default. A present map must cover every allowed
  * uid; malformed or incomplete policy refuses startup. Rows outside the
  * allowlist are retained with a warning and do not grant socket access.
@@ -310,7 +311,7 @@ static int load_uid_tier_ceilings(onode_state_t *state,
         }
         else {
             fprintf(stderr, "[O-Node] socket_uid_tier_ceilings['%s'] = '%s' "
-                            "unrecognized (want green/yellow/red/black) — "
+                            "unrecognized (want green/yellow/red) — "
                             "refusing\n", key, s);
             return -1;
         }

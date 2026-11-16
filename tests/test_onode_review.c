@@ -442,6 +442,66 @@ static void t_H2_executed_must_be_single_boolean(void)
 }
 
 /* =========================================================================
+ * H3 — tier consistency
+ *
+ * The route-table default (unmapped -> RED) is pinned across all five CLI
+ * drivers by tests/test_driver_route_defaults.c, which needs the driver
+ * objects. What can be pinned here, without them, is the ceiling
+ * contract the corrected comments now state: a per-uid row is GREEN,
+ * YELLOW or RED, decides in both directions, and a refused update leaves
+ * the table exactly as it was.
+ * ========================================================================= */
+
+static void t_H3_uid_ceiling_contract(void)
+{
+    printf("\n  H3: per-uid ceilings — authoritative, never BLACK, atomic update\n");
+    static onode_state_t st;
+    CHECK(onode_init(&st, 1, NULL, "/tmp/virp-review-unused.sock") == VIRP_OK,
+          "state initialised");
+    st.gate_max_tier = VIRP_TIER_YELLOW;
+
+    const uid_t uids[2] = { 4101, 4102 };
+    const virp_trust_tier_t ok[2] = { VIRP_TIER_GREEN, VIRP_TIER_RED };
+    CHECK(onode_set_uid_ceilings(&st, uids, ok, 2) == VIRP_OK,
+          "GREEN and RED rows install");
+    CHECK(onode_effective_max_tier(&st, 4101) == VIRP_TIER_GREEN &&
+          strcmp(onode_ceiling_source(&st, 4101), "per-uid") == 0,
+          "a TIGHTER row decides, and is recorded as per-uid");
+    CHECK(onode_effective_max_tier(&st, 4102) == VIRP_TIER_RED &&
+          strcmp(onode_ceiling_source(&st, 4102), "per-uid") == 0,
+          "a LOOSER row decides too, and is recorded as per-uid");
+    CHECK(onode_effective_max_tier(&st, 4199) == VIRP_TIER_YELLOW &&
+          strcmp(onode_ceiling_source(&st, 4199), "node-wide") == 0,
+          "a uid with no row gets the node-wide ceiling");
+    CHECK(onode_effective_max_tier(&st, (uid_t)-1) == VIRP_TIER_YELLOW,
+          "the internal caller gets the node-wide ceiling");
+
+    /* A refused update must not have moved anything: row 0 is valid and
+     * LOOSER than what is installed, row 1 is the retired BLACK. */
+    const virp_trust_tier_t bad[2] = { VIRP_TIER_RED, VIRP_TIER_BLACK };
+    CHECK(onode_set_uid_ceilings(&st, uids, bad, 2) == VIRP_ERR_INVALID_TYPE,
+          "a BLACK ceiling is rejected");
+    CHECK(onode_effective_max_tier(&st, 4101) == VIRP_TIER_GREEN,
+          "and the rejected call did not loosen the row before it");
+    const virp_trust_tier_t unc[1] = { VIRP_TIER_UNCLASSIFIED };
+    CHECK(onode_set_uid_ceilings(&st, uids, unc, 1) == VIRP_ERR_INVALID_TYPE,
+          "an UNCLASSIFIED ceiling is rejected");
+    CHECK(st.uid_ceiling_count == 2 &&
+          onode_effective_max_tier(&st, 4102) == VIRP_TIER_RED,
+          "the installed table is unchanged");
+
+    /* BLACK is outside the order: no ceiling admits it. */
+    CHECK(gate_tier_blocks(VIRP_TIER_BLACK, VIRP_TIER_RED) &&
+          gate_tier_blocks(VIRP_TIER_UNCLASSIFIED, VIRP_TIER_RED),
+          "BLACK and UNCLASSIFIED block under the highest ceiling");
+    CHECK(!gate_tier_blocks(VIRP_TIER_YELLOW, VIRP_TIER_YELLOW) &&
+          gate_tier_blocks(VIRP_TIER_YELLOW, VIRP_TIER_GREEN) &&
+          gate_tier_blocks(VIRP_TIER_RED, VIRP_TIER_YELLOW),
+          "YELLOW runs unapproved at a YELLOW ceiling, needs approval under GREEN; RED needs it under YELLOW");
+    onode_destroy(&st);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -451,6 +511,7 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_H1_second_apply_inside_ttl",         t_H1_second_apply_inside_ttl },
     { "t_H1_unspent_record_must_match_chain", t_H1_unspent_record_must_match_chain },
     { "t_H2_executed_must_be_single_boolean", t_H2_executed_must_be_single_boolean },
+    { "t_H3_uid_ceiling_contract",            t_H3_uid_ceiling_contract },
 };
 
 static void rm_rf_root(void)

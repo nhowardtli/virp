@@ -400,11 +400,17 @@ virp_trust_tier_t zm_route_path(const char *path);
  * YELLOW for the write is load-bearing, not a label. The node-wide
  * ceiling is YELLOW, but uid 993 (virp-netclaw, the remote requester)
  * carries a per-uid ceiling of GREEN in socket_uid_tier_ceilings, and
- * onode_effective_max_tier() only ever TIGHTENS. So a remote requester
- * hits gate_tier_blocks(YELLOW, GREEN) → blocked → proposal-only, and
- * cannot self-apply because it holds no approver key. A local operator
- * at the node-wide YELLOW ceiling can execute it directly. Demoting
- * this row to GREEN would hand the write to the remote path silently.
+ * an explicit per-uid row is what onode_effective_max_tier() returns.
+ * So a remote requester hits gate_tier_blocks(YELLOW, GREEN) → blocked
+ * → proposal-only, and cannot self-apply because it holds no approver
+ * key. A local operator whose ceiling is YELLOW or above can execute it
+ * directly. Demoting this row to GREEN would hand the write to the
+ * remote path silently.
+ *
+ * This rests on the CONFIG ROW, not on the code: since 2026-09-15 a
+ * per-uid row is authoritative in both directions, so the old "the
+ * helper only ever tightens" guarantee no longer exists. Raise 993's
+ * row to YELLOW and the remote requester executes this write directly.
  */
 virp_trust_tier_t zammad_gate_tier(const char *command);
 

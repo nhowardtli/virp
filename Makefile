@@ -1495,12 +1495,24 @@ proofs:
 # by timestamp).
 DRIVER_BUILD_DIR = build-drivers
 
+# Unmapped commands classify RED in all five table-driven CLI drivers
+# (security review H3). Pure classification, no device contact.
+$(BUILD_DIR)/test_driver_route_defaults: tests/test_driver_route_defaults.c $(LIB)
+	@test -n "$(ASA)" -a -n "$(JUNIPER)" -a -n "$(FORTIGATE)" -a -n "$(PANOS)" -a -n "$(CISCO)" || \
+	    { echo "ERROR: test-route-defaults needs CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 (run: make test-drivers)"; exit 1; }
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+.PHONY: test-route-defaults
+test-route-defaults: $(BUILD_DIR)/test_driver_route_defaults
+	./$(BUILD_DIR)/test_driver_route_defaults
+
 .PHONY: test-drivers
 test-drivers:
-	@echo "=== driver test suites (cisco, cisco-io, cisco-reconnect, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, zammad-gate, typed-hash, ingress-nul, pbs-trunc) ==="
+	@echo "=== driver test suites (cisco, cisco-io, cisco-reconnect, cisco-gate, linux-gate, juniper, asa, panos, fortigate, wazuh, librenms, pbs, pbs-gate, zammad-gate, typed-hash, ingress-nul, pbs-trunc, route-defaults) ==="
 	$(MAKE) BUILD_DIR=$(DRIVER_BUILD_DIR) CISCO=1 PANOS=1 ASA=1 JUNIPER=1 FORTIGATE=1 LINUX=1 WAZUH=1 LIBRENMS=1 PBS=1 ZAMMAD=1 \
 	        test-cisco test-cisco-io test-cisco-reconnect test-cisco-gate test-linux-gate test-juniper test-asa test-panos test-fortigate test-wazuh test-librenms \
-	        test-pbs test-pbs-gate test-zammad-gate test-typed-hash test-ingress-nul test-pbs-trunc test-cisco-description
+	        test-pbs test-pbs-gate test-zammad-gate test-typed-hash test-ingress-nul test-pbs-trunc test-cisco-description \
+	        test-route-defaults
 
 # Live-contact fence — STRUCTURAL, not a list of known targets.
 #
