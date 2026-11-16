@@ -10,6 +10,9 @@
 #   - the usage text no longer claims a key is generated "if the file
 #     doesn't exist" (it never was), and documents -O, the observation key
 #     that -3 no longer shares with the chain-signing key.
+# M26:
+#   - main() loads its config with the production loader and does not
+#     assign evidence_required afterwards.
 #
 # Every check here must be answerable by the binary ALONE: no config file,
 # no keys, no socket, no root. That is why the -k check sits ahead of the
@@ -52,6 +55,23 @@ if [ "$rc" -ne 0 ] && ! echo "$out" | grep -q 'requires -k'; then
     ok "with -k given, the -k refusal does not fire"
 else
     bad "with -k given, the daemon still complained about -k (rc=$rc)"
+fi
+
+# ---- main() no longer overrules the config (M26) ----------------------------
+# "evidence_required": false is refused by the production LOADER
+# (load_devices_production — unit-tested in test_onode_review.c). What only
+# the source can show is that main() does not force the flag afterwards:
+# that override is how a config saying false used to run as true.
+SRC="$(dirname "$0")/../src/virp_onode_prod.c"
+if grep -Eq 'g_state\.evidence_required[[:space:]]*=' "$SRC"; then
+    bad "main() still assigns g_state.evidence_required (the silent override)"
+else
+    ok "main() does not assign evidence_required after loading the config"
+fi
+if grep -q 'load_devices_production(&g_state' "$SRC"; then
+    ok "main() loads its config through the production loader"
+else
+    bad "main() does not call load_devices_production()"
 fi
 
 # ---- usage text ------------------------------------------------------------

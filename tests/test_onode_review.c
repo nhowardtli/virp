@@ -39,6 +39,7 @@ static int review_pthread_create(pthread_t *t, const pthread_attr_t *a,
 extern void virp_driver_mock_init(void);
 /* The production config loader (virp_onode_prod.c, linked NO_MAIN). */
 extern int load_devices(onode_state_t *state, const char *path);
+extern int load_devices_production(onode_state_t *state, const char *path);
 extern int  virp_driver_mock_exec_attempts_reset(void);
 
 /* Fail the Nth creation from now (1 = the next one); 0 = never. */
@@ -3343,6 +3344,56 @@ static void t_M25_declared_empty_protected_vmids_is_fatal(void)
 }
 
 /* =========================================================================
+ * M26 — production refuses "evidence_required": false
+ * ========================================================================= */
+
+static int cfg_load_production(const char *name, const char *json,
+                               onode_state_t *st)
+{
+    char path[200];
+    snprintf(path, sizeof(path), "%s/%s.json", g_root, name);
+    FILE *f = fopen(path, "w");
+    if (!f) return -99;
+    fputs(json, f);
+    fclose(f);
+    if (onode_init(st, 1, NULL, "/tmp/virp-review-unused.sock") != VIRP_OK)
+        return -98;
+    return load_devices_production(st, path);
+}
+
+static void t_M26_production_refuses_evidence_required_false(void)
+{
+    printf("\n  M26: the production loader refuses evidence_required=false\n");
+    static onode_state_t st;
+
+    CHECK(cfg_load_production("m26-false",
+              "{\"evidence_required\":false,\"devices\":[]}", &st) == -1,
+          "production: \"evidence_required\": false is a fatal config error");
+    CHECK(st.evidence_required,
+          "and the refused load did not clear the flag on its way out");
+    onode_destroy(&st);
+
+    CHECK(cfg_load_production("m26-true",
+              "{\"evidence_required\":true,\"devices\":[]}", &st) == 0 &&
+          st.evidence_required, "production: true loads");
+    onode_destroy(&st);
+    CHECK(cfg_load_production("m26-absent", "{\"devices\":[]}", &st) == 0 &&
+          st.evidence_required,
+          "production: absent keeps the compiled-in true");
+    onode_destroy(&st);
+    CHECK(cfg_load_production("m26-string",
+              "{\"evidence_required\":\"false\",\"devices\":[]}", &st) == -1,
+          "production: a non-boolean is fatal, as it always was");
+    onode_destroy(&st);
+
+    /* The lab loader keeps the documented opt-out. */
+    CHECK(cfg_load("m26-lab", "{\"evidence_required\":false,\"devices\":[]}",
+                   &st) == 0 && !st.evidence_required,
+          "lab loader: false is still accepted (mock daemon, fixtures)");
+    onode_destroy(&st);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -3406,6 +3457,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M24_uid_keys_are_parsed_strictly",   t_M24_uid_keys_are_parsed_strictly },
     { "t_M25_declared_empty_protected_vmids_is_fatal",
                                               t_M25_declared_empty_protected_vmids_is_fatal },
+    { "t_M26_production_refuses_evidence_required_false",
+                                              t_M26_production_refuses_evidence_required_false },
     { "t_M18_shutdown_wakes_the_accept_loop", t_M18_shutdown_wakes_the_accept_loop },
     { "t_M18_shutdown_from_signal_handler",   t_M18_shutdown_from_signal_handler },
     { "t_M18_shutdown_before_start_is_not_lost",

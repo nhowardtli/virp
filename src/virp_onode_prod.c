@@ -652,9 +652,10 @@ static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
  *                        with evidence required and no chain.
  *                        false: record after the fact, best-effort (the
  *                        pre-Task-5 shape); every dispatch logs a WARNING
- *                        that it ran without a durable record. A value
- *                        that is not a JSON boolean is logged and IGNORED
- *                        — the default stays true (fail closed).
+ *                        that it ran without a durable record. LAB ONLY:
+ *                        the production loader refuses false (M26). A
+ *                        value that is not a JSON boolean is FATAL in
+ *                        both.
  *
  * Absent keys leave the onode_init() defaults (ENFORCE default / no
  * overrides / YELLOW / evidence required) in place. A key that is
@@ -662,7 +663,8 @@ static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
  * unrecognized string, more gate_modes entries than fit — is FATAL
  * (security review M23): nothing here falls back to a default.
  */
-static int load_gate_config(onode_state_t *state, struct json_object *root)
+static int load_gate_config(onode_state_t *state, struct json_object *root,
+                            bool production)
 {
     struct json_object *v;
 
@@ -777,8 +779,31 @@ static int load_gate_config(onode_state_t *state, struct json_object *root)
      * a string "false", a 0, or a typo keeps the compiled-in true. */
     if (json_object_object_get_ex(root, "evidence_required", &v)) {
         if (json_object_is_type(v, json_type_boolean)) {
-            state->evidence_required = json_object_get_boolean(v) ? true
-                                                                  : false;
+            bool want = json_object_get_boolean(v) ? true : false;
+            /*
+             * PRODUCTION DOES NOT RUN WITHOUT EVIDENCE (security review
+             * M26). virp-onode-prod's main() used to follow the load by
+             * assigning true to this field — so a config saying false
+             * was accepted, logged the WARNING below ("executions
+             * will be recorded AFTER the device acts"), and was then
+             * silently overruled. The outcome was the safe one, but the
+             * operator had been told the opposite of what the daemon
+             * did, and a file that says false while the node runs true
+             * is a file nobody can trust on the next line either. The
+             * override is gone; in production the value is refused
+             * instead, so the posture in the file is the posture
+             * running. The lab loaders (the mock daemon, the test
+             * fixtures) keep the opt-out, with its warning.
+             */
+            if (!want && production) {
+                fprintf(stderr, "[O-Node] FATAL: \"evidence_required\": "
+                        "false is not accepted by the production daemon. "
+                        "Every execution must be preceded by a durable "
+                        "pre-execution record. Remove the key or set it to "
+                        "true. Refusing to load the config.\n");
+                return -1;
+            }
+            state->evidence_required = want;
             if (!state->evidence_required)
                 fprintf(stderr, "[O-Node] WARNING: evidence_required=false "
                         "— executions will be recorded AFTER the device "
@@ -867,11 +892,12 @@ static const char *unknown_top_level_key(struct json_object *root)
 }
 
 /*
- * Not static: the issue #7 regression test in tests/test_onode.c links
- * against the prod parser (via the *_lib.o object compiled with
- * VIRP_ONODE_PROD_NO_MAIN) and calls this directly.
+ * The loader itself. `production` selects the production posture rules
+ * — today, that "evidence_required": false is refused (M26). Reached
+ * through the two wrappers below, never directly.
  */
-int load_devices(onode_state_t *state, const char *path)
+static int load_devices_impl(onode_state_t *state, const char *path,
+                             bool production)
 {
     /* Autopilot hard exclusion — non-negotiable: refuse the entire
      * config if it mentions a blocked address anywhere. */
@@ -962,7 +988,7 @@ int load_devices(onode_state_t *state, const char *path)
      * from config if present. Installed before onode_start(). A strict
      * failure here (e.g. a non-boolean evidence_required, 1.4) aborts the
      * load rather than running with a guessed posture. */
-    if (load_gate_config(state, root) != 0) {
+    if (load_gate_config(state, root, production) != 0) {
         json_object_put(root);
         return -1;
     }
@@ -1465,6 +1491,31 @@ int load_devices(onode_state_t *state, const char *path)
 }
 
 /*
+ * LAB loader: the mock demonstration daemon and the test fixtures. Accepts
+ * everything load_devices_production() does, plus the documented opt-out
+ * "evidence_required": false.
+ *
+ * Not static: the issue #7 regression test in tests/test_onode.c links
+ * against the prod parser (via the *_lib.o object compiled with
+ * VIRP_ONODE_PROD_NO_MAIN) and calls this directly.
+ */
+int load_devices(onode_state_t *state, const char *path)
+{
+    return load_devices_impl(state, path, false);
+}
+
+/*
+ * PRODUCTION loader — what virp-onode-prod's main() calls. Identical to
+ * load_devices() except that a config asking for
+ * "evidence_required": false is a fatal error (M26). Not static, so the
+ * rule is testable without running main().
+ */
+int load_devices_production(onode_state_t *state, const char *path)
+{
+    return load_devices_impl(state, path, true);
+}
+
+/*
  * Trust chain (Primitive 6) + approval flow startup.
  *
  * Invariant enforced here: approval mode NEVER runs without a working
@@ -1846,16 +1897,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Load devices from JSON config */
-    int loaded = load_devices(&g_state, devices_path);
+    /* Load devices from JSON config — the PRODUCTION loader, which
+     * refuses "evidence_required": false outright (M26). There is
+     * deliberately no assignment to evidence_required after this: it is
+     * true because onode_init() set it and the loader would not clear
+     * it, not because main() overruled the file. */
+    int loaded = load_devices_production(&g_state, devices_path);
     if (loaded <= 0) {
         fprintf(stderr, "[O-Node] No devices loaded. Exiting.\n");
         onode_destroy(&g_state);
         virp_context_destroy(ctx);
         return 1;
     }
-
-    g_state.evidence_required = true;
 
     /*
      * Trust chain (Primitive 6) + approval flow. Fatal if approval mode
