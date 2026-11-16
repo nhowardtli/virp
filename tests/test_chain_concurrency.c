@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include <pthread.h>
 
 #define NUM_APPENDERS   16
@@ -35,7 +36,10 @@ static const char *DB  = "/tmp/virp_test_chain_conc.db";
 static const char *KEY = "/tmp/virp_test_chain_conc.key";
 
 static virp_chain_state_t g_chain;
-static volatile int g_appends_running = 1;
+/* atomic, not volatile: main clears this while the readers poll it, which
+ * is a data race ThreadSanitizer reports — and a report from the harness
+ * would mask one from the chain under test (make tsan-test). */
+static atomic_int g_appends_running = 1;
 
 typedef struct { int tid; } warg_t;
 

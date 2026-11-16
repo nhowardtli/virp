@@ -2339,6 +2339,32 @@ asan-test:
 	@echo "=== cleaning instrumented build/ so later plain builds are safe ==="
 	$(MAKE) --no-print-directory clean
 
+# ThreadSanitizer over the threaded suites: concurrent onode_execute
+# against a disrupted connection, and concurrent chain append / verify /
+# artifact-store. Separate object tree (build-tsan/) — TSan and ASan
+# cannot share one, and instrumented objects must not leak into build/.
+#
+# TSAN_RUN disables ASLR for the test process. With the kernel's default
+# mmap entropy (vm.mmap_rnd_bits=32 on current distro kernels) gcc's
+# libtsan aborts at startup with "FATAL: ThreadSanitizer: unexpected
+# memory mapping" before a single test line runs; `setarch -R` is the
+# per-process fix and needs no sysctl. Override TSAN_RUN= (empty) on a
+# toolchain that does not need it.
+#
+# halt_on_error=1: a race is a failure, not a log line.
+TSAN_RUN ?= setarch $(shell uname -m) -R
+.PHONY: tsan-test
+tsan-test:
+	rm -rf build-tsan
+	$(MAKE) BUILD_DIR=build-tsan CC=gcc \
+	        CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+	        LDFLAGS_EXTRA="-fsanitize=thread" \
+	        build-tsan/test_onode_concurrency build-tsan/test_chain_concurrency
+	@echo "=== Running threaded suites under ThreadSanitizer ==="
+	TSAN_OPTIONS=halt_on_error=1 $(TSAN_RUN) ./build-tsan/test_onode_concurrency
+	TSAN_OPTIONS=halt_on_error=1 $(TSAN_RUN) ./build-tsan/test_chain_concurrency
+	@echo "=== ThreadSanitizer run complete ==="
+
 # Driver suites under ASan+UBSan. Separate from asan-test because the
 # driver objects need their -D guards, which are evaluated at Makefile
 # parse time and so require a recursive $(MAKE) with the flags set.
