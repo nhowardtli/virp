@@ -3158,6 +3158,76 @@ static void t_M22_shipped_templates_still_load(void)
 }
 
 /* =========================================================================
+ * M23 — a gate key the loader cannot use is fatal, not defaulted
+ * ========================================================================= */
+
+static void t_M23_gate_config_values_are_strict(void)
+{
+    printf("\n  M23: unusable gate_max_tier / gate_default_mode / gate_modes are fatal\n");
+    static const struct { const char *json; const char *what; } BAD[] = {
+        { "{\"gate_max_tier\":\"grren\",\"devices\":[]}",
+          "a misspelled gate_max_tier (was: silently YELLOW)" },
+        { "{\"gate_max_tier\":\"green \",\"devices\":[]}",
+          "gate_max_tier with trailing space" },
+        { "{\"gate_max_tier\":1,\"devices\":[]}",
+          "a numeric gate_max_tier (was: silently ignored)" },
+        { "{\"gate_max_tier\":\"black\",\"devices\":[]}",
+          "gate_max_tier \"black\"" },
+        { "{\"gate_default_mode\":\"shadoww\",\"devices\":[]}",
+          "a misspelled gate_default_mode" },
+        { "{\"gate_default_mode\":true,\"devices\":[]}",
+          "a boolean gate_default_mode" },
+        { "{\"gate_mode\":\"enforced\",\"devices\":[]}",
+          "a misspelled gate_mode (deprecated alias)" },
+        { "{\"gate_default_mode\":\"enforce\",\"gate_mode\":\"shadow\","
+          "\"devices\":[]}",
+          "gate_default_mode and gate_mode together" },
+        { "{\"gate_modes\":{\"linux\":\"shdow\"},\"devices\":[]}",
+          "a misspelled gate_modes value (was: ignored)" },
+        { "{\"gate_modes\":{\"linux\":1},\"devices\":[]}",
+          "a numeric gate_modes value (was: skipped)" },
+        { "{\"gate_modes\":[\"linux\"],\"devices\":[]}",
+          "gate_modes that is not an object" },
+        { "{\"gate_modes\":\"shadow\",\"devices\":[]}",
+          "gate_modes that is a string" },
+    };
+    for (size_t i = 0; i < sizeof(BAD) / sizeof(BAD[0]); i++) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "refused: %s", BAD[i].what);
+        CHECK(cfg_load("m23-bad", BAD[i].json, NULL) == -1, msg);
+    }
+
+    /* More overrides than the table holds: the extras used to be dropped. */
+    char many[2048];
+    size_t off = (size_t)snprintf(many, sizeof(many), "{\"gate_modes\":{");
+    for (int i = 0; i <= ONODE_MAX_GATE_OVERRIDES; i++)
+        off += (size_t)snprintf(many + off, sizeof(many) - off,
+                                "%s\"drv%d\":\"shadow\"", i ? "," : "", i);
+    snprintf(many + off, sizeof(many) - off, "},\"devices\":[]}");
+    CHECK(cfg_load("m23-many", many, NULL) == -1,
+          "refused: more gate_modes entries than fit (was: extras dropped)");
+
+    /* Valid values still load and take effect. */
+    static onode_state_t st;
+    CHECK(cfg_load("m23-ok",
+                   "{\"gate_max_tier\":\"GREEN\","
+                   "\"gate_default_mode\":\"shadow\","
+                   "\"gate_modes\":{\"linux\":\"enforce\",\"mock\":\"shadow\"},"
+                   "\"devices\":[]}", &st) == 0 &&
+          st.gate_max_tier == VIRP_TIER_GREEN &&
+          st.gate_default_mode == GATE_MODE_SHADOW &&
+          st.gate_overrides_count == 2 &&
+          gate_effective_mode(&st, "linux") == GATE_MODE_ENFORCE &&
+          gate_effective_mode(&st, "juniper") == GATE_MODE_SHADOW,
+          "well-formed gate keys load and apply (case-insensitive values)");
+    onode_destroy(&st);
+    CHECK(cfg_load("m23-alias", "{\"gate_mode\":\"shadow\",\"devices\":[]}",
+                   &st) == 0 && st.gate_default_mode == GATE_MODE_SHADOW,
+          "the deprecated gate_mode alias still works on its own");
+    onode_destroy(&st);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -3217,6 +3287,7 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M22_explicit_allowlist_requires_ceilings",
                                               t_M22_explicit_allowlist_requires_ceilings },
     { "t_M22_shipped_templates_still_load",   t_M22_shipped_templates_still_load },
+    { "t_M23_gate_config_values_are_strict",  t_M23_gate_config_values_are_strict },
     { "t_M18_shutdown_wakes_the_accept_loop", t_M18_shutdown_wakes_the_accept_loop },
     { "t_M18_shutdown_from_signal_handler",   t_M18_shutdown_from_signal_handler },
     { "t_M18_shutdown_before_start_is_not_lost",

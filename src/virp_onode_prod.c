@@ -589,59 +589,114 @@ static bool parse_gate_mode(const char *s, onode_gate_mode_t *out)
  *                        — the default stays true (fail closed).
  *
  * Absent keys leave the onode_init() defaults (ENFORCE default / no
- * overrides / YELLOW / evidence required) in place. Unrecognized values
- * are logged and ignored.
+ * overrides / YELLOW / evidence required) in place. A key that is
+ * PRESENT with a value this loader cannot use — wrong JSON type, an
+ * unrecognized string, more gate_modes entries than fit — is FATAL
+ * (security review M23): nothing here falls back to a default.
  */
 static int load_gate_config(onode_state_t *state, struct json_object *root)
 {
     struct json_object *v;
 
+    /*
+     * STRICT (security review M23). Each of the three gate keys used to
+     * tolerate a value it could not use: a wrong JSON type was skipped
+     * without a word, and an unrecognized string was logged and the
+     * default kept. For gate_max_tier the default is YELLOW, so
+     * "gate_max_tier": "grren" — or 1, or "GREEN " with a trailing space
+     * — ran the node one tier LOOSER than the operator wrote. For
+     * gate_modes a misspelled or mistyped entry left that driver on the
+     * default mode, and an entry past the override limit was dropped.
+     * The same reasoning as evidence_required below (1.4): a posture key
+     * means exactly what it says or the daemon does not load.
+     */
+
     /* Max tier. */
-    if (json_object_object_get_ex(root, "gate_max_tier", &v) &&
-        json_object_is_type(v, json_type_string)) {
-        const char *s = json_object_get_string(v);
-        if      (strcasecmp(s, "green")  == 0) state->gate_max_tier = VIRP_TIER_GREEN;
-        else if (strcasecmp(s, "yellow") == 0) state->gate_max_tier = VIRP_TIER_YELLOW;
-        else if (strcasecmp(s, "red")    == 0) state->gate_max_tier = VIRP_TIER_RED;
-        else fprintf(stderr, "[O-Node] gate_max_tier '%s' unrecognized — "
-                             "keeping YELLOW\n", s);
+    if (json_object_object_get_ex(root, "gate_max_tier", &v)) {
+        const char *s = json_object_is_type(v, json_type_string)
+                      ? json_object_get_string(v) : NULL;
+        if      (s && strcasecmp(s, "green")  == 0) state->gate_max_tier = VIRP_TIER_GREEN;
+        else if (s && strcasecmp(s, "yellow") == 0) state->gate_max_tier = VIRP_TIER_YELLOW;
+        else if (s && strcasecmp(s, "red")    == 0) state->gate_max_tier = VIRP_TIER_RED;
+        else {
+            fprintf(stderr, "[O-Node] FATAL: gate_max_tier must be \"green\", "
+                    "\"yellow\" or \"red\"; got %s%s%s. Refusing to load "
+                    "the config rather than fall back to YELLOW.\n",
+                    s ? "\"" : "", s ? s
+                        : json_type_to_name(json_object_get_type(v)),
+                    s ? "\"" : "");
+            return -1;
+        }
     }
 
-    /* Default mode: gate_default_mode (canonical) or gate_mode (deprecated). */
-    if (json_object_object_get_ex(root, "gate_default_mode", &v) &&
-        json_object_is_type(v, json_type_string)) {
-        const char *s = json_object_get_string(v);
-        if (!parse_gate_mode(s, &state->gate_default_mode))
-            fprintf(stderr, "[O-Node] gate_default_mode '%s' unrecognized — "
-                            "keeping ENFORCE default\n", s);
-    } else if (json_object_object_get_ex(root, "gate_mode", &v) &&
-               json_object_is_type(v, json_type_string)) {
-        const char *s = json_object_get_string(v);
-        if (parse_gate_mode(s, &state->gate_default_mode))
-            fprintf(stderr, "[O-Node] gate_mode is deprecated — "
-                            "use gate_default_mode\n");
-        else
-            fprintf(stderr, "[O-Node] gate_mode '%s' unrecognized — "
-                            "keeping ENFORCE default\n", s);
+    /* Default mode: gate_default_mode (canonical) or gate_mode (deprecated).
+     * Giving both is refused: two keys for one setting is a config that
+     * can disagree with itself. */
+    {
+        struct json_object *canon = NULL, *alias = NULL;
+        bool has_canon = json_object_object_get_ex(root, "gate_default_mode",
+                                                   &canon);
+        bool has_alias = json_object_object_get_ex(root, "gate_mode", &alias);
+        if (has_canon && has_alias) {
+            fprintf(stderr, "[O-Node] FATAL: both gate_default_mode and its "
+                    "deprecated alias gate_mode are set — keep "
+                    "gate_default_mode only. Refusing to load the config.\n");
+            return -1;
+        }
+        if (has_canon || has_alias) {
+            const char *name = has_canon ? "gate_default_mode" : "gate_mode";
+            v = has_canon ? canon : alias;
+            const char *s = json_object_is_type(v, json_type_string)
+                          ? json_object_get_string(v) : NULL;
+            if (!s || !parse_gate_mode(s, &state->gate_default_mode)) {
+                fprintf(stderr, "[O-Node] FATAL: %s must be \"enforce\" or "
+                        "\"shadow\"; got %s%s%s. Refusing to load the "
+                        "config.\n", name, s ? "\"" : "",
+                        s ? s : json_type_to_name(json_object_get_type(v)),
+                        s ? "\"" : "");
+                return -1;
+            }
+            if (has_alias)
+                fprintf(stderr, "[O-Node] gate_mode is deprecated — "
+                                "use gate_default_mode\n");
+        }
     }
 
     /* Per-driver overrides. */
-    if (json_object_object_get_ex(root, "gate_modes", &v) &&
-        json_object_is_type(v, json_type_object)) {
+    if (json_object_object_get_ex(root, "gate_modes", &v)) {
+        if (!json_object_is_type(v, json_type_object)) {
+            fprintf(stderr, "[O-Node] FATAL: gate_modes must be an object "
+                    "mapping driver names to \"enforce\"/\"shadow\"; got "
+                    "%s. Refusing to load the config.\n",
+                    json_type_to_name(json_object_get_type(v)));
+            return -1;
+        }
         json_object_object_foreach(v, drv_name, mode_obj) {
-            if (!json_object_is_type(mode_obj, json_type_string))
-                continue;
-            if (state->gate_overrides_count >= ONODE_MAX_GATE_OVERRIDES) {
-                fprintf(stderr, "[O-Node] gate_modes: override limit reached, "
-                                "ignoring '%s'\n", drv_name);
-                continue;
-            }
+            const char *ms = json_object_is_type(mode_obj, json_type_string)
+                           ? json_object_get_string(mode_obj) : NULL;
             onode_gate_mode_t m;
-            const char *ms = json_object_get_string(mode_obj);
-            if (!parse_gate_mode(ms, &m)) {
-                fprintf(stderr, "[O-Node] gate_modes['%s']='%s' unrecognized — "
-                                "ignoring\n", drv_name, ms);
-                continue;
+            if (!ms || !parse_gate_mode(ms, &m)) {
+                fprintf(stderr, "[O-Node] FATAL: gate_modes[\"%s\"] must be "
+                        "\"enforce\" or \"shadow\"; got %s%s%s. Refusing to "
+                        "load the config.\n", drv_name, ms ? "\"" : "",
+                        ms ? ms
+                           : json_type_to_name(json_object_get_type(mode_obj)),
+                        ms ? "\"" : "");
+                return -1;
+            }
+            if (state->gate_overrides_count >= ONODE_MAX_GATE_OVERRIDES) {
+                fprintf(stderr, "[O-Node] FATAL: gate_modes has more than %d "
+                        "entries; \"%s\" would be dropped and run under the "
+                        "default mode. Refusing to load the config.\n",
+                        ONODE_MAX_GATE_OVERRIDES, drv_name);
+                return -1;
+            }
+            if (strlen(drv_name) >=
+                    sizeof(state->gate_overrides[0].driver)) {
+                fprintf(stderr, "[O-Node] FATAL: gate_modes key \"%s\" is "
+                        "longer than any driver name. Refusing to load the "
+                        "config.\n", drv_name);
+                return -1;
             }
             size_t idx = state->gate_overrides_count++;
             snprintf(state->gate_overrides[idx].driver,
