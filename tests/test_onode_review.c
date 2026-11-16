@@ -21,11 +21,12 @@
 /* Thread-creation seam (see ONODE_PTHREAD_CREATE in the daemon source):
  * every pthread_create the daemon makes goes through this, so a test can
  * make the Nth one fail. Declared before the daemon source is included. */
-#define _POSIX_C_SOURCE 200809L   /* the same two the daemon source sets; */
-#define _GNU_SOURCE               /* they must precede the first header   */
-#include <pthread.h>
-static int review_pthread_create(pthread_t *t, const pthread_attr_t *a,
-                                 void *(*fn)(void *), void *arg);
+/* Only the macro, and NO header before the daemon source: that source
+ * sets its own feature-test macros and they must be the first thing the
+ * C library sees. (Including <pthread.h> here first made glibc >= 2.41
+ * pick a newer _POSIX_C_SOURCE under _GNU_SOURCE, which the source's own
+ * #define then "redefined" — a -Werror build failure on the CI runner
+ * that an older glibc never showed.) The source declares the prototype. */
 #define ONODE_PTHREAD_CREATE review_pthread_create
 
 #include "../src/virp_onode.c"

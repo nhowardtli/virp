@@ -4952,7 +4952,12 @@ static virp_error_t onode_list_fleet(onode_state_t *state,
  * not give us a thread" is otherwise untestable and is exactly the case
  * the batch path used to get wrong (security review M17).
  */
-#ifndef ONODE_PTHREAD_CREATE
+#ifdef ONODE_PTHREAD_CREATE
+/* Declared here rather than by the test, so the test needs no header
+ * ahead of this file's feature-test macros. */
+static int ONODE_PTHREAD_CREATE(pthread_t *t, const pthread_attr_t *a,
+                                void *(*fn)(void *), void *arg);
+#else
 #define ONODE_PTHREAD_CREATE pthread_create
 #endif
 
