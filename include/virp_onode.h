@@ -46,7 +46,10 @@ const char *onode_health_command(virp_vendor_t vendor);
 #define ONODE_SOCKET_PATH       "/run/virp/onode.sock"
 #define ONODE_HEARTBEAT_SEC     30
 #define ONODE_MAX_CLIENTS       8
-#define ONODE_RECV_TIMEOUT_SEC  5
+#define ONODE_RECV_TIMEOUT_SEC  5   /* ONE deadline for a whole request
+                                       frame, header to last byte */
+#define ONODE_SEND_TIMEOUT_SEC  10  /* a peer that stops reading its
+                                       response is abandoned after this */
 #define ONODE_MAX_REQUEST_SIZE  131072
 #define ONODE_MAX_ALLOWED_UIDS  16
 #define ONODE_MAX_UID_CAPP_TYPES 16 /* max chain_append types per uid (v0.2.1) */
@@ -71,6 +74,21 @@ const char *onode_health_command(virp_vendor_t vendor);
  */
 #ifndef ONODE_MAX_WORKERS
 #define ONODE_MAX_WORKERS       32
+#endif
+
+/*
+ * Per-uid share of the worker pool (security review M14). The pool cap
+ * above is global, so one allowed uid could hold all of it — by design
+ * or by a stuck client library — and every other principal's
+ * connections were then closed at accept. No single uid may hold more
+ * than this many workers at once; a connection over the cap is closed
+ * at accept exactly like a saturated pool. Half the pool by default:
+ * far above any legitimate client's fan-out (batch_execute multiplexes
+ * inside ONE connection), and it always leaves room for someone else.
+ * Override at build time with -DONODE_MAX_WORKERS_PER_UID=N.
+ */
+#ifndef ONODE_MAX_WORKERS_PER_UID
+#define ONODE_MAX_WORKERS_PER_UID (ONODE_MAX_WORKERS / 2)
 #endif
 
 /*
@@ -495,6 +513,35 @@ typedef struct {
     uint32_t            workers_rejected;   /* saturated-pool rejections */
     bool                drain_failed;       /* drain timed out; leak, don't free */
 
+    /*
+     * Live workers per peer uid (M14), under state_mutex. A slot is
+     * claimed by onode_worker_admit() at accept and returned by
+     * onode_worker_release() when the worker ends; a slot whose count is
+     * zero is free for another uid. Sized by the pool, not by the
+     * allowlist: at most ONODE_MAX_WORKERS workers are live, so at most
+     * that many distinct uids can hold one.
+     */
+    struct {
+        uid_t       uid;
+        uint32_t    live;
+    }                   worker_uid_live[ONODE_MAX_WORKERS];
+    uint32_t            workers_rejected_uid_cap;
+
+    /*
+     * Client I/O bounds in milliseconds (M14). onode_init() sets them
+     * from ONODE_RECV_TIMEOUT_SEC / ONODE_SEND_TIMEOUT_SEC; they are
+     * fields rather than constants only so a test can shorten them.
+     *   request_deadline_ms  ONE absolute deadline for receiving a whole
+     *                        request frame. It used to be a per-recv()
+     *                        timeout, which a peer sending one byte every
+     *                        few seconds never tripped.
+     *   send_timeout_ms      SO_SNDTIMEO on the client socket: a peer
+     *                        that stops reading is abandoned instead of
+     *                        pinning its worker until restart.
+     */
+    uint32_t            request_deadline_ms;
+    uint32_t            send_timeout_ms;
+
     /* Runtime */
     bool                running;
     uint32_t            uptime_start;   /* time(NULL) at startup */
@@ -617,6 +664,18 @@ virp_error_t onode_start(onode_state_t *state);
  * onode_destroy() clears watchdog_running and joins the thread.
  */
 virp_error_t onode_watchdog_start(onode_state_t *state);
+
+/*
+ * Per-uid worker accounting (M14). onode_worker_admit() returns false —
+ * and counts nothing — when `uid` already holds
+ * ONODE_MAX_WORKERS_PER_UID workers; otherwise it claims one and returns
+ * true, and the caller owes exactly one onode_worker_release(uid). The
+ * accept loop calls admit before spawning and the worker (or the
+ * spawn-failure path) calls release. Exposed so the cap can be tested
+ * without a listening socket.
+ */
+bool onode_worker_admit(onode_state_t *state, uid_t uid);
+void onode_worker_release(onode_state_t *state, uid_t uid);
 
 /*
  * Signal the O-Node to shut down gracefully.

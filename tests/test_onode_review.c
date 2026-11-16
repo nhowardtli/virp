@@ -23,6 +23,7 @@
 #include "virp_federation.h"
 #include <assert.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
 
 extern void virp_driver_mock_init(void);
@@ -2147,6 +2148,242 @@ static void t_M13_proposal_id_survives_long_command(void)
 }
 
 /* =========================================================================
+ * M14 — bounded client I/O and a per-uid share of the worker pool
+ * ========================================================================= */
+
+static int64_t m14_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+typedef struct { int fd; int bytes; int gap_ms; } m14_drip_t;
+
+/* Send one byte every gap_ms — each well inside a per-read timeout. */
+static void *m14_drip(void *arg)
+{
+    m14_drip_t *d = arg;
+    for (int i = 0; i < d->bytes; i++) {
+        struct timespec gap = { 0, (long)d->gap_ms * 1000000L };
+        nanosleep(&gap, NULL);
+        if (send(d->fd, "x", 1, MSG_NOSIGNAL) != 1) break;
+    }
+    return NULL;
+}
+
+static void t_M14_request_deadline_is_absolute(void)
+{
+    printf("\n  M14: a slow sender cannot hold a worker past the request deadline\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m14-recv")) { CHECK(false, "fixture"); return; }
+    fx->st.request_deadline_ms = 400;
+
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    /* Declare a 200-byte frame, then drip it at 10 bytes a second: every
+     * byte arrives long before any per-read timeout, and the frame would
+     * take 20 seconds to complete. */
+    uint32_t n = htonl(200);
+    uint8_t ver = VIRP_FRAME_VERSION;
+    CHECK(send(sv[0], &n, 4, 0) == 4 && send(sv[0], &ver, 1, 0) == 1,
+          "frame header sent");
+    m14_drip_t drip = { sv[0], 199, 100 };
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, m14_drip, &drip) == 0, "slow sender started");
+
+    int64_t t0 = m14_now_ms();
+    handle_client(&fx->st, sv[1], getuid());
+    int64_t took = m14_now_ms() - t0;
+    CHECK(took >= 350 && took < 2000,
+          "handle_client gave up at the request deadline, not at end of frame");
+    printf("      (returned after %lld ms; the frame needed ~20000)\n",
+           (long long)took);
+
+    shutdown(sv[0], SHUT_RDWR);        /* stop the sender */
+    pthread_join(t, NULL);
+    close(sv[0]);
+    fx_destroy(fx);
+}
+
+static void t_M14_send_timeout_abandons_a_stalled_reader(void)
+{
+    printf("\n  M14: a peer that stops reading its response is abandoned\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m14-send")) { CHECK(false, "fixture"); return; }
+    fx->st.send_timeout_ms = 300;
+
+    /* A large list_devices answer: many refused config entries with long
+     * reasons make the listing tens of kilobytes. */
+    char reason[128];
+    memset(reason, 'r', sizeof(reason) - 1);
+    reason[sizeof(reason) - 1] = '\0';
+    for (int i = 0; i < ONODE_MAX_DEVICES; i++)
+        onode_note_rejected(&fx->st, "refused-device-name", "10.255.9.9",
+                            VIRP_VENDOR_MOCK, reason);
+
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    int small = 2048;                  /* the kernel's floor is a few KiB */
+    setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    const char *req = "{\"action\":\"list_devices\"}";
+    uint32_t n = htonl((uint32_t)strlen(req) + 1);
+    uint8_t ver = VIRP_FRAME_VERSION;
+    CHECK(send(sv[0], &n, 4, 0) == 4 && send(sv[0], &ver, 1, 0) == 1 &&
+          send(sv[0], req, strlen(req), 0) == (ssize_t)strlen(req),
+          "request sent; the client now never reads");
+
+    int64_t t0 = m14_now_ms();
+    handle_client(&fx->st, sv[1], getuid());   /* pre-fix: blocks forever */
+    int64_t took = m14_now_ms() - t0;
+    CHECK(took >= 250 && took < 3000,
+          "the worker returned once the send timeout expired");
+    printf("      (returned after %lld ms)\n", (long long)took);
+    close(sv[0]);
+    fx_destroy(fx);
+}
+
+static void t_M14_per_uid_worker_cap(void)
+{
+    printf("\n  M14: no single uid can take the whole worker pool\n");
+    static onode_state_t st;
+    CHECK(onode_init(&st, 1, NULL, "/tmp/virp-review-unused.sock") == VIRP_OK,
+          "state initialised");
+    CHECK(ONODE_MAX_WORKERS_PER_UID < ONODE_MAX_WORKERS,
+          "the per-uid cap is below the pool size");
+
+    int got = 0;
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++)
+        if (onode_worker_admit(&st, 5001)) got++;
+    CHECK(got == ONODE_MAX_WORKERS_PER_UID,
+          "one uid is admitted up to the cap and no further");
+    CHECK(onode_worker_admit(&st, 5002),
+          "a different uid is still admitted while the first is at its cap");
+    CHECK(st.workers_rejected_uid_cap ==
+              (uint32_t)(ONODE_MAX_WORKERS - ONODE_MAX_WORKERS_PER_UID),
+          "every refusal was counted");
+
+    onode_worker_release(&st, 5001);
+    CHECK(onode_worker_admit(&st, 5001) && !onode_worker_admit(&st, 5001),
+          "releasing one worker frees exactly one admission");
+
+    /* Returning everything empties the table for other uids to use. */
+    for (int i = 0; i < ONODE_MAX_WORKERS_PER_UID; i++)
+        onode_worker_release(&st, 5001);
+    onode_worker_release(&st, 5002);
+    int distinct = 0;
+    for (uid_t u = 6000; u < 6000 + ONODE_MAX_WORKERS; u++)
+        if (onode_worker_admit(&st, u)) distinct++;
+    CHECK(distinct == ONODE_MAX_WORKERS,
+          "a full pool of distinct uids fits (released slots are reused)");
+    onode_destroy(&st);
+}
+
+/* ---- a real listening daemon, for what only the accept loop decides ---- */
+
+static void *fx_server_thread(void *arg)
+{
+    (void)onode_start((onode_state_t *)arg);
+    return NULL;
+}
+
+static int fx_connect(const onode_state_t *st)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s", st->socket_path);
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool fx_server_start(fx_t *fx, pthread_t *thread)
+{
+    if (pthread_create(thread, NULL, fx_server_thread, &fx->st) != 0)
+        return false;
+    for (int i = 0; i < 300; i++) {
+        if (access(fx->st.socket_path, F_OK) == 0 && fx->st.running)
+            return true;
+        struct timespec p = { 0, 10 * 1000000L };
+        nanosleep(&p, NULL);
+    }
+    return false;
+}
+
+/* Ask the daemon to stop and wait for onode_start() to return. The extra
+ * connect only matters to a daemon whose accept loop has no shutdown wake
+ * of its own; it is harmless otherwise. */
+static void fx_server_stop(fx_t *fx, pthread_t thread)
+{
+    onode_shutdown(&fx->st);
+    int wake = fx_connect(&fx->st);
+    if (wake >= 0) close(wake);
+    pthread_join(thread, NULL);
+}
+
+/* true iff the peer closed this connection within wait_ms. */
+static bool fx_peer_closed(int fd, int wait_ms)
+{
+    struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+    if (poll(&p, 1, wait_ms) <= 0) return false;
+    char c;
+    return recv(fd, &c, 1, MSG_DONTWAIT) == 0;
+}
+
+static void t_M14_accept_loop_enforces_per_uid_cap(void)
+{
+    printf("\n  M14: the accept loop closes a uid's connection over its cap\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m14-accept")) { CHECK(false, "fixture"); return; }
+    fx->st.request_deadline_ms = 4000;      /* idle connections are held */
+    pthread_t srv;
+    if (!fx_server_start(fx, &srv)) { CHECK(false, "server start"); return; }
+
+    int held[ONODE_MAX_WORKERS_PER_UID];
+    int ok = 0;
+    for (int i = 0; i < ONODE_MAX_WORKERS_PER_UID; i++) {
+        held[i] = fx_connect(&fx->st);
+        if (held[i] >= 0) ok++;
+    }
+    CHECK(ok == ONODE_MAX_WORKERS_PER_UID, "a full per-uid share of connections opened");
+
+    int over = fx_connect(&fx->st);
+    CHECK(over >= 0 && fx_peer_closed(over, 1500),
+          "one more connection from the same uid is closed at accept");
+    bool others_alive = true;
+    for (int i = 0; i < ONODE_MAX_WORKERS_PER_UID; i++)
+        if (held[i] >= 0 && fx_peer_closed(held[i], 0)) others_alive = false;
+    CHECK(others_alive, "the connections inside the cap are still being served");
+
+    /* Give one back: the next connection is admitted again. */
+    close(held[0]);
+    held[0] = -1;
+    int again = -1;
+    bool admitted = false;
+    for (int tries = 0; tries < 50 && !admitted; tries++) {
+        struct timespec p = { 0, 20 * 1000000L };
+        nanosleep(&p, NULL);
+        again = fx_connect(&fx->st);
+        if (again < 0) continue;
+        if (!fx_peer_closed(again, 150)) admitted = true;
+        else { close(again); again = -1; }
+    }
+    CHECK(admitted, "after one worker finishes, the uid is admitted again");
+
+    if (over >= 0) close(over);
+    if (again >= 0) close(again);
+    for (int i = 0; i < ONODE_MAX_WORKERS_PER_UID; i++)
+        if (held[i] >= 0) close(held[i]);
+    fx_server_stop(fx, srv);
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -2187,6 +2424,12 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M12_v3_session_lost_after_dispatch", t_M12_v3_session_lost_after_dispatch },
     { "t_M13_proposal_id_survives_long_command",
                                               t_M13_proposal_id_survives_long_command },
+    { "t_M14_request_deadline_is_absolute",   t_M14_request_deadline_is_absolute },
+    { "t_M14_send_timeout_abandons_a_stalled_reader",
+                                              t_M14_send_timeout_abandons_a_stalled_reader },
+    { "t_M14_per_uid_worker_cap",             t_M14_per_uid_worker_cap },
+    { "t_M14_accept_loop_enforces_per_uid_cap",
+                                              t_M14_accept_loop_enforces_per_uid_cap },
 };
 
 static void rm_rf_root(void)

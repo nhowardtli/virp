@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/select.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -4896,27 +4897,59 @@ static void hex_encode(char *buf, size_t buf_size, const uint8_t *data, size_t l
  * a raw 4-byte VIRP_ERR_PROTOCOL_VERSION and closes.
  * ========================================================================= */
 
+static int64_t onode_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 /*
- * Read exactly `len` bytes from fd into buf.
- * Handles partial reads, distinguishes EAGAIN/EINTR from EOF.
- * Returns 0 on success, -1 on EOF or fatal error.
+ * Read exactly `len` bytes from fd into buf, all of them before
+ * `deadline_ms` (CLOCK_MONOTONIC milliseconds).
+ * Returns 0 on success, -1 on EOF, error, or the deadline passing.
+ *
+ * ONE DEADLINE FOR THE WHOLE REQUEST (security review M14). This used to
+ * be recv() under SO_RCVTIMEO, and that timeout restarts on every byte:
+ * a peer that sent one byte every four seconds never tripped the
+ * five-second limit and could hold a worker for the days a 128 KiB frame
+ * takes at that rate. The pool is 32 workers and the peer needs only to
+ * be on the allowlist, so a single slow — or merely stuck — client
+ * library could starve every other principal. The caller computes the
+ * deadline once, before the length prefix, and passes the same value for
+ * the payload: what is bounded is the request, not each read.
+ *
+ * poll() carries the wait so the bound holds however the bytes dribble
+ * in; the recv is MSG_DONTWAIT so a spurious wakeup cannot block past
+ * the deadline. CLOCK_MONOTONIC, so a wall-clock step neither stretches
+ * nor collapses it.
  */
-static int recv_exact(int fd, void *buf, size_t len)
+static int recv_exact(int fd, void *buf, size_t len, int64_t deadline_ms)
 {
     size_t got = 0;
     while (got < len) {
-        ssize_t n = recv(fd, (uint8_t *)buf + got, len - got, 0);
+        int64_t left = deadline_ms - onode_monotonic_ms();
+        if (left <= 0)
+            return -1;      /* request deadline passed */
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, left > INT32_MAX ? INT32_MAX : (int)left);
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;   /* signal interrupted — re-check the deadline */
+            return -1;
+        }
+        if (pr == 0)
+            return -1;      /* deadline passed while waiting */
+
+        ssize_t n = recv(fd, (uint8_t *)buf + got, len - got, MSG_DONTWAIT);
         if (n > 0) {
             got += (size_t)n;
         } else if (n == 0) {
             /* EOF — peer closed */
             return -1;
         } else {
-            /* n < 0: check errno */
-            if (errno == EINTR)
-                continue;   /* signal interrupted — retry */
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return -1;  /* timeout or non-blocking — treat as failure */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;   /* nothing there after all — poll again */
             return -1;      /* other error */
         }
     }
@@ -4932,11 +4965,12 @@ static int recv_exact(int fd, void *buf, size_t len)
  * So: loop until every byte is out, retry on EINTR.
  *
  * EAGAIN/EWOULDBLOCK is fatal by design. Client fds here are blocking
- * (only SO_RCVTIMEO is set), so EAGAIN can only appear if someone later
- * configures SO_SNDTIMEO — and a frame cannot be resumed after a
- * mid-frame timeout. On a hypothetical non-blocking fd, retrying
- * without poll() would spin. Either way the framing on this connection
- * is unrecoverable: return -1 and let the caller treat it as dead.
+ * with SO_SNDTIMEO set (handle_client, M14), so EAGAIN means the peer
+ * stopped reading for the whole send timeout — and a frame cannot be
+ * resumed after a mid-frame timeout. On a hypothetical non-blocking fd,
+ * retrying without poll() would spin. Either way the framing on this
+ * connection is unrecoverable: return -1 and let the caller treat it as
+ * dead.
  *
  * MSG_NOSIGNAL on every daemon send: a client that closes before
  * reading its response would otherwise raise SIGPIPE, whose default
@@ -5742,9 +5776,37 @@ static void handle_client(onode_state_t *state, int client_fd,
     uint8_t resp_buf[VIRP_MAX_MESSAGE_SIZE];
     size_t resp_len = 0;
 
-    /* Set receive timeout */
-    struct timeval tv = { .tv_sec = ONODE_RECV_TIMEOUT_SEC, .tv_usec = 0 };
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* ── Client I/O bounds (M14) ──────────────────────────────────────
+     * Receive: one absolute deadline for the whole request frame, fixed
+     * NOW and enforced by recv_exact() — not a per-recv() timeout, which
+     * a slow sender resets with every byte.
+     *
+     * Send: SO_SNDTIMEO. Nothing bounded the response before: a peer
+     * that asked for a large answer (a 16-item batch is up to 1 MiB) and
+     * then stopped reading left its worker blocked in send() until the
+     * daemon restarted, holding its pool slot and — at shutdown — the
+     * drain. send_all() already treats the resulting EAGAIN as fatal
+     * for the connection. A failed setsockopt is not ignored: an
+     * unbounded send is the defect, so the connection is refused. */
+    /* 0 means "not configured" (a state that did not come from
+     * onode_init), never "no limit": fall back to the compiled bounds. */
+    const uint32_t deadline_ms = state->request_deadline_ms
+        ? state->request_deadline_ms : ONODE_RECV_TIMEOUT_SEC * 1000u;
+    const uint32_t send_ms = state->send_timeout_ms
+        ? state->send_timeout_ms : ONODE_SEND_TIMEOUT_SEC * 1000u;
+    const int64_t recv_deadline = onode_monotonic_ms() + (int64_t)deadline_ms;
+    {
+        struct timeval stv = {
+            .tv_sec  = (time_t)(send_ms / 1000),
+            .tv_usec = (suseconds_t)((send_ms % 1000) * 1000),
+        };
+        if (setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &stv,
+                       sizeof(stv)) != 0) {
+            perror("[O-Node] setsockopt SO_SNDTIMEO");
+            close(client_fd);
+            return;
+        }
+    }
 
     /* client_uid is the peer uid the ACCEPT loop validated via SO_PEERCRED
      * (peer_uid_allowed) and threaded in through worker_arg. There is
@@ -5763,7 +5825,7 @@ static void handle_client(onode_state_t *state, int client_fd,
      * Read 4-byte big-endian length prefix. If the first byte is
      * non-zero, the client is sending raw JSON (v1) — reject cleanly. */
     uint8_t len_buf[4];
-    if (recv_exact(client_fd, len_buf, 4) < 0) {
+    if (recv_exact(client_fd, len_buf, 4, recv_deadline) < 0) {
         close(client_fd);
         return;
     }
@@ -5805,7 +5867,7 @@ static void handle_client(onode_state_t *state, int client_fd,
 
     /* Read exactly frame_len bytes */
     char frame_buf[ONODE_MAX_REQUEST_SIZE];
-    if (recv_exact(client_fd, frame_buf, frame_len) < 0) {
+    if (recv_exact(client_fd, frame_buf, frame_len, recv_deadline) < 0) {
         close(client_fd);
         return;
     }
@@ -7469,6 +7531,10 @@ static void *connection_worker(void *raw_arg)
     /* handle_client() closes the fd on every return path. */
     handle_client(state, fd, client_uid);
 
+    /* Return this uid's share of the pool (M14) — the accept loop
+     * claimed it with onode_worker_admit() before spawning us. */
+    onode_worker_release(state, client_uid);
+
     /* Clear the drain-registration slot (closing our dup of the client
      * fd), release the worker slot, and update the live counter. The
      * broadcast is the shutdown barrier: onode_start()'s drain waits on
@@ -7487,6 +7553,57 @@ static void *connection_worker(void *raw_arg)
     sem_post(&state->worker_sem);
 
     return NULL;
+}
+
+/*
+ * Per-uid worker accounting (M14) — see the header. Both run under
+ * state_mutex; neither blocks.
+ */
+bool onode_worker_admit(onode_state_t *state, uid_t uid)
+{
+    if (!state) return false;
+    bool admitted = false;
+    pthread_mutex_lock(&state->state_mutex);
+    int free_slot = -1, mine = -1;
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++) {
+        if (state->worker_uid_live[i].live == 0) {
+            if (free_slot < 0) free_slot = i;
+        } else if (state->worker_uid_live[i].uid == uid) {
+            mine = i;
+            break;
+        }
+    }
+    if (mine >= 0) {
+        if (state->worker_uid_live[mine].live < ONODE_MAX_WORKERS_PER_UID) {
+            state->worker_uid_live[mine].live++;
+            admitted = true;
+        }
+    } else if (free_slot >= 0) {
+        state->worker_uid_live[free_slot].uid = uid;
+        state->worker_uid_live[free_slot].live = 1;
+        admitted = true;
+    }
+    /* No slot of its own and none free cannot happen while the pool
+     * semaphore holds (one slot per live worker at most); if it ever
+     * did, refusing is the safe answer. */
+    if (!admitted)
+        state->workers_rejected_uid_cap++;
+    pthread_mutex_unlock(&state->state_mutex);
+    return admitted;
+}
+
+void onode_worker_release(onode_state_t *state, uid_t uid)
+{
+    if (!state) return;
+    pthread_mutex_lock(&state->state_mutex);
+    for (int i = 0; i < ONODE_MAX_WORKERS; i++) {
+        if (state->worker_uid_live[i].live > 0 &&
+            state->worker_uid_live[i].uid == uid) {
+            state->worker_uid_live[i].live--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&state->state_mutex);
 }
 
 /* =========================================================================
@@ -7557,6 +7674,8 @@ virp_error_t onode_init(onode_state_t *state,
     state->workers_live = 0;
     state->workers_rejected = 0;
     state->drain_failed = false;
+    state->request_deadline_ms = ONODE_RECV_TIMEOUT_SEC * 1000u;
+    state->send_timeout_ms = ONODE_SEND_TIMEOUT_SEC * 1000u;
     for (int i = 0; i < ONODE_MAX_WORKERS; i++)
         state->worker_fds[i] = -1;
     /* Monotonic clock for the drain barrier's timedwait — a wall-clock
@@ -8259,11 +8378,29 @@ virp_error_t onode_start(onode_state_t *state)
             }
 
             /*
+             * Per-uid share first (M14): a uid already holding
+             * ONODE_MAX_WORKERS_PER_UID workers gets no more, so no
+             * single principal can take the whole pool and lock the
+             * others out. Closed without a response, like a saturated
+             * pool — the accept loop must never block on a send.
+             */
+            if (!onode_worker_admit(state, peer_uid)) {
+                fprintf(stderr,
+                        "[O-Node] per-uid worker cap reached (max=%d per "
+                        "uid) — closing peer uid=%u pid=%d\n",
+                        ONODE_MAX_WORKERS_PER_UID,
+                        (unsigned)peer_uid, (int)peer_pid);
+                close(client_fd);
+                continue;
+            }
+
+            /*
              * Reserve a worker slot. sem_trywait never blocks — if the
              * pool is full we reject immediately rather than letting
              * slow SSH sessions pile up behind the accept loop.
              */
             if (sem_trywait(&state->worker_sem) != 0) {
+                onode_worker_release(state, peer_uid);
                 pthread_mutex_lock(&state->state_mutex);
                 state->workers_rejected++;
                 uint32_t rej = state->workers_rejected;
@@ -8281,6 +8418,7 @@ virp_error_t onode_start(onode_state_t *state)
             if (!arg) {
                 /* malloc failure: return the slot and drop the client. */
                 sem_post(&state->worker_sem);
+                onode_worker_release(state, peer_uid);
                 fprintf(stderr, "[O-Node] worker_arg alloc failed — dropping\n");
                 close(client_fd);
                 continue;
@@ -8339,6 +8477,7 @@ virp_error_t onode_start(onode_state_t *state)
                     pthread_cond_broadcast(&state->workers_cv);
                 pthread_mutex_unlock(&state->state_mutex);
                 sem_post(&state->worker_sem);
+                onode_worker_release(state, peer_uid);
                 free(arg);
                 fprintf(stderr, "[O-Node] pthread_create failed: %s\n",
                         strerror(rc));
