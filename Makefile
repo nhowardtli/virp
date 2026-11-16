@@ -2300,7 +2300,8 @@ asan-test:
 	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" $(TEST_SSH_IO) $(TEST_FG_SCRUB) $(TEST_CHAIN) \
 	        $(TEST_OBSKEY) $(TEST_OBS_ED25519) $(TEST_OBS_FORGE) $(TEST_OBS_NEG) \
-	        $(BUILD_DIR)/test_security_bounds $(BUILD_DIR)/test_security_handlers $(BUILD_DIR)/test_onode_security
+	        $(BUILD_DIR)/test_security_bounds $(BUILD_DIR)/test_security_handlers $(BUILD_DIR)/test_onode_security \
+	        $(BUILD_DIR)/test_onode_review
 	@echo "=== Running tests under ASan+UBSan ==="
 	./$(TEST_BIN) 2>&1
 	./$(TEST_ONODE) 2>&1
@@ -2314,6 +2315,7 @@ asan-test:
 	./$(BUILD_DIR)/test_security_bounds 2>&1
 	./$(BUILD_DIR)/test_security_handlers 2>&1
 	./$(BUILD_DIR)/test_onode_security 2>&1
+	./$(BUILD_DIR)/test_onode_review 2>&1
 	@echo "=== ASan+UBSan test run complete ==="
 	# Leave no instrumented residue in the shared build/ tree. asan-test
 	# already clean-builds at the start, so the tree is disposable; a
@@ -2549,6 +2551,18 @@ $(BUILD_DIR)/test_onode_security: tests/test_onode_security.c tests/test_onode.c
 test-onode-security: $(BUILD_DIR)/test_onode_security
 	./$(BUILD_DIR)/test_onode_security
 all-tests: test-onode-security
+
+# O-Node security review regressions (security/onode-review-1): one test
+# function per finding ID. Includes src/virp_onode.c directly, like
+# test_security_handlers, so the static parsers and gate helpers are
+# reachable without a socket.
+$(BUILD_DIR)/test_onode_review: tests/test_onode_review.c src/virp_onode.c $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB)
+	rm -f $@
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/virp_onode_prod_lib.o $(LIB) $(LDFLAGS) -ljson-c -o $@
+.PHONY: test-onode-review
+test-onode-review: $(BUILD_DIR)/test_onode_review
+	./$(BUILD_DIR)/test_onode_review
+all-tests: test-onode-review
 
 .PHONY: test-execute-v3
 test-execute-v3: build/libvirp.a

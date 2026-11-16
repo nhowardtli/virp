@@ -20,6 +20,7 @@
 static virp_error_t chain_count_intents_for_approval_locked(
         virp_chain_state_t *state, const char *aeh, int *count);
 static void chain_maps_free(virp_chain_state_t *state);
+static bool cj_str(const cJSON *o, const char *key, char *out, size_t cap);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -838,6 +839,121 @@ virp_error_t virp_chain_count_intents_for_approval(virp_chain_state_t *state,
     virp_error_t rc = chain_count_intents_for_approval_locked(
                           state, approval_entry_hash, count);
     chain_maps_free(state);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+/*
+ * The second apply-time replay key (security review H1): committed
+ * gate_intent entries whose body names this PROPOSAL id.
+ *
+ * virp_chain_count_intents_for_approval() above is keyed on the approval
+ * entry hash, and the daemon learns that hash from the on-disk approval
+ * record — whose third line is not covered by the approver's signature.
+ * Blank or alter that line and the hash-keyed count is 0 for an approval
+ * that was spent. The proposal id cannot be moved that way: it is inside
+ * the signed canonical payload, it names the record's own path, and the
+ * intent that consumed the approval wrote it into its body. Same parsing
+ * discipline as the sibling — cJSON over the stored body of a
+ * type-restricted query, never a substring match.
+ */
+virp_error_t virp_chain_count_intents_for_proposal(virp_chain_state_t *state,
+                                                   const char *proposal_id,
+                                                   int *count)
+{
+    if (!state || !proposal_id || !count) return VIRP_ERR_NULL_PTR;
+    *count = 0;
+    if (!proposal_id[0]) return VIRP_ERR_INVALID_LENGTH;
+
+    pthread_mutex_lock(&state->lock);
+    sqlite3_stmt *st = NULL;
+    virp_error_t rc = VIRP_OK;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT a.artifact_content FROM chain_entries c "
+            "JOIN artifacts a ON a.artifact_id = c.artifact_id "
+            "               AND a.artifact_hash = c.artifact_hash "
+            "WHERE c.artifact_type = 'gate_intent'", -1, &st, NULL)
+        != SQLITE_OK) {
+        rc = VIRP_ERR_CHAIN_DB;
+    } else {
+        int step, n = 0;
+        while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+            const unsigned char *b = sqlite3_column_text(st, 0);
+            if (!b) continue;
+            cJSON *o = cJSON_Parse((const char *)b);
+            if (!o) continue;
+            char got[64];
+            if (cj_str(o, "proposal_id", got, sizeof(got)) &&
+                strcmp(got, proposal_id) == 0)
+                n++;
+            cJSON_Delete(o);
+        }
+        if (step != SQLITE_DONE)
+            rc = VIRP_ERR_CHAIN_DB;
+        else
+            *count = n;
+    }
+    if (st) sqlite3_finalize(st);
+    pthread_mutex_unlock(&state->lock);
+    return rc;
+}
+
+/*
+ * The APPROVAL entry the daemon itself appended for this proposal, read
+ * from the chain rather than from the approval record (security review
+ * H1). virp_approval_submit() appends it as artifact_type 'approval',
+ * artifact_id "approval:<proposal_id>" — a daemon-reserved type no socket
+ * client can mint — so the chain is the authority on which entry hash an
+ * approval of this proposal has. *count is the number of such entries;
+ * out_hash is filled only when there is exactly one. Zero means the
+ * record on disk has no chain entry behind it, and more than one is not
+ * something submit can produce: the caller refuses both.
+ */
+virp_error_t virp_chain_approval_entry_hash(virp_chain_state_t *state,
+                                            const char *proposal_id,
+                                            char out_hash[65],
+                                            int *count)
+{
+    if (!state || !proposal_id || !out_hash || !count)
+        return VIRP_ERR_NULL_PTR;
+    out_hash[0] = '\0';
+    *count = 0;
+
+    char artifact_id[96];
+    int n = snprintf(artifact_id, sizeof(artifact_id), "approval:%s",
+                     proposal_id);
+    if (!proposal_id[0] || n < 0 || (size_t)n >= sizeof(artifact_id))
+        return VIRP_ERR_INVALID_LENGTH;
+
+    pthread_mutex_lock(&state->lock);
+    sqlite3_stmt *st = NULL;
+    virp_error_t rc = VIRP_OK;
+    if (sqlite3_prepare_v2(state->db,
+            "SELECT chain_entry_hash FROM chain_entries "
+            "WHERE artifact_id = ? AND artifact_type = 'approval' LIMIT 2",
+            -1, &st, NULL) != SQLITE_OK) {
+        rc = VIRP_ERR_CHAIN_DB;
+    } else {
+        sqlite3_bind_text(st, 1, artifact_id, -1, SQLITE_TRANSIENT);
+        int step, rows = 0;
+        char first[65] = "";
+        while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+            const unsigned char *h = sqlite3_column_text(st, 0);
+            if (rows == 0 && h && strlen((const char *)h) == 64)
+                memcpy(first, h, 65);
+            rows++;
+        }
+        if (step != SQLITE_DONE) {
+            rc = VIRP_ERR_CHAIN_DB;
+        } else {
+            *count = rows;
+            if (rows == 1 && first[0])
+                memcpy(out_hash, first, 65);
+            else if (rows == 1)
+                rc = VIRP_ERR_CHAIN_DB;   /* a hash that is not a hash */
+        }
+    }
+    if (st) sqlite3_finalize(st);
     pthread_mutex_unlock(&state->lock);
     return rc;
 }

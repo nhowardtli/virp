@@ -267,4 +267,18 @@ void virp_approval_consume_unlock(void);
 virp_error_t virp_approval_commit_consume_locked(const char *dir,
                                                  const char *proposal_id);
 
+/*
+ * Is proposal_id already on consumed.list? Read-only; the caller must
+ * hold consume_lock. The apply path asks this BEFORE committing the
+ * consuming gate_intent (security review H1): the commit above reports
+ * REUSED only after the intent is already durable, which is too late to
+ * refuse cleanly. *consumed is left TRUE on any error, so a store that
+ * cannot answer reads as spent (fail closed). A missing list is an empty
+ * list; an existing list that cannot be opened is
+ * VIRP_ERR_APPROVAL_STORE_UNREADABLE.
+ */
+virp_error_t virp_approval_is_consumed_locked(const char *dir,
+                                              const char *proposal_id,
+                                              bool *consumed);
+
 #endif /* VIRP_APPROVAL_H */

@@ -1500,9 +1500,12 @@ static virp_error_t gate_emit_intent(onode_state_t *state,
         /* APPROVAL BINDING (Sep 1 review, 1.1). For an approved apply the
          * intent carries the same two hashes the outcome body does, so the
          * intent — the record that CONSUMES the approval — names exactly
-         * what it consumed. approval_entry_hash is the apply-time replay
-         * key (virp_chain_count_intents_for_approval). Null for an
-         * auto-executed GREEN read, which consumes no approval. */
+         * what it consumed. approval_entry_hash and proposal_id (above)
+         * are the two apply-time replay keys
+         * (virp_chain_count_intents_for_approval / _for_proposal); the
+         * caller has already checked apr->chain_entry_hash against the
+         * chain's own APPROVAL entry (H1). Null for an auto-executed
+         * GREEN read, which consumes no approval. */
         if (apr && apr->chain_entry_hash[0]) {
             cJSON_AddStringToObject(o, "approval_entry_hash",
                                     apr->chain_entry_hash);
@@ -2985,16 +2988,19 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
          *   item 2  TTL re-check: connect can take seconds on a dead
          *           device, so an approval valid at verify may have expired
          *           by now. Refuse expired here, consuming nothing.
-         *   item 1  replay guard: a committed gate_intent already citing
-         *           this approval entry hash means it was already spent
-         *           (the chain is the authority; this survives a lost
-         *           consumed.list cache write). Refuse reused.
-         *           gate_emit_intent then commits under the same lock.
+         *   item 1  replay guard: consumed.list, the chain's own APPROVAL
+         *           entry for this proposal, and committed gate_intents
+         *           naming the proposal or citing that entry (the chain is
+         *           the authority; this survives a lost consumed.list
+         *           cache write, and a tampered record hash line — H1).
+         *           Refuse reused. gate_emit_intent then commits under the
+         *           same lock.
          *   item 3  consume: the intent is durable, so update the cache.
-         *           A cache-write failure AFTER the intent committed is
-         *           logged at error level and execution CONTINUES — the
-         *           chain already records the consumption and the replay
-         *           guard reads the chain, not the cache. */
+         *           A cache-write PERSIST failure AFTER the intent
+         *           committed is logged at error level and execution
+         *           CONTINUES — the chain already records the consumption
+         *           and the replay guard reads the chain, not the cache.
+         *           REUSED from that write is a refusal, not a log line. */
         virp_error_t refuse_err = VIRP_OK;
         char refuse_msg[416];
         refuse_msg[0] = '\0';
@@ -3021,12 +3027,83 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                      proposal_id, device_name, gate_tier_name(gate_tier));
         }
 
-        /* item 1 — replay guard, atomic with the append below. */
-        if (refuse_err == VIRP_OK && apr.chain_entry_hash[0]) {
-            int prior = 0;
+        /* item 1 — replay guard, atomic with the append below.
+         *
+         * FOUR KEYS, NOT ONE (security review H1). This used to be a
+         * single count keyed on apr.chain_entry_hash, and skipped when
+         * that field was empty. But apr.chain_entry_hash is the third
+         * line of the on-disk approval record, and the approver's
+         * signature covers the canonical payload only — not that line.
+         * Whoever can write the approval store could blank it (guard
+         * skipped) or alter it (count of a hash nothing cites: 0) and
+         * replay a spent approval for as long as its TTL ran. None of the
+         * keys below can be steered that way: the proposal id is inside
+         * the signed payload and names the record's own path, and the
+         * chain entries are daemon-reserved types no client can mint.
+         *
+         *   (a) consumed.list already names this proposal. Asked HERE,
+         *       before the intent, so a spent approval is refused with
+         *       nothing committed; it used to be discovered only when the
+         *       post-intent cache write returned REUSED, which was logged
+         *       and ignored.
+         *   (b) the APPROVAL entry the daemon appended for this proposal
+         *       must exist on the chain and its hash must equal the
+         *       record's. An empty record hash therefore refuses instead
+         *       of skipping the guard.
+         *   (c) no committed gate_intent may name this proposal id, nor
+         *       cite the chain's own approval entry hash. Both, because
+         *       either alone leaves a way round: the proposal id survives
+         *       a tampered hash line, and the hash survives anything that
+         *       is not a gate_intent body field.
+         *
+         * A store or chain that cannot answer is a refusal, never a pass. */
+        char chain_aeh[65];
+        chain_aeh[0] = '\0';
+        if (refuse_err == VIRP_OK) {
+            bool listed = true;
+            virp_error_t le = virp_approval_is_consumed_locked(
+                    state->approval_dir, proposal_id, &listed);
+            if (le != VIRP_OK || listed) {
+                refuse_err = VIRP_ERR_APPROVAL_REUSED;
+                snprintf(refuse_msg, sizeof(refuse_msg),
+                         "ERROR: apply rejected (%s, err=%d) for proposal %s "
+                         "on '%s': approval already consumed (tier=%s)",
+                         virp_approval_err_name(refuse_err), (int)refuse_err,
+                         proposal_id, device_name, gate_tier_name(gate_tier));
+                fprintf(stderr, "[GATE] apply rejected: proposal=%s device=%s "
+                        "reason=consumed-list (query_rc=%d listed=%d)\n",
+                        proposal_id, device_name, (int)le, (int)listed);
+            }
+        }
+        if (refuse_err == VIRP_OK) {
+            int approvals = 0;
+            virp_error_t ae = virp_chain_approval_entry_hash(
+                    &state->chain, proposal_id, chain_aeh, &approvals);
+            if (ae != VIRP_OK || approvals != 1 ||
+                strlen(apr.chain_entry_hash) != 64 ||
+                virp_consttime_eq(apr.chain_entry_hash, chain_aeh, 64) != 1) {
+                refuse_err = VIRP_ERR_APPROVAL_NOT_FOUND;
+                snprintf(refuse_msg, sizeof(refuse_msg),
+                         "ERROR: apply rejected (%s, err=%d) for proposal %s "
+                         "on '%s': the approval record does not match the "
+                         "APPROVAL entry on the chain (tier=%s)",
+                         virp_approval_err_name(refuse_err), (int)refuse_err,
+                         proposal_id, device_name, gate_tier_name(gate_tier));
+                fprintf(stderr, "[GATE] apply rejected: proposal=%s device=%s "
+                        "reason=approval-entry-mismatch (query_rc=%d "
+                        "chain_entries=%d record_hash=%s)\n",
+                        proposal_id, device_name, (int)ae, approvals,
+                        apr.chain_entry_hash[0] ? "present" : "empty");
+            }
+        }
+        if (refuse_err == VIRP_OK) {
+            int by_hash = 0, by_proposal = 0;
             virp_error_t qe = virp_chain_count_intents_for_approval(
-                    &state->chain, apr.chain_entry_hash, &prior);
-            if (qe != VIRP_OK || prior > 0) {
+                    &state->chain, chain_aeh, &by_hash);
+            virp_error_t pe = virp_chain_count_intents_for_proposal(
+                    &state->chain, proposal_id, &by_proposal);
+            if (qe != VIRP_OK || pe != VIRP_OK ||
+                by_hash > 0 || by_proposal > 0) {
                 refuse_err = VIRP_ERR_APPROVAL_REUSED;
                 snprintf(refuse_msg, sizeof(refuse_msg),
                          "ERROR: apply rejected (%s, err=%d) for proposal %s "
@@ -3035,14 +3112,15 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                          virp_approval_err_name(refuse_err), (int)refuse_err,
                          proposal_id, device_name, gate_tier_name(gate_tier));
                 fprintf(stderr, "[GATE] apply rejected: proposal=%s device=%s "
-                        "reason=intent-already-committed (query_rc=%d "
-                        "prior=%d)\n", proposal_id, device_name,
-                        (int)qe, prior);
+                        "reason=intent-already-committed (query_rc=%d/%d "
+                        "by_hash=%d by_proposal=%d)\n", proposal_id,
+                        device_name, (int)qe, (int)pe, by_hash, by_proposal);
             }
         }
 
         /* item 1 — the intent commit is the consumption event. */
         virp_error_t ierr = VIRP_OK;
+        bool reused_after_intent = false;
         if (refuse_err == VIRP_OK) {
             ierr = gate_emit_intent(state, device_name, drv, command,
                                     gate_tier, gate_eff_max, gate_mode,
@@ -3050,10 +3128,30 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                                     &apr, &intent_ce);
             if (ierr == VIRP_OK) {
                 intent = &intent_ce;
-                /* item 3 — cache update; failure is logged, not fatal. */
+                /* item 3 — cache update. A PERSIST failure is logged, not
+                 * fatal: the committed intent is the authority and guard
+                 * (c) reads the chain. REUSED is a different thing and is
+                 * a REFUSAL (H1): guard (a) read the same list under this
+                 * same lock a moment ago and it was not there, so the list
+                 * changed underneath the daemon. Something else is
+                 * consuming this approval; do not dispatch. */
                 virp_error_t ce = virp_approval_commit_consume_locked(
                         state->approval_dir, proposal_id);
-                if (ce != VIRP_OK)
+                if (ce == VIRP_ERR_APPROVAL_REUSED) {
+                    reused_after_intent = true;
+                    refuse_err = VIRP_ERR_APPROVAL_REUSED;
+                    snprintf(refuse_msg, sizeof(refuse_msg),
+                             "ERROR: apply rejected (%s, err=%d) for proposal "
+                             "%s on '%s': approval was consumed concurrently; "
+                             "nothing was dispatched (tier=%s)",
+                             virp_approval_err_name(refuse_err),
+                             (int)refuse_err, proposal_id, device_name,
+                             gate_tier_name(gate_tier));
+                    fprintf(stderr, "[GATE] apply rejected: proposal=%s "
+                            "device=%s reason=consumed-list-changed-under-"
+                            "lock — refusing AFTER the intent committed\n",
+                            proposal_id, device_name);
+                } else if (ce != VIRP_OK)
                     fprintf(stderr, "[GATE] ERROR: consumed.list cache write "
                             "failed for proposal=%s (%s) AFTER the intent "
                             "committed; the committed intent is the authority "
@@ -3066,6 +3164,17 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
         virp_approval_consume_unlock();
 
         if (refuse_err != VIRP_OK) {
+            if (reused_after_intent) {
+                /* The intent is on the chain and nothing was dispatched.
+                 * Close it, so the verifier does not grade a refusal as
+                 * an OPEN execution ("attempted, disposition unknown"):
+                 * the outcome names this intent with success=false. A
+                 * closer that cannot be written latches evidence-degraded
+                 * inside approval_emit_outcome, exactly as it does after
+                 * a real dispatch. */
+                (void)approval_emit_outcome(state, proposal_id, &apr,
+                                            device_name, false, intent);
+            }
             if (refuse_err == VIRP_ERR_APPROVAL_REUSED) {
                 virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command);
                 if (re != VIRP_OK) { pthread_mutex_unlock(&state->exec_mutex[dev_idx]); return re; }

@@ -770,6 +770,25 @@ virp_error_t virp_chain_count_intents_for_approval(virp_chain_state_t *state,
                                                    int *count);
 
 /*
+ * Security review H1 — the two replay keys that do not depend on the
+ * unsigned chain-hash line of the on-disk approval record.
+ *
+ * count_intents_for_proposal: committed gate_intent entries whose body
+ * names this proposal id. approval_entry_hash: the entry hash of the
+ * 'approval' entry the daemon appended as "approval:<proposal_id>";
+ * *count is how many such entries exist and out_hash is filled only when
+ * that is exactly one. Both are read-only and return VIRP_OK on a
+ * successful query whether or not anything matched.
+ */
+virp_error_t virp_chain_count_intents_for_proposal(virp_chain_state_t *state,
+                                                   const char *proposal_id,
+                                                   int *count);
+virp_error_t virp_chain_approval_entry_hash(virp_chain_state_t *state,
+                                            const char *proposal_id,
+                                            char out_hash[65],
+                                            int *count);
+
+/*
  * Set *conflict to true iff the artifacts table already holds a body
  * under the given artifact_id whose artifact_hash DIFFERS from the one
  * supplied; a byte-identical resubmission (same id, same hash) is NOT a

@@ -937,22 +937,36 @@ static virp_error_t approval_record_load(const char *dir,
  * must already hold it. Split out (Sep 1 review, Phase 1 pre-merge item 1)
  * so the daemon can hold consume_mu across the apply-time chain replay
  * guard AND the consume, making the two atomic w.r.t. other consumers. */
-static virp_error_t consume_once_locked(const char *dir,
-                                        const char *proposal_id)
+/*
+ * Read consumed.list into `existing` and report whether proposal_id is on
+ * it (exact line match). Shared by the consume itself and by the read-only
+ * probe below, so "is this approval spent according to the cache" has one
+ * answer. A MISSING file is an empty list; a file that exists and cannot
+ * be opened is NOT — treating it as empty would let an unreadable store
+ * read as "never consumed", so that is store-unreadable (fail closed).
+ * Caller holds consume_mu.
+ */
+static virp_error_t consumed_list_scan_locked(const char *dir,
+                                              const char *proposal_id,
+                                              char *existing, size_t cap,
+                                              bool *listed)
 {
     char path[VIRP_APPROVAL_DIR_MAX + 32];
     snprintf(path, sizeof(path), "%s/consumed.list", dir);
 
-    char existing[65536];
+    *listed = false;
     existing[0] = '\0';
+    errno = 0;
     FILE *f = fopen(path, "r");
     if (f) {
-        size_t got = fread(existing, 1, sizeof(existing) - 1, f);
+        size_t got = fread(existing, 1, cap - 1, f);
         fclose(f);
         existing[got] = '\0';
         /* An over-full store would silently truncate below — refuse. */
-        if (got == sizeof(existing) - 1)
+        if (got == cap - 1)
             return VIRP_ERR_CHAIN_DB;
+    } else if (errno != ENOENT) {
+        return VIRP_ERR_APPROVAL_STORE_UNREADABLE;
     }
 
     /* Already consumed? Exact line match. */
@@ -961,11 +975,30 @@ static virp_error_t consume_once_locked(const char *dir,
     while (*p) {
         const char *nl = strchr(p, '\n');
         size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
-        if (linelen == idlen && strncmp(p, proposal_id, idlen) == 0)
-            return VIRP_ERR_APPROVAL_REUSED;
+        if (linelen == idlen && strncmp(p, proposal_id, idlen) == 0) {
+            *listed = true;
+            break;
+        }
         if (!nl) break;
         p = nl + 1;
     }
+    return VIRP_OK;
+}
+
+static virp_error_t consume_once_locked(const char *dir,
+                                        const char *proposal_id)
+{
+    char path[VIRP_APPROVAL_DIR_MAX + 32];
+    snprintf(path, sizeof(path), "%s/consumed.list", dir);
+
+    char existing[65536];
+    bool listed = false;
+    virp_error_t err = consumed_list_scan_locked(dir, proposal_id, existing,
+                                                 sizeof(existing), &listed);
+    if (err != VIRP_OK)
+        return err;
+    if (listed)
+        return VIRP_ERR_APPROVAL_REUSED;
 
     char updated[65536 + 64];
     snprintf(updated, sizeof(updated), "%s%s\n", existing, proposal_id);
@@ -1072,6 +1105,27 @@ virp_error_t virp_approval_commit_consume_locked(const char *dir,
     virp_error_t _c = consume_once_locked(dir, proposal_id);
     if (_c == VIRP_OK) VIRP_FI("post_consume");
     return _c;
+}
+
+/* Read-only probe of the consumed.list cache; caller holds consume_lock.
+ * See the header for why the apply path asks this BEFORE it commits the
+ * consuming intent rather than learning it from the commit afterwards. */
+virp_error_t virp_approval_is_consumed_locked(const char *dir,
+                                              const char *proposal_id,
+                                              bool *consumed)
+{
+    if (!dir || !consumed) return VIRP_ERR_NULL_PTR;
+    *consumed = true;   /* fail closed on every early return */
+    if (!proposal_id_valid(proposal_id))
+        return VIRP_ERR_APPROVAL_NOT_FOUND;
+    char existing[65536];
+    bool listed = false;
+    virp_error_t err = consumed_list_scan_locked(dir, proposal_id, existing,
+                                                 sizeof(existing), &listed);
+    if (err != VIRP_OK)
+        return err;
+    *consumed = listed;
+    return VIRP_OK;
 }
 
 /*
