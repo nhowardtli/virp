@@ -2072,6 +2072,81 @@ static void t_M12_v3_session_lost_after_dispatch(void)
 }
 
 /* =========================================================================
+ * M13 — a long command cannot push the proposal id out of the refusal
+ * ========================================================================= */
+
+static void t_M13_proposal_id_survives_long_command(void)
+{
+    printf("\n  M13: the refusal carries its proposal id whatever the command length\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m13-msg")) { CHECK(false, "fixture"); return; }
+    uint8_t ot = 0;
+    static char payload[4096];
+
+    /* 500 bytes, RED on the mock ("reload ..."): well past the ~380
+     * bytes at which the old 448-byte buffer dropped the id, and inside
+     * the 511 canonical bytes a proposal's command hash can cover. */
+    static char longcmd[501];
+    memset(longcmd, 'x', sizeof(longcmd) - 1);
+    memcpy(longcmd, "reload ", 7);
+    longcmd[sizeof(longcmd) - 1] = '\0';
+
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1] = "";
+    CHECK(fx_run(fx, FX_DEV, longcmd, NULL, (uid_t)-1, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR,
+          "a 500-byte RED command is refused");
+    CHECK(fx_extract_pid(payload, pid) == 0,
+          "the refusal still carries proposal_id=<32 hex>");
+    virp_proposal_rec_t prop;
+    CHECK(pid[0] && virp_approval_load_proposal(fx->dir, pid, &prop) == VIRP_OK &&
+          strcmp(prop.command, longcmd) == 0,
+          "and it is the id of the proposal filed for exactly that command");
+
+    const char *idpos  = strstr(payload, "proposal_id=");
+    const char *cmdpos = strstr(payload, "'reload ");
+    CHECK(strncmp(payload, "ERROR: tier gate blocked proposal_id=", 37) == 0 &&
+          idpos && cmdpos && idpos < cmdpos,
+          "the id comes BEFORE the command text, straight after the fixed prefix");
+    size_t plen = strlen(payload);
+    static const char TAIL[] = "' on '" FX_DEV "' (tier=RED max=YELLOW)";
+    CHECK(plen > sizeof(TAIL) &&
+          strcmp(payload + plen - (sizeof(TAIL) - 1), TAIL) == 0,
+          "the device and tier after the command were not truncated either");
+
+    /* What the chain kept matches what the caller was told. */
+    cJSON *body = NULL;
+    (void)fx_rejections(fx, "gate-enforce:" FX_DEV, NULL, &body);
+    const cJSON *msg = body ? cJSON_GetObjectItemCaseSensitive(body, "message") : NULL;
+    CHECK(cJSON_IsString(msg) && strcmp(msg->valuestring, payload) == 0,
+          "the chain body's message is the same text as the signed observation");
+    if (body) cJSON_Delete(body);
+
+    /* The longest command the socket can carry. No proposal can be filed
+     * for it — its canonical form exceeds what a proposal's command hash
+     * covers, a limit that predates this change — but the refusal itself
+     * must still arrive whole. */
+    static char maxcmd[1024];
+    memset(maxcmd, 'y', sizeof(maxcmd) - 1);
+    memcpy(maxcmd, "reload ", 7);
+    maxcmd[sizeof(maxcmd) - 1] = '\0';
+    CHECK(fx_run(fx, FX_DEV, maxcmd, NULL, (uid_t)-1, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR,
+          "a 1023-byte RED command is refused");
+    plen = strlen(payload);
+    CHECK(plen > sizeof(TAIL) &&
+          strcmp(payload + plen - (sizeof(TAIL) - 1), TAIL) == 0,
+          "and its refusal is not truncated: device and tier are intact");
+
+    /* No proposal (BLACK): the layout is the historical one, unchanged. */
+    CHECK(fx_run(fx, FX_DEV, "selfdestruct", NULL, (uid_t)-1, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR &&
+          strncmp(payload, "ERROR: tier gate blocked 'selfdestruct' on '",
+                  44) == 0 && strstr(payload, "proposal_id=") == NULL,
+          "a BLACK refusal files no proposal and keeps the old layout");
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -2110,6 +2185,8 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
                                               t_M11_verify_response_carries_verifier_state },
     { "t_M12_v2_session_lost_after_dispatch", t_M12_v2_session_lost_after_dispatch },
     { "t_M12_v3_session_lost_after_dispatch", t_M12_v3_session_lost_after_dispatch },
+    { "t_M13_proposal_id_survives_long_command",
+                                              t_M13_proposal_id_survives_long_command },
 };
 
 static void rm_rf_root(void)

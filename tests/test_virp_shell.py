@@ -493,6 +493,20 @@ class TestCommands(unittest.TestCase):
         self.assertIn(pid, buf.getvalue())
         self.assertIn("R1", buf.getvalue())
 
+    def test_blocked_message_with_proposal_id_before_the_command(self):
+        """The daemon's current refusal layout (security review M13): the
+        proposal id sits between "blocked" and the quoted command."""
+        pid = "fedcba9876543210fedcba9876543210"
+        new_layout = ("ERROR: tier gate blocked proposal_id=%s '%s' on 'R1' "
+                      "(tier=%s max=GREEN) reason: configuration change")
+        out, _, sh = self._config_session(
+            lambda r: observation(0x0F, new_layout % (pid, r.get("command", ""), "RED"), tier=0x03),
+            ["interface Gi1/0/1 description uplink"])
+        self.assertIn("PROPOSED, not applied", out)
+        self.assertIn("proposal_id " + pid, out)
+        self.assertEqual(sh.proposals[0][3], "RED")
+        self.assertEqual(sh.proposals[0][4], pid)
+
     def test_black_is_refused_without_a_proposal(self):
         out, _, sh = self._config_session(
             lambda r: observation(0x0F, "ERROR: tier gate blocked 'reload' on 'R1' (tier=BLACK max=GREEN)", tier=0xFF),

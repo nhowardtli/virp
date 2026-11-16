@@ -2388,7 +2388,9 @@ static void separator_refuse_chain(onode_state_t *state,
  * the unconditional BLACK branch (any mode) and the ENFORCE over-tier /
  * unclassified branch. Files the escalation proposal when the tier
  * allows one (never for BLACK), persists the gate_rejection/1 chain
- * entry, logs, and builds the signed ERROR observation.
+ * entry, logs, and builds the signed ERROR observation — whose text
+ * carries the proposal id BEFORE the command (M13, see the layout note
+ * in the function).
  *
  * `mode` is recorded in the chain body (gate_mode, additive to schema
  * gate_rejection/1 — the same field gate_execution/1 has carried from
@@ -2414,24 +2416,34 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
                                     uint8_t *out_buf, size_t out_buf_len,
                                     size_t *out_len)
 {
-    char err_msg[448];
-    snprintf(err_msg, sizeof(err_msg),
-             "ERROR: tier gate blocked '%s' on '%s' "
-             "(tier=%s max=%s)",
-             command, device_name, gate_tier_name(gate_tier),
-             gate_tier_name(eff_max));
-
-    /* Classifier-supplied instructive reason (optional hook):
-     * appended before the proposal_id so the rejection payload
-     * teaches the escalation path, not just the tier math. */
-    if (drv->route_reason) {
-        const char *why = drv->route_reason(command);
-        if (why) {
-            size_t off = strlen(err_msg);
-            snprintf(err_msg + off, sizeof(err_msg) - off,
-                     " reason: %s", why);
-        }
-    }
+    /*
+     * MESSAGE LAYOUT (security review M13).
+     *
+     *   ERROR: tier gate blocked [proposal_id=<32 hex> ]'<command>' on
+     *   '<device>' (tier=<T> max=<M>)[ reason: <why>]
+     *
+     * The proposal id used to be APPENDED, after the command, into a
+     * 448-byte buffer. A command of ~380 bytes or more filled the buffer
+     * first, the append was truncated to nothing, and the caller received
+     * a refusal with no proposal id in it: a proposal existed on disk and
+     * on the chain, and the one party who needed its id to ask for
+     * approval was never told. Long commands are exactly the config lines
+     * that end up needing approval.
+     *
+     * Two changes, either of which alone would have been enough:
+     *  - the proposal is filed FIRST and its id is placed BEFORE the
+     *    command text, so nothing caller-controlled sits between the
+     *    start of the message and the id;
+     *  - the buffer is sized for the longest request the socket can
+     *    carry (a 1023-byte command, a 63-byte device, a bounded reason)
+     *    so the tier and device after the command survive as well.
+     *
+     * "ERROR: tier gate blocked " stays the literal prefix — the cage
+     * (tools/cage/port_native.py) requires it — and the quoted command
+     * still follows "blocked " directly when no proposal was filed
+     * (BLACK, or no approval store), so that form is byte-identical to
+     * what it was. tools/virp-shell.py's pattern accepts both.
+     */
 
     /*
      * PROPOSE: file a signed proposal so a human can escalate
@@ -2439,6 +2451,7 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
      * proposal failure never weakens the rejection — and never
      * offered for BLACK: inexpressible has no escalation path.
      */
+    char proposal_tag[16 + VIRP_APPROVAL_ID_HEX_LEN] = "";
     if (state->approval_dir[0] && gate_tier != VIRP_TIER_BLACK) {
         /* The record's session_id keeps the bare session marker it has
          * always carried; `proposer` additionally names the peer uid
@@ -2460,9 +2473,8 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
                 proposer, gate_tier_name(gate_tier),
                 &prop);
         if (perr == VIRP_OK) {
-            size_t off = strlen(err_msg);
-            snprintf(err_msg + off, sizeof(err_msg) - off,
-                     " proposal_id=%s", prop.proposal_id);
+            snprintf(proposal_tag, sizeof(proposal_tag), "proposal_id=%s ",
+                     prop.proposal_id);
             fprintf(stderr, "[GATE] proposal filed: proposal=%s "
                     "device=%s tier=%s chain=%.16s\n",
                     prop.proposal_id, device_name,
@@ -2474,6 +2486,18 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
                     virp_error_str(perr));
         }
     }
+
+    /* Classifier-supplied instructive reason (optional hook), so the
+     * rejection payload teaches the escalation path, not just the tier
+     * math. Driver-supplied static text; bounded all the same. */
+    const char *why = drv->route_reason ? drv->route_reason(command) : NULL;
+
+    char err_msg[2048];
+    snprintf(err_msg, sizeof(err_msg),
+             "ERROR: tier gate blocked %s'%s' on '%s' (tier=%s max=%s)%s%.256s",
+             proposal_tag, command, device_name, gate_tier_name(gate_tier),
+             gate_tier_name(eff_max),
+             why ? " reason: " : "", why ? why : "");
 
     /* Phase C — rejection persistence: write a durable, HMAC-signed
      * entry to the trust chain via the same append path the AI

@@ -117,7 +117,12 @@ COMMAND_ACTIONS = {
 }
 
 PROPOSAL_RE = re.compile(r"proposal_id=([0-9a-f]{32})")
-BLOCKED_RE = re.compile(r"tier gate blocked '(.*)' on '([^']+)' \(tier=([A-Z]+) max=([A-Z]+)\)")
+# Since the O-Node security review (M13) the daemon puts the proposal id
+# BEFORE the command — "tier gate blocked proposal_id=<hex> '<cmd>' on ..."
+# — so a long command can no longer push it out of the message. The
+# optional group keeps this matching refusals from older daemons, and
+# refusals that filed no proposal (BLACK), which have no id there at all.
+BLOCKED_RE = re.compile(r"tier gate blocked (?:proposal_id=[0-9a-f]{32} )?'(.*)' on '([^']+)' \(tier=([A-Z]+) max=([A-Z]+)\)")
 
 # ── wire constants (include/virp.h) ────────────────────────────────────
 
