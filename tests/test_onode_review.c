@@ -1738,6 +1738,87 @@ static void t_M9_policy_refusal_is_chained_and_signed(void)
 }
 
 /* =========================================================================
+ * M10 — refusals and proposals say which uid they are about
+ * ========================================================================= */
+
+/* true iff body.uid is the number `want`, or JSON null when want is the
+ * internal caller. */
+static bool m10_uid_is(const cJSON *body, uid_t want)
+{
+    const cJSON *u = body ? cJSON_GetObjectItemCaseSensitive(body, "uid") : NULL;
+    if (want == (uid_t)-1) return cJSON_IsNull(u);
+    return cJSON_IsNumber(u) && (uid_t)u->valuedouble == want;
+}
+
+static void t_M10_uid_in_rejections_and_proposer(void)
+{
+    printf("\n  M10: gate_rejection bodies and proposals carry the peer uid\n");
+    fx_t *fx = &g_fx;
+    if (!fx_init(fx, "m10-uid")) { CHECK(false, "fixture"); return; }
+    const uid_t who = 4242;
+    uint8_t ot = 0;
+    char payload[2048];
+    char want[64];
+
+    /* Tier refusal (RED over the YELLOW ceiling) from a socket uid. */
+    char pid[VIRP_APPROVAL_ID_HEX_LEN + 1] = "";
+    CHECK(fx_run(fx, FX_DEV, "reload", NULL, who, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR &&
+          fx_extract_pid(payload, pid) == 0, "a RED command is refused, proposal filed");
+    cJSON *body = NULL;
+    (void)fx_rejections(fx, "gate-enforce:" FX_DEV, NULL, &body);
+    CHECK(m10_uid_is(body, who), "the tier gate_rejection names the uid");
+    if (body) cJSON_Delete(body);
+
+    virp_proposal_rec_t prop;
+    snprintf(want, sizeof(want), "uid:%lu", (unsigned long)who);
+    CHECK(virp_approval_load_proposal(fx->dir, pid, &prop) == VIRP_OK &&
+          strstr(prop.proposer, want) != NULL &&
+          strncmp(prop.proposer, "unauthenticated-v1 ", 19) == 0,
+          "the proposal's proposer is '<session marker> uid:<n>'");
+    CHECK(strcmp(prop.session_id, "unauthenticated-v1") == 0,
+          "its session_id keeps the bare session marker");
+
+    /* Separator refusal. */
+    CHECK(fx_run(fx, FX_DEV, "show version ; reload", NULL, who, &ot, payload,
+                 sizeof(payload)) == 0, "a separator-carrying command is refused");
+    body = NULL;
+    (void)fx_rejections(fx, "gate-separator:" FX_DEV, "ingress-separator", &body);
+    CHECK(m10_uid_is(body, who), "the separator gate_rejection names the uid");
+    if (body) cJSON_Delete(body);
+
+    /* Replay refusal: approve, apply, apply again as the same uid. */
+    virp_approval_rec_t apr;
+    CHECK(fx_approve(fx, pid, &apr) == VIRP_OK, "approval submitted");
+    CHECK(fx_run(fx, FX_DEV, "reload", pid, who, &ot, payload,
+                 sizeof(payload)) == 0, "first apply");
+    CHECK(fx_run(fx, FX_DEV, "reload", pid, who, &ot, payload,
+                 sizeof(payload)) == 0 && ot == VIRP_OBS_ERROR &&
+          strstr(payload, "approval_reused") != NULL, "second apply refused");
+    body = NULL;
+    (void)fx_rejections(fx, "gate-enforce:" FX_DEV, NULL, &body);
+    const cJSON *reason = body ? cJSON_GetObjectItemCaseSensitive(body, "reason") : NULL;
+    CHECK(cJSON_IsString(reason) && !strcmp(reason->valuestring, "approval_reused") &&
+          m10_uid_is(body, who),
+          "the replay gate_rejection names the uid that tried it");
+    if (body) cJSON_Delete(body);
+
+    /* The internal caller is explicit, never 4294967295. */
+    char pid2[VIRP_APPROVAL_ID_HEX_LEN + 1] = "";
+    CHECK(fx_run(fx, FX_DEV, "erase flash", NULL, (uid_t)-1, &ot, payload,
+                 sizeof(payload)) == 0 && fx_extract_pid(payload, pid2) == 0,
+          "an internal caller's RED command is refused, proposal filed");
+    body = NULL;
+    (void)fx_rejections(fx, "gate-enforce:" FX_DEV, NULL, &body);
+    CHECK(m10_uid_is(body, (uid_t)-1), "internal caller: uid is JSON null");
+    if (body) cJSON_Delete(body);
+    CHECK(virp_approval_load_proposal(fx->dir, pid2, &prop) == VIRP_OK &&
+          strstr(prop.proposer, "uid:internal") != NULL,
+          "internal caller: proposer says uid:internal");
+    fx_destroy(fx);
+}
+
+/* =========================================================================
  * Runner
  * ========================================================================= */
 
@@ -1771,6 +1852,7 @@ static const struct { const char *name; void (*fn)(void); } TESTS[] = {
     { "t_M8_ns_fields_are_decimal_strings",   t_M8_ns_fields_are_decimal_strings },
     { "t_M9_policy_refusal_is_chained_and_signed",
                                               t_M9_policy_refusal_is_chained_and_signed },
+    { "t_M10_uid_in_rejections_and_proposer", t_M10_uid_in_rejections_and_proposer },
 };
 
 static void rm_rf_root(void)

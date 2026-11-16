@@ -2201,7 +2201,46 @@ static virp_error_t onode_approval_submit(onode_state_t *state,
     return err;
 }
 
-/* Proposer identity for a PROPOSAL record: the active v2 session id if
+/* The peer uid as a chain-body member: a number, or JSON null for the
+ * internal caller ((uid_t)-1 is not a uid, and a reader must never
+ * render it as 4294967295). */
+static void json_add_uid(cJSON *o, uid_t uid)
+{
+    if (uid == (uid_t)-1)
+        cJSON_AddNullToObject(o, "uid");
+    else
+        cJSON_AddNumberToObject(o, "uid", (double)uid);
+}
+
+/*
+ * WHO FILED IT (security review M10): the proposer string for a PROPOSAL
+ * record — approval_proposer_id()'s session marker followed by the peer
+ * uid, "session:<16 hex> uid:<n>" / "unauthenticated-v1 uid:<n>".
+ *
+ * The session marker alone identified nobody. Every v1 client was the
+ * same "unauthenticated-v1", and the daemon holds ONE v2 session that
+ * any connecting uid's requests ride on, so "session:<id>" named the
+ * session and not the caller either. The peer uid is the one identity
+ * the daemon actually authenticates (SO_PEERCRED at accept), and it was
+ * already recorded on intents and executions — just not on the request
+ * that asks a human to approve something. An approver deciding whether
+ * to sign should be able to see which principal is asking.
+ *
+ * The internal caller is spelled out rather than omitted, so the absence
+ * of a uid is never ambiguous.
+ */
+static void approval_proposer_with_uid(const char *session_marker,
+                                       uid_t client_uid,
+                                       char *out, size_t out_len)
+{
+    if (client_uid == (uid_t)-1)
+        snprintf(out, out_len, "%s uid:internal", session_marker);
+    else
+        snprintf(out, out_len, "%s uid:%lu", session_marker,
+                 (unsigned long)client_uid);
+}
+
+/* Session marker for a PROPOSAL record: the active v2 session id if
  * one is bound, else a fixed marker for legacy v1 clients. */
 static void approval_proposer_id(onode_state_t *state, int obs_version,
                                  char *out, size_t out_len)
@@ -2286,7 +2325,8 @@ static void separator_refuse_chain(onode_state_t *state,
                                    const char *device_name,
                                    const char *command,
                                    const char *why,
-                                   const char *err_msg)
+                                   const char *err_msg,
+                                   uid_t client_uid)
 {
     if (!state->chain_enabled)
         return;
@@ -2312,6 +2352,8 @@ static void separator_refuse_chain(onode_state_t *state,
         cJSON_AddStringToObject(o, "command", command);
         cJSON_AddStringToObject(o, "classified_tier", "UNCLASSIFIED");
         cJSON_AddStringToObject(o, "refused_sequence", why);
+        /* Additive (M10): which principal sent it. */
+        json_add_uid(o, client_uid);
         cJSON_AddStringToObject(o, "message", err_msg);
         cJSON_AddBoolToObject(o, "executed", false);
         body = cJSON_PrintUnformatted(o);
@@ -2398,14 +2440,20 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
      * offered for BLACK: inexpressible has no escalation path.
      */
     if (state->approval_dir[0] && gate_tier != VIRP_TIER_BLACK) {
-        char proposer[80];
-        approval_proposer_id(state, obs_version, proposer,
-                             sizeof(proposer));
+        /* The record's session_id keeps the bare session marker it has
+         * always carried; `proposer` additionally names the peer uid
+         * (M10). Sized so neither can truncate: marker <= 24 bytes,
+         * " uid:" + 10 digits on top, against proposer[64]. */
+        char session_marker[40], proposer[64];
+        approval_proposer_id(state, obs_version, session_marker,
+                             sizeof(session_marker));
+        approval_proposer_with_uid(session_marker, client_uid, proposer,
+                                   sizeof(proposer));
         virp_proposal_rec_t prop;
         virp_error_t perr = virp_approval_propose(
                 state->approval_dir,
                 state->chain_enabled ? &state->chain : NULL,
-                proposer, device_name,
+                session_marker, device_name,
                 state->devices[dev_idx].node_id,
                 command,
                 onode_typed_profile(state, dev_idx),
@@ -2523,6 +2571,12 @@ static virp_error_t gate_refuse_obs(onode_state_t *state,
                 cJSON_AddStringToObject(o, "matched_rule", matched);
             else
                 cJSON_AddNullToObject(o, "matched_rule");
+            /* Additive to gate_rejection/1 (M10): the peer uid. The
+             * gate_intent and gate_execution bodies have carried it from
+             * the start; a REFUSAL was the one gate record that did not
+             * say who it refused. ceiling_source above says whether a
+             * per-uid row decided — this says which uid. */
+            json_add_uid(o, client_uid);
             cJSON_AddStringToObject(o, "message", err_msg);
             cJSON_AddBoolToObject(o, "executed", false);
             body = cJSON_PrintUnformatted(o);
@@ -2690,7 +2744,8 @@ virp_error_t onode_apply_obs(onode_state_t *state,
  * The outcome ID is populated only if that outcome actually exists. A crash
  * after intent leaves a null outcome, never an invented successful result. */
 static virp_error_t replay_refusal_record(onode_state_t *state,
-    const char *device, const char *proposal_id, const char *command)
+    const char *device, const char *proposal_id, const char *command,
+    uid_t client_uid)
 {
     if (!state->chain_enabled) return VIRP_OK;
     char outcome[64], session[96], artifact[96], hash[65];
@@ -2707,6 +2762,7 @@ static virp_error_t replay_refusal_record(onode_state_t *state,
     cJSON_AddStringToObject(o, "proposal_id", proposal_id);
     cJSON_AddStringToObject(o, "device", device);
     cJSON_AddStringToObject(o, "command", command);
+    json_add_uid(o, client_uid);      /* who tried the replay (M10) */
     cJSON_AddBoolToObject(o, "executed", false);
     if (exists) cJSON_AddStringToObject(o, "original_outcome_id", outcome);
     else { cJSON_AddNullToObject(o, "original_outcome_id");
@@ -3064,7 +3120,7 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                 find_device(state, device_name) >= 0
                     ? device_name : ONODE_SEPARATOR_UNKNOWN_DEVICE;
             separator_refuse_chain(state, session_device, device_name,
-                                   command, why, err_msg);
+                                   command, why, err_msg, client_uid);
             log_error_obs(device_name, VIRP_TIER_UNCLASSIFIED, err_msg);
             return virp_build_observation_tiered(
                         out_buf, out_buf_len, out_len,
@@ -3299,7 +3355,7 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                 /* fall through: the approved command executes below */
             } else {
                 if (aerr == VIRP_ERR_APPROVAL_REUSED) {
-                    virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command);
+                    virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command, client_uid);
                     if (re != VIRP_OK) { pthread_mutex_unlock(&state->exec_mutex[dev_idx]); return re; }
                 }
                 pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -3645,7 +3701,7 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
                                             device_name, false, intent);
             }
             if (refuse_err == VIRP_ERR_APPROVAL_REUSED) {
-                virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command);
+                virp_error_t re = replay_refusal_record(state, device_name, proposal_id, command, client_uid);
                 if (re != VIRP_OK) { pthread_mutex_unlock(&state->exec_mutex[dev_idx]); return re; }
             }
             pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
@@ -3693,7 +3749,8 @@ static virp_error_t onode_execute_legacy(onode_state_t *state,
             if (ce != VIRP_OK) {
                 if (ce == VIRP_ERR_APPROVAL_REUSED) {
                     virp_error_t re = replay_refusal_record(state, device_name,
-                                                           proposal_id, command);
+                                                           proposal_id, command,
+                                                           client_uid);
                     if (re != VIRP_OK) {
                         pthread_mutex_unlock(&state->exec_mutex[dev_idx]);
                         return re;
